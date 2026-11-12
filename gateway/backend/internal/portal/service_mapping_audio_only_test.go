@@ -30,7 +30,7 @@ func listFlavorMarkers(t *testing.T, svc *Service, appID string) map[string]mapp
 	}
 	got := make(map[string]mappingFlavorMarkers, len(list.Data))
 	for _, dto := range list.Data {
-		got[dto.ID] = mappingFlavorMarkers{ImagesOnly: dto.ImagesOnly, AudioOnly: dto.AudioOnly}
+		got[dto.ID] = mappingFlavorMarkers{ImagesOnly: dto.ImagesOnly, AudioOnly: dto.AudioOnly, DecisionsOnly: dto.DecisionsOnly}
 	}
 	return got
 }

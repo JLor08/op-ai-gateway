@@ -809,6 +809,34 @@ func TestUpstreamPathSpeechFlavorBypassesModeAndProviderFallbacks(t *testing.T) 
 	}
 }
 
+// TestUpstreamPathSystemOneBypassesModeAndProviderFallbacks proves the System One
+// branch fires before the endpointModeFor lookup and the provider fallbacks
+// (which would answer {prefix}/chat/completions), for the same providers the
+// speech twin uses. The branch keys on the flavor, never the endpoint.
+func TestUpstreamPathSystemOneBypassesModeAndProviderFallbacks(t *testing.T) {
+	cases := []struct {
+		name      string
+		provider  string
+		apiFlavor string
+		endpoint  sessionEndpoint
+		want      string
+	}{
+		{"ollama target", routing.ProviderOllama, apiFlavorSystemOne, endpointSystemOne, "/v1/systemone"},
+		{"audio.cpp target", routing.ProviderAudioCpp, apiFlavorSystemOne, endpointSystemOne, "/v1/systemone"},
+		{"vendor anthropic target", routing.ProviderVendorAnthropic, apiFlavorSystemOne, endpointSystemOne, "/v1/systemone"},
+		{"unresolved target keeps the empty answer", "", apiFlavorSystemOne, endpointSystemOne, ""},
+		{"System One endpoint does not hijack another flavor", routing.ProviderOllama, "openai_chat_completions", endpointSystemOne, "/api/chat"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := routing.Target{Provider: tc.provider}
+			if got := upstreamPath(target, tc.apiFlavor, tc.endpoint); got != tc.want {
+				t.Fatalf("upstreamPath(%q, %q, endpoint %d) = %q, want %q", tc.provider, tc.apiFlavor, tc.endpoint, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestUpstreamPathTranscriptionKeysOnEndpointNotFlavor pins the one place
 // transcription differs from every other single-purpose flavor: it shares the
 // openai_audio flavor with speech (apiFlavorSpeech), so the flavor cannot

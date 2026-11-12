@@ -190,38 +190,24 @@ func (s *Server) streamOnceWithin(ctx context.Context, streamer provider.Streami
 	return ttft, usage, nil
 }
 
-// mappingIsImagesOnly reads a mapping's runtime spec (mappingRuntimeSpec)
+// mappingCannotChat reads a mapping's runtime spec once (mappingRuntimeSpec)
 // and reports whether its EFFECTIVE flavors are images-only
-// (mappingSpecIsImagesOnly). The swap workaround's sibling pick
-// (benchmarkSiblingModel) asks it before it sends a mapping a chat prompt,
-// because such a mapping cannot answer one. The model warmer does not use it:
-// it reads the spec itself, so it can ask both the images-only and the
-// audio-only test (mappingSpecIsAudioOnly) of one read.
+// (mappingSpecIsImagesOnly), audio-only (mappingSpecIsAudioOnly) or
+// decisions-only (mappingSpecIsDecisionsOnly): a server that cannot answer a
+// chat prompt. The swap workaround's sibling pick (benchmarkSiblingModel) asks
+// it before it sends a mapping a chat prompt. The model warmer does not use
+// it: it reads the spec itself.
 //
 // Unlike benchmarkSpecFor it keeps "no spec" apart from a failed read: the
 // first means the application's flavors, the second means the answer is
 // unknown, which it reports as an error so the caller can skip rather than
 // guess.
-func (s *Server) mappingIsImagesOnly(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
+func (s *Server) mappingCannotChat(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
 	spec, hasSpec, err := s.mappingRuntimeSpec(ctx, app, mappingID)
 	if err != nil {
 		return false, err
 	}
-	return mappingSpecIsImagesOnly(app, spec, hasSpec), nil
-}
-
-// mappingIsAudioOnly is mappingIsImagesOnly's audio twin: it reads the
-// mapping's runtime spec and reports whether its EFFECTIVE flavors are
-// audio-only (mappingSpecIsAudioOnly) -- a speech- or transcription-only
-// server that benchmarkSiblingModel must also pass over, since it cannot
-// answer a chat prompt either. Same "no spec" kept apart from a failed read
-// as mappingIsImagesOnly.
-func (s *Server) mappingIsAudioOnly(ctx context.Context, app routing.Application, mappingID string) (bool, error) {
-	spec, hasSpec, err := s.mappingRuntimeSpec(ctx, app, mappingID)
-	if err != nil {
-		return false, err
-	}
-	return mappingSpecIsAudioOnly(app, spec, hasSpec), nil
+	return mappingSpecIsImagesOnly(app, spec, hasSpec) || mappingSpecIsAudioOnly(app, spec, hasSpec) || mappingSpecIsDecisionsOnly(app, spec, hasSpec), nil
 }
 
 // benchmarkSpecFor resolves the RuntimeSpec the model warmer's
@@ -812,10 +798,10 @@ func (s *Server) waitModelUnloaded(ctx context.Context, lister provider.LoadedMo
 // benchmarkSiblingModel returns another active mapping's upstream model name on the same
 // application (a distinct AppModelName), for the swap-workaround eviction.
 //
-// The swap sends that sibling a chat prompt, so a sibling that serves only images
-// (mappingIsImagesOnly) or only audio (mappingIsAudioOnly) is passed over, and so is one
-// whose runtime spec cannot be read, since whether it serves only images or audio is then
-// unknown.
+// The swap sends that sibling a chat prompt, so a sibling that serves only images, only
+// audio or only decisions (mappingCannotChat, one spec read per sibling) is passed over, and
+// so is one whose runtime spec cannot be read, since whether it can answer a chat prompt is
+// then unknown.
 func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget) (string, bool) {
 	mappings, err := s.Routes.MappingsByApplication(ctx, tgt.app.ID)
 	if err != nil {
@@ -825,10 +811,7 @@ func (s *Server) benchmarkSiblingModel(ctx context.Context, tgt benchmarkTarget)
 		if m.Status != routing.ServerStatusActive || strings.TrimSpace(m.AppModelName) == "" || m.AppModelName == tgt.mapping.AppModelName {
 			continue
 		}
-		if imagesOnly, err := s.mappingIsImagesOnly(ctx, tgt.app, m.ID); err != nil || imagesOnly {
-			continue
-		}
-		if audioOnly, err := s.mappingIsAudioOnly(ctx, tgt.app, m.ID); err != nil || audioOnly {
+		if cannotChat, err := s.mappingCannotChat(ctx, tgt.app, m.ID); err != nil || cannotChat {
 			continue
 		}
 		return m.AppModelName, true

@@ -172,7 +172,7 @@ func (w *modelWarmer) textCandidates(ctx context.Context, cands []routing.Mappin
 			slog.Debug("model warm: runtime spec read failed", "mapping_id", c.Mapping.ID, "err", err)
 			continue
 		}
-		if mappingSpecIsImagesOnly(c.Application, spec, hasSpec) || mappingSpecIsAudioOnly(c.Application, spec, hasSpec) || (hasSpec && spec.ClusterEnabled) {
+		if mappingSpecIsImagesOnly(c.Application, spec, hasSpec) || mappingSpecIsAudioOnly(c.Application, spec, hasSpec) || mappingSpecIsDecisionsOnly(c.Application, spec, hasSpec) || (hasSpec && spec.ClusterEnabled) {
 			continue
 		}
 		out = append(out, c)

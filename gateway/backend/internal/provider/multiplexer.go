@@ -381,6 +381,38 @@ func (m *Multiplexer) dispatchProbeSdcppCapabilities(ctx context.Context, target
 	return SdcppVerdicts{}, ErrUnavailable
 }
 
+var _ SystemOneProber = (*Multiplexer)(nil)
+
+// ProbeSystemOne routes the System One decision probe to the provider's client
+// (like ProbeSdcppCapabilities), falling back to the fallback client. A
+// provider whose client does not implement SystemOneProber yields
+// ("", ErrUnavailable): no verdict, so the caller writes nothing.
+func (m *Multiplexer) ProbeSystemOne(ctx context.Context, target routing.Target, model string) (string, error) {
+	ctx, span := tracing.Start(ctx, "provider.ProbeSystemOne")
+	defer span.End()
+	verdict, err := m.dispatchProbeSystemOne(ctx, target, model)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return verdict, err
+}
+
+func (m *Multiplexer) dispatchProbeSystemOne(ctx context.Context, target routing.Target, model string) (string, error) {
+	if m == nil {
+		return "", ErrUnavailable
+	}
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		if p, ok := client.(SystemOneProber); ok {
+			return p.ProbeSystemOne(ctx, target, model)
+		}
+	}
+	if p, ok := m.fallback.(SystemOneProber); ok {
+		return p.ProbeSystemOne(ctx, target, model)
+	}
+	return "", ErrUnavailable
+}
+
 var _ AudioCppModelsProber = (*Multiplexer)(nil)
 
 // ProbeAudioCppModels routes the audio.cpp /v1/models speech probe to the

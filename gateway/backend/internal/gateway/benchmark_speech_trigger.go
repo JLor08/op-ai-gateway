@@ -222,7 +222,7 @@ func (s *Server) TriggerAudioBenchmark(ctx context.Context, server routing.AISer
 		return AudioAutoRunDeferred
 	case s.audioAutoRuns.done(mapping.ID, tgt.spec.Replicable):
 		return AudioAutoRunSettled
-	case skipped == benchmarkSkippedImagesOnly, skipped == benchmarkSkippedSpeechClone, skipped == benchmarkSkippedClusterHead, skipped == "" && tgt.audio.role == "":
+	case skipped == benchmarkSkippedImagesOnly, skipped == benchmarkSkippedSpeechClone, skipped == benchmarkSkippedClusterHead, skipped == benchmarkSkippedDecisionsOnly, skipped == "" && tgt.audio.role == "":
 		slog.Debug("audio benchmark not started by the health loop: the mapping is no audio target it can measure", "mapping_id", mapping.ID, "skipped", skipped)
 		return AudioAutoRunSettled
 	case skipped != "", !AudioAutoRunWanted(mapping, tgt.spec.Replicable):

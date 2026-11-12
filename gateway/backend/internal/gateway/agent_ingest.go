@@ -1533,6 +1533,7 @@ var reservedAgentCapabilityNames = map[string]bool{
 	routing.CapabilityLiveProgress:        true,
 	routing.CapabilitySpeculationObserved: true,
 	routing.CapabilityImageEdit:           true,
+	routing.CapabilityDecision:            true,
 }
 
 // audioCppProbeCapabilities is the allowlist for the audiocpp_models source:

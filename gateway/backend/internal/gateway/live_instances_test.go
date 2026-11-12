@@ -51,6 +51,9 @@ const (
 	liveInstImgSpec      = "spec-img-inst"
 	liveInstImgMap       = "route-img-inst"
 	liveInstImgUp        = "img-up"
+	liveInstSysSpec      = "spec-sys-inst"
+	liveInstSysMap       = "route-sys-inst"
+	liveInstSysUp        = "sys-up"
 )
 
 // routerRefusal is the error a fake agent router answers for an address.
@@ -225,6 +228,16 @@ func (a *instanceAgentRouter) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "audio/wav")
 		_, _ = w.Write(speechTestWAV())
+	case r.URL.Path == "/v1/systemone":
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if a.arrive(w, body.Model) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"model":"sys","answers":{"q":"yes"},"usage":{"input_tokens":1,"output_tokens":0}}`)
 	case r.URL.Path == "/v1/images/generations":
 		var body struct {
 			Model string `json:"model"`
@@ -365,13 +378,14 @@ func newInstanceRouterServerWith(t *testing.T, agent *instanceAgentRouter, cfg i
 		}
 	}
 	must("CreateAIServer", routes.CreateAIServer(ctx, routing.AIServer{ID: liveInstServer, Name: "Instances", Domain: up.Hostname(), Provider: routing.ProviderVLLM, Endpoint: agent.server.URL, Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now}))
-	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages}, Priority: 10, Weight: 50, TimeoutMS: 30000, AdmissionQueueTimeoutSeconds: cfg.queueTimeoutSecs, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
-	// tts-inst (speech) and img-inst (image generation and edit), replicable alike.
+	must("CreateApplication", routes.CreateApplication(ctx, routing.Application{ID: "app-live-inst", ServerID: liveInstServer, Type: routing.ProviderServerAgent, Port: port, Scheme: "http", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio, routing.APIFlavorOpenAIImages, routing.APIFlavorDecisions}, Priority: 10, Weight: 50, TimeoutMS: 30000, AdmissionQueueTimeoutSeconds: cfg.queueTimeoutSecs, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+	// tts-inst (speech), img-inst (image generation and edit) and sys-inst (System One), replicable alike.
 	for _, m := range []struct {
 		mapping, spec, model, up, flavor, capability string
 	}{
 		{liveInstTTSMap, liveInstTTSSpec, "tts-inst", liveInstTTSUp, routing.APIFlavorOpenAIAudio, routing.CapabilitySpeech},
 		{liveInstImgMap, liveInstImgSpec, "img-inst", liveInstImgUp, routing.APIFlavorOpenAIImages, routing.CapabilityImage},
+		{liveInstSysMap, liveInstSysSpec, "sys-inst", liveInstSysUp, routing.APIFlavorDecisions, routing.CapabilityDecision},
 	} {
 		must("CreateMapping "+m.model, routes.CreateMapping(ctx, routing.ModelMapping{ID: m.mapping, ApplicationID: "app-live-inst", GatewayModelName: m.model, AppModelName: m.up, Status: routing.ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
 		must("UpsertMappingCapabilities "+m.model, routes.UpsertMappingCapabilities(ctx, m.mapping, []routing.CapabilityRow{

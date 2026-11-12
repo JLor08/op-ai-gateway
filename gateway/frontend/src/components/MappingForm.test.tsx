@@ -532,6 +532,58 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     }
 
+    // decision is the speech twin for System One decision models: yes is the
+    // operator's override of the decision probe, and (decision, no) is reserved
+    // for that probe, so no is shown only when it is already stored.
+    describe('decision verdict', () => {
+      const label = t.mappingDecisionCapable;
+
+      it('offers unknown and yes, never a selectable no', async () => {
+        renderForm({ row: makeMapping({ capabilities: [] }) });
+        fireEvent.mouseDown(screen.getByRole('combobox', { name: label }));
+        expect(
+          await screen.findByRole('option', { name: t.mappingCapabilityUnknown }),
+        ).toBeInTheDocument();
+        expect(screen.getByRole('option', { name: t.mappingCapabilityYes })).toBeInTheDocument();
+        expect(
+          screen.queryByRole('option', { name: t.mappingCapabilityNo }),
+        ).not.toBeInTheDocument();
+        expect(screen.getByText(t.mappingDecisionCapableUnknownHint)).toBeInTheDocument();
+      });
+
+      it('sends yes once picked and nothing when untouched', async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await pickOption(label, t.mappingCapabilityYes);
+        await save();
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ decision: 'yes' });
+      });
+
+      it('shows a stored no as a disabled option and does not resend it', async () => {
+        const { submitted } = renderForm({
+          row: makeMapping({
+            capabilities: [
+              {
+                capability: 'decision',
+                verdict: 'no',
+                source: 'decision_probe',
+                checked_at: '2026-09-25T12:00:00Z',
+              },
+            ],
+          }),
+        });
+        const combo = screen.getByRole('combobox', { name: label });
+        expect(combo.textContent).toBe(t.mappingCapabilityNo);
+        fireEvent.mouseDown(combo);
+        const no = await screen.findByRole('option', { name: t.mappingCapabilityNo });
+        expect(no).toHaveAttribute('aria-disabled', 'true');
+        fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+        await save();
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+      });
+    });
+
     // embedding and rerank mark a model's ROLE (a vector encoder / a reranker,
     // not a text generator). Unlike the audio and image controls above, nothing
     // probes either one and neither pair is reserved, so there is no automated
@@ -762,6 +814,13 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(button).toBeEnabled());
       expect(button).not.toHaveAccessibleDescription();
       expect(screen.queryByText(t.mappingProbeContextAudioOnly)).not.toBeInTheDocument();
+    });
+
+    it('disables the probe for a decisions-only mapping and names the reason', () => {
+      renderForm({ contextProbePath: '/props', row: makeMapping({ decisions_only: true }) });
+      const button = screen.getByRole('button', { name: t.mappingProbeContext });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAccessibleDescription(t.mappingProbeContextDecisionsOnly);
     });
 
     // A list naming both openai_images and openai_audio (and no text flavor)

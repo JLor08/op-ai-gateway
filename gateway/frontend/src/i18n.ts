@@ -993,6 +993,10 @@ const de = {
   // anthropic nennt sie neben dem API-Wert auch den Zweck, weil der Wert allein
   // nicht verrät, dass er die Bilderzeugung (/v1/images/generations) freischaltet.
   applicationFlavorOpenaiImages: 'openai_images (Bilderzeugung)',
+  // Beschriftung des Kontrollkästchens der Variante decisions: nennt den Zweck
+  // statt des API-Werts, weil „decisions“ allein nicht verrät, dass es die
+  // System-One-Entscheidungen (/v1/systemone) freischaltet.
+  applicationFlavorDecisions: 'Entscheidungen (System One)',
   // The fourth flavor checkbox's label, for the same reason as the third's: it
   // enables speech synthesis (/v1/audio/speech).
   applicationFlavorOpenaiAudio: 'openai_audio (Sprachsynthese)',
@@ -1175,6 +1179,9 @@ const de = {
   mappingSpeechCapable: 'Sprachsynthese',
   mappingSpeechCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Sprache synthetisiert. Das wird automatisch aus dem Feld „task“ in /v1/models des audio.cpp-Servers erkannt: durch das Gateway mit dem nächsten Health-Check bei einem statischen Server, den es direkt erreicht, und durch den Server-Agent (ab Version 0.9.1) bei einem Modell, das er startet. Wo das noch kein Ergebnis geliefert hat, etwa bei einem älteren Agent oder einem Modell, das die Auflistung nicht nennt, setze es auf Ja, um die Sprachsynthese freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
+  mappingDecisionCapable: 'Entscheidungen (System One)',
+  mappingDecisionCapableUnknownHint:
+    'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es System-One-Entscheidungen liefert. Das ermittelt die Prüfung der Entscheidungsmodelle automatisch. Wo sie noch kein Ergebnis geliefert hat, setze es auf Ja, um POST /v1/systemone für dieses Modell freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
   mappingTranscriptionCapable: 'Transkription',
   mappingTranscriptionCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Audio transkribiert. Das wird automatisch aus dem Feld „task“ in /v1/models des audio.cpp-Servers erkannt („asr“ steht für Transkription): durch das Gateway mit dem nächsten Health-Check bei einem statischen Server, den es direkt erreicht, und durch den Server-Agent (ab Version 0.9.1) bei einem Modell, das er startet. Wo das noch kein Ergebnis geliefert hat, etwa bei einem älteren Agent oder einem Modell, das die Auflistung nicht nennt, setze es auf Ja, um die Transkription freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
@@ -1216,6 +1223,8 @@ const de = {
   // loads the model with a chat prompt, which the gateway refuses for it.
   mappingProbeContextImagesOnly:
     'Nicht verfügbar: Dieses Modell erzeugt nur Bilder (seine API-Varianten nennen openai_images, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein Bildmodell nicht beantwortet.',
+  mappingProbeContextDecisionsOnly:
+    'Nicht verfügbar: Dieses Modell liefert nur Entscheidungen (seine API-Varianten nennen decisions, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein reines Entscheidungsmodell nicht beantwortet.',
   mappingProbeContextAudioOnly:
     'Nicht verfügbar: Dieses Modell stellt nur Audio bereit (seine API-Varianten nennen openai_audio, aber weder openai noch anthropic). Die Kontextgröße wird mit einem Chat-Prompt ermittelt, den ein reines Audio-Modell nicht beantwortet.',
   runtimeAdmin: 'Agent-gesteuerte Runtime',
@@ -1896,9 +1905,13 @@ const de = {
   // and a finished run names what it did not measure.
   benchmarkImagesOnlyHint:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision messen mit einem Chat-Prompt, den ein Bildmodell nicht beantwortet, und sind deshalb gesperrt.',
+  benchmarkDecisionsOnlyHint:
+    'Dieses Modell liefert nur Entscheidungen: Seine API-Varianten nennen decisions, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide und Vision senden einen Chat-Prompt, den ein reines Entscheidungsmodell nicht beantwortet, und sind deshalb gesperrt.',
   benchmarkAudioOnlyHint:
     'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität und Beide messen hier seine Audio-Leistung (× Echtzeit, erste Ausgabe, Echtzeit-Parallelität). Vision misst mit einem Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und ist deshalb gesperrt.',
   benchmarkResultSkippedImagesOnly: 'übersprungen – erzeugt nur Bilder, kein Chat-Prompt gesendet',
+  benchmarkResultSkippedDecisionsOnly:
+    'übersprungen – liefert nur Entscheidungen, kein Chat-Prompt gesendet',
   benchmarkResultSkippedAudioOnly: 'übersprungen – erzeugt nur Audio, kein Chat-Prompt gesendet',
   benchmarkResultSkippedNotSpeech: 'übersprungen – kein Sprachsynthese-Modell, nichts gesendet',
   benchmarkResultSkippedSpeechClone:
@@ -2052,6 +2065,7 @@ const de = {
   // Refines "Transkription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.
   capabilityTranscriptionStreaming: 'Streaming-Transkription',
+  capabilityDecision: 'Entscheidungen',
   capabilitySpeech: 'Sprachsynthese',
   capabilitySpeechClone: 'Stimmklon',
   // Refines "Sprachsynthese": the model delivers its audio as it is generated
@@ -2194,6 +2208,8 @@ const de = {
   // sentences as the tooltip of a disabled Load action.
   errorBenchmarkImagesOnly:
     'Dieses Modell erzeugt nur Bilder: Seine API-Varianten nennen openai_images, aber weder openai noch anthropic. Die Ermittlung der Kontextgröße und die Messungen von Geschwindigkeit, Kapazität und Vision senden einen Chat-Prompt, den ein Bildmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Ein Lauf über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes seiner Modelle nur Bilder erzeugt.',
+  errorBenchmarkDecisionsOnly:
+    'Dieses Modell liefert nur Entscheidungen: Seine API-Varianten nennen decisions, aber weder openai noch anthropic. Geschwindigkeit, Kapazität, Beide, Vision und die Ermittlung der Kontextgröße senden einen Chat-Prompt, den ein reines Entscheidungsmodell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet.',
   errorBenchmarkAudioOnly:
     'Dieses Modell stellt nur Audio bereit: Seine API-Varianten nennen openai_audio, aber weder openai noch anthropic. Geschwindigkeit, Kapazität und Beide messen seine Audio-Leistung. Die Ermittlung der Kontextgröße und die Vision-Messung senden dagegen einen Chat-Prompt, den ein reines Audio-Modell nicht beantwortet, und werden deshalb nicht gestartet. Auch „Laden“ ist nur möglich, wenn der Server-Agent das Modell startet. Eine Vision-Messung über eine Anwendung oder einen Server wird so abgelehnt, wenn jedes ihrer Modelle nur Audio bereitstellt.',
   // Not one of the four starter refusals above: 409 benchmark.speech_unavailable,
@@ -4963,6 +4979,10 @@ const en: PortalMessages = {
   // the purpose next to the API value, because the value alone does not say
   // that it enables image generation (/v1/images/generations).
   applicationFlavorOpenaiImages: 'openai_images (image generation)',
+  // The decisions flavor checkbox's label. It names the purpose instead of the
+  // API value, because "decisions" alone does not say that it enables System
+  // One decisions (/v1/systemone).
+  applicationFlavorDecisions: 'Decisions (System One)',
   // The fourth flavor checkbox's label, for the same reason as the third's: it
   // enables speech synthesis (/v1/audio/speech).
   applicationFlavorOpenaiAudio: 'openai_audio (speech synthesis)',
@@ -5134,6 +5154,9 @@ const en: PortalMessages = {
   mappingSpeechCapable: 'Speech synthesis',
   mappingSpeechCapableUnknownHint:
     'Unknown: whether this mapping synthesises speech is not on file. It is detected automatically from the "task" field of the audio.cpp server\'s /v1/models: by the gateway on the next health check for a static server it reaches directly, and by the server agent (version 0.9.1 or later) for a model it launches. Where that has not produced a verdict yet, for example with an older agent or a model the listing does not name, set it to Yes to enable speech synthesis. A Yes set here takes precedence over the automatic detection.',
+  mappingDecisionCapable: 'Decisions (System One)',
+  mappingDecisionCapableUnknownHint:
+    'Unknown: whether this mapping serves System One decisions is not on file. The decision-model probe detects it automatically. Where it has not produced a verdict yet, set it to Yes to enable POST /v1/systemone for this model. A Yes set here takes precedence over the automatic detection.',
   mappingTranscriptionCapable: 'Transcription',
   mappingTranscriptionCapableUnknownHint:
     'Unknown: whether this mapping transcribes audio is not on file. It is detected automatically from the "task" field of the audio.cpp server\'s /v1/models ("asr" means transcription): by the gateway on the next health check for a static server it reaches directly, and by the server agent (version 0.9.1 or later) for a model it launches. Where that has not produced a verdict yet, for example with an older agent or a model the listing does not name, set it to Yes to enable transcription. A Yes set here takes precedence over the automatic detection.',
@@ -5172,6 +5195,8 @@ const en: PortalMessages = {
     'Determining the context size is taking longer than expected; run it again once the server is free.',
   mappingProbeContextImagesOnly:
     'Not available: this model only generates images (its API flavors name openai_images but neither openai nor anthropic). The context size is determined with a chat prompt, which an image model does not answer.',
+  mappingProbeContextDecisionsOnly:
+    'Not available: this model only serves decisions (its API flavors name decisions but neither openai nor anthropic). The context size is determined with a chat prompt, which a decisions-only model does not answer.',
   mappingProbeContextAudioOnly:
     'Not available: this model only serves audio (its API flavors name openai_audio but neither openai nor anthropic). The context size is determined with a chat prompt, which an audio-only model does not answer.',
   runtimeAdmin: 'Agent-managed runtime',
@@ -5804,9 +5829,12 @@ const en: PortalMessages = {
   benchmarkLastCompleted: 'Last completed',
   benchmarkImagesOnlyHint:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Speed, Capacity, Both and Vision measure with a chat prompt, which an image model does not answer, so they are disabled.',
+  benchmarkDecisionsOnlyHint:
+    'This model only serves decisions: its API flavors name decisions but neither openai nor anthropic. Speed, capacity, both and vision send a chat prompt, which a decisions-only model does not answer, so they are disabled.',
   benchmarkAudioOnlyHint:
     'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, Capacity and Both measure its audio performance here (× real time, first output, real-time concurrency). Vision measures with a chat prompt, which an audio-only model does not answer, so it is disabled.',
   benchmarkResultSkippedImagesOnly: 'skipped — generates images only, no chat prompt sent',
+  benchmarkResultSkippedDecisionsOnly: 'skipped — serves decisions only, no chat prompt sent',
   benchmarkResultSkippedAudioOnly: 'skipped — generates audio only, no chat prompt sent',
   benchmarkResultSkippedNotSpeech: 'skipped — not a speech synthesis model, nothing sent',
   benchmarkResultSkippedSpeechClone:
@@ -5936,6 +5964,7 @@ const en: PortalMessages = {
   // Refines "Transcription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.
   capabilityTranscriptionStreaming: 'Streaming transcription',
+  capabilityDecision: 'Decisions',
   capabilitySpeech: 'Speech synthesis',
   capabilitySpeechClone: 'Voice clone',
   // Refines "Speech synthesis": the model delivers its audio as it is generated
@@ -6061,6 +6090,8 @@ const en: PortalMessages = {
     'The run could not be started: an internal error occurred while reading the stored configuration. Please try again.',
   errorBenchmarkImagesOnly:
     'This model only generates images: its API flavors name openai_images but neither openai nor anthropic. Determining the context size and the speed, capacity and vision runs send a chat prompt, which an image model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. An application or server run is refused this way when every model in it only generates images.',
+  errorBenchmarkDecisionsOnly:
+    'This model only serves decisions: its API flavors name decisions but neither openai nor anthropic. Speed, capacity, both, vision and determining the context size send a chat prompt, which a decisions-only model does not answer, so they are not started. "Load" is only possible when the server agent launches the model.',
   errorBenchmarkAudioOnly:
     'This model only serves audio: its API flavors name openai_audio but neither openai nor anthropic. Speed, capacity and both measure its audio performance. Determining the context size and the vision run, however, send a chat prompt, which an audio-only model does not answer, so they are not started. "Load" is only possible when the server agent launches the model. A vision run over an application or server is refused this way when every model in it only serves audio.',
   // 409 benchmark.speech_unavailable: answered when nothing in the scope can be

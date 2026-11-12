@@ -1166,6 +1166,9 @@ func runCapabilityCycle(runner *appHealthRunner) {
 		lastProbed: map[string]time.Time{},
 		lastAvail:  make(map[string]availWriteState),
 	})
+	// The System One pass runs detached from the cycle; wait for it so a test
+	// reads what the cycle started.
+	runner.systemOnePasses.Wait()
 }
 
 // TestRunAppHealthOnceProbeDoesNotOverwriteAManualVerdict is the operator's

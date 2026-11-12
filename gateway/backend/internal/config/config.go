@@ -161,6 +161,7 @@ type Config struct {
 	MaxChatAudioBytes               int // total ceiling on the decoded PCM bytes one chat run may store across its audio blobs (#279); default 256 MiB; the per-blob cap above still bounds each blob; config only, enforced by the gateway run executor
 	MaxRunHistoryBytes              int // ceiling on the stored-image bytes one chat run resolves into its upstream history (#124); config only, the service layer enforces it
 	MaxImageEditBodyBytes           int // cap on the multipart body POST /v1/images/edits holds in memory; default 32 MiB, the server agent's own cap (an edit to an agent-launched model is also refused past that, whatever this is set to)
+	MaxDecisionsBodyBytes           int // cap on the JSON body of POST /v1/systemone (and, later, /v1/decisions) held in memory; default 32 MiB, the agent router's JSON buffer
 	MaxAudioTranscriptionBodyBytes  int // cap on the multipart body POST /v1/audio/transcriptions (and /v1/audio/transcriptions/details) holds in memory, and on the JSON response it buffers to read the billable duration; default 32 MiB, the server agent's own cap (its own setting, independent of the image-edit cap)
 	MockDelay                       time.Duration
 	MockUnreachable                 bool
@@ -322,6 +323,9 @@ func Load() (Config, error) {
 		MaxChatBlobBytes:          l.integer("OP_AI_GATEWAY_MAX_CHAT_BLOB_BYTES", 20<<20),
 		MaxRunHistoryBytes:        l.integer("OP_AI_GATEWAY_MAX_RUN_HISTORY_BYTES", 32<<20),
 		MaxImageEditBodyBytes:     l.integer("OP_AI_GATEWAY_MAX_IMAGE_EDIT_BODY_BYTES", 32<<20),
+		// System One / decisions body cap: its own setting, the agent router's
+		// JSON buffer by default. Junk/0/negative -> the 32 MiB default.
+		MaxDecisionsBodyBytes: l.integer("OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES", 32<<20),
 		// Audio-transcription upload cap: a dedicated setting so operators can size
 		// audio independently of images. Junk/0/negative -> the 32 MiB default.
 		MaxAudioTranscriptionBodyBytes: l.integer("OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES", 32<<20),

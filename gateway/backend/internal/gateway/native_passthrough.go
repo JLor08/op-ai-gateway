@@ -159,6 +159,15 @@ func targetIsAudioOnly(target routing.Target) bool {
 	return routing.FlavorsAreAudioOnly(target.APIFlavors)
 }
 
+// targetIsDecisionsOnly is targetIsAudioOnly's decision twin: whether target's
+// effective APIFlavors are decisions-only -- see routing.FlavorsAreDecisionsOnly.
+// The text translate dispatch refuses such a target like an images-only or
+// audio-only one (resolveTranslateTarget), and the model listings agree
+// (routing.MappingServesAPIFlavor's openai row).
+func targetIsDecisionsOnly(target routing.Target) bool {
+	return routing.FlavorsAreDecisionsOnly(target.APIFlavors)
+}
+
 // upstreamPath returns the endpoint PATH the gateway calls on the upstream for a
 // RESOLVED target + client API flavor: the native passthrough path when the
 // effective mode for that flavor is passthrough, otherwise the built-in
@@ -223,6 +232,12 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 	// no translate fallback, and none of the provider fallbacks below applies.
 	if apiFlavor == apiFlavorSpeech {
 		return "/v1/audio/speech"
+	}
+	// System One is answered here for the same reason: no EndpointMode to look
+	// up, no translate fallback, and none of the provider fallbacks below applies
+	// (they would answer {prefix}/chat/completions).
+	if apiFlavor == apiFlavorSystemOne {
+		return "/v1/systemone"
 	}
 	if p, mode := endpointModeFor(target, apiFlavor); mode == routing.EndpointModePassthrough {
 		return p
@@ -1607,6 +1622,10 @@ func mergePassthroughUsage(dst *inference.Usage, apiFlavor string, body []byte) 
 			mergeResponsesUsage(dst, payload)
 		case "anthropic_messages":
 			mergeAnthropicUsage(dst, payload)
+		case apiFlavorSystemOne:
+			// A System One answer carries usage {input_tokens, output_tokens} in the
+			// Responses spelling.
+			mergeResponsesUsage(dst, payload)
 		}
 	}
 }

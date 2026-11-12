@@ -11846,3 +11846,124 @@ knowable on a mixed host). **Per-request VRAM metering** (left for later).
 [Security §8.4](cross-cutting/security-auth-rbac.md#84-rpc-clusters-rights-on-every-server-consent-and-anonymous-positions),
 [Runtime View §6.9](06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start),
 [HTTP API Surface](reference/api-surface.md).
+
+## ADR-097 — System One decisions: a third non-text flavor, a probe-written `decision` capability, and a value-for-value relay (Phase 1 of #373)
+
+**Context:** System One is a decision protocol: a client sends `{model, state, questions}` and a decision model
+answers each question (`{model, answers, usage}`), with no chat turn, no streaming and no prompt the gateway writes.
+Models that speak it (served by llama.cpp, vLLM or vllm-sr, launched by an agent or run by hand) answer
+`POST /v1/systemone` on their own server. The gateway already has the template for a non-text endpoint behind a
+capability gate ([ADR-042](#adr-042--the-images-gate-keys-on-a-required-capability-and-an-absent-verdict-refuses),
+[ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)),
+so this entry records what decisions decided *differently*. The inputs are facts no design could choose. A decision
+model is **no chat model** and must never be offered a chat prompt, so a warm-up, a benchmark or a text request
+reaching it would fail or load it for nothing. No agent reports whether a model answers decisions, and no model
+listing carries it, so the gateway has to find out. The request body can be a whole document, so unlike a chat
+body it needs a cap. And the same server may later also serve a second route, `/v1/decisions` (Phase 2), so the
+vocabulary must not be named after one path.
+
+**Decision — five choices, taken together. No migration, no agent change, no `ServerAgent` version bump.**
+
+- **(a) `decisions` is a third non-text coarse flavor, opt-in like `openai_audio`.**
+  `routing.APIFlavorDecisions` normalizes to itself, is never implied (an empty list still saves as
+  `[openai, anthropic]` exactly), and a new runtime spec does not inherit it in the portal form.
+  `routing.FlavorsAreDecisionsOnly` (names `decisions`, neither `openai` nor `anthropic`) is the one predicate every
+  chat-prompt path asks: the three chat listings (through the `openai` row of `MappingHasAPIFlavor`/
+  `MappingServesAPIFlavor`), the text translate dispatch (404 `routing.no_model_route`), the model warmer, manual and
+  scheduled benchmarks and Load (`409 benchmark.decisions_only`, the skipped reason `decisions_only`, checked **after**
+  the images-only and audio-only refusals so `[openai_audio, decisions]` answers `benchmark.audio_only`; a Load of a
+  `server_agent` mapping whose agent declares `runtime_ensure` is allowed and starts it through the router's ensure route
+  without generating), the context probe, the swap sibling and the speech-rate trigger. The VRAM probe treats it like
+  an images-only or audio-only agent target: it ensure-starts it, and refuses with `vramEnsureUnsupported` when the
+  agent lacks `runtime_ensure`. `score_servers` still ranks it (the portal's
+  ordering path is read-only). The portal mapping DTO carries `decisions_only`.
+- **(b) `decision` is a capability, and the gate is the existing one.** `POST /v1/systemone` sets
+  `RequiredCapabilities = ["decision"]`, so a model with no `(decision, yes)` verdict, an unprobed one included, is
+  `404 routing.model_not_capable`; the same list keeps the request off the vendor-account path, as for speech. The
+  pair `(decision, no)` is in `reservedManualVerdicts` and the name `decision` is in `reservedAgentCapabilityNames`,
+  so the probe below is the **only** writer of a `no`, and an operator's `yes` remains an override that outranks it
+  (rank 3 over the probe's rank 1). The portal folds the verdict into `ModelDTO.Decision`.
+- **(c) The gateway establishes the verdict by asking.** The health loop's `probeSystemOne` pass sends each
+  decision mapping one tiny `POST /v1/systemone` (the question "Is the state non-empty?" about the state `ok`), through
+  `provider.SystemOneProber`, unmetered. A 2xx with an object `answers.probe` is `yes`; a 404 or 501 is `no`, **except**
+  a 404 carrying the agent router's own `runtime.*` error envelope, which is the router answering before any child
+  was asked and so is no verdict; everything else (a timeout, a 400, a 401/403, a 5xx, an unreadable answer) is no
+  verdict. It is retried after a five-minute back-off, except a refusal that will not pass on its own (a 400, 405 or
+  422), whose window doubles per refusal of the same identity in a row up to one hour, so a loaded model that refuses
+  the probe is not kept resident by it. The probe has its own 30 s timeout, because the answer is a real inference,
+  and so the pass runs **detached from the health cycle**, one in flight per application, skipping an application
+  last observed unreachable: a cycle never waits on it. External applications are asked with their own credential
+  once per (mapping, app model name); a `server_agent` mapping only **while the agent reports the model loaded** (the
+  router would otherwise start a child and refresh its idle timer), with its spec's credential, once per (mapping,
+  `agentSpecIdentity`). A settled verdict is not asked again in the process while its row stays on file (a verdict
+  the operator clears is asked again on the next pass), so a gateway restart re-probes once, and a verdict the store
+  failed to write is not remembered as settled. The source is `systemone_probe`, rank 1. The contract was checked
+  against the vLLM v0.33.0 and llama.cpp `tools/server` (`2cbe0ec4`) sources (both answer a model that cannot serve
+  decisions with a 501); a run against a live decision model is still pending.
+- **(d) The endpoint is bearer-only and a value-for-value relay.** `POST /v1/systemone` accepts `gateway:use` or
+  `llm:invoke` and nothing else (never a session cookie or the internal loopback; no `/openai` alias). The validator
+  owns only `model` (`systemone.model_required`), `questions` (`systemone.questions_required`, a non-empty object) and
+  `stream` (`systemone.stream_unsupported`: absent, `null` and `false` are accepted, `null` meaning "not set");
+  `state` and the questions' contents reach the upstream unexamined. The body is read under
+  `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES` (default 32 MiB, the agent router's JSON buffer; `413
+  request.body_too_large`). It is relayed through `proxyNative` to the upstream `/v1/systemone` with `model` rewritten
+  to the mapping's own name; the relay is **value for value, not byte for byte**, because the shared JSON model
+  rewrite re-serializes the body as on every native relay. The upstream's status and body come back verbatim,
+  non-2xx included (recorded `upstream.<status>`), and the call is **token-metered** from
+  `usage.input_tokens`/`usage.output_tokens` (`billing_unit` empty, so the default tokens unit).
+- **(e) `GET /v1/systemone/models` lists what the gate would accept.** Bearer-only, `{"object":"list","data":[{"id",
+  "object":"model","api":"systemone"}]}`, `data` never `null`: the models that list `decisions` **and** carry
+  `decision: yes`. Visibility mirrors `GET /v1/models` exactly: unfiltered by a service token's own allowlist (the
+  allowlist restricts *invocation*, not discovery) and filtered by resource-group provisioning.
+
+**Rejected:**
+
+- **A `systemone_mode` column in Phase 1**, as issue #373 sketched. The flavor and the verdict already answer "is this
+  model served for decisions?", and the only reader a mode would have is the Phase 2 `/v1/decisions` route. The column
+  arrives with `decisions_mode` in Phase 2, when there is a second route to choose between; adding it now is a
+  migration with no reader. This is a deliberate deviation from the issue.
+- **Reading llama.cpp's `/v1/models` `output_modalities`** for the verdict, as the issue also suggested. It would need
+  an agent change (the gateway reads an agent-launched child's listing through the agent) and a version bump with its
+  mixed-fleet gating, and it would cover llama.cpp only. One uniform POST probe works for llama.cpp, vLLM and vllm-sr
+  alike, with no agent change. This too is a deliberate deviation.
+- **An agent-side probe** (the agent asks its own child and reports a `decision` row, as for `speech`). The gateway
+  already holds the credential, the cadence and the verdict-precedence machinery for external applications, which an
+  agent probe would not cover, so the logic would exist twice; and `decision` would then have to leave the reserved
+  agent names.
+- **Treating any non-2xx as `no`.** A 400, a 503 while a model loads or a timeout says nothing about whether the
+  model answers decisions, and a `no` stays on file until a later probe replaces it; only a 404 or 501 states it.
+- **Reusing the 3 s health-probe timeout.** A real inference would never finish inside it, the verdict would never
+  settle, and every retry would keep an agent child's idle timer fresh.
+- **A session-cookie or loopback path for the portal.** No portal feature calls System One in Phase 1; a surface with no
+  client is exposure with no benefit.
+- **A byte-for-byte relay.** It would need a second body path beside the shared model rewrite for no client-visible
+  gain; a decision client reads JSON.
+- **Filtering `/v1/systemone/models` by the token's allowlist.** That would make discovery differ from `/v1/models`;
+  invoking an allowlisted-out model is refused anyway (`model.not_allowed`).
+
+**Consequence:**
+
+- **A decisions-only model is invisible to chat, warm-up and benchmarks.** It is also not measured: a benchmark skips
+  it and a Load refuses it on a non-agent application, so it has no speed or capacity metrics in Phase 1. An agent
+  child is still started through the router's ensure route without generating.
+- **A new model is not usable until it is probed.** An application's mapping starts with no verdict and is refused
+  (`routing.model_not_capable`) until the next health pass settles it; an agent-launched one is probed only once the
+  agent reports it loaded. A request naming a decision model that has not been probed yet (an agent model never loaded,
+  say) is refused at the capability gate (`404 routing.model_not_capable`) and never reaches the agent: Load it (the
+  next health pass then probes it) or set a manual `decision: yes`.
+- **A model unloading within the loaded snapshot's staleness can still be started once by the probe**, and a transient
+  router 404 never turns into a sticky `no`.
+- **The probe is the only unmetered System One call.** It leaves no usage row and no capture; relayed calls are metered
+  in tokens as any native relay.
+- **A gateway restart asks each decision model once more**: each external mapping once, and each agent mapping
+  whose model is loaded once, as one request to an already running child. An agent model that is not loaded is not
+  asked until the agent reports it loaded.
+- **An external application has no loaded-only guard.** An upstream that routes `/v1/systemone` by model and loads
+  on demand (llama-server's router mode, say) can load each mapping of an application listing `decisions` once for
+  its probe; an operator lists `decisions` only where the mapped models are decision models, or sets the verdict by
+  hand.
+- **No upgrade order and no new migration.** Neither the agent nor the schema moved.
+
+→ [Compatibility & Inference §3.9](cross-cutting/compatibility-and-inference.md#39-system-one-decisions),
+[Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
+[HTTP API Surface](reference/api-surface.md).

@@ -109,6 +109,12 @@ const (
 	// CapabilityAudio, which means the model ACCEPTS audio input: this flavor
 	// names the endpoint that PRODUCES audio.
 	APIFlavorOpenAIAudio = "openai_audio"
+	// APIFlavorDecisions is the System One decision twin of APIFlavorOpenAIAudio:
+	// a COARSE flavor of its own with the same opt-in rule. It is what lets an
+	// application serve the decision endpoints and not text (or the reverse), and
+	// normalizeFlavors' empty-list default stays [openai, anthropic] exactly.
+	// See docs/architecture/09-architecture-decisions.md ADR-097.
+	APIFlavorDecisions = "decisions"
 
 	// PrincipalTypeService / PrincipalTypeUser are the two supported
 	// principal_limits owner kinds (Phase 2 of the service-accounts work):
@@ -1823,6 +1829,17 @@ const (
 	// (usage.BillingUnitAudioSecond).
 	CapabilitySpeechStreaming = "speech_streaming"
 
+	// CapabilityDecision means the model is a System One DECISION model: it
+	// answers the decision endpoints (flavor APIFlavorDecisions). It says
+	// nothing about chat: a mapping whose flavors are [decisions] only is kept
+	// off every chat path (decisions-only), while one that also lists openai
+	// stays a chat model too. It is orthogonal to every name above. Two
+	// sources write it: the systemone_probe (CapabilitySourceSystemOneProbe),
+	// the only one that may establish decision: no, and an operator's manual
+	// yes, which the probe never overwrites. A manual (decision, no) and an
+	// agent-reported row are both refused.
+	CapabilityDecision = "decision"
+
 	// CapabilityEmbedding means the model produces text EMBEDDINGS: it is a
 	// vector encoder, not a generator. It is orthogonal to every name above (an
 	// embedding model neither accepts images nor synthesises speech), and it is
@@ -1991,6 +2008,7 @@ const (
 	CapabilitySourceLlamaCppTimings   = "llama_cpp_timings"
 	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
 	CapabilitySourceAudioCppModels    = "audiocpp_models"
+	CapabilitySourceSystemOneProbe    = "systemone_probe"
 	CapabilitySourceLegacy            = "legacy"
 )
 

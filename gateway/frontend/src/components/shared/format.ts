@@ -92,13 +92,15 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // store read failed before the run started.
   'benchmark.request_failed': 'errorBenchmarkRequestFailed',
   // The starters' refusals before the reservation (benchmarkErrRows): a run
-  // that would send an images-only (or, as benchmark.audio_only, an audio-only)
-  // mapping a chat prompt; an images-only or audio-only agent mapping whose
-  // agent does not report runtime_ensure (the Load, and the VRAM probe under
-  // the same code); a Load of a force_stopped launch spec. The model list's
+  // that would send an images-only (or, as benchmark.audio_only, an audio-only;
+  // as benchmark.decisions_only, a decisions-only) mapping a chat prompt; an
+  // images-only, audio-only or decisions-only agent mapping whose agent does
+  // not report runtime_ensure (the Load, and the VRAM probe under the same
+  // code); a Load of a force_stopped launch spec. The model list's
   // `load_refusal` reuses these labels as the disabled Load action's tooltip.
   'benchmark.images_only': 'errorBenchmarkImagesOnly',
   'benchmark.audio_only': 'errorBenchmarkAudioOnly',
+  'benchmark.decisions_only': 'errorBenchmarkDecisionsOnly',
   // A run with nothing it can measure as audio: the speech run with no
   // speech target, or a speed/capacity/both scope whose audio-only models
   // cannot be measured yet (beside images-only ones or not). The gateway

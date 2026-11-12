@@ -383,11 +383,11 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 }
 
 // hasCapabilityFold reports whether capability is one capableNames can fold:
-// the closed set of capabilities that have a fold: image, image_edit, speech and
-// transcription. Keep it in step with capabilityFlagsByName.
+// the closed set of capabilities that have a fold: image, image_edit, speech,
+// transcription and decision. Keep it in step with capabilityFlagsByName.
 func hasCapabilityFold(capability string) bool {
 	switch capability {
-	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech, routing.CapabilityTranscription:
+	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityDecision:
 		return true
 	}
 	return false
@@ -413,6 +413,8 @@ func capabilityFlagsByName(capability string, views []mappingView, capsByMapping
 		return speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
 	case routing.CapabilityTranscription:
 		return transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
+	case routing.CapabilityDecision:
+		return decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
 	default:
 		return map[string]bool{}
 	}

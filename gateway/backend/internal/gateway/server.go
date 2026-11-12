@@ -160,6 +160,9 @@ type ServerDeps struct {
 	// OP_AI_GATEWAY_MAX_AUDIO_TRANSCRIPTION_BODY_BYTES). <= 0 defaults in New to
 	// defaultMaxAudioTranscriptionBodyBytes.
 	MaxAudioTranscriptionBodyBytes int
+	// MaxDecisionsBodyBytes caps the JSON body of POST /v1/systemone (and, in a
+	// later phase, /v1/decisions). A value <= 0 uses defaultDecisionsBodyBytes.
+	MaxDecisionsBodyBytes int
 	// MaxChatAudioBytes is the total decoded PCM bytes (the audio itself, not its
 	// WAV headers) one chat run may store across its audio blobs when a long
 	// speech response is spread over several blobs (config
@@ -470,6 +473,9 @@ type Server struct {
 	// /v1/audio/transcriptions and of its /details twin, defaulted in New; a bare
 	// &Server{} leaves it 0, which transcriptionBodyLimit reads as the default.
 	maxAudioTranscriptionBodyBytes int64
+	// maxDecisionsBodyBytes is the JSON read cap of the decision endpoints; a bare
+	// &Server{} leaves it 0, which decisionsBodyLimit reads as the default.
+	maxDecisionsBodyBytes int64
 	// maxChatAudioBytes is the total decoded PCM bytes (the audio itself, not its
 	// WAV headers) one chat run may store across its audio blobs, and
 	// maxChatBlobBytes the per-blob ceiling each blob must fit (see
@@ -937,6 +943,10 @@ func New(deps ServerDeps) *Server {
 	if maxImageEditBodyBytes <= 0 {
 		maxImageEditBodyBytes = defaultMaxImageEditBodyBytes
 	}
+	maxDecisionsBodyBytes := int64(deps.MaxDecisionsBodyBytes)
+	if maxDecisionsBodyBytes <= 0 {
+		maxDecisionsBodyBytes = defaultDecisionsBodyBytes
+	}
 	maxAudioTranscriptionBodyBytes := int64(deps.MaxAudioTranscriptionBodyBytes)
 	if maxAudioTranscriptionBodyBytes <= 0 {
 		maxAudioTranscriptionBodyBytes = defaultMaxAudioTranscriptionBodyBytes
@@ -1196,6 +1206,7 @@ func New(deps ServerDeps) *Server {
 		certMeshRequireTLSDisable:   deps.CertMeshRequireTLSDisable,
 		// multipart read cap of POST /v1/audio/transcriptions and /details (defaulted above)
 		maxAudioTranscriptionBodyBytes: maxAudioTranscriptionBodyBytes,
+		maxDecisionsBodyBytes:          maxDecisionsBodyBytes,
 		maxChatAudioBytes:              maxChatAudioBytes,
 		maxChatBlobBytes:               maxChatBlobBytes,
 		liveTickets:                    newLiveTicketStore(),
@@ -1686,6 +1697,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/images/edits", s.handleOpenAIImagesEdit)
 	s.mux.HandleFunc("/openai/v1/audio/speech", s.handleOpenAISpeech)
 	s.mux.HandleFunc("/v1/audio/speech", s.handleOpenAISpeech)
+	s.mux.HandleFunc("/v1/systemone", s.handleSystemOne)
+	s.mux.HandleFunc("/v1/systemone/models", s.handleSystemOneModels)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions", s.handleOpenAITranscription)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions/details", s.handleOpenAITranscriptionDetails)

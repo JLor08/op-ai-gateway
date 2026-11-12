@@ -32,6 +32,7 @@ const (
 	endpointSpeech                                      // /v1/audio/speech (OpenAI text-to-speech)
 	endpointTranscription                               // /v1/audio/transcriptions (OpenAI speech-to-text, multipart)
 	endpointTranscriptionDetails                        // /v1/audio/transcriptions/details (OpenAI speech-to-text with speaker turns, multipart, one-shot)
+	endpointSystemOne                                   // /v1/systemone (System One decisions)
 )
 
 // sessionInfo is the extractor result. ExplicitHeader is the raw
@@ -91,6 +92,9 @@ func extractClientSession(h http.Header, raw []byte, endpoint sessionEndpoint) s
 	case endpointSpeech:
 		// /v1/audio/speech has no per-endpoint header signal either; see the
 		// fuller comment on sessionFromBody's speech case below.
+	case endpointSystemOne:
+		// /v1/systemone has no per-endpoint header signal either; see the
+		// fuller comment on sessionFromBody's System One case below.
 	case endpointTranscription, endpointTranscriptionDetails:
 		// /v1/audio/transcriptions and its one-shot diarized twin
 		// /v1/audio/transcriptions/details have no per-endpoint header signal
@@ -157,6 +161,13 @@ func sessionFromBody(raw []byte, endpoint sessionEndpoint) (id, source string) {
 		// Stated as a case rather than left to the switch's absent default, so a
 		// reader can tell "considered, and there is none" from "nobody thought
 		// about it".
+	case endpointSystemOne:
+		// /v1/systemone carries no session signal: its request (model, state,
+		// questions) has no prompt_cache_key, no user and no metadata field, and a
+		// decision request is a one-shot verdict with no conversation to pin an
+		// affinity to. Stated as a case rather than left to the switch's absent
+		// default, so a reader can tell "considered, and there is none" from
+		// "nobody thought about it".
 	case endpointTranscription, endpointTranscriptionDetails:
 		// /v1/audio/transcriptions (and its /details twin, which takes the same
 		// form) carries no session signal: OpenAI's

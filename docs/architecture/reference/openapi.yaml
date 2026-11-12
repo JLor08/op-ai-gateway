@@ -834,6 +834,72 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/systemone:
+    post:
+      tags: [inference]
+      summary: System One decision request (value-for-value relay to a decision model, no translate path)
+      description: >
+        Bearer-only (scope `gateway:use` or `llm:invoke`): a portal session
+        cookie and the internal loopback are no way in, and there is no
+        /openai alias. Required: a non-blank string `model` (400
+        `systemone.model_required`) and a non-empty object `questions` (400
+        `systemone.questions_required`); `state` and the questions' contents
+        reach the upstream unexamined. The protocol does not stream: `stream`
+        must be absent, `null` or `false` (400 `systemone.stream_unsupported`).
+        Admission takes an application that declares the `decisions` API
+        flavor (otherwise 404 `routing.no_model_route`; an agent-launched
+        model's runtime spec must declare it too) and a mapping whose
+        `decision` verdict is `yes` (otherwise 404
+        `routing.model_not_capable`; an unprobed model is refused too). The
+        body is read under `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES` (default
+        32 MiB; 413 `request.body_too_large`). The request is relayed to the
+        upstream `/v1/systemone` with `model` rewritten to the mapping's own
+        model name and the rest of the body carried value for value; the
+        upstream's status and body come back verbatim, a non-2xx one
+        included (recorded as `upstream.<status>`). Metered in tokens from
+        the answer's `usage.input_tokens` and `usage.output_tokens`. Never
+        routed to a vendor account. Beyond those it answers the same
+        statuses as every other inference path (429/402 from the principal
+        limiter, 503 from the capacity queue or no healthy host).
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SystemOneRequest' }
+      responses:
+        '200':
+          description: The upstream's own answer, relayed verbatim.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemOneResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413':
+          description: The Error envelope with code `request.body_too_large`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v1/systemone/models:
+    get:
+      tags: [inference]
+      summary: Models a System One client can name in POST /v1/systemone
+      description: >
+        Bearer-only (scope `gateway:use` or `llm:invoke`). The models that
+        list the `decisions` flavor and carry a `decision` verdict of `yes`.
+        Visibility mirrors /v1/models: unfiltered by a service token's own
+        allowlist (the allowlist restricts invocation, not discovery) but
+        filtered by resource-group provisioning visibility. `data` is `[]`,
+        never null, when nothing qualifies.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: The decision models.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SystemOneModelList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /v1/models:
     get:
       tags: [inference]
@@ -5047,6 +5113,59 @@ components:
         `capabilities`, never nested. The row's display_name is then the honest
         label (the target's own listing label, never a Claude model name). No
         other row, a manual override alias included, carries it.
+    SystemOneRequest:
+      type: object
+      description: >
+        A System One decision request. Only `model`, `questions` and `stream`
+        are the gateway's business; every other field (`state`, the questions'
+        `type` and `instructions`, ...) belongs to the upstream and is relayed
+        unexamined.
+      required: [model, questions]
+      properties:
+        model:
+          type: string
+          minLength: 1
+          description: The gateway model name, rewritten to the mapping's own model name on the way out.
+        state:
+          description: The state the questions are asked about, opaque to the gateway.
+        questions:
+          type: object
+          minProperties: 1
+          description: Question id to question document, opaque to the gateway.
+          additionalProperties: true
+        stream:
+          type: [boolean, 'null']
+          description: Absent, null or false; true is 400 `systemone.stream_unsupported`.
+      additionalProperties: true
+    SystemOneResponse:
+      type: object
+      description: >
+        The upstream's answer, relayed as it came. The gateway reads only
+        `usage` (for metering) and does not validate the rest.
+      properties:
+        model: { type: string }
+        answers: { type: object, additionalProperties: true }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer, minimum: 0 }
+            output_tokens: { type: integer, minimum: 0 }
+      additionalProperties: true
+    SystemOneModelList:
+      type: object
+      description: The listing of GET /v1/systemone/models.
+      required: [object, data]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, api]
+            properties:
+              id: { type: string, description: The gateway model name. }
+              object: { type: string, const: model }
+              api: { type: string, const: systemone }
     OpenAIModelList:
       type: object
       description: The OpenAI-shaped model listing of /v1/models.

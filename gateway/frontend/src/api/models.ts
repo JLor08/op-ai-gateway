@@ -229,6 +229,11 @@ export type PortalModelMapping = {
   // openai_images and openai_audio is both. Same advisory contract and the
   // same optionality as images_only.
   audio_only?: boolean;
+  // The same twin for decision models: true when the mapping's effective API
+  // flavors name decisions and neither openai nor anthropic, so every
+  // chat-prompt run is refused for it (`benchmark.decisions_only`). Same
+  // advisory contract and optionality as images_only.
+  decisions_only?: boolean;
   // The audio performance metrics (#340), written by the audio measurement a
   // speed, capacity or both run takes on a speech or transcription mapping and
   // editable like the text metrics above, under the same metrics_locked:
@@ -705,6 +710,7 @@ export type ModelServerRow = {
 //                               launch; a Load would send it a chat prompt.
 //   audio_only               -- images_only's speech twin: an audio-only model
 //                               the server agent does not launch.
+//   decisions_only           -- images_only's decision-model twin.
 //   agent_ensure_unsupported -- an images-only or audio-only agent model whose
 //                               agent does not report the runtime_ensure
 //                               feature.
@@ -717,6 +723,7 @@ export type ModelServerRow = {
 export type LoadRefusal =
   | 'images_only'
   | 'audio_only'
+  | 'decisions_only'
   | 'agent_ensure_unsupported'
   | 'spec_force_stopped'
   | 'cluster_head_unsupported';

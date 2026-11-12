@@ -105,36 +105,53 @@ const audioOnlyRefusedModes: ReadonlySet<string> = new Set<BenchType>(['vision']
 const noRefusedModes: ReadonlySet<string> = new Set<BenchType>();
 
 /** The run kinds the model scope's mapping is refused, by why it is. */
-function refusedModesFor(refusal: 'images_only' | 'audio_only' | null): ReadonlySet<string> {
-  if (refusal === 'images_only') return promptModes;
+function refusedModesFor(
+  refusal: 'images_only' | 'audio_only' | 'decisions_only' | null,
+): ReadonlySet<string> {
+  // A decisions-only model answers no chat prompt at all, so it is refused
+  // every prompt run, like an images-only one.
+  if (refusal === 'images_only' || refusal === 'decisions_only') return promptModes;
   if (refusal === 'audio_only') return audioOnlyRefusedModes;
   return noRefusedModes;
 }
 
+/** The hint sentence for a chat refusal reason. */
+function chatRefusalHint(
+  refusal: 'images_only' | 'audio_only' | 'decisions_only',
+  t: Translation,
+): string {
+  if (refusal === 'images_only') return t.benchmarkImagesOnlyHint;
+  if (refusal === 'decisions_only') return t.benchmarkDecisionsOnlyHint;
+  return t.benchmarkAudioOnlyHint;
+}
+
 /**
  * Why the mapping the model scope is set to cannot take a chat prompt, if it
- * cannot: it serves images only (`images_only`) or audio only (`audio_only`),
- * or null when neither marker is set. Which runs that refuses is
- * refusedModesFor's: every chat-prompt run for images-only, vision alone for
- * audio-only, since speed, capacity and both measure an audio mapping's audio
- * (#340). A mapping carrying both is reported as images-only: the form shows
- * one hint, and that sentence names a flavor that holds. Only the model scope
- * asks: the application and server scopes run each mapping as its kind
- * allows, and the gateway answers `benchmark.images_only` for a chat-prompt
- * run whose every mapping serves only images, and `benchmark.audio_only` for
- * a vision run whose every mapping serves only audio, so there is nothing to
+ * cannot: it serves images only (`images_only`), audio only (`audio_only`) or
+ * decisions only (`decisions_only`), or null when no such marker is set.
+ * Which runs that refuses is refusedModesFor's: every chat-prompt run for
+ * images-only and decisions-only, vision alone for audio-only, since speed,
+ * capacity and both measure an audio mapping's audio (#340). A mapping
+ * carrying several markers is reported by the first of images-only,
+ * audio-only, decisions-only: the form shows one hint, and that sentence names
+ * a flavor that holds. Only the model scope asks: the application and server
+ * scopes run each mapping as its kind allows (a decisions-only one is
+ * skipped), and the gateway answers `benchmark.images_only` for a chat-prompt
+ * run whose every mapping serves only images, and `benchmark.audio_only` for a
+ * vision run whose every mapping serves only audio, so there is nothing to
  * run.
  */
 function selectedMappingChatRefusal(
   scopeKind: ScopeKind,
   mappings: readonly PortalModelMapping[],
   mappingId: string,
-): 'images_only' | 'audio_only' | null {
+): 'images_only' | 'audio_only' | 'decisions_only' | null {
   if (scopeKind !== 'mapping') return null;
   const id = mappingId || mappings[0]?.id;
   const mapping = mappings.find((m) => m.id === id);
   if (mapping?.images_only === true) return 'images_only';
   if (mapping?.audio_only === true) return 'audio_only';
+  if (mapping?.decisions_only === true) return 'decisions_only';
   return null;
 }
 
@@ -377,6 +394,7 @@ function audioResultLine(r: BenchmarkResult, t: Translation): string {
 function benchmarkResultLine(r: BenchmarkResult, t: Translation): string {
   if (r.skipped === 'images_only') return t.benchmarkResultSkippedImagesOnly;
   if (r.skipped === 'audio_only') return t.benchmarkResultSkippedAudioOnly;
+  if (r.skipped === 'decisions_only') return t.benchmarkResultSkippedDecisionsOnly;
   if (r.skipped === 'not_speech') return t.benchmarkResultSkippedNotSpeech;
   if (r.skipped === 'speech_clone') return t.benchmarkResultSkippedSpeechClone;
   if (r.skipped === 'cluster_head') return t.benchmarkResultSkippedClusterHead;
@@ -1233,7 +1251,7 @@ export function BenchmarkSection({
           </Typography>
           {chatRefusal !== null && (
             <Typography id="benchmark-chat-refusal-hint" variant="caption" color="text.secondary">
-              {chatRefusal === 'images_only' ? t.benchmarkImagesOnlyHint : t.benchmarkAudioOnlyHint}
+              {chatRefusalHint(chatRefusal, t)}
             </Typography>
           )}
           <Box>

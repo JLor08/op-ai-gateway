@@ -89,6 +89,19 @@ func TestParsePassthroughUsageReadsResponsesTimings(t *testing.T) {
 	}
 }
 
+// A System One answer's usage object ({input_tokens, output_tokens}) is read
+// under its own flavor; before the merge case existed it recorded zero tokens.
+func TestParsePassthroughUsageReadsSystemOneUsage(t *testing.T) {
+	body := `{"model":"m","answers":{"q":"yes"},"usage":{"input_tokens":213,"output_tokens":0}}`
+	u := parsePassthroughUsage(apiFlavorSystemOne, []byte(body))
+	if u.InputTokens != 213 || u.OutputTokens != 0 || u.TotalTokens != 213 {
+		t.Fatalf("usage = %+v, want input 213, output 0, total 213", u)
+	}
+	if none := parsePassthroughUsage(apiFlavorSystemOne, []byte(`{"answers":{}}`)); none.InputTokens != 0 || none.TotalTokens != 0 {
+		t.Fatalf("usage without a usage object = %+v, want zero", none)
+	}
+}
+
 // TestParsePassthroughUsageReadsResponsesDraftTokens carries Task 4's
 // drafted-token counter (llama.cpp's `timings.draft_n`) through the same
 // Responses-stream merge path TestParsePassthroughUsageReadsResponsesTimings
