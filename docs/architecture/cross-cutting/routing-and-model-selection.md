@@ -1235,13 +1235,22 @@ is not known before the resolve, so for it only the post-resolve refusal applies
 session-pin check and the server-override filter alike) admits a mapping that can serve
 either route and refuses the rest `404 routing.model_not_capable`. **`/v1/systemone` sets the same list**
 ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)); it is satisfied by either verdict because the System One route may be a translate to an
-upstream that only answers `/v1/decisions` (see *The System One route* below; `routing.EffectiveSystemOneRoute`). The gate is deliberately **not mode-aware**: the
-route a request needs follows from the mode, which is only known once a target is chosen,
-so the post-resolve step (`routing.EffectiveDecisionsRoute`) refuses a forced mode whose
-verdict is missing with the same `404 routing.model_not_capable` and **does not re-select
-another candidate**. Two applications serving one model name with a forced mode that
-lacks its verdict on one of them therefore answer intermittently: an operator
-configuration issue (use the same mode on both, or `auto`). An operator who tries to write
+upstream that only answers `/v1/decisions` (see *The System One route* below; `routing.EffectiveSystemOneRoute`).
+**For an ordinary application the gate is route-aware** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): its mode is the
+application's own, so `filterCapable` asks `candidateCapable`, which the session-pin check
+(`affinityCapabilityVerdict`), the server-override filter and the group walk (`memberPool`) share, for the route as well:
+`routing.EffectiveSystemOneRoute` over the application's `systemone_mode` on `/v1/systemone` (the coarse `decisions`
+flavor), `routing.EffectiveDecisionsRoute` over its `decisions_mode` on `/v1/decisions` (`openai_decisions`), each over
+the candidate's verdict rows as `capabilityRowsForKind` leaves them (`decisionRouteServes`). A mapping the route would
+refuse after the resolve is not a candidate: an application with the `systemone_mode: passthrough` migration 107 stored
+on every existing row and only a `decision_openai` verdict gives way to a sibling with `decision: yes`, as Phase 1's
+`[decision]` gate made it, and a forced `decisions_mode: passthrough` without `decision_openai` gives way to an `auto`
+sibling. A name none of whose candidates has a route is `404 routing.model_not_capable`. **A `server_agent` candidate
+keeps the plain `any_decision` check**: its effective mode lives on the runtime spec, not known before the resolve, so
+the post-resolve step (`settleDecisionRoute`) refuses a forced spec mode whose verdict is missing with the same
+`404 routing.model_not_capable` and **does not re-select another candidate**. Two `server_agent` applications serving
+one model name with a forced spec mode that lacks its verdict on one of them therefore answer intermittently: an
+operator configuration issue (use the same mode on both, or `auto`). An operator who tries to write
 a `manual` row named `any_decision` is refused `mapping.capability_reserved`. The unknown-model redirect's
 `ModelOffering.Capable` has the matching fold (`anyDecisionFlagsByName`: every mapping of a
 name has either verdict and passes the decisions flavor half); it and `ModelDTO.DecisionOpenAI`
@@ -1268,7 +1277,8 @@ self-hosted mappings, is not applied to it.
 twin of `EffectiveDecisionsRoute`, settled after the resolve: `disabled` is disabled; `passthrough` needs `decision`;
 `translate` needs `decision_openai` on a `DecisionsPassthroughCapableKind`; `auto` passes through when `decision` is
 yes, else translates when `decision_openai` is yes on a capable kind, else there is no route
-(`404 routing.model_not_capable`). For a kind that is not capable, `decision_openai` is ignored. The check does not
+(`404 routing.model_not_capable`). For a kind that is not capable, `decision_openai` is ignored. For an ordinary
+application the candidate filter has applied the route already (above); for a `server_agent` target the check does not
 re-select another candidate, as for `/v1/decisions`. Every listing surface judges by this route: the portal's per-model
 `decision` fold (`decisionFlagsByName`: a route exists, is not disabled, and the flavors and mode serve System One),
 `GET /v1/systemone/models`, the unknown-model redirect and the mapping DTO's `systemone_route`.

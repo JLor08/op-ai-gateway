@@ -853,15 +853,18 @@ paths:
         `any_decision`; otherwise 404 `routing.model_not_capable`, an unprobed
         model included). The effective `systemone_mode` (`auto`, `passthrough`,
         `translate`, `disabled`) then settles the route: passthrough to the
-        upstream `/v1/systemone`, or translate to its `/v1/decisions` (a
-        verdict missing for a forced mode is 404 `routing.model_not_capable`).
+        upstream `/v1/systemone`, or translate to its `/v1/decisions`. A
+        mapping with no route under an ordinary application's own mode is no
+        candidate; a name left without one, or an agent-launched model whose
+        spec mode lacks its verdict, is 404 `routing.model_not_capable` (no
+        other candidate is tried after the resolve).
         A decision model of an OpenAI api-key vendor account (`gpt-6-luna`) is
         served by translation to api.openai.com. The translate route refuses
         what OpenAI Decisions cannot express with 400
         `systemone.question_type_unsupported` or `systemone.field_unsupported`,
         answers a refused question 422 `systemone.refused`, and answers a
-        failure or a non-2xx upstream answer with `systemone.upstream_error`
-        (502, or the upstream's status). The
+        non-2xx upstream answer with `systemone.upstream_error` under the
+        upstream's status. The
         body is read under `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES` (default
         32 MiB; 413 `request.body_too_large`). The request is relayed to the
         upstream `/v1/systemone` with `model` rewritten to the mapping's own
@@ -872,9 +875,11 @@ paths:
         every choice and score answer recomputed as max(p)/sum(p) in a 2xx
         JSON body (a non-2xx or non-JSON body is still relayed as sent).
         A resolved agent-launched model whose runtime spec has
-        `systemone_mode` `disabled` is 404 `systemone.endpoint_disabled`; for
-        such a token (and on the translate route) a 502 `systemone.upstream_error` answers an upstream body
-        that is over the buffer bound or broken off. Metered in tokens from
+        `systemone_mode` `disabled` is 404 `systemone.endpoint_disabled`. A
+        502 `systemone.upstream_error` answers, on the translate route, a
+        missing answer, an unreadable or unusable body, or a body over the
+        buffer bound, and for a token with `decisions_confidence_normalize`
+        an upstream body that is over the buffer bound or broken off. Metered in tokens from
         the answer's `usage.input_tokens` and `usage.output_tokens`. Routed to a
         vendor account only for that decision model. Beyond those it answers the same
         statuses as every other inference path (429/402 from the principal
@@ -945,7 +950,10 @@ paths:
         default) passes through when the mapping has `decision_openai: yes`
         and otherwise translates; `translate` needs `decision: yes` and
         `passthrough` needs `decision_openai: yes`, else 404
-        `routing.model_not_capable` (no other candidate is tried). PASSTHROUGH
+        `routing.model_not_capable`. A mapping with no route under an
+        ordinary application's own mode is no candidate; for an
+        agent-launched model the route is settled after the resolve and no
+        other candidate is tried. PASSTHROUGH
         relays the body to the upstream `/v1/decisions` with `model` rewritten
         to the mapping's own name and returns the upstream's status and body
         verbatim, a non-2xx one included. TRANSLATE converts the request to a

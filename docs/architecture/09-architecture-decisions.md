@@ -12025,7 +12025,8 @@ System One alias, so `auto` there translates, and the `decision_openai` probe (e
 vendor path admits (OpenAI api-key accounts' decision models, which `/v1/decisions` passes through to). (c)'s `systemone_mode`
 (`passthrough` | `disabled`, default `passthrough`) now has the four values of `decisions_mode` and defaults to `auto` on new rows; and
 the "System One translator" of the title gains a twin in the other direction (`TranslateSystemOneRequest`, `TranslateOpenAIDecisionsResponse`) behind
-`systemone_mode: translate`.
+`systemone_mode: translate`. (b)'s "not mode-aware" now holds only for a `server_agent` candidate: for an ordinary application, whose mode is
+its own, the candidate filter also requires the route (ADR-100 (b)).
 
 **Context:** Phase 1 ([ADR-097](#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373))
 relays System One. Phase 2 adds **OpenAI's Decisions API**, `POST /v1/decisions`, whose clients (the OpenAI SDKs)
@@ -12307,8 +12308,10 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
 **Decision — eight choices, taken together. No migration (the latest stays 108), no agent change.**
 
 - **(a) `systemone_mode` takes the four values of `decisions_mode`, and defaults to `auto` on new rows.** `auto` | `passthrough` | `translate` |
-  `disabled` (`validSystemOneMode` is `validDecisionsMode`). The column is plain text, so **existing rows keep the `passthrough` they stored and
-  an upgrade changes no row's behavior**; **new** application and runtime-spec rows of **every** type default to `auto` (the portal service writes it on create and on every
+  `disabled` (`validSystemOneMode` is `validDecisionsMode`). The column is plain text, so **existing rows keep the `passthrough` they stored**;
+  with only `[any_decision]` that stored `passthrough` would make a mapping with just a `decision_openai` verdict a `/v1/systemone` candidate
+  without a route, so for an ordinary application the route-aware candidate filter of (b) keeps such a row's routing what it was in Phase 1,
+  and only a `server_agent` candidate is left to the post-resolve route; **new** application and runtime-spec rows of **every** type default to `auto` (the portal service writes it on create and on every
   spec write; the form default follows). `translate` needs an OpenAI `/v1/decisions` upstream, which `routing.DecisionsPassthroughCapableKind` says `llama_cpp`
   and `vllm_sr` lack, so it is **refused at save** for them by the guard `decisions_mode: passthrough` already had (`refuseIncapableDecisionModes`):
   `400 application.systemone_translate_unsupported` (the request set the mode, on create or on an update that sends `type`),
@@ -12317,10 +12320,15 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
 - **(b) The route is settled after the resolve, by one pure function, and the gate is `any_decision`.**
   `routing.EffectiveSystemOneRoute(kind, mode, decision, decisionOpenAI)`: `disabled` is disabled; `passthrough` needs `decision`; `translate` needs
   `decision_openai` **and** a passthrough-capable kind; `auto` is passthrough when `decision` is yes, else translate when `decision_openai` is yes on a capable
-  kind, else no route. `POST /v1/systemone` therefore sets `RequiredCapabilities = ["any_decision"]` like `/v1/decisions` (a mode-aware pre-resolve filter is
-  still impossible, ADR-098 (b)); the handler settles the route after `resolveDecisionsTarget` with `settleDecisionRoute`, the step both endpoints now share: a
-  disabled endpoint is `404 systemone.endpoint_disabled`, a missing route `404 routing.model_not_capable`, and, as before, **no other candidate is
-  re-selected**. `upstreamPath` answers `/v1/decisions` under translate and `/v1/systemone` otherwise, and the route reaches the usage row as `provider_path`.
+  kind, else no route. `POST /v1/systemone` therefore sets `RequiredCapabilities = ["any_decision"]` like `/v1/decisions`. **For an ordinary application
+  the candidate filter is route-aware**, on both decision endpoints: its mode is its own, so `filterCapable` (through `candidateCapable`, which the
+  session-pin check, the server-override filter and the group walk share) keeps a candidate only when `EffectiveSystemOneRoute` over its
+  `systemone_mode` (on `/v1/systemone`) or `EffectiveDecisionsRoute` over its `decisions_mode` (on `/v1/decisions`) gives a route for the
+  candidate's verdict rows. Without it a stored `passthrough` with only `decision_openai` could win the selection over a `decision` sibling and end in a
+  404, where Phase 1 always chose the sibling. **A `server_agent` candidate keeps the plain `any_decision` check**: its mode lives on the runtime spec,
+  unknown before the resolve (ADR-098 (b)), so the handler settles its route after `resolveDecisionsTarget` with `settleDecisionRoute`, the step both
+  endpoints now share: a disabled endpoint is `404 systemone.endpoint_disabled`, a missing route `404 routing.model_not_capable`, and, as before, **no
+  other candidate is re-selected**. `upstreamPath` answers `/v1/decisions` under translate and `/v1/systemone` otherwise, and the route reaches the usage row as `provider_path`.
   **Every listing surface judges by the route, not by the verdict**: the per-model fold behind `ModelDTO.Decision` and the `decisions` flavor, `GET /v1/systemone/models`,
   the unknown-model redirect (`MappingServesDecisionEndpoint` asks with both verdicts assumed yes) and the portal mapping DTO, which carries `systemone_route`.
 - **(c) The reverse translator refuses what it cannot express, rather than guessing (matrix B).** `compat.TranslateSystemOneRequest` and
@@ -12329,8 +12337,10 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
   `score` `levels`; a string `state` is an `input` string, **or, with images, one user message** (`input_text`, then one `input_image` per image); an object or
   array-of-objects `state` is an `input_json` part. A question `type` other than `noul`, `choice` and `score` is `400 systemone.question_type_unsupported`; every structural
   problem and every field OpenAI Decisions has no slot for (top-level `instructions`, `assets`, `audio`, `videos`, `roles`, `options`, `preset`, `states`, `joint`,
-  `chat_template_kwargs`, `cache_salt`, `priority`, `request_id`; a missing or scalar state; a non-object array element; a null or empty image; a duplicate key; a null question) is
-  `400 systemone.field_unsupported`, both before any upstream call. **Response:** answers are matched to questions **by name, then by position**; the computed `probabilities` and
+  `chat_template_kwargs`, `cache_salt`, `priority`; a missing or scalar state; a non-object array element; a null or empty image; a duplicate key; a null question) is
+  `400 systemone.field_unsupported`, both before any upstream call. **A default value counts as absent**, since it asks for nothing the upstream would miss:
+  `null` for every field; `false`, `0`, `[]` and `{}` for `joint`, `priority`, `assets`, `audio`, `videos`, `options`, `states`, `roles` and
+  `chat_template_kwargs`; `""` for `cache_salt` and the top-level `instructions`. `request_id`, a correlation id, is dropped silently. **Response:** answers are matched to questions **by name, then by position**; the computed `probabilities` and
   `confidence` of a predicate are **rounded to 12 decimals**; a **refusal** answer is `422 systemone.refused` naming the keys and **takes precedence over a malformed sibling**
   (the usage row records the upstream's tokens, since it answered); a missing answer or an unusable body is `502 systemone.upstream_error`; a non-2xx upstream answer is that
   envelope under the upstream's status, with its message. Usage carries the **cached and cache-write** tokens, so a vendor row records what OpenAI billed.
@@ -12378,7 +12388,8 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
   billed. `gpt-6-luna` already passes the `gpt-*` chat heuristic and every api-key refresh now adds the row. The only switches are `vendor_accounts_enabled` and the per-token §11 policy; there is no
   decision-specific flag.
 - **`auto` on `/v1/systemone` can now translate.** A model with only a `decision_openai` verdict (a vLLM decision model, the vendor model) is served to System One clients; one with both verdicts keeps passing
-  through. A forced mode whose verdict is missing is still an intermittent 404 when two applications share a name.
+  through. A forced mode whose verdict is missing is still an intermittent 404 when two `server_agent` applications share a name; an ordinary
+  application without a route is no candidate.
 - **The translated route buffers the answer** (the cost the forward translate route already pays), and refuses a malformed request with a 400 instead of relaying it.
 - **A new decision model is a release.** `routing.IsOpenAIDecisionModel` reads the unexported package-level map `openAIDecisionModels`, a var that nothing mutates; until it changes, a model OpenAI adds is a chat-routed name that fails if used on a decision endpoint (it is not offered there).
 - **Not verified live:** a real OpenAI api-key account with `gpt-6-luna` through `/v1/decisions` and `/v1/systemone`; the official OpenAI SDK against the vendor route; OpenAI's real error envelope on this endpoint; the zero-based score index of a reverse `score` answer; and
