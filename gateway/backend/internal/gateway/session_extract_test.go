@@ -140,6 +140,20 @@ func TestExtractClientSession(t *testing.T) {
 			wantID: "", wantSource: "", wantAgent: "",
 		},
 		{
+			// System One (/v1/systemone) is the same story as speech: no header and no
+			// body field is read, through either switch.
+			name: "systemone: every other endpoint's signal present -> still empty", endpoint: endpointSystemOne,
+			h:      hdr("session_id", "would-be-codex", "x-claude-code-session-id", "would-be-claude-code"),
+			raw:    `{"model":"m","state":"s","questions":{},"prompt_cache_key":"would-be-pck","user":"would-be-user","metadata":{"user_id":"would-be-anthropic"}}`,
+			wantID: "", wantSource: "",
+		},
+		{
+			name: "systemone: claude-code agent id is not read", endpoint: endpointSystemOne,
+			h:      hdr("x-claude-code-agent-id", "agent_9"),
+			raw:    `{"model":"m","state":"s","questions":{}}`,
+			wantID: "", wantSource: "", wantAgent: "",
+		},
+		{
 			// Transcription (/v1/audio/transcriptions) is the same story as speech
 			// (see the cases above): no per-endpoint header and no body field is
 			// read; both are explicit, empty cases (endpointTranscription in

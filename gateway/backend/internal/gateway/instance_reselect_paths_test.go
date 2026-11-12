@@ -55,6 +55,7 @@ func reselectPaths() []reselectPath {
 		chat("streamed chat", `{"model":"chat-inst","stream":true,"messages":[{"role":"user","content":"hi"}]}`, true, "served by chat-up"),
 		{name: "responses passthrough", spec: "spec-chat-inst", mapping: liveInstChatMap, up: liveInstChatUp, answer: `"model":"chat-up"`, build: jsonRequest("/v1/responses", `{"model":"chat-inst","input":"hi"}`)},
 		{name: "speech", spec: liveInstTTSSpec, mapping: liveInstTTSMap, up: liveInstTTSUp, answer: "RIFF", build: jsonRequest("/v1/audio/speech", `{"model":"tts-inst","input":"hello"}`)},
+		{name: "systemone", spec: liveInstSysSpec, mapping: liveInstSysMap, up: liveInstSysUp, answer: `"answers"`, build: jsonRequest("/v1/systemone", `{"model":"sys-inst","state":"s","questions":{"q":{"type":"noul","instructions":"x"}}}`)},
 		{name: "image generation", spec: liveInstImgSpec, mapping: liveInstImgMap, up: liveInstImgUp, answer: "b64_json", build: jsonRequest("/v1/images/generations", `{"model":"img-inst","prompt":"a cat"}`)},
 		{name: "image edit", spec: liveInstImgSpec, mapping: liveInstImgMap, up: liveInstImgUp, answer: "b64_json", build: multipartRequest("/v1/images/edits", func() []editPart { return validEditParts("img-inst") })},
 		{name: "transcription", spec: liveInstASRSpec, mapping: liveInstASRMap, up: liveInstASRUp, answer: "hello there", build: multipartRequest("/v1/audio/transcriptions", func() []editPart { return validTranscriptionParts("asr-inst") })},
