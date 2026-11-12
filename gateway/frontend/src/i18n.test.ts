@@ -4658,3 +4658,24 @@ describe('RPC cluster wording', () => {
     expect(messages.de.binariesNewTitle).toBe('Neues Binary');
   });
 });
+
+describe('vllm_sr i18n keys', () => {
+  it('defines the type notes, the spec type label, the warning and the api_version texts in de and en', () => {
+    const keys = [
+      'applicationTypeVllmSrNote',
+      'runtimeSpecTypeVllmSr',
+      'runtimeSpecTypeVllmSrNote',
+      'runtimeTextOnVllmSrWarning',
+      'modelServerColRuntimeApiVersion',
+      'modelServerRuntimeApiVersionUnsupported',
+      'modelServerRuntimeApiVersionTooltipUnsupported',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      // The product name is the same in both locales; everything else is text.
+      if (k !== 'runtimeSpecTypeVllmSr') expect(messages.en[k]).not.toBe(messages.de[k]);
+    }
+  });
+});

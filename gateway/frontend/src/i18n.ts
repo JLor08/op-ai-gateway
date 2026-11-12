@@ -986,6 +986,8 @@ const de = {
   // applicationTypeDefaults.ts.
   applicationTypeAudioCppNote:
     'audio.cpp bedient nur Sprachsynthese-Anfragen. Das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Synthese deutlich länger dauern kann als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_audio“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird. Der Health-Check-Modus bleibt bei „Health-Pfad prüfen“, aber der Health-Pfad ist standardmäßig /health statt /v1/health, weil der Server /health beantwortet und /v1/health mit 404.',
+  applicationTypeVllmSrNote:
+    'vLLM Semantic Router wird hier nur im Engine-Modus unterstützt (vllm-sr serve <Modell> --engine); der Router-Modus wird nicht unterstützt. Jedes Modell muss am Listener freigegeben sein (listeners[].apis.systemone.models), und die api_keys des Listeners müssen auf den API-Schlüssel dieser Anwendung gesetzt sein. Der Listener beantwortet eine Anfrage, die länger als 30 s läuft, mit 504, sofern der Client nicht options.deadline_ms sendet. Die Gesundheit wird über /v1/systemone/models geprüft, weil /health am Verwaltungsport des Containers liegt. Der Standard-Port ist 8899, das Timeout 10 Minuten, die API-Variante nur „decisions“; Decisions-Durchreichen wird nicht angeboten.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -1250,6 +1252,7 @@ const de = {
   runtimeSpecTypeTgi: 'TGI',
   runtimeSpecTypeOllama: 'Ollama',
   runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
+  runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Benutzerdefiniert',
   runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
@@ -1422,6 +1425,8 @@ const de = {
     'Eine Runtime-Spezifikation nennt eine API-Variante, die ihre Anwendung nicht deklariert. Diese Variante hat keine Wirkung.',
   runtimeTextOnStableDiffusionWarning:
     'Eine Runtime-Spezifikation für stable-diffusion.cpp nennt eine Text-API-Variante (openai oder anthropic) oder gar keine Variante. sd-server hat keinen Chat-Endpunkt, deshalb schlagen Textanfragen an ihr Modell fehl.',
+  runtimeTextOnVllmSrWarning:
+    'Eine Runtime-Spezifikation für vLLM Semantic Router nennt eine Text-API-Variante (openai oder anthropic). Der Worker bedient nur POST /v1/systemone, deshalb schlagen Textanfragen an sein Modell fehl.',
   runtimeSpecsIntro: 'Startkonfigurationen der Modell-Zuordnungen dieser Anwendung verwalten.',
   runtimeSpecCreate: 'Spezifikation anlegen',
   runtimeSpecEditAction: 'Bearbeiten',
@@ -1597,6 +1602,8 @@ const de = {
     'sd-server lauscht auf --listen-port (Standard 1234), nicht auf --port. Gewichte sind wörtliche Dateipfade – ${MODEL} ist ein Modellname, kein Pfad. Der Health-Pfad ist standardmäßig /v1/models, weil der Server /health mit 404 beantwortet. Unter „API-Varianten“ hier nur „openai_images (Bilderzeugung)“ ankreuzen und openai sowie anthropic abwählen; an der übergeordneten server_agent-Anwendung muss „openai_images (Bilderzeugung)“ ebenfalls angekreuzt sein.',
   runtimeSpecTypeAudioCppNote:
     'audiocpp_server liefert nur Sprachsynthese. Unter „API-Varianten“ hier nur „openai_audio (Sprachsynthese)“ ankreuzen und openai sowie anthropic abwählen; an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein.',
+  runtimeSpecTypeVllmSrNote:
+    'vllm-srun startet vLLM Semantic Router als Worker. Startvorlage: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (Gerät 0, weil die GPU durch die sichtbaren Geräte neu zugeordnet wird). vllm-srun aus einem Checkout des festgelegten Commits installieren (pip install ./src/model-runtime) und dessen venv in runtime_allow_binary_dirs aufnehmen. Der erste Start lädt das Modell herunter – den Start-Timeout entsprechend erhöhen. Der Worker hat keine Authentifizierung und muss auf Loopback bleiben. Das Portal warnt, wenn der Worker eine api_version mit einer anderen Hauptversion als 5 meldet. Unter „API-Varianten“ hier nur „decisions“ ankreuzen; Decisions-Durchreichen wird nicht angeboten.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -2041,6 +2048,10 @@ const de = {
   // the shared "—" placeholder instead of nothing (an override of the design
   // spec: an indistinguishable "no such column" vs "nothing determined yet"
   // already cost a real support report on a sibling table's silent `null`).
+  modelServerColRuntimeApiVersion: 'Runtime-API-Version',
+  modelServerRuntimeApiVersionUnsupported: 'Version nicht unterstützt',
+  modelServerRuntimeApiVersionTooltipUnsupported:
+    'Der Worker meldet eine api_version mit einer anderen Hauptversion als der unterstützten (5). Das Gateway spricht ihn weiter an; Antworten können abweichen.',
   modelServerColLiveProgress: 'Live-Fortschritt',
   modelServerLiveProgressSupported: 'Unterstützt',
   // The NEUTRAL badge label, deliberately not phrased as a warning: an older
@@ -4994,6 +5005,8 @@ const en: PortalMessages = {
   // applicationTypeDefaults.ts.
   applicationTypeAudioCppNote:
     'audio.cpp serves speech synthesis requests only. The timeout defaults to 10 minutes instead of 30 seconds, because a synthesis can take far longer than a text reply; and the API flavor defaults to "openai_audio" only, instead of openai/anthropic, so this server is never offered as a text candidate. The health check mode stays at "Check health path", but the health path defaults to /health instead of /v1/health, because the server answers /health and returns 404 for /v1/health.',
+  applicationTypeVllmSrNote:
+    'vLLM Semantic Router is supported here in Engine mode only (vllm-sr serve <model> --engine); Router mode is not supported. Grant each model on the listener (listeners[].apis.systemone.models), and set the listener api_keys to this application\'s API key. The listener answers a request that runs longer than 30 s with 504 unless the client sends options.deadline_ms. Health is checked via /v1/systemone/models, because /health is on the container\'s management port. The default port is 8899, the timeout 10 minutes, and the API flavor only "decisions"; decisions passthrough is not offered.',
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',
@@ -5244,6 +5257,7 @@ const en: PortalMessages = {
   runtimeSpecTypeTgi: 'TGI',
   runtimeSpecTypeOllama: 'Ollama',
   runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
+  runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Custom',
   runtimeSpecMetricsPath: 'Metrics path (override)',
@@ -5404,6 +5418,8 @@ const en: PortalMessages = {
     'A launch spec lists an API flavor its application does not declare. That flavor has no effect.',
   runtimeTextOnStableDiffusionWarning:
     'A stable-diffusion.cpp launch spec lists a text API flavor (openai or anthropic), or no flavor at all. sd-server has no chat endpoint, so text requests to its model fail.',
+  runtimeTextOnVllmSrWarning:
+    'A runtime spec for vLLM Semantic Router lists a text API flavor (openai or anthropic). The worker serves POST /v1/systemone only, so text requests to its model fail.',
   runtimeSpecsIntro: "Manage this application's model-mapping launch configurations.",
   runtimeSpecCreate: 'Create spec',
   runtimeSpecEditAction: 'Edit',
@@ -5563,6 +5579,8 @@ const en: PortalMessages = {
     'sd-server listens on --listen-port (default 1234), not --port. Weights are literal file paths — ${MODEL} is a model name, not a path. Its health path defaults to /v1/models, because the server answers /health with 404. Under "API flavors", tick only "openai_images (image generation)" here, with openai and anthropic unticked; the parent server_agent application needs "openai_images (image generation)" ticked too.',
   runtimeSpecTypeAudioCppNote:
     'audiocpp_server serves speech synthesis only. Under "API flavors", tick only "openai_audio (speech synthesis)" here, with openai and anthropic unticked; the parent server_agent application needs "openai_audio (speech synthesis)" ticked too.',
+  runtimeSpecTypeVllmSrNote:
+    'vllm-srun launches vLLM Semantic Router as a worker. Launch template: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (device 0, because the GPU is remapped by the visible devices). Install vllm-srun from a checkout of the pinned commit (pip install ./src/model-runtime) and add its venv to runtime_allow_binary_dirs. The first start downloads the model, so raise the startup timeout. The worker has no authentication and must stay on loopback. The portal warns when the worker reports an api_version with a major other than 5. Under "API flavors", tick only "decisions" here; decisions passthrough is not offered.',
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:
@@ -5972,6 +5990,10 @@ const en: PortalMessages = {
     audioFigureEn(k, limit),
   modelServerColActive: 'Active',
   modelServerColQueue: 'Queue',
+  modelServerColRuntimeApiVersion: 'Runtime API version',
+  modelServerRuntimeApiVersionUnsupported: 'Version not supported',
+  modelServerRuntimeApiVersionTooltipUnsupported:
+    'The worker reports an api_version with a major other than the supported one (5). The gateway keeps calling it; responses may differ.',
   modelServerColLiveProgress: 'Live progress',
   modelServerLiveProgressSupported: 'Supported',
   modelServerLiveProgressUnsupported: 'Not supported',

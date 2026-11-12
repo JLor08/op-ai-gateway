@@ -1324,6 +1324,60 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`ApplicationSection vllm_sr type [${locale}]`, () => {
+    it('offers vllm_sr and prefills its defaults with the note as the type description', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
+      expect(await screen.findByRole('option', { name: 'vllm_sr' })).toBeInTheDocument();
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+      await selectType('vllm_sr');
+      expect(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'openai' })).not.toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'anthropic' })).not.toBeChecked();
+      expect((screen.getByLabelText(t.applicationPort) as HTMLInputElement).value).toBe('8899');
+      expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe(
+        '600000',
+      );
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/v1/systemone/models',
+      );
+      expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveAccessibleDescription(
+        t.applicationTypeVllmSrNote,
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].type).toBe('vllm_sr');
+      expect(created[0].api_flavors).toEqual(['decisions']);
+      expect(created[0].responses_mode).toBe('disabled');
+      expect(created[0].messages_mode).toBe('disabled');
+      expect(created[0].decisions_mode).toBe('auto');
+      expect(created[0].systemone_mode).toBe('passthrough');
+      expect(created[0].timeout_ms).toBe(600000);
+      expect(created[0].health_check_path).toBe('/v1/systemone/models');
+    });
+
+    it('offers no decisions passthrough and turns a selected one into auto on the type change', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
+      const field = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
+      fireEvent.mouseDown(field());
+      fireEvent.click(await screen.findByRole('option', { name: t.applicationModePassthrough }));
+      expect(field()).toHaveTextContent(t.applicationModePassthrough);
+
+      await selectType('vllm_sr');
+      expect(field()).toHaveTextContent(t.applicationDecisionsModeAuto);
+      fireEvent.mouseDown(field());
+      expect(screen.queryByRole('option', { name: t.applicationModePassthrough })).toBeNull();
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].decisions_mode).toBe('auto');
+    });
+  });
+
   // openai_images is the third flavor checkbox: opt-in, never ticked by
   // default, so an operator can add it to any application -- a server_agent
   // one included, whose agent-launched image child needs it for candidacy.
@@ -1921,6 +1975,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       server_agent: true,
       stable_diffusion_cpp: true,
       audio_cpp: true,
+      vllm_sr: true,
     };
     const allTypes = Object.keys(typeKeys) as ApplicationType[];
     const refusedTypes = allTypes.filter((type) => type !== 'server_agent');

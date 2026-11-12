@@ -259,6 +259,7 @@ const runtimeWarningLabelByCode: Record<string, MessageKey> = {
   binary_path_os_mismatch: 'runtimeBinaryPathOsMismatchWarning',
   api_flavors_not_on_application: 'runtimeFlavorNotOnApplicationWarning',
   api_flavors_text_on_stable_diffusion: 'runtimeTextOnStableDiffusionWarning',
+  api_flavors_text_on_vllm_sr: 'runtimeTextOnVllmSrWarning',
 };
 
 // admin_state's three valid wire values (service_runtime.go): "" (no
@@ -750,6 +751,7 @@ function runtimeSpecHealthPathDefault(type: RuntimeSpec['type']): string {
 function runtimeSpecTypeNote(type: RuntimeSpec['type'], t: Translation): string | undefined {
   if (type === 'stable_diffusion_cpp') return t.runtimeSpecTypeStableDiffusionCppNote;
   if (type === 'audio_cpp') return t.runtimeSpecTypeAudioCppNote;
+  if (type === 'vllm_sr') return t.runtimeSpecTypeVllmSrNote;
   return undefined;
 }
 
@@ -4996,6 +4998,7 @@ export function RuntimeAdminSection({
               <option value="ollama">{t.runtimeSpecTypeOllama}</option>
               <option value="stable_diffusion_cpp">{t.runtimeSpecTypeStableDiffusionCpp}</option>
               <option value="audio_cpp">{t.runtimeSpecTypeAudioCpp}</option>
+              <option value="vllm_sr">{t.runtimeSpecTypeVllmSr}</option>
               <option value="custom">{t.runtimeSpecTypeCustom}</option>
             </SelectField>
             <Field

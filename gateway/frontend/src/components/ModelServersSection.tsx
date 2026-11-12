@@ -623,6 +623,26 @@ export function ModelServersSection({
       },
     },
     {
+      // #373: the api_version a vllm-srun worker reported. Only that kind
+      // carries one; every other row renders the shared placeholder. An
+      // unsupported major gets the attention chip beside the version.
+      id: 'runtimeApiVersion',
+      label: t.modelServerColRuntimeApiVersion,
+      value: (r) => r.runtime_api_version ?? '',
+      render: (r) => {
+        if (!r.runtime_api_version) return '—';
+        if (!r.runtime_api_version_unsupported) return r.runtime_api_version;
+        return (
+          <Tooltip title={t.modelServerRuntimeApiVersionTooltipUnsupported}>
+            <span>
+              {r.runtime_api_version}{' '}
+              <StatusChip status="watch" label={t.modelServerRuntimeApiVersionUnsupported} />
+            </span>
+          </Tooltip>
+        );
+      },
+    },
+    {
       id: 'capabilities',
       label: t.modelServerColCapabilities,
       value: (r) =>

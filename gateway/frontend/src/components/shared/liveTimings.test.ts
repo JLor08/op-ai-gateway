@@ -60,6 +60,7 @@ const applicationTypeKeys: Record<ApplicationType, true> = {
   server_agent: true,
   stable_diffusion_cpp: true,
   audio_cpp: true,
+  vllm_sr: true,
 };
 const allApplicationTypes = Object.keys(applicationTypeKeys) as ApplicationType[];
 
@@ -71,6 +72,7 @@ const specTypeKeys: Record<RuntimeSpec['type'], true> = {
   ollama: true,
   stable_diffusion_cpp: true,
   audio_cpp: true,
+  vllm_sr: true,
   custom: true,
 };
 const allSpecTypes = Object.keys(specTypeKeys) as RuntimeSpec['type'][];

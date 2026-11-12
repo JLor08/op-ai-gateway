@@ -1289,6 +1289,71 @@ describe('RuntimeAdminSection launch specs list', () => {
   });
 });
 
+describe('RuntimeAdminSection vllm_sr launch-spec kind', { timeout: 15_000 }, () => {
+  async function openCreate() {
+    const rendered = renderSection({
+      application: { ...application, api_flavors: ['openai', 'anthropic'] },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/vllm-sr/bin/vllm-srun' },
+    });
+    return rendered;
+  }
+
+  it('offers vllm_sr and shows its note as the type description, and only for it', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByText(t.runtimeSpecTypeVllmSrNote)).not.toBeInTheDocument();
+    await pickFlavorFormType(t.runtimeSpecTypeVllmSr);
+    expect(screen.getByRole('combobox', { name: t.runtimeSpecType })).toHaveAccessibleDescription(
+      t.runtimeSpecTypeVllmSrNote,
+    );
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+    expect(screen.queryByText(t.runtimeSpecTypeVllmSrNote)).not.toBeInTheDocument();
+  });
+
+  it('sets decisions with both coding modes disabled and sends type vllm_sr', async () => {
+    const { putSpecs } = await openCreate();
+    await pickFlavorFormType(t.runtimeSpecTypeVllmSr);
+    expect(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions })).toBeChecked();
+    expect(flavorBoxes().openai).not.toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('vllm_sr');
+    expect(putSpecs[0].body.api_flavors).toEqual(['decisions']);
+    expect(putSpecs[0].body.responses_mode).toBe('disabled');
+    expect(putSpecs[0].body.messages_mode).toBe('disabled');
+    expect(putSpecs[0].body.decisions_mode).toBe('auto');
+  });
+
+  it('offers no passthrough for vllm_sr and turns a selected one into auto', async () => {
+    const { putSpecs } = await openCreate();
+    const field = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
+    fireEvent.click(screen.getByRole('checkbox', { name: t.applicationFlavorDecisions }));
+    fireEvent.mouseDown(field());
+    fireEvent.click(await screen.findByRole('option', { name: t.applicationModePassthrough }));
+    expect(field()).toHaveTextContent(t.applicationModePassthrough);
+    await pickFlavorFormType(t.runtimeSpecTypeVllmSr);
+    expect(field()).toHaveTextContent(t.applicationDecisionsModeAuto);
+    fireEvent.mouseDown(field());
+    expect(screen.queryByRole('option', { name: t.applicationModePassthrough })).toBeNull();
+    fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.decisions_mode).toBe('auto');
+  });
+
+  it('renders the api_flavors_text_on_vllm_sr warning by its label in both locales', async () => {
+    renderSection({ warnings: ['api_flavors_text_on_vllm_sr'] });
+    expect(await screen.findByText(t.runtimeTextOnVllmSrWarning)).toBeInTheDocument();
+    expect(screen.queryByText('api_flavors_text_on_vllm_sr')).not.toBeInTheDocument();
+    expect(messages.en.runtimeTextOnVllmSrWarning).not.toBe(messages.de.runtimeTextOnVllmSrWarning);
+  });
+});
+
 describe('RuntimeAdminSection decisions modes in the spec form', () => {
   const decisionsField = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
   const systemOneField = () => screen.getByRole('combobox', { name: t.applicationSystemOneMode });

@@ -61,6 +61,7 @@ const applicationTypeOptions: ApplicationType[] = [
   'server_agent',
   'stable_diffusion_cpp',
   'audio_cpp',
+  'vllm_sr',
 ];
 const applicationSchemeOptions: ApplicationScheme[] = ['http', 'https'];
 // Seeds a fresh create form's flavor checkboxes (openCreate always starts
@@ -798,7 +799,11 @@ export function ApplicationSection({
       managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
       serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
       type === 'stable_diffusion_cpp' ? t.applicationTypeStableDiffusionCppNote : undefined,
-      type === 'audio_cpp' ? t.applicationTypeAudioCppNote : undefined,
+      type === 'audio_cpp'
+        ? t.applicationTypeAudioCppNote
+        : type === 'vllm_sr'
+          ? t.applicationTypeVllmSrNote
+          : undefined,
     ].filter((reason): reason is string => reason !== undefined);
     // The scheme is the GATEWAY's field only while the application actually
     // takes part in the proxy on a server that runs one. In every other case --

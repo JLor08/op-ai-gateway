@@ -1503,6 +1503,32 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(cell).queryByText(t.capabilityImageEditOptOut)).not.toBeInTheDocument();
     });
 
+    it('shows the runtime api_version, and a warning chip when it is unsupported', async () => {
+      const rows = makeRows().map((r) => {
+        if (r.mapping_id === 'map-a') {
+          return { ...r, runtime_api_version: '5.0.0', runtime_api_version_unsupported: false };
+        }
+        if (r.mapping_id === 'map-b') {
+          return { ...r, runtime_api_version: '6.1.0', runtime_api_version_unsupported: true };
+        }
+        return r;
+      });
+      const { api } = makeApi({
+        modelServers: vi.fn().mockResolvedValue(rows),
+      } as Partial<ModelServersSectionApi>);
+      renderSection(api);
+      await screen.findByText('GPU-Box-C');
+
+      const ok = cellForColumn('GPU-Box-A', t.modelServerColRuntimeApiVersion);
+      expect(ok).toHaveTextContent('5.0.0');
+      expect(within(ok).queryByText(t.modelServerRuntimeApiVersionUnsupported)).toBeNull();
+      const bad = cellForColumn('GPU-Box-B', t.modelServerColRuntimeApiVersion);
+      expect(bad).toHaveTextContent('6.1.0');
+      expect(within(bad).getByText(t.modelServerRuntimeApiVersionUnsupported)).toBeInTheDocument();
+      // A row that reports no version renders the shared placeholder.
+      expect(cellForColumn('GPU-Box-C', t.modelServerColRuntimeApiVersion)).toHaveTextContent('—');
+    });
+
     // "mtp"/"live_progress" are rows in this SAME capabilities array now (they
     // share the model_mapping_capabilities table with vision/video/audio/
     // tools), but this table already has its OWN dedicated "MTP"/

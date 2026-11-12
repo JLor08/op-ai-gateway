@@ -13,6 +13,7 @@ export type RuntimeSpecFlavorValues = RuntimeSpecTemplate;
 
 const sdTypeDefaults = applicationTypeDefaults.stable_diffusion_cpp;
 const audioTypeDefaults = applicationTypeDefaults.audio_cpp;
+const vllmSrTypeDefaults = applicationTypeDefaults.vllm_sr;
 
 /**
  * What the form sets when Type switches to stable_diffusion_cpp: the
@@ -37,6 +38,17 @@ export const audioCppSpecFlavorDefaults: RuntimeSpecFlavorValues = {
 };
 
 /**
+ * What the form sets when Type switches to vllm_sr: the application form's own
+ * default for that server kind, because the worker answers POST /v1/systemone
+ * only (decisions flavor, both coding endpoints disabled).
+ */
+export const vllmSrSpecFlavorDefaults: RuntimeSpecFlavorValues = {
+  apiFlavors: [...vllmSrTypeDefaults.apiFlavors],
+  responsesMode: vllmSrTypeDefaults.responsesMode,
+  messagesMode: vllmSrTypeDefaults.messagesMode,
+};
+
+/**
  * The spec kinds whose Type switch defaults the API-variant block: each serves
  * one non-text API only, so the stock text flavors would make it a text
  * candidate. Every other kind has no entry and defaults nothing.
@@ -44,6 +56,7 @@ export const audioCppSpecFlavorDefaults: RuntimeSpecFlavorValues = {
 const specTypeFlavorDefaults: Partial<Record<RuntimeSpec['type'], RuntimeSpecFlavorValues>> = {
   stable_diffusion_cpp: stableDiffusionSpecFlavorDefaults,
   audio_cpp: audioCppSpecFlavorDefaults,
+  vllm_sr: vllmSrSpecFlavorDefaults,
 };
 
 /**
