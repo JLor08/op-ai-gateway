@@ -101,6 +101,7 @@ func TestPortalApplicationDecisionModesReachTheWire(t *testing.T) {
 		{"bad decisions_mode", `{"type":"vllm","port":8401,"scheme":"http","decisions_mode":"bogus"}`, "application.endpoint_mode_invalid", http.StatusBadRequest},
 		{"systemone translate", `{"type":"vllm","port":8402,"scheme":"http","systemone_mode":"translate"}`, "application.endpoint_mode_invalid", http.StatusBadRequest},
 		{"llama_cpp passthrough", `{"type":"llama_cpp","port":8403,"scheme":"http","decisions_mode":"passthrough"}`, "application.decisions_passthrough_unsupported", http.StatusBadRequest},
+		{"vllm_sr passthrough", `{"type":"vllm_sr","port":8405,"scheme":"http","decisions_mode":"passthrough"}`, "application.decisions_passthrough_unsupported", http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := post(tc.body)

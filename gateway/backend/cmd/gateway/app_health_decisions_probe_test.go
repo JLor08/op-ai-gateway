@@ -74,6 +74,47 @@ func TestDecisionsPassSkipsOutOfScopeTypes(t *testing.T) {
 	st.assertCapability(t, "m1", routing.CapabilityDecision, routing.CapabilityYes, routing.CapabilitySourceSystemOneProbe)
 }
 
+// TestDecisionsPassSkipsVllmSR: a vllm_sr application, and a vllm_sr spec
+// (explicit or detected from vllm-srun), never get the OpenAI Decisions probe
+// but do get the System One probe.
+func TestDecisionsPassSkipsVllmSR(t *testing.T) {
+	t.Run("application", func(t *testing.T) {
+		up := newSystemOneUpstream(t)
+		_, port := up.hostPort(t)
+		runner, st, _ := systemOneRunner(t, up, systemOneApp(routing.ProviderVllmSR, port, routing.APIFlavorDecisions), systemOneMapping("m1", "decider"))
+		runCapabilityCycle(runner)
+		if countPath(up, decisionsPathValue) != 0 {
+			t.Fatalf("vllm_sr app saw %v, want no /v1/decisions", pathsSeen(up))
+		}
+		if _, ok := st.capabilityOf("m1", routing.CapabilityDecisionOpenAI); ok {
+			t.Fatal("a decision_openai row was written for a vllm_sr app")
+		}
+		if countPath(up, systemOnePathValue) != 1 {
+			t.Fatalf("want one System One probe, saw %v", pathsSeen(up))
+		}
+	})
+	for name, spec := range map[string]struct{ typ, binary string }{
+		"explicit spec": {string(routing.RuntimeSpecTypeVllmSR), "llama-server"},
+		"detected spec": {"", "/opt/vllm-sr/.venv/bin/vllm-srun"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			up := newSystemOneUpstream(t)
+			up.answerPath(decisionsPathValue, http.StatusOK, decisionsYesBody)
+			runner, st, loaded := agentSystemOneRunner(t, up)
+			st.runtimeSpecs[0].Type = spec.typ
+			st.runtimeSpecs[0].Binary = spec.binary
+			loaded.SetGatewayProbe("a1", []string{"decider"})
+			runCapabilityCycle(runner)
+			if countPath(up, decisionsPathValue) != 0 {
+				t.Fatalf("saw %v, want no /v1/decisions", pathsSeen(up))
+			}
+			if countPath(up, systemOnePathValue) != 1 {
+				t.Fatalf("want one System One probe, saw %v", pathsSeen(up))
+			}
+		})
+	}
+}
+
 // TestDecisionsPassForAgentSpecTypes: a server_agent mapping gets the OpenAI
 // probe for spec type vllm or custom, only while loaded; llama_cpp never.
 func TestDecisionsPassForAgentSpecTypes(t *testing.T) {

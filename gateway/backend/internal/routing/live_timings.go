@@ -63,7 +63,7 @@ package routing
 // this opt-in governs, does not even apply to it), custom, mock, and "" --
 // the empty spec type, which means "auto-detect from the binary" and is a
 // legitimate STORED value, so it has to be answered for rather than assumed
-// absent. That is all eleven strings the two vocabularies hold between them,
+// absent. That is all twelve strings the two vocabularies hold between them,
 // minus the one member above. The default is OFF, so a kind added later
 // never opts in silently.
 var liveTimingsCapableKinds = map[string]struct{}{

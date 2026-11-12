@@ -3681,6 +3681,8 @@ func viewRuntimeType(view mappingView, idx runtimeSpecIndex) routing.RuntimeSpec
 		return routing.RuntimeSpecTypeStableDiffusionCpp
 	case routing.ProviderAudioCpp:
 		return routing.RuntimeSpecTypeAudioCpp
+	case routing.ProviderVllmSR:
+		return routing.RuntimeSpecTypeVllmSR
 	}
 	return ""
 }

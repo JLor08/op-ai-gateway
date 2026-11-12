@@ -42,6 +42,14 @@ const (
 	// RuntimeSpecTypeAudioCpp, but it is a different namespace: that one names
 	// the kind of an agent-managed runtime spec on a server_agent application.
 	ProviderAudioCpp = "audio_cpp"
+	// ProviderVllmSR is an operator-run vLLM Semantic Router in Engine mode
+	// (ADR-099): a static application with no runtime spec that serves only the
+	// decision endpoints (System One at /v1/systemone, listed at
+	// /v1/systemone/models). It shares the OpenAI-compatible provider client.
+	// The string equals RuntimeSpecTypeVllmSR, but it is a different namespace:
+	// that one names the kind of an agent-launched vllm-srun worker on a
+	// server_agent application.
+	ProviderVllmSR = "vllm_sr"
 	// ProviderVendorOpenAI and ProviderVendorAnthropic are the provider kinds of
 	// a vendor-account target: inference served by a hosted vendor API
 	// (api.openai.com / api.anthropic.com) instead of an on-prem application.

@@ -208,3 +208,39 @@ func TestRuntimeSpecType_DeriveProbePaths(t *testing.T) {
 		})
 	}
 }
+
+// TestDetectRuntimeSpecTypeVllmSR pins that the vLLM Semantic Router worker
+// (vllm-srun) detects as vllm_sr, ahead of the vllm substring case, while
+// plain vllm launchers still detect as vllm.
+func TestDetectRuntimeSpecTypeVllmSR(t *testing.T) {
+	cases := []struct {
+		binary string
+		want   RuntimeSpecType
+	}{
+		{"vllm-srun", RuntimeSpecTypeVllmSR},
+		{"/opt/vllm-sr/.venv/bin/vllm-srun", RuntimeSpecTypeVllmSR},
+		{"vllm_srun", RuntimeSpecTypeVllmSR},
+		{"vllm-sr", RuntimeSpecTypeVllmSR},
+		{"vllm", RuntimeSpecTypeVLLM},
+		{"/usr/bin/vllm", RuntimeSpecTypeVLLM},
+		{"python -m vllm.entrypoints.openai.api_server", RuntimeSpecTypeVLLM},
+	}
+	for _, tc := range cases {
+		if got := DetectRuntimeSpecType(tc.binary); got != tc.want {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", tc.binary, got, tc.want)
+		}
+	}
+	if got := EffectiveRuntimeSpecType(RuntimeSpec{Binary: "/opt/vllm-sr/.venv/bin/vllm-srun"}); got != RuntimeSpecTypeVllmSR {
+		t.Errorf("EffectiveRuntimeSpecType(vllm-srun) = %q, want vllm_sr", got)
+	}
+}
+
+func TestDeriveProbePathsVllmSR(t *testing.T) {
+	metrics, context := DeriveProbePaths(RuntimeSpecTypeVllmSR, "", "")
+	if metrics != "/metrics" || context != "/v1/models" {
+		t.Fatalf("probe paths = (%q, %q), want (/metrics, /v1/models)", metrics, context)
+	}
+	if m, c := DeriveProbePaths(RuntimeSpecTypeVllmSR, "/m", "/c"); m != "/m" || c != "/c" {
+		t.Fatalf("overrides = (%q, %q), want (/m, /c)", m, c)
+	}
+}

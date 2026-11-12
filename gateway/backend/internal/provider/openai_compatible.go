@@ -189,14 +189,22 @@ const sdcppModelsPath = "/sdapi/v1/sd-models"
 // already has.
 //
 // pathPrefix is the target's normalised OpenAI-dialect prefix
-// (Target.OpenAIPathPrefixOrDefault); every type but stable_diffusion_cpp lists
-// at {pathPrefix}/models, while sd.cpp keeps its fixed, unprefixed path.
+// (Target.OpenAIPathPrefixOrDefault); every type but stable_diffusion_cpp and vllm_sr
+// lists at {pathPrefix}/models, while those two keep a fixed, unprefixed path.
 func modelDiscoveryFor(providerType, pathPrefix string) (path string, decode func(io.Reader) ([]string, error)) {
 	if strings.TrimSpace(providerType) == routing.ProviderStableDiffusionCpp {
 		return sdcppModelsPath, decodeSdcppModelList
 	}
+	if strings.TrimSpace(providerType) == routing.ProviderVllmSR {
+		return vllmSRModelsPath, decodeOpenAIModelList
+	}
 	return pathPrefix + "/models", decodeOpenAIModelList
 }
+
+// vllmSRModelsPath is the System One model listing of a vllm_sr application:
+// the decision models, not /v1/models (the router's own chat models). Fixed and
+// unprefixed, like sdcppModelsPath.
+const vllmSRModelsPath = "/v1/systemone/models"
 
 // decodeSingleJSON decodes exactly one JSON value from r into v and requires
 // that nothing but optional whitespace follows it. Model-discovery listings

@@ -308,3 +308,59 @@ func TestMappingDTODecisionsRoute(t *testing.T) {
 		t.Fatalf("decisions_route not always on the wire: %s", raw)
 	}
 }
+
+// TestVllmSRRefusesDecisionsPassthrough: the vllm_sr application and spec
+// types serve the decision endpoints themselves but have no native
+// /v1/decisions route, so passthrough is refused like llama_cpp.
+func TestVllmSRRefusesDecisionsPassthrough(t *testing.T) {
+	ctx := context.Background()
+	svc, _, serverID := decisionModesFixture(t)
+
+	_, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+		Type: routing.ProviderVllmSR, Port: 8330, Scheme: "http", DecisionsMode: "passthrough",
+	})
+	if !errors.Is(err, ErrApplicationDecisionsPassthroughUnsupported) {
+		t.Fatalf("create vllm_sr passthrough: %v", err)
+	}
+	sr, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{Type: routing.ProviderVllmSR, Port: 8331, Scheme: "http"})
+	if err != nil {
+		t.Fatalf("create vllm_sr: %v", err)
+	}
+	_, err = svc.UpdateApplication(ctx, ownerToken(), sr.ID, UpdateApplicationRequest{DecisionsMode: strPtr("passthrough")})
+	if !errors.Is(err, ErrApplicationDecisionsPassthroughConflict) {
+		t.Fatalf("update stored vllm_sr: %v, want conflict", err)
+	}
+
+	vllm, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8332, Scheme: "http", DecisionsMode: "passthrough",
+	})
+	if err != nil {
+		t.Fatalf("create vllm: %v", err)
+	}
+	retyped, err := svc.UpdateApplication(ctx, ownerToken(), vllm.ID, UpdateApplicationRequest{Type: strPtr(routing.ProviderVllmSR)})
+	if err != nil || retyped.DecisionsMode != "auto" {
+		t.Fatalf("retype = %+v, %v; want decisions_mode auto", retyped, err)
+	}
+}
+
+func TestRuntimeSpecVllmSR(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("sr1"), PutRuntimeSpecRequest{
+		Binary: "/opt/vllm-sr/.venv/bin/vllm-srun", Type: "vllm_sr", DecisionsMode: "passthrough",
+	}); !errors.Is(err, ErrRuntimeSpecDecisionsPassthroughUnsupported) {
+		t.Fatalf("explicit vllm_sr passthrough: %v", err)
+	}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("sr2"), PutRuntimeSpecRequest{
+		Binary: "/opt/vllm-sr/.venv/bin/vllm-srun", DecisionsMode: "passthrough",
+	}); !errors.Is(err, ErrRuntimeSpecDecisionsPassthroughUnsupported) {
+		t.Fatalf("detected vllm_sr passthrough: %v", err)
+	}
+	dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("sr3"), PutRuntimeSpecRequest{
+		Binary: "/opt/vllm-sr/.venv/bin/vllm-srun", Type: "vllm_sr",
+	})
+	if err != nil || dto.Type != "vllm_sr" {
+		t.Fatalf("vllm_sr spec = %+v, %v", dto, err)
+	}
+}
