@@ -216,11 +216,12 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     healthCheckPath: '/health',
     apiFlavors: ['openai_audio'],
   },
-  // vLLM Semantic Router in Engine mode (operator-run): it answers
-  // POST /v1/systemone only, so the decisions flavor replaces the text pair and
-  // both coding-agent endpoints are 'disabled'. Models are listed at
+  // vLLM Semantic Router in Engine mode (operator-run): the gateway routes only
+  // the decision endpoints to it, so the decisions flavor replaces the text pair
+  // and both coding-agent endpoints are 'disabled'. Models are listed at
   // GET /v1/systemone/models (OpenAI shape), which doubles as the health probe
-  // because /health lives on the container's management port. The backend
+  // because /health lives on the container's management port, and as the
+  // loaded-models listing: on an Engine listener a granted model is loaded. The backend
   // timeout default is 600000 (a routed request can run long). Port 8899 is the
   // listener's conventional port.
   vllm_sr: {

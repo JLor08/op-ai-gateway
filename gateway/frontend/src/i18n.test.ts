@@ -4683,4 +4683,23 @@ describe('vllm_sr i18n keys', () => {
       expect(note).toContain('4ec449f358ce7805228fb341bdc55ea5211707fd');
     }
   });
+
+  it('tells the spec note that the parent server_agent application lists decisions too', () => {
+    expect(messages.de.runtimeSpecTypeVllmSrNote).toContain(
+      'an der übergeordneten server_agent-Anwendung muss „decisions“ ebenfalls angekreuzt sein',
+    );
+    expect(messages.en.runtimeSpecTypeVllmSrNote).toContain(
+      'the parent server_agent application needs "decisions" ticked too',
+    );
+  });
+
+  it('tells the application note how to re-probe a model granted after a not-published verdict', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].applicationTypeVllmSrNote;
+      expect(note).toContain('404 systemone_not_published');
+      expect(note).toContain('decision: no');
+    }
+    expect(messages.de.applicationTypeVllmSrNote).toContain('das Urteil im Portal löschen');
+    expect(messages.en.applicationTypeVllmSrNote).toContain('clear the verdict in the portal');
+  });
 });
