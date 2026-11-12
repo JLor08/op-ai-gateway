@@ -10,7 +10,7 @@ Let the server agent manage a model server that runs as a **Docker container**, 
 - show its stdout/stderr as the runtime log;
 - and **charge its RAM and VRAM to that container**, so that admission and co-residency keep working.
 
-This is the second execution mode, beside the WSL2 mode in #TBD. Both share the same `execution` seam in the runtime spec. Docker matters because many engines ship as images first: vLLM, SGLang, and sglang-omni, whose documented route is Docker. Docker also brings the same workloads to Linux hosts without a Python environment per engine.
+This is the second execution mode, beside the WSL2 mode in #381. Both share the same `execution` seam in the runtime spec. Docker matters because many engines ship as images first: vLLM, SGLang, and sglang-omni, whose documented route is Docker. Docker also brings the same workloads to Linux hosts without a Python environment per engine.
 
 As in the WSL2 issue, **the resource accounting is the point**: a container that starts and stops but is charged too little RAM or VRAM breaks admission (§5.2). That outcome counts as failure even if everything else works.
 
@@ -47,9 +47,9 @@ All facts were checked on 2026-11-12 against primary sources.
 | | Native Linux (Docker Engine, NVIDIA Container Toolkit) | Docker Desktop on Windows (WSL2 backend) | Docker Engine inside a WSL2 distro | macOS (Docker Desktop, colima, OrbStack) |
 |---|---|---|---|---|
 | GPU access | `--gpus device=<uuid,…>` or CDI `--device nvidia.com/gpu=…` ([toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html)) | `--gpus=all` only ([Docker GPU](https://docs.docker.com/desktop/features/gpu/); NVIDIA WSL guide: "only `--gpus all` is supported") | `--gpus all` only | **none**: "there is no GPU passthrough for Metal in containers" ([Docker blog](https://www.docker.com/blog/docker-model-runner-vllm-metal-macos/)); only experimental Vulkan via libkrun/krunkit |
-| Per-container VRAM | **exact**: host `nvidia-smi --query-compute-apps` reports host PIDs, which the container's cgroup (`cgroup.procs`) maps to the container. NVML inside a container sees nothing without `--pid=host` ([toolkit FAQ](https://nvidia.github.io/container-wiki/toolkit/faq.html)) | **none per container**: NVML has no "active compute process" in WSL ([CUDA on WSL](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)). On the host, all VM GPU memory is charged to the VM worker process `vmwp`, with one same-named PDH instance per guest GPU process (measured in #TBD, Phase 0) | same as Docker Desktop | n/a |
+| Per-container VRAM | **exact**: host `nvidia-smi --query-compute-apps` reports host PIDs, which the container's cgroup (`cgroup.procs`) maps to the container. NVML inside a container sees nothing without `--pid=host` ([toolkit FAQ](https://nvidia.github.io/container-wiki/toolkit/faq.html)) | **none per container**: NVML has no "active compute process" in WSL ([CUDA on WSL](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)). On the host, all VM GPU memory is charged to the VM worker process `vmwp`, with one same-named PDH instance per guest GPU process (measured in #381, Phase 0) | same as Docker Desktop | n/a |
 | Per-container RAM | cgroup v2 `memory.current` and `memory.stat`; `docker stats` subtracts `inactive_file` ([docker stats](https://docs.docker.com/reference/cli/docker/container/stats/), [kernel](https://docs.kernel.org/admin-guide/cgroup-v2.html)) | same, inside the VM. The VM is capped by `.wslconfig` (50 % of RAM by default) | same | same, inside the VM |
-| Constraints | daemon access is root-equivalent ("the `docker` group grants root-level privileges", [post-install](https://docs.docker.com/engine/install/linux-postinstall/)); rootless Docker and Podman exist | "not supported on server versions of Windows"; `docker-users` is "equivalent to granting administrative privileges"; paid above 250 employees or USD 10M revenue ([install](https://docs.docker.com/desktop/setup/install/windows-install/)); needs a logged-in user (open request, [roadmap#515](https://github.com/docker/roadmap/issues/515)) | the WSL per-user and Session 0 constraints of #TBD | CPU-only for the CUDA images |
+| Constraints | daemon access is root-equivalent ("the `docker` group grants root-level privileges", [post-install](https://docs.docker.com/engine/install/linux-postinstall/)); rootless Docker and Podman exist | "not supported on server versions of Windows"; `docker-users` is "equivalent to granting administrative privileges"; paid above 250 employees or USD 10M revenue ([install](https://docs.docker.com/desktop/setup/install/windows-install/)); needs a logged-in user (open request, [roadmap#515](https://github.com/docker/roadmap/issues/515)) | the WSL per-user and Session 0 constraints of #381 | CPU-only for the CUDA images |
 
 - **VRAM demand that can be declared rather than measured:**
   - vLLM `--gpu-memory-utilization` is "a per-instance limit". Its default has changed between versions (0.9 → 0.92 → 1.0 with the extensible KV cache, per the latest docs), so it is predictable only when it is set explicitly ([engine args](https://docs.vllm.ai/en/latest/configuration/engine_args.html)).
@@ -64,7 +64,7 @@ All facts were checked on 2026-11-12 against primary sources.
   - the router (§4).
 - **Admission never under-charges a container.**
   - On native Linux with NVIDIA, VRAM is measured per container, exactly.
-  - Where Docker runs in a VM (Windows, macOS), VRAM follows the VM-level attribution of #TBD, and RAM is measured per container in both cases.
+  - Where Docker runs in a VM (Windows, macOS), VRAM follows the VM-level attribution of #381, and RAM is measured per container in both cases.
 - A graceful stop reaches the container's whole process tree. No container survives a stop, an agent restart or an agent crash unaccounted for: an orphan sweep runs on every start.
 - Logs and the resolved command work as for a native child (§14).
 - The agent-local policy stays the authority (ADR-024): an image allowlist, a mount allowlist, and no free-form Docker flags.
@@ -81,7 +81,7 @@ All facts were checked on 2026-11-12 against primary sources.
 
 ### Spec shape
 
-The same optional `execution` object as #TBD, with a `docker` variant:
+The same optional `execution` object as #381, with a `docker` variant:
 
 ```json
 {
@@ -154,9 +154,9 @@ The measurement source for a `docker` instance is its **container**, never the C
 
 - **RAM:** `memory.current − inactive_file` of the container's cgroup, the `docker stats` definition and the same one WSL mode uses. One `docker stats --no-stream` call (or one cgroup read on native Linux) per beat covers all containers, off the owner goroutine, under the measurer deadline.
   - Native Linux: the host pool (rule 6) is unchanged, because container memory is host memory.
-  - Docker in a VM: also charge the VM pool of #TBD.
+  - Docker in a VM: also charge the VM pool of #381.
 - **VRAM, native Linux:** each instance gets the **set** of host PIDs in its container's cgroup (`cgroup.procs`). The existing compute-apps measurer sums the usage of that set per GPU. This is exact, and it includes vLLM's engine worker processes. Today a native child counts only its own PID (§13).
-- **VRAM, Docker in a VM (Windows, macOS):** the VM-level attribution of #TBD, with start deltas under a per-VM start interlock and the remainder charged as occupied. Docker Desktop's containers and WSL workloads of the same Windows user share **one** VM, so they share one attribution domain. On macOS there is no GPU.
+- **VRAM, Docker in a VM (Windows, macOS):** the VM-level attribution of #381, with start deltas under a per-VM start interlock and the remainder charged as occupied. Docker Desktop's containers and WSL workloads of the same Windows user share **one** VM, so they share one attribution domain. On macOS there is no GPU.
   - Until that attribution exists, a Docker-in-VM spec must be denied the one-shot VRAM bootstrap eviction (ADR-086). Today that grant is host-wide (`vramBootstrapEligible`, `server-agent/internal/runtime/manager.go:2719-2721`), and a Windows NVIDIA host has a measurer. This is the same per-spec "measurable" condition the WSL2 issue adds.
 
 ### Logs
@@ -204,12 +204,12 @@ The measurement source for a `docker` instance is its **container**, never the C
 
 ## Architecture touched
 
-- `agent-runtime-manager.md`: §3 (authority, local policy), §4 (router), §5.1–5.4 (measurement, pools), §6 (lifecycle), §13 (limitations), §14 (logs), plus the new execution-mode section shared with #TBD.
-- ADRs: ADR-024 (authority, plus the root-equivalence acceptance), ADR-025, ADR-031 (Phase 2), ADR-083–086, ADR-090, ADR-095, plus the execution-mode ADR from #TBD.
+- `agent-runtime-manager.md`: §3 (authority, local policy), §4 (router), §5.1–5.4 (measurement, pools), §6 (lifecycle), §13 (limitations), §14 (logs), plus the new execution-mode section shared with #381.
+- ADRs: ADR-024 (authority, plus the root-equivalence acceptance), ADR-025, ADR-031 (Phase 2), ADR-083–086, ADR-090, ADR-095, plus the execution-mode ADR from #381.
 - `11-risks-and-technical-debt.md` §11.4 (daemon access is root-equivalent).
 - `server-agent/README.md`.
 
 ## Related
 
-- #TBD: WSL2 execution mode on Windows (same seam; owns the VM-level VRAM attribution that Phase 2 reuses).
+- #381: WSL2 execution mode on Windows (same seam; owns the VM-level VRAM attribution that Phase 2 reuses).
 - #373 / PR #376: decision endpoints. vLLM is their first runtime, and its official image makes Docker the quickest way to run it on Linux hosts.

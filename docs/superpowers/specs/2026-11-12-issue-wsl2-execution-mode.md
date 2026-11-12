@@ -10,7 +10,7 @@ Let the server agent on a **Windows** AI server manage a model server that runs 
 - show its stdout/stderr as the runtime log;
 - and, above all, **charge its RAM and VRAM to that workload**, so that admission and co-residency keep working when several models share a host.
 
-This adds an **execution mode** to the runtime spec: `native` (today, the default) and `wsl`. A Docker mode for every host OS is a separate issue (#TBD). It builds on the same seam.
+This adds an **execution mode** to the runtime spec: `native` (today, the default) and `wsl`. A Docker mode for every host OS is a separate issue (#382). It builds on the same seam.
 
 **The resource accounting is the point of this feature, not a nice-to-have.** A WSL workload that starts and stops cleanly but is charged too little RAM or VRAM breaks the arithmetic that admission (§5.2) depends on. Two co-resident models can then reach an OOM. That outcome counts as failure even if everything else works.
 
@@ -153,7 +153,7 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
 
 ## Non-goals
 
-- Docker. It gets its own issue (#TBD), which reuses the execution-mode seam.
+- Docker. It gets its own issue (#382), which reuses the execution-mode seam.
 - WSL1, and Windows Server hosts. Server 2022/2025 is untested here; NVIDIA's WSL guide lists only Windows 10 21H2+ and Windows 11. Server can follow once someone verifies it.
 - Installing or configuring WSL, distros, `.wslconfig` or the engines. That stays the operator's job, documented in the README.
 - WebSocket endpoints such as sglang-omni's `/v1/realtime`. The router does not upgrade protocols (§4.5).
@@ -364,4 +364,4 @@ The owner ran Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, th
 ## Related
 
 - #373 / PR #376: decision endpoints. vLLM is their first runtime, and a WSL-managed vLLM brings them to Windows AI servers.
-- #TBD: Docker execution mode for all host OSes (same seam; native Linux Docker can measure VRAM per container exactly).
+- #382: Docker execution mode for all host OSes (same seam; native Linux Docker can measure VRAM per container exactly).
