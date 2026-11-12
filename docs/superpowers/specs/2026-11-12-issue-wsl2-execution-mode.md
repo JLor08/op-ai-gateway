@@ -76,6 +76,14 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
     - That adapter's `GPU Adapter Memory` total (13084 MiB) matched `nvidia-smi`'s `memory.used` for GPU index 0 (13077 MiB).
     - 12318 MiB is close to half of a 24 GB card, as the setting predicts.
     - The third-party report is therefore right about the process name. Its remark about differing LUIDs does not apply to the host-side PDH instances.
+  - **Measured (Phase 0, B2, same host):** a second vLLM started with `--gpu-memory-utilization 0.3` on the same card.
+    - The adapter total rose from 13084 to 20662 MiB (+7578, against about 7.4 GB predicted), and `nvidia-smi` agreed (20654 MiB).
+    - After the second server stopped, the total fell to 13221 MiB.
+    - **The adapter level is additive and reversible.**
+    - While both servers ran, the WMI view of `vmwp` (`Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory`) showed **7432 MiB, not 19750**. After the stop it showed 12318 MiB again.
+    - The reading that fits these numbers, still to be confirmed: there is **one PDH instance per guest GPU process**, all named after `vmwp`'s PID, and WMI keys on the name and so shows only one of them. This would match the GPU-PV doc's "a DXGPROCESS for every process in a guest VM".
+    - The agent reads PDH through `PdhGetFormattedCounterArrayW`, keeps same-named instances, and sums them by (pid, adapter) (`server-agent/internal/collector/nvidia_pdh_windows.go:526-528`). If the reading holds, the agent sees the full VM total.
+    - **Two consequences:** the measurement must use the PDH array API and **never** WMI. And if each instance really is one guest process, each instance's value is a per-workload figure, which could make attribution direct rather than delta-based (open question 9). B2b checks this with the same API calls the agent makes.
 - **The engines reserve their VRAM up front, as a configurable fraction of the card:**
   - vLLM `--gpu-memory-utilization`: "a per-instance limit". Its default has moved between versions (0.9 → 0.92; the latest docs say 1.0 with the extensible KV cache). So it is a predictable number only when it is set explicitly ([engine args](https://docs.vllm.ai/en/latest/configuration/engine_args.html)).
   - SGLang `--mem-fraction-static`: weights plus the KV pool. sglang-omni accepts it for every engine stage ([config](https://sgl-project.github.io/sglang-omni/developer_reference/config.html)).
@@ -261,7 +269,8 @@ The drain grace (10 s) and kill grace (5 s) carry over unchanged. The generation
 **Phase 0: verify on a real Windows 11 host. No product code.**
 The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, the same host class as ADR-031's measurement. Each result is recorded in this issue before Phase 1 starts, together with the Windows build, the WSL version (`wsl --version`), the GPU count and the driver version. The Phase 1 and Phase 2 acceptance runs use the same host, because CI has no Windows job (§11.3).
 - **B1** ✅ Which host process holds the VM's GPU memory, per adapter, and do its LUIDs resolve? Answer: `vmwp`, carrying the host's adapter LUIDs (see "GPU and VRAM").
-- **B2** Is the VM's per-GPU figure additive across two vLLM starts, and does it fall when one stops?
+- **B2** ✅ (adapter level) Is the VM's per-GPU figure additive across two vLLM starts, and does it fall when one stops? Answer: yes. WMI collapses same-named instances (see "GPU and VRAM").
+- **B2b** Read through the PDH array API (`PdhAddEnglishCounterW` plus `PdhGetFormattedCounterArrayW`, as the agent does): with two WSL GPU processes, does `vmwp` appear as two same-named instances whose values match each process?
 - **B3** Multi-GPU: do the GPU indices and PCI bus IDs inside WSL match the host, and does `CUDA_VISIBLE_DEVICES` select the intended card?
 - **B4** Does `wsl.exe` work from an NSSM service running as the distro-owning user (Session 0) on Windows 11 Pro?
 - **B5** What happens to vLLM, and to its VRAM, when `wsl.exe` is killed?
@@ -303,6 +312,7 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 6. **Config files on hosts with automount disabled.** Write them into the distro through a fixed `wsl.exe --exec` helper instead of `/mnt/c`?
 7. **Host facts upward.** Should the agent report its WSL facts upward so the portal can display them: the VM's `MemTotal`, and whether WSL works for the service account? It must not list the allowlists, for the same reason the work-dir allowlist is never listed (§3.1).
 8. **Exit cause after the scope is gone.** A transient scope is removed once its last process exits, so a counter read at exit time may already be gone. Which record survives long enough to tell an OOM kill or a SIGKILL from `exit(9)`: the last per-beat `memory.events` reading, systemd's unit result, or the VM kernel log? To be settled in Phase 1, with B6 as the testbed.
+9. **Per-instance attribution.** If B2b confirms one PDH instance per guest GPU process, can the agent tie an instance to a workload? Same-named instances carry no identity, so it would have to be by appearance: a new instance shows up while the workload's start window is open. Does the order of the PDH array stay stable across samples? If it does, start deltas become a fallback, not the primary mechanism.
 
 ## Architecture touched
 
