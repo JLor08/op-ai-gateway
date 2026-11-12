@@ -70,7 +70,12 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
   - Microsoft's GPU-paravirtualization driver doc says "Each VM DXG process belongs to the same EPROCESS as the VM worker process" ([GPU-PV](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/gpu-paravirtualization)), and identifies that process as `vmmem`.
   - A third-party tool that measured it on driver 610.88 found the memory charged to `vmwp.exe`. It also reports that WSL's adapter LUIDs differ from the host's ([shanselman/gputaskman](https://github.com/shanselman/gputaskman)).
   - Both sources agree on the consequence: **one host PID, per adapter, for every Linux process in the VM.** Neither documents a per-Linux-process split.
-  - **Unverified:** which PID it is on our hosts, and whether its LUIDs resolve through the existing D3DKMT bridge (ADR-031). Phase 0, B1.
+  - **Measured (Phase 0, B1, 2026-11-12):** on a Windows 11 Pro host with three NVIDIA GPUs, vLLM ran in WSL with `--gpu-memory-utilization 0.5` on a 24 GB card.
+    - The WSL GPU memory appeared on **`vmwp`**, not `vmmem`: 12318 MiB on one adapter, and an instance with 0 MiB on each of the other two.
+    - Its PDH instances carry the **same adapter LUIDs as ordinary host processes** such as `dwm`. So the existing LUID → PCI → index bridge (ADR-031) applies to it unchanged.
+    - That adapter's `GPU Adapter Memory` total (13084 MiB) matched `nvidia-smi`'s `memory.used` for GPU index 0 (13077 MiB).
+    - 12318 MiB is close to half of a 24 GB card, as the setting predicts.
+    - The third-party report is therefore right about the process name. Its remark about differing LUIDs does not apply to the host-side PDH instances.
 - **The engines reserve their VRAM up front, as a configurable fraction of the card:**
   - vLLM `--gpu-memory-utilization`: "a per-instance limit". Its default has moved between versions (0.9 → 0.92; the latest docs say 1.0 with the extensible KV cache). So it is a predictable number only when it is set explicitly ([engine args](https://docs.vllm.ai/en/latest/configuration/engine_args.html)).
   - SGLang `--mem-fraction-static`: weights plus the KV pool. sglang-omni accepts it for every engine stage ([config](https://sgl-project.github.io/sglang-omni/developer_reference/config.html)).
@@ -210,7 +215,7 @@ The drain grace (10 s) and kill grace (5 s) carry over unchanged. The generation
 - The cold-start bootstrap (ADR-086) works unchanged once a real measurement exists.
 
 **VRAM (Phase 2).**
-- **Source:** PDH `\GPU Process Memory(*)\Dedicated Usage` of the **VM process**, summed per adapter and mapped to the GPU index through the existing LUID → PCI → index bridge (ADR-031). Phase 0 confirms which process it is and whether its LUIDs resolve.
+- **Source:** PDH `\GPU Process Memory(*)\Dedicated Usage` of the WSL VM's worker process (`vmwp`, measured in B1), summed per adapter and mapped to the GPU index through the existing LUID → PCI → index bridge (ADR-031). B1 showed that its LUIDs are the host's.
 - **Attribution:**
   - **One WSL workload** using a GPU: the VM's figure on that GPU is that workload's figure. This is exact, apart from any non-agent GPU use inside the VM.
   - **Several:** each workload's figure is its **start delta** per GPU, the VM's figure once the instance has settled after its first passing health probe minus the figure just before exec.
@@ -255,7 +260,7 @@ The drain grace (10 s) and kill grace (5 s) carry over unchanged. The generation
 
 **Phase 0: verify on a real Windows 11 host. No product code.**
 The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, the same host class as ADR-031's measurement. Each result is recorded in this issue before Phase 1 starts, together with the Windows build, the WSL version (`wsl --version`), the GPU count and the driver version. The Phase 1 and Phase 2 acceptance runs use the same host, because CI has no Windows job (§11.3).
-- **B1** Which host process holds the VM's GPU memory, per adapter, and do its LUIDs resolve through D3DKMT?
+- **B1** ✅ Which host process holds the VM's GPU memory, per adapter, and do its LUIDs resolve? Answer: `vmwp`, carrying the host's adapter LUIDs (see "GPU and VRAM").
 - **B2** Is the VM's per-GPU figure additive across two vLLM starts, and does it fall when one stops?
 - **B3** Multi-GPU: do the GPU indices and PCI bus IDs inside WSL match the host, and does `CUDA_VISIBLE_DEVICES` select the intended card?
 - **B4** Does `wsl.exe` work from an NSSM service running as the distro-owning user (Session 0) on Windows 11 Pro?
@@ -290,8 +295,8 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 
 ## Open questions
 
-1. **VM process identity.** `vmmem` per Microsoft, `vmwp.exe` per a third-party measurement. How does the agent find it robustly (name, parentage, or the PDH instance that grows with a WSL start)? Answered by B1.
-2. **LUIDs.** Do the VM process's PDH instances carry the host adapter LUIDs that D3DKMT resolves, or different ones? Answered by B1.
+1. **Which `vmwp`.** B1 showed that the WSL VM's GPU memory sits on a `vmwp` process. Every Hyper-V VM has its own `vmwp`, though, so a host that also runs other VMs with GPU partitioning has several. How does the agent pick the WSL VM's worker reliably? Candidates: the VM's identity (the `NT VIRTUAL MACHINE\<VM GUID>` account, matched against WSL's utility VM), or the `vmwp` whose usage grows when a WSL start is observed. On a host without other GPU VMs there is only one, which is the case Phase 2 must handle first.
+2. *(answered by B1: the LUIDs are the host's.)*
 3. **Settle criterion for the start delta.** A fixed time after the first passing health probe, or two equal beats? vLLM captures CUDA graphs before it reports healthy, so the delta is probably stable at that point (unverified).
 4. **Session 0.** If B4 fails, is a per-user helper acceptable, or should WSL mode require an interactive logon?
 5. **User systemd scope versus a shim.** If `systemd-run --user` is unavailable or unreliable in WSL, should a tiny root-free Linux shim, cross-built from `server-agent`, own the process group and signal forwarding (SIGHUP → SIGTERM with grace) instead? Per-workload RAM would then come from the sum of PSS over the group instead of a cgroup.
