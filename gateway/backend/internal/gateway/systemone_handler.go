@@ -217,7 +217,7 @@ func (s *Server) resolveDecisionsTarget(w http.ResponseWriter, r *http.Request, 
 		slog.Debug("decisions request rejected: resolved target's effective flavors exclude decisions",
 			"path", r.URL.Path, "api_flavor", c.req.APIFlavor, "model", c.req.Model,
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
-		s.recordDecisionsRoutingFailure(w, r, *c, routing.Target{}, routing.ErrNoModelRoute)
+		s.recordDecisionsRoutingFailure(w, r, *c, target, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
 	return target, true

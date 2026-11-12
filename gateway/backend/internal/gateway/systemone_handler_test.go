@@ -378,9 +378,12 @@ func TestSystemOneRefusesAServerAgentChildWhoseSpecExcludesDecisions(t *testing.
 	if len(events) != 1 || events[0].ErrorCode != "routing.no_model_route" {
 		t.Fatalf("usage events = %+v, want one routing.no_model_route error", events)
 	}
-	if got := events[0]; got.Host != "" || got.RouteID != "" || got.ProviderPath != "" || got.ReqPath != "/v1/systemone" || got.HTTPStatus != http.StatusNotFound {
+	if got := events[0]; got.ReqPath != "/v1/systemone" || got.HTTPStatus != http.StatusNotFound {
 		t.Fatalf("usage row = %+v, want an upstream-less 404 row on /v1/systemone", got)
 	}
+	// The target was resolved before the spec's flavors refused it, so the row
+	// carries it.
+	requireRefusalAttributedTo(t, events[0], "srv-agent-sys", "route-agent-sys")
 }
 
 // The positive control of the test above: the same fixture with a spec listing
