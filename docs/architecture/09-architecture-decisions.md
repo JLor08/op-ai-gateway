@@ -12047,9 +12047,10 @@ operator can read, never a guess. The contract was checked against openai-python
   non-2xx is relayed verbatim. A translated answer is **read whole**, bounded by `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`.
 - **(g) Confidence normalization is a per-token, ungated opt-in** (`decisions_confidence_normalize`, migration 108, portal
   and service tokens). For an opted-in token, on **both** endpoints and in **every** mode, the gateway recomputes
-  `confidence = max(p) / Σp` on each choice and score answer that carries a `type` and usable probabilities. Only an
-  opted-in token's answers take the buffered parse-and-rewrite path (and a non-JSON 2xx is relayed unchanged); every other
-  token keeps the streaming relay **byte for byte**.
+  `confidence = max(p) / Σp` on each choice and score answer that carries a `type` and usable probabilities. On a passthrough
+  `/v1/decisions` relay and on `/v1/systemone`, only an opted-in token's answers take the buffered parse-and-rewrite path
+  (and a non-JSON 2xx is relayed unchanged); every other token keeps the streaming relay **byte for byte** there. A
+  translated `/v1/decisions` request is always buffered, whatever the token (f).
 - **(h) Usage is metered from what each route sees.** A translate records the System One tokens it read before the
   translation; a passthrough reads the Responses-shaped `usage` of the answer (streaming copier or buffered) and records
   `input_tokens_details.cached_tokens` and `cache_write_tokens` as the cached and cache-write columns.

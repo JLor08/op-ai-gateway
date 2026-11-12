@@ -1445,9 +1445,10 @@ and never changes a request, only the `confidence` of the answer: for every **ch
 `confidence = max(p) / Σp`; predicate answers, answers without usable probabilities and
 every other field are left as the model sent them, and a 2xx body that is not JSON is
 relayed unchanged. It applies to both decision endpoints and every mode (translate, passthrough,
-and the System One relay). Only an opted-in token's answers are read whole (bounded by
-`OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`) instead of streamed; every other token's relay
-is byte for byte as before ([Compatibility & Inference
+and the System One relay). On a passthrough `/v1/decisions` relay and on `/v1/systemone`, only an opted-in token's
+answers are read whole (bounded by `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`) instead of
+streamed, and every other token's relay is byte for byte as before; a translated
+`/v1/decisions` request is always read whole, whatever the token ([Compatibility & Inference
 §3.10](../cross-cutting/compatibility-and-inference.md#310-openai-decisions) item 8).
 
 #### RPC clusters

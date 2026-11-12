@@ -856,7 +856,14 @@ paths:
         upstream `/v1/systemone` with `model` rewritten to the mapping's own
         model name and the rest of the body carried value for value; the
         upstream's status and body come back verbatim, a non-2xx one
-        included (recorded as `upstream.<status>`). Metered in tokens from
+        included (recorded as `upstream.<status>`), except that a token with
+        the `decisions_confidence_normalize` flag gets the `confidence` of
+        every choice and score answer recomputed as max(p)/sum(p) in a 2xx
+        JSON body (a non-2xx or non-JSON body is still relayed as sent).
+        A resolved agent-launched model whose runtime spec has
+        `systemone_mode` `disabled` is 404 `systemone.endpoint_disabled`; for
+        such a token a 502 `systemone.upstream_error` answers an upstream body
+        that is over the buffer bound or broken off. Metered in tokens from
         the answer's `usage.input_tokens` and `usage.output_tokens`. Never
         routed to a vendor account. Beyond those it answers the same
         statuses as every other inference path (429/402 from the principal
@@ -869,13 +876,19 @@ paths:
             schema: { $ref: '#/components/schemas/SystemOneRequest' }
       responses:
         '200':
-          description: The upstream's own answer, relayed verbatim.
+          description: The upstream's own answer, relayed verbatim (the `confidence` values rewritten for a token with `decisions_confidence_normalize`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SystemOneResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: >
+            The Error envelope: `routing.no_model_route`, `routing.model_not_capable`,
+            `server_override.model_unavailable` or `systemone.endpoint_disabled`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '413':
           description: The Error envelope with code `request.body_too_large`.
           content:
@@ -965,6 +978,11 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '502':
+          description: The Error envelope with code `systemone.upstream_error`; only for a token with `decisions_confidence_normalize` whose upstream answer is over the buffer bound or broken off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /v1/systemone/models:
     get:
       tags: [inference]

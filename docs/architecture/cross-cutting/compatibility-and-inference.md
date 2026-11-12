@@ -1898,7 +1898,7 @@ endpoints and in **every** mode, so a client gets one comparable figure whatever
 predicate answers, answers without usable probabilities and every other field are left
 value for value. It reads the OpenAI shape (`answers` an array) on `/v1/decisions`, the
 System One shape (`answers` an object) on `/v1/systemone`, on the translate route after
-the translation. Only an opted-in token takes the buffered path (item 7); a **2xx body
+the translation. On a **passthrough** `/v1/decisions` relay and on `/v1/systemone`, only an opted-in token takes the buffered path (item 7; a translated `/v1/decisions` request is always buffered, whatever the token); a **2xx body
 that is not JSON is relayed unchanged** under the upstream's `Content-Type`, and a
 non-2xx is relayed as the copier would.
 

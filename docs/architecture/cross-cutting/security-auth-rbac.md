@@ -286,9 +286,10 @@ and no `principalMayManageTokenSetting` check applies. The difference from the e
 is what it touches: the effort flag changes **what the gateway sends to the upstream**, this
 one changes only **a number in the answer the token's own client receives** (the request
 reaches the model unchanged), so it confers no reach and no cost that the token did not
-already have. Its one operational effect is that the token's decision answers are buffered
-rather than streamed (bounded by `OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`), a memory
-cost borne per in-flight request of an opted-in token. A run-as token carries the setting
+already have. Its one operational effect is that the token's passthrough `/v1/decisions` and
+`/v1/systemone` answers are buffered rather than streamed (bounded by
+`OP_AI_GATEWAY_MAX_DECISIONS_BODY_BYTES`), a memory cost borne per in-flight request of
+an opted-in token (a translated `/v1/decisions` answer is buffered for every token). A run-as token carries the setting
 onto the run (`AuthorizeRunAsToken` copies the field); the portal session principal itself
 never has it.
 
