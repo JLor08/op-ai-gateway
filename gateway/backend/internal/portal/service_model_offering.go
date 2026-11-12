@@ -435,7 +435,7 @@ func capabilityFlagsByName(capability string, views []mappingView, capsByMapping
 	case routing.CapabilityTranscription:
 		return transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
 	case routing.CapabilityDecision:
-		return decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
+		return decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 	case routing.CapabilityDecisionOpenAI:
 		return decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 	case routing.CapabilityAnyDecision:

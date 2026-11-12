@@ -29,8 +29,13 @@ func TestCreateApplicationDecisionModesDefaultAndValidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if dto.DecisionsMode != "auto" || dto.SystemOneMode != "passthrough" {
-		t.Fatalf("defaults = %q/%q, want auto/passthrough", dto.DecisionsMode, dto.SystemOneMode)
+	if dto.DecisionsMode != "auto" || dto.SystemOneMode != "auto" {
+		t.Fatalf("defaults = %q/%q, want auto/auto", dto.DecisionsMode, dto.SystemOneMode)
+	}
+	// vllm_sr defaults to auto too (auto behaves like passthrough there).
+	sr, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{Type: routing.ProviderVllmSR, Port: 8302, Scheme: "http"})
+	if err != nil || sr.SystemOneMode != "auto" {
+		t.Fatalf("vllm_sr default = %+v, %v", sr, err)
 	}
 	dto, err = svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
 		Type: routing.ProviderVLLM, Port: 8301, Scheme: "http", DecisionsMode: "auto", SystemOneMode: "disabled",
@@ -38,13 +43,21 @@ func TestCreateApplicationDecisionModesDefaultAndValidate(t *testing.T) {
 	if err != nil || dto.DecisionsMode != "auto" || dto.SystemOneMode != "disabled" {
 		t.Fatalf("explicit = %+v, %v", dto, err)
 	}
+	for _, mode := range []string{"auto", "passthrough", "translate"} {
+		port := 8340 + len(mode)
+		dto, err = svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+			Type: routing.ProviderVLLM, Port: port, Scheme: "http", SystemOneMode: mode,
+		})
+		if err != nil || dto.SystemOneMode != mode {
+			t.Fatalf("systemone_mode %s = %+v, %v", mode, dto, err)
+		}
+	}
 
 	for name, req := range map[string]CreateApplicationRequest{
-		"responses auto":      {ResponsesMode: "auto"},
-		"messages auto":       {MessagesMode: "auto"},
-		"systemone translate": {SystemOneMode: "translate"},
-		"systemone auto":      {SystemOneMode: "auto"},
-		"decisions bogus":     {DecisionsMode: "bogus"},
+		"responses auto":  {ResponsesMode: "auto"},
+		"messages auto":   {MessagesMode: "auto"},
+		"systemone bogus": {SystemOneMode: "bogus"},
+		"decisions bogus": {DecisionsMode: "bogus"},
 	} {
 		req.Type, req.Port, req.Scheme = routing.ProviderVLLM, 8310, "http"
 		if _, err := svc.CreateApplication(ctx, ownerToken(), serverID, req); !errors.Is(err, ErrApplicationEndpointModeInvalid) {
@@ -124,10 +137,10 @@ func TestUpdateApplicationDecisionModesKeepAndValidate(t *testing.T) {
 		t.Fatalf("kept = %q/%q", kept.DecisionsMode, kept.SystemOneMode)
 	}
 	for name, req := range map[string]UpdateApplicationRequest{
-		"empty decisions":     {DecisionsMode: strPtr("")},
-		"systemone translate": {SystemOneMode: strPtr("translate")},
-		"systemone auto":      {SystemOneMode: strPtr("auto")},
-		"responses auto":      {ResponsesMode: strPtr("auto")},
+		"empty decisions": {DecisionsMode: strPtr("")},
+		"empty systemone": {SystemOneMode: strPtr("")},
+		"systemone bogus": {SystemOneMode: strPtr("bogus")},
+		"responses auto":  {ResponsesMode: strPtr("auto")},
 	} {
 		if _, err := svc.UpdateApplication(ctx, ownerToken(), app.ID, req); !errors.Is(err, ErrApplicationEndpointModeInvalid) {
 			t.Errorf("%s: err = %v", name, err)
@@ -149,7 +162,7 @@ func TestRuntimeSpecDecisionModes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if dto.DecisionsMode != "auto" || dto.SystemOneMode != "passthrough" {
+	if dto.DecisionsMode != "auto" || dto.SystemOneMode != "auto" {
 		t.Fatalf("defaults = %q/%q", dto.DecisionsMode, dto.SystemOneMode)
 	}
 
@@ -176,10 +189,9 @@ func TestRuntimeSpecDecisionModes(t *testing.T) {
 
 	// Invalid values.
 	for name, r := range map[string]PutRuntimeSpecRequest{
-		"decisions bogus":     {DecisionsMode: "bogus"},
-		"systemone translate": {SystemOneMode: "translate"},
-		"systemone auto":      {SystemOneMode: "auto"},
-		"responses auto":      {ResponsesMode: "auto"},
+		"decisions bogus": {DecisionsMode: "bogus"},
+		"systemone bogus": {SystemOneMode: "bogus"},
+		"responses auto":  {ResponsesMode: "auto"},
 	} {
 		r.Binary = "/usr/local/bin/vllm"
 		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), m1, r); !errors.Is(err, ErrRuntimeSpecEndpointModeInvalid) {
@@ -424,6 +436,212 @@ func TestDecisionOpenAIFoldsAreKindAware(t *testing.T) {
 		}
 		if _, capable := off.Capable[name]; capable != w {
 			t.Errorf("%s any_decision capable = %v, want %v", name, capable, w)
+		}
+	}
+}
+
+// TestApplicationSystemOneTranslateTypeGuard: systemone_mode translate needs an
+// OpenAI /v1/decisions upstream, so llama_cpp and vllm_sr refuse it like they
+// refuse a decisions passthrough (ADR-100): 400 when the request supplies the
+// type, 409 when the stored type is kept, and a retype resets a stored
+// translate to auto. A stored passthrough is kept on an unrelated update.
+func TestApplicationSystemOneTranslateTypeGuard(t *testing.T) {
+	ctx := context.Background()
+	svc, _, serverID := decisionModesFixture(t)
+	port := 8400
+	for _, kind := range []string{routing.ProviderLlamaCPP, routing.ProviderVllmSR} {
+		port += 10
+		_, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+			Type: kind, Port: port, Scheme: "http", SystemOneMode: "translate",
+		})
+		if !errors.Is(err, ErrApplicationSystemOneTranslateUnsupported) {
+			t.Fatalf("create %s translate: %v", kind, err)
+		}
+		app, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{Type: kind, Port: port + 1, Scheme: "http"})
+		if err != nil {
+			t.Fatalf("create %s: %v", kind, err)
+		}
+		if _, err = svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{SystemOneMode: strPtr("translate")}); !errors.Is(err, ErrApplicationSystemOneTranslateConflict) {
+			t.Fatalf("update stored %s: %v, want conflict", kind, err)
+		}
+		if _, err = svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{Type: strPtr(kind), SystemOneMode: strPtr("translate")}); !errors.Is(err, ErrApplicationSystemOneTranslateUnsupported) {
+			t.Fatalf("update with type %s: %v, want unsupported", kind, err)
+		}
+		got, err := svc.GetApplication(ctx, ownerToken(), app.ID)
+		if err != nil || got.SystemOneMode != "auto" {
+			t.Fatalf("after refusals: %+v, %v", got, err)
+		}
+		// Passthrough and disabled stay allowed.
+		for _, mode := range []string{"passthrough", "disabled", "auto"} {
+			if _, err = svc.UpdateApplication(ctx, ownerToken(), app.ID, UpdateApplicationRequest{SystemOneMode: strPtr(mode)}); err != nil {
+				t.Fatalf("%s %s: %v", kind, mode, err)
+			}
+		}
+	}
+
+	vllm, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8450, Scheme: "http", SystemOneMode: "translate",
+	})
+	if err != nil {
+		t.Fatalf("create vllm translate: %v", err)
+	}
+	retyped, err := svc.UpdateApplication(ctx, ownerToken(), vllm.ID, UpdateApplicationRequest{Type: strPtr(routing.ProviderVllmSR)})
+	if err != nil || retyped.SystemOneMode != "auto" {
+		t.Fatalf("retype resets translate: %+v, %v", retyped, err)
+	}
+
+	// A stored Phase 1 passthrough is kept across an unrelated update, and a
+	// retype to an incapable kind keeps it (only translate is reset).
+	legacy, err := svc.CreateApplication(ctx, ownerToken(), serverID, CreateApplicationRequest{
+		Type: routing.ProviderVLLM, Port: 8460, Scheme: "http", SystemOneMode: "passthrough",
+	})
+	if err != nil {
+		t.Fatalf("create legacy: %v", err)
+	}
+	kept, err := svc.UpdateApplication(ctx, ownerToken(), legacy.ID, UpdateApplicationRequest{Priority: intPtr(2)})
+	if err != nil || kept.SystemOneMode != "passthrough" {
+		t.Fatalf("kept = %+v, %v", kept, err)
+	}
+	kept, err = svc.UpdateApplication(ctx, ownerToken(), legacy.ID, UpdateApplicationRequest{Type: strPtr(routing.ProviderLlamaCPP)})
+	if err != nil || kept.SystemOneMode != "passthrough" {
+		t.Fatalf("retype keeps passthrough: %+v, %v", kept, err)
+	}
+}
+
+func TestRuntimeSpecSystemOneTranslateGuard(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _, newMapping := liveTimingsSpecFixture(t)
+	for name, r := range map[string]PutRuntimeSpecRequest{
+		"llama_cpp explicit": {Binary: "/x/server", Type: "llama_cpp", SystemOneMode: "translate"},
+		"llama_cpp detected": {Binary: "/usr/local/bin/llama-server", SystemOneMode: "translate"},
+		"vllm_sr explicit":   {Binary: "/x/server", Type: "vllm_sr", SystemOneMode: "translate"},
+	} {
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("s1-"+strings.ReplaceAll(name, " ", "")), r); !errors.Is(err, ErrRuntimeSpecSystemOneTranslateUnsupported) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	for _, mode := range []string{"auto", "translate", "passthrough", "disabled"} {
+		dto, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("s1-ok-"+mode), PutRuntimeSpecRequest{
+			Binary: "/usr/local/bin/vllm", Type: "vllm", SystemOneMode: mode,
+		})
+		if err != nil || dto.SystemOneMode != mode {
+			t.Errorf("vllm %s: %+v, %v", mode, dto, err)
+		}
+	}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), newMapping("s1-sr-auto"), PutRuntimeSpecRequest{
+		Binary: "/x/server", Type: "vllm_sr", SystemOneMode: "auto",
+	}); err != nil {
+		t.Fatalf("vllm_sr auto: %v", err)
+	}
+}
+
+func TestMappingDTOSystemOneRoute(t *testing.T) {
+	caps := func(names ...string) map[string]routing.CapabilityRow {
+		out := map[string]routing.CapabilityRow{}
+		for _, n := range names {
+			out[n] = routing.CapabilityRow{Capability: n, Verdict: routing.CapabilityYes}
+		}
+		return out
+	}
+	dec, oa := routing.CapabilityDecision, routing.CapabilityDecisionOpenAI
+	app := func(kind string, mode routing.EndpointMode, flavors ...string) routing.Application {
+		return routing.Application{Type: kind, APIFlavors: flavors, SystemOneMode: mode}
+	}
+	cases := []struct {
+		name string
+		app  routing.Application
+		caps map[string]routing.CapabilityRow
+		want string
+	}{
+		{"auto + decision", app("vllm", "auto", "decisions"), caps(dec, oa), "passthrough"},
+		{"auto + decision_openai only", app("vllm", "auto", "decisions"), caps(oa), "translate"},
+		{"auto no verdict", app("vllm", "auto", "decisions"), caps(), ""},
+		{"blank behaves as auto", app("vllm", "", "decisions"), caps(oa), "translate"},
+		{"passthrough with decision", app("vllm", "passthrough", "decisions"), caps(dec), "passthrough"},
+		{"passthrough without decision", app("vllm", "passthrough", "decisions"), caps(oa), ""},
+		{"translate with decision_openai", app("vllm", "translate", "decisions"), caps(oa), "translate"},
+		{"translate without decision_openai", app("vllm", "translate", "decisions"), caps(dec), ""},
+		{"disabled", app("vllm", "disabled", "decisions"), caps(dec), "disabled"},
+		{"no decisions flavor", app("vllm", "auto", "openai"), caps(dec, oa), ""},
+		{"llama_cpp ignores decision_openai", app(routing.ProviderLlamaCPP, "auto", "decisions"), caps(oa), ""},
+		{"llama_cpp stale translate", app(routing.ProviderLlamaCPP, "translate", "decisions"), caps(oa), ""},
+		{"vllm_sr auto passthrough", app(routing.ProviderVllmSR, "auto", "decisions"), caps(dec, oa), "passthrough"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dto := mappingDTO(routing.ModelMapping{ID: "m"}, tc.caps, effectiveFlavorMarkers(tc.app, routing.RuntimeSpec{}, false))
+			if dto.SystemOneRoute != tc.want {
+				t.Fatalf("systemone_route = %q, want %q", dto.SystemOneRoute, tc.want)
+			}
+		})
+	}
+	// The server_agent spec wins over the application.
+	agent := routing.Application{Type: routing.ProviderServerAgent, APIFlavors: []string{"decisions"}, SystemOneMode: "auto"}
+	spec := routing.RuntimeSpec{APIFlavors: []string{"decisions"}, SystemOneMode: "disabled"}
+	if got := mappingDTO(routing.ModelMapping{}, caps(dec), effectiveFlavorMarkers(agent, spec, true)).SystemOneRoute; got != "disabled" {
+		t.Fatalf("spec wins: %q", got)
+	}
+	raw, _ := json.Marshal(mappingDTO(routing.ModelMapping{}, nil, mappingFlavorMarkers{}))
+	if !strings.Contains(string(raw), `"systemone_route":""`) {
+		t.Fatalf("systemone_route not always on the wire: %s", raw)
+	}
+}
+
+// TestSystemOneDecisionFoldJudgesTheRoute: ModelDTO.Decision and the
+// /v1/systemone redirect's Capable follow the System One route (ADR-100). A
+// mapping with only decision_openai yes is listed under auto on a kind that can
+// take /v1/decisions and is not on llama_cpp or vllm_sr; a Phase 1 row
+// (passthrough, decision yes) is unchanged.
+func TestSystemOneDecisionFoldJudgesTheRoute(t *testing.T) {
+	rs := routing.NewMemoryStore()
+	oaOnly := []routing.CapabilityRow{{Capability: routing.CapabilityDecisionOpenAI, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: offeringTime}}
+	decOnly := []routing.CapabilityRow{{Capability: routing.CapabilityDecision, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: offeringTime}}
+	seed := func(gateway, kind string, mode routing.EndpointMode, rows []routing.CapabilityRow) {
+		t.Helper()
+		ctx := context.Background()
+		srv, appID, mapID := "srv_"+gateway, "app_"+gateway, "map_"+gateway
+		if err := rs.CreateAIServer(ctx, routing.AIServer{ID: srv, Name: srv, Domain: srv + ".test", Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+			t.Fatal(err)
+		}
+		if err := rs.CreateApplication(ctx, routing.Application{ID: appID, ServerID: srv, Type: kind, Port: 8000, Scheme: "http", APIFlavors: []string{routing.APIFlavorDecisions}, SystemOneMode: mode, DecisionsMode: routing.EndpointModeAuto, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+			t.Fatal(err)
+		}
+		if err := rs.CreateMapping(ctx, routing.ModelMapping{ID: mapID, ApplicationID: appID, GatewayModelName: gateway, AppModelName: gateway, Status: routing.ServerStatusActive, CreatedAt: offeringTime, UpdatedAt: offeringTime}); err != nil {
+			t.Fatal(err)
+		}
+		if err := rs.UpsertMappingCapabilities(ctx, mapID, rows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("auto-vllm-oa", routing.ProviderVLLM, routing.EndpointModeAuto, oaOnly)
+	seed("auto-llama-oa", routing.ProviderLlamaCPP, routing.EndpointModeAuto, oaOnly)
+	seed("auto-sr-oa", routing.ProviderVllmSR, routing.EndpointModeAuto, oaOnly)
+	seed("auto-vllm-dec", routing.ProviderVLLM, routing.EndpointModeAuto, decOnly)
+	seed("legacy-pass-dec", routing.ProviderVLLM, routing.EndpointModePassthrough, decOnly)
+	seed("pass-vllm-oa", routing.ProviderVLLM, routing.EndpointModePassthrough, oaOnly)
+	seed("translate-vllm-oa", routing.ProviderVLLM, routing.EndpointModeTranslate, oaOnly)
+	seed("translate-vllm-dec", routing.ProviderVLLM, routing.EndpointModeTranslate, decOnly)
+	seed("stale-translate-llama-oa", routing.ProviderLlamaCPP, routing.EndpointModeTranslate, oaOnly)
+	seed("disabled-vllm-dec", routing.ProviderVLLM, routing.EndpointModeDisabled, decOnly)
+
+	want := map[string]bool{
+		"auto-vllm-oa": true, "auto-llama-oa": false, "auto-sr-oa": false, "auto-vllm-dec": true,
+		"legacy-pass-dec": true, "pass-vllm-oa": false, "translate-vllm-oa": true, "translate-vllm-dec": false,
+		"stale-translate-llama-oa": false, "disabled-vllm-dec": false,
+	}
+	svc := offerSvc(rs, nil)
+	byID := modelsByID(svc.Models(context.Background(), auth.Token{UserID: "usr_1"}))
+	off := svc.ModelOfferingFor(context.Background(), auth.Token{UserID: "usr_1"}, routing.APIFlavorDecisions, []string{routing.CapabilityDecision})
+	for name, w := range want {
+		got, ok := byID[name]
+		if !ok {
+			t.Fatalf("%s missing from the listing", name)
+		}
+		if got.Decision != w {
+			t.Errorf("%s decision = %v, want %v", name, got.Decision, w)
+		}
+		if _, capable := off.Capable[name]; capable != w {
+			t.Errorf("%s systemone capable = %v, want %v", name, capable, w)
 		}
 	}
 }

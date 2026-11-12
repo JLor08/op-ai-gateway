@@ -188,7 +188,14 @@ func MappingServesDecisionEndpoint(app Application, eff EffectiveSpecFields, req
 	var mode EndpointMode
 	switch requestFlavor {
 	case APIFlavorDecisions:
-		mode = eff.SystemOneMode
+		// Judged by the System One route with both verdicts assumed yes: the
+		// listing has no verdicts here, so this is "some route can exist",
+		// which excludes disabled and a translate row on a kind that has no
+		// /v1/decisions to translate to (the per-model fold judges the verdicts).
+		if route, ok := EffectiveSystemOneRoute(app.Type, eff.SystemOneMode, true, true); !ok || route == EndpointModeDisabled {
+			return false
+		}
+		return MappingHasAPIFlavor(app, eff, APIFlavorDecisions)
 	case APIFlavorOpenAIDecisions:
 		mode = eff.DecisionsMode
 	default:

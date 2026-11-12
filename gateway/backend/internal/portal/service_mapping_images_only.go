@@ -27,6 +27,9 @@ type mappingFlavorMarkers struct {
 	// decisions, and the effective decisions mode.
 	DecisionsListed bool
 	DecisionsMode   routing.EndpointMode
+	// SystemOneMode is the effective systemone mode, the input of
+	// ModelMappingDTO.SystemOneRoute (ADR-100).
+	SystemOneMode routing.EndpointMode
 	// DecisionsKind is the effective upstream kind (the runtime spec type for a
 	// server_agent mapping with a spec, else the application type): the kind
 	// routing.EffectiveDecisionsRoute judges the route by.
@@ -94,6 +97,7 @@ func effectiveFlavorMarkers(app routing.Application, spec routing.RuntimeSpec, h
 		DecisionsOnly:   routing.FlavorsAreDecisionsOnly(eff.APIFlavors),
 		DecisionsListed: slices.Contains(eff.APIFlavors, routing.APIFlavorDecisions),
 		DecisionsMode:   eff.DecisionsMode,
+		SystemOneMode:   eff.SystemOneMode,
 	}
 }
 

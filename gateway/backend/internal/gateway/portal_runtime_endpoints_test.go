@@ -1058,9 +1058,13 @@ func TestHandlePortalMappingRuntimeSpecPutDecisionModes(t *testing.T) {
 		srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
 		return rec
 	}
-	rec := put(`{"binary":"/usr/local/bin/vllm","type":"vllm","systemone_mode":"translate"}`)
+	rec := put(`{"binary":"/usr/local/bin/vllm","type":"vllm","systemone_mode":"bogus"}`)
 	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.endpoint_mode_invalid" {
 		t.Fatalf("bad systemone_mode: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = put(`{"binary":"/usr/local/bin/llama-server","type":"llama_cpp","systemone_mode":"translate"}`)
+	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.systemone_translate_unsupported" {
+		t.Fatalf("llama_cpp systemone translate: status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 	rec = put(`{"binary":"/usr/local/bin/llama-server","type":"llama_cpp","decisions_mode":"passthrough"}`)
 	if rec.Code != http.StatusBadRequest || errorBodyOf(t, rec) != "runtime_spec.decisions_passthrough_unsupported" {

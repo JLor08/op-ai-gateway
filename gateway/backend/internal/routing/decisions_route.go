@@ -54,3 +54,41 @@ func EffectiveDecisionsRoute(kind string, mode EndpointMode, decision, decisionO
 		return "", false
 	}
 }
+
+// EffectiveSystemOneRoute is EffectiveDecisionsRoute's twin for POST
+// /v1/systemone (ADR-100): the concrete route from the effective systemone mode
+// and the mapping's two verdicts, decision (System One yes) and decisionOpenAI
+// (native /v1/decisions yes). A blank mode behaves as auto.
+//
+//   - disabled: (disabled, true); the caller answers the endpoint-disabled error.
+//   - passthrough: passthrough, ok only with the decision verdict.
+//   - translate: translate (System One in, the OpenAI Decisions upstream), ok
+//     only with the decisionOpenAI verdict on a DecisionsPassthroughCapableKind.
+//   - auto: passthrough when the mapping answers System One, else translate when
+//     it answers /v1/decisions on a capable kind, else no route.
+//
+// kind is the effective upstream kind, as for EffectiveDecisionsRoute. For a
+// kind that is not DecisionsPassthroughCapableKind a decisionOpenAI verdict is
+// ignored, so a stale translate row there (the save guards refuse it) is not ok
+// rather than sent to an upstream that cannot parse it.
+func EffectiveSystemOneRoute(kind string, mode EndpointMode, decision, decisionOpenAI bool) (route EndpointMode, ok bool) {
+	if !DecisionsPassthroughCapableKind(kind) {
+		decisionOpenAI = false
+	}
+	switch mode {
+	case EndpointModeDisabled:
+		return EndpointModeDisabled, true
+	case EndpointModePassthrough:
+		return EndpointModePassthrough, decision
+	case EndpointModeTranslate:
+		return EndpointModeTranslate, decisionOpenAI
+	default: // auto and blank
+		switch {
+		case decision:
+			return EndpointModePassthrough, true
+		case decisionOpenAI:
+			return EndpointModeTranslate, true
+		}
+		return "", false
+	}
+}

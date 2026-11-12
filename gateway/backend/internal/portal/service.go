@@ -1470,7 +1470,8 @@ type ModelDTO struct {
 	Speech bool `json:"speech"`
 	// Decision is true only when POST /v1/systemone would serve the model --
 	// EVERY offering mapping (or, for a group, every offerable member) has a
-	// (decision, yes) verdict, declares the decisions flavor (the
+	// System One route (routing.EffectiveSystemOneRoute over its decision and
+	// decision_openai verdicts, ADR-100), declares the decisions flavor (the
 	// application's and, for an agent-launched model with a spec, the spec's)
 	// and has its effective systemone mode not disabled
 	// (routing.MappingServesDecisionEndpoint): AND aggregation, fail-closed,
@@ -2967,7 +2968,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// capability batch and the same runtime-spec index as the image folds,
 			// so the flag costs no further store read.
 			speechOn := speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
-			decisionOn := decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
+			decisionOn := decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 			decisionOpenAIOn := decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 			// transcription is transcriptionFlagsByName, speech's twin and the one
 			// transcription fold the redirect asks too: the (transcription, yes)
@@ -3478,21 +3479,30 @@ func speechFlagsByName(views []mappingView, speechRows map[string]routing.Capabi
 }
 
 // decisionFlagsByName is speechFlagsByName's decision twin: a name carries the
-// decision capability only when EVERY one of its mappings has a (decision, yes)
-// verdict (decisionRows, keyed by mapping id) AND POST /v1/systemone serves it:
-// the decisions flavor half and the effective systemone mode not disabled
-// (viewServesSystemOne). Fail-closed, independent of every other capability.
-// It backs ModelDTO.Decision, GET /v1/systemone/models and the /v1/systemone
-// redirect's ModelOffering.Capable.
-func decisionFlagsByName(views []mappingView, decisionRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+// decision capability only when EVERY one of its mappings has a System One
+// route (routing.EffectiveSystemOneRoute, ADR-100) over its (decision, yes)
+// verdict (decisionRows, keyed by mapping id) and its decision_openai verdict
+// (openAIRows, counted only where viewDecisionOpenAI allows it) that is neither
+// absent nor disabled, AND POST /v1/systemone serves it (viewServesSystemOne:
+// the decisions flavor half and the effective systemone mode not disabled).
+// Fail-closed, independent of every other capability. It backs
+// ModelDTO.Decision, GET /v1/systemone/models and the /v1/systemone redirect's
+// ModelOffering.Capable.
+func decisionFlagsByName(views []mappingView, decisionRows, openAIRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	return foldMappingFlags(views, func(view mappingView) bool {
-		return decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewServesSystemOne(view, idx)
+		if !viewServesSystemOne(view, idx) {
+			return false
+		}
+		route, ok := routing.EffectiveSystemOneRoute(idx.kind(view), idx.effective(view).SystemOneMode,
+			decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes, viewDecisionOpenAI(view, openAIRows, idx))
+		return ok && route != routing.EndpointModeDisabled
 	})
 }
 
 // viewServesSystemOne is viewHasAPIFlavorFailClosed for POST /v1/systemone:
 // the mapping passes routing.MappingServesDecisionEndpoint for the systemone
-// endpoint under its effective flavors and modes, and an application whose spec
+// endpoint under its effective flavors and mode (the verdict-free half of the
+// route; decisionFlagsByName adds the verdicts), and an application whose spec
 // read failed passes nothing, since the unreadable spec may disable it.
 func viewServesSystemOne(view mappingView, idx runtimeSpecIndex) bool {
 	if _, failed := idx.failed[view.app.ID]; failed {
