@@ -7,6 +7,7 @@ import (
 	"context"
 	"log/slog"
 	"op-ai-gateway/internal/routing"
+	"slices"
 )
 
 // mappingFlavorMarkers is the pair of advisory markers ModelMappingDTO carries
@@ -21,6 +22,11 @@ type mappingFlavorMarkers struct {
 	AudioOnly  bool
 	// DecisionsOnly is AudioOnly's decision twin.
 	DecisionsOnly bool
+	// DecisionsListed and DecisionsMode are what ModelMappingDTO.DecisionsRoute
+	// is computed from (mappingDTO): whether the effective flavors list
+	// decisions, and the effective decisions mode.
+	DecisionsListed bool
+	DecisionsMode   routing.EndpointMode
 }
 
 // mappingsFlavorMarkers returns ModelMappingDTO.ImagesOnly and AudioOnly for
@@ -72,10 +78,13 @@ func (s *Service) mappingFlavorMarkersFor(ctx context.Context, app routing.Appli
 // (routing.EffectiveFields): the spec's for a server_agent mapping that has
 // one, the application's otherwise.
 func effectiveFlavorMarkers(app routing.Application, spec routing.RuntimeSpec, hasSpec bool) mappingFlavorMarkers {
+	eff := routing.EffectiveFields(app, spec, hasSpec)
 	return mappingFlavorMarkers{
-		ImagesOnly:    effectiveFlavorsAreImagesOnly(app, spec, hasSpec),
-		AudioOnly:     effectiveFlavorsAreAudioOnly(app, spec, hasSpec),
-		DecisionsOnly: routing.FlavorsAreDecisionsOnly(routing.EffectiveFields(app, spec, hasSpec).APIFlavors),
+		ImagesOnly:      effectiveFlavorsAreImagesOnly(app, spec, hasSpec),
+		AudioOnly:       effectiveFlavorsAreAudioOnly(app, spec, hasSpec),
+		DecisionsOnly:   routing.FlavorsAreDecisionsOnly(eff.APIFlavors),
+		DecisionsListed: slices.Contains(eff.APIFlavors, routing.APIFlavorDecisions),
+		DecisionsMode:   eff.DecisionsMode,
 	}
 }
 

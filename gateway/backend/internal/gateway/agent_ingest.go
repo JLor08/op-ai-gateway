@@ -1534,6 +1534,9 @@ var reservedAgentCapabilityNames = map[string]bool{
 	routing.CapabilitySpeculationObserved: true,
 	routing.CapabilityImageEdit:           true,
 	routing.CapabilityDecision:            true,
+	routing.CapabilityDecisionOpenAI:      true,
+	// The derived any_decision requirement is never a stored row name.
+	routing.CapabilityAnyDecision: true,
 }
 
 // audioCppProbeCapabilities is the allowlist for the audiocpp_models source:

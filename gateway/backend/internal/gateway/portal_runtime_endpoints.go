@@ -165,6 +165,14 @@ var portalRuntimeSpecErrRows = []errRow{
 			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecResponsesLiveTimingsUnsupported.Error()+": ")
 		},
 	},
+	{
+		err:    portal.ErrRuntimeSpecDecisionsPassthroughUnsupported,
+		status: http.StatusBadRequest,
+		code:   "runtime_spec.decisions_passthrough_unsupported",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecDecisionsPassthroughUnsupported.Error()+": ")
+		},
+	},
 	// Dynamic message, same shape as the row above: the service wraps the
 	// sentinel with the offending file's name and the rule it broke (never its
 	// content), and the operator needs that to fix the entry.

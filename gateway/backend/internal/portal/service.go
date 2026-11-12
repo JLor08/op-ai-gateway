@@ -1466,6 +1466,10 @@ type ModelDTO struct {
 	// asks too, and GET /v1/systemone/models lists only the rows that carry it.
 	// Always present, like its sibling flags.
 	Decision bool `json:"decision"`
+	// DecisionOpenAI is Decision's twin for POST /v1/decisions served natively
+	// (the decision_openai verdict, ADR-098): the same AND aggregation over the
+	// offering mappings, via decisionOpenAIFlagsByName. Always present.
+	DecisionOpenAI bool `json:"decision_openai"`
 	// Transcription is true only when the transcription endpoint would serve the
 	// model -- EVERY offering mapping (or, for a group, every offerable member) has
 	// a (transcription, yes) verdict and passes both flavor stages of a
@@ -2945,6 +2949,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// so the flag costs no further store read.
 			speechOn := speechFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeech), idx)
 			decisionOn := decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
+			decisionOpenAIOn := decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
 			// transcription is transcriptionFlagsByName, speech's twin and the one
 			// transcription fold the redirect asks too: the (transcription, yes)
 			// verdict and the same openai_audio flavor half, from the same
@@ -3344,6 +3349,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.ImageEdit = imageEditOn[id]
 				dto.Speech = speechOn[id]
 				dto.Decision = decisionOn[id]
+				dto.DecisionOpenAI = decisionOpenAIOn[id]
 				dto.Transcription = transcriptionOn[id]
 				dto.SpeechClone = speechCloneOn[id]
 				dto.SpeechCloneVoices = speechCloneVoicesOn[id]
@@ -3459,6 +3465,28 @@ func speechFlagsByName(views []mappingView, speechRows map[string]routing.Capabi
 func decisionFlagsByName(views []mappingView, decisionRows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
 	return foldMappingFlags(views, func(view mappingView) bool {
 		return decisionRows[view.mapping.ID].Verdict == routing.CapabilityYes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
+	})
+}
+
+// decisionOpenAIFlagsByName is decisionFlagsByName's twin for the
+// decision_openai verdict (the upstream serves /v1/decisions natively).
+func decisionOpenAIFlagsByName(views []mappingView, rows map[string]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	return foldMappingFlags(views, func(view mappingView) bool {
+		return rows[view.mapping.ID].Verdict == routing.CapabilityYes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
+	})
+}
+
+// anyDecisionFlagsByName folds the derived routing.CapabilityAnyDecision, the
+// pre-resolve requirement of POST /v1/decisions: every mapping of a name has a
+// yes on decision OR decision_openai and passes the decisions flavor half. It
+// backs ModelOffering.Capable for that endpoint's unknown-model redirect.
+func anyDecisionFlagsByName(views []mappingView, capsByMapping map[string][]routing.CapabilityRow, idx runtimeSpecIndex) map[string]bool {
+	decision := capabilityRowsFor(capsByMapping, routing.CapabilityDecision)
+	openAI := capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI)
+	return foldMappingFlags(views, func(view mappingView) bool {
+		id := view.mapping.ID
+		yes := decision[id].Verdict == routing.CapabilityYes || openAI[id].Verdict == routing.CapabilityYes
+		return yes && viewHasAPIFlavorFailClosed(view, idx, routing.APIFlavorDecisions)
 	})
 }
 

@@ -387,7 +387,8 @@ func (s *Service) capableNames(ctx context.Context, callable map[string]struct{}
 // transcription and decision. Keep it in step with capabilityFlagsByName.
 func hasCapabilityFold(capability string) bool {
 	switch capability {
-	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityDecision:
+	case routing.CapabilityImage, routing.CapabilityImageEdit, routing.CapabilitySpeech, routing.CapabilityTranscription, routing.CapabilityDecision,
+		routing.CapabilityDecisionOpenAI, routing.CapabilityAnyDecision:
 		return true
 	}
 	return false
@@ -415,6 +416,10 @@ func capabilityFlagsByName(capability string, views []mappingView, capsByMapping
 		return transcriptionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityTranscription), idx)
 	case routing.CapabilityDecision:
 		return decisionFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecision), idx)
+	case routing.CapabilityDecisionOpenAI:
+		return decisionOpenAIFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityDecisionOpenAI), idx)
+	case routing.CapabilityAnyDecision:
+		return anyDecisionFlagsByName(views, capsByMapping, idx)
 	default:
 		return map[string]bool{}
 	}
