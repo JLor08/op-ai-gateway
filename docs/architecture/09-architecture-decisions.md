@@ -11862,6 +11862,10 @@ knowable on a mixed host). **Per-request VRAM metering** (left for later).
 with `decisions_confidence_normalize`, a buffered relay that recomputes `confidence`, and `decision` gains a sibling
 capability, `decision_openai`. Everything else below stands.
 
+**Amended by [ADR-099](#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)
+(Phase 3).** vllm-sr is now a first-class type on both sides (the `vllm_sr` application type and runtime spec type), with its
+`decision` verdict established by this entry's one uniform probe, as predicted; its `decisions_mode: passthrough` is refused.
+
 **Context:** System One is a decision protocol: a client sends `{model, state, questions}` and a decision model
 answers each question (`{model, answers, usage}`), with no chat turn, no streaming and no prompt the gateway writes.
 Models that speak it (served by llama.cpp, vLLM or vllm-sr, launched by an agent or run by hand) answer
@@ -11982,6 +11986,10 @@ vocabulary must not be named after one path.
 [HTTP API Surface](reference/api-surface.md).
 
 ## ADR-098 — OpenAI Decisions: a request flavor, decision modes, a probe-written `decision_openai` capability and a System One translator (Phase 2 of #373)
+
+**Amended by [ADR-099](#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)
+(Phase 3).** `decisions_mode: passthrough` is also refused for `vllm_sr` (application and spec), whose `/v1/decisions` is the
+System One alias, so `auto` there always translates, and the `decision_openai` probe (e) never targets it. Everything else below stands.
 
 **Context:** Phase 1 ([ADR-097](#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373))
 relays System One. Phase 2 adds **OpenAI's Decisions API**, `POST /v1/decisions`, whose clients (the OpenAI SDKs)
@@ -12105,3 +12113,114 @@ operator can read, never a guess. The contract was checked against openai-python
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
 [Data Model §4](reference/data-model.md#4-migration-history-108-migrations).
+
+## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
+
+**Context:** Phases 1 and 2 ([ADR-097](#adr-097--system-one-decisions-a-third-non-text-flavor-a-probe-written-decision-capability-and-a-value-for-value-relay-phase-1-of-373),
+[ADR-098](#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373))
+serve System One and OpenAI Decisions from servers an operator registered as `llama_cpp`, `vllm` or `custom` and told
+which flavors to carry. Phase 3 makes the **vLLM Semantic Router** (vllm-sr) a type of its own. Four facts, all read
+off `vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd` (2026-11-12), shaped it:
+
+- **It is two different programs.** The operator-run **Engine** mode (`vllm-sr serve <model> --engine`) is a listener
+  (port 8899) with API keys and per-model grants, in front of a worker; **Router** mode is a different surface. The
+  runtime worker is `vllm-srun` (package `vllm-srun`, runtime api_version `5.0.0`), a plain process that serves
+  `/v1/systemone`, `/v1/models`, `/health` and `/metrics`; the `vllm-sr` command that orchestrates containers is neither.
+- **Its health endpoint is not on the listener.** `/health` is on the container's management port (127.0.0.1:8080),
+  which the gateway cannot reach; the listener lists the models it grants at `GET /v1/systemone/models`.
+- **The worker has no authentication, is not on PyPI, and exposes one gauge.** It binds loopback by default and checks
+  no key; it installs from a checkout (`pip install ./src/model-runtime`); its Prometheus surface has a waiting gauge
+  (`vllm_srun_queue_depth`) and no in-flight one; its `/health` answers 503 until the model loaded and its golden check
+  passed (an `unverified` golden on NVIDIA still answers 200).
+- **The contract moves fast.** The runtime api_version went 3 → 4 → 5 between 2026-11-09 and 2026-11-11, and the router
+  itself refuses a worker of another major. Version 5.0 also changed the `/v1/systemone` error envelope (`detail` plus
+  flat `code`/`question`/`reason`, no `error` key, `529` for overload) and its `/v1/decisions` is the System One alias,
+  not OpenAI's shape.
+
+**Decision — seven choices, taken together. No migration (`applications.type` and `agent_runtime_specs.type` are plain
+text), `ServerAgent` version `0.18.1` → `0.18.2` (PATCH).**
+
+- **(a) One name, two namespaces, as `audio_cpp` ([ADR-061](#adr-061--speech-is-the-second-endpoint-on-the-capability-gate-a-distinct-speech-capability-a-coarse-openai_audio-flavor-the-audio_cpp-kind-and-a-binary-relay-that-serves-wav-only)).**
+  `routing.ProviderVllmSR` is an **application type**: a static, operator-run Engine-mode router with no runtime spec,
+  served by the shared OpenAI-compatible client, discovered at `GET /v1/systemone/models` (a fixed, unprefixed path in
+  `modelDiscoveryFor`, decoded as an OpenAI list), with a 600000 ms backend timeout default (a request may wait on a cold
+  load or a first-start download). `routing.RuntimeSpecTypeVllmSR` is a **runtime spec kind**: the agent-launched
+  `vllm-srun`. Router mode is not supported, and nothing detects or rejects it.
+- **(b) Engine health is the model listing.** The portal's `vllm_sr` defaults are port 8899, `health_check_mode`
+  `health_path` with path `/v1/systemone/models`, flavors `["decisions"]`, both coding-agent modes `disabled`,
+  `decisions_mode` `auto` and `systemone_mode` `passthrough`. The listing needs the application's API key (the listener's
+  `api_keys`, a Bearer) and a grant (`listeners[].apis.systemone.models`), so a healthy check also proves both. The
+  listener's own **30 s default deadline** (`504 systemone_deadline_exceeded` unless the client sends
+  `options.deadline_ms`) is documented as an operator note and left alone.
+- **(c) The spec binary is the worker, detected before `vllm`.** `DetectRuntimeSpecType` matches `vllm-srun`,
+  `vllm_srun` and `vllm-sr` ahead of `vllm` (the worker's name contains it); `DeriveProbePaths` is `/metrics` and
+  `/v1/models`; the health path stays `/health`. The portal's type note carries the launch template `serve ${MODEL}
+  --device cuda:0 --host 127.0.0.1 --port ${PORT}` (device 0 because `set_visible_devices` remaps the GPU), the install
+  from a checkout of the pinned commit with `runtime_allow_binary_dirs`, the first-start download and the
+  loopback-only rule that follows from the missing authentication. The form defaults a switched spec to the `decisions`
+  flavor, and `api_flavors_text_on_vllm_sr` (a `RuntimeWarning`) flags a spec that lists `openai` or `anthropic`.
+- **(d) Passthrough is refused for both types, so `auto` translates.** vllm-sr's `/v1/decisions` returns System One's
+  body, so a passthrough would hand an OpenAI client the wrong shape. `decisionsPassthroughCapableKind` refuses it as it
+  does for `llama_cpp` (`application.decisions_passthrough_unsupported` 400, `application.decisions_passthrough_conflict`
+  409, `runtime_spec.decisions_passthrough_unsupported` 400; a stored `passthrough` is reset to `auto` on a retype). The
+  `decision_openai` probe's scope is unchanged and never reaches the type; the System One probe asks it like any
+  application declaring `decisions`. The 5.0 error envelope needs no code: the Phase 2 translator already reads `detail`
+  (string or list) and relays the upstream's status, and tests pin a `422 question_failed` and a `529`.
+- **(e) The agent reads what the worker gives, and no more (0.18.2).** The context size is
+  `data[].limits.max_input_tokens` (the first entry that has it, the best-effort scan as the fallback); the queue depth
+  is `vllm_srun_queue_depth` with no running count (active stays 0); the capability probe is skipped (no `/props`, no
+  capability document); and the sample gains `runtime_api_version`, the top-level `api_version` of the same
+  `/v1/models` body the context probe already fetched. It is reported whenever the body parsed, **even when no context
+  limit came out of it**, cached only with a real size, and omitted when unknown. The agent records it and never judges it.
+- **(f) The gateway warns on an unsupported major and refuses nothing.** `routing.VllmSRSupportedAPIMajor` is `5`
+  (with the pinned commit in its comment); `routing.VllmSRAPIVersionUnsupported` is true only when a leading integer
+  parses and differs, so an empty or unparsable version is unknown and never warns. The ingest logs one `slog.Warn`
+  per runtime row (spec id and instance) whose version **changes into** an unsupported major, not one per sample. The
+  model-servers row carries `runtime_api_version` and `runtime_api_version_unsupported` (true only for an effective
+  `vllm_sr` spec type), the portal shows a version chip beside the row's version, and no request is refused or
+  re-routed. An **external** Engine application reports no api_version (the listener exposes none), so no warning exists
+  there.
+- **(g) The type enters no capability, role or flavor table beyond its own row.** A `vllm_sr` model's role is derived
+  from its capabilities (no type fallback, so `other` without verdicts), and the application is decisions-only
+  (`FlavorsAreDecisionsOnly`) like any application carrying only that flavor.
+
+**Rejected:**
+
+- **Router mode.** It is a different surface (its own listener contract, error shapes and failure modes) the gateway has
+  no probe or test for; Engine mode is the documented way to serve a decision model, and Router mode can be added as its own type.
+- **The Docker-orchestrating `vllm-sr` CLI as the spec binary.** The agent supervises one child process it can signal,
+  measure and restart; the CLI starts containers and exits, so the agent would supervise a launcher whose child it
+  cannot see. The spec names `vllm-srun`, whose name also detects the right type.
+- **Refusing an unknown major.** The router does, but the gateway sits in front of a model an operator chose and may
+  already have verified; a hard refusal turns a contract change nobody tested into an outage of a working route. A warning
+  names the cause and the request still runs.
+- **A separate `/health` request for the version.** `/v1/models` is already fetched by the context probe and carries the
+  field; a second poll per child per cycle is spent to learn what the first answered.
+- **A running gauge from the router's metrics port (9190).** That surface belongs to the router, not the worker the
+  agent supervises, and is unreachable from it in Engine mode's container; reporting no running count is honest.
+- **Reading `output_modalities` (or any capability document) for the verdict.** ADR-097's uniform probe already
+  establishes `decision` for this type, and `vllm-srun` serves no capability document to read.
+- **Passthrough for vllm-sr.** Its `/v1/decisions` is System One under another name (d).
+
+**Consequence:**
+
+- **A vllm-sr model needs no more configuration than any decision model:** the form fills the defaults, the probe finds
+  the verdict, `auto` translates. A model the listener does not grant is a 404 the probe records as `no`.
+- **The supported major is a build-time constant.** The next major needs a gateway release that knows its shape
+  (`VllmSRSupportedAPIMajor`); until then workers of that major run with a warning and a chip, and nothing the gateway
+  does for them is guarded.
+- **Mixed fleets are harmless in both directions.** An agent before 0.18.2 ignores the type (best-effort context, no queue
+  gauge, no `runtime_api_version`, and therefore no warning); a gateway before this change sees the extra sample field
+  as unknown JSON. No upgrade order.
+- **Operator burdens documented, not removed:** the worker is unauthenticated and stays on loopback; the listener's 30 s
+  deadline applies; `vllm-srun` is installed from a checkout, not PyPI; the first start downloads the model.
+- **Not verified live:** an Engine-mode instance registered as `vllm_sr` end to end (discovery, health, a `/v1/systemone`
+  relay, a `/v1/decisions` translate); an agent-launched `vllm-srun serve vllm-sr/d3-mini` through both endpoints; the
+  warning against a worker of another major; and the cold-start and answers-per-second comparison between the `vllm`
+  and `vllm_sr` spec types for the same checkpoint. The contract was read off the pinned commit; these are operator
+  steps, as ADR-097's and ADR-098's live runs were.
+
+→ [Compatibility & Inference §3.9 and §3.10](cross-cutting/compatibility-and-inference.md#39-system-one-decisions),
+[Agent-Managed Model Runtime §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+[Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
+[HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode).

@@ -7,7 +7,7 @@ Premise / On Prem), a Linux-first, cross-platform AI gateway portal, licensed
 AGPL-3.0-only.
 
 The system routes AI client requests to AI servers running Ollama, llama.cpp,
-or vLLM. It supports OpenAI-compatible clients, Anthropic-compatible clients,
+vLLM or the vLLM Semantic Router. It supports OpenAI-compatible clients, Anthropic-compatible clients,
 coding agents such as Codex and Claude Code, and a built-in portal chat
 experience. It ships with local users, invite-based provisioning, API tokens,
 model-based routing with load-aware scoring from agent telemetry, usage

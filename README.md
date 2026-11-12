@@ -5,8 +5,8 @@
 **Run your own AI fleet behind one gateway.**
 
 A self-hostable AI gateway and management portal for servers running
-**llama.cpp**, **vLLM**, **Ollama**, **stable-diffusion.cpp** or
-**audio.cpp** — with drop-in **OpenAI-** and **Anthropic-compatible** APIs,
+**llama.cpp**, **vLLM**, **Ollama**, **stable-diffusion.cpp**,
+**audio.cpp** or the **vLLM Semantic Router** — with drop-in **OpenAI-** and **Anthropic-compatible** APIs,
 load-aware routing, agent-managed model processes (including llama.cpp RPC
 clusters across several servers), usage/cost/energy analytics, and an
 optional private mesh.
@@ -131,7 +131,7 @@ servers, models, launch specifications, users, and policies in a bilingual
   child processes bound to loopback.
 - Launch specifications (type, binary, arguments, environment, config files,
   GPUs, timeouts) are maintained in the portal for llama.cpp, vLLM, TGI,
-  Ollama, stable-diffusion.cpp, audio.cpp or a custom server, while the AI
+  Ollama, stable-diffusion.cpp, audio.cpp, the vLLM Semantic Router or a custom server, while the AI
   server's own operator keeps a **binary allowlist** that decides what may
   execute at all. Model secrets never enter the gateway: a spec's environment
   values are `${AGENT_ENV:NAME}` references resolved on the AI server. A spec's
@@ -218,7 +218,7 @@ flowchart LR
     subgraph fleet ["AI servers"]
         direction TB
         agent["Server-Agent<br/>(telemetry, model processes, TLS proxy)"]
-        srv1["llama.cpp · vLLM · Ollama<br/>sd.cpp · audio.cpp"]
+        srv1["llama.cpp · vLLM · Ollama<br/>sd.cpp · audio.cpp · vllm-sr"]
         member["ggml-rpc-server<br/>(cluster members)"]
     end
 

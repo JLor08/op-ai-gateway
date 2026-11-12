@@ -1738,6 +1738,27 @@ non-2xx, a body that is not JSON) is relayed as the copier would, and the gatewa
 `502 systemone.upstream_error` answers a body over the buffer bound or broken off. Other
 tokens keep the streaming relay byte for byte.
 
+**10. vllm-sr as a backend (Phase 3, [ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)).** The vLLM Semantic
+Router serves this endpoint, and `vllm_sr` is a type on both sides. As an **application
+type** (`routing.ProviderVllmSR`) it is an operator-run router in **Engine** mode
+(`vllm-sr serve <model> --engine`; Router mode is not supported): a static application
+with no runtime spec, served by the shared OpenAI-compatible client, whose model discovery
+is `GET /v1/systemone/models` (a fixed, unprefixed path, `modelDiscoveryFor`, decoded as an
+OpenAI list) and whose health check defaults to that same path, because the router's
+`/health` lives on the container's management port (127.0.0.1:8080), which the gateway
+cannot reach. As a **runtime spec type** it is the agent-launched worker `vllm-srun`
+([Agent-Managed Model Runtime
+§3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+Both are probed for the `decision` verdict like any application that declares `decisions`
+(the probe of item 7 asks both), and the portal defaults the form to flavors `decisions`,
+both coding-agent modes `disabled` and `systemone_mode: passthrough`. What an operator must
+know of the **Engine listener**: a model must be granted under
+`listeners[].apis.systemone.models`, or the listing omits it and a request is a 404
+(`systemone_not_published`, recorded by the probe as `no`, as for any 404); the application's
+API key is the listener's `api_keys` entry, sent as a Bearer; and the listener applies a
+**30 s default deadline**, answering `504 systemone_deadline_exceeded`, unless the client sends
+`options.deadline_ms`. The gateway changes none of it: the application's own `timeout_ms`
+defaults to 600000 ms, but the listener's deadline is the shorter bound.
 
 ### 3.10 OpenAI Decisions
 
@@ -1949,10 +1970,30 @@ reserved from manual edits so the probe alone states a `no`, and an agent may no
 the name. `decision` and `decision_openai` are **orthogonal**: a model may answer either,
 both or neither.
 
-**11. Checked against the sources, not yet live.** The wire contract was read off the
+**11. vllm-sr serves only System One, so its modes never pass through
+([ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)).** vllm-sr's `/v1/decisions` is the router's alias of its System One
+endpoint (the body is System One's, not OpenAI's), so a passthrough would hand an OpenAI
+client a System One answer. `decisionsPassthroughCapableKind` therefore refuses
+`passthrough` for `vllm_sr` exactly as for `llama_cpp` (§6: the three refusal codes, and a
+stored `passthrough` is reset to `auto` when an application is retyped to `vllm_sr`), and the
+`decision_openai` probe never targets it (`openAIDecisionsInScope` admits `vllm` applications
+and `vllm`/`custom` specs only), while the System One probe does. `auto` there always resolves
+to **translate** (a `decision` verdict is the only one it can carry). The 5.0 runtime
+changed its `/v1/systemone` error envelope: it carries `detail` (a string, or a list on a 422)
+plus flat `code`/`question`/`reason` fields, has **no `error` key**, and uses `529` for overload.
+The translate error normalizer of item 6 already reads `detail` in both shapes and relays the
+upstream's status, so a `422 question_failed` and a `529` surface as `decisions.upstream_error`
+under their own status (tests pin both); a `501` never comes from vllm-sr (an unsupported question
+type is a 422). Nothing here is a gateway code path of its own.
+
+**12. Checked against the sources, not yet live.** The wire contract was read off the
 openai-python v3.49.0 SDK types and the vLLM v0.33.0 sources (vLLM answers a model without a read strategy with a `501` on both of its decision routes). **Not verified against a running model:** a live translate run against a real
 System One model (the score index base in particular), a vLLM Qwen3 passthrough, and the
-official OpenAI SDK against either route; those remain operator steps.
+official OpenAI SDK against either route; those remain operator steps. The vllm-sr contract was read off
+`vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd` (runtime api_version 5.0.0, 2026-11-12);
+**not verified against a running instance:** an Engine-mode router end to end (discovery, health, the
+`/v1/systemone` relay and a `/v1/decisions` translate) and an agent-launched `vllm-srun`
+through both endpoints.
 
 ## 4. Session / continuity signals
 
@@ -2329,11 +2370,11 @@ redirect's `ModelOffering.Callable` judges a name per endpoint
 cannot call it" case `UnknownModelRedirectBlocked` redirects. A forced mode whose verdict the mapping lacks is `404
 routing.model_not_capable` after the resolve (no re-selection), and `routing.EffectiveDecisionsRoute`
 is the one function that maps mode and verdicts to a route.
-`passthrough` is **refused at save for `llama_cpp`**, which has no `/v1/decisions` route:
+`passthrough` is **refused at save for `llama_cpp`** (no `/v1/decisions` route) **and for `vllm_sr`** (its `/v1/decisions` is the System One alias, §3.10 item 11):
 `application.decisions_passthrough_unsupported` (400, the request supplied the type),
 `application.decisions_passthrough_conflict` (409, an update that sends no `type` and
 collides with the stored one) and `runtime_spec.decisions_passthrough_unsupported` (400,
-the spec's effective type); and an application **retyped** to `llama_cpp` with a stored
+the spec's effective type); and an application **retyped** to `llama_cpp` or `vllm_sr` with a stored
 `passthrough` is reset to `auto` rather than refused (the "clear when the type cannot carry
 it" rule `responses_live_timings_enabled` follows). An unrecognized mode is
 `application.endpoint_mode_invalid` / `runtime_spec.endpoint_mode_invalid`; `systemone_mode`
@@ -2667,7 +2708,7 @@ The mock, Ollama and OpenAI-compatible clients also implement `Prober` (reachabi
 routing/capacity subsystems — out of this chapter's scope; see [Routing & Model
 Selection](routing-and-model-selection.md). One `OpenAICompatibleClient`
 instance is shared across vLLM, llama.cpp, llama-swap, LiteLLM, `server_agent`,
-`stable_diffusion_cpp` and `audio_cpp` (`cmd/gateway/main.go`) since they all speak the
+`stable_diffusion_cpp`, `audio_cpp` and `vllm_sr` (`cmd/gateway/main.go`) since they all speak the
 same OpenAI HTTP dialect; only Ollama gets its own client for its distinct
 `/api/chat` NDJSON shape. `stable_diffusion_cpp` cannot borrow the Ollama client
 instead: that client does not implement `NativeProxyClient`, and the images

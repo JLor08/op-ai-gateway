@@ -24,7 +24,7 @@ erDiagram
         string health_status "unknown/healthy/degraded/unhealthy"
     }
     APPLICATION {
-        string type "ollama/vllm/llama_cpp/llama_swap/litellm/server_agent/stable_diffusion_cpp/audio_cpp/mock"
+        string type "ollama/vllm/llama_cpp/llama_swap/litellm/server_agent/stable_diffusion_cpp/audio_cpp/vllm_sr/mock"
         string api_flavors "openai | anthropic | openai_images | openai_audio | decisions -- saved empty = openai + anthropic, stored empty = none"
         int port
         string scheme "http/https"
@@ -189,8 +189,8 @@ mode for `GET /v1/systemone/models` and the redirect's `ModelOffering.Callable`,
 `/v1/decisions` asks under `openai_decisions`. The mode defaults are `auto`
 (`routing.EndpointModeAuto`, valid for `decisions_mode` only) and `passthrough`, and neither
 depends on the application type: the `stable_diffusion_cpp` and `audio_cpp` default tables
-below never declare `decisions`, and the type enters only through the save-time refusal of
-`decisions_mode: passthrough` on `llama_cpp` (API surface, "Decision endpoint modes").
+below never declare `decisions` (the `vllm_sr` table does, and only it), and the type enters only through the save-time refusal of
+`decisions_mode: passthrough` on `llama_cpp` and `vllm_sr` (API surface, "Decision endpoint modes").
 See [API Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions).
 
 **Flavor exclusion is two-staged, by design.** Candidacy filters on the
@@ -285,7 +285,7 @@ provider dispatch mapping (`cmd/gateway/main.go: providerClients`):
 |---|---|
 | `mock` | `provider.NewMockWithDelay` (dev/test) |
 | `ollama` | `provider.NewOllamaClient` |
-| `vllm`, `llama_cpp`, `llama_swap`, `litellm`, `server_agent`, `stable_diffusion_cpp`, `audio_cpp` | `provider.NewOpenAICompatibleClient` (shared — all seven speak the OpenAI HTTP dialect) |
+| `vllm`, `llama_cpp`, `llama_swap`, `litellm`, `server_agent`, `stable_diffusion_cpp`, `audio_cpp`, `vllm_sr` | `provider.NewOpenAICompatibleClient` (shared — all eight speak the OpenAI HTTP dialect, `vllm_sr` only for its decision endpoints) |
 
 `server_agent` is a **full application type**, not a special case: it is
 creatable through the portal (`normalizeApplicationType`) and dispatches to that
@@ -366,6 +366,36 @@ Unlike `stable_diffusion_cpp`, **model discovery is the default**: audio.cpp's
 case for the type, and `health_path` mode works because a real health endpoint exists.
 The type's `speech` and `transcription` verdicts come from the `audiocpp_models` source
 (§2.3).
+
+`vllm_sr` is the application type for an **operator-run vLLM Semantic Router in Engine
+mode** (`routing.ProviderVllmSR`, [ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)), a static application with no
+runtime spec that serves only the decision endpoints, so it dispatches to the same shared
+client (`providerClients`) and `viewRuntimeType` maps it to the runtime spec kind of the same
+name (the agent-launched `vllm-srun`, a different namespace). Router mode is not supported.
+Its defaults, which the form fills in only where a field still holds the previous type's
+default:
+
+| Field | Default for `vllm_sr` |
+|---|---|
+| `port` | 8899 (the Engine listener's conventional port) |
+| `health_check_mode` / `health_check_path` | `health_path` / `/v1/systemone/models` — the router's `/health` is on the container's management port (127.0.0.1:8080), unreachable from the gateway, so the authenticated listing doubles as the health probe |
+| `loaded_models_path` / `loaded_models_format` | `/v1/systemone/models` / `openai` |
+| `timeout_ms` | 600000 (also the backend's default for the type when `timeout_ms` is 0: a request may wait on a cold load or a first-start download) |
+| `api_flavors` | `["decisions"]` |
+| `responses_mode` / `messages_mode` | both `disabled` |
+| `decisions_mode` / `systemone_mode` | `auto` / `passthrough`; `decisions_mode: passthrough` is refused (and not offered) because its `/v1/decisions` is the System One alias |
+| `context_probe_path` | empty |
+
+**Model discovery is the default**, at the fixed, unprefixed `/v1/systemone/models`
+(`modelDiscoveryFor`, like `stable_diffusion_cpp`'s `sd-models`, decoded as an OpenAI list), which
+lists the models the listener grants under `listeners[].apis.systemone.models`; the
+application's API key is the listener's `api_keys` Bearer. The router's own `/v1/models`
+(its chat models) is not read. The type's `decision` verdict comes from the System One
+probe, which asks it like any application that declares `decisions`; the `decision_openai`
+probe never does (below). A mapping of the type is **decisions-only** (`routing.FlavorsAreDecisionsOnly`).
+An agent-launched worker of the spec kind reports its own `api_version`, which the model-servers
+row compares with the supported major (agent-runtime-manager §3.4); an external Engine application
+reports none, so no version warning exists there.
 
 `ModelGroup` also carries five selection-setting columns, added append-only by
 migration `62`: `loaded_only`, `member_order`, `climb_speed_margin_percent`,
@@ -1181,7 +1211,7 @@ System One. It is **orthogonal** to `decision` (System One): a model can answer 
 both or neither. Its one automatic writer is the
 gateway's OpenAI Decisions probe (source `decisions_probe`, `routing.CapabilitySourceDecisionsProbe`,
 rank 1 like `systemone_probe`), which asks only an external `vllm` application and a
-`server_agent` mapping whose runtime spec type is `vllm` or `custom`, with separate
+`server_agent` mapping whose runtime spec type is `vllm` or `custom` (never `vllm_sr`, whose `/v1/decisions` is the System One alias and which only translates), with separate
 settled and back-off state (a probe settling does not suppress the other, [API Compatibility &
 Inference §3.10](compatibility-and-inference.md#310-openai-decisions) item 10). The two lists keep the writer unique exactly as for
 `decision`: `(decision_openai, no)` is in `reservedManualVerdicts` (an operator's `yes` stays an
