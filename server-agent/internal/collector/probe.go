@@ -96,6 +96,10 @@ func SafeProbePath(p string) bool {
 //     Source: ollama/ollama, docs/api.md "Show Model Information",
 //     https://github.com/ollama/ollama/blob/main/docs/api.md
 //
+//   - vllm_sr: GET /v1/models -> {"api_version": "...", "data":[{"limits":
+//     {"max_input_tokens": N}}, ...]}; the first entry carrying the limit
+//     wins, with the best-effort scan below as the fallback.
+//
 //   - "custom", "", and any other value: best-effort — scans the decoded
 //     JSON body at any depth for the first key matching n_ctx, max_model_len,
 //     or context_length (exactly, or by a ".context_length" suffix to also
@@ -112,9 +116,27 @@ func SafeProbePath(p string) bool {
 // client falls back to http.DefaultClient, for existing/incidental callers
 // that have no such concern.
 func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, contextPath, model string) (int, error) {
+	info, err := ProbeContextInfo(ctx, client, baseURL, specType, contextPath, model)
+	return info.Size, err
+}
+
+// ContextInfo is what one context probe reads from a single document: the
+// context size and, for a "vllm_sr" child only, the top-level api_version of
+// the same /v1/models body ("" for every other type or when absent).
+type ContextInfo struct {
+	Size       int
+	APIVersion string
+}
+
+// ProbeContextInfo is ProbeContext plus the vllm-sr api_version read from the
+// same response body (ADR-099), so no second request is spent on it. The agent
+// only records the version; it never judges it. Errors and the router-mode
+// verdict are exactly ProbeContext's.
+func ProbeContextInfo(ctx context.Context, client *http.Client, baseURL, specType, contextPath, model string) (ContextInfo, error) {
+	var zero ContextInfo
 	path := strings.TrimSpace(contextPath)
 	if path == "" {
-		return 0, fmt.Errorf("probe context: no context path configured")
+		return zero, fmt.Errorf("probe context: no context path configured")
 	}
 
 	normalizedType := strings.ToLower(strings.TrimSpace(specType))
@@ -126,25 +148,25 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 	if normalizedType == "ollama" {
 		model = strings.TrimSpace(model)
 		if model == "" {
-			return 0, ErrOllamaModelRequired
+			return zero, ErrOllamaModelRequired
 		}
 		reqBody, merr := json.Marshal(struct {
 			Model string `json:"model"`
 		}{Model: model})
 		if merr != nil {
-			return 0, fmt.Errorf("probe context: %w", merr)
+			return zero, fmt.Errorf("probe context: %w", merr)
 		}
 		body, _, err = fetchProbeBodyWith(ctx, client, baseURL, http.MethodPost, path, reqBody)
 	} else {
 		body, _, err = fetchProbeBody(ctx, client, baseURL, path)
 	}
 	if err != nil {
-		return 0, fmt.Errorf("probe context: %w", err)
+		return zero, fmt.Errorf("probe context: %w", err)
 	}
 
 	var v any
 	if err := json.Unmarshal(body, &v); err != nil {
-		return 0, fmt.Errorf("probe context: parse response: %w", err)
+		return zero, fmt.Errorf("probe context: parse response: %w", err)
 	}
 
 	// llama.cpp router mode answers /props with a dummy carrying "role":
@@ -154,15 +176,19 @@ func ProbeContext(ctx context.Context, client *http.Client, baseURL, specType, c
 	// every other body, none of which carries a top-level "role": "router".
 	if obj, ok := v.(map[string]any); ok {
 		if role, ok := obj["role"].(string); ok && role == "router" {
-			return 0, ErrRouterMode
+			return zero, ErrRouterMode
 		}
 	}
 
 	n, ok := extractContext(normalizedType, v)
 	if !ok {
-		return 0, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
+		return zero, fmt.Errorf("probe context: no context field found for spec type %q at %s", specType, path)
 	}
-	return n, nil
+	info := ContextInfo{Size: n}
+	if normalizedType == "vllm_sr" {
+		info.APIVersion = extractVLLMSRAPIVersion(v)
+	}
+	return info, nil
 }
 
 // ErrOllamaModelRequired is the distinct error ProbeContext returns for the
@@ -921,6 +947,8 @@ func extractContext(specType string, v any) (int, bool) {
 		return extractTGIContext(v)
 	case "ollama":
 		return extractOllamaContext(v)
+	case "vllm_sr":
+		return extractVLLMSRContext(v)
 	default: // "custom", "", and any unrecognized type.
 		return extractBestEffortContext(v)
 	}
@@ -947,6 +975,31 @@ func extractVLLMContext(v any) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// extractVLLMSRContext reads data[].limits.max_input_tokens from a vllm-sr
+// /v1/models body, taking the first entry that carries it, and otherwise falls
+// back to the best-effort key scan.
+func extractVLLMSRContext(v any) (int, bool) {
+	if obj, ok := v.(map[string]any); ok {
+		arr, _ := obj["data"].([]any)
+		for _, item := range arr {
+			m, _ := item.(map[string]any)
+			limits, _ := m["limits"].(map[string]any)
+			if n, ok := asInt(limits["max_input_tokens"]); ok {
+				return n, true
+			}
+		}
+	}
+	return extractBestEffortContext(v)
+}
+
+// extractVLLMSRAPIVersion reads the top-level api_version string of a vllm-sr
+// /v1/models body ("" when absent or not a string).
+func extractVLLMSRAPIVersion(v any) string {
+	obj, _ := v.(map[string]any)
+	s, _ := obj["api_version"].(string)
+	return strings.TrimSpace(s)
 }
 
 // extractLlamaCppContext reads default_generation_settings.n_ctx from a

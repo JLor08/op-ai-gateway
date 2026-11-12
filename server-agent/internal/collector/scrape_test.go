@@ -149,3 +149,17 @@ func TestScraperRejectsNon2xx(t *testing.T) {
 		t.Fatalf("Scrape on a 400 reply = (%d, %d, nil), want a non-nil error", active, queue)
 	}
 }
+
+func TestScraperVLLMSRQueueDepth(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("# HELP vllm_srun_queue_depth q\nvllm_srun_queue_depth 3\n"))
+	}))
+	defer ts.Close()
+	active, queue, err := NewScraper(ts.URL, ts.Client()).Scrape(context.Background())
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if queue != 3 || active != 0 {
+		t.Errorf("active/queue = %d/%d, want 0/3 (no running metric exists for vllm-sr)", active, queue)
+	}
+}

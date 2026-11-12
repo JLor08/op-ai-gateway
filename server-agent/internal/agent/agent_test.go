@@ -5410,3 +5410,56 @@ func TestCollectSkipsRPCServerProbes(t *testing.T) {
 		t.Fatalf("Runtimes = %+v", got)
 	}
 }
+
+// TestCollectOnceVLLMSRRecordsAPIVersionAndSkipsProps proves a vllm_sr child's
+// context probe of /v1/models yields the input limit and the top-level
+// api_version, and that no /props request is ever made for it. A vllm child
+// carries no api_version.
+func TestCollectOnceVLLMSRRecordsAPIVersionAndSkipsProps(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"api_version":"5.0.0","data":[{"id":"m"},{"id":"n","limits":{"max_input_tokens":32768}}]}`))
+		case "/metrics":
+			_, _ = w.Write([]byte("vllm_srun_queue_depth 3\n"))
+		case "/props":
+			atomic.AddInt32(&propsHits, 1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	run := func(typ string) sample.RuntimeSample {
+		drv := newFakeRuntimeDriver()
+		drv.setActive(true)
+		drv.setStatuses([]runtimectl.Status{{
+			SpecID: "rspec_sr", Model: "m", State: runtimectl.StateRunning, PID: 4545,
+			Port: portFromURL(t, srv.URL), Type: typ,
+			MetricsPath: "/metrics", ContextProbePath: "/v1/models",
+		}})
+		poster := &capturePoster{}
+		a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+		a.collectOnce(context.Background())
+		a.collectOnce(context.Background()) // cached cycle keeps the version
+		last := poster.last()
+		if last == nil || len(last.Runtimes) != 1 {
+			t.Fatalf("Runtimes = %+v", last)
+		}
+		return last.Runtimes[0]
+	}
+
+	sr := run("vllm_sr")
+	if sr.RuntimeAPIVersion != "5.0.0" || sr.ContextSize != 32768 || sr.QueueDepth != 3 {
+		t.Errorf("vllm_sr sample = api %q ctx %d queue %d; want 5.0.0 / 32768 / 3", sr.RuntimeAPIVersion, sr.ContextSize, sr.QueueDepth)
+	}
+	if n := atomic.LoadInt32(&propsHits); n != 0 {
+		t.Errorf("/props hits for vllm_sr = %d, want 0", n)
+	}
+	if v := run("vllm"); v.RuntimeAPIVersion != "" {
+		t.Errorf("vllm sample api_version = %q, want empty", v.RuntimeAPIVersion)
+	}
+}

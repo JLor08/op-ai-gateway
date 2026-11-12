@@ -1499,3 +1499,47 @@ func TestSafeProbePath(t *testing.T) {
 		}
 	}
 }
+
+const vllmSRModelsBody = `{"object":"list","api_version":"5.0.0","data":[{"id":"a","object":"model"},{"id":"b","object":"model","limits":{"max_input_tokens":32768}}]}`
+
+func TestExtractContext_VLLMSRReadsFirstLimitsEntry(t *testing.T) {
+	var v any
+	if err := json.Unmarshal([]byte(vllmSRModelsBody), &v); err != nil {
+		t.Fatal(err)
+	}
+	n, ok := extractContext("vllm_sr", v)
+	if !ok || n != 32768 {
+		t.Errorf("extractContext(vllm_sr) = %d, %v; want 32768, true", n, ok)
+	}
+}
+
+func TestExtractContext_VLLMSRFallsBackBestEffort(t *testing.T) {
+	var v any
+	if err := json.Unmarshal([]byte(`{"api_version":"5.0.0","data":[{"id":"a","max_model_len":2048}]}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	n, ok := extractContext("vllm_sr", v)
+	if !ok || n != 2048 {
+		t.Errorf("fallback = %d, %v; want 2048, true", n, ok)
+	}
+	if _, ok := extractContext("vllm_sr", map[string]any{"data": []any{}}); ok {
+		t.Error("empty body must report no context")
+	}
+}
+
+func TestProbeContextInfo_VLLMSRReturnsAPIVersion(t *testing.T) {
+	ts := newProbeServer(t, vllmSRModelsBody)
+	info, err := ProbeContextInfo(context.Background(), ts.Client(), ts.URL, "vllm_sr", "/v1/models", "")
+	if err != nil {
+		t.Fatalf("ProbeContextInfo: %v", err)
+	}
+	if info.Size != 32768 || info.APIVersion != "5.0.0" {
+		t.Errorf("info = %+v, want size 32768 api_version 5.0.0", info)
+	}
+	// A non-vllm_sr type never reports an api_version.
+	vts := newProbeServer(t, `{"api_version":"9","data":[{"id":"m","max_model_len":4096}]}`)
+	info, err = ProbeContextInfo(context.Background(), vts.Client(), vts.URL, "vllm", "/v1/models", "")
+	if err != nil || info.APIVersion != "" || info.Size != 4096 {
+		t.Errorf("vllm info = %+v, err %v; want size 4096, no api_version", info, err)
+	}
+}

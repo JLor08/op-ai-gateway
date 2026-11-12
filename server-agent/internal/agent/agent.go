@@ -408,7 +408,14 @@ import (
 // (runtime.cluster_member_unreachable, non-terminal, instead of a terminal
 // device_backend_mismatch), and a member's reported command carries the
 // arguments and environment the agent adds.
-const Version = "0.18.1"
+//
+// 0.18.1 -> 0.18.2 is the single bump for the vLLM Semantic Router worker
+// (#373 Phase 3). PATCH: no agent.Features entry changes, but a vllm_sr child's
+// context size is read from data[].limits.max_input_tokens, its
+// vllm_srun_queue_depth gauge feeds queue_depth, its /v1/models api_version
+// rides the runtime sample as runtime_api_version, and the /props capability
+// probe is skipped for it.
+const Version = "0.18.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1609,6 +1616,8 @@ type runtimeCtxEntry struct {
 	contextProbePath string
 	model            string
 	size             int
+	// apiVersion is the vllm_sr api_version read from the same body as size.
+	apiVersion string
 }
 
 // runtimeCapabilityEntry is one cached capability-probe result: the PID it
@@ -1783,11 +1792,13 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		// A cached size means a prior probe on this exact (pid, type, path,
 		// model) generation already succeeded.
 		rs.ContextSize = entry.size
+		rs.RuntimeAPIVersion = entry.apiVersion
 		return "ok"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	size, err := collector.ProbeContext(cctx, client, base, st.Type, st.ContextProbePath, model)
+	info, err := collector.ProbeContextInfo(cctx, client, base, st.Type, st.ContextProbePath, model)
 	cancel()
+	size := info.Size
 	if errors.Is(err, collector.ErrRouterMode) {
 		// llama.cpp router mode: /props answered with the router dummy
 		// ("role": "router", n_ctx 0). Report the mode itself rather than
@@ -1818,8 +1829,10 @@ func (a *Agent) probeRuntimeChildContext(ctx context.Context, client *http.Clien
 		contextProbePath: st.ContextProbePath,
 		model:            model,
 		size:             size,
+		apiVersion:       info.APIVersion,
 	}
 	rs.ContextSize = size
+	rs.RuntimeAPIVersion = info.APIVersion
 	return "ok"
 }
 
@@ -1914,7 +1927,7 @@ func (a *Agent) clock() time.Time {
 // was that a child is never asked a second time just to answer a second
 // question.
 //
-// WHICH document is read, one of four, is what st.Type decides here (and,
+// WHICH document is read, one of four (or none, for vllm_sr), is what st.Type decides here (and,
 // for two of them, whether the gateway lets it be sent at all -- see the
 // gate below):
 //
@@ -1939,6 +1952,9 @@ func (a *Agent) clock() time.Time {
 //     its mode (for a tts or clon model, speech_streaming from its mode),
 //     and nothing else; its LiveProgress is ALWAYS "", because audio.cpp has no
 //     timings surface.
+//   - "vllm_sr": no probe at all -- the vLLM Semantic Router worker serves
+//     no /props and no capability document, so nothing is requested and
+//     nothing is sent.
 //   - EVERY other type, "custom" INCLUDED: collector.ProbePropsVerdicts
 //     GETs collector.LiveProgressProbePath ("/props").
 //
@@ -2055,6 +2071,11 @@ func (a *Agent) clock() time.Time {
 // miss both set it after the gate checks above, never before them. No other
 // probe sets the collector field, so it stays nil for every other type.
 func (a *Agent) probeRuntimeChildProps(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) {
+	if st.Type == "vllm_sr" {
+		// vllm-sr serves no /props and no capability document; probing it
+		// would spend a request to learn nothing.
+		return
+	}
 	key, model := runtimeProbeKey(st), probeModel(st)
 	if entry, ok := a.runtimeCapabilityCache[key]; ok && entry.pid == st.PID &&
 		entry.specType == st.Type && entry.model == model {
