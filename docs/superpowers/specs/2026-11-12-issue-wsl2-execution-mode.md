@@ -97,7 +97,7 @@ All facts were checked on 2026-11-12 against primary sources. Microsoft's WSL is
 - **The engines reserve their VRAM up front, as a configurable fraction of the card:**
   - vLLM `--gpu-memory-utilization`: "a per-instance limit". Its default has moved between versions (0.9 → 0.92; the latest docs say 1.0 with the extensible KV cache). So it is a predictable number only when it is set explicitly ([engine args](https://docs.vllm.ai/en/latest/configuration/engine_args.html)).
   - SGLang `--mem-fraction-static`: weights plus the KV pool. sglang-omni accepts it for every engine stage ([config](https://sgl-project.github.io/sglang-omni/developer_reference/config.html)).
-  - That makes a **start delta** a stable per-workload figure, as long as nothing else starts at the same moment. **Unverified** (Phase 0, B2).
+  - That makes a **start delta** a stable per-workload figure, as long as nothing else starts at the same moment. B2 confirmed this at the adapter level (below).
 - **Multi-GPU (Phase 0, B3, same host, one RTX 4090 and two RTX 5090):**
   - Inside WSL, `torch.cuda.device_count()` is 3.
   - `nvidia-smi` inside WSL reports **the same indices and PCI bus IDs as on the host** (0 → `21:00.0`, 1 → `C1:00.0`, 2 → `E1:00.0`).
@@ -293,8 +293,8 @@ The drain grace (10 s) and kill grace (5 s) carry over unchanged. The generation
 
 ## Phased plan
 
-**Phase 0: verify on a real Windows 11 host. No product code.**
-The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, the same host class as ADR-031's measurement. Each result is recorded in this issue before Phase 1 starts, together with the Windows build, the WSL version (`wsl --version`), the GPU count and the driver version. The Phase 1 and Phase 2 acceptance runs use the same host, because CI has no Windows job (§11.3).
+**Phase 0: verify on a real Windows 11 host. No product code. Done on 2026-11-12; all items below are answered.**
+The owner ran Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, the same host class as ADR-031's measurement. Each result is recorded in this issue, and a later re-run should record it together with the Windows build, the WSL version (`wsl --version`), the GPU count and the driver version. The Phase 1 and Phase 2 acceptance runs use the same host, because CI has no Windows job (§11.3).
 - **B1** ✅ Which host process holds the VM's GPU memory, per adapter, and do its LUIDs resolve? Answer: `vmwp`, carrying the host's adapter LUIDs (see "GPU and VRAM").
 - **B2** ✅ (adapter level) Is the VM's per-GPU figure additive across two vLLM starts, and does it fall when one stops? Answer: yes. WMI collapses same-named instances (see "GPU and VRAM").
 - **B2b** ✅ Read through the PDH array API (`PdhAddEnglishCounterW` plus `PdhGetFormattedCounterArrayW`, as the agent does): with two WSL GPU processes, does `vmwp` appear as two same-named instances whose values match each process? Answer: yes, one instance per guest GPU process, in an order that is not stable.
@@ -338,7 +338,7 @@ The owner runs Phase 0 on a Windows 11 Pro AI server with several NVIDIA GPUs, t
 
 1. **Which `vmwp`.** B1 showed that the WSL VM's GPU memory sits on a `vmwp` process. Every Hyper-V VM has its own `vmwp`, though, so a host that also runs other VMs with GPU partitioning has several. How does the agent pick the WSL VM's worker reliably? Candidates: the VM's identity (the `NT VIRTUAL MACHINE\<VM GUID>` account, matched against WSL's utility VM), or the `vmwp` whose usage grows when a WSL start is observed. On a host without other GPU VMs there is only one, which is the case Phase 2 must handle first.
 2. *(answered by B1: the LUIDs are the host's.)*
-3. **Settle criterion for the start delta.** A fixed time after the first passing health probe, or two equal beats? vLLM captures CUDA graphs before it reports healthy, so the delta is probably stable at that point (unverified).
+3. **Settle criterion for the start delta.** A fixed time after the first passing health probe, or two equal beats? vLLM captures its CUDA graphs before it reports ready: in B5's log the capture finishes before "Application startup complete". So the delta is probably stable at the first passing probe. Engines other than vLLM are unmeasured.
 4. **Session 0.** If B4 fails, is a per-user helper acceptable, or should WSL mode require an interactive logon?
 5. **User systemd scope versus a shim.** If `systemd-run --user` is unavailable or unreliable in WSL, should a tiny root-free Linux shim, cross-built from `server-agent`, own the process group and signal forwarding (SIGHUP → SIGTERM with grace) instead? Per-workload RAM would then come from the sum of PSS over the group instead of a cgroup.
 6. **Config files on hosts with automount disabled.** Write them into the distro through a fixed `wsl.exe --exec` helper instead of `/mnt/c`?
