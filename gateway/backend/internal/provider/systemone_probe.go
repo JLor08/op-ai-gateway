@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"op-ai-gateway/internal/routing"
+	"strings"
 )
 
 // systemOnePath is the System One decision endpoint the probe asks. It is the
@@ -39,6 +40,12 @@ const systemOneProbeQuestion = "Is the state non-empty?"
 //     SystemOneProbeNo;
 //   - anything else -- a transport failure or timeout, a 400, a 5xx other than
 //     501, a 2xx without the answer or that is not JSON -- is no verdict: "".
+//
+// One 404 is not a no: the agent router's OWN 404, its error envelope with a
+// runtime.* code (runtime.model_not_managed for a model whose spec it no longer
+// holds, say), comes from the router before any child was asked, so it says
+// nothing about the model and is no verdict ("", ErrUnavailable). A 501 is a
+// no whatever its body.
 //
 // "" is the only verdict that is not an answer, so the caller writes nothing
 // for it and asks again later. err is nil for both real verdicts and, for "",
@@ -79,6 +86,26 @@ type systemOneProbeAnswer struct {
 	} `json:"answers"`
 }
 
+// agentRouterErrorCodePrefix starts every error code the server agent's
+// runtime router writes itself (its errorEnvelope), as opposed to an answer
+// the upstream child gave.
+const agentRouterErrorCodePrefix = "runtime."
+
+// agentRouterErrorCode returns the error.code of body when body is the agent
+// router's own error envelope ({"error":{"code":"runtime.…","message":…}}),
+// and "" for any other body, an empty or unparseable one included.
+func agentRouterErrorCode(body []byte) string {
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil || !strings.HasPrefix(envelope.Error.Code, agentRouterErrorCodePrefix) {
+		return ""
+	}
+	return envelope.Error.Code
+}
+
 // probeSystemOne is the POST behind ProbeSystemOne. Modelled on
 // fetchSdcppDoc: it honours target.Timeout, attaches the per-application
 // upstream credential from ctx, and bounds the answer at 1 MiB.
@@ -110,14 +137,20 @@ func probeSystemOne(ctx context.Context, httpClient *http.Client, target routing
 	}
 	defer resp.Body.Close()
 	switch {
-	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusNotImplemented:
+	case resp.StatusCode == http.StatusNotImplemented:
 		return SystemOneProbeNo, nil
-	case resp.StatusCode < 200 || resp.StatusCode >= 300:
+	case resp.StatusCode != http.StatusNotFound && (resp.StatusCode < 200 || resp.StatusCode >= 300):
 		return "", unavailableStatus(resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return "", fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		if code := agentRouterErrorCode(body); code != "" {
+			return "", fmt.Errorf("%w: the agent router answered 404 %s", ErrUnavailable, code)
+		}
+		return SystemOneProbeNo, nil
 	}
 	var answer systemOneProbeAnswer
 	if err := json.Unmarshal(body, &answer); err != nil {

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -427,4 +428,75 @@ func TestSystemOnePassRetriesAVerdictTheStoreDidNotTake(t *testing.T) {
 		t.Fatalf("after the back-off the upstream saw %d requests, want 2", n)
 	}
 	st.assertCapability(t, "m1", routing.CapabilityDecision, routing.CapabilityYes, routing.CapabilitySourceSystemOneProbe)
+}
+
+// systemOneFakeProber records the target and model of every System One probe
+// and answers yes. It embeds fakeProber for the loop's other probes.
+type systemOneFakeProber struct {
+	*fakeProber
+	soMu      sync.Mutex
+	soTargets []routing.Target
+	soModels  []string
+}
+
+func (f *systemOneFakeProber) ProbeSystemOne(_ context.Context, target routing.Target, model string) (string, error) {
+	f.soMu.Lock()
+	defer f.soMu.Unlock()
+	f.soTargets = append(f.soTargets, target)
+	f.soModels = append(f.soModels, model)
+	return routing.CapabilityYes, nil
+}
+
+// TestSystemOnePassUsesItsOwnProbeTimeout: a System One answer is a real
+// inference, so the probe target carries systemOneProbeTimeout and not the
+// health loop's short probe timeout (which a slow model would never beat,
+// leaving the verdict unsettled and an agent child's idle timer refreshed on
+// every retry).
+func TestSystemOnePassUsesItsOwnProbeTimeout(t *testing.T) {
+	shrinkRetryGap(t)
+	app := systemOneApp(routing.ProviderLlamaCPP, 8001, routing.APIFlavorDecisions)
+	st := newHealthTestStore(app)
+	st.mappings = map[string][]routing.ModelMapping{"a1": {systemOneMapping("m1", "decider")}}
+	prober := &systemOneFakeProber{fakeProber: newFakeProber()}
+	runner := &appHealthRunner{
+		store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil),
+		settings: st, probeTimeout: 3 * time.Second, now: time.Now,
+	}
+
+	runCapabilityCycle(runner)
+
+	prober.soMu.Lock()
+	defer prober.soMu.Unlock()
+	if len(prober.soTargets) != 1 {
+		t.Fatalf("probes = %+v, want exactly one", prober.soTargets)
+	}
+	got := prober.soTargets[0]
+	if got.Provider != routing.ProviderLlamaCPP || got.Endpoint != "http://s1.local:8001" || got.Timeout != systemOneProbeTimeout || prober.soModels[0] != "decider" {
+		t.Fatalf("probe = {Provider:%s Endpoint:%s Timeout:%v} for %q, want {llama_cpp http://s1.local:8001 %v} for decider",
+			got.Provider, got.Endpoint, got.Timeout, prober.soModels[0], systemOneProbeTimeout)
+	}
+	if systemOneProbeTimeout != 30*time.Second {
+		t.Fatalf("systemOneProbeTimeout = %v, want 30s", systemOneProbeTimeout)
+	}
+}
+
+// TestSystemOnePassTreatsARouter404AsNoVerdict: a 404 the agent router writes
+// itself (runtime.model_not_managed, say: a spec dropped while the loaded
+// snapshot still names the model) asked no child, so it writes no sticky
+// decision: no; it backs off like any other inconclusive answer.
+func TestSystemOnePassTreatsARouter404AsNoVerdict(t *testing.T) {
+	up := newSystemOneUpstream(t)
+	up.answer(http.StatusNotFound, `{"error":{"code":"runtime.model_not_managed","message":"model decider is not managed"}}`)
+	runner, st, loaded := agentSystemOneRunner(t, up)
+	loaded.SetGatewayProbe("a1", []string{"decider"})
+
+	runCapabilityCycle(runner)
+	runCapabilityCycle(runner)
+
+	if n := len(up.requests()); n != 1 {
+		t.Fatalf("router saw %d requests, want 1 (the second pass is inside the back-off)", n)
+	}
+	if row, ok := st.capabilityOf("m1", routing.CapabilityDecision); ok {
+		t.Fatalf("a router 404 wrote %+v, want no decision row", row)
+	}
 }

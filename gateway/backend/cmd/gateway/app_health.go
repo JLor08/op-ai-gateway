@@ -56,6 +56,13 @@ var (
 	systemOneRetryBackoff = 5 * time.Minute
 )
 
+// systemOneProbeTimeout bounds one System One decision probe (probeSystemOne).
+// It is the probe's own, not the loop's probeTimeout: the answer is a real
+// inference, which a slow model would never finish within the few seconds a
+// reachability probe gets, so the verdict would never settle and the retry
+// every systemOneRetryBackoff would keep refreshing an agent child's idle timer.
+const systemOneProbeTimeout = 30 * time.Second
+
 // healthStore is the store surface the app-health loop needs. *store.SQLiteStore
 // and *routing.MemoryStore both satisfy it.
 type healthStore interface {
@@ -1809,13 +1816,17 @@ func systemOneProbeKey(mappingID, identity string) string {
 //     name).
 //   - A server_agent mapping is asked through the agent router at the same
 //     endpoint, with its runtime spec's credential (routing.SpecUpstreamAuth),
-//     once per (mapping, agentSpecIdentity), and ONLY while the agent reports
+//     once per (mapping, agentSpecIdentity), and only while the agent reports
 //     its model loaded (LoadedAppModels): the router starts a child for any
-//     request naming it and refreshes its idle timer on every one, so asking an
-//     unloaded model would cold-start it and asking a loaded one again would
-//     keep it alive. A runtime spec read that fails asks none of the
-//     application's mappings this tick, since their effective flavors cannot be
-//     told.
+//     request naming it and refreshes its idle timer on every one, so the pass
+//     does not ask a model the agent reports unloaded, and does not ask a loaded
+//     one again once settled. The loaded set is a snapshot, so a model that
+//     unloads within its staleness can still be started once by the probe. A
+//     runtime spec read that fails asks none of the application's mappings this
+//     tick, since their effective flavors cannot be told.
+//
+// The probe target carries systemOneProbeTimeout, not the loop's probeTimeout:
+// the answer is a real inference.
 //
 // A verdict (yes or no) that landed settles the key for this process
 // (systemOneSettled), so a gateway restart re-probes once. No verdict writes
@@ -1850,8 +1861,11 @@ func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIS
 	target := routing.Target{
 		Provider: app.Type,
 		Endpoint: routing.ApplicationEndpoint(server, app),
-		Timeout:  r.probeTimeout,
+		Timeout:  systemOneProbeTimeout,
 	}
+	// One instant for the whole pass: the back-off windows it opens and the
+	// CheckedAt of the rows it writes.
+	now := r.now()
 	for _, mp := range mappings {
 		if mp.Status != routing.ServerStatusActive || mp.AppModelName == "" {
 			continue
@@ -1872,14 +1886,13 @@ func (r *appHealthRunner) probeSystemOne(ctx context.Context, server routing.AIS
 				continue
 			}
 		}
-		now := r.now()
 		if r.systemOneSettled.has(key) || r.systemOneBackoff.active(key, now) {
 			continue
 		}
 		// Attach the credential to the probe (fail-open).
 		token, _ := capture.OpenSecret(r.cipher, authToken)
 		verdict, err := prober.ProbeSystemOne(provider.WithUpstreamAuth(ctx, authHeader, token), target, mp.AppModelName)
-		rows := systemOneCapabilityRows(verdict, r.now())
+		rows := systemOneCapabilityRows(verdict, now)
 		if len(rows) == 0 {
 			r.systemOneBackoff.start(key, now, now.Add(systemOneRetryBackoff))
 			if errors.Is(err, provider.ErrAuthRejected) {
@@ -2477,7 +2490,8 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 		// flavors include decisions with one tiny POST /v1/systemone and write
 		// the decision verdict (probeSystemOne). External applications and
 		// agent-launched children alike; a child only while the agent reports
-		// it loaded, so the pass never cold-starts one. An application that
+		// it loaded (a model that unloads within the loaded snapshot's
+		// staleness can still be started once by the probe). An application that
 		// does not declare decisions has no mapping the rule could admit
 		// (routing.MappingHasAPIFlavor asks the application first), so it
 		// costs no goroutine and no store read. Its own "systemone:"+id

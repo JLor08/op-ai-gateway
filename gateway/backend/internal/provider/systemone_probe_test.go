@@ -33,6 +33,12 @@ func TestProbeSystemOneClassifies(t *testing.T) {
 		{"a non-JSON 2xx is no verdict", http.StatusOK, `<html>not an answer</html>`, 0, ""},
 		{"404 is a no", http.StatusNotFound, `{"error":"not found"}`, 0, SystemOneProbeNo},
 		{"501 is a no", http.StatusNotImplemented, `{"error":"not implemented"}`, 0, SystemOneProbeNo},
+		// The agent router's own 404 (its error envelope with a runtime.*
+		// code) says nothing about the model: no verdict, not a no.
+		{"a router 404 is no verdict", http.StatusNotFound, `{"error":{"code":"runtime.model_not_managed","message":"x"}}`, 0, ""},
+		{"an empty 404 is a no", http.StatusNotFound, ``, 0, SystemOneProbeNo},
+		{"a 404 with another error code is a no", http.StatusNotFound, `{"error":{"code":"not_found","message":"x"}}`, 0, SystemOneProbeNo},
+		{"a 501 with a runtime code is still a no", http.StatusNotImplemented, `{"error":{"code":"runtime.model_not_managed","message":"x"}}`, 0, SystemOneProbeNo},
 		{"400 is no verdict", http.StatusBadRequest, `{"error":"bad request"}`, 0, ""},
 		{"503 is no verdict", http.StatusServiceUnavailable, `{"error":"loading"}`, 0, ""},
 		{"a timeout is no verdict", http.StatusOK, `{"answers":{"probe":{"type":"noul","noul":0.9}}}`, 200 * time.Millisecond, ""},
