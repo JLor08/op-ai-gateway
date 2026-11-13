@@ -615,8 +615,8 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.18.2" {
-		t.Fatalf("Version = %q, want 0.18.2 (the vllm_sr PATCH bump; runtime_stop keeps Since 0.17.0)", Version)
+	if Version != "0.19.0" {
+		t.Fatalf("Version = %q, want 0.19.0 (the WSL MINOR bump; runtime_stop keeps Since 0.17.0)", Version)
 	}
 }
 
@@ -639,7 +639,28 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.18.2" {
-		t.Fatalf("Version = %q, want 0.18.2 (a PATCH bump: rpc_cluster keeps Since 0.18.0)", Version)
+	if Version != "0.19.0" {
+		t.Fatalf("Version = %q, want 0.19.0 (the WSL MINOR bump: rpc_cluster keeps Since 0.18.0)", Version)
+	}
+}
+
+func TestFeaturesDeclareRuntimeExecWSL(t *testing.T) {
+	if FeatureRuntimeExecWSL != "runtime_exec_wsl" {
+		t.Fatalf("FeatureRuntimeExecWSL = %q, want the wire literal runtime_exec_wsl", FeatureRuntimeExecWSL)
+	}
+	found := false
+	for _, f := range Features {
+		if f.Name == "runtime_exec_wsl" {
+			found = true
+			if f.Since != "0.19.0" {
+				t.Fatalf("runtime_exec_wsl Since = %q, want 0.19.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_exec_wsl")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_exec_wsl") {
+		t.Fatal("FeatureNames() does not carry runtime_exec_wsl")
 	}
 }

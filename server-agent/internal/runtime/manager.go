@@ -2089,6 +2089,14 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Replicable = false
 		s.MinInstances = 0
 		s.MaxInstances = 0
+		// Execution stays in the comparison (#381): the mode and the WSL distro
+		// decide which process is exec'd and where. Only the spelling is
+		// normalised, so an absent block and an explicit native one -- the same
+		// launch -- do not bounce a healthy child when a gateway starts sending
+		// the explicit form.
+		if s.Execution != nil && s.Execution.Mode == ExecutionModeNative {
+			s.Execution = nil
+		}
 		// Kind, DeviceBackend, Cluster and RPC stay in the comparison: they
 		// decide what is exec'd and how (a member's bind and port, a head's
 		// ordered endpoint list). The one exception is the connection
