@@ -1697,14 +1697,15 @@ type owner struct {
 	// wslUIDInFlight names the distros whose lookup is running, so a burst of
 	// starts asks each distro once (requestWSLUID).
 	wslUIDInFlight map[string]bool
-	// wslSweepDue names the distros the orphan sweep has yet to visit: set at
-	// the first applyConfig, cleared as each distro's first UID answer starts
-	// its sweep, so a distro that cannot be reached at first is swept once it
-	// can.
+	// wslSweepDue names the distros the orphan sweep has yet to visit: set by
+	// the applyConfig whose document first names the distro in a wsl spec,
+	// cleared as the distro's first UID answer starts its sweep, so a distro
+	// that cannot be reached at first is swept once it can.
 	wslSweepDue map[string]bool
-	// wslWarmed is set by the first applyConfig, which starts the UID lookups
-	// and the orphan sweep of the manager's lifetime (maybeWarmWSL).
-	wslWarmed bool
+	// wslWarmed names the distros an applyConfig has warmed: the UID lookup
+	// started and the orphan sweep marked due, once per distro in the
+	// manager's lifetime, for the distros wsl specs name (maybeWarmWSL).
+	wslWarmed map[string]bool
 	// ramFreedMB is the host RAM that managed processes held when they exited
 	// and that the hardware sample has not necessarily caught up with yet, valid
 	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
@@ -1941,13 +1942,15 @@ func (o *owner) applyConfig(cfg Config) {
 	}
 	defer o.purgeChangedHeadCaches(memberHeads, cfg.Specs)
 	defer o.maybeSweepMemberCaches(cfg.Specs)
-	// The first document starts the UID lookups for every allowed distro, off
-	// the owner, before anything in it is admitted -- so its wsl starts wait
-	// for those lookups instead of asking again -- and each answer starts that
-	// distro's sweep of the units an earlier agent run left behind. Starts this
-	// document triggers run concurrently with the sweep; the nonce keeps their
-	// units out of its reach.
-	o.maybeWarmWSL()
+	// The document starts the UID lookup of every allowed distro its wsl specs
+	// name and no earlier document did, off the owner, before anything in it is
+	// admitted -- so its wsl starts wait for those lookups instead of asking
+	// again -- and each answer starts that distro's sweep of the units an
+	// earlier agent run left behind. A document with no wsl spec calls into no
+	// distro, so it never boots the WSL VM. Starts this document triggers run
+	// concurrently with the sweep; the nonce keeps their units out of its
+	// reach.
+	o.maybeWarmWSL(cfg.Specs)
 
 	newIDs := make(map[string]bool, len(cfg.Specs))
 	bases := make(map[string]Spec, len(cfg.Specs))

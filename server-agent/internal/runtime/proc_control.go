@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -201,7 +202,7 @@ func (o *owner) requestWSLUID(distro string) {
 // detail and fails the start of every instance waiting for that distro, with
 // the generic wslUIDFailureMessage: start_failed, then the ordinary crash-loop
 // backoff, whose retry asks the distro again (requestWSLUID; failures are
-// never cached). A lookup nobody waits for (the first applyConfig's) fails
+// never cached). A lookup nobody waits for (a document's pre-warm) fails
 // silently but for the log.
 func (o *owner) handleWSLUIDResolved(c cmdWSLUIDResolved) {
 	delete(o.wslUIDInFlight, c.distro)
@@ -333,10 +334,11 @@ func wslExitMessage(exitCode int) string {
 	return fmt.Sprintf("wsl.exe could not run the workload (exit %d); see the runtime log", exitCode)
 }
 
-// maybeWarmWSL runs once per manager lifetime, from the first applyConfig,
-// when WSL is configured: it starts the UID lookup for every allowed distro
-// off the owner (requestWSLUID) and marks every distro as due for its orphan
-// sweep, which the distro's first UID answer starts (handleWSLUIDResolved).
+// maybeWarmWSL runs at every applyConfig, when WSL is configured, for the
+// distros the document's wsl specs name: each allowed one it has not warmed in
+// this manager's lifetime gets its UID lookup started off the owner
+// (requestWSLUID) and is marked as due for its orphan sweep, which the
+// distro's first UID answer starts (handleWSLUIDResolved).
 //
 // The lookups are started before the document's specs are admitted, so a wsl
 // start in it waits for them rather than asking again, and a later start
@@ -345,23 +347,38 @@ func wslExitMessage(exitCode int) string {
 // update): its workload still holds the GPU, the RAM and the port inside the
 // VM, invisible to this run. Tying it to the UID answer gives it the bus
 // address it needs without a lookup of its own, and sweeps a distro that was
-// unreachable at first as soon as a later start reaches it. A manager that is
-// never configured never calls into a distro.
-func (o *owner) maybeWarmWSL() {
-	if o.wslWarmed || o.closing {
+// unreachable at first as soon as a later start reaches it.
+//
+// Only distros a wsl spec names, because a call into a distro starts the WSL
+// VM when it is not running: a host whose document runs nothing in WSL must
+// not have its VM booted at every agent start, and a distro no spec names has
+// nothing of this agent's to sweep unless an earlier run's document named it
+// -- the next document that names it again sweeps it then. A distro outside
+// runtime_wsl_allowed_distros is never called into: such a spec is not
+// permitted anyway. A manager that is never configured never calls into a
+// distro.
+func (o *owner) maybeWarmWSL(specs []Spec) {
+	if o.closing {
 		return
 	}
-	o.wslWarmed = true
 	pol := o.policy.WSL
 	if pol.Exe == "" || wslUserRefused(pol.User) {
 		return
 	}
-	o.wslSweepDue = make(map[string]bool)
-	for _, distro := range pol.AllowedDistros {
-		// A file-sourced allowlist entry is not validated like a spec's distro;
-		// only a name a spec could use is passed to wsl.exe -d.
-		if !wslDistroPattern.MatchString(distro) {
+	for _, spec := range specs {
+		distro := spec.WSLDistro()
+		// A distro outside the allowlist is never passed to wsl.exe -d, and
+		// neither is one a spec could not carry (ParseConfig drops it; this
+		// covers a Config handed to Apply directly).
+		if distro == "" || o.wslWarmed[distro] || !slices.Contains(pol.AllowedDistros, distro) || !wslDistroPattern.MatchString(distro) {
 			continue
+		}
+		if o.wslWarmed == nil {
+			o.wslWarmed = make(map[string]bool)
+		}
+		o.wslWarmed[distro] = true
+		if o.wslSweepDue == nil {
+			o.wslSweepDue = make(map[string]bool)
 		}
 		o.wslSweepDue[distro] = true
 		o.requestWSLUID(distro)

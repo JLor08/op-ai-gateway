@@ -665,9 +665,10 @@ func TestWSLUIDIsLookedUpOncePerDistro(t *testing.T) {
 	}
 }
 
-// TestWSLUIDIsPrewarmedAtFirstApply: the first document starts the UID lookup
-// of every allowed distro by itself, with nothing asking for a start, and a
-// later start finds the answer cached.
+// TestWSLUIDIsPrewarmedAtFirstApply: a document starts the UID lookup of
+// every allowed distro a wsl spec in it names, by itself, with nothing asking
+// for a start, and a later start finds the answer cached. An allowed distro no
+// spec names is not called into: a lookup would boot an idle VM.
 func TestWSLUIDIsPrewarmedAtFirstApply(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -685,9 +686,8 @@ func TestWSLUIDIsPrewarmedAtFirstApply(t *testing.T) {
 		}
 		return n
 	}
-	waitUntil(t, 5*time.Second, "the first document's UID lookups for both distros", func() bool {
-		n := asked()
-		return n[wslTestDistro] == 1 && n["Debian"] == 1
+	waitUntil(t, 5*time.Second, "the first document's UID lookup for the spec's distro", func() bool {
+		return asked()[wslTestDistro] == 1
 	})
 	if st := statusFor(m, "S"); st == nil || st.State != StateStopped || st.LastError != nil {
 		t.Errorf("S = %+v, want stopped and untouched: a lookup starts nothing", st)
@@ -697,8 +697,55 @@ func TestWSLUIDIsPrewarmedAtFirstApply(t *testing.T) {
 	}
 
 	ensureWSL(t, m, "m")
-	if n := asked(); n[wslTestDistro] != 1 {
-		t.Errorf("id -u in %s = %d after a start, want 1: the start must find the warmed UID", wslTestDistro, n[wslTestDistro])
+	m.Close() // joins every lookup the manager started, so the count is final
+	if n := asked(); n[wslTestDistro] != 1 || n["Debian"] != 0 {
+		t.Errorf("id -u calls %v after a start, want 1 in %s (the start found the warmed UID) and none in Debian (no spec names it)", n, wslTestDistro)
+	}
+}
+
+// TestWSLPrewarmOnlyDistrosNamedBySpecs: a document with no wsl spec calls
+// into no distro at all -- neither a UID lookup nor the orphan sweep, which
+// would boot the VM at every agent start of a host that runs nothing in WSL.
+// A later document that names an allowed distro warms it then: its lookup, and
+// at the answer its orphan sweep, once per manager lifetime. Each count is
+// read after Close, which joins every call the manager started.
+func TestWSLPrewarmOnlyDistrosNamedBySpecs(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	pol := wslTestPolicy()
+	pol.AllowedDistros = []string{wslTestDistro, "Debian"}
+	native := baseSpec("N", "n")
+	native.Pinned = true
+
+	idle := newWSLTestManagerWith(t, pol, f.runner())
+	idle.Apply(Config{ETag: "v1", Specs: []Spec{native}})
+	waitForState(t, idle, "N", StateRunning)
+	idle.Close()
+	if calls := f.calls(t); len(calls) != 0 {
+		t.Fatalf("a document without wsl specs called into a distro: %+v", calls)
+	}
+
+	m := newWSLTestManagerWith(t, pol, f.runner())
+	m.Apply(Config{ETag: "v1", Specs: []Spec{native}})
+	debian := wslTestSpec(f, "D", "d")
+	debian.Execution.WSL.Distro = "Debian"
+	m.Apply(Config{ETag: "v2", Specs: []Spec{native, debian}})
+	waitUntil(t, 5*time.Second, "Debian's lookup and its sweep's listing", func() bool {
+		return len(f.find(t, "systemctl", "--user", "list-units")) == 1
+	})
+	m.Apply(Config{ETag: "v3", Specs: []Spec{native, debian}})
+	m.Close()
+	for _, c := range f.calls(t) {
+		if c.Argv[1] != "Debian" {
+			t.Errorf("a call into %s, which no spec names: %q", c.Argv[1], c.Argv)
+		}
+	}
+	if n := len(f.find(t, "id", "-u")); n != 1 {
+		t.Errorf("id -u calls = %d after a further document, want 1: a distro is warmed once", n)
+	}
+	if n := len(f.find(t, "systemctl", "--user", "list-units")); n != 1 {
+		t.Errorf("list-units calls = %d after a further document, want 1: the sweep runs once", n)
 	}
 }
 
