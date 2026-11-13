@@ -620,7 +620,7 @@ func speechDurationSeconds(header string) (float64, bool) {
 // duration header, by design) and still leave its quantity at 0.
 //
 // A target that is not audio.cpp (sglang-omni for one, v0.2.0) sends no duration header.
-// With no usable header the quantity falls back to the audio itself: tally, which the
+// With no header at all (absent or empty, never a present-but-unusable one) the quantity falls back to the audio itself: tally, which the
 // copier fed with the relayed body, reads the byte rate off the WAV's `fmt ` chunk and
 // counts the data bytes that were really relayed (speechWavTally.seconds). audio.cpp's
 // header always wins, so its behaviour and logging are unchanged; a body that is no
@@ -632,14 +632,25 @@ func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.
 	value := upstream.Get(speechDurationHeader)
 	seconds, ok := speechDurationSeconds(value)
 	if !ok {
-		if seconds, ok = tally.seconds(); ok {
-			meta.BillingQuantity = seconds
-			return
+		// Only an ABSENT header is a target that is not audio.cpp. A header that is there
+		// but unusable is audio.cpp's own broken statement: it stays the loud zero below.
+		if speechDurationHeaderAbsent(upstream) {
+			if seconds, ok = tally.seconds(); ok {
+				meta.BillingQuantity = seconds
+				return
+			}
 		}
 		slog.Error("speech relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "header", speechDurationHeader, "value", value)
 		return
 	}
 	meta.BillingQuantity = seconds
+}
+
+// speechDurationHeaderAbsent reports whether the upstream sent no duration header at all
+// (absent or empty): the sign of a target that is not audio.cpp, and the only case the WAV
+// fallback applies to.
+func speechDurationHeaderAbsent(h http.Header) bool {
+	return strings.TrimSpace(h.Get(speechDurationHeader)) == ""
 }
 
 // speechWavHeadCap bounds how much of a one-shot speech body speechWavTally keeps to find
@@ -683,8 +694,9 @@ func (t *speechWavTally) feed(chunk []byte) {
 // when no rate can be read (not a RIFF/WAVE body, no consistent `fmt ` chunk before `data`)
 // or when no audio bytes were relayed, since neither states how much audio was produced.
 // When the `data` chunk declares a size smaller than what follows it, only the declared
-// size counts (trailing metadata chunks are not audio); a declaration of 0 or one past
-// what was relayed is the streaming writers' placeholder, and the relayed bytes count.
+// size counts (trailing metadata chunks are not audio); any other declaration (0, or one
+// at least as large as what was relayed: the streaming writers' placeholders) is not
+// believed, and the relayed bytes count.
 func (t *speechWavTally) seconds() (float64, bool) {
 	if t == nil {
 		return 0, false

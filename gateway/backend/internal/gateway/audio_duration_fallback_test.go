@@ -152,6 +152,38 @@ func TestSpeechWavTally(t *testing.T) {
 			t.Fatalf("seconds = (%v, %v), want (1, true)", got, ok)
 		}
 	})
+	t.Run("a LIST chunk between fmt and data is passed over", func(t *testing.T) {
+		var wav bytes.Buffer
+		wav.WriteString("RIFF")
+		wavPut(t, &wav, uint32(0))
+		wav.WriteString("WAVE")
+		wav.Write(wavFmtChunk(t, 24000, 1, 16))
+		wav.Write(wavChunk(t, "LIST", 4, []byte("INFO")))
+		wav.WriteString("data")
+		wavPut(t, &wav, uint32(0xFFFFFFFF))
+		wav.Write(make([]byte, 48000))
+		tally := newSpeechWavTally()
+		tally.feed(wav.Bytes())
+		if got, ok := tally.seconds(); !ok || math.Abs(got-1) > 1e-9 {
+			t.Fatalf("seconds = (%v, %v), want (1, true)", got, ok)
+		}
+	})
+	t.Run("fmt is not the first chunk", func(t *testing.T) {
+		var wav bytes.Buffer
+		wav.WriteString("RIFF")
+		wavPut(t, &wav, uint32(0))
+		wav.WriteString("WAVE")
+		wav.Write(wavChunk(t, "bext", 4, []byte("abcd")))
+		wav.Write(wavFmtChunk(t, 24000, 1, 16))
+		wav.WriteString("data")
+		wavPut(t, &wav, uint32(0))
+		wav.Write(make([]byte, 24000))
+		tally := newSpeechWavTally()
+		tally.feed(wav.Bytes())
+		if got, ok := tally.seconds(); !ok || math.Abs(got-0.5) > 1e-9 {
+			t.Fatalf("seconds = (%v, %v), want (0.5, true)", got, ok)
+		}
+	})
 	t.Run("a header with no audio is no duration", func(t *testing.T) {
 		tally := newSpeechWavTally()
 		tally.feed(fallbackWAV(t, 0, 0, 0))
@@ -194,6 +226,8 @@ func TestTranscriptionBillsFromTheUploadedWAVWithoutTiming(t *testing.T) {
 	}{
 		{"no timing, WAV upload", `{"text":"hi"}`, parts("clip.wav", "audio/wav", wav.Bytes()), 2.5, false},
 		{"timing present wins", transcriptionDoc("1000"), parts("clip.wav", "audio/wav", wav.Bytes()), 1, false},
+		{"timing key absent, WAV upload", `{"text":"hi","timing":{"wall_ms":5}}`, parts("clip.wav", "audio/wav", wav.Bytes()), 2.5, false},
+		{"timing present 0 is audio.cpp's own loud zero, WAV upload", transcriptionDoc("0"), parts("clip.wav", "audio/wav", wav.Bytes()), 0, true},
 		{"no timing, mp3 upload", `{"text":"hi"}`, parts("clip.mp3", "audio/mpeg", mp3), 0, true},
 	}
 	for _, tc := range cases {

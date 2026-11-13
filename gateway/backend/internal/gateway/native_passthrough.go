@@ -970,12 +970,15 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// becomes application/octet-stream and its Content-Length the data size, and only the
 	// data chunk (io.LimitReader) reaches the copier. Metering is untouched:
 	// setSpeechBillingQuantity below still reads the upstream WAV's duration header, which the
-	// strip leaves in resp.Header.
+	// strip leaves in resp.Header; a target with no such header is measured from the PCM
+	// relayed and the stripped WAV's byte rate (speechTally).
 	relayBody := io.Reader(resp.Body)
-	// A one-shot speech body is also measured as it is relayed (speechWavTally), for the
-	// target that sends no duration header: setSpeechBillingQuantity falls back to it.
+	// A one-shot speech body is also measured as it is relayed (speechWavTally), only when
+	// the upstream sent no duration header (not audio.cpp): setSpeechBillingQuantity falls
+	// back to it. An audio.cpp response is not tallied at all.
 	var speechTally *speechWavTally
-	if speechRelay && speechScan == nil {
+	noSpeechHeader := speechDurationHeaderAbsent(resp.Header)
+	if speechRelay && speechScan == nil && noSpeechHeader {
 		speechTally = newSpeechWavTally()
 	}
 	if rel.speechPCMStrip {
@@ -989,7 +992,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		contentType = "application/octet-stream"
 		w.Header().Set(contentLengthHeader, strconv.FormatInt(dataSize, 10))
 		relayBody = io.LimitReader(resp.Body, dataSize)
-		speechTally = newSpeechPCMTally(format.ByteRate)
+		if noSpeechHeader {
+			speechTally = newSpeechPCMTally(format.ByteRate)
+		}
 	}
 
 	markServedInstance(w, rel.pfReq, rel.target)
@@ -1085,7 +1090,8 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// The speech measure, likewise for a speech request that finished cleanly and
 	// for nothing else. Its quantity is the upstream's own duration header, so
 	// resp.Header is passed alongside the exchange -- see
-	// setSpeechBillingQuantity (speech_handler.go). A STREAMED speech call has no such
+	// setSpeechBillingQuantity (speech_handler.go), or, with no header at all, the
+	// WAV measured as it was relayed (speechTally). A STREAMED speech call has no such
 	// header: what it bills is what the scan counted on a completed stream, and
 	// setSpeechBillingQuantity -- which would log every streamed success as one that
 	// reported no duration -- is not asked. See setStreamedSpeechBillingQuantity.

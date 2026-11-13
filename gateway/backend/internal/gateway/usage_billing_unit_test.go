@@ -303,9 +303,15 @@ func TestSpeechUsageWithoutAUsableDurationRecordsZeroAndLogsOnce(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf, restore := withCapturedSlog(t)
 			t.Cleanup(restore)
-			// The body is no WAV: with no usable header the relay falls back to measuring a WAV
-			// body (speechWavTally), and these cases are about a duration nothing states.
-			up := speechBillingUpstreamBody(t, http.StatusOK, tc.headers, []byte("not a wav"))
+			// A present-but-unusable header is audio.cpp's own broken statement: the loud zero
+			// holds even for a body that is a valid WAV. Only an absent or empty header
+			// (a target that is not audio.cpp) falls back to measuring the body, so those two
+			// cases answer a non-WAV one.
+			body := speechTestWAV()
+			if tc.headers["X-AudioCPP-Audio-Duration-Ms"] == "" {
+				body = []byte("not a wav")
+			}
+			up := speechBillingUpstreamBody(t, http.StatusOK, tc.headers, body)
 			srv, _ := newSpeechCapableTestServer(t, up.URL)
 
 			rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there."}`)

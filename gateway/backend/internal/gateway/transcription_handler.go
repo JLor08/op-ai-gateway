@@ -1163,6 +1163,21 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 	return ms / 1000, true
 }
 
+// transcriptionDurationAbsent reports whether body states no audio duration at all: no
+// timing object, or one without an audio_duration_ms key (any value there, a null or a
+// zero included, is a statement). A body that is no JSON object states nothing either.
+func transcriptionDurationAbsent(body []byte) bool {
+	var doc struct {
+		Timing struct {
+			AudioDurationMs json.RawMessage `json:"audio_duration_ms"`
+		} `json:"timing"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return true
+	}
+	return doc.Timing.AudioDurationMs == nil
+}
+
 // setTranscriptionBillingQuantity records, on meta, how many seconds of audio a
 // finished transcription relay transcribed (the plain endpoint's and the details
 // endpoint's alike: both answer with the same timing block) -- and does nothing at all
@@ -1197,9 +1212,13 @@ func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []
 	}
 	seconds, ok := transcriptionDurationSeconds(body)
 	if !ok {
-		if ms, measured := uploadWavDurationMillis(ex.raw, contentType); measured {
-			meta.BillingQuantity = float64(ms) / 1000
-			return
+		// Only an ABSENT statement is a target that is not audio.cpp; a present but
+		// unusable one (0, negative, null, not a number) stays the loud zero below.
+		if transcriptionDurationAbsent(body) {
+			if ms, measured := uploadWavDurationMillis(ex.raw, contentType); measured {
+				meta.BillingQuantity = float64(ms) / 1000
+				return
+			}
 		}
 		slog.Error("transcription relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "field", "timing.audio_duration_ms", "body_bytes", len(body))
 		return
