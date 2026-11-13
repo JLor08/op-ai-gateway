@@ -19,12 +19,13 @@ demand). Everything below is runnable headlessly by a coding agent.
 | Docker | any recent | Deploy images, the Postgres test env, the local SonarQube server |
 | sonar-scanner | 8.0.1+ (optional) | The local SonarQube gate's native scanner, the default on arm64 hosts ([§7.3](#73-scanner-modes-docker-and-native)); `brew install sonar-scanner` |
 
-**Go stays on 1.26 for now (CI `go-version: "1.26"`, both Go builder images pinned to
-`golang:1.26.5`).** Go 1.27 (checked up to go1.27.4) carries a net/http server regression,
-golang/go commit `f5c3217500dc` (CL 794640, "net/http: don't rely on server request body not
-changing"): to decide whether to close the connection after the reply, `chunkWriter.writeHeader`
-now calls `bodyRemains()`, which takes the request body's mutex, where Go 1.26 read a lock-free
-flag. `body.Read` holds that mutex for the whole blocking network read. So for a request that sent
+**Go stays on 1.26.10 or older for now (CI `go-version: "1.26.10"`, both Go builder images
+pinned to `golang:1.26.5`).** Go 1.27 (checked up to go1.27.4) carries a net/http server
+regression, golang/go commit `f5c3217500dc` (CL 794640, "net/http: don't rely on server request
+body not changing"), and the go1.26.11 security release backported it to the 1.26 line
+(`bdd49b5785`), so a floating `1.26` no longer avoids it. To decide whether to close the
+connection after the reply, `chunkWriter.writeHeader` now calls `bodyRemains()`, which takes the
+request body's mutex, where Go 1.26.10 and older read a lock-free flag. `body.Read` holds that mutex for the whole blocking network read. So for a request that sent
 `Expect: 100-continue`, a full-duplex handler (`EnableFullDuplex`) cannot write its response
 headers while another goroutine is blocked reading the request body: the header write waits until
 the client sends more body bytes. The live-transcription relay hits exactly that. The loopback
@@ -38,12 +39,16 @@ cancelling the request context, and writing the `200` before the dial would turn
 refusal into an in-band error. The server-agent is not affected, because the gateway never sends
 it `Expect: 100-continue`.
 
-Go 1.27 is therefore refused explicitly (#387). `cmd/gateway/toolchain_guard_go127.go` and
+Go 1.27 is therefore refused explicitly (#387), and every Go pin names an exact 1.26 patch release
+up to 1.26.10. `cmd/gateway/toolchain_guard_go127.go` and
 `internal/gateway/toolchain_guard_go127_test.go` carry a `//go:build go1.27` constraint and
 reference an undefined identifier that names the issue, so on Go 1.27 the gateway binary and
 the `internal/gateway` tests fail to compile at once instead of shipping the deadlock or hanging
-until the test timeout. A newer local Go wins over a `toolchain` line in `go.mod`, so that line
-cannot pin downward. Build, test and lint with `GOTOOLCHAIN=go1.26.5` on such a machine.
+until the test timeout. Build constraints carry no patch level, so the guards cannot refuse
+go1.26.11 and later 1.26 releases; on those `TestFullDuplexExpectContinueHeaderFlush` fails
+within seconds and the loopback tests time out. A newer local Go wins over a `toolchain` line in
+`go.mod`, so that line cannot pin downward. Build, test and lint with `GOTOOLCHAIN=go1.26.10` (or `go1.26.5`, the
+image's version) on such a machine.
 `TestFullDuplexExpectContinueHeaderFlush` reproduces the regression with net/http alone. Move to
 Go 1.27+ once a Go release takes the body lock out of that header-write path: remove both guard
 files, and the canary plus the `TestVoice*` and `TestLiveTranscriptionLoopback*` tests in

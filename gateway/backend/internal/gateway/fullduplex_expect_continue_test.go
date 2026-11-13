@@ -20,8 +20,9 @@ import (
 // the client sent Expect: 100-continue (the voice/live loopback) and waits for the response
 // before it sends more body.
 //
-// On Go 1.26 the header flush does not touch the request body's mutex, so the client gets the
-// response at once. On Go 1.27 (golang/go commit f5c3217500dc) chunkWriter.writeHeader calls
+// On Go 1.26.10 and older the header flush does not touch the request body's mutex, so the
+// client gets the response at once. On Go 1.27 (golang/go commit f5c3217500dc) and on
+// go1.26.11, which backported it, chunkWriter.writeHeader calls
 // body.bodyRemains(), which waits for the mutex the parked body read holds, and the response
 // never arrives while the client waits: this test then fails after its deadline. That is why
 // toolchain_guard_go127_test.go keeps this package from compiling on Go 1.27. Removing those
@@ -103,6 +104,6 @@ func TestFullDuplexExpectContinueHeaderFlush(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the full-duplex response header did not reach a client that sent Expect: 100-continue " +
-			"while the server's body read was parked: the net/http regression of issue #387 (Go 1.27)")
+			"while the server's body read was parked: the net/http regression of issue #387 (Go 1.27, go1.26.11+)")
 	}
 }

@@ -13,9 +13,12 @@ package gateway
 // that mutex while it waits for more audio. TestFullDuplexExpectContinueHeaderFlush is the
 // minimal reproduction.
 //
-// Run the tests with Go 1.26 instead, for example:
+// Run the tests with Go 1.26.10 or older instead, for example:
 //
-//	GOTOOLCHAIN=go1.26.5 go test ./...
+//	GOTOOLCHAIN=go1.26.10 go test ./...
+//
+// go1.26.11 backported the regression, which this constraint cannot express; there
+// TestFullDuplexExpectContinueHeaderFlush fails within seconds.
 //
 // Remove this file together with the cmd/gateway guard once a Go release fixes the regression.
 var _ = go1_27_deadlocks_live_transcription_see_issue_387_test_with_GOTOOLCHAIN_go1_26_5

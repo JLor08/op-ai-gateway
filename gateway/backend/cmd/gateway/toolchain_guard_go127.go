@@ -13,12 +13,14 @@ package main
 // mutex for the whole blocking network read. The live-transcription relay
 // (/v1/audio/transcriptions/live, also behind every Voice Chat turn) reads the request body in
 // full duplex during the upstream dial, so its first SSE flush blocks until the client sends
-// more audio -- and a client that waits for the SSE response first deadlocks. Go 1.26 read a
-// lock-free flag there.
+// more audio -- and a client that waits for the SSE response first deadlocks. Go 1.26.10 and
+// older read a lock-free flag there. go1.26.11 backported the change; a build constraint has
+// no patch level, so this file cannot refuse it, and the Go pins (Dockerfiles, CI) name an
+// exact release up to 1.26.10 instead.
 //
-// Build with Go 1.26 instead, for example:
+// Build with Go 1.26.10 or older instead, for example:
 //
-//	GOTOOLCHAIN=go1.26.5 go build ./cmd/gateway
+//	GOTOOLCHAIN=go1.26.10 go build ./cmd/gateway
 //
 // Remove this file (and internal/gateway/toolchain_guard_go127_test.go) only once a Go
 // release no longer takes the body lock on that header-write path and the TestVoice* and
