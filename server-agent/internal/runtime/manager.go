@@ -1464,6 +1464,14 @@ type specState struct {
 	// it describes.
 	waitingOnRAM bool
 
+	// waitingOnWSLVM is true while this spec's most recent admission verdict was
+	// a Wait the WSL VM pool's arithmetic contributed to (Decision.WaitOnWSLVM).
+	// It is what makes a VM sample worth taking with no wsl process live
+	// (wslVMWaitDistros): the VM's figure is otherwise refreshed only by
+	// measuring a live wsl process, and a stale one could hold the start back
+	// for good. admitAndStart rewrites it on every verdict, like waitingOnRAM.
+	waitingOnWSLVM bool
+
 	// waitingOnGrace is true while this spec's most recent admission verdict was a
 	// Wait blocked SOLELY by a within-grace victim (Decision.WaitOnGrace). It is the
 	// grace twin of waitingOnRAM: a Wait that resolves with nothing happening to any
@@ -1650,9 +1658,11 @@ type owner struct {
 	// dispatches it as soon as the outstanding one returns, instead of leaving
 	// the new process unmeasured for a whole housekeeping beat: a burst
 	// instance inherits its siblings' measured demand, and a fresh sibling's
-	// figure is what lets the next one start. Only a start sets it -- a
-	// skipped housekeeping beat stays skipped -- so a measurer slower than the
-	// beat still never runs back to back.
+	// figure is what lets the next one start. Only a start sets it, and a wsl
+	// start's first wait on the WSL VM pool with no wsl process live
+	// (admitAndStart, wslVMWaitDistros) -- a skipped housekeeping beat stays
+	// skipped -- so a measurer slower than the beat still never runs back to
+	// back.
 	remeasure bool
 
 	// turn numbers the owner's turns -- one per command handled, housekeeping
@@ -3176,7 +3186,9 @@ func (o *owner) admitAndStart(specID string) {
 	// before one: a spec nobody wants up, or one force-stopped, is neither a RAM
 	// nor a grace waiter, and a stale true must never be able to select it for a
 	// sample or grace wake.
+	wasWaitingOnWSLVM := st.waitingOnWSLVM
 	st.waitingOnRAM = false
+	st.waitingOnWSLVM = false
 	st.waitingOnGrace = false
 	st.waitingOnDemand = false
 	st.waitingOnSibling = false
@@ -3312,7 +3324,17 @@ func (o *owner) admitAndStart(specID string) {
 	snap.VRAMBootstrapEligible = o.vramBootstrapEligible(st)
 	dec := Admit(snap, demand)
 	st.waitingOnRAM = dec.Wait && dec.WaitOnRAM
+	st.waitingOnWSLVM = dec.Wait && dec.WaitOnWSLVM
 	st.waitingOnGrace = dec.Wait && dec.WaitOnGrace
+	// A wsl start that has just begun to wait on the VM pool, with no wsl
+	// process live, asks for a VM sample now rather than at the next beat: no
+	// beat would otherwise sample the VM at all, and the figure it waits on
+	// may be as old as the last wsl process (wslVMWaitDistros). Once per wait,
+	// on its first verdict; the beat refreshes it after that, and an
+	// outstanding measurement defers it to that one's return (measureSoon).
+	if st.waitingOnWSLVM && !wasWaitingOnWSLVM && !o.wslLive() {
+		o.measureSoon()
+	}
 	switch {
 	case dec.NoCapacity:
 		// FIRST, and it must stay first: NoCapacity carries Reason "", Wait
@@ -3536,8 +3558,10 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 // which answers each scope's cgroup figure and the VM's meminfo. It is gated
 // on wsl targets existing and on WSL being usable at all (wslSamplable), not on
 // either native measurer: the scope is readable wherever the workload runs.
-// The calls share the 2 s bound the native measurers keep (wslSampleTimeout),
-// and their answer travels in the same one cmdMeasured.
+// With no wsl target live, a wsl start waiting on the VM pool gets a VM-only
+// sample in its place, the script with no units (wslVMWaitDistros). The calls
+// share the 2 s bound the native measurers keep (wslSampleTimeout), and their
+// answer travels in the same one cmdMeasured.
 func (o *owner) dispatchMeasurement() {
 	if o.closing || o.measuring {
 		return
@@ -3548,9 +3572,6 @@ func (o *owner) dispatchMeasurement() {
 		return
 	}
 	targets, declaresGPU := o.measurementTargets()
-	if len(targets) == 0 {
-		return
-	}
 	// Native pids for the two native measurers, wsl units per distro for the
 	// sampler. A wsl target is never in pids (see the paragraph above).
 	pids := make([]int, 0, len(targets))
@@ -3567,6 +3588,12 @@ func (o *owner) dispatchMeasurement() {
 			wslUnits = make(map[string][]string)
 		}
 		wslUnits[t.wslDistro] = append(wslUnits[t.wslDistro], t.wslUnit)
+	}
+	if wslUnits == nil {
+		// No wsl process is live, so nothing above samples the VM. A wsl start
+		// waiting on the VM pool still needs a current figure: a VM-only
+		// sample (no units), only then (wslVMWaitDistros).
+		wslUnits = o.wslVMWaitDistros()
 	}
 	// The two measurers are gated independently, and the asymmetry is the
 	// point. The VRAM one keeps the declares-a-GPU gate described above, so a
@@ -3642,6 +3669,51 @@ func (o *owner) dispatchMeasurement() {
 // allocate-nothing path.
 func (o *owner) wslSamplable() bool {
 	return o.policy.WSL.Exe != "" && !wslUserRefused(o.policy.WSL.User)
+}
+
+// wslLive reports whether any wsl generation is live, i.e. whether the beat
+// samples the VM on its own.
+func (o *owner) wslLive() bool {
+	for _, st := range o.specs {
+		if st.proc != nil && st.proc.wslUnit != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// wslVMWaitDistros is the VM-only sample's input for sampleWSL: the distro of
+// every wsl start still waiting on the VM pool (waitingOnWSLVM, and still
+// wanted up: a queued request or a pinned spec), each with no units, or nil
+// when there is none or WSL is not usable. dispatchMeasurement asks for it
+// only when no wsl process is live.
+//
+// WHY. The VM's figure (owner.wslVM) is refreshed only by measuring a live wsl
+// process. Once the last one has gone, a figure taken while something outside
+// the agent's scopes held VM memory -- a container, the user's own process,
+// another distro -- stays, and a wsl start that does not fit it finds no wsl
+// process to evict and waits on a sample that never comes. With no figure it
+// would have started. So the VM is sampled for such a waiter: the script with
+// no units prints only the meminfo line. And only for one: with nothing wsl
+// live or waiting, a sample would start a VM that is idle, or keep one up that
+// would otherwise stop. The cadence is the beat's, under the beat's one
+// outstanding measurement and its 2 s bound.
+func (o *owner) wslVMWaitDistros() map[string][]string {
+	if !o.wslSamplable() {
+		return nil
+	}
+	var out map[string][]string
+	for _, st := range o.specs {
+		distro := st.spec.WSLDistro()
+		if st.proc != nil || distro == "" || !st.waitingOnWSLVM || !wantsWakeAfterStart(st) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string][]string)
+		}
+		out[distro] = nil
+	}
+	return out
 }
 
 // measurementTargets lists the live generations worth measuring right now, or

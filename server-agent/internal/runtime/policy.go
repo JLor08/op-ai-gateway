@@ -341,6 +341,13 @@ type Decision struct {
 	// its sample lands with the measurement beat, which re-asks the same
 	// specs (owner.applyMeasurement).
 	WaitOnRAM bool
+	// WaitOnWSLVM is set only together with WaitOnRAM, and only when the WSL
+	// VM pool's arithmetic (ruleWSLRAM) was among what blocked -- not its
+	// bootstrap interlock, which no sample resolves. It tells the caller that a
+	// fresh VM sample may end this Wait: the VM's figure is refreshed only
+	// while a wsl process is live to be measured, so with none live the owner
+	// has to ask for one itself (owner.wslVMWaitDistros).
+	WaitOnWSLVM bool
 	// WaitOnGrace is set only together with Wait, and only when this Wait would
 	// have been a non-Wait (an OK, or an Evict) had NOTHING been grace-protected:
 	// the admission is blocked SOLELY by one or more within-grace victims, each of
@@ -1029,6 +1036,9 @@ type admission struct {
 	// a start waiting on a busy matrix neighbour must not be woken by every
 	// hardware sample, and only the RAM verdict depends on one.
 	ramBlocked bool
+	// vmBlocked records that the WSL VM pool's arithmetic was among the causes
+	// of blocked (Decision.WaitOnWSLVM).
+	vmBlocked bool
 	// waitMessage is set by rule 4 alone, and only ever reaches a Wait: rule 4
 	// setting it also sets blocked, and blocked always answers Wait. See
 	// blockOnKnownTouchers for why that one Wait is the only one that explains
@@ -1809,8 +1819,10 @@ func (a *admission) ruleHostRAM() {
 // the bootstrap guess; an occupant of unknown RAM is neither charged nor
 // drawn; victims are the idle ones, in orderVictims' order, asked evictable as
 // each is drawn; and what idle victims cannot free makes it a WaitOnRAM, which
-// the next VM sample re-asks. The candidate's own demand against the whole VM
-// was decided in step 1 (wslRAMOwnDemandRefusal).
+// the next VM sample re-asks, and a WaitOnWSLVM, which asks for that sample
+// when no wsl process is live to bring one (owner.wslVMWaitDistros). The
+// candidate's own demand against the whole VM was decided in step 1
+// (wslRAMOwnDemandRefusal).
 //
 // WHERE IT RUNS. BEFORE the host pool (rule 6), narrow before broad, for the
 // reason rule 3 runs before rule 6. Only a wsl process can free VM RAM, so the
@@ -1876,6 +1888,7 @@ func (a *admission) ruleWSLRAM() {
 	if sum > a.snap.WSLRAMBudgetMB {
 		a.blocked = true
 		a.ramBlocked = true
+		a.vmBlocked = true
 	}
 }
 
@@ -1927,6 +1940,7 @@ func (a *admission) decide() Decision {
 		return Decision{
 			Wait:        true,
 			WaitOnRAM:   a.ramBlocked,
+			WaitOnWSLVM: a.vmBlocked,
 			WaitOnGrace: a.blockedSolelyByGrace(),
 			Message:     a.waitMessage,
 			Evict:       []string{},

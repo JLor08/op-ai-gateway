@@ -141,3 +141,27 @@ func TestAdmitWSLRAMUnconstrainedWithoutSample(t *testing.T) {
 	}
 	assertDecision(t, "no VM sample", Admit(snap, wslCandidate("cand", 50000)), Decision{OK: true, Evict: []string{}})
 }
+
+// TestAdmitWSLRAMWaitOnWSLVM: only the VM pool's arithmetic marks a Wait as
+// one a fresh VM sample may end -- not the host pool, and not the bootstrap
+// interlock, which no sample resolves.
+func TestAdmitWSLRAMWaitOnWSLVM(t *testing.T) {
+	busy := wslPoolRunning()
+	busy[0].InFlight, busy[1].InFlight = 1, 1
+	snap := PolicySnapshot{Running: busy, WSLRAMBudgetMB: 10000, HostRAMBudgetMB: 64000, Allowed: allowPairs("cand", "native", "wsl")}
+	if dec := Admit(snap, wslCandidate("cand", 5000)); !dec.Wait || !dec.WaitOnRAM || !dec.WaitOnWSLVM {
+		t.Errorf("VM pool full: %+v, want Wait, WaitOnRAM and WaitOnWSLVM", dec)
+	}
+
+	host := snap
+	host.WSLRAMBudgetMB, host.HostRAMBudgetMB = 64000, 10000
+	if dec := Admit(host, wslCandidate("cand", 5000)); !dec.Wait || !dec.WaitOnRAM || dec.WaitOnWSLVM {
+		t.Errorf("host pool full: %+v, want a RAM wait without WaitOnWSLVM", dec)
+	}
+
+	boot := snap
+	boot.HostRAMBudgetMB, boot.RAMBootstrapInFlight = 0, true
+	if dec := Admit(boot, wslCandidate("cand", 1000)); !dec.Wait || dec.WaitOnWSLVM {
+		t.Errorf("bootstrap in flight: %+v, want a wait without WaitOnWSLVM", dec)
+	}
+}

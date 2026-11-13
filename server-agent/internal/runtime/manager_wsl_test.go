@@ -1191,3 +1191,191 @@ func TestWSLVMSampleWakesARAMWaiter(t *testing.T) {
 		t.Errorf("A is %s, want it untouched (pinned)", st.State)
 	}
 }
+
+// wslSampleCalls is the number of sampling calls the fake has logged.
+func (f *fakeWSL) wslSampleCalls(t *testing.T) []fakeWSLCall {
+	t.Helper()
+	return f.find(t, "sh", "-c")
+}
+
+// stopWSLAfterSample starts the wsl spec model, has its scope report heldMB of
+// a VM with availMB available, waits for that sample to land, and stops it
+// again: the VM pool is then frozen at availMB + heldMB, with no wsl process
+// left to refresh it.
+func stopWSLAfterSample(t *testing.T, m *Manager, f *fakeWSL, specID, model string, heldMB, availMB int) {
+	t.Helper()
+	ensureWSL(t, m, model)
+	unit := f.onlyLaunchedUnit(t)
+	f.writeSample(t, "unit "+unit+" "+strconv.Itoa(heldMB<<20)+" 0\nmeminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(availMB<<10)+"\n")
+	waitUntil(t, 5*time.Second, specID+"'s sample lands", func() bool {
+		st := statusFor(m, specID)
+		return st != nil && st.MeasuredRAMMB == heldMB
+	})
+	if _, err := m.Stop(context.Background(), model); err != nil {
+		t.Fatalf("Stop(%s): %v", model, err)
+	}
+	waitForState(t, m, specID, StateStopped)
+}
+
+// TestWSLStaleVMSampleIsRefreshedForAWaitingStart: the last sample was taken
+// while something outside the agent's scopes held most of the VM (500 MB
+// available beside A's 1000), and A has since stopped, so no beat samples the
+// VM any more. That consumer has left too. A wsl start that does not fit the
+// stale pool must not wait on it for good: with no wsl process live, its wait
+// on the VM pool asks for a VM-only sample (the script with no units), and the
+// fresh figure lets it start.
+//
+// Only a VM-only call is answered with the fresh figure; a call that carries
+// units -- one dispatched while A was live may still be out after the stop --
+// keeps answering the stale one. So B can start through a VM-only sample and
+// nothing else.
+func TestWSLStaleVMSampleIsRefreshedForAWaitingStart(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	fresh := filepath.Join(t.TempDir(), "fresh")
+	if err := os.WriteFile(fresh, []byte("meminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(9000<<10)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(ctx context.Context, exe string, args, env []string) ([]byte, error) {
+		sample := f.sample
+		if n := len(args); n > 0 && args[n-1] == "sh" && slices.Contains(args, wslSampleScript) {
+			sample = fresh
+		}
+		env = append(slices.Clone(env), "FAKEWSL_LOG="+f.log, "FAKEWSL_STATE="+f.state, "FAKEWSL_SAMPLE="+sample)
+		return execWSLRunner(ctx, exe, args, env)
+	}
+	m := newWSLTestManager(t, run)
+	a := wslTestSpec(f, "A", "a")
+	a.RAMMB = 1000
+	b := wslTestSpec(f, "B", "b")
+	b.RAMMB = 5000
+	m.Apply(Config{ETag: "v1", Specs: []Spec{a, b}, Coresident: coresidentAllPairs("A", "B")})
+	stopWSLAfterSample(t, m, f, "A", "a", 1000, 500) // a pool of 1500 MB
+
+	before := len(f.wslSampleCalls(t))
+	ensureWSL(t, m, "b")
+	waitForState(t, m, "B", StateRunning)
+
+	// A sample dispatched while A was still live may be logged after the
+	// stop, so the refresh is looked for, not assumed to be the next call.
+	want := []string{"-d", wslTestDistro, "-u", "ai", "--exec", "sh", "-c", wslSampleScript, "sh"}
+	if !slices.ContainsFunc(f.wslSampleCalls(t)[before:], func(c fakeWSLCall) bool { return slices.Equal(c.Argv, want) }) {
+		t.Errorf("no VM-only sampling call (%q) after the start began to wait: %+v", want, f.wslSampleCalls(t)[before:])
+	}
+}
+
+// TestWSLNoVMSampleWhileNoWSLStartWaits: with no wsl process live and no wsl
+// start waiting, nothing samples the VM -- a sample would start an idle VM --
+// even while the beat keeps measuring a live native process.
+func TestWSLNoVMSampleWhileNoWSLStartWaits(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+	var beats atomic.Int32
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		beats.Add(1)
+		return nil
+	})
+	native := baseSpec("N", "n")
+	native.Pinned = true
+	a := wslTestSpec(f, "A", "a")
+	a.RAMMB = 1000
+	m.Apply(Config{ETag: "v1", Specs: []Spec{native, a}, Coresident: coresidentAllPairs("N", "A")})
+	waitForState(t, m, "N", StateRunning)
+	stopWSLAfterSample(t, m, f, "A", "a", 1000, 500)
+	// Two native beats after the stop, any measurement dispatched while A was
+	// live has finished (one is outstanding at a time), its sample logged.
+	settled := beats.Load()
+	waitUntil(t, 5*time.Second, "two native measurement beats", func() bool { return beats.Load() >= settled+2 })
+
+	before := len(f.wslSampleCalls(t))
+	start := beats.Load()
+	waitUntil(t, 5*time.Second, "ten native measurement beats", func() bool { return beats.Load() >= start+10 })
+	if got := len(f.wslSampleCalls(t)); got != before {
+		t.Errorf("sampling calls went from %d to %d with nothing wsl live or waiting", before, got)
+	}
+}
+
+// TestWSLVMWaitAsksForASampleAtOnce: the first verdict that makes a wsl start
+// wait on the VM pool, with no wsl process live, dispatches a VM-only sample at
+// once -- the owner here has no beat at all -- and that sample's answer travels
+// back as the ordinary measurement. A second verdict of the same wait asks for
+// nothing more (the beat refreshes it from then on), and a start that waits on
+// the VM pool beside a live wsl process asks for nothing either.
+func TestWSLVMWaitAsksForASampleAtOnce(t *testing.T) {
+	var mu sync.Mutex
+	var calls [][]string
+	run := func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
+		mu.Lock()
+		calls = append(calls, slices.Clone(args))
+		mu.Unlock()
+		return []byte("meminfo " + strconv.Itoa(12000<<10) + " " + strconv.Itoa(9000<<10) + "\n"), nil
+	}
+	pol := allowlistPolicy()
+	pol.WSL = wslTestPolicy()
+	b := wslCandidate("B", 5000)
+	b.Binary, b.UpstreamModel, b.Pinned = stubchildPath, "b", true
+	m := &Manager{cmds: make(chan command, 4), done: make(chan struct{})}
+	o := &owner{
+		m:         m,
+		policy:    pol,
+		cfg:       Config{Specs: []Spec{b}},
+		specs:     map[string]*specState{"B": {spec: b, state: StateStopped}},
+		wslRunner: run,
+		getenv:    func(string) string { return "" },
+		wslUIDs:   map[string]int{wslTestDistro: 1000},
+		// A stale pool of 500 MB, with nothing wsl live to refresh it.
+		wslVM: &wslVMInfo{TotalMB: 12000, AvailableMB: 500},
+	}
+	st := o.specs["B"]
+
+	o.admitAndStart("B")
+	if !st.waitingOnWSLVM || !st.waitingOnRAM || st.proc != nil {
+		t.Fatalf("B: waitingOnWSLVM=%v waitingOnRAM=%v proc=%v, want a wait on the VM pool", st.waitingOnWSLVM, st.waitingOnRAM, st.proc)
+	}
+	var c cmdMeasured
+	select {
+	case cmd := <-m.cmds:
+		c = cmd.(cmdMeasured)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait on the VM pool dispatched no sample")
+	}
+	m.wg.Wait()
+	want := []string{"-d", wslTestDistro, "-u", "ai", "--exec", "sh", "-c", wslSampleScript, "sh"}
+	if len(calls) != 1 || !slices.Equal(calls[0], want) {
+		t.Errorf("sampling calls %q, want one VM-only call %q", calls, want)
+	}
+	if c.wslVM == nil || c.wslVM.AvailableMB != 9000 || len(c.targets) != 0 {
+		t.Errorf("measurement = %+v, want the VM-only answer with no targets", c)
+	}
+
+	// The same wait, asked again while that measurement is still unapplied:
+	// no second sample, now or deferred to the outstanding one's return.
+	o.admitAndStart("B")
+	if !st.waitingOnWSLVM {
+		t.Fatal("B no longer waits on the VM pool")
+	}
+	if o.remeasure {
+		t.Error("a repeated verdict of the same wait asked for another measurement")
+	}
+
+	// Beside a live wsl process the beat samples the VM anyway: a new wait
+	// asks for nothing.
+	o.applyMeasurement(cmdMeasured{}) // clears measuring, without a VM reading
+	st.waitingOnWSLVM = false
+	a := wslCandidate("A", 1000)
+	o.specs["A"] = &specState{spec: a, state: StateRunning, inFlight: 1, proc: &runningProc{specID: "A", pid: 300, wslUnit: "opagent-n-A-1", wslDistro: wslTestDistro}}
+	o.allowedPairs = allowPairs("B", "A")
+	o.wslVM = &wslVMInfo{TotalMB: 12000, AvailableMB: 500}
+	o.admitAndStart("B")
+	if !st.waitingOnWSLVM {
+		t.Fatal("B no longer waits on the VM pool beside A")
+	}
+	if o.measuring {
+		t.Error("a wait beside a live wsl process dispatched a measurement of its own")
+	}
+	close(m.done)
+	m.wg.Wait()
+}
