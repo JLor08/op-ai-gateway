@@ -8,7 +8,7 @@
 
 import { type Fetcher, buildQueryString, request, requestNoContent } from './transport';
 
-export type ServerBinaryKind = 'llama_server' | 'rpc_server' | 'other';
+export type ServerBinaryKind = 'llama_server' | 'rpc_server' | 'vllm' | 'other';
 
 export interface ServerBinary {
   path: string;
@@ -29,6 +29,14 @@ export interface ServerBinary {
   // Whether the agent's binary allow-list admits the path.
   allowed: boolean;
   reported_at: string;
+  // Where the entry runs: "native", or "wsl" for a wsl://<distro>/<path>
+  // allow-list entry. A row from an older gateway lacks these; read it as
+  // native.
+  execution: 'native' | 'wsl';
+  // The WSL distro, '' for a native row.
+  distro: string;
+  // The path to execute: the Linux path for a WSL row, path for a native row.
+  exec_path: string;
 }
 
 // POST: every field but path is the row's content. PUT: an absent field is

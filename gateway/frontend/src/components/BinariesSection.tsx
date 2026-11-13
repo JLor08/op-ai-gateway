@@ -47,6 +47,7 @@ type Editor = {
 function kindLabel(kind: string, t: Translation): string {
   if (kind === 'llama_server') return t.binariesKindLlamaServer;
   if (kind === 'rpc_server') return t.binariesKindRpcServer;
+  if (kind === 'vllm') return t.binariesKindVllm;
   return t.binariesKindOther;
 }
 
@@ -168,6 +169,7 @@ export function BinariesSection({
           <TableHead>
             <TableRow>
               <TableCell>{t.binariesPath}</TableCell>
+              <TableCell>{t.binariesColExecution}</TableCell>
               <TableCell>{t.binariesKind}</TableCell>
               <TableCell>{t.binariesVersion}</TableCell>
               <TableCell>{t.binariesSource}</TableCell>
@@ -189,6 +191,14 @@ export function BinariesSection({
                         sx={{ fontFamily: 'inherit' }}
                       >
                         {t.binariesNotAllowed}
+                      </Typography>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {b.execution === 'wsl' ? 'WSL2' : t.runtimeSpecExecutionModeNative}
+                    {b.execution === 'wsl' && (
+                      <Typography component="div" variant="caption" color="text.secondary">
+                        {b.distro}
                       </Typography>
                     )}
                   </TableCell>
@@ -275,6 +285,7 @@ export function BinariesSection({
               >
                 <option value="llama_server">{t.binariesKindLlamaServer}</option>
                 <option value="rpc_server">{t.binariesKindRpcServer}</option>
+                <option value="vllm">{t.binariesKindVllm}</option>
                 <option value="other">{t.binariesKindOther}</option>
               </SelectField>
               <Field

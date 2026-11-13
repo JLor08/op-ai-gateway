@@ -2376,7 +2376,7 @@ const de = {
   runtimeSpecExecutionModeWSL: 'WSL (Linux unter Windows)',
   runtimeSpecWSLDistro: 'WSL-Distribution',
   runtimeSpecWSLHint:
-    'Programmpfad und Arbeitsverzeichnis sind Linux-Pfade innerhalb der WSL-Distribution und müssen in den Freigaben des Agenten (runtime_wsl_allowed_*) enthalten sein.',
+    'Programmpfad und Arbeitsverzeichnis sind Linux-Pfade innerhalb der WSL-Distribution. Der Agent muss das Programm als Eintrag wsl://<Distro>/<Pfad> in runtime_allowed_binaries freigeben (Arbeitsverzeichnisse optional in runtime_allowed_dirs).',
   runtimeSpecWSLAgentUnsupported:
     'Dieser Agent unterstützt WSL nicht (runtime_exec_wsl fehlt). Die Spezifikation wird gespeichert, aber nicht an den Agenten übertragen.',
   runtimeSpecBinaryLinux: 'Programmpfad (Linux-Pfad in WSL)',
@@ -2503,7 +2503,9 @@ const de = {
   binariesKind: 'Art',
   binariesKindLlamaServer: 'llama-server',
   binariesKindRpcServer: 'ggml-rpc-server',
+  binariesKindVllm: 'vLLM',
   binariesKindOther: 'Sonstige',
+  binariesColExecution: 'Ausführung',
   binariesVersion: 'Version',
   binariesBuild: 'Build',
   binariesCommit: 'Commit',
@@ -6306,7 +6308,7 @@ const en: PortalMessages = {
   runtimeSpecExecutionModeWSL: 'WSL (Linux on Windows)',
   runtimeSpecWSLDistro: 'WSL distro',
   runtimeSpecWSLHint:
-    "The binary path and working directory are Linux paths inside the WSL distro and must be within the agent's allowed paths (runtime_wsl_allowed_*).",
+    'The binary path and working directory are Linux paths inside the WSL distro. The agent must allow the binary as a wsl://<distro>/<path> entry in runtime_allowed_binaries (working directories optionally in runtime_allowed_dirs).',
   runtimeSpecWSLAgentUnsupported:
     'This agent does not support WSL (runtime_exec_wsl is missing). The spec is saved but not pushed to the agent.',
   runtimeSpecBinaryLinux: 'Binary path (Linux path in WSL)',
@@ -6431,7 +6433,9 @@ const en: PortalMessages = {
   binariesKind: 'Kind',
   binariesKindLlamaServer: 'llama-server',
   binariesKindRpcServer: 'ggml-rpc-server',
+  binariesKindVllm: 'vLLM',
   binariesKindOther: 'Other',
+  binariesColExecution: 'Execution',
   binariesVersion: 'Version',
   binariesBuild: 'Build',
   binariesCommit: 'Commit',
