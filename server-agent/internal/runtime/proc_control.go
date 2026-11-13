@@ -306,7 +306,7 @@ func (c wslControl) signalScope(sig string) {
 // 8 hex characters, so two agent runs sharing a distro user can tell their units
 // apart. crypto/rand.Read does not fail (it aborts the program instead).
 func newWSLNonce() string {
-	var b [4]byte
+	var b [wslNonceLen / 2]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
@@ -398,7 +398,7 @@ func (s wslSweep) sweepDistro(distro string) {
 	if s.stopped() {
 		return
 	}
-	out, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", "--user", "list-units", "--plain", "--no-legend", "--all", wslUnitPrefix+"*.scope")
+	out, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", "--user", "list-units", "--plain", "--no-legend", "--all", "--full", wslUnitPrefix+"*.scope")
 	if err != nil {
 		slog.Warn("runtime: WSL orphan sweep could not list the agent's units", "distro", distro, "error", err)
 		return
@@ -416,12 +416,14 @@ func (s wslSweep) sweepDistro(distro string) {
 }
 
 // wslOrphanUnits picks, from a `systemctl --user list-units --plain
-// --no-legend --all` listing (UNIT LOAD ACTIVE SUB DESCRIPTION per line), the
-// agent's scopes that belong to another run: the name has the agent's prefix
-// and only characters wslUnitName can produce, and its nonce segment (up to the
-// next "-") differs from nonce. A scope that is inactive or failed holds no
-// process any more -- a scope is active for as long as one remains -- so it is
-// left alone rather than signalled into an error on every agent start.
+// --no-legend --all --full` listing (UNIT LOAD ACTIVE SUB DESCRIPTION per line;
+// --full so no long name is ellipsized), the agent's scopes that belong to
+// another run: the name is one wslUnitName could have built
+// (parseWSLUnitName), and its nonce differs from nonce. Any other
+// opagent-prefixed unit is not the agent's and is never touched. A scope that
+// is inactive or failed holds no process any more -- a scope is active for as
+// long as one remains -- so it is left alone rather than signalled into an
+// error on every agent start.
 func wslOrphanUnits(listing []byte, nonce string) []string {
 	var out []string
 	for _, line := range strings.Split(string(listing), "\n") {
@@ -439,14 +441,11 @@ func wslOrphanUnits(listing []byte, nonce string) []string {
 		if !ok {
 			continue
 		}
-		rest, ok := strings.CutPrefix(name, wslUnitPrefix)
-		if !ok || rest == "" || strings.IndexFunc(rest, func(r rune) bool { return !wslUnitRune(r) }) >= 0 {
+		unitNonce, _, _, ok := parseWSLUnitName(name)
+		if !ok || unitNonce == nonce {
 			continue
 		}
 		if active == "inactive" || active == "failed" {
-			continue
-		}
-		if seg, _, _ := strings.Cut(rest, "-"); seg == nonce {
 			continue
 		}
 		out = append(out, unit)

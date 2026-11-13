@@ -460,6 +460,9 @@ func TestWSLOrphanSweepKillsOnlyForeignNonce(t *testing.T) {
 		t.Fatalf("list-units calls = %d, want 1 (the sweep runs once)", len(lists))
 	}
 	assertHelperCall(t, lists[0])
+	if want := []string{"systemctl", "--user", "list-units", "--plain", "--no-legend", "--all", "--full", "opagent-*.scope"}; !slices.Equal(lists[0].command(), want) {
+		t.Errorf("list-units command %q, want %q (--full, so no long name is ellipsized)", lists[0].command(), want)
+	}
 	kills := f.find(t, "systemctl", "--user", "kill")
 	if len(kills) != 1 || !slices.Equal(kills[0].command(), []string{"systemctl", "--user", "kill", "--signal=SIGKILL", foreign + ".scope"}) {
 		t.Fatalf("sweep kills = %+v, want exactly one SIGKILL of %s.scope", kills, foreign)
@@ -823,21 +826,45 @@ func TestWSLLaunchFailedExitCode(t *testing.T) {
 	}
 }
 
+// TestWSLOrphanUnits: only names wslUnitName could have built, with another
+// run's nonce, on a scope that still holds a process, are picked. Every other
+// opagent-prefixed unit is the operator's and is never killed.
 func TestWSLOrphanUnits(t *testing.T) {
-	listing := strings.Join([]string{
-		"opagent-deadbeef-S-1.scope loaded active running S",
+	kill := []string{
+		"opagent-deadbeef-S-1.scope loaded active running another run's",
+		"● opagent-0badf00d-T_1-2.scope loaded active running marked with a bullet",
+		"opagent-deadbeef-my-model-12.scope loaded active running a key with dashes",
+		"opagent-deadbeef-" + strings.Repeat("k", 64) + "-0.scope loaded active running the longest key",
+	}
+	keep := []string{
 		"opagent-cafe0001-S-3.scope loaded active running this run's own",
-		"● opagent-0badf00d-T_1-2.scope loaded active running marked",
 		"opagent-deadbeef-U-4.scope loaded failed failed nothing left to kill",
 		"opagent-deadbeef-V-5.scope loaded inactive dead nothing left to kill",
-		"user.slice loaded active active not ours",
+		"user.slice loaded active active not a scope",
+		"opagent-deadbeef-S-1.service loaded active running not a scope",
+		"opagent-foo.scope loaded active running an operator's own unit",
+		"opagent-deadbeef.scope loaded active running no key, no generation",
+		"opagent-deadbee-S-1.scope loaded active running a 7-character nonce",
+		"opagent-deadbeefa-S-1.scope loaded active running a 9-character nonce",
+		"opagent-deadbeeg-S-1.scope loaded active running a non-hex nonce",
+		"opagent-DEADBEEF-S-1.scope loaded active running an upper-case nonce",
+		"opagent-deadbeef-S.scope loaded active running no generation",
+		"opagent-deadbeef-S-.scope loaded active running an empty generation",
+		"opagent-deadbeef-S-x1.scope loaded active running a non-numeric generation",
+		"opagent-deadbeef-S-01.scope loaded active running a generation FormatUint never writes",
+		"opagent-deadbeef--1.scope loaded active running an empty key",
+		"opagent-deadbeef-" + strings.Repeat("k", 65) + "-0.scope loaded active running a key wslUnitName would cut",
+		"opagent-deadbeef-a.b-1.scope loaded active running a key character wslUnitName replaces",
 		"opagent-dead;beef-W-6.scope loaded active running not a name the agent makes",
-		"opagent-deadbeef.scope loaded active running no nonce segment end",
 		"",
-	}, "\n")
-	got := wslOrphanUnits([]byte(listing), "cafe0001")
-	want := []string{"opagent-deadbeef-S-1.scope", "opagent-0badf00d-T_1-2.scope", "opagent-deadbeef.scope"}
-	if !slices.Equal(got, want) {
+	}
+	listing := strings.Join(append(slices.Clone(kill), keep...), "\n")
+	var want []string
+	for _, line := range kill {
+		f := strings.Fields(strings.TrimPrefix(line, "● "))
+		want = append(want, f[0])
+	}
+	if got := wslOrphanUnits([]byte(listing), "cafe0001"); !slices.Equal(got, want) {
 		t.Errorf("wslOrphanUnits = %q, want %q", got, want)
 	}
 }

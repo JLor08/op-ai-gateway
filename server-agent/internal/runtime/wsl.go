@@ -44,6 +44,57 @@ func wslUnitRune(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-'
 }
 
+// wslNonceLen is the length of a run nonce (newWSLNonce): 8 lowercase hex
+// characters.
+const wslNonceLen = 8
+
+// isWSLNonce reports whether s has the shape newWSLNonce draws.
+func isWSLNonce(s string) bool {
+	if len(s) != wslNonceLen {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// parseWSLUnitName is wslUnitName read backwards: it splits name (without
+// ".scope") into the run nonce, the cleaned instance key and the generation,
+// and reports whether name has exactly the shape wslUnitName builds from a
+// nonce newWSLNonce drew -- the prefix, an 8-hex nonce, a non-empty key of at
+// most wslUnitNameKeyMax unit runes, and a decimal generation as FormatUint
+// writes it. The key may itself contain "-", so the generation is what follows
+// the last one. The orphan sweep kills only names this accepts: an
+// opagent-prefixed unit of any other shape is not one the agent made, so it is
+// the operator's, and left alone.
+func parseWSLUnitName(name string) (nonce, key string, gen uint64, ok bool) {
+	rest, ok := strings.CutPrefix(name, wslUnitPrefix)
+	if !ok || len(rest) <= wslNonceLen {
+		return "", "", 0, false
+	}
+	nonce, rest = rest[:wslNonceLen], rest[wslNonceLen:]
+	rest, ok = strings.CutPrefix(rest, "-")
+	if !ok || !isWSLNonce(nonce) {
+		return "", "", 0, false
+	}
+	i := strings.LastIndexByte(rest, '-')
+	if i < 0 {
+		return "", "", 0, false
+	}
+	key, genText := rest[:i], rest[i+1:]
+	if key == "" || len(key) > wslUnitNameKeyMax || strings.IndexFunc(key, func(r rune) bool { return !wslUnitRune(r) }) >= 0 {
+		return "", "", 0, false
+	}
+	gen, err := strconv.ParseUint(genText, 10, 64)
+	if err != nil || strconv.FormatUint(gen, 10) != genText {
+		return "", "", 0, false
+	}
+	return nonce, key, gen, true
+}
+
 // wslUnitName builds the systemd unit name for one launch. The nonce makes it
 // unique to this agent run, the generation to this launch of the instance. Any
 // character outside [A-Za-z0-9_-] becomes "_": the name ends up in an argv

@@ -81,6 +81,34 @@ func TestWSLUnitName(t *testing.T) {
 	}
 }
 
+// TestParseWSLUnitNameRoundTrips: every name wslUnitName builds from a nonce
+// newWSLNonce draws parses back to its parts, so the orphan sweep's shape check
+// cannot drift from the builder.
+func TestParseWSLUnitNameRoundTrips(t *testing.T) {
+	for _, nonce := range []string{newWSLNonce(), "00000000", "ab12cd34"} {
+		if !isWSLNonce(nonce) {
+			t.Fatalf("nonce %q is not the shape newWSLNonce draws", nonce)
+		}
+		for _, tc := range []struct {
+			key  string
+			gen  uint64
+			want string // the key as wslUnitName writes it
+		}{
+			{"S", 1, "S"},
+			{"m#2", 7, "m_2"},
+			{"a b/c.d", 0, "a_b_c_d"},
+			{"my-model-3", 12, "my-model-3"},
+			{strings.Repeat("k", 100), 18446744073709551615, strings.Repeat("k", 64)},
+		} {
+			name := wslUnitName(nonce, tc.key, tc.gen)
+			gotNonce, gotKey, gotGen, ok := parseWSLUnitName(name)
+			if !ok || gotNonce != nonce || gotKey != tc.want || gotGen != tc.gen {
+				t.Errorf("parseWSLUnitName(%q) = %q, %q, %d, %v; want %q, %q, %d, true", name, gotNonce, gotKey, gotGen, ok, nonce, tc.want, tc.gen)
+			}
+		}
+	}
+}
+
 func TestWindowsPathToWSL(t *testing.T) {
 	for in, want := range map[string]string{
 		`C:\a\b`: "/mnt/c/a/b", "d:/x": "/mnt/d/x", "/already/posix": "/already/posix",
