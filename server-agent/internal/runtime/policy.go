@@ -1864,10 +1864,24 @@ func (a *admission) ruleHostRAM() {
 		return
 	}
 
+	sum = a.drawRAMVictims(holders, sum, a.snap.HostRAMBudgetMB)
+	if sum > a.snap.HostRAMBudgetMB {
+		a.blocked = true
+		a.ramBlocked = true
+	}
+}
+
+// drawRAMVictims is the victim draw both RAM pools share (rule 6, ruleHostRAM,
+// and its WSL VM twin, ruleWSLRAM), so the two cannot disagree about it: the
+// idle ones among holders, in orderVictims' order, each asked evictable as it
+// is drawn, join toEvict until sum -- the pool's demand, candidate included --
+// fits budgetMB. It returns what is left of sum, which still exceeds budgetMB
+// when the idle holders could not free enough.
+func (a *admission) drawRAMVictims(holders []RunningProc, sum, budgetMB int) int {
 	idleHolders := a.evictableOf(holders)
 	a.orderVictims(idleHolders)
 	for _, r := range idleHolders {
-		if sum <= a.snap.HostRAMBudgetMB {
+		if sum <= budgetMB {
 			break
 		}
 		if !a.evictable(r) {
@@ -1876,10 +1890,7 @@ func (a *admission) ruleHostRAM() {
 		a.toEvict[r.SpecID] = r
 		sum -= r.RAMMB
 	}
-	if sum > a.snap.HostRAMBudgetMB {
-		a.blocked = true
-		a.ramBlocked = true
-	}
+	return sum
 }
 
 // ruleWSLRAM is rule 6 a second time, against the WSL VM's own RAM pool
@@ -1953,18 +1964,7 @@ func (a *admission) ruleWSLRAM() {
 		return
 	}
 
-	idleHolders := a.evictableOf(holders)
-	a.orderVictims(idleHolders)
-	for _, r := range idleHolders {
-		if sum <= a.snap.WSLRAMBudgetMB {
-			break
-		}
-		if !a.evictable(r) {
-			continue // a higher sibling stays running (higherSiblingStays)
-		}
-		a.toEvict[r.SpecID] = r
-		sum -= r.RAMMB
-	}
+	sum = a.drawRAMVictims(holders, sum, a.snap.WSLRAMBudgetMB)
 	if sum > a.snap.WSLRAMBudgetMB {
 		a.blocked = true
 		a.ramBlocked = true

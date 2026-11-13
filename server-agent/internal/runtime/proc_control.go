@@ -303,7 +303,7 @@ func (c wslControl) kill() error {
 }
 
 func (c wslControl) signalScope(sig string) {
-	if _, err := runWSLHelper(c.run, c.pol, c.distro, c.env, "systemctl", "--user", "kill", "--signal="+sig, c.unit+".scope"); err != nil {
+	if _, err := runWSLHelper(c.run, c.pol, c.distro, c.env, "systemctl", systemdUserFlag, "kill", "--signal="+sig, c.unit+".scope"); err != nil {
 		slog.Warn("runtime: signalling the WSL scope failed", "spec", c.specID, "distro", c.distro, "unit", c.unit, "signal", sig, "error", err)
 	}
 }
@@ -420,7 +420,7 @@ func (s wslSweep) sweepDistro(distro string) {
 	if s.stopped() {
 		return
 	}
-	out, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", "--user", "list-units", "--plain", "--no-legend", "--all", "--full", wslUnitPrefix+"*.scope")
+	out, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", systemdUserFlag, "list-units", "--plain", "--no-legend", "--all", "--full", wslUnitPrefix+"*.scope")
 	if err != nil {
 		slog.Warn("runtime: WSL orphan sweep could not list the agent's units", "distro", distro, "error", err)
 		return
@@ -429,7 +429,7 @@ func (s wslSweep) sweepDistro(distro string) {
 		if s.stopped() {
 			return
 		}
-		if _, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", "--user", "kill", "--signal=SIGKILL", unit); err != nil {
+		if _, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", systemdUserFlag, "kill", "--signal=SIGKILL", unit); err != nil {
 			slog.Warn("runtime: WSL orphan sweep could not stop a unit", "distro", distro, "unit", unit, "error", err)
 			continue
 		}

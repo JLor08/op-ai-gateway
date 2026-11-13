@@ -38,6 +38,11 @@ const wslUnitNameKeyMax = 64
 // orphan sweep lists by.
 const wslUnitPrefix = "opagent-"
 
+// systemdUserFlag points systemd-run and systemctl at the calling user's own
+// systemd manager, the one every unit the agent launches inside a distro lives
+// in: the launch (buildWSLLaunch), the stop and the orphan sweep all address it.
+const systemdUserFlag = "--user"
+
 // wslUnitRune reports whether r may appear in a unit name as the agent builds
 // it: [A-Za-z0-9_-].
 func wslUnitRune(r rune) bool {
@@ -117,35 +122,49 @@ func wslUnitName(nonce, instanceKey string, gen uint64) string {
 	return wslUnitPrefix + clean(nonce) + "-" + key + "-" + strconv.FormatUint(gen, 10)
 }
 
+// wslLaunchInput is what one wsl launch is built from (buildWSLLaunch), besides
+// the operator's WSL policy: the distro and the UID of the policy's user inside
+// it, the unit name (wslUnitName), the working directory inside the distro, and
+// the operator's binary with its expanded args and Windows-side env.
+type wslLaunchInput struct {
+	UID     int
+	Distro  string
+	Unit    string
+	WorkDir string
+	Binary  string
+	Args    []string
+	Env     []string
+}
+
 // buildWSLLaunch assembles the wsl.exe command. It is pure: no process, no
 // filesystem, so the exact argv and environment are unit-tested on any OS.
 //
 // The argv uses --exec, never a shell, and always "-u <pol.User>": the agent
 // never passes root, so no gateway-chosen argument or variable reaches a root
 // process (policy refuses root as the user as well). systemd-run --scope puts
-// the child in a unit named Unit inside the user's systemd manager, which is
-// what makes the tree stoppable and measurable as a group.
+// the child in a unit named in.Unit inside the user's systemd manager, which
+// is what makes the tree stoppable and measurable as a group.
 //
-// env is the expanded Windows-side environment. It is kept as a prefix of the
-// result so a caller can tell the entries the agent added (result[len(env):]).
-// Agent-owned entries are added only when the key is absent, so a spec's
-// explicit PYTHONUNBUFFERED wins; WSLENV is the exception, always the agent's
-// (a spec's own is refused by checkSpecEnv).
+// in.Env is the expanded Windows-side environment. It is kept as a prefix of
+// the result so a caller can tell the entries the agent added
+// (result[len(in.Env):]). Agent-owned entries are added only when the key is
+// absent, so a spec's explicit PYTHONUNBUFFERED wins; WSLENV is the exception,
+// always the agent's (a spec's own is refused by checkSpecEnv).
 //
 // WSLENV is what carries variables across the Windows/WSL boundary: every name
 // except the Windows base block (PATH, HOME, ... would be meaningless or
 // harmful inside the distro) and WSL_UTF8 (read by wsl.exe itself) is listed
 // with /u, "only when launching from Win32 to WSL".
-func buildWSLLaunch(pol WSLPolicy, uid int, distro, unit, workDir, binary string, args, env []string) wslLaunch {
+func buildWSLLaunch(pol WSLPolicy, in wslLaunchInput) wslLaunch {
 	argv := []string{
-		"-d", distro, "-u", pol.User, "--cd", workDir, "--exec",
-		"systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit, "--",
-		binary,
+		"-d", in.Distro, "-u", pol.User, "--cd", in.WorkDir, "--exec",
+		"systemd-run", systemdUserFlag, "--scope", "--quiet", "--unit=" + in.Unit, "--",
+		in.Binary,
 	}
 	prefix := len(argv)
-	argv = append(argv, args...)
+	argv = append(argv, in.Args...)
 
-	out := slices.Clone(env)
+	out := slices.Clone(in.Env)
 	has := func(name string) bool {
 		for _, e := range out {
 			if k, _, _ := strings.Cut(e, "="); strings.EqualFold(k, name) {
@@ -165,7 +184,7 @@ func buildWSLLaunch(pol WSLPolicy, uid int, distro, unit, workDir, binary string
 		setDefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 	}
 	setDefault("PYTHONUNBUFFERED", "1")
-	setDefault("XDG_RUNTIME_DIR", "/run/user/"+strconv.Itoa(uid))
+	setDefault("XDG_RUNTIME_DIR", "/run/user/"+strconv.Itoa(in.UID))
 	setDefault("WSL_UTF8", "1")
 
 	var names []string
@@ -179,7 +198,7 @@ func buildWSLLaunch(pol WSLPolicy, uid int, distro, unit, workDir, binary string
 	slices.Sort(names)
 	out = append(out, "WSLENV="+strings.Join(names, ":"))
 
-	return wslLaunch{Exe: pol.Exe, Args: argv, Env: out, Unit: unit, PrefixLen: prefix}
+	return wslLaunch{Exe: pol.Exe, Args: argv, Env: out, Unit: in.Unit, PrefixLen: prefix}
 }
 
 func isBaseEnvName(k string) bool {
@@ -321,60 +340,107 @@ type wslVMInfo struct {
 // it does not recognise, or a missing or repeated meminfo line, fails the
 // whole answer: a garbled sample is no sample.
 func parseWSLSample(out []byte) (ramByUnit map[string]int, vm wslVMInfo, err error) {
-	garbage := func(line string) error {
-		return fmt.Errorf("runtime: unexpected line in the WSL RAM sample: %q", clipText(strings.TrimSpace(line), 120))
-	}
 	text := string(out)
-	// body is where the script's own output starts: just past the sentinel.
-	body, found := 0, false
+	body, err := wslSampleBody(text)
+	if err != nil {
+		return nil, wslVMInfo{}, err
+	}
+	var r wslSampleReader
+	for line := range strings.Lines(text[body:]) {
+		if err = r.readLine(line); err != nil {
+			return nil, wslVMInfo{}, err
+		}
+	}
+	if !r.seenMeminfo {
+		return nil, wslVMInfo{}, fmt.Errorf("runtime: the WSL RAM sample has no meminfo line")
+	}
+	return r.ramByUnit, r.vm, nil
+}
+
+// wslSampleBody returns where the script's own output starts in text, a
+// sampling call's stdout: just past its sentinel line (wslSampleSentinel),
+// whatever wsl.exe printed ahead of it. Output without that line fails, naming
+// how it began.
+func wslSampleBody(text string) (int, error) {
+	body := 0
 	for line := range strings.Lines(text) {
 		body += len(line)
 		if strings.TrimSpace(line) == wslSampleSentinel {
-			found = true
-			break
+			return body, nil
 		}
 	}
-	if !found {
-		first, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
-		return nil, wslVMInfo{}, fmt.Errorf("runtime: the WSL RAM sample has no %q line; its output began %q", wslSampleSentinel, clipText(strings.TrimSpace(first), 120))
+	first, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	return 0, fmt.Errorf("runtime: the WSL RAM sample has no %q line; its output began %q", wslSampleSentinel, clipText(strings.TrimSpace(first), 120))
+}
+
+// wslSampleGarbage is the error for a line of a sample that parseWSLSample
+// does not accept.
+func wslSampleGarbage(line string) error {
+	return fmt.Errorf("runtime: unexpected line in the WSL RAM sample: %q", clipText(strings.TrimSpace(line), 120))
+}
+
+// wslSampleReader is what parseWSLSample has read of the script's output so
+// far, past its sentinel line: the units' positive figures (nil while there are
+// none) and the VM's meminfo, once seen.
+type wslSampleReader struct {
+	ramByUnit   map[string]int
+	vm          wslVMInfo
+	seenMeminfo bool
+}
+
+// readLine takes one line of the script's output: a blank line or a unit
+// printed as "-" is skipped, a unit's figures or the first meminfo line are
+// read, and anything else -- a second meminfo line among it -- fails.
+func (r *wslSampleReader) readLine(line string) error {
+	f := strings.Fields(line)
+	switch {
+	case len(f) == 0:
+		return nil
+	case f[0] == "unit" && len(f) == 3 && f[2] == "-":
+		return nil
+	case f[0] == "unit" && len(f) == 4:
+		return r.readUnit(f, line)
+	case f[0] == "meminfo" && len(f) == 3 && !r.seenMeminfo:
+		return r.readMeminfo(f, line)
+	default:
+		return wslSampleGarbage(line)
 	}
-	seenMeminfo := false
-	for line := range strings.Lines(text[body:]) {
-		f := strings.Fields(line)
-		switch {
-		case len(f) == 0:
-		case f[0] == "unit" && len(f) == 3 && f[2] == "-":
-		case f[0] == "unit" && len(f) == 4:
-			current, err1 := strconv.ParseUint(f[2], 10, 63)
-			inactive, err2 := strconv.ParseUint(f[3], 10, 63)
-			if err1 != nil || err2 != nil {
-				return nil, wslVMInfo{}, garbage(line)
-			}
-			if current <= inactive {
-				continue
-			}
-			if mb := int((current - inactive) >> 20); mb > 0 {
-				if ramByUnit == nil {
-					ramByUnit = make(map[string]int)
-				}
-				ramByUnit[f[1]] = mb
-			}
-		case f[0] == "meminfo" && len(f) == 3 && !seenMeminfo:
-			total, err1 := strconv.ParseUint(f[1], 10, 63)
-			avail, err2 := strconv.ParseUint(f[2], 10, 63)
-			if err1 != nil || err2 != nil || total>>10 == 0 {
-				return nil, wslVMInfo{}, garbage(line)
-			}
-			vm = wslVMInfo{TotalMB: int(total >> 10), AvailableMB: int(avail >> 10)}
-			seenMeminfo = true
-		default:
-			return nil, wslVMInfo{}, garbage(line)
+}
+
+// readUnit takes a "unit <u> <memory.current> <inactive_file>" line, split
+// into f: the unit's figure, in MiB, is the difference, recorded only when it
+// is positive (absent otherwise, never "uses nothing"). Figures that are not
+// numbers fail the line.
+func (r *wslSampleReader) readUnit(f []string, line string) error {
+	current, err1 := strconv.ParseUint(f[2], 10, 63)
+	inactive, err2 := strconv.ParseUint(f[3], 10, 63)
+	if err1 != nil || err2 != nil {
+		return wslSampleGarbage(line)
+	}
+	if current <= inactive {
+		return nil
+	}
+	if mb := int((current - inactive) >> 20); mb > 0 {
+		if r.ramByUnit == nil {
+			r.ramByUnit = make(map[string]int)
 		}
+		r.ramByUnit[f[1]] = mb
 	}
-	if !seenMeminfo {
-		return nil, wslVMInfo{}, fmt.Errorf("runtime: the WSL RAM sample has no meminfo line")
+	return nil
+}
+
+// readMeminfo takes the "meminfo <MemTotal kB> <MemAvailable kB>" line, split
+// into f, as the VM's figures in MiB. Figures that are not numbers, or a total
+// under 1 MiB, fail the line.
+func (r *wslSampleReader) readMeminfo(f []string, line string) error {
+	total, err1 := strconv.ParseUint(f[1], 10, 63)
+	avail, err2 := strconv.ParseUint(f[2], 10, 63)
+	if err1 != nil || err2 != nil || total>>10 == 0 {
+		return wslSampleGarbage(line)
 	}
-	return ramByUnit, vm, nil
+	r.vm = wslVMInfo{TotalMB: int(total >> 10), AvailableMB: int(avail >> 10)}
+	r.seenMeminfo = true
+	return nil
 }
 
 // sampleWSL runs the sampling script once per distro in unitsByDistro, with

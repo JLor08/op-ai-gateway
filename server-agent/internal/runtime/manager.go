@@ -3341,35 +3341,10 @@ func (o *owner) admitAndStartWith(specID string, mayEvict bool) {
 		}
 		st.bindMismatch = false
 	}
-	// A wsl start cannot be built without the configured user's UID inside its
-	// distro (the user manager's bus is /run/user/<uid>), and asking the distro
-	// is a wsl.exe call that can take seconds -- far too long for the owner,
-	// whose every other client (Status, every ensure, health results, kill
-	// graces) would queue behind it. So the lookup runs off the owner, and the
-	// instance waits for its answer here, before admission: queued, its state
-	// untouched, no error recorded, and nothing evicted for a start that cannot
-	// happen yet. The answer re-asks it (handleWSLUIDResolved). Like the
-	// sibling wait, it is held back rather than decided.
-	//
-	// A BURST instance does not wait: its admission is all-or-nothing and
-	// immediate (handleEnsure never leaves its waiter queued), so it is refused
-	// at once with ErrInstanceNoCapacity, exactly like a burst start that finds
-	// no free room, and the deferred retireIfSpent removes its row. The lookup
-	// is started all the same, so the gateway's next attempt finds the UID
-	// cached.
-	if st.spec.IsWSL() {
-		if _, ok := o.wslUIDs[st.spec.WSLDistro()]; !ok {
-			o.requestWSLUID(st.spec.WSLDistro())
-			if st.burst() {
-				slog.Debug("runtime: burst instance refused: the WSL user's uid is not known yet", "spec", specID)
-				o.failPending(st, ErrInstanceNoCapacity)
-				return
-			}
-			st.waitingOnWSLUID = true
-			st.decidedTurn = 0
-			slog.Debug("runtime: wsl instance waits for the WSL user's uid", "spec", specID)
-			return
-		}
+	// Before admission, so nothing is evicted for a wsl start that cannot be
+	// built yet (heldForWSLUID).
+	if o.heldForWSLUID(st, specID) {
+		return
 	}
 
 	// The protected instances of a spec start lowest index first, on every path
@@ -3437,18 +3412,8 @@ func (o *owner) admitAndStartWith(specID string, mayEvict bool) {
 	snap.VRAMBootstrapEligible = o.vramBootstrapEligible(st)
 	dec := Admit(snap, demand)
 	st.waitingOnRAM = dec.Wait && dec.WaitOnRAM
-	st.waitingOnWSLVM = dec.Wait && dec.WaitOnWSLVM
-	st.waitingOnWSLStart = dec.Wait && dec.WaitOnWSLStart
 	st.waitingOnGrace = dec.Wait && dec.WaitOnGrace
-	// A wsl start that has just begun to wait on the VM pool, with no wsl
-	// process live, asks for a VM sample now rather than at the next beat: no
-	// beat would otherwise sample the VM at all, and the figure it waits on
-	// may be as old as the last wsl process (wslVMWaitDistros). Once per wait,
-	// on its first verdict; the beat refreshes it after that, and an
-	// outstanding measurement defers it to that one's return (measureSoon).
-	if st.waitingOnWSLVM && !wasWaitingOnWSLVM && !o.wslLive() {
-		o.measureSoon()
-	}
+	o.noteWSLWaits(st, dec, wasWaitingOnWSLVM)
 	switch {
 	case dec.NoCapacity:
 		// FIRST, and it must stay first: NoCapacity carries Reason "", Wait
@@ -3485,13 +3450,12 @@ func (o *owner) admitAndStartWith(specID string, mayEvict bool) {
 		// noteAdmissionWait.
 		o.noteAdmissionWait(st, dec.Message)
 		blockedBy = o.claimedMemberBlocking(snap, demand)
+	case len(dec.Evict) > 0 && !mayEvict:
+		// A re-ask that may not evict (admitAndStartWith) leaves the start
+		// queued. Ahead of the eviction case below, so nothing is evicted and
+		// no bootstrap shot is spent.
+		slog.Debug("runtime: start would evict and this re-ask may not", "spec", specID, "victims", dec.Evict)
 	case len(dec.Evict) > 0:
-		if !mayEvict {
-			// Ahead of the bootstrap burn below: nothing is evicted, so no
-			// shot is spent.
-			slog.Debug("runtime: start would evict and this re-ask may not", "spec", specID, "victims", dec.Evict)
-			return
-		}
 		if dec.VRAMBootstrap {
 			// This Evict spent the candidate's one-shot VRAM bootstrap (rule 4
 			// evicted a known-demand occupant it would otherwise only have
@@ -3522,6 +3486,65 @@ func (o *owner) admitAndStartWith(specID string, mayEvict bool) {
 			// now, side by side with it.
 			o.wakeSiblingsWaitingFor(st)
 		}
+	}
+}
+
+// heldForWSLUID is admitAndStart's step for a wsl instance whose distro user's
+// UID is not known yet (#381), and reports whether it held st back from this
+// admission; a native spec, or a wsl one whose UID is cached, goes on (false).
+//
+// A wsl start cannot be built without the configured user's UID inside its
+// distro (the user manager's bus is /run/user/<uid>), and asking the distro
+// is a wsl.exe call that can take seconds -- far too long for the owner,
+// whose every other client (Status, every ensure, health results, kill
+// graces) would queue behind it. So the lookup runs off the owner
+// (requestWSLUID), and the instance waits for its answer here, before
+// admission: queued, its state untouched, no error recorded, and nothing
+// evicted for a start that cannot happen yet. The answer re-asks it
+// (handleWSLUIDResolved). Like the sibling wait, it is held back rather than
+// decided (decidedTurn 0).
+//
+// A BURST instance does not wait: its admission is all-or-nothing and
+// immediate (handleEnsure never leaves its waiter queued), so it is refused
+// at once with ErrInstanceNoCapacity, exactly like a burst start that finds
+// no free room, and admitAndStart's deferred retireIfSpent removes its row.
+// The lookup is started all the same, so the gateway's next attempt finds the
+// UID cached.
+func (o *owner) heldForWSLUID(st *specState, specID string) bool {
+	if !st.spec.IsWSL() {
+		return false
+	}
+	if _, ok := o.wslUIDs[st.spec.WSLDistro()]; ok {
+		return false
+	}
+	o.requestWSLUID(st.spec.WSLDistro())
+	if st.burst() {
+		slog.Debug("runtime: burst instance refused: the WSL user's uid is not known yet", "spec", specID)
+		o.failPending(st, ErrInstanceNoCapacity)
+		return true
+	}
+	st.waitingOnWSLUID = true
+	st.decidedTurn = 0
+	slog.Debug("runtime: wsl instance waits for the WSL user's uid", "spec", specID)
+	return true
+}
+
+// noteWSLWaits records on st the two WSL waits of its admission verdict dec
+// (#381), the way admitAndStart records waitingOnRAM and waitingOnGrace: each
+// holds only for a Wait. wasWaitingOnWSLVM is st's waitingOnWSLVM from before
+// this admission reset it.
+//
+// A wsl start that has just begun to wait on the VM pool, with no wsl
+// process live, asks for a VM sample now rather than at the next beat: no
+// beat would otherwise sample the VM at all, and the figure it waits on
+// may be as old as the last wsl process (wslVMWaitDistros). Once per wait,
+// on its first verdict; the beat refreshes it after that, and an
+// outstanding measurement defers it to that one's return (measureSoon).
+func (o *owner) noteWSLWaits(st *specState, dec Decision, wasWaitingOnWSLVM bool) {
+	st.waitingOnWSLVM = dec.Wait && dec.WaitOnWSLVM
+	st.waitingOnWSLStart = dec.Wait && dec.WaitOnWSLStart
+	if st.waitingOnWSLVM && !wasWaitingOnWSLVM && !o.wslLive() {
+		o.measureSoon()
 	}
 }
 
@@ -4759,7 +4782,10 @@ func (o *owner) startProcess(st *specState) {
 		// the wrapper as exec'd, with the operator's arguments masked at their
 		// shifted positions (withWrapper).
 		wslUnit = wslUnitName(o.wslNonce, spec.ID, plog.gen)
-		l := buildWSLLaunch(o.policy.WSL, distroUID, spec.WSLDistro(), wslUnit, effectiveWSLWorkDir(spec), spec.Binary, args, env)
+		l := buildWSLLaunch(o.policy.WSL, wslLaunchInput{
+			UID: distroUID, Distro: spec.WSLDistro(), Unit: wslUnit, WorkDir: effectiveWSLWorkDir(spec),
+			Binary: spec.Binary, Args: args, Env: env,
+		})
 		resolved = ex.withWrapper(l).resolvedWSLCommand(spec, l.Exe, o.specsFromLocalFile)
 		execPath = l.Exe
 		cmd = exec.Command(l.Exe, l.Args...) //nolint:gosec // l.Exe is the operator's runtime_wsl_exe; the distro, binary and user were permitted by LocalPolicy.Permit above

@@ -7,8 +7,10 @@ import (
 )
 
 func testWSLLaunch(env []string) wslLaunch {
-	return buildWSLLaunch(wslPolicy().WSL, 1000, "Ubuntu-24.04", "opagent-ab12cd34-m-7",
-		"/home/ai/vllm", wslBin, []string{"serve", "m", "--port", "41234"}, env)
+	return buildWSLLaunch(wslPolicy().WSL, wslLaunchInput{
+		UID: 1000, Distro: "Ubuntu-24.04", Unit: "opagent-ab12cd34-m-7", WorkDir: "/home/ai/vllm",
+		Binary: wslBin, Args: []string{"serve", "m", "--port", "41234"}, Env: env,
+	})
 }
 
 func TestBuildWSLLaunchArgv(t *testing.T) {
@@ -144,7 +146,10 @@ func TestResolvedCommandMasksSecretUnderWSLWrapper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l := buildWSLLaunch(wslPolicy().WSL, 1000, "Ubuntu-24.04", "opagent-n-m-1", "/home/ai/vllm", spec.Binary, ex.args, ex.env)
+	l := buildWSLLaunch(wslPolicy().WSL, wslLaunchInput{
+		UID: 1000, Distro: "Ubuntu-24.04", Unit: "opagent-n-m-1", WorkDir: "/home/ai/vllm",
+		Binary: spec.Binary, Args: ex.args, Env: ex.env,
+	})
 	w := ex.withWrapper(l)
 	if !slices.Equal(w.args, l.Args) {
 		t.Fatalf("wrapped args = %q, want the full launch argv %q", w.args, l.Args)
