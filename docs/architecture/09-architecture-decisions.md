@@ -12577,4 +12577,4 @@ An operator who tested #390 with the three settings set also had a configuration
   shows its last good version, or the one its path implies.
 - **Accepted residual.** The running-list snapshot is taken once per scan, so a distro that idles out during a long scan (a `vllm --version` can take
   up to 60 s) can be started again by a later `stat` in the same scan.
-- **Mixed fleets need no upgrade order.** An older gateway drops a `wsl://` row and lists a `vllm` as `other`; an older agent sends neither.
+- **Running things needs no upgrade order; display does.** The agent's policy decides what runs. An older gateway stores and lists a `wsl://` row verbatim, without `execution`, `distro` or `exec_path`: its Binaries tab shows the raw `wsl://…` path, its picker would offer that string as a native binary path, and a `vllm` is stored as `other`. Upgrade the gateway (and its portal) together with, or before, agents that list `wsl://` entries.

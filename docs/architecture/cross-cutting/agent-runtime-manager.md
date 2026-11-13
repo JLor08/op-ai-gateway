@@ -5812,9 +5812,13 @@ by `wsl://` entries in `runtime_allowed_binaries` / `runtime_allowed_dirs`
 ([§3.8](#38-execution-modes-wsl2),
 [ADR-102](../09-architecture-decisions.md#adr-102--one-runtime-allowlist-with-wsl-entries-the-binary-inventory-and-picker-see-wsl-binaries)),
 and the inventory gains the `vllm` kind and `wsl://` rows. The wire is unchanged: a
-`wsl://` row travels as an ordinary inventory path. There is **no upgrade order**:
-an older gateway drops a `wsl://` row (its path is not one it recognises) and lists
-a `vllm` as `other`, and an older agent never sends either.
+`wsl://` row travels as an ordinary inventory path. There is **no upgrade order
+for running things**, because the agent's policy decides. It matters for display
+only: an older gateway stores and lists a `wsl://` row verbatim, without
+`execution`, `distro` or `exec_path` (its Binaries tab shows the raw path and its
+picker would offer it as a native binary) and stores a `vllm` as `other`. Upgrade
+the gateway, with its portal, together with or before agents that list `wsl://`
+entries.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
