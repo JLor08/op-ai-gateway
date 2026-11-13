@@ -57,20 +57,24 @@ func TestAdmitWSLRAMEvictsIdleWSLOnly(t *testing.T) {
 	})
 
 	t.Run("both pools draw, and a victim is drawn once", func(t *testing.T) {
-		// Host: 6000 + 6000 + 5000 = 17000 > 7000 needs both processes gone;
-		// the VM then has room. Each victim appears once.
+		// VM: 6000 + 5000 > 10000 takes the wsl process; host: 6000 + 5000 =
+		// 11000 > 7000 then still needs the native one. Each appears once.
 		tight := snap
 		tight.HostRAMBudgetMB = 7000
 		assertDecision(t, "both pools", Admit(tight, wslCandidate("cand", 5000)), Decision{Evict: []string{"native", "wsl"}})
+	})
 
-		// When the host pool's own pick is the wsl process (the older one
-		// now) and it is enough there (-> 11000 <= 12000), the VM pool sees it
-		// gone and asks for nothing more.
-		running := wslPoolRunning()
-		running[0].LastUsed, running[1].LastUsed = t1, t0
-		tight.Running = running
-		tight.HostRAMBudgetMB = 12000
-		assertDecision(t, "host's wsl victim serves the VM too", Admit(tight, wslCandidate("cand", 5000)), Decision{Evict: []string{"wsl"}})
+	t.Run("a native candidate is neither blocked by nor evicts for the VM pool", func(t *testing.T) {
+		// The VM is over its pool already (a busy wsl process of 6000 MB
+		// against 5000), which would block a wsl candidate; a native one
+		// starts, and the wsl processes are left alone.
+		full := snap
+		full.WSLRAMBudgetMB = 5000
+		full.Running = wslPoolRunning()
+		full.Running[1].InFlight = 1
+		assertDecision(t, "native beside a full VM", Admit(full, Spec{ID: "cand", RAMMB: 5000}), Decision{OK: true, Evict: []string{}})
+		full.Running[1].InFlight = 0
+		assertDecision(t, "native beside a full VM, idle wsl", Admit(full, Spec{ID: "cand", RAMMB: 5000}), Decision{OK: true, Evict: []string{}})
 	})
 
 	t.Run("an unknown-RAM wsl candidate is charged the bootstrap guess", func(t *testing.T) {
@@ -87,6 +91,22 @@ func TestAdmitWSLRAMEvictsIdleWSLOnly(t *testing.T) {
 		boot.RAMBootstrapInFlight = true
 		assertDecision(t, "bootstrap in flight", Admit(boot, wslCandidate("cand", 1000)), Decision{Wait: true, WaitOnRAM: true, Evict: []string{}})
 	})
+}
+
+// TestAdmitWSLRAMVictimServesTheHostPoolToo pins the order of the two RAM
+// pools: the VM pool draws first, and its wsl victim frees host RAM as well,
+// so the older idle native process survives. Host first, the host pool would
+// take the native process (the oldest) and the VM pool then the wsl one too.
+func TestAdmitWSLRAMVictimServesTheHostPoolToo(t *testing.T) {
+	snap := PolicySnapshot{
+		Running:         wslPoolRunning(), // native 6000 at t0 (older), wsl 6000 at t1
+		WSLRAMBudgetMB:  10000,
+		HostRAMBudgetMB: 12000,
+		Allowed:         allowPairs("cand", "native", "wsl"),
+	}
+	// VM: 6000 + 5000 = 11000 > 10000 -> wsl goes. Host: with it gone,
+	// 6000 + 5000 = 11000 <= 12000, so the native process stays.
+	assertDecision(t, "VM victim serves the host", Admit(snap, wslCandidate("cand", 5000)), Decision{Evict: []string{"wsl"}})
 }
 
 func TestAdmitWSLRAMOwnDemandRefusal(t *testing.T) {

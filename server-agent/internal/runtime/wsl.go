@@ -347,10 +347,13 @@ func sampleWSL(run wslRunner, pol WSLPolicy, env []string, unitsByDistro map[str
 // snapshot is built, and that is what keeps the two halves of the sum about one
 // instant. The host pool can afford to add back the live set, because its
 // sample is replaced every second; this one is replaced only by the
-// measurement beat, and only while a wsl process is live to be measured. A
-// scope that exited after the sample took its share of the add-back with it
-// while MemAvailable still lacks it, and with no wsl process left nothing would
-// ever correct that: the start its eviction made room for would wait for good.
+// measurement beat, and only while a wsl process is live to be measured. With
+// the live set's measured RAM at snapshot time as the add-back, a scope that
+// exited after the sample takes its share of the add-back with it while the
+// sample's MemAvailable still lacks it. That is exactly the state after a wsl
+// start evicts the last idle wsl workload to make room: the victim is gone, no
+// wsl process is left to sample, so no later sample ever shows the room, and
+// the start the eviction was for would wait for good.
 //
 // No sample (vm nil) is 0, unconstrained, as everywhere; a real one floors at
 // 1, never 0, for the reason hostRAMBudgetMB gives.

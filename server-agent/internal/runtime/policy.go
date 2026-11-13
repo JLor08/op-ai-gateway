@@ -1236,8 +1236,13 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //     only, oldest LastUsed first, until it fits or idle candidates run
 //     out. Spec's own demand is already known to fit each budget by
 //     itself: step 1 refused it otherwise.
-//  5. Host-RAM pool (rule 6), the host-scoped twin of step 4, evaluated with
-//     steps 3-4's queued evictions notionally already gone: the candidate's RAM
+//  5. RAM pools (rule 6). For a wsl candidate only, the WSL VM's own pool
+//     comes first (PolicySnapshot.WSLRAMBudgetMB): only wsl processes are
+//     summed and drawn, narrow before broad as step 4 runs before this one, so
+//     a wsl victim it needs anyway is already gone for the host pool and is
+//     never joined by a native one the VM did not need (see ruleWSLRAM).
+//     Then the host-RAM pool, the host-scoped twin of step 4, evaluated with
+//     steps 3-5's queued evictions notionally already gone: the candidate's RAM
 //     charge plus every remaining process's RAM, against the one
 //     PolicySnapshot.HostRAMBudgetMB. A budget <= 0 (no sample yet) skips it. The
 //     candidate's charge is its KNOWN demand, or -- when that demand is unknown
@@ -1249,10 +1254,7 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //     evicts idle processes HOST-WIDE -- any of them, not one GPU's occupants --
 //     oldest LastUsed first, until it fits; if the idle ones cannot make it fit,
 //     step 7 answers Wait. A still-loading process is never a victim, so it
-//     reserves its RAM. Then, for a wsl candidate only, the same rule against
-//     the WSL VM's own pool (PolicySnapshot.WSLRAMBudgetMB): only wsl
-//     processes are summed and drawn, and the host pool's victims are already
-//     gone (see ruleWSLRAM).
+//     reserves its RAM.
 //  6. Process-count limit (rule 2), evaluated last so it only asks for as
 //     many ADDITIONAL evictions as steps 3-5 have not already supplied.
 //  7. Build the Decision (decide): any non-evictable blocker anywhere makes the
@@ -1372,8 +1374,8 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	a.ruleUnknownVRAMCandidate() // rule 4: candidate's own unknown VRAM
 	a.ruleUnknownVRAMOccupant()  // rule 5: an occupant's unknown VRAM
 	a.rulePerGPUVRAM()           // rule 3: per-GPU VRAM arithmetic
-	a.ruleHostRAM()              // rule 6: host-wide RAM pool
 	a.ruleWSLRAM()               // rule 6 against the WSL VM's pool, wsl candidates only
+	a.ruleHostRAM()              // rule 6: host-wide RAM pool
 	a.ruleProcessCount()         // rule 2: process-count limit, last
 
 	return a.decide()
@@ -1689,8 +1691,10 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 // a process one of them already queued is guaranteed to be gone, so its RAM is
 // skipped here rather than charged twice, and it is not drawn again -- a VRAM
 // victim that also holds the RAM we need must not be joined by a second,
-// innocent one. It runs before rule 2 for the reason rules 1-5 do: the
-// process-count limit asks only for the victims still missing.
+// innocent one. For the same reason it runs after the WSL VM pool
+// (ruleWSLRAM), the narrower of the two RAM pools. It runs before rule 2 for
+// the reason rules 1-5 do: the process-count limit asks only for the victims
+// still missing.
 //
 // Both ends of the pool follow the 0 sentinels used everywhere else:
 //
@@ -1808,12 +1812,20 @@ func (a *admission) ruleHostRAM() {
 // the next VM sample re-asks. The candidate's own demand against the whole VM
 // was decided in step 1 (wslRAMOwnDemandRefusal).
 //
-// WHERE IT RUNS. After rule 6, so that it sees the host pool's victims as gone:
-// a wsl process the host pool already queued frees its VM RAM too, so it is
-// skipped here rather than charged twice, and it is never drawn a second time;
-// the VM pool then asks only for the wsl victims still missing. Before rule 2,
-// for the reason every resource rule runs before it: the process-count limit
-// asks only for the evictions the resources have not already supplied.
+// WHERE IT RUNS. BEFORE the host pool (rule 6), narrow before broad, for the
+// reason rule 3 runs before rule 6. Only a wsl process can free VM RAM, so the
+// wsl victims this pool needs are needed whatever the host pool decides, and
+// each also frees its RAM on the host. Drawn first, they are already gone when
+// the host pool sums and draws, which then asks only for what is still
+// missing. The other order over-evicts: with a host pool of 12000 MB, a VM
+// pool of 10000 MB, an older idle native process and an idle wsl process of
+// 6000 MB each, and a wsl candidate of 5000 MB, the host pool would draw the
+// older native process first (17000 -> 11000 fits the host), and this pool
+// would then still need the wsl one -- two evictions where the wsl one alone
+// fits both pools. After rules 1, 3, 4 and 5 for the reason rule 6 is: a process they
+// queued is gone, never charged twice or drawn again. Before rule 2, for the
+// reason every resource rule runs before it: the process-count limit asks only
+// for the evictions the resources have not already supplied.
 func (a *admission) ruleWSLRAM() {
 	if !a.spec.IsWSL() || a.snap.WSLRAMBudgetMB <= 0 {
 		return
