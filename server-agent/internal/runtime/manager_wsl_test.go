@@ -639,6 +639,123 @@ func TestWSLUIDIsLookedUpOncePerDistro(t *testing.T) {
 	}
 }
 
+// TestWSLUIDIsPrewarmedAtFirstApply: the first document starts the UID lookup
+// of every allowed distro by itself, with nothing asking for a start, and a
+// later start finds the answer cached.
+func TestWSLUIDIsPrewarmedAtFirstApply(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	pol := wslTestPolicy()
+	pol.AllowedDistros = []string{wslTestDistro, "Debian"}
+	m := newWSLTestManagerWith(t, pol, f.runner())
+	// A wsl spec nobody has asked for: not pinned, no request.
+	m.Apply(Config{ETag: "v1", Specs: []Spec{wslTestSpec(f, "S", "m")}})
+
+	asked := func() map[string]int {
+		n := map[string]int{}
+		for _, c := range f.find(t, "id", "-u") {
+			n[c.Argv[1]]++
+		}
+		return n
+	}
+	waitUntil(t, 5*time.Second, "the first document's UID lookups for both distros", func() bool {
+		n := asked()
+		return n[wslTestDistro] == 1 && n["Debian"] == 1
+	})
+	if st := statusFor(m, "S"); st == nil || st.State != StateStopped || st.LastError != nil {
+		t.Errorf("S = %+v, want stopped and untouched: a lookup starts nothing", st)
+	}
+	if launches := f.find(t, "systemd-run"); len(launches) != 0 {
+		t.Errorf("a workload was launched with no request: %+v", launches)
+	}
+
+	ensureWSL(t, m, "m")
+	if n := asked(); n[wslTestDistro] != 1 {
+		t.Errorf("id -u in %s = %d after a start, want 1: the start must find the warmed UID", wslTestDistro, n[wslTestDistro])
+	}
+}
+
+// TestWSLBurstInstanceRefusedWhileUIDUnknown: a burst instance never waits, not
+// even for the UID lookup -- it is refused at once with ErrInstanceNoCapacity
+// and leaves no row behind, while the lookup it needs is started, so a later
+// attempt finds the UID cached and starts.
+func TestWSLBurstInstanceRefusedWhileUIDUnknown(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	second := make(chan struct{})
+	release := sync.OnceFunc(func() { close(second) })
+	var lookups atomic.Int32
+	run := func(ctx context.Context, exe string, args, env []string) ([]byte, error) {
+		if slices.Contains(args, "id") {
+			switch lookups.Add(1) {
+			case 1: // the first document's: fails, so nothing is cached
+				return nil, errors.New("exit status 1: the distro is still booting")
+			case 2: // the burst ensure's: held, so the UID stays unknown meanwhile
+				select {
+				case <-second:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+		}
+		return f.runner()(ctx, exe, args, env)
+	}
+	m := newWSLTestManager(t, run)
+	t.Cleanup(release) // registered after the manager, so it runs before Close
+	spec := wslTestSpec(f, "S", "m")
+	spec.Replicable = true
+	spec.RAMMB = 64
+	m.Apply(Config{ETag: "v1", Specs: []Spec{spec}})
+	waitUntil(t, 5*time.Second, "the first document's lookup", func() bool { return lookups.Load() >= 1 })
+
+	// Every ensure is refused at once; one made after the first lookup's
+	// failure has been taken starts the second lookup.
+	deadline := time.Now().Add(5 * time.Second)
+	for lookups.Load() < 2 {
+		took, err := ensureErr(t, m, "m#1")
+		if !errors.Is(err, ErrInstanceNoCapacity) {
+			t.Fatalf("EnsureRunning(m#1) = %v, want ErrInstanceNoCapacity while the uid is unknown", err)
+		}
+		if took > 2*time.Second {
+			t.Fatalf("the refusal took %s; a burst refusal must be immediate", took)
+		}
+		if st := instanceStatus(m, "S", 1); st != nil {
+			t.Fatalf("instance-1 row = %+v, want none: a refused burst instance leaves no state behind", st)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no burst ensure started a UID lookup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if launches := f.find(t, "systemd-run"); len(launches) != 0 {
+		t.Fatalf("a workload was launched without a UID: %+v", launches)
+	}
+
+	// Once the lookup answers, the next attempt finds the UID and starts.
+	release()
+	waitUntil(t, 10*time.Second, "a burst ensure to start once the uid is cached", func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, rel, err := m.EnsureRunning(ctx, "m#1")
+		if err != nil {
+			if !errors.Is(err, ErrInstanceNoCapacity) {
+				t.Fatalf("EnsureRunning(m#1) = %v", err)
+			}
+			return false
+		}
+		rel()
+		return true
+	})
+	if st := instanceStatus(m, "S", 1); st == nil || st.State != StateRunning {
+		t.Errorf("instance-1 row = %+v, want running", st)
+	}
+	if n := lookups.Load(); n != 2 {
+		t.Errorf("UID lookups = %d, want 2", n)
+	}
+}
+
 func TestWSLLaunchFailedExitCode(t *testing.T) {
 	u32max := int64(4294967295) // a variable: the constant does not fit a 32-bit int
 	for _, code := range []int{-1, int(u32max)} {

@@ -3207,11 +3207,23 @@ func (o *owner) admitAndStart(specID string) {
 	// untouched, no error recorded, and nothing evicted for a start that cannot
 	// happen yet. The answer re-asks it (handleWSLUIDResolved). Like the
 	// sibling wait, it is held back rather than decided.
+	//
+	// A BURST instance does not wait: its admission is all-or-nothing and
+	// immediate (handleEnsure never leaves its waiter queued), so it is refused
+	// at once with ErrInstanceNoCapacity, exactly like a burst start that finds
+	// no free room, and the deferred retireIfSpent removes its row. The lookup
+	// is started all the same, so the gateway's next attempt finds the UID
+	// cached.
 	if st.spec.IsWSL() {
 		if _, ok := o.wslUIDs[st.spec.WSLDistro()]; !ok {
+			o.requestWSLUID(st.spec.WSLDistro())
+			if st.burst() {
+				slog.Debug("runtime: burst instance refused: the WSL user's uid is not known yet", "spec", specID)
+				o.failPending(st, ErrInstanceNoCapacity)
+				return
+			}
 			st.waitingOnWSLUID = true
 			st.decidedTurn = 0
-			o.requestWSLUID(st.spec.WSLDistro())
 			slog.Debug("runtime: wsl instance waits for the WSL user's uid", "spec", specID)
 			return
 		}
