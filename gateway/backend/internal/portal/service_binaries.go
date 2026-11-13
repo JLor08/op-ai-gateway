@@ -19,8 +19,17 @@ import (
 const (
 	BinaryKindLlamaServer = "llama_server"
 	BinaryKindRPCServer   = "rpc_server"
+	BinaryKindVLLM        = "vllm"
 	BinaryKindOther       = "other"
 )
+
+// Execution modes of an inventory row.
+const (
+	BinaryExecutionNative = "native"
+	BinaryExecutionWSL    = "wsl"
+)
+
+const binaryWSLScheme = "wsl://"
 
 // Limits on operator-entered inventory fields.
 const (
@@ -31,8 +40,8 @@ const (
 var (
 	// ErrBinaryPathInvalid rejects an empty, relative or oversized path.
 	ErrBinaryPathInvalid = errors.New("binary.path_invalid")
-	// ErrBinaryKindInvalid rejects a kind outside llama_server, rpc_server
-	// and other.
+	// ErrBinaryKindInvalid rejects a kind outside llama_server, rpc_server,
+	// vllm and other.
 	ErrBinaryKindInvalid = errors.New("binary.kind_invalid")
 	// ErrBinaryVersionInvalid rejects an oversized version, build or commit.
 	ErrBinaryVersionInvalid = errors.New("binary.version_invalid")
@@ -58,6 +67,12 @@ type ServerBinaryDTO struct {
 	Source           string    `json:"source"`
 	Allowed          bool      `json:"allowed"`
 	ReportedAt       time.Time `json:"reported_at"`
+	// Execution is "native" or "wsl", derived from Path. Distro is the WSL
+	// distro ("" for native); ExecPath is what a run spec's binary field
+	// takes: the Linux path for a WSL row, Path itself for a native one.
+	Execution string `json:"execution"`
+	Distro    string `json:"distro"`
+	ExecPath  string `json:"exec_path"`
 }
 
 // PutServerBinaryRequest is the body of a manual binary write. On POST every
@@ -73,8 +88,34 @@ type PutServerBinaryRequest struct {
 	VersionOverride *string `json:"version_override"`
 }
 
+// parseWSLBinaryPath splits a wsl://<distro>/<linux path> inventory path. It
+// mirrors ParseWSLEntry in the server-agent (internal/runtime/wsl_allowlist.go),
+// its twin: lowercase scheme, distro up to the first "/" matching the run-spec
+// distro pattern, Linux path = the rest including that "/", no NUL, no
+// backslash, verbatim. Keep both in step.
+func parseWSLBinaryPath(p string) (distro, linuxPath string, ok bool) {
+	if !strings.HasPrefix(p, binaryWSLScheme) {
+		return "", "", false
+	}
+	rest := p[len(binaryWSLScheme):]
+	i := strings.IndexByte(rest, '/')
+	if i < 0 {
+		return "", "", false
+	}
+	distro, linuxPath = rest[:i], rest[i:]
+	if !runtimeSpecWSLDistroPattern.MatchString(distro) || strings.ContainsAny(linuxPath, "\x00\\") {
+		return "", "", false
+	}
+	return distro, linuxPath, true
+}
+
 func serverBinaryDTO(b routing.ServerBinary) ServerBinaryDTO {
+	execution, distro, execPath := BinaryExecutionNative, "", b.Path
+	if d, lp, ok := parseWSLBinaryPath(b.Path); ok {
+		execution, distro, execPath = BinaryExecutionWSL, d, lp
+	}
 	return ServerBinaryDTO{
+		Execution: execution, Distro: distro, ExecPath: execPath,
 		Path: b.Path, Kind: b.Kind, Version: b.Version, VersionOverride: b.VersionOverride,
 		EffectiveVersion: b.EffectiveVersion(), Build: b.Build, Commit: b.Commit,
 		VersionSource: b.VersionSource, Source: b.Source, Allowed: b.Allowed, ReportedAt: b.ReportedAt,
@@ -83,17 +124,22 @@ func serverBinaryDTO(b routing.ServerBinary) ServerBinaryDTO {
 
 func validBinaryKind(kind string) bool {
 	switch kind {
-	case BinaryKindLlamaServer, BinaryKindRPCServer, BinaryKindOther:
+	case BinaryKindLlamaServer, BinaryKindRPCServer, BinaryKindVLLM, BinaryKindOther:
 		return true
 	}
 	return false
 }
 
-// validBinaryPath accepts absolute POSIX or Windows paths: the agent may run
-// on either, and the gateway only stores the string.
+// validBinaryPath accepts absolute POSIX or Windows paths (the agent may run
+// on either) and well-formed wsl:// paths; the gateway only stores the string.
+// A string starting with wsl:// that breaks the form is refused.
 func validBinaryPath(p string) bool {
 	if p == "" || len(p) > maxBinaryPathLen || strings.ContainsRune(p, 0) {
 		return false
+	}
+	if strings.HasPrefix(p, binaryWSLScheme) {
+		_, _, ok := parseWSLBinaryPath(p)
+		return ok
 	}
 	if path.IsAbs(p) {
 		return true

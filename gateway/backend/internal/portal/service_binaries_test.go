@@ -40,6 +40,37 @@ func TestValidBinaryPath(t *testing.T) {
 	}
 }
 
+func TestValidBinaryPathWSL(t *testing.T) {
+	for p, want := range map[string]bool{
+		"wsl://Ubuntu-24.04/home/ai/venv/bin/vllm": true,
+		"wsl://Ubuntu-24.04":                       false,
+		"WSL://Ubuntu-24.04/x":                     false,
+		"wsl://-x/y":                               false,
+		`wsl://Ubuntu-24.04\x`:                     false,
+		"wsl://Ubuntu-24.04/a\x00b":                false,
+		`wsl://Ubuntu-24.04/a\b`:                   false,
+	} {
+		if got := validBinaryPath(p); got != want {
+			t.Errorf("validBinaryPath(%q) = %v, want %v", p, got, want)
+		}
+	}
+}
+
+func TestServerBinaryDTOExecution(t *testing.T) {
+	native := serverBinaryDTO(routing.ServerBinary{Path: "/usr/bin/llama-server", Kind: BinaryKindLlamaServer})
+	if native.Execution != "native" || native.Distro != "" || native.ExecPath != "/usr/bin/llama-server" {
+		t.Errorf("native = %+v", native)
+	}
+	wsl := serverBinaryDTO(routing.ServerBinary{Path: "wsl://Ubuntu-24.04/home/ai/venv/bin/vllm", Kind: BinaryKindVLLM})
+	if wsl.Execution != "wsl" || wsl.Distro != "Ubuntu-24.04" || wsl.ExecPath != "/home/ai/venv/bin/vllm" {
+		t.Errorf("wsl = %+v", wsl)
+	}
+	bad := serverBinaryDTO(routing.ServerBinary{Path: "wsl://Ubuntu-24.04", Kind: BinaryKindOther})
+	if bad.Execution != "native" || bad.Distro != "" || bad.ExecPath != "wsl://Ubuntu-24.04" {
+		t.Errorf("malformed = %+v", bad)
+	}
+}
+
 func TestMatchingRPCBinaryByCommitThenBuild(t *testing.T) {
 	ctx := context.Background()
 	svc, store := newServerTestService(t, rpcMemberTestNow)

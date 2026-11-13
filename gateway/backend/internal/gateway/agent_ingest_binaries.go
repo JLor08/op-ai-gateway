@@ -55,7 +55,7 @@ func sanitizeBinarySamples(in []agentBinarySample, serverID string, now time.Tim
 		seen[b.Path] = struct{}{}
 		kind := b.Kind
 		switch kind {
-		case portal.BinaryKindLlamaServer, portal.BinaryKindRPCServer, portal.BinaryKindOther:
+		case portal.BinaryKindLlamaServer, portal.BinaryKindRPCServer, portal.BinaryKindVLLM, portal.BinaryKindOther:
 		default:
 			kind = portal.BinaryKindOther
 		}
