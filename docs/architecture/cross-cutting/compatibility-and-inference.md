@@ -176,6 +176,15 @@ followed by a `role:"tool"` result message keyed by `tool_call_id`. Content is
 required on every message *except* such a tool-call turn or a tool-result
 message (`parseChatMessageContent`'s `contentOptional`).
 
+**Inline images only for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).** When the resolved target's effective runtime spec type is
+`sglang_omni`, every `image_url.url` must be a `data:` URL, whether the request arrived as chat completions or was
+translated from Responses or Anthropic Messages. Otherwise the request is refused after routing as **400
+`chat.media_url_unsupported`**, logged at Warn and recorded as a usage row without an upstream call. sglang-omni v0.2.0 reads
+a bare path from the model host and fetches any URL, and its chat image connector allows private addresses. The top-level
+chat fields `audios`, `images` and `videos` never reach the provider, which rebuilds the body from the fields it knows.
+Not guarded: a spec whose type is misdeclared (an explicit `custom`) and a static application fronting an sglang-omni
+server. Every other target is unchanged.
+
 ### 3.2 OpenAI Responses — Codex continuity
 
 `compat.ParseOpenAIResponses` accepts both the simple string `input` and the
@@ -852,6 +861,27 @@ the metering headers), gated on the response's own `Content-Type`; a streamed re
 the capture's endpoint is stamped speech
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
+*Targets that are not audio.cpp ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* An `sglang_omni` target (sglang-omni v0.2.0) sends no
+`X-AudioCPP-Audio-Duration-Ms` header, so a one-shot call falls back to measuring the audio it relayed, and **only when
+audio.cpp's signal is absent**: no header, or an empty one. A header that is present but unusable (zero, negative, not a
+number) is audio.cpp's own broken statement and stays the Error log and quantity `0` of ADR-041, and a present
+header always wins, so audio.cpp's billing and logging are unchanged. The duration is the audio data bytes the relay
+actually forwarded, divided by the byte rate of the WAV's `fmt ` chunk (`speechWavTally`). The header's `data` size field
+is not trusted, because a streaming WAV writer leaves `0` or `0xFFFFFFFF` there: a declared size is used only when it is
+smaller than what followed (trailing metadata chunks are not audio). A `pcm` answer, which the gateway derives from the
+upstream WAV, is tallied the same way, from the bytes of the stripped stream and the byte rate of the header it
+stripped. A body that is no WAV, or one with no audio bytes, keeps the logged zero. A **streamed** call keeps the rule
+above unchanged.
+
+*Inline voice references for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni reads a bare `ref_audio` path from the model
+host and fetches a URL, and authenticates nothing, so the gateway relays only inline voice references to a target whose
+effective runtime spec type is `sglang_omni`: `ref_audio` and every `references[]` `audio_path`, `ref_audio` and `audio`
+must be `data:` URLs (the scheme is case-insensitive). Keys are matched case-insensitively, because the JSON decoder
+in Go and the Python upstream disagree on duplicate and differently cased keys, and a `references` value that cannot be
+read as objects is refused. The refusal is **400 `speech.reference_audio_unsupported`**, decided after the route is
+resolved, answered before any upstream call, logged at Warn (the field name, never the value) and recorded as one
+`error` usage row of quantity `0`. Every other target is relayed unchanged.
+
 **7. Resolving a speech request writes the token's last-used-model marker, and the
 redirect only takes a speech-capable model.** Like the image relays, `relaySpeech`
 resolves through `resolveTarget`, so a speech model becomes the marker a later request's
@@ -1193,6 +1223,13 @@ capture stores the multipart **request** as a JSON summary, the text fields kept
 the transcript is the user's spoken content, **output-sensitive**, captured like any
 response under the opt-in and clipped, like any, at the capture cap
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+
+*Targets that are not audio.cpp ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni returns no `timing` block. When the response body states no duration
+at all, that is, has no `timing` object or none with an `audio_duration_ms` key (any value under the key, a `null` or a
+`0` included, is a statement), the quantity falls back to the duration of the **uploaded** WAV file part, measured with
+`wavDurationFromReader`, the measurement a streamed transcription is billed by (item 11). audio.cpp's statement always
+wins. A present but unusable value stays the Error log and quantity `0`, and an upload that is no WAV whose header can be
+believed (an mp3, say) also stays the logged zero: a duration is never guessed (ADR-041).
 
 **10. Resolving a transcription writes the token's last-used-model marker, and the
 redirect takes a transcription candidate.** `relayTranscription` resolves through

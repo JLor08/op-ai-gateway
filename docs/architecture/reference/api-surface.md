@@ -1144,7 +1144,7 @@ than refusing it. See
 
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `type` (`""` | `"vllm"` |
 `"llama_cpp"` | `"tgi"` | `"ollama"` | `"stable_diffusion_cpp"` | `"audio_cpp"` |
-`"vllm_sr"` | `"custom"`, empty = auto-detect from `binary`) and the operator's own raw
+`"vllm_sr"` | `"sglang"` | `"sglang_omni"` | `"custom"`, empty = auto-detect from `binary`) and the operator's own raw
 `metrics_path`/`context_probe_path` overrides (empty = use the resolved type's own default). The **GET**
 response additionally echoes three **read-only** fields —
 `effective_type`, `resolved_metrics_path`, `resolved_context_probe_path` —

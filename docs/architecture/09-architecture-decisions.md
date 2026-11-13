@@ -12581,3 +12581,78 @@ Configs generated since #390 carry the removed keys, so removing them must not s
 - **Accepted residual.** The running-list snapshot is taken once per scan, so a distro that idles out during a long scan (a `vllm --version` can take
   up to 60 s) can be started again by a later `stat` in the same scan.
 - **Running things needs no upgrade order; display does.** The agent's policy decides what runs. An older gateway stores and lists a `wsl://` row verbatim, without `execution`, `distro` or `exec_path`: its Binaries tab shows the raw `wsl://…` path, its picker would offer that string as a native binary path, and a `vllm` is stored as `other`. Upgrade the gateway (and its portal) together with, or before, agents that list `wsl://` entries. An agent before 0.19.1 has no `wsl://` concept: such a string in `runtime_allowed_binaries` is a useless native entry, and in `runtime_allowed_dirs` a native dir entry that turns native `work_dir` containment on. It still needs the old `runtime_wsl_allowed_*` settings: upgrade the agent before switching its config.
+
+## ADR-103 — SGLang and sglang-omni runtime spec types; duration fallbacks for non-audio.cpp audio and inline-only media for sglang-omni
+
+**Context.** Operators run SGLang and sglang-omni (a multimodal server for chat, speech and transcription; Ming-3.0-TTS is one of its
+model families) behind the agent, and had to register them as `custom` or `vllm`, which gave them no metrics, no context size and the
+wrong probes. Five facts, read off `sgl-project/sglang` `v0.5.23` (`297e54fd`) and `sgl-project/sglang-omni` `v0.2.0` (`e8c635ec`), shaped
+the change.
+
+- **The two servers differ.** SGLang serves Prometheus metrics at `/metrics` (only with `--enable-metrics`), one series per scheduler
+  rank, and a `/v1/models` listing with `max_model_len`. sglang-omni has no `/metrics`, and its `/v1/models` carries no context length.
+  Neither serves `/props`.
+- **One name contains the other.** An omni binary name contains `sglang`, so detection order decides the type.
+- **sglang-omni sends none of audio.cpp's duration signals.** Billing audio seconds read `X-AudioCPP-Audio-Duration-Ms` (speech) and
+  `timing.audio_duration_ms` (transcription), so every call to it would have billed the logged zero of ADR-041.
+- **sglang-omni trusts its caller.** It authenticates nothing on its inference routes and listens on `0.0.0.0` by default. Its speech
+  `ref_audio` and `references[]` read a bare path from the host and fetch a URL, and its chat image connector fetches private
+  addresses. A gateway key holder could therefore read a file on the model host or make it fetch an internal URL.
+- **A server may host any model.** One sglang-omni server can host a text, speech or ASR model.
+
+**Decision.**
+
+- **Two spec types, `sglang` and `sglang_omni`** (`routing.RuntimeSpecType`; the agent keeps literal copies of the strings). Detection
+  checks `sgl-omni`, `sgl_omni`, `sglang-omni` and `sglang_omni` first, then `sglang`, both before `vllm`; the base name `sglang` (the
+  console script) detects as `sglang`. `python -m sglang.launch_server` and `sglang serve --model-type omni` need an explicit type. An
+  explicit type still wins; only a binary whose name contains `sglang` or one of the omni names changes type.
+- **Probes follow the server.** `sglang`: `/metrics` and the context probe `/v1/models` (`data[].max_model_len`). `sglang_omni`: neither.
+  The `/props` probe is skipped for both, as for `vllm_sr`. `sglang:num_queue_reqs` and `sglang:num_running_reqs` count only series
+  with `tp_rank="0"` or no `tp_rank` label, summed over the rest, so tensor parallelism does not multiply the figure; other families
+  keep their aggregation.
+- **Role and warning.** `sglang` falls back to chat. `sglang_omni` has no fallback, so capabilities decide and an ASR-only server stays
+  ASR. A `sglang_omni` spec without `openai_audio` raises the advisory `api_flavors_no_audio_on_sglang_omni`. Live timings and live
+  progress stay off for both.
+- **Portal defaults for `sglang_omni`.** Flavors `openai` and `openai_audio`; `responses_mode` and `messages_mode` both `disabled`,
+  because v0.2.0 serves neither route and a passthrough would bypass the media guard. The type notes give the launch templates, keep
+  `--host 127.0.0.1` and say that speech and transcription verdicts are manual.
+- **Duration fallbacks, only when audio.cpp's signal is absent.** Speech: no or an empty `X-AudioCPP-Audio-Duration-Ms` on a successful
+  one-shot relay makes the duration the audio data bytes actually relayed divided by the byte rate of the WAV `fmt ` chunk; the header's
+  size field is not trusted, and pcm derived from the WAV is tallied the same way. Transcription: a body with no `timing` object or no
+  `timing.audio_duration_ms` key makes the duration that of the uploaded WAV part, measured with `wavDurationFromReader`. A present but
+  unusable audio.cpp value stays an Error log and quantity 0 (ADR-041), and streamed speech is unchanged. A fallback that cannot
+  measure (a non-WAV upload, a body that is no WAV) keeps the logged zero.
+- **Inline media only, for a resolved target of effective type `sglang_omni`.** Speech `ref_audio` and every `references[]`
+  `audio_path`, `ref_audio` and `audio` must be `data:` URLs, matched case-insensitively, with a malformed `references` refused
+  (400 `speech.reference_audio_unsupported`). Chat `image_url.url`, translated Anthropic images included, must be `data:` (400
+  `chat.media_url_unsupported`). Both are logged at Warn with a usage row. The top-level chat fields `audios`, `images` and `videos`
+  never reach the provider.
+- **Agent `0.19.1` → `0.19.2`, PATCH.** No feature flag changes; there is no upgrade order.
+- **Realtime is out of this change.** `/v1/realtime` is a later phase; the WebSocket limitation stands.
+
+**Rejected:**
+
+- **A capability probe now.** Neither server was found to state what a model does in a form the agent can read, so a probe would
+  guess, and a wrong verdict gates a route. The verdicts stay manual.
+- **Relaxing the response formats.** Speech stays `wav` and `pcm`. Relaying mp3 or flac would need a second relay path and a
+  duration measurement the WAV byte-rate logic cannot make. Ming-3.0-TTS also offers wav and pcm, which the relay serves.
+- **Trusting the WAV header's size field.** Streaming writers leave `0` or `0xFFFFFFFF` there, so the relayed bytes are counted
+  instead, and a declared size counts only when it is smaller than what followed.
+- **Falling back on a garbage audio.cpp header.** A present but unusable header is audio.cpp's own failure. Billing a guess for it would
+  hide the failure ADR-041 makes loud, and would change audio.cpp's behaviour. The fallback fires only on absence.
+- **Allowlisting paths instead of requiring inline media.** A path allowlist needs a directory on the model host the gateway cannot
+  see, and says nothing about a fetched URL. A `data:` URL is the one form the upstream resolves without touching the host or the
+  network.
+
+**Consequence:**
+
+- **A client that sends a path or a URL to an sglang-omni model gets a 400.** It must inline the image or voice reference as a `data:`
+  URL. Other targets are unchanged.
+- **Accepted residuals.** A misdeclared type (an explicit `custom` on an sglang-omni binary) and a static application fronting an
+  sglang-omni server are not guarded; sglang-omni still authenticates nothing, so it stays on loopback behind the agent router.
+- **Other billing shapes stay logged zeros.** A non-WAV transcription upload to a target with no reported duration, and a speech body
+  that is no WAV, bill quantity 0 with an Error log.
+- **Speech and transcription verdicts are manual** for `sglang_omni`, and the model is not offered for audio until they are set under the
+  `openai_audio` flavor.
+- **Not verified live:** an sglang-omni server end to end through the agent. The contracts were read off the pinned commits.
+- **Older agents** ignore the type strings: the gateway sees a best-effort context and no SGLang queue gauge.

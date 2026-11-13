@@ -837,14 +837,15 @@ have emitted).
 ### 3.4 Runtime-server kind and per-kind probe-path derivation
 
 A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` |
-`stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `custom`; migration 75, `text not null default ''`)
+`stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `sglang` | `sglang_omni` | `custom`; migration 75, `text not null default ''`)
 is what tells the gateway — and, through it, the agent — which conventions govern
 *this* child's metrics and context-window endpoints (design 2026-09-07), and,
 for `stable_diffusion_cpp`, its health path. `""` (every pre-feature row) is
 not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
 (`routing/runtime_spec_type.go`) matches case-insensitive substrings of the
 launched binary's basename, first match wins — `vllm-srun`/`vllm_srun`
-(before `vllm`, whose substring they contain), then `vllm`, then
+(before `vllm`, whose substring they contain), then `sgl-omni`/`sgl_omni`/`sglang-omni`/`sglang_omni`
+(`sglang_omni`, before `sglang`, whose substring they contain), then `sglang`, then `vllm`, then
 `llama-server`/`llama_cpp`/`llama.cpp`, then
 `text-generation-launcher`/`tgi`, then `sd-server`/`stable-diffusion`, then
 `audiocpp_server`/`audio.cpp`, then `ollama` — and falls back to `custom` when nothing
@@ -865,6 +866,8 @@ winning **per field** over the type's own default:
 | `stable_diffusion_cpp` | *(none)* — measured: `sd-server` serves no metrics endpoint of any kind | *(none)* — no `/props`, no context-length field in its capability document, and an image model has no context window | — |
 | `audio_cpp` | *(none)* — an audio server's design relies on no Prometheus-style scrape | *(none)* — `/v1/models` entries carry `family`, `task`, `mode`, `loaded` and `path`, not a context length, and a speech or transcription model has no context window | — |
 | `vllm_sr` | `/metrics` (Prometheus; `vllm_srun_queue_depth`=queue, **no** running gauge, so active stays 0) | `/v1/models` | `data[].limits.max_input_tokens` (the first entry that carries it; the best-effort scan is the fallback) |
+| `sglang` | `/metrics` (Prometheus, needs `--enable-metrics`; `sglang:num_queue_reqs`=queue, `sglang:num_running_reqs`=active) | `/v1/models` | `data[].max_model_len` |
+| `sglang_omni` | *(none)* — sglang-omni has no `/metrics` | *(none)* — its `/v1/models` carries no context length | — |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -976,6 +979,52 @@ the code:
   Against an older agent the type is harmless: it ignores the type string, so
   the gateway sees a best-effort context, no queue gauge and no `runtime_api_version`
   (unknown, never a warning).
+
+**`sglang` and `sglang_omni` are two spec types for two different servers, both launched as an agent child ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).**
+`sglang` is SGLang (`routing.RuntimeSpecTypeSGLang`, read off `v0.5.23`), a text server. `sglang_omni` is sglang-omni
+(`routing.RuntimeSpecTypeSGLangOmni`, read off `v0.2.0`), a multimodal server that serves chat, speech and transcription;
+Ming-3.0-TTS (`inclusionAI/Ming-3.0-tts-tiny` and `-0.5B`), a model family it serves, offers `/v1/audio/speech` at 44.1 kHz in
+wav, mp3, flac and pcm, with voice cloning through `ref_audio`. Their facts, each from the code:
+
+- **Detection** checks `sgl-omni`, `sgl_omni`, `sglang-omni` and `sglang_omni` first, so an omni name never detects as
+  `sglang`, then `sglang`, and both before `vllm`. The binary base name `sglang` (SGLang's console script, `sglang serve`)
+  detects as `sglang`. `python -m sglang.launch_server` and `sglang serve --model-type omni` have a base name that says
+  nothing, so they need an explicit `type`. An explicit `type` always wins.
+- **Probe paths.** `sglang` uses `/metrics` (SGLang serves it only with `--enable-metrics`) and the context probe `/v1/models`
+  (`data[].max_model_len`, read by the same extractor as vLLM's). `sglang_omni` has neither a metrics path nor a context probe.
+  The health path stays the stock `/health` for both.
+- **Metrics.** The scrape reads `sglang:num_queue_reqs` as the queue depth and `sglang:num_running_reqs` as the running count,
+  after the existing names. SGLang emits one series per scheduler rank, labelled `tp_rank`, `dp_rank`, `pp_rank` and
+  `moe_ep_rank`, so a tensor-parallel server emits one series per tensor-parallel rank. For these two names only a series
+  with `tp_rank="0"` or with no `tp_rank` label counts, and those are summed over the rest (the data-parallel replicas), so
+  `--tp-size 2` does not double the figure. Every other metric family is aggregated as before.
+- **No `/props` probe:** neither type serves `/props` or a capability document, so the capability probe (§10) returns before
+  sending a request, as for `vllm_sr`. An `sglang_omni` server's speech and transcription verdicts are manual.
+- **Role.** `routing.DeriveRole` falls back to chat for `sglang`, like `vllm`. `sglang_omni` has no type fallback, because one
+  server may host a text, speech or ASR model: its capabilities decide, and a bare mapping is `other`.
+- **Launch shape** (the portal form's type notes). `sglang`: `serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics`;
+  set `--mem-fraction-static` when the card is shared, because the automatic default takes most of it; `--api-key` leaves
+  `/health` and `/metrics` open. `sglang_omni`: `serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}`.
+  Keep `--host 127.0.0.1`: sglang-omni authenticates nothing and listens on `0.0.0.0` by default. On Windows both run in the
+  WSL execution mode (§3.8).
+- **Portal defaults.** Switching an untouched spec to `sglang_omni` ticks the flavors `openai` and `openai_audio` and sets
+  `responses_mode` and `messages_mode` to `disabled`: v0.2.0 serves neither route, and a passthrough would bypass the media
+  guard below. `sglang` keeps the stock defaults. A `sglang_omni` spec without `openai_audio` raises the advisory warning
+  `api_flavors_no_audio_on_sglang_omni`, because speech and transcription are routed only under that flavor.
+- **Inline media only.** For a resolved target of effective type `sglang_omni`, the gateway relays only inline media, because
+  sglang-omni reads a bare path from the model host, fetches any URL (its chat image connector allows private addresses) and
+  authenticates nothing. Speech `ref_audio` and every `references[]` `audio_path`, `ref_audio` and `audio` must be `data:`
+  URLs (keys are matched case-insensitively, and a malformed `references` value is refused); chat `image_url.url`, including
+  images translated from Anthropic Messages, must be `data:` too. The refusals are 400 `speech.reference_audio_unsupported`
+  and 400 `chat.media_url_unsupported`, logged at Warn and recorded as a usage row. The top-level chat fields `audios`,
+  `images` and `videos` never reach the provider, which rebuilds the body from known fields. Two residuals stay: a misdeclared
+  type (an explicit `custom` on an sglang-omni binary) and a static application fronting an sglang-omni server are not guarded.
+- **Audio billing.** sglang-omni sends none of audio.cpp's duration signals, so the gateway measures the audio itself, but only
+  where audio.cpp's signal is absent ([Compatibility & Inference §3.6 item 6](compatibility-and-inference.md#36-openai-audio-speech)).
+- **Realtime.** `/v1/realtime` is not served by this change (it is a later phase); the WebSocket limitation in §13 stands.
+- **Agent `0.19.1` → `0.19.2` is PATCH** (§7.1): no `agent.Features` entry changed. Against an older agent the types are
+  harmless: it ignores the type string, so the gateway sees a best-effort context and no `sglang:` queue gauge, and the agent
+  still sends the `/props` probe.
 
 **`ollama` is the one row whose verb is not `GET`, and having it wrong made
 that probe unsatisfiable for as long as it existed (issue #54, fixed).**
@@ -4601,14 +4650,14 @@ capability verdicts and its effective runtime type, **first match wins**:
 | 4 | `embedding` is yes | `embedding` |
 | 5 | `rerank` is yes | `reranker` |
 | 6a | none of the above, and the type is `stable_diffusion_cpp` | `image` |
-| 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi` or `ollama` | `chat` |
+| 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi`, `ollama` or `sglang` | `chat` |
 | 7 | any chat-only capability (`vision`, `video`, `audio`, `tools`, `mtp`) is yes | `chat` |
-| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server, a `vllm_sr` worker, to which the gateway routes decisions only) | `other` |
+| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` or `sglang_omni` server, a `vllm_sr` worker, to which the gateway routes decisions only) | `other` |
 
 Capabilities outrank the type because they are specific and the type is not (an
 operator's `embedding` verdict on a `vllm` server is how that model becomes an
 embedding model); a model that both transcribes and synthesises is `asr`;
-`audio_cpp` is deliberately no type fallback, because one server hosts asr or tts
+`audio_cpp` and `sglang_omni` are deliberately no type fallback, because one server hosts asr, tts or chat
 and the type cannot say which, and `vllm_sr` is none because the gateway routes no chat to it. `embedding` and `rerank` are capabilities of their
 own, **operator-stated** on the mapping form (no probe; no reserved verdict, so a
 manual `no` is selectable), and gate no route, since the gateway serves no
@@ -5847,6 +5896,12 @@ containment on (a native spec with an explicit `work_dir` outside it is
 refused). It still needs the old `runtime_wsl_allowed_*` settings, so upgrade the
 agent before switching its config to `wsl://` entries.
 
+**`0.19.1` → `0.19.2` (the SGLang and sglang-omni spec types, #395) is PATCH.** No feature flag
+changes: the `sglang` type adds a context extractor (`data[].max_model_len`, shared with `vllm`), the two queue and running
+gauge names (`tp_rank="0"` or unlabelled series only), and both types skip the `/props` probe (§3.4). An older agent keeps
+working against a newer gateway and the reverse; there is **no upgrade order**
+([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
@@ -6622,6 +6677,8 @@ mirror). Three different cadences share the one collect cycle:
     worker serves no `/props` and no capability document, so nothing is requested and
     nothing is sent. The skip sits in the caller, `probeRuntimeChild`, so a `vllm_sr`
     child never reaches `probeRuntimeChildProps` at all.
+  - `sglang`, `sglang_omni` — **no probe at all** (agent 0.19.2, ADR-103): neither server serves `/props`, so the skip
+    sits in the same caller, `probeRuntimeChild`, beside `vllm_sr`'s.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.
@@ -6634,7 +6691,7 @@ mirror). Three different cadences share the one collect cycle:
   either capability, which is exactly the case this probe exists to recover.
   A type may be claimed by name only when its binary serves no `/props` at
   all, so that claiming it loses nothing a `/props` probe could have found —
-  true of `ollama`, of `stable_diffusion_cpp`, of `audio_cpp` and of `vllm_sr`, and of nothing else; `custom`
+  true of `ollama`, of `stable_diffusion_cpp`, of `audio_cpp`, of `vllm_sr`, of `sglang` and of `sglang_omni`, and of nothing else; `custom`
   can never be claimed, whatever binary it turns out to run, or that fallback
   loses its probe. Either way it is one extra loopback request per child
   lifetime once a verdict set is cached, on a path that is a package
@@ -6952,6 +7009,8 @@ Nothing found is recorded as 0, which the history shows as "—". Per spec type:
 | `stable_diffusion_cpp` | not applicable | not applicable | none | always: an images-only mapping gets no speed row, and the standalone context probe is refused and disabled for it |
 | `audio_cpp` | not applicable | not applicable | none | always: an audio-only mapping gets no speed row, and the standalone context probe is refused (`benchmark.audio_only`) and disabled for it |
 | `vllm_sr` | not applicable | not applicable | none from a benchmark | always: a `vllm_sr` mapping is decisions-only, so it gets no speed row and the standalone context probe is refused (`benchmark.decisions_only`). The context the agent reads (`data[].limits.max_input_tokens` of `/v1/models`, best effort) reaches the mapping through the ingest write-back, not through a benchmark |
+| `sglang` | none (the `/props` probe is skipped), so telemetry decides | `/v1/models` | `data[].max_model_len` | a child started with `--api-key`, which protects `/v1/models` (`/health` and `/metrics` stay open) |
+| `sglang_omni` | not applicable | not applicable | none | always: its `/v1/models` carries no context length, and the standalone context probe has no path to read |
 | `custom` | yes, if the child serves a llama.cpp-shaped `/props` | only when the spec sets `context_probe_path`, and only for a child without a key | a best-effort scan for `n_ctx`, `max_model_len` or `context_length` | otherwise |
 | Auto (`""`) | follows the type `EffectiveRuntimeSpecType` resolves | | | |
 
