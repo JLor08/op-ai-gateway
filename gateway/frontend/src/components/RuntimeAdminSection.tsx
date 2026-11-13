@@ -4034,9 +4034,14 @@ export function RuntimeAdminSection({
           <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'end' }}>
             <span>{formatMb(totalGpuVram(spec))}</span>
             <Chip size="small" variant="outlined" label={t.runtimeStatusWSLMarker} />
-            <Typography variant="caption" color="text.secondary">
-              {t.runtimeStatusVRAMFromVM}
-            </Typography>
+            {/* Only a measured figure is attributed from the VM; an estimate
+                alone is the operator's, and labelling it would claim a
+                measurement that has not happened. */}
+            {spec.gpus.some((g) => g.vram_measured_mb > 0) && (
+              <Typography variant="caption" color="text.secondary">
+                {t.runtimeStatusVRAMFromVM}
+              </Typography>
+            )}
           </Box>
         ) : (
           formatMb(totalGpuVram(spec))
@@ -5788,7 +5793,9 @@ export function RuntimeAdminSection({
                   />
                   <Typography variant="body2" color="text.secondary" sx={{ minWidth: 200 }}>
                     {t.runtimeSpecVramMeasured}: {row.vramMeasuredMb} MB
-                    {executionMode === 'wsl' && ` (${t.runtimeStatusVRAMFromVM})`}
+                    {executionMode === 'wsl' &&
+                      row.vramMeasuredMb > 0 &&
+                      ` (${t.runtimeStatusVRAMFromVM})`}
                   </Typography>
                   {/* THE THIRD NUMBER, and the only one this form merely
                       OFFERS. Rendered read-only through `Field`'s own prop

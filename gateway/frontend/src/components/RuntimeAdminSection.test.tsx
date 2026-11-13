@@ -1862,6 +1862,28 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       await screen.findByText('gw-wsl');
       expect(await screen.findByText(t.runtimeStatusWSLMarker)).toBeInTheDocument();
       expect(screen.getByText(t.runtimeStatusVRAMFromVM)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
+      expect(
+        await screen.findByText(
+          `${t.runtimeSpecVramMeasured}: 9000 MB (${t.runtimeStatusVRAMFromVM})`,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('does not label a wsl spec VRAM as attributed from the WSL VM before anything was measured', async () => {
+      renderSection({
+        mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-wsl' })],
+        specsByMappingId: {
+          map_1: wslSpec({ gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }] }),
+        },
+        report: wslReport,
+      });
+      await screen.findByText('gw-wsl');
+      expect(await screen.findByText(t.runtimeStatusWSLMarker)).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeStatusVRAMFromVM)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
+      expect(await screen.findByText(`${t.runtimeSpecVramMeasured}: 0 MB`)).toBeInTheDocument();
+      expect(screen.queryByText(new RegExp(t.runtimeStatusVRAMFromVM))).not.toBeInTheDocument();
     });
   });
 

@@ -216,8 +216,10 @@ export interface RuntimeSpec {
   // fixtures compile unchanged. A wsl spec saved for an agent that does not
   // declare runtime_exec_wsl is stored but never pushed to it.
   execution_mode?: 'native' | 'wsl';
-  // The WSL distro a wsl spec runs in; empty for native specs and for wsl
-  // specs that use the agent's default distro.
+  // The WSL distro a wsl spec runs in. Required for a wsl spec: the gateway
+  // refuses an empty or malformed name (runtime_spec.wsl_distro_invalid), and
+  // the agent has no default distro. Empty for a native spec, which stores
+  // none.
   wsl_distro?: string;
   gpus: RuntimeSpecGPU[];
   // This spec's resident HOST RAM demand, in MB. RAM is host-scoped, so both
