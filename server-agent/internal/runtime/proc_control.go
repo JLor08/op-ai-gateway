@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"op-ai-server-agent/internal/wslentry"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -371,7 +372,7 @@ func (o *owner) maybeWarmWSL(specs []Spec) {
 		// A distro outside the allowlist is never passed to wsl.exe -d, and
 		// neither is one a spec could not carry (ParseConfig drops it; this
 		// covers a Config handed to Apply directly).
-		if distro == "" || o.wslWarmed[distro] || !o.policy.wslDistroAllowed(distro) || !wslDistroPattern.MatchString(distro) {
+		if distro == "" || o.wslWarmed[distro] || !o.policy.wslDistroAllowed(distro) || !wslentry.ValidDistro(distro) {
 			continue
 		}
 		if o.wslWarmed == nil {

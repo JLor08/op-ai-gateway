@@ -347,7 +347,7 @@ type LocalPolicy struct {
 	// AllowedBinaries lists the absolute paths a spec's Binary must exactly
 	// match to be permitted. An entry of the form wsl://<distro>/<absolute
 	// Linux path> allowlists a binary inside a WSL2 distro instead (see
-	// WSLEntryScheme); only WSL specs consult those, and only native specs
+	// wslentry.Scheme); only WSL specs consult those, and only native specs
 	// consult the rest. EMPTY (the default, meaning the operator has
 	// configured nothing) means NOTHING may start -- a deliberate hard
 	// refusal, not a permissive default: a freshly provisioned agent must

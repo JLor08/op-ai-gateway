@@ -1,8 +1,8 @@
-package runtime
+package wslentry
 
 import "testing"
 
-func TestParseWSLEntry(t *testing.T) {
+func TestParse(t *testing.T) {
 	for _, tc := range []struct {
 		entry, distro, path string
 		ok                  bool
@@ -20,13 +20,13 @@ func TestParseWSLEntry(t *testing.T) {
 		{"/usr/bin/x", "", "", false},
 		{`C:\x.exe`, "", "", false},
 	} {
-		d, p, ok := ParseWSLEntry(tc.entry)
+		d, p, ok := Parse(tc.entry)
 		if d != tc.distro || p != tc.path || ok != tc.ok {
-			t.Errorf("ParseWSLEntry(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.entry, d, p, ok, tc.distro, tc.path, tc.ok)
+			t.Errorf("Parse(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.entry, d, p, ok, tc.distro, tc.path, tc.ok)
 		}
 		wantIs := len(tc.entry) >= 6 && tc.entry[:6] == "wsl://"
-		if IsWSLEntry(tc.entry) != wantIs {
-			t.Errorf("IsWSLEntry(%q) = %v, want %v", tc.entry, !wantIs, wantIs)
+		if Is(tc.entry) != wantIs {
+			t.Errorf("Is(%q) = %v, want %v", tc.entry, !wantIs, wantIs)
 		}
 	}
 }

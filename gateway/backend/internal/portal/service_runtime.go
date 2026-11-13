@@ -1415,7 +1415,7 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 // runtimeSpecWSLDistroPattern is a plain distro name: what `wsl --list` can
 // print and wsl.exe accepts after -d, with no space, quote or path separator,
 // and a letter or digit first, so it can never read as an option. The agent's
-// wslDistroPattern is the same rule.
+// wslentry.DistroPattern is the same rule.
 var runtimeSpecWSLDistroPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // normalizeExecutionMode reads a stored "" (a row never written with the

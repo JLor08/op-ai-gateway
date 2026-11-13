@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"op-ai-server-agent/internal/wslentry"
 	"os"
 	"os/exec"
 	"path"
@@ -189,7 +190,7 @@ func wslLocalPolicy(distros ...string) LocalPolicy {
 	}
 	pol := allowlistPolicy()
 	for _, d := range distros {
-		pol.AllowedBinaries = append(pol.AllowedBinaries, WSLEntryScheme+d+stubchildPath)
+		pol.AllowedBinaries = append(pol.AllowedBinaries, wslentry.Scheme+d+stubchildPath)
 	}
 	pol.WSL = wslTestPolicy()
 	return pol

@@ -1,40 +1,6 @@
 package runtime
 
-import "strings"
-
-// WSLEntryScheme prefixes an allowlist entry that names a binary (or a
-// directory) inside a WSL2 distribution: wsl://<distro>/<absolute Linux path>,
-// e.g. wsl://Ubuntu-24.04/home/ai/vllm-env/bin/vllm. The scheme is exactly
-// lowercase; WSL:// or wsl:/ is not a WSL entry.
-const WSLEntryScheme = "wsl://"
-
-// IsWSLEntry reports whether entry carries the wsl:// scheme, well-formed or
-// not. A native allowlist ignores every such entry, so a malformed one can
-// never be misread as a native path.
-func IsWSLEntry(entry string) bool {
-	return strings.HasPrefix(entry, WSLEntryScheme)
-}
-
-// ParseWSLEntry splits a well-formed wsl:// entry into its distro and Linux
-// path. The distro is everything up to the first "/" after the scheme and must
-// match wslDistroPattern; the Linux path is the rest INCLUDING that "/", with
-// no NUL and no backslash, and is returned verbatim (no cleaning), exactly as a
-// native entry is compared. ok is false for anything else.
-func ParseWSLEntry(entry string) (distro, linuxPath string, ok bool) {
-	if !IsWSLEntry(entry) {
-		return "", "", false
-	}
-	rest := entry[len(WSLEntryScheme):]
-	i := strings.IndexByte(rest, '/')
-	if i < 0 {
-		return "", "", false
-	}
-	distro, linuxPath = rest[:i], rest[i:]
-	if !wslDistroPattern.MatchString(distro) || strings.ContainsAny(linuxPath, "\x00\\") {
-		return "", "", false
-	}
-	return distro, linuxPath, true
-}
+import "op-ai-server-agent/internal/wslentry"
 
 // splitAllowlist separates a list into its native entries (everything that is
 // not a wsl:// entry, malformed ones included) and, per distro, the Linux paths
@@ -42,11 +8,11 @@ func ParseWSLEntry(entry string) (distro, linuxPath string, ok bool) {
 // land in neither: they permit nothing.
 func splitAllowlist(list []string) (native []string, wsl map[string][]string) {
 	for _, e := range list {
-		if !IsWSLEntry(e) {
+		if !wslentry.Is(e) {
 			native = append(native, e)
 			continue
 		}
-		if d, p, ok := ParseWSLEntry(e); ok {
+		if d, p, ok := wslentry.Parse(e); ok {
 			if wsl == nil {
 				wsl = make(map[string][]string)
 			}
@@ -56,27 +22,13 @@ func splitAllowlist(list []string) (native []string, wsl map[string][]string) {
 	return native, wsl
 }
 
-// LooksLikeWSLEntry reports whether entry is a failed attempt at a WSL entry:
-// its lowercased form starts with "wsl:" but ParseWSLEntry rejects it. That
-// covers a malformed wsl:// entry, a wrong-case WSL:// one, and a wsl:/ or
-// wsl:x typo. It is the one look-alike rule shared by the fail-closed work_dir
-// containment (hasMalformedWSLEntry) and the startup warnings in the config
-// package.
-func LooksLikeWSLEntry(entry string) bool {
-	if len(entry) < 4 || !strings.EqualFold(entry[:4], "wsl:") {
-		return false
-	}
-	_, _, ok := ParseWSLEntry(entry)
-	return !ok
-}
-
-// hasMalformedWSLEntry reports whether list holds a LooksLikeWSLEntry entry.
+// hasMalformedWSLEntry reports whether list holds a wslentry.LooksLike entry.
 // For a directory list that is the operator's failed attempt to restrict WSL
 // work_dirs, so WSL containment must stay on (fail closed) rather than fall
 // back to "any work_dir".
 func hasMalformedWSLEntry(list []string) bool {
 	for _, e := range list {
-		if LooksLikeWSLEntry(e) {
+		if wslentry.LooksLike(e) {
 			return true
 		}
 	}

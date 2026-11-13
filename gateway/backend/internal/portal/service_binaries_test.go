@@ -202,8 +202,8 @@ func TestMatchingRPCBinarySkipsWSLRows(t *testing.T) {
 	}
 }
 
-// The vectors of the agent's TestParseWSLEntry (server-agent
-// internal/runtime/wsl_allowlist_test.go): both twins must agree on them.
+// The vectors of the agent's wslentry TestParse (server-agent
+// internal/wslentry/wslentry_test.go): both twins must agree on them.
 func TestParseWSLBinaryPathTwinVectors(t *testing.T) {
 	for _, tc := range []struct {
 		entry, distro, path string

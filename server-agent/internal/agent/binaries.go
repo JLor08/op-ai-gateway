@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	runtimectl "op-ai-server-agent/internal/runtime"
 	"op-ai-server-agent/internal/sample"
+	"op-ai-server-agent/internal/wslentry"
 	"os"
 	"os/exec"
 	"path"
@@ -381,7 +382,7 @@ func scanAll(ctx context.Context, now time.Time, allowed []string, native *probe
 		}
 		seen[p] = true
 		var ok bool
-		switch distro, lp, isWSL := runtimectl.ParseWSLEntry(p); {
+		switch distro, lp, isWSL := wslentry.Parse(p); {
 		case isWSL:
 			ok = sc.add(p, lp, w.prober(distro))
 		case strings.HasPrefix(strings.ToLower(p), "wsl:"):
@@ -555,7 +556,7 @@ func (sc *binaryScan) cachedOrProbedVersion(entry, target string, fi fs.FileInfo
 
 // entryTarget is the path of an entry in its execution context.
 func entryTarget(entry string) string {
-	if _, lp, ok := runtimectl.ParseWSLEntry(entry); ok {
+	if _, lp, ok := wslentry.Parse(entry); ok {
 		return lp
 	}
 	return entry
@@ -564,8 +565,8 @@ func entryTarget(entry string) string {
 // siblingDirKey is the key of the directory an entry sits in: its parent for a
 // native path, "wsl://<distro>" plus the Linux parent for a WSL entry.
 func siblingDirKey(entry string) string {
-	if distro, lp, ok := runtimectl.ParseWSLEntry(entry); ok {
-		return runtimectl.WSLEntryScheme + distro + path.Dir(lp)
+	if distro, lp, ok := wslentry.Parse(entry); ok {
+		return wslentry.Scheme + distro + path.Dir(lp)
 	}
 	return filepath.Dir(entry)
 }

@@ -89,7 +89,7 @@ type PutServerBinaryRequest struct {
 }
 
 // parseWSLBinaryPath splits a wsl://<distro>/<linux path> inventory path. It
-// mirrors ParseWSLEntry in the server-agent (internal/runtime/wsl_allowlist.go),
+// mirrors Parse in the server-agent (internal/wslentry/wslentry.go),
 // its twin: lowercase scheme, distro up to the first "/" matching the run-spec
 // distro pattern, Linux path = the rest including that "/", no NUL, no
 // backslash, verbatim. Keep both in step.

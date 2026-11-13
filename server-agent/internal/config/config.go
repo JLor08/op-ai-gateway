@@ -15,14 +15,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"op-ai-server-agent/internal/wslentry"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
-
-	runtimectl "op-ai-server-agent/internal/runtime"
 )
 
 // defaultInterval is the collection cadence when nothing else sets one.
@@ -663,8 +662,8 @@ func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(
 		entries []string
 	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}} {
 		for i, e := range list.entries {
-			if runtimectl.IsWSLEntry(e) {
-				if _, _, ok := runtimectl.ParseWSLEntry(e); !ok {
+			if wslentry.Is(e) {
+				if _, _, ok := wslentry.Parse(e); !ok {
 					msg := "%s[%d] is a malformed wsl:// entry and permits nothing (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
 					if list.name == "runtime_allowed_dirs" {
 						msg = "%s[%d] is a malformed wsl:// entry and is ignored, but WSL work_dir containment stays on: only well-formed wsl:// dir entries (and binary dirs with runtime_allow_binary_dirs) permit a WSL work_dir (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
@@ -673,7 +672,7 @@ func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(
 				}
 				continue
 			}
-			if runtimectl.LooksLikeWSLEntry(e) {
+			if wslentry.LooksLike(e) {
 				msg := "%s[%d] looks like a WSL entry but is not wsl:// (the scheme must be exactly lowercase wsl://); it is not a WSL entry and is treated as a native path"
 				if list.name == "runtime_allowed_dirs" {
 					msg += ", and WSL work_dir containment stays on"
