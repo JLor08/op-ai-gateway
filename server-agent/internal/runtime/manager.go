@@ -1131,17 +1131,26 @@ type measureTarget struct {
 	// load at any point, even if the process is healthy by the time the answer
 	// lands. Only a ready reading is one a sibling inherits (specState.readyVRAM).
 	ready bool
+	// wslUnit and wslDistro are proc's (runningProc.wslUnit/wslDistro): set
+	// for a wsl generation, whose RAM is its scope's figure in the sampling
+	// call (cmdMeasured.ramByUnit) and whose pid -- wsl.exe, a thin client --
+	// reaches no native measurer. Both empty for a native process.
+	wslUnit, wslDistro string
 }
 
 // cmdMeasured carries a completed off-owner measurement back to the owner.
 // byPID is exactly what the installed VRAM measurer returned (pid -> gpu index
 // -> MB) and ramByPID what the installed RAM measurer returned (pid -> MB);
 // either is nil when that measurer is not installed, was not consulted this
-// cycle, or answered nothing.
+// cycle, or answered nothing. ramByUnit and wslVM are the WSL sampler's answer
+// (sampleWSL): each wsl target's scope figure by unit name (MB), and the VM's
+// meminfo, nil when there was no wsl target or no distro answered.
 type cmdMeasured struct {
-	targets  []measureTarget
-	byPID    map[int]map[int]int
-	ramByPID map[int]int
+	targets   []measureTarget
+	byPID     map[int]map[int]int
+	ramByPID  map[int]int
+	ramByUnit map[string]int
+	wslVM     *wslVMInfo
 }
 
 func (cmdMeasured) isCommand() {}
@@ -1564,8 +1573,17 @@ type owner struct {
 	// run while this run's own units are starting.
 	wslNonce string
 	// wslRAMReserveMB is ManagerOptions.WSLRAMReserveMB, never negative. Fixed
-	// for the process lifetime, like hostRAMReserveMB.
+	// for the process lifetime, like hostRAMReserveMB; read by the WSL VM RAM
+	// pool (wslRAMBudgetMB, wslRAMCeilingMB).
 	wslRAMReserveMB int
+	// wslVM is the WSL VM's meminfo from the latest sampling call that
+	// answered (applyMeasurement), nil until one has; wslVMHeldMB is what the
+	// agent's own scopes held in that same sample, summed. Together they are
+	// the VM RAM pool (wslRAMBudgetMB), and they change only together, when a
+	// new sample lands -- never when a process starts or exits, see
+	// wslRAMBudgetMB for why. Owner-goroutine state, like specs.
+	wslVM       *wslVMInfo
+	wslVMHeldMB int
 	// wslUIDs is the configured user's UID per distro, owner-goroutine state
 	// like specs: written only when an off-owner lookup's answer is handled
 	// (handleWSLUIDResolved), read by admitAndStart and startProcess. Only
@@ -3506,18 +3524,49 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 // to, no admission arithmetic it could inform, and no portal row it could
 // fill. That gate belongs to the VRAM measurer alone: the RAM measurer has no
 // GPU index to need, so it is gated only on a live process existing.
+//
+// A WSL GENERATION IS MEASURED BY ITS SCOPE, NEVER BY ITS PID (#381). Its pid
+// is wsl.exe, a thin client inside which the workload does not run: its few MB
+// of private working set would land as a real measurement -- ending the RAM
+// bootstrap with most of the model uncharged (vLLM's API server alone is a
+// third of its scope) -- and no VRAM is ever found on it. So a wsl target's pid
+// goes to neither native measurer. Its RAM comes from the third source riding
+// this beat, the WSL sampler (sampleWSL): one wsl.exe call per distro with live
+// wsl targets, carrying the agent's fixed script and the units as arguments,
+// which answers each scope's cgroup figure and the VM's meminfo. It is gated
+// on wsl targets existing and on WSL being usable at all (wslSamplable), not on
+// either native measurer: the scope is readable wherever the workload runs.
+// The calls share the 2 s bound the native measurers keep (wslSampleTimeout),
+// and their answer travels in the same one cmdMeasured.
 func (o *owner) dispatchMeasurement() {
 	if o.closing || o.measuring {
 		return
 	}
 	mp := o.m.measurer.Load()
 	rp := o.m.ramMeasurer.Load()
-	if mp == nil && rp == nil {
+	if mp == nil && rp == nil && !o.wslSamplable() {
 		return
 	}
 	targets, declaresGPU := o.measurementTargets()
 	if len(targets) == 0 {
 		return
+	}
+	// Native pids for the two native measurers, wsl units per distro for the
+	// sampler. A wsl target is never in pids (see the paragraph above).
+	pids := make([]int, 0, len(targets))
+	var wslUnits map[string][]string
+	for _, t := range targets {
+		if t.wslUnit == "" {
+			pids = append(pids, t.pid)
+			continue
+		}
+		if !o.wslSamplable() {
+			continue
+		}
+		if wslUnits == nil {
+			wslUnits = make(map[string][]string)
+		}
+		wslUnits[t.wslDistro] = append(wslUnits[t.wslDistro], t.wslUnit)
 	}
 	// The two measurers are gated independently, and the asymmetry is the
 	// point. The VRAM one keeps the declares-a-GPU gate described above, so a
@@ -3532,15 +3581,22 @@ func (o *owner) dispatchMeasurement() {
 		vramMeasure = *mp
 	}
 	var ramMeasure ramMeasurerFunc
-	if rp != nil {
+	if rp != nil && len(pids) > 0 {
 		ramMeasure = *rp
 	}
-	if vramMeasure == nil && ramMeasure == nil {
-		return // only a VRAM measurer, and no spec declares a GPU
+	if vramMeasure == nil && ramMeasure == nil && wslUnits == nil {
+		// Nothing any source would be asked: only a VRAM measurer and no
+		// native spec declares a GPU, or only wsl targets on a host where WSL
+		// is not usable.
+		return
 	}
-	pids := make([]int, len(targets))
-	for i, t := range targets {
-		pids[i] = t.pid
+	// The sampler's inputs, copied off owner state for the goroutine. Its env
+	// carries no XDG_RUNTIME_DIR (uid -1): the script reads files, it does not
+	// talk to the user's systemd manager.
+	run, pol := o.wslRunner, o.policy.WSL
+	var env []string
+	if wslUnits != nil {
+		env = wslHelperEnv(o.getenv, -1)
 	}
 	o.measuring = true
 	// Tracked in m.wg like every other goroutine the owner spawns, so Close
@@ -3560,14 +3616,17 @@ func (o *owner) dispatchMeasurement() {
 		// stopped, which only happens during Close, where the flag no longer
 		// matters.)
 		//
-		// Both measurers run here, one after the other, and their answers
-		// travel together. Each bounds its own runtime (the RAM one is a few
-		// in-process reads and returns at once), so the pair costs no more than
-		// the VRAM measurer alone did, and one cmdMeasured keeps the
+		// All three run here, one after the other, and their answers travel
+		// together. Each bounds its own runtime (the RAM one is a few
+		// in-process reads and returns at once, the WSL sampler and the VRAM
+		// measurer 2 s each), and one cmdMeasured keeps the
 		// one-measurement-outstanding invariant.
 		c := cmdMeasured{targets: targets}
 		if ramMeasure != nil {
 			c.ramByPID = ramMeasure(pids)
+		}
+		if wslUnits != nil {
+			c.ramByUnit, c.wslVM = sampleWSL(run, pol, env, wslUnits)
 		}
 		if vramMeasure != nil {
 			c.byPID = vramMeasure(pids)
@@ -3576,26 +3635,40 @@ func (o *owner) dispatchMeasurement() {
 	}()
 }
 
+// wslSamplable reports whether the WSL sampler can run at all: a wsl.exe is
+// configured and the user is one the agent may run anything as. Without
+// either no wsl generation can have started, and the check keeps a host
+// without WSL and without native measurers on dispatchMeasurement's
+// allocate-nothing path.
+func (o *owner) wslSamplable() bool {
+	return o.policy.WSL.Exe != "" && !wslUserRefused(o.policy.WSL.User)
+}
+
 // measurementTargets lists the live generations worth measuring right now, or
 // nil when there are none. Ordered by spec ID so the pid list handed to an
 // external command does not depend on Go's randomized map iteration -- the
 // measurer treats it as a set, but a stable order keeps logs and test
 // expectations reproducible.
 //
-// declaresGPU reports whether any live spec declares a GPU. It is NOT applied
-// here: it is the VRAM measurer's gate (see dispatchMeasurement's gating
-// paragraph), and the RAM measurer, which has no GPU axis, must still see every
-// live process on a host where no spec declares one.
+// declaresGPU reports whether any live NATIVE spec declares a GPU. It is NOT
+// applied here: it is the VRAM measurer's gate (see dispatchMeasurement's
+// gating paragraph), and the RAM measurer, which has no GPU axis, must still
+// see every live process on a host where no spec declares one. A wsl
+// generation does not count: its pid is never handed to the VRAM measurer, so
+// it alone gives that measurer nothing to read.
 func (o *owner) measurementTargets() (targets []measureTarget, declaresGPU bool) {
 	targets = make([]measureTarget, 0, len(o.specs))
 	for id, st := range o.specs {
 		if st.proc == nil {
 			continue
 		}
-		if len(st.spec.GPUs) > 0 {
+		if len(st.spec.GPUs) > 0 && st.proc.wslUnit == "" {
 			declaresGPU = true
 		}
-		targets = append(targets, measureTarget{specID: id, proc: st.proc, pid: st.proc.pid, ready: st.proc.everHealthy})
+		targets = append(targets, measureTarget{
+			specID: id, proc: st.proc, pid: st.proc.pid, ready: st.proc.everHealthy,
+			wslUnit: st.proc.wslUnit, wslDistro: st.proc.wslDistro,
+		})
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].specID < targets[j].specID })
 	return targets, declaresGPU
@@ -3689,15 +3762,30 @@ func realRAM(v int) int {
 // reading of a load in progress cannot end that wait and wakes nobody. And a
 // measurement a start asked for while this one was out (remeasure) is
 // dispatched now.
+//
+// A wsl target's RAM is its unit's figure from the WSL sampler, under the same
+// generation guard and the same "a non-measurement says nothing" rule, and
+// never a figure keyed by its pid (see dispatchMeasurement). A VM reading
+// replaces the VM pool's sample together with what the agent's scopes held in
+// it -- every wsl target's figure, superseded generations' included: they held
+// it when the sample was taken, so it is the VM's to give back (wslRAMBudgetMB).
+// A new pool can end a Wait on RAM, so the RAM waiters are re-asked, as a host
+// sample re-asks them (wakeOnHostSample).
 func (o *owner) applyMeasurement(c cmdMeasured) {
 	o.measuring = false
 	landed := false
+	heldMB := 0
 	for _, t := range c.targets {
+		if t.wslUnit != "" {
+			heldMB += realRAM(c.ramByUnit[t.wslUnit])
+		}
 		st := o.specs[t.specID]
 		if st == nil || st.proc != t.proc {
 			continue // superseded generation -- see measureTarget
 		}
-		if byGPU := realMeasurement(c.byPID[t.pid]); byGPU != nil {
+		// No VRAM is ever measured per pid for a wsl generation: its pid was not
+		// asked, and a figure that happens to sit under it belongs to nobody.
+		if byGPU := realMeasurement(c.byPID[t.pid]); byGPU != nil && t.wslUnit == "" {
 			st.measuredVRAM = byGPU
 			// A real measurement resolves the VRAM bootstrap durably: the spec
 			// has a number now, so it must never spend (or keep holding) the
@@ -3713,7 +3801,13 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		// above is what keeps a recycled pid's reading off a different
 		// process, and realRAM is the same "a non-measurement says nothing"
 		// rule, so a cycle of zeros leaves a previous real number in place.
-		if mb := realRAM(c.ramByPID[t.pid]); mb > 0 {
+		// For a wsl generation the figure is its scope's, the whole workload
+		// tree, keyed by the unit that names exactly this generation.
+		ramMB := realRAM(c.ramByPID[t.pid])
+		if t.wslUnit != "" {
+			ramMB = realRAM(c.ramByUnit[t.wslUnit])
+		}
+		if mb := ramMB; mb > 0 {
 			st.measuredRAM = mb
 			// Task 4.4: a successful RAM measurement RESOLVES the cold-start
 			// bootstrap -- the RAM twin of vramBootstrapDone above. It resets
@@ -3743,8 +3837,14 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 			}
 		}
 	}
+	if c.wslVM != nil {
+		o.wslVM, o.wslVMHeldMB = c.wslVM, heldMB
+	}
 	if landed {
 		o.wakeAdmission(wantsDemandWake)
+	}
+	if c.wslVM != nil {
+		o.wakeAdmission(wantsHostSampleWake)
 	}
 	if o.remeasure {
 		o.remeasure = false
@@ -3825,9 +3925,11 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// budget from the next.
 	hi := o.hostInfo()
 
+	// A wsl generation's pid is wsl.exe, never measured (dispatchMeasurement):
+	// it stays out of this read too.
 	pids := make([]int, 0, len(o.specs))
 	for _, st := range o.specs {
-		if st.proc != nil {
+		if st.proc != nil && st.proc.wslUnit == "" {
 			pids = append(pids, st.proc.pid)
 		}
 	}
@@ -3975,6 +4077,10 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			// evicted -- see isEvictable for the fork-exec storm that
 			// produced.
 			Starting: st.state == StateStarting,
+			// Read off the generation, not st.spec: what holds VM memory is
+			// the process that runs, and a push may have changed the spec's
+			// mode while the old generation drains.
+			WSL: st.proc.wslUnit != "",
 		})
 	}
 
@@ -4019,8 +4125,18 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		// Copied verbatim; Admit is the one place that interprets it (0 = off),
 		// like every budget. It applies only to an unknown-RAM candidate.
 		RAMBootstrapGuessMB: o.ramBootstrapGuessMB,
-		Allowed:             o.allowedPairs,
+		// The WSL VM pool and its ceiling, both 0 (unconstrained) until a
+		// sampling call has answered; see wslRAMBudgetMB for why the pool's
+		// add-back comes from the sample rather than the live set above.
+		WSLRAMBudgetMB:  o.wslRAMBudget(),
+		WSLRAMCeilingMB: wslRAMCeilingMB(o.wslVM, o.wslRAMReserveMB),
+		Allowed:         o.allowedPairs,
 	}
+}
+
+// wslRAMBudget is the WSL VM RAM pool as of the latest sample (wslRAMBudgetMB).
+func (o *owner) wslRAMBudget() int {
+	return wslRAMBudgetMB(o.wslVM, o.wslVMHeldMB, o.wslRAMReserveMB)
 }
 
 // hostRAMBudgetMB is the host-RAM pool admission budgets managed processes
@@ -4672,8 +4788,9 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	ramBudgetAtDeath := 0
 	if bootstrapSpec {
 		// Only the bootstrap classifier reads this, and it loops the spec set, so
-		// skip it for every ordinary (known-RAM) exit.
-		ramBudgetAtDeath = o.hostRAMBudgetSnapshot()
+		// skip it for every ordinary (known-RAM) exit. A wsl generation is
+		// weighed against the VM pool it lived in, not the host's (ramPoolAtDeath).
+		ramBudgetAtDeath = o.ramPoolAtDeath(proc)
 	}
 
 	cancelTimer(o.m, &proc.killTimer)
@@ -5043,6 +5160,21 @@ func betterBootstrapVictim(a, b *specState) bool {
 		return a.lastUsed.Before(b.lastUsed)
 	}
 	return a.spec.ID < b.spec.ID
+}
+
+// ramPoolAtDeath is the RAM pool proc lived in, for the bootstrap
+// memory-pressure classifier's "last measured RAM at 90 % of the pool"
+// criterion: the WSL VM pool for a wsl generation, whose OOM killer is the
+// VM's and strikes at the VM's ceiling while the host may have room to spare,
+// and the host pool otherwise. Read off the generation, like the exit message.
+// Both are what admission weighed the generation against, and both are 0
+// (unconstrained) before their first sample, which makes the criterion a
+// no-op there.
+func (o *owner) ramPoolAtDeath(proc *runningProc) int {
+	if proc.wslUnit != "" {
+		return o.wslRAMBudget()
+	}
+	return o.hostRAMBudgetSnapshot()
 }
 
 // hostRAMBudgetSnapshot computes the current host-RAM pool exactly as

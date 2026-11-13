@@ -33,27 +33,48 @@ import (
 const wslTestDistro = "Ubuntu-24.04"
 
 // fakeWSL is one test's fakewsl world: the log every invocation appends a line
-// to, and the state directory that stands in for the distro's units.
+// to, the state directory that stands in for the distro's units, and the file
+// whose contents the fake prints as the RAM sampling script's answer.
 type fakeWSL struct {
-	log, state string
+	log, state, sample string
 }
+
+// fakeWSLIdleSample is the sampling answer newFakeWSL starts with: no scope
+// figures, and a roomy VM, so a test that does not look at RAM gets a sample
+// that parses and constrains nothing it starts.
+const fakeWSLIdleSample = "meminfo 67108864 67108864\n"
 
 func newFakeWSL(t *testing.T) *fakeWSL {
 	t.Helper()
 	dir := t.TempDir()
-	f := &fakeWSL{log: filepath.Join(dir, "calls.jsonl"), state: filepath.Join(dir, "state")}
+	f := &fakeWSL{log: filepath.Join(dir, "calls.jsonl"), state: filepath.Join(dir, "state"), sample: filepath.Join(dir, "sample")}
 	if err := os.Mkdir(f.state, 0o755); err != nil {
 		t.Fatalf("mkdir state: %v", err)
 	}
+	f.writeSample(t, fakeWSLIdleSample)
 	return f
 }
 
-// runner is execWSLRunner with the fake's two locations added to every helper
+// writeSample replaces what the fake prints for the next sampling call. It
+// renames a complete file into place, so a concurrent call reads the old
+// answer or the new one, never half of one.
+func (f *fakeWSL) writeSample(t *testing.T, body string) {
+	t.Helper()
+	tmp := f.sample + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
+		t.Fatalf("write sample: %v", err)
+	}
+	if err := os.Rename(tmp, f.sample); err != nil {
+		t.Fatalf("rename sample: %v", err)
+	}
+}
+
+// runner is execWSLRunner with the fake's locations added to every helper
 // call's environment: the agent builds that environment itself and passes on
 // nothing else of its own, so this is the one way to point the fake at them.
 func (f *fakeWSL) runner() wslRunner {
 	return func(ctx context.Context, exe string, args, env []string) ([]byte, error) {
-		env = append(slices.Clone(env), "FAKEWSL_LOG="+f.log, "FAKEWSL_STATE="+f.state)
+		env = append(slices.Clone(env), "FAKEWSL_LOG="+f.log, "FAKEWSL_STATE="+f.state, "FAKEWSL_SAMPLE="+f.sample)
 		return execWSLRunner(ctx, exe, args, env)
 	}
 }
@@ -830,5 +851,343 @@ func TestExecWSLRunnerReportsStderr(t *testing.T) {
 	_, err = execWSLRunner(context.Background(), fakewslPath, []string{"-d", wslTestDistro, "-u", "ai", "--exec", "frobnicate"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "unsupported command") {
 		t.Fatalf("a failing call returned %v, want an error carrying its stderr", err)
+	}
+}
+
+// TestWSLTargetsNeverReachThePIDRAMMeasurer: a wsl instance's pid is wsl.exe, a
+// thin client whose few MB would count as a real measurement and end the RAM
+// bootstrap with a third of the workload uncharged, and on which no VRAM is
+// ever found. Its RAM comes from its scope's cgroup through the sampling call
+// instead, and its pid reaches neither native measurer -- neither the beat's
+// nor the admission snapshot's synchronous VRAM read.
+func TestWSLTargetsNeverReachThePIDRAMMeasurer(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+
+	var mu sync.Mutex
+	ramPIDs, vramPIDs := map[int]bool{}, map[int]bool{}
+	m.SetRAMMeasurer(func(pids []int) map[int]int {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make(map[int]int, len(pids))
+		for _, p := range pids {
+			ramPIDs[p] = true
+			out[p] = 1500
+		}
+		return out
+	})
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make(map[int]map[int]int, len(pids))
+		for _, p := range pids {
+			vramPIDs[p] = true
+			out[p] = map[int]int{0: 4242}
+		}
+		return out
+	})
+
+	native := baseSpec("N", "n")
+	native.Pinned = true
+	native.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}} // so the VRAM measurer runs at all
+	wsl := wslTestSpec(f, "S", "m")
+	wsl.Pinned = true
+	wsl.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{ETag: "v1", Specs: []Spec{native, wsl}, Coresident: coresidentAllPairs("N", "S")})
+	waitForState(t, m, "N", StateRunning)
+	sStatus := waitForState(t, m, "S", StateRunning)
+	unit := f.onlyLaunchedUnit(t)
+
+	f.writeSample(t, "unit "+unit+" 8419880960 4535152640\nmeminfo 28763116 21000000\n")
+	waitUntil(t, 5*time.Second, "S reports its scope's RAM", func() bool {
+		st := statusFor(m, "S")
+		return st != nil && st.MeasuredRAMMB == 3704
+	})
+	// A further admission runs buildSnapshot's synchronous VRAM read.
+	ensureWSL(t, m, "n")
+
+	nStatus := statusFor(m, "N")
+	mu.Lock()
+	defer mu.Unlock()
+	if ramPIDs[sStatus.PID] || vramPIDs[sStatus.PID] {
+		t.Errorf("the wsl.exe pid %d reached a native measurer (RAM %v, VRAM %v)", sStatus.PID, ramPIDs, vramPIDs)
+	}
+	if !ramPIDs[nStatus.PID] || !vramPIDs[nStatus.PID] {
+		t.Errorf("the native pid %d was not measured (RAM %v, VRAM %v)", nStatus.PID, ramPIDs, vramPIDs)
+	}
+	if nStatus.MeasuredRAMMB != 1500 {
+		t.Errorf("N MeasuredRAMMB = %d, want the PID measurer's 1500", nStatus.MeasuredRAMMB)
+	}
+	if got := statusFor(m, "S").MeasuredVRAM; len(got) != 0 {
+		t.Errorf("S MeasuredVRAM = %v, want none: no per-PID VRAM exists for a wsl instance", got)
+	}
+
+	samples := f.find(t, "sh", "-c")
+	if len(samples) == 0 {
+		t.Fatal("no sampling call was made")
+	}
+	for _, c := range samples {
+		want := []string{"-d", wslTestDistro, "-u", "ai", "--exec", "sh", "-c", wslSampleScript, "sh", unit}
+		if !slices.Equal(c.Argv, want) {
+			t.Errorf("sampling argv %q\nwant %q", c.Argv, want)
+		}
+		if _, ok := c.Env["XDG_RUNTIME_DIR"]; ok {
+			t.Errorf("the sampling call carries XDG_RUNTIME_DIR, which it does not need: %v", c.Env)
+		}
+	}
+}
+
+// newWSLPoolOwner is a hand-driven owner with one native instance N (pid 100)
+// and one wsl instance S (pid 200) running, the VRAM pids buildSnapshot hands
+// its synchronous measurer recorded in *vramPIDs, and a 1024 MB WSL reserve.
+func newWSLPoolOwner(vramPIDs *[]int) (o *owner, native, wsl *specState) {
+	m := &Manager{}
+	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		*vramPIDs = append(*vramPIDs, pids...)
+		return nil
+	})
+	nSpec := baseSpec("N", "n")
+	sSpec := baseSpec("S", "m")
+	sSpec.Execution = &Execution{Mode: ExecutionModeWSL, WSL: &WSLExecution{Distro: wslTestDistro}}
+	native = &specState{spec: nSpec, state: StateRunning, proc: &runningProc{specID: "N", pid: 100}}
+	wsl = &specState{spec: sSpec, state: StateRunning, proc: &runningProc{specID: "S", pid: 200, wslUnit: "opagent-n-S-1", wslDistro: wslTestDistro}}
+	o = &owner{
+		m:               m,
+		cfg:             Config{Specs: []Spec{nSpec, sSpec}},
+		specs:           map[string]*specState{"N": native, "S": wsl},
+		wslRAMReserveMB: 1024,
+	}
+	return o, native, wsl
+}
+
+func runningRow(t *testing.T, snap PolicySnapshot, id string) RunningProc {
+	t.Helper()
+	for _, r := range snap.Running {
+		if r.SpecID == id {
+			return r
+		}
+	}
+	t.Fatalf("no running row for %s", id)
+	return RunningProc{}
+}
+
+// TestBuildSnapshotWSLRAMPool: the VM pool is the sample's MemAvailable plus
+// what the agent's own scopes held in that same sample, minus the reserve; the
+// ceiling is MemTotal minus the reserve; both are 0 (unconstrained) before the
+// first sample. A wsl process is marked as such, takes its RAM from its unit's
+// figure only, and its pid is not in the synchronous VRAM read.
+func TestBuildSnapshotWSLRAMPool(t *testing.T) {
+	var vramPIDs []int
+	o, native, wsl := newWSLPoolOwner(&vramPIDs)
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 40000})
+
+	snap := o.buildSnapshot()
+	if snap.WSLRAMBudgetMB != 0 || snap.WSLRAMCeilingMB != 0 {
+		t.Errorf("before any sample: budget/ceiling = %d/%d, want 0/0", snap.WSLRAMBudgetMB, snap.WSLRAMCeilingMB)
+	}
+	if !runningRow(t, snap, "S").WSL || runningRow(t, snap, "N").WSL {
+		t.Errorf("WSL flags: S=%v N=%v, want true/false", runningRow(t, snap, "S").WSL, runningRow(t, snap, "N").WSL)
+	}
+	if !slices.Equal(vramPIDs, []int{100}) {
+		t.Errorf("synchronous VRAM read got pids %v, want only the native 100", vramPIDs)
+	}
+
+	o.applyMeasurement(cmdMeasured{
+		targets: []measureTarget{
+			{specID: "N", proc: native.proc, pid: 100, ready: true},
+			{specID: "S", proc: wsl.proc, pid: 200, ready: true, wslUnit: "opagent-n-S-1", wslDistro: wslTestDistro},
+		},
+		// 200 is S's pid: a figure for it must never land on S.
+		ramByPID:  map[int]int{100: 1500, 200: 99},
+		ramByUnit: map[string]int{"opagent-n-S-1": 3704},
+		wslVM:     &wslVMInfo{TotalMB: 28088, AvailableMB: 20507},
+	})
+	if native.measuredRAM != 1500 || wsl.measuredRAM != 3704 {
+		t.Fatalf("measuredRAM N/S = %d/%d, want 1500/3704", native.measuredRAM, wsl.measuredRAM)
+	}
+	snap = o.buildSnapshot()
+	if want := 20507 + 3704 - 1024; snap.WSLRAMBudgetMB != want {
+		t.Errorf("WSLRAMBudgetMB = %d, want %d", snap.WSLRAMBudgetMB, want)
+	}
+	if want := 28088 - 1024; snap.WSLRAMCeilingMB != want {
+		t.Errorf("WSLRAMCeilingMB = %d, want %d", snap.WSLRAMCeilingMB, want)
+	}
+	// The host pool is unchanged by the mode: every managed process's measured
+	// RAM is added back, the wsl one's included (vmmem holds it on the host).
+	if want := 40000 + 1500 + 3704; snap.HostRAMBudgetMB != want {
+		t.Errorf("HostRAMBudgetMB = %d, want %d", snap.HostRAMBudgetMB, want)
+	}
+	if got := runningRow(t, snap, "S").RAMMB; got != 3704 {
+		t.Errorf("S RAMMB = %d, want 3704", got)
+	}
+
+	// S exits. The sample still describes the instant it was taken, when S held
+	// 3704 MB the VM has now got back: the pool must not shrink by S's share
+	// until a later sample shows the VM's MemAvailable without it. Charging it
+	// to nobody here is what would strand the very start S was evicted for.
+	wsl.proc = nil
+	wsl.measuredRAM = 0
+	if got := o.buildSnapshot().WSLRAMBudgetMB; got != 20507+3704-1024 {
+		t.Errorf("after S exits: WSLRAMBudgetMB = %d, want it unchanged at %d", got, 20507+3704-1024)
+	}
+
+	// A tight VM floors at 1, never at the unconstrained 0.
+	o.applyMeasurement(cmdMeasured{wslVM: &wslVMInfo{TotalMB: 1000, AvailableMB: 10}})
+	snap = o.buildSnapshot()
+	if snap.WSLRAMBudgetMB != 1 || snap.WSLRAMCeilingMB != 1 {
+		t.Errorf("tight VM: budget/ceiling = %d/%d, want 1/1", snap.WSLRAMBudgetMB, snap.WSLRAMCeilingMB)
+	}
+}
+
+// TestApplyMeasurementWSLGenerationAndSilence: a scope's figure lands only on
+// the generation it was taken for, a unit the sample said nothing about keeps
+// its previous figure, and a cycle with no VM reading keeps the previous pool.
+func TestApplyMeasurementWSLGenerationAndSilence(t *testing.T) {
+	var vramPIDs []int
+	o, _, wsl := newWSLPoolOwner(&vramPIDs)
+	old := wsl.proc
+	wsl.proc = &runningProc{specID: "S", pid: 201, wslUnit: "opagent-n-S-2", wslDistro: wslTestDistro}
+	wsl.measuredRAM = 777
+
+	o.applyMeasurement(cmdMeasured{
+		targets:   []measureTarget{{specID: "S", proc: old, pid: 200, wslUnit: "opagent-n-S-1", wslDistro: wslTestDistro}},
+		ramByUnit: map[string]int{"opagent-n-S-1": 5000},
+		wslVM:     &wslVMInfo{TotalMB: 28088, AvailableMB: 20000},
+	})
+	if wsl.measuredRAM != 777 {
+		t.Errorf("a superseded generation's figure landed: measuredRAM = %d, want 777", wsl.measuredRAM)
+	}
+	// What the superseded scope held at the sample is the VM's to give back.
+	if got := o.buildSnapshot().WSLRAMBudgetMB; got != 20000+5000-1024 {
+		t.Errorf("WSLRAMBudgetMB = %d, want %d", got, 20000+5000-1024)
+	}
+
+	cur := measureTarget{specID: "S", proc: wsl.proc, pid: 201, wslUnit: "opagent-n-S-2", wslDistro: wslTestDistro}
+	o.applyMeasurement(cmdMeasured{targets: []measureTarget{cur}, ramByUnit: map[string]int{}})
+	if wsl.measuredRAM != 777 {
+		t.Errorf("a unit the sample said nothing about lost its figure: %d", wsl.measuredRAM)
+	}
+	if got := o.buildSnapshot().WSLRAMBudgetMB; got != 20000+5000-1024 {
+		t.Errorf("a cycle without a VM reading moved the pool to %d", got)
+	}
+}
+
+// TestRAMPoolAtDeathIsTheVMForWSL: the bootstrap memory-pressure classifier
+// compares a wsl instance's last RAM with the VM pool it lived in, a native
+// one's with the host pool.
+func TestRAMPoolAtDeathIsTheVMForWSL(t *testing.T) {
+	var vramPIDs []int
+	o, native, wsl := newWSLPoolOwner(&vramPIDs)
+	o.m.SetHostInfo(HostInfo{MemAvailableMB: 40000})
+	native.measuredRAM, wsl.measuredRAM = 1500, 3704
+	if got, want := o.ramPoolAtDeath(wsl.proc), 0; got != want {
+		t.Errorf("wsl before any VM sample = %d, want %d (unknown)", got, want)
+	}
+	o.wslVM, o.wslVMHeldMB = &wslVMInfo{TotalMB: 28088, AvailableMB: 6000}, 3704
+	if got, want := o.ramPoolAtDeath(wsl.proc), 6000+3704-1024; got != want {
+		t.Errorf("wsl = %d, want the VM pool %d", got, want)
+	}
+	if got, want := o.ramPoolAtDeath(native.proc), 40000+1500+3704; got != want {
+		t.Errorf("native = %d, want the host pool %d", got, want)
+	}
+	// 8000 MB is 92 % of the 8680 MB VM pool, but 18 % of the host pool:
+	// memory pressure in the VM, which the host's figure would hide.
+	if !bootstrapDiedOfMemoryPressure(false, 8000, o.ramPoolAtDeath(wsl.proc)) {
+		t.Error("8000 MB of a 8680 MB VM pool must read as memory pressure")
+	}
+	if bootstrapDiedOfMemoryPressure(false, 8000, o.ramPoolAtDeath(native.proc)) {
+		t.Error("8000 MB of the 45204 MB host pool must not")
+	}
+}
+
+// TestWSLEvictionForVMRoomStartsTheCandidate: a wsl start that does not fit the
+// VM pool evicts the idle wsl workload, and then starts. After the eviction no
+// wsl process is left to sample, so the pool cannot be refreshed: the start
+// must fit the pool the last sample described, in which the victim's share was
+// already the VM's to give back. Charging the victim's share to nobody instead
+// would leave the candidate waiting for a sample that never comes.
+func TestWSLEvictionForVMRoomStartsTheCandidate(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+	a := wslTestSpec(f, "A", "a")
+	a.RAMMB = 6000
+	b := wslTestSpec(f, "B", "b")
+	b.RAMMB = 5000
+	m.Apply(Config{ETag: "v1", Specs: []Spec{a, b}, Coresident: coresidentAllPairs("A", "B")})
+
+	ensureWSL(t, m, "a")
+	unitA := f.onlyLaunchedUnit(t)
+	// A's scope holds 6000 MB of a VM with 4000 MB available: a pool of 10000,
+	// and 6000 + 5000 does not fit it.
+	f.writeSample(t, "unit "+unitA+" "+strconv.Itoa(6000<<20)+" 0\nmeminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(4000<<10)+"\n")
+	waitUntil(t, 5*time.Second, "A's sample lands", func() bool {
+		st := statusFor(m, "A")
+		return st != nil && st.MeasuredRAMMB == 6000
+	})
+
+	ensureWSL(t, m, "b")
+	if st := statusFor(m, "A"); st.State == StateRunning {
+		t.Errorf("A is still running beside B: the VM pool was not applied")
+	}
+	waitForState(t, m, "B", StateRunning)
+}
+
+// TestWSLVMSampleWakesARAMWaiter: a wsl start that waits on the VM pool -- the
+// only wsl holder is pinned, so nothing can be evicted -- is re-asked when the
+// next VM sample lands, and starts once that sample shows the room.
+func TestWSLVMSampleWakesARAMWaiter(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+	a := wslTestSpec(f, "A", "a")
+	a.RAMMB = 1000
+	a.Pinned = true
+	b := wslTestSpec(f, "B", "b")
+	b.RAMMB = 5000
+	m.Apply(Config{ETag: "v1", Specs: []Spec{a, b}, Coresident: coresidentAllPairs("A", "B")})
+	waitForState(t, m, "A", StateRunning)
+	unitA := f.onlyLaunchedUnit(t)
+	sample := func(availMB int) string {
+		return "unit " + unitA + " " + strconv.Itoa(1000<<20) + " 0\nmeminfo " + strconv.Itoa(12000<<10) + " " + strconv.Itoa(availMB<<10) + "\n"
+	}
+	// A pool of 2000 + 1000 = 3000: B's 5000 does not fit beside A.
+	f.writeSample(t, sample(2000))
+	waitUntil(t, 5*time.Second, "A's sample lands", func() bool {
+		st := statusFor(m, "A")
+		return st != nil && st.MeasuredRAMMB == 1000
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, "b")
+		if err == nil {
+			release()
+		}
+		done <- err
+	}()
+	// Several beats, each landing the same tight sample: B keeps waiting.
+	time.Sleep(300 * time.Millisecond)
+	if st := statusFor(m, "B"); st.State == StateRunning || st.State == StateStarting {
+		t.Fatalf("B is %s with the VM pool too small for it", st.State)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("EnsureRunning(b) returned %v while it should wait", err)
+	default:
+	}
+
+	f.writeSample(t, sample(8000)) // a pool of 9000 now
+	if err := <-done; err != nil {
+		t.Fatalf("EnsureRunning(b) = %v, want the next VM sample to start it", err)
+	}
+	if st := statusFor(m, "A"); st.State != StateRunning {
+		t.Errorf("A is %s, want it untouched (pinned)", st.State)
 	}
 }

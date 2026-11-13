@@ -1,11 +1,15 @@
 package runtime
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
+	"maps"
 	"path"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // wslLaunch is the fully built wsl.exe invocation for one WSL spec: what
@@ -201,4 +205,168 @@ func (ex expandedSpec) withWrapper(l wslLaunch) expandedSpec {
 	out.envSpans = append(slices.Clone(ex.envSpans), make([][]secretSpan, len(extra))...)
 	out.envFromSpec = append(slices.Clone(ex.envFromSpec), make([]bool, len(extra))...)
 	return out
+}
+
+// wslSampleScript is the agent's one fixed sampling script, run as
+// "sh -c <script> sh <unit...>" inside a distro (sampleWSL). It is the only
+// shell the agent ever starts there, and nothing the gateway sends reaches it:
+// the script is this constant, and the unit names -- agent-built, see
+// wslUnitName -- arrive as positional arguments, read only as "$@" and quoted
+// words, never spliced into the program text.
+//
+// For each unit it prints "unit <u> <memory.current> <inactive_file>" from the
+// unit's scope cgroup under the calling user's systemd manager (the path
+// systemd-run --user --scope gives it; Phase 0 B6), or "unit <u> -" when those
+// files cannot be read: a unit that has already gone, or a cgroup layout the
+// agent does not know. It ends with "meminfo <MemTotal kB> <MemAvailable kB>"
+// for the whole VM, which every distro shares. POSIX sh with cat and awk (and
+// id for the uid in the path), nothing a minimal distro lacks.
+const wslSampleScript = `uid=$(id -u)
+app=/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/app.slice
+for u in "$@"; do
+	s=$app/$u.scope
+	c=$(cat "$s/memory.current" 2>/dev/null)
+	i=$(awk '$1 == "inactive_file" { print $2 }' "$s/memory.stat" 2>/dev/null)
+	if [ -n "$c" ] && [ -n "$i" ]; then
+		printf 'unit %s %s %s\n' "$u" "$c" "$i"
+	else
+		printf 'unit %s -\n' "$u"
+	fi
+done
+awk '$1 == "MemTotal:" { t = $2 } $1 == "MemAvailable:" { a = $2 } END { print "meminfo", t, a }' /proc/meminfo
+`
+
+// wslSampleTimeout bounds one beat's sampling calls, all distros together:
+// the same 2 s the native measurers bound themselves to, because the calls
+// ride the same off-owner measurement (dispatchMeasurement) and Close waits
+// for it.
+const wslSampleTimeout = 2 * time.Second
+
+// wslVMInfo is the WSL VM's own memory, in MiB, as /proc/meminfo inside it
+// reports it: the ceiling .wslconfig gives the VM (MemTotal) and what the VM
+// can still hand out (MemAvailable). All distros of one Windows user share the
+// VM, so any distro's answer describes it.
+type wslVMInfo struct {
+	TotalMB, AvailableMB int
+}
+
+// parseWSLSample reads what wslSampleScript printed: each unit's RAM figure in
+// MiB, memory.current minus inactive_file (the docker stats definition, so the
+// figure does not count reclaimable page cache such as a model file's), and
+// the VM's meminfo. A figure that is not positive is absent, like a unit
+// printed as "-": realRAM's rule, "unknown", never "uses nothing". Any line it
+// does not recognise, or a missing or repeated meminfo line, fails the whole
+// answer: a garbled sample is no sample.
+func parseWSLSample(out []byte) (ramByUnit map[string]int, vm wslVMInfo, err error) {
+	garbage := func(line string) error {
+		return fmt.Errorf("runtime: unexpected line in the WSL RAM sample: %q", clipText(strings.TrimSpace(line), 120))
+	}
+	seenMeminfo := false
+	for line := range strings.Lines(string(out)) {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 0:
+		case f[0] == "unit" && len(f) == 3 && f[2] == "-":
+		case f[0] == "unit" && len(f) == 4:
+			current, err1 := strconv.ParseUint(f[2], 10, 63)
+			inactive, err2 := strconv.ParseUint(f[3], 10, 63)
+			if err1 != nil || err2 != nil {
+				return nil, wslVMInfo{}, garbage(line)
+			}
+			if current <= inactive {
+				continue
+			}
+			if mb := int((current - inactive) >> 20); mb > 0 {
+				if ramByUnit == nil {
+					ramByUnit = make(map[string]int)
+				}
+				ramByUnit[f[1]] = mb
+			}
+		case f[0] == "meminfo" && len(f) == 3 && !seenMeminfo:
+			total, err1 := strconv.ParseUint(f[1], 10, 63)
+			avail, err2 := strconv.ParseUint(f[2], 10, 63)
+			if err1 != nil || err2 != nil || total>>10 == 0 {
+				return nil, wslVMInfo{}, garbage(line)
+			}
+			vm = wslVMInfo{TotalMB: int(total >> 10), AvailableMB: int(avail >> 10)}
+			seenMeminfo = true
+		default:
+			return nil, wslVMInfo{}, garbage(line)
+		}
+	}
+	if !seenMeminfo {
+		return nil, wslVMInfo{}, fmt.Errorf("runtime: the WSL RAM sample has no meminfo line")
+	}
+	return ramByUnit, vm, nil
+}
+
+// sampleWSL runs the sampling script once per distro in unitsByDistro, with
+// that distro's units, and returns every answered unit's figure and the VM's
+// meminfo (nil when no distro answered). It runs off the owner, inside
+// dispatchMeasurement's goroutine, under one wslSampleTimeout for all distros.
+// Distros are asked in sorted order, so a call log is reproducible.
+//
+// A distro whose call fails or whose answer does not parse contributes
+// nothing, and a Warn says why: like a native measurer that answers nothing,
+// its units keep their previous figures (applyMeasurement), and the pool keeps
+// its previous reading when no distro answered at all.
+func sampleWSL(run wslRunner, pol WSLPolicy, env []string, unitsByDistro map[string][]string) (ramByUnit map[string]int, vm *wslVMInfo) {
+	ctx, cancel := context.WithTimeout(context.Background(), wslSampleTimeout)
+	defer cancel()
+	for _, distro := range slices.Sorted(maps.Keys(unitsByDistro)) {
+		command := append([]string{"sh", "-c", wslSampleScript, "sh"}, unitsByDistro[distro]...)
+		out, err := runWSLHelperCtx(ctx, run, pol, distro, env, command...)
+		if err == nil {
+			var byUnit map[string]int
+			var info wslVMInfo
+			byUnit, info, err = parseWSLSample(out)
+			if err == nil {
+				for u, mb := range byUnit {
+					if ramByUnit == nil {
+						ramByUnit = make(map[string]int)
+					}
+					ramByUnit[u] = mb
+				}
+				vm = &info
+				continue
+			}
+		}
+		slog.Warn("runtime: could not sample the RAM of the WSL workloads", "wsl_distro", distro, "err", err)
+	}
+	return ramByUnit, vm
+}
+
+// wslRAMBudgetMB is the WSL VM RAM pool a wsl candidate must also fit
+// (PolicySnapshot.WSLRAMBudgetMB): the VM's MemAvailable plus what the agent's
+// own scopes held in that SAME sample (heldMB), minus the operator's reserve.
+// It is the host pool's arithmetic (hostRAMBudgetMB) applied to the VM, and
+// the add-back exists for the same reason: MemAvailable already excludes what
+// the managed scopes hold, which rule 6's VM twin sums again.
+//
+// The add-back is taken from the sample, not from the processes alive when the
+// snapshot is built, and that is what keeps the two halves of the sum about one
+// instant. The host pool can afford to add back the live set, because its
+// sample is replaced every second; this one is replaced only by the
+// measurement beat, and only while a wsl process is live to be measured. A
+// scope that exited after the sample took its share of the add-back with it
+// while MemAvailable still lacks it, and with no wsl process left nothing would
+// ever correct that: the start its eviction made room for would wait for good.
+//
+// No sample (vm nil) is 0, unconstrained, as everywhere; a real one floors at
+// 1, never 0, for the reason hostRAMBudgetMB gives.
+func wslRAMBudgetMB(vm *wslVMInfo, heldMB, reserveMB int) int {
+	if vm == nil {
+		return 0
+	}
+	return max(1, vm.AvailableMB+heldMB-reserveMB)
+}
+
+// wslRAMCeilingMB is the most the VM pool could ever offer, for the terminal
+// own-demand refusal (PolicySnapshot.WSLRAMCeilingMB): the VM's MemTotal minus
+// the reserve. A demand above it cannot fit the VM whatever is evicted.
+func wslRAMCeilingMB(vm *wslVMInfo, reserveMB int) int {
+	if vm == nil {
+		return 0
+	}
+	return max(1, vm.TotalMB-reserveMB)
 }

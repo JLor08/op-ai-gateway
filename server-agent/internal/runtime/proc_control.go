@@ -126,11 +126,17 @@ func wslHelperEnv(getenv func(string) string, uid int) []string {
 // It refuses a root user itself rather than trusting every caller to have
 // checked: this is the one way the agent's own calls reach a distro.
 func runWSLHelper(run wslRunner, pol WSLPolicy, distro string, env []string, command ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), wslHelperTimeout)
+	defer cancel()
+	return runWSLHelperCtx(ctx, run, pol, distro, env, command...)
+}
+
+// runWSLHelperCtx is runWSLHelper under a deadline the caller sets: the RAM
+// sampler shares one, shorter, across a beat's calls (sampleWSL).
+func runWSLHelperCtx(ctx context.Context, run wslRunner, pol WSLPolicy, distro string, env []string, command ...string) ([]byte, error) {
 	if wslUserRefused(pol.User) {
 		return nil, fmt.Errorf("runtime: no non-root WSL user is configured (runtime_wsl_user)")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), wslHelperTimeout)
-	defer cancel()
 	return run(ctx, pol.Exe, wslHelperArgs(pol.User, distro, command...), env)
 }
 
