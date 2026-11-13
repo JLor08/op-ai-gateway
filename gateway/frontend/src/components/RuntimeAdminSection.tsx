@@ -768,6 +768,16 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+// The short table label of a spec's execution mode. A mode this build does not
+// know yet (a later Docker mode, say) shows its raw value rather than nothing,
+// so the column and its filter stay truthful across a gateway/portal skew.
+function executionModeLabel(mode: string, t: Translation): string {
+  if (mode === '') return '—';
+  if (mode === 'native') return t.runtimeSpecExecutionModeNative;
+  if (mode === 'wsl') return t.runtimeExecutionWSL;
+  return mode;
+}
+
 // The VRAM the admission arithmetic actually charges for one GPU row of a
 // spec, which is NOT always the operator's estimate: the larger of the agent's
 // measurement and the operator's estimate, so the estimate is a floor and a
@@ -3979,6 +3989,38 @@ export function RuntimeAdminSection({
       filter: 'text',
     },
     {
+      // HOW the spec runs (native process, WSL2, later Docker) is a launch
+      // property of the spec, so it lives here and never in the model-mapping
+      // table, which carries capabilities and speeds only. The value is the
+      // raw mode so the enum filter keeps working for a mode this build does
+      // not know yet; an unconfigured row has none.
+      id: 'execution',
+      label: t.runtimeSpecExecutionMode,
+      value: (m) => {
+        const spec = specsById[m.id];
+        return spec?.configured ? (spec.execution_mode ?? 'native') : '';
+      },
+      filter: 'enum',
+      searchable: false,
+      enumLabel: (v) => executionModeLabel(v, t),
+      render: (m) => {
+        const spec = specsById[m.id];
+        if (!spec?.configured) return '—';
+        const mode = spec.execution_mode ?? 'native';
+        if (mode !== 'wsl') return executionModeLabel(mode, t);
+        return (
+          <Box sx={{ display: 'grid', gap: 0.25 }}>
+            <span>{executionModeLabel(mode, t)}</span>
+            {spec.wsl_distro && (
+              <Typography variant="caption" color="text.secondary">
+                {spec.wsl_distro}
+              </Typography>
+            )}
+          </Box>
+        );
+      },
+    },
+    {
       id: 'gpus',
       label: t.runtimeSpecGpus,
       value: (m) => formatGpus(specsById[m.id]),
@@ -4033,19 +4075,17 @@ export function RuntimeAdminSection({
             />
           );
         }
-        if (spec?.execution_mode === 'wsl') {
+        // How the spec runs is the execution column's job; this cell only says
+        // where a WSL spec's VRAM figure comes from. Only a measured figure is
+        // attributed from the VM: an estimate alone is the operator's, and
+        // labelling it would claim a measurement that has not happened.
+        if (spec?.execution_mode === 'wsl' && spec.gpus.some((g) => g.vram_measured_mb > 0)) {
           return (
             <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'end' }}>
               <span>{formatMb(totalGpuVram(spec))}</span>
-              <Chip size="small" variant="outlined" label={t.runtimeStatusWSLMarker} />
-              {/* Only a measured figure is attributed from the VM; an estimate
-                  alone is the operator's, and labelling it would claim a
-                  measurement that has not happened. */}
-              {spec.gpus.some((g) => g.vram_measured_mb > 0) && (
-                <Typography variant="caption" color="text.secondary">
-                  {t.runtimeStatusVRAMFromVM}
-                </Typography>
-              )}
+              <Typography variant="caption" color="text.secondary">
+                {t.runtimeStatusVRAMFromVM}
+              </Typography>
             </Box>
           );
         }

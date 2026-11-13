@@ -29,20 +29,20 @@ const rpcMemberNamesRetry = 5 * time.Second
 // server) and is not safe for concurrent use.
 type rpcMemberNamer struct {
 	// resolve names the given member spec ids for the reader.
-	resolve func(ctx context.Context, specIDs []string) (map[string]string, error)
+	resolve func(ctx context.Context, specIDs []string) (map[string]portal.RPCMemberName, error)
 	now     func() time.Time
 	// key is the member set of the last lookup, tried at tried; names and
 	// resolvedAt are from the last successful one.
 	key        string
 	tried      time.Time
 	failed     bool
-	names      map[string]string
+	names      map[string]portal.RPCMemberName
 	resolvedAt time.Time
 }
 
-// apply returns rows with each RPC member row's DisplayName set. The rows of
-// a published frame are shared by every subscriber, so a frame with a member
-// is copied before it is named. A member without a name is shown by its id.
+// apply returns rows with each RPC member row's DisplayName, HeadModel and
+// HeadServer set. The rows of a published frame are shared by every
+// subscriber, so a frame with a member is copied before it is named. A member without a name is shown by its id.
 func (n *rpcMemberNamer) apply(ctx context.Context, rows []RuntimeStatusDTO) []RuntimeStatusDTO {
 	ids := rpcMemberIDs(rows)
 	if len(ids) == 0 {
@@ -52,7 +52,8 @@ func (n *rpcMemberNamer) apply(ctx context.Context, rows []RuntimeStatusDTO) []R
 	out := slices.Clone(rows)
 	for i := range out {
 		if out[i].Kind == portal.AgentSpecKindRPCServer {
-			out[i].DisplayName = n.names[out[i].SpecID]
+			name := n.names[out[i].SpecID]
+			out[i].DisplayName, out[i].HeadModel, out[i].HeadServer = name.DisplayName, name.HeadModel, name.HeadServer
 		}
 	}
 	return out

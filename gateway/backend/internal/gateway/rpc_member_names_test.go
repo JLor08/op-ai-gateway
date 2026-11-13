@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,10 +21,10 @@ import (
 func TestRPCMemberNamerNamesAndCaches(t *testing.T) {
 	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	calls := 0
-	answer := map[string]string{"rpcm_a": "RPC (m)(s)"}
+	answer := map[string]portal.RPCMemberName{"rpcm_a": {DisplayName: "RPC (m)(s)", HeadModel: "m", HeadServer: "s"}}
 	var failWith error
 	n := &rpcMemberNamer{
-		resolve: func(_ context.Context, ids []string) (map[string]string, error) {
+		resolve: func(_ context.Context, ids []string) (map[string]portal.RPCMemberName, error) {
 			calls++
 			return answer, failWith
 		},
@@ -33,11 +34,11 @@ func TestRPCMemberNamerNamesAndCaches(t *testing.T) {
 	ctx := context.Background()
 
 	got := n.apply(ctx, shared)
-	if got[1].DisplayName != "RPC (m)(s)" || got[0].DisplayName != "" || calls != 1 {
+	if got[1].DisplayName != "RPC (m)(s)" || got[1].HeadModel != "m" || got[1].HeadServer != "s" || got[0].DisplayName != "" || calls != 1 {
 		t.Fatalf("named = %+v, calls %d", got, calls)
 	}
 	// The published rows are shared by every subscriber: never written.
-	if shared[1].DisplayName != "" {
+	if shared[1].DisplayName != "" || shared[1].HeadModel != "" || shared[1].HeadServer != "" {
 		t.Fatal("the shared frame was modified")
 	}
 	// The same members within the TTL: no new lookup.
@@ -47,7 +48,7 @@ func TestRPCMemberNamerNamesAndCaches(t *testing.T) {
 	}
 	// The first frame a TTL after the last lookup looks up again: a rename shows.
 	now = now.Add(rpcMemberNamesTTL)
-	answer = map[string]string{"rpcm_a": "RPC (renamed)(s)"}
+	answer = map[string]portal.RPCMemberName{"rpcm_a": {DisplayName: "RPC (renamed)(s)", HeadModel: "renamed", HeadServer: "s"}}
 	if got := n.apply(ctx, shared); got[1].DisplayName != "RPC (renamed)(s)" || calls != 2 {
 		t.Fatalf("after the TTL = %q, calls %d", got[1].DisplayName, calls)
 	}
@@ -70,8 +71,8 @@ func TestRPCMemberNamerNamesAndCaches(t *testing.T) {
 		t.Fatalf("after the back-off = %q, calls %d", got[1].DisplayName, calls)
 	}
 	now = now.Add(rpcMemberNamesTTL - rpcMemberNamesRetry - time.Second)
-	if got := n.apply(ctx, more); got[1].DisplayName != "" {
-		t.Fatalf("names outlived the TTL: %q", got[1].DisplayName)
+	if got := n.apply(ctx, more); got[1].DisplayName != "" || got[1].HeadModel != "" || got[1].HeadServer != "" {
+		t.Fatalf("names outlived the TTL: %+v", got[1])
 	}
 	// A frame without a member is passed through untouched.
 	plain := []RuntimeStatusDTO{{SpecID: "spec_model"}}
@@ -85,8 +86,8 @@ func TestRPCMemberNamerDropsNamesWhenTheServerIsRefused(t *testing.T) {
 	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 	var failWith error
 	n := &rpcMemberNamer{
-		resolve: func(_ context.Context, ids []string) (map[string]string, error) {
-			return map[string]string{"rpcm_a": "RPC (m)(s)"}, failWith
+		resolve: func(_ context.Context, ids []string) (map[string]portal.RPCMemberName, error) {
+			return map[string]portal.RPCMemberName{"rpcm_a": {DisplayName: "RPC (m)(s)", HeadModel: "m", HeadServer: "s"}}, failWith
 		},
 		now: func() time.Time { return now },
 	}
@@ -96,8 +97,8 @@ func TestRPCMemberNamerDropsNamesWhenTheServerIsRefused(t *testing.T) {
 	}
 	failWith = portal.ErrServerNotFound
 	now = now.Add(rpcMemberNamesTTL)
-	if got := n.apply(context.Background(), rows); got[0].DisplayName != "" {
-		t.Fatalf("name kept after the server was refused: %q", got[0].DisplayName)
+	if got := n.apply(context.Background(), rows); got[0].DisplayName != "" || got[0].HeadModel != "" || got[0].HeadServer != "" {
+		t.Fatalf("name kept after the server was refused: %+v", got[0])
 	}
 }
 
@@ -133,7 +134,9 @@ func TestRuntimeEventsNameRPCMembers(t *testing.T) {
 	if err := json.Unmarshal([]byte(data), &snap); err != nil {
 		t.Fatal(err)
 	}
-	if snap.Runtimes[0].DisplayName != "RPC (ggml-rpc-server)" || snap.Runtimes[1].DisplayName != "" {
+	// A manual spec no head uses names no head: no head keys on the wire.
+	if snap.Runtimes[0].DisplayName != "RPC (ggml-rpc-server)" || snap.Runtimes[1].DisplayName != "" ||
+		strings.Contains(data, "head_model") || strings.Contains(data, "head_server") {
 		t.Fatalf("snapshot = %+v", snap.Runtimes)
 	}
 }
@@ -187,7 +190,7 @@ func TestRuntimeEventsNameMembersPerReader(t *testing.T) {
 	owner, other := open(runtimeEventsOwnerSecret), open(runtimeEventsOtherSecret)
 
 	srv.RuntimeStatus.publish(runtimeEventsServerID, []RuntimeStatusDTO{{SpecID: member, State: "running", Kind: portal.AgentSpecKindRPCServer}})
-	nameIn := func(reader *bufio.Reader) string {
+	rowIn := func(reader *bufio.Reader) (RuntimeStatusDTO, string) {
 		t.Helper()
 		event, data := readPerfSSEFrame(t, reader, 3*time.Second)
 		if event != "update" {
@@ -195,12 +198,15 @@ func TestRuntimeEventsNameMembersPerReader(t *testing.T) {
 		}
 		var frame runtimeStatusEventDTO
 		must(json.Unmarshal([]byte(data), &frame))
-		return frame.Runtimes[0].DisplayName
+		return frame.Runtimes[0], data
 	}
-	if got := nameIn(owner); got != "RPC (big-model)(Head)" {
-		t.Fatalf("owner sees %q", got)
+	if got, _ := rowIn(owner); got.DisplayName != "RPC (big-model)(Head)" || got.HeadModel != "big-model" || got.HeadServer != "Head" {
+		t.Fatalf("owner sees %+v", got)
 	}
-	if got := nameIn(other); got != "RPC (—)" {
-		t.Fatalf("the reader without the head sees %q", got)
+	// The reader without the head learns neither its model nor its server:
+	// the fields are not even on the wire.
+	got, data := rowIn(other)
+	if got.DisplayName != "RPC (—)" || strings.Contains(data, "head_model") || strings.Contains(data, "head_server") {
+		t.Fatalf("the reader without the head sees %s", data)
 	}
 }

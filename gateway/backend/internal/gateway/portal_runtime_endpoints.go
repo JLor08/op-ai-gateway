@@ -358,7 +358,7 @@ func (s *Server) handleRuntimeEvents(w http.ResponseWriter, r *http.Request, tok
 	// RPC members are named for this reader: what the name may say depends
 	// on the heads the reader may see.
 	namer := &rpcMemberNamer{
-		resolve: func(ctx context.Context, ids []string) (map[string]string, error) {
+		resolve: func(ctx context.Context, ids []string) (map[string]portal.RPCMemberName, error) {
 			return s.Portal.RPCMemberDisplayNames(ctx, token, serverID, ids)
 		},
 		now: time.Now,

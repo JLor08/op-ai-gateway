@@ -362,18 +362,73 @@ describe('RpcMemberSection member status', () => {
     expect(within(region).queryByText(/rspec_/)).toBeNull();
   });
 
-  it('shows the columns name, status, occupancy, VRAM and RAM; the protocol only on demand', async () => {
+  it('shows the columns name, head server, model, status, occupancy, VRAM and RAM; the protocol only on demand', async () => {
     setup({ rows: [memberRow({ rpc: { protocol: '8.0.1' } })] });
     await memberTableRow('rpcm_1');
     const headers = screen.getAllByRole('columnheader').map((h) => h.textContent);
     expect(headers).toEqual([
       t.tableName,
+      t.rpcStatusHeadServer,
+      t.rpcStatusHeadModel,
       t.tableStatus,
       t.rpcStatusOccupancy,
       t.rpcStatusVram,
       t.rpcStatusRam,
     ]);
     expect(screen.queryByText('8.0.1')).toBeNull();
+  });
+
+  it("shows the head's server and model, and a dash for a member whose head is not named", async () => {
+    setup({
+      rows: [
+        memberRow({
+          spec_id: 'rpca_rspec_1_srv_1',
+          display_name: 'RPC (unsloth/Qwen3.8-27B)(Head)',
+          head_model: 'unsloth/Qwen3.8-27B',
+          head_server: 'Head',
+        }),
+        memberRow({ spec_id: 'rpca_rspec_2_srv_1', display_name: 'RPC (—)' }),
+      ],
+    });
+    const named = await memberTableRow('RPC (unsloth/Qwen3.8-27B)(Head)');
+    const cells = within(named)
+      .getAllByRole('cell')
+      .map((c) => c.textContent);
+    expect(cells.slice(0, 3)).toEqual([
+      'RPC (unsloth/Qwen3.8-27B)(Head)',
+      'Head',
+      'unsloth/Qwen3.8-27B',
+    ]);
+    const hidden = await memberTableRow('RPC (—)');
+    expect(
+      within(hidden)
+        .getAllByRole('cell')
+        .slice(1, 3)
+        .map((c) => c.textContent),
+    ).toEqual(['—', '—']);
+  });
+
+  it('sorts by head server', async () => {
+    setup({
+      rows: [
+        memberRow({
+          spec_id: 'rpcm_a',
+          display_name: 'RPC (a)(Zeta)',
+          head_model: 'a',
+          head_server: 'Zeta',
+        }),
+        memberRow({
+          spec_id: 'rpcm_b',
+          display_name: 'RPC (b)(Alpha)',
+          head_model: 'b',
+          head_server: 'Alpha',
+        }),
+      ],
+    });
+    await memberTableRow('RPC (a)(Zeta)');
+    expect(memberNames()).toEqual(['RPC (a)(Zeta)', 'RPC (b)(Alpha)']);
+    fireEvent.click(screen.getByRole('button', { name: t.rpcStatusHeadServer }));
+    await waitFor(() => expect(memberNames()).toEqual(['RPC (b)(Alpha)', 'RPC (a)(Zeta)']));
   });
 
   it('finds a named member by its spec id once the ID column is shown', async () => {

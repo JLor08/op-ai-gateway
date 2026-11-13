@@ -11,6 +11,11 @@ import (
 	"testing"
 )
 
+// headed is the name of a member of a head the reader may see.
+func headed(model, server string) RPCMemberName {
+	return RPCMemberName{DisplayName: "RPC (" + model + ")(" + server + ")", HeadModel: model, HeadServer: server}
+}
+
 func TestRPCMemberDisplayNamesAutomaticAndRename(t *testing.T) {
 	f := newClusterFixture(t)
 	efyga := f.member("efyga")
@@ -21,7 +26,7 @@ func TestRPCMemberDisplayNamesAutomaticAndRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := map[string]string{id: "RPC (big)(Head)"}; !maps.Equal(names, want) {
+	if want := map[string]RPCMemberName{id: headed("big", "Head")}; !maps.Equal(names, want) {
 		t.Fatalf("names = %v, want %v (the head's model and server; a model spec gets no name)", names, want)
 	}
 
@@ -41,8 +46,8 @@ func TestRPCMemberDisplayNamesAutomaticAndRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names[id]; got != "RPC (unsloth/Qwen3.8-27B)(Head-2)" {
-		t.Fatalf("after rename = %q", got)
+	if got := names[id]; got != headed("unsloth/Qwen3.8-27B", "Head-2") {
+		t.Fatalf("after rename = %+v", got)
 	}
 }
 
@@ -61,10 +66,10 @@ func TestRPCMemberDisplayNamesManual(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{
-		used.ID: "RPC (big)(Head)",
+	want := map[string]RPCMemberName{
+		used.ID: headed("big", "Head"),
 		// No head uses it: its binary's file name stands in for the head.
-		free.ID: "RPC (ggml-rpc-server)",
+		free.ID: {DisplayName: "RPC (ggml-rpc-server)"},
 		// A spec of another server is no member here and gets no name.
 	}
 	if !maps.Equal(names, want) {
@@ -86,7 +91,7 @@ func TestRPCMemberDisplayNamesWithoutAMembershipRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{ids[0]: "RPC (big)(Head)", ids[1]: "RPC (—)"}
+	want := map[string]RPCMemberName{ids[0]: headed("big", "Head"), ids[1]: {DisplayName: "RPC (—)"}}
 	if !maps.Equal(names, want) {
 		t.Fatalf("names = %v, want %v", names, want)
 	}
@@ -107,8 +112,8 @@ func TestRPCMemberDisplayNamesHideAHeadTheReaderMayNotSee(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names[id]; got != "RPC (—)" {
-		t.Fatalf("hidden head name = %q", got)
+	if got := names[id]; got != (RPCMemberName{DisplayName: "RPC (—)"}) {
+		t.Fatalf("hidden head name = %+v", got)
 	}
 	// The member server itself is the reader's boundary.
 	if _, err := f.svc.RPCMemberDisplayNames(f.ctx, otherToken(), f.head.ID, []string{id}); err == nil {
@@ -161,7 +166,7 @@ func TestRPCMemberDisplayNamesReadEachHeadOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(names) != 4 || names[ids[1]] != "RPC (other)(Other head)" {
+	if len(names) != 4 || names[ids[1]] != headed("other", "Other head") {
 		t.Fatalf("names = %v", names)
 	}
 	if m, h, s := counting.memberships.Load(), counting.heads.Load(), counting.manual.Load(); m != 1 || h != 2 || s != 1 {

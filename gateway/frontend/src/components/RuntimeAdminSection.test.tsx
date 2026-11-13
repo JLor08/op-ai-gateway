@@ -1948,7 +1948,37 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       expect(screen.queryByText(t.runtimeSpecWSLAgentUnsupported)).not.toBeInTheDocument();
     });
 
-    it('marks a wsl spec row and labels its measured VRAM as attributed from the WSL VM', async () => {
+    it('shows how each spec runs in its own execution column', async () => {
+      renderSection({
+        mappings: [
+          makeMapping({ id: 'map_1', gateway_model_name: 'gw-wsl' }),
+          makeMapping({ id: 'map_2', gateway_model_name: 'gw-native' }),
+        ],
+        specsByMappingId: {
+          map_1: wslSpec(),
+          map_2: makeSpec({
+            configured: true,
+            id: 'spec_2',
+            mapping_id: 'map_2',
+            binary: '/opt/llama/llama-server',
+            execution_mode: 'native',
+          }),
+        },
+        report: wslReport,
+      });
+      await screen.findByText('gw-wsl');
+      expect(
+        screen.getByRole('columnheader', { name: t.runtimeSpecExecutionMode }),
+      ).toBeInTheDocument();
+      const wslRow = screen.getByText('gw-wsl').closest('tr') as HTMLElement;
+      expect(within(wslRow).getByText(t.runtimeExecutionWSL)).toBeInTheDocument();
+      expect(within(wslRow).getByText('Ubuntu-24.04')).toBeInTheDocument();
+      const nativeRow = screen.getByText('gw-native').closest('tr') as HTMLElement;
+      expect(within(nativeRow).getByText(t.runtimeSpecExecutionModeNative)).toBeInTheDocument();
+      expect(within(nativeRow).queryByText(t.runtimeExecutionWSL)).not.toBeInTheDocument();
+    });
+
+    it('labels a wsl spec measured VRAM as attributed from the WSL VM', async () => {
       renderSection({
         mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-wsl' })],
         specsByMappingId: {
@@ -1957,8 +1987,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         report: wslReport,
       });
       await screen.findByText('gw-wsl');
-      expect(await screen.findByText(t.runtimeStatusWSLMarker)).toBeInTheDocument();
-      expect(screen.getByText(t.runtimeStatusVRAMFromVM)).toBeInTheDocument();
+      expect(await screen.findByText(t.runtimeStatusVRAMFromVM)).toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
       expect(
         await screen.findByText(
@@ -1976,7 +2005,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         report: wslReport,
       });
       await screen.findByText('gw-wsl');
-      expect(await screen.findByText(t.runtimeStatusWSLMarker)).toBeInTheDocument();
+      expect(await screen.findByText(t.runtimeExecutionWSL)).toBeInTheDocument();
       expect(screen.queryByText(t.runtimeStatusVRAMFromVM)).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
       expect(await screen.findByText(`${t.runtimeSpecVramMeasured}: 0 MB`)).toBeInTheDocument();
