@@ -16,6 +16,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -171,7 +173,15 @@ func wslTestSpec(f *fakeWSL, id, model string) Spec {
 
 func newWSLTestManager(t *testing.T, run wslRunner) *Manager {
 	t.Helper()
-	m := NewManager(ManagerOptions{WSL: wslTestPolicy(), WSLRunner: run, Getenv: func(string) string { return "" }})
+	return newWSLTestManagerWith(t, wslTestPolicy(), run)
+}
+
+// newWSLTestManagerWith is newWSLTestManager with its own WSL policy. The
+// native allowlist admits stubchild too, so a test can run a native spec
+// beside the wsl one.
+func newWSLTestManagerWith(t *testing.T, pol WSLPolicy, run wslRunner) *Manager {
+	t.Helper()
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), WSL: pol, WSLRunner: run, Getenv: func(string) string { return "" }})
 	t.Cleanup(m.Close)
 	return m
 }
@@ -246,12 +256,12 @@ func TestWSLSpecStartsAndServes(t *testing.T) {
 		t.Errorf("launch XDG_RUNTIME_DIR = %q, want /run/user/1000 (the uid id -u printed)", got)
 	}
 
-	// The UID was asked of the distro, as the configured user. The orphan
-	// sweep the first document started may have asked as well, concurrently
-	// with the start, before either answer was cached.
+	// The UID was asked of the distro once, as the configured user: the
+	// first document's lookup, which the start waited for and the orphan sweep
+	// reused.
 	ids := f.find(t, "id", "-u")
-	if len(ids) == 0 || len(ids) > 2 {
-		t.Fatalf("id -u calls = %d, want 1 or 2 (the start's and maybe the sweep's)", len(ids))
+	if len(ids) != 1 {
+		t.Fatalf("id -u calls = %d, want 1", len(ids))
 	}
 	for _, c := range ids {
 		if want := []string{"-d", wslTestDistro, "-u", "ai", "--exec"}; !slices.Equal(c.Argv[:5], want) {
@@ -439,23 +449,32 @@ func TestWSLOrphanSweepKillsOnlyForeignNonce(t *testing.T) {
 	}
 }
 
+// TestWSLUIDLookupFailureIsStartFailure: a lookup that fails, answers no
+// number, or answers UID 0 fails the waiting start with a message that names
+// the setting but neither the distro nor the user (the detail is the agent
+// log's), and nothing is launched.
 func TestWSLUIDLookupFailureIsStartFailure(t *testing.T) {
 	skipOnWindows(t)
+	const user = "modelsvc"
 	for name, answer := range map[string]func() ([]byte, error){
-		"lookup fails":  func() ([]byte, error) { return nil, errors.New("exit status 1: id: 'ai': no such user") },
-		"not a number":  func() ([]byte, error) { return []byte("ai\n"), nil },
+		"lookup fails":  func() ([]byte, error) { return nil, errors.New("exit status 1: id: '" + user + "': no such user") },
+		"not a number":  func() ([]byte, error) { return []byte(user + "\n"), nil },
 		"user is uid 0": func() ([]byte, error) { return []byte("0\n"), nil },
 	} {
 		t.Run(name, func(t *testing.T) {
 			shrinkTimings(t)
 			f := newFakeWSL(t)
+			var lookups atomic.Int32
 			run := func(ctx context.Context, exe string, args, env []string) ([]byte, error) {
 				if slices.Contains(args, "id") {
+					lookups.Add(1)
 					return answer()
 				}
 				return f.runner()(ctx, exe, args, env)
 			}
-			m := newWSLTestManager(t, run)
+			pol := wslTestPolicy()
+			pol.User = user
+			m := newWSLTestManagerWith(t, pol, run)
 			m.Apply(Config{ETag: "v1", Specs: []Spec{wslTestSpec(f, "S", "m")}})
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -464,8 +483,16 @@ func TestWSLUIDLookupFailureIsStartFailure(t *testing.T) {
 				t.Fatalf("EnsureRunning err = %v, want ErrStartFailed", err)
 			}
 			st := statusFor(m, "S")
-			if st == nil || st.LastError == nil || !strings.Contains(st.LastError.Message, "runtime_wsl_user") {
-				t.Fatalf("status %+v, want a last_error naming runtime_wsl_user", st)
+			if st == nil || st.LastError == nil || st.LastError.Message != wslUIDFailureMessage {
+				t.Fatalf("status %+v, want last_error %q", st, wslUIDFailureMessage)
+			}
+			for _, leak := range []string{user, wslTestDistro, "Ubuntu"} {
+				if strings.Contains(st.LastError.Message, leak) {
+					t.Errorf("last_error %q names %q", st.LastError.Message, leak)
+				}
+			}
+			if lookups.Load() == 0 {
+				t.Error("no UID lookup ran")
 			}
 			if launches := f.find(t, "systemd-run"); len(launches) != 0 {
 				t.Errorf("the workload was launched without a UID: %+v", launches)
@@ -474,34 +501,141 @@ func TestWSLUIDLookupFailureIsStartFailure(t *testing.T) {
 	}
 }
 
-func TestWSLUIDIsCachedPerDistro(t *testing.T) {
-	var asked []string
-	o := &owner{
-		m:       &Manager{},
-		policy:  LocalPolicy{WSL: wslTestPolicy()},
-		getenv:  func(string) string { return "" },
-		wslUIDs: newWSLUIDCache(),
-		wslRunner: func(_ context.Context, _ string, args, _ []string) ([]byte, error) {
-			distro := args[1]
-			asked = append(asked, distro)
-			if distro == "Broken" {
-				return nil, errors.New("exit status 1")
+// TestWSLUIDLookupRunsOffTheOwner: while the UID lookup hangs, the owner keeps
+// answering -- Status, and a native spec's whole start -- and the wsl instance
+// waits without an error; it is started once the answer is posted back.
+func TestWSLUIDLookupRunsOffTheOwner(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	answer := make(chan struct{})
+	release := sync.OnceFunc(func() { close(answer) })
+	var lookups atomic.Int32
+	run := func(ctx context.Context, exe string, args, env []string) ([]byte, error) {
+		if slices.Contains(args, "id") {
+			lookups.Add(1)
+			select {
+			case <-answer:
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			}
-			return []byte("1000\n"), nil
-		},
+		}
+		return f.runner()(ctx, exe, args, env)
 	}
-	for _, distro := range []string{"A", "A", "B", "Broken", "Broken"} {
-		uid, err := o.wslUID(distro)
-		switch {
-		case distro == "Broken" && err == nil:
-			t.Errorf("wslUID(%s) succeeded, want the runner's failure", distro)
-		case distro != "Broken" && (err != nil || uid != 1000):
-			t.Errorf("wslUID(%s) = %d, %v, want 1000", distro, uid, err)
+	m := newWSLTestManager(t, run)
+	t.Cleanup(release) // registered after the manager, so it runs before Close
+	wsl := wslTestSpec(f, "S", "m")
+	wsl.Pinned = true
+	// Each owner round trip must come back while the lookup still hangs.
+	promptly := func(what string, call func()) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			call()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s blocked while the UID lookup was running", what)
 		}
 	}
-	// One lookup per distro that answered; a failed one is asked again.
-	if want := []string{"A", "B", "Broken", "Broken"}; !slices.Equal(asked, want) {
-		t.Errorf("lookups %q, want %q", asked, want)
+	// The pinned wsl spec is admitted in this very Apply.
+	promptly("Apply", func() { m.Apply(Config{ETag: "v1", Specs: []Spec{wsl, baseSpec("N", "n")}}) })
+	waitUntil(t, 5*time.Second, "the UID lookup to start", func() bool { return lookups.Load() > 0 })
+	promptly("Status", func() { m.Status() })
+	ensureWSL(t, m, "n") // a native start goes through the owner untouched
+	waitForState(t, m, "N", StateRunning)
+
+	st := statusFor(m, "S")
+	if st == nil || st.State != StateStopped || st.LastError != nil {
+		t.Fatalf("waiting wsl instance = %+v, want stopped with no last_error", st)
+	}
+	if launches := f.find(t, "systemd-run"); len(launches) != 0 {
+		t.Fatalf("the workload was launched before its UID was known: %+v", launches)
+	}
+
+	release()
+	waitForState(t, m, "S", StateRunning)
+	if n := lookups.Load(); n != 1 {
+		t.Errorf("UID lookups = %d, want 1 (the waiting start reuses the first document's)", n)
+	}
+	// The lookup the start waited for ran before the launch, in the log's order.
+	calls := f.calls(t)
+	idAt := slices.IndexFunc(calls, func(c fakeWSLCall) bool { return slices.Equal(c.command(), []string{"id", "-u"}) })
+	launchAt := slices.IndexFunc(calls, func(c fakeWSLCall) bool { return c.unit() != "" })
+	if idAt < 0 || launchAt < 0 || idAt > launchAt {
+		t.Errorf("id -u at %d, launch at %d: want the lookup first", idAt, launchAt)
+	}
+}
+
+// TestWSLUIDLookupFailureIsRetried: a failed lookup is not cached. The start
+// that waited for it fails into the ordinary backoff, whose retry asks the
+// distro again, and the instance starts once that answer comes.
+func TestWSLUIDLookupFailureIsRetried(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	second := make(chan struct{})
+	release := sync.OnceFunc(func() { close(second) })
+	var lookups atomic.Int32
+	run := func(ctx context.Context, exe string, args, env []string) ([]byte, error) {
+		if slices.Contains(args, "id") {
+			switch lookups.Add(1) {
+			case 1:
+				return nil, errors.New("exit status 1: the distro is still booting")
+			case 2:
+				select {
+				case <-second:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+		}
+		return f.runner()(ctx, exe, args, env)
+	}
+	m := newWSLTestManager(t, run)
+	t.Cleanup(release) // registered after the manager, so it runs before Close
+	spec := wslTestSpec(f, "S", "m")
+	spec.Pinned = true
+	m.Apply(Config{ETag: "v1", Specs: []Spec{spec}})
+
+	waitUntil(t, 10*time.Second, "the backoff retry to ask the distro again", func() bool { return lookups.Load() >= 2 })
+	st := statusFor(m, "S")
+	if st == nil || st.LastError == nil || st.LastError.Message != wslUIDFailureMessage {
+		t.Fatalf("status %+v, want the first lookup's failure, %q", st, wslUIDFailureMessage)
+	}
+	if launches := f.find(t, "systemd-run"); len(launches) != 0 {
+		t.Fatalf("the workload was launched without a UID: %+v", launches)
+	}
+
+	release()
+	waitForState(t, m, "S", StateRunning)
+	if n := lookups.Load(); n != 2 {
+		t.Errorf("UID lookups = %d, want 2 (the failed one and its retry)", n)
+	}
+}
+
+// TestWSLUIDIsLookedUpOncePerDistro: an answer is kept for the manager's
+// lifetime, so a second start of the instance asks nothing.
+func TestWSLUIDIsLookedUpOncePerDistro(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+	m.Apply(Config{ETag: "v1", Specs: []Spec{wslTestSpec(f, "S", "m")}})
+	ensureWSL(t, m, "m")
+	if _, err := m.Stop(context.Background(), "m"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	waitForState(t, m, "S", StateStopped)
+	ensureWSL(t, m, "m")
+
+	if n := len(f.find(t, "systemd-run")); n != 2 {
+		t.Fatalf("workload launches = %d, want 2", n)
+	}
+	if n := len(f.find(t, "id", "-u")); n != 1 {
+		t.Errorf("id -u calls = %d, want 1 for two starts", n)
 	}
 }
 

@@ -134,56 +134,19 @@ func runWSLHelper(run wslRunner, pol WSLPolicy, distro string, env []string, com
 	return run(ctx, pol.Exe, wslHelperArgs(pol.User, distro, command...), env)
 }
 
-// wslUIDCache holds each distro's UID for the configured user. Guarded, since
-// the owner (startProcess) and the orphan sweep's goroutine both read and fill
-// it.
-type wslUIDCache struct {
-	mu   sync.Mutex
-	uids map[string]int
-}
+// wslUIDFailureMessage is the last_error of a wsl start whose UID lookup
+// failed. It names the setting, not the distro or the user: the detail (which
+// distro, what id -u or wsl.exe printed) goes to the agent's own log
+// (handleWSLUIDResolved), where the operator who owns both reads it.
+const wslUIDFailureMessage = "runtime: could not resolve the uid of runtime_wsl_user in the WSL distro; see the agent log"
 
-func newWSLUIDCache() *wslUIDCache { return &wslUIDCache{uids: make(map[string]int)} }
-
-// get and put treat a nil cache as an empty one that keeps nothing, so an owner
-// built by hand in a test needs none.
-func (c *wslUIDCache) get(distro string) (int, bool) {
-	if c == nil {
-		return 0, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	uid, ok := c.uids[distro]
-	return uid, ok
-}
-
-func (c *wslUIDCache) put(distro string, uid int) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.uids[distro] = uid
-}
-
-// wslUID is the configured user's UID inside distro, which names the user
-// manager's bus (/run/user/<uid>) that the launch and every scope call need.
-//
-// It runs on the owner goroutine, from startProcess, which otherwise does
-// nothing slow there: a launch cannot be built without the UID, and the cost
-// is bounded -- at most wslHelperTimeout, and once per distro for the agent's
-// lifetime, since only an answer is cached (a user's UID does not change under
-// a running agent; a failure is asked again at the next start).
-func (o *owner) wslUID(distro string) (int, error) {
-	return resolveWSLUID(o.wslRunner, o.policy.WSL, o.getenv, o.wslUIDs, distro)
-}
-
-// resolveWSLUID is wslUID for any goroutine: the owner's and the sweep's. A
-// user whose UID is 0 is refused like root by name: wsl.exe -u would run the
-// workload, and the gateway-chosen environment it carries, as root.
-func resolveWSLUID(run wslRunner, pol WSLPolicy, getenv func(string) string, cache *wslUIDCache, distro string) (int, error) {
-	if uid, ok := cache.get(distro); ok {
-		return uid, nil
-	}
+// lookupWSLUID asks distro for the configured user's UID (id -u), which names
+// the user manager's bus (/run/user/<uid>) that the launch and every scope
+// call need. It is a wsl.exe call bounded by wslHelperTimeout and runs off the
+// owner (requestWSLUID). A user whose UID is 0 is refused like root by name:
+// wsl.exe -u would run the workload, and the gateway-chosen environment it
+// carries, as root.
+func lookupWSLUID(run wslRunner, pol WSLPolicy, getenv func(string) string, distro string) (int, error) {
 	out, err := runWSLHelper(run, pol, distro, wslHelperEnv(getenv, -1), "id", "-u")
 	if err != nil {
 		return 0, fmt.Errorf("runtime: could not look up the UID of the WSL user (runtime_wsl_user) in distro %q: %w", distro, err)
@@ -196,8 +159,74 @@ func resolveWSLUID(run wslRunner, pol WSLPolicy, getenv func(string) string, cac
 	if uid == 0 {
 		return 0, fmt.Errorf("runtime: the WSL user (runtime_wsl_user) is UID 0 in distro %q; refusing to run anything as root there", distro)
 	}
-	cache.put(distro, uid)
 	return uid, nil
+}
+
+// requestWSLUID starts the UID lookup for distro off the owner, unless one is
+// already running: however many instances wait for one distro, it is asked
+// once. The answer comes back as cmdWSLUIDResolved. Owner goroutine only; the
+// goroutine is tracked in the manager's WaitGroup, so Close waits for it (at
+// most wslHelperTimeout). Once the owner has stopped, the answer is dropped
+// (postCmd).
+func (o *owner) requestWSLUID(distro string) {
+	if o.closing || o.wslUIDInFlight[distro] {
+		return
+	}
+	if o.wslUIDInFlight == nil {
+		o.wslUIDInFlight = make(map[string]bool)
+	}
+	o.wslUIDInFlight[distro] = true
+	run, pol, getenv, m := o.wslRunner, o.policy.WSL, o.getenv, o.m
+	m.wg.Go(func() {
+		uid, err := lookupWSLUID(run, pol, getenv, distro)
+		m.postCmd(cmdWSLUIDResolved{distro: distro, uid: uid, err: err})
+	})
+}
+
+// handleWSLUIDResolved takes a lookup's answer on the owner. An answer is
+// cached, starts the distro's orphan sweep if it is still due (with the UID it
+// needs, so the sweep asks nothing itself), and re-asks the instances waiting
+// for it, through the ordinary admission wake. A failure is logged with its
+// detail and fails the start of every instance waiting for that distro, with
+// the generic wslUIDFailureMessage: start_failed, then the ordinary crash-loop
+// backoff, whose retry asks the distro again (requestWSLUID; failures are
+// never cached). A lookup nobody waits for (the first applyConfig's) fails
+// silently but for the log.
+func (o *owner) handleWSLUIDResolved(c cmdWSLUIDResolved) {
+	delete(o.wslUIDInFlight, c.distro)
+	if o.closing {
+		return
+	}
+	if c.err != nil {
+		slog.Warn("runtime: could not resolve the WSL user's uid", "distro", c.distro, "error", c.err)
+		for _, st := range o.specs {
+			if !st.waitingOnWSLUID || st.proc != nil || st.spec.WSLDistro() != c.distro {
+				continue
+			}
+			st.waitingOnWSLUID = false
+			if !o.wantsUp(st) {
+				continue
+			}
+			o.setState(st, StateStartFailed)
+			o.recordFailure(st, wslUIDFailureMessage, 0, "")
+			o.failPending(st, ErrStartFailed)
+			o.enterBackoff(st)
+		}
+		return
+	}
+	if o.wslUIDs == nil {
+		o.wslUIDs = make(map[string]int)
+	}
+	o.wslUIDs[c.distro] = c.uid
+	if o.wslSweepDue[c.distro] {
+		delete(o.wslSweepDue, c.distro)
+		sw := wslSweep{run: o.wslRunner, pol: o.policy.WSL, env: wslHelperEnv(o.getenv, c.uid), nonce: o.wslNonce, done: o.m.done}
+		distro := c.distro
+		o.m.wg.Go(func() { sw.sweepDistro(distro) })
+	}
+	o.wakeAdmission(func(st *specState) bool {
+		return st.waitingOnWSLUID && st.spec.WSLDistro() == c.distro && wantsWake(st)
+	})
 }
 
 // wslControl signals a WSL generation from inside its distro, through the
@@ -293,63 +322,56 @@ func wslExitMessage(exitCode int) string {
 	return fmt.Sprintf("wsl.exe could not run the workload (exit %d); see the runtime log", exitCode)
 }
 
-// maybeSweepWSLOrphans starts the sweep of the WSL units an earlier run of the
-// agent left behind (wslSweep), once per manager lifetime, off the owner
-// goroutine. A unit outlives its agent when the agent dies without stopping it
-// (a crash, a kill, a host-side update): its workload still holds the GPU, the
-// RAM and the port inside the VM, invisible to this run. It is started from the
-// first applyConfig, like maybeSweepMemberCaches, so it is the owner that
-// dispatches it, into the WaitGroup Close waits on, and a manager that is
-// never configured never calls into a distro.
+// maybeWarmWSL runs once per manager lifetime, from the first applyConfig,
+// when WSL is configured: it starts the UID lookup for every allowed distro
+// off the owner (requestWSLUID) and marks every distro as due for its orphan
+// sweep, which the distro's first UID answer starts (handleWSLUIDResolved).
 //
-// It never touches a unit of this run, even one whose spec starts while the
-// sweep is listing: every unit this run launches carries this manager's nonce
-// (wslUnitName), and the sweep kills only units whose nonce differs.
-func (o *owner) maybeSweepWSLOrphans() {
-	if o.wslSwept || o.closing {
+// The lookups are started before the document's specs are admitted, so a wsl
+// start in it waits for them rather than asking again, and a later start
+// usually finds its UID cached. The sweep exists because a unit outlives its
+// agent when the agent dies without stopping it (a crash, a kill, a host-side
+// update): its workload still holds the GPU, the RAM and the port inside the
+// VM, invisible to this run. Tying it to the UID answer gives it the bus
+// address it needs without a lookup of its own, and sweeps a distro that was
+// unreachable at first as soon as a later start reaches it. A manager that is
+// never configured never calls into a distro.
+func (o *owner) maybeWarmWSL() {
+	if o.wslWarmed || o.closing {
 		return
 	}
-	o.wslSwept = true
+	o.wslWarmed = true
 	pol := o.policy.WSL
 	if pol.Exe == "" || wslUserRefused(pol.User) {
 		return
 	}
-	sw := wslSweep{run: o.wslRunner, pol: pol, getenv: o.getenv, uids: o.wslUIDs, nonce: o.wslNonce, done: o.m.done}
-	o.m.wg.Go(sw.sweep)
-}
-
-// wslSweep is one orphan sweep's inputs, all fixed for the manager's lifetime,
-// copied off the owner so the sweep's goroutine reads nothing the owner owns.
-// done is the manager's: once the owner has stopped, the sweep issues no
-// further call, so Close waits for at most the one in flight.
-type wslSweep struct {
-	run    wslRunner
-	pol    WSLPolicy
-	getenv func(string) string
-	uids   *wslUIDCache
-	nonce  string
-	done   <-chan struct{}
-}
-
-// sweep lists the agent's scopes in every allowed distro and SIGKILLs those of
-// another run. SIGKILL rather than a graceful stop: an orphan has nobody
-// waiting for its answers and no grace to honour, and the point is to give its
-// resources back before this run admits anything against them. Every failure
-// is a Warn; the sweep never blocks a start.
-func (s wslSweep) sweep() {
-	seen := make(map[string]bool)
-	for _, distro := range s.pol.AllowedDistros {
+	o.wslSweepDue = make(map[string]bool)
+	for _, distro := range pol.AllowedDistros {
 		// A file-sourced allowlist entry is not validated like a spec's distro;
 		// only a name a spec could use is passed to wsl.exe -d.
-		if seen[distro] || !wslDistroPattern.MatchString(distro) {
+		if !wslDistroPattern.MatchString(distro) {
 			continue
 		}
-		seen[distro] = true
-		if s.stopped() {
-			return
-		}
-		s.sweepDistro(distro)
+		o.wslSweepDue[distro] = true
+		o.requestWSLUID(distro)
 	}
+}
+
+// wslSweep is one distro's orphan sweep: its inputs, copied off the owner so
+// the sweep's goroutine reads nothing the owner owns. env is the helper
+// environment for the distro's UID. done is the manager's: once the owner has
+// stopped, the sweep issues no further call, so Close waits for at most the
+// one in flight.
+//
+// It never touches a unit of this run, even one whose spec starts while the
+// sweep is listing: every unit this run launches carries this manager's nonce
+// (wslUnitName), and the sweep kills only units whose nonce differs.
+type wslSweep struct {
+	run   wslRunner
+	pol   WSLPolicy
+	env   []string
+	nonce string
+	done  <-chan struct{}
 }
 
 func (s wslSweep) stopped() bool {
@@ -361,14 +383,16 @@ func (s wslSweep) stopped() bool {
 	}
 }
 
+// sweepDistro lists the agent's scopes in distro and SIGKILLs those of another
+// run. SIGKILL rather than a graceful stop: an orphan has nobody waiting for
+// its answers and no grace to honour, and the point is to give its resources
+// back before this run admits anything against them. Every failure is a Warn;
+// the sweep never blocks a start.
 func (s wslSweep) sweepDistro(distro string) {
-	uid, err := resolveWSLUID(s.run, s.pol, s.getenv, s.uids, distro)
-	if err != nil {
-		slog.Warn("runtime: WSL orphan sweep skipped a distro", "distro", distro, "error", err)
+	if s.stopped() {
 		return
 	}
-	env := wslHelperEnv(s.getenv, uid)
-	out, err := runWSLHelper(s.run, s.pol, distro, env, "systemctl", "--user", "list-units", "--plain", "--no-legend", "--all", wslUnitPrefix+"*.scope")
+	out, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", "--user", "list-units", "--plain", "--no-legend", "--all", wslUnitPrefix+"*.scope")
 	if err != nil {
 		slog.Warn("runtime: WSL orphan sweep could not list the agent's units", "distro", distro, "error", err)
 		return
@@ -377,7 +401,7 @@ func (s wslSweep) sweepDistro(distro string) {
 		if s.stopped() {
 			return
 		}
-		if _, err := runWSLHelper(s.run, s.pol, distro, env, "systemctl", "--user", "kill", "--signal=SIGKILL", unit); err != nil {
+		if _, err := runWSLHelper(s.run, s.pol, distro, s.env, "systemctl", "--user", "kill", "--signal=SIGKILL", unit); err != nil {
 			slog.Warn("runtime: WSL orphan sweep could not stop a unit", "distro", distro, "unit", unit, "error", err)
 			continue
 		}

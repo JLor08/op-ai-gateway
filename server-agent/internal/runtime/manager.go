@@ -486,7 +486,6 @@ func NewManager(opts ManagerOptions) *Manager {
 		wslRunner:           run,
 		wslNonce:            newWSLNonce(),
 		wslRAMReserveMB:     max(0, opts.WSLRAMReserveMB),
-		wslUIDs:             newWSLUIDCache(),
 		specs:               make(map[string]*specState),
 		allowedPairs:        map[[2]string]bool{},
 		logs:                m.logs,
@@ -1147,6 +1146,17 @@ type cmdMeasured struct {
 
 func (cmdMeasured) isCommand() {}
 
+// cmdWSLUIDResolved carries the answer of one off-owner UID lookup
+// (requestWSLUID) back to the owner: the configured user's UID inside distro,
+// or why it could not be had.
+type cmdWSLUIDResolved struct {
+	distro string
+	uid    int
+	err    error
+}
+
+func (cmdWSLUIDResolved) isCommand() {}
+
 // ensureOutcome is what an EnsureRunning caller eventually receives.
 type ensureOutcome struct {
 	endpoint string
@@ -1287,6 +1297,13 @@ type specState struct {
 	// two load side by side rather than one after the other. admitAndStart
 	// rewrites it on every verdict, like waitingOnDemand.
 	waitingOnSibling bool
+
+	// waitingOnWSLUID is true while this wsl instance is held back because the
+	// configured user's UID inside its distro is not known yet: the lookup runs
+	// off the owner (requestWSLUID), and its answer re-asks exactly these
+	// instances (handleWSLUIDResolved) or, if it failed, fails their start.
+	// admitAndStart rewrites it on every verdict, like waitingOnSibling.
+	waitingOnWSLUID bool
 
 	// decidedTurn is the owner turn (owner.turn) of this instance's latest FULL
 	// admission decision -- one that went on to build a snapshot, whatever its
@@ -1549,12 +1566,24 @@ type owner struct {
 	// wslRAMReserveMB is ManagerOptions.WSLRAMReserveMB, never negative. Fixed
 	// for the process lifetime, like hostRAMReserveMB.
 	wslRAMReserveMB int
-	// wslUIDs caches the configured user's UID per distro (wslUID). It carries
-	// its own mutex: the orphan sweep fills and reads it off the owner.
-	wslUIDs *wslUIDCache
-	// wslSwept is set by the first applyConfig, which starts the one orphan
-	// sweep of the manager's lifetime (maybeSweepWSLOrphans).
-	wslSwept bool
+	// wslUIDs is the configured user's UID per distro, owner-goroutine state
+	// like specs: written only when an off-owner lookup's answer is handled
+	// (handleWSLUIDResolved), read by admitAndStart and startProcess. Only
+	// answers are kept -- a user's UID does not change under a running agent --
+	// so a failed lookup is asked again by the next start. A reader off the
+	// owner gets a copy of the value it needs, never the map.
+	wslUIDs map[string]int
+	// wslUIDInFlight names the distros whose lookup is running, so a burst of
+	// starts asks each distro once (requestWSLUID).
+	wslUIDInFlight map[string]bool
+	// wslSweepDue names the distros the orphan sweep has yet to visit: set at
+	// the first applyConfig, cleared as each distro's first UID answer starts
+	// its sweep, so a distro that cannot be reached at first is swept once it
+	// can.
+	wslSweepDue map[string]bool
+	// wslWarmed is set by the first applyConfig, which starts the UID lookups
+	// and the orphan sweep of the manager's lifetime (maybeWarmWSL).
+	wslWarmed bool
 	// ramFreedMB is the host RAM that managed processes held when they exited
 	// and that the hardware sample has not necessarily caught up with yet, valid
 	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
@@ -1687,6 +1716,8 @@ func (o *owner) handle(cmd command) {
 		o.handleKillGraceExpired(c)
 	case cmdMeasured:
 		o.applyMeasurement(c)
+	case cmdWSLUIDResolved:
+		o.handleWSLUIDResolved(c)
 	case cmdStatus:
 		c.reply <- o.snapshotStatus()
 	case cmdLoadedModels:
@@ -1787,10 +1818,13 @@ func (o *owner) applyConfig(cfg Config) {
 	}
 	defer o.purgeChangedHeadCaches(memberHeads, cfg.Specs)
 	defer o.maybeSweepMemberCaches(cfg.Specs)
-	// The first document starts the sweep of WSL units an earlier agent run
-	// left behind (once per manager lifetime). Starts this document triggers
-	// run concurrently with it; the nonce keeps their units out of its reach.
-	defer o.maybeSweepWSLOrphans()
+	// The first document starts the UID lookups for every allowed distro, off
+	// the owner, before anything in it is admitted -- so its wsl starts wait
+	// for those lookups instead of asking again -- and each answer starts that
+	// distro's sweep of the units an earlier agent run left behind. Starts this
+	// document triggers run concurrently with the sweep; the nonce keeps their
+	// units out of its reach.
+	o.maybeWarmWSL()
 
 	newIDs := make(map[string]bool, len(cfg.Specs))
 	bases := make(map[string]Spec, len(cfg.Specs))
@@ -3128,6 +3162,7 @@ func (o *owner) admitAndStart(specID string) {
 	st.waitingOnGrace = false
 	st.waitingOnDemand = false
 	st.waitingOnSibling = false
+	st.waitingOnWSLUID = false
 	// The claimed member blocking this admission is decided afresh on every ask
 	// and recorded once, on the way out, so a wait that stays blocked by the
 	// same member does not ring the transitions doorbell on every re-ask.
@@ -3162,6 +3197,24 @@ func (o *owner) admitAndStart(specID string) {
 			return
 		}
 		st.bindMismatch = false
+	}
+	// A wsl start cannot be built without the configured user's UID inside its
+	// distro (the user manager's bus is /run/user/<uid>), and asking the distro
+	// is a wsl.exe call that can take seconds -- far too long for the owner,
+	// whose every other client (Status, every ensure, health results, kill
+	// graces) would queue behind it. So the lookup runs off the owner, and the
+	// instance waits for its answer here, before admission: queued, its state
+	// untouched, no error recorded, and nothing evicted for a start that cannot
+	// happen yet. The answer re-asks it (handleWSLUIDResolved). Like the
+	// sibling wait, it is held back rather than decided.
+	if st.spec.IsWSL() {
+		if _, ok := o.wslUIDs[st.spec.WSLDistro()]; !ok {
+			st.waitingOnWSLUID = true
+			st.decidedTurn = 0
+			o.requestWSLUID(st.spec.WSLDistro())
+			slog.Debug("runtime: wsl instance waits for the WSL user's uid", "spec", specID)
+			return
+		}
 	}
 
 	// The protected instances of a spec start lowest index first, on every path
@@ -4195,18 +4248,16 @@ func (o *owner) startProcess(st *specState) {
 
 	// A wsl spec runs as the configured distro user under that user's own
 	// systemd manager, whose bus is named after the user's UID inside the
-	// distro, so the launch cannot be built without it. A failed lookup is a
-	// start failure that backs off and retries, like the port and config-file
-	// failures above: the distro may simply not be up yet, so it is not a
-	// not_permitted verdict. Nothing is exec'd and no generation is opened.
+	// distro. admitAndStart admits a wsl instance only once that UID is cached,
+	// in this same turn, so it is there; should it ever not be, the instance
+	// goes back to waiting for the off-owner lookup rather than block here.
+	// Nothing is exec'd and no generation is opened.
 	distroUID := -1
 	if spec.IsWSL() {
-		uid, err := o.wslUID(spec.WSLDistro())
-		if err != nil {
-			o.setState(st, StateStartFailed)
-			o.recordFailure(st, err.Error(), 0, "")
-			o.failPending(st, ErrStartFailed)
-			o.enterBackoff(st) // I2 fix: rate-limit / retry a persistently failing start, same as any other start_failed
+		uid, ok := o.wslUIDs[spec.WSLDistro()]
+		if !ok {
+			st.waitingOnWSLUID = true
+			o.requestWSLUID(spec.WSLDistro())
 			return
 		}
 		distroUID = uid
