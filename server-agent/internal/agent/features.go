@@ -370,6 +370,14 @@ var Features = []Feature{
 	//
 	// Since is 0.18.0: agent.Features gains an entry, so the rule is a MINOR bump.
 	{Name: FeatureRPCCluster, Since: "0.18.0"},
+
+	// runtime_exec_wsl: the agent runs specs whose execution block says "wsl"
+	// inside a WSL2 distribution on a Windows host, and reports their state and
+	// resource use like any other spec. The gateway sends such specs only to an
+	// agent declaring it.
+	//
+	// Since is 0.19.0: agent.Features gains an entry, so the rule is a MINOR bump.
+	{Name: FeatureRuntimeExecWSL, Since: "0.19.0"},
 }
 
 // FeatureRuntimeInstances names the runtime_instances feature (see its registry
@@ -383,6 +391,10 @@ const FeatureRuntimeStop = "runtime_stop"
 // FeatureRPCCluster names the rpc_cluster feature (see its registry entry
 // above): RPC cluster members and heads.
 const FeatureRPCCluster = "rpc_cluster"
+
+// FeatureRuntimeExecWSL names the runtime_exec_wsl feature (see its registry
+// entry above): specs that run inside a WSL2 distribution.
+const FeatureRuntimeExecWSL = "runtime_exec_wsl"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {

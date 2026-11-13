@@ -5,6 +5,8 @@ package runtime
 
 import (
 	"fmt"
+	"log/slog"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -365,6 +367,36 @@ type LocalPolicy struct {
 	// adding the first AllowedDirs entry does. Same operator-only provenance as
 	// the two allowlists: it comes ONLY from the agent's own config.
 	AllowBinaryDirs bool
+	// WSL is the operator's policy for specs that run inside a WSL2
+	// distribution (Spec.IsWSL). It is a separate block, not extra entries on
+	// the lists above: a WSL spec's binary and work_dir are POSIX paths inside
+	// the distro, which a Windows allowlist can neither express nor safely
+	// match. Same operator-only provenance as everything else here.
+	WSL WSLPolicy
+}
+
+// WSLPolicy is the local policy for WSL specs. The zero value refuses every WSL
+// spec: nothing is permitted until the operator names the wsl.exe, a user, a
+// distro and a binary.
+type WSLPolicy struct {
+	// Exe is the wsl.exe to launch through; empty means WSL is not configured.
+	Exe string
+	// AllowedDistros lists the distros a spec may name, matched exactly.
+	AllowedDistros []string
+	// AllowedBinaries lists the absolute POSIX binary paths a spec must match
+	// exactly.
+	AllowedBinaries []string
+	// AllowedDirs lists permitted POSIX work_dir prefixes; empty permits any
+	// absolute work_dir.
+	AllowedDirs []string
+	// User is the distro user the process runs as. Empty and "root" are
+	// refused: no gateway-chosen argv or env may reach a root process.
+	User string
+}
+
+// isZero reports whether w configures nothing at all (ManagerOptions.WSL).
+func (w WSLPolicy) isZero() bool {
+	return w.Exe == "" && w.User == "" && len(w.AllowedDistros) == 0 && len(w.AllowedBinaries) == 0 && len(w.AllowedDirs) == 0
 }
 
 // effectiveWorkDir is the directory a spec's child process ACTUALLY runs in
@@ -401,6 +433,12 @@ func effectiveWorkDir(spec Spec) string {
 // spec.Env or spec.Args -- so it is always safe to log verbatim or surface
 // as a Status.LastError.Message alongside StateNotPermitted.
 func (p LocalPolicy) Permit(spec Spec) error {
+	// A WSL spec is judged ONLY by the WSL policy: its binary is a path inside
+	// the distro, so the native allowlist (Windows or host paths) is neither
+	// consulted nor required to be non-empty.
+	if spec.IsWSL() {
+		return p.permitWSL(spec)
+	}
 	if len(p.AllowedBinaries) == 0 {
 		return fmt.Errorf("runtime: binary allowlist is empty, refusing to start %q (configure the agent's runtime_allowed_binaries / OP_AGENT_RUNTIME_ALLOWED_BINARIES)", spec.Binary)
 	}
@@ -477,6 +515,101 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	}
 	return fmt.Errorf("runtime: work_dir %q is not within any allowed directory", spec.WorkDir)
 }
+
+// permitWSL is Permit for a WSL spec. Check order: the operator configured WSL
+// at all (exe, then user), the distro, the binary, the work_dir. Every refusal
+// names the setting and, for a list, how many entries it holds -- never a path,
+// distro or user name, so the text is safe to surface as a Status message
+// (agent-runtime-manager section 3.1).
+func (p LocalPolicy) permitWSL(spec Spec) error {
+	w := p.WSL
+	if w.Exe == "" {
+		return fmt.Errorf("runtime: WSL is not configured, refusing a wsl spec (configure the agent's runtime_wsl_exe / OP_AGENT_RUNTIME_WSL_EXE)")
+	}
+	// Root is refused by name here; the launcher additionally never passes -u
+	// root, so the two cannot drift into letting a gateway-chosen command line
+	// run with UID 0. "0" is refused as well, since wsl.exe -u accepts a UID.
+	if wslUserRefused(w.User) {
+		return fmt.Errorf("runtime: no non-root WSL user is configured, refusing a wsl spec (set the agent's runtime_wsl_user / OP_AGENT_RUNTIME_WSL_USER to a non-root distro user)")
+	}
+	// The empty-distro guard keeps this self-contained against a file-sourced
+	// [""] allowlist entry, which survives as a non-empty list.
+	if spec.WSLDistro() == "" || !slices.Contains(w.AllowedDistros, spec.WSLDistro()) {
+		return fmt.Errorf("runtime: the spec's WSL distro is not in the allowed-distros list (runtime_wsl_allowed_distros holds %d entries)", len(w.AllowedDistros))
+	}
+	// Absolute POSIX only: a bare name would resolve through the distro's PATH,
+	// and a Windows path can never be an executable inside it. Non-absolute
+	// allowlist entries (including a file-sourced "") can never permit anything.
+	if !strings.HasPrefix(spec.Binary, "/") || !slices.Contains(w.AllowedBinaries, spec.Binary) {
+		return fmt.Errorf("runtime: the spec's WSL binary is not an allowed absolute path (runtime_wsl_allowed_binaries holds %d entries)", len(w.AllowedBinaries))
+	}
+	// As for native specs, an empty work_dir runs beside the (allowlisted)
+	// binary and is permitted on its own merit.
+	if spec.WorkDir == "" {
+		return nil
+	}
+	if !strings.HasPrefix(spec.WorkDir, "/") {
+		return fmt.Errorf("runtime: a WSL work_dir must be an absolute POSIX path")
+	}
+	if len(w.AllowedDirs) == 0 {
+		return nil
+	}
+	for _, dir := range w.AllowedDirs {
+		if withinPosixDir(spec.WorkDir, allowedDirBase(dir)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("runtime: the spec's WSL work_dir is not within any allowed directory (runtime_wsl_allowed_dirs holds %d entries)", len(w.AllowedDirs))
+}
+
+// isZeroUID reports whether s is all ASCII digits and parses to 0 ("0", "00"):
+// wsl.exe -u takes a numeric UID, so every spelling of 0 is root.
+func isZeroUID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return strings.Trim(s, "0") == ""
+}
+
+// withinPosixDir is withinDir for POSIX paths inside a distro: path.Clean (not
+// filepath.Clean, whose separator is the agent's host's) on both sides, then
+// equality or a prefix ending at a "/" boundary, so "/home/aix" is not inside
+// "/home/ai" and "/home/ai/../etc" resolves to "/etc" before comparing.
+func withinPosixDir(candidate, dir string) bool {
+	if candidate == "" || dir == "" {
+		return false
+	}
+	c, d := path.Clean(candidate), path.Clean(dir)
+	if c == d {
+		return true
+	}
+	if d == "/" {
+		return strings.HasPrefix(c, "/")
+	}
+	return strings.HasPrefix(c, d+"/")
+}
+
+// effectiveWSLWorkDir is effectiveWorkDir for a WSL spec: the explicit work_dir,
+// else the directory of the POSIX binary (path.Dir, since filepath.Dir would
+// treat the path with the host's separator rules).
+func effectiveWSLWorkDir(spec Spec) string {
+	if spec.WorkDir != "" {
+		return spec.WorkDir
+	}
+	return path.Dir(spec.Binary)
+}
+
+// wslOwnedEnvNames are the variables the agent's WSL launcher sets itself;
+// a WSL spec may not set them. WSLENV would let a spec forward Windows
+// variables across the boundary, WSL_UTF8 changes wsl.exe's output encoding the
+// agent parses, and XDG_RUNTIME_DIR is the systemd user-session socket the
+// agent derives from the configured user's UID. Native specs are unaffected.
+var wslOwnedEnvNames = []string{"WSLENV", "WSL_UTF8", "XDG_RUNTIME_DIR"}
 
 // withinDir reports whether candidate, once cleaned, is dir itself or sits
 // strictly beneath it. Both sides are run through filepath.Clean first so a
@@ -953,6 +1086,23 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 	// non-empty default at runtime, and spec.ID is the spec's identity,
 	// so the join is never a hole in a path.
 	if inner == "CONFIG_DIR" {
+		if spec.IsWSL() {
+			// The child runs inside the distro, so the agent-side Windows
+			// directory must be named by its /mnt/<drive> path. Joined with
+			// path, not filepath: the result is a POSIX path whatever the
+			// agent's host is. An untranslatable directory (UNC, or one whose
+			// .. climbs above its drive's root) is a placeholder error, which
+			// the dry run reports as not_permitted and a start as its
+			// last_error -- both travel to the gateway, so the error names the
+			// setting and not the agent-local path, which goes to the agent's
+			// own log (the rule every policy refusal follows, §3.1).
+			dir, derr := windowsPathToWSL(configFilesDir)
+			if derr != nil {
+				slog.Warn("runtime: config_files_dir does not map into a WSL distro", "spec", spec.ID, "error", derr)
+				return "", true, fmt.Errorf("${CONFIG_DIR} cannot be resolved for a wsl spec: the agent's config_files_dir does not map into a WSL distro (UNC paths and paths climbing above their drive's root cannot); see the agent log")
+			}
+			return path.Join(dir, spec.ID), true, nil
+		}
 		return filepath.Join(configFilesDir, spec.ID), true, nil
 	}
 
@@ -1128,6 +1278,16 @@ func checkSpecEnv(spec Spec, envKeys []string, gpuIDs string) error {
 		// comparison against "SYSTEMROOT" would wave it through.
 		if slices.Contains(baseEnvNames, strings.ToUpper(k)) {
 			return fmt.Errorf("runtime: spec env %q is reserved for the agent-provided base environment and may not be set by a spec", k)
+		}
+	}
+
+	// A WSL spec additionally may not set the variables the WSL launcher owns
+	// (see wslOwnedEnvNames); same case-fold as above.
+	if spec.IsWSL() {
+		for _, k := range envKeys {
+			if slices.Contains(wslOwnedEnvNames, strings.ToUpper(k)) {
+				return fmt.Errorf("runtime: spec env %q is owned by the agent's WSL launcher and may not be set by a wsl spec", k)
+			}
 		}
 	}
 

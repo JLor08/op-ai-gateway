@@ -139,7 +139,11 @@ import {
   type InstanceForm,
 } from './shared/runtimeInstances';
 import { minRealtimeWarning } from './shared/audioMetrics';
-import { runtimeRowPlan, startInstanceLimit } from './shared/runtimeActions';
+import {
+  RUNTIME_EXEC_WSL_FEATURE,
+  runtimeRowPlan,
+  startInstanceLimit,
+} from './shared/runtimeActions';
 import { ClusterProgress } from './ClusterProgress';
 import { ClusterTotalCell, ClusterWithheldNotice } from './ClusterTotalCell';
 import { clusterStatusView } from './shared/clusterStatus';
@@ -300,6 +304,8 @@ function emptySpec(mappingId: string): RuntimeSpec {
     admin_state: '',
     set_visible_devices: false,
     visible_devices_mode: 'env',
+    execution_mode: 'native',
+    wsl_distro: '',
     gpus: [],
     ram_estimate_mb: 0,
     ram_measured_mb: 0,
@@ -2730,6 +2736,8 @@ export function RuntimeAdminSection({
   const [ramMeasuredMb, setRamMeasuredMb] = useState(0);
   const [setVisibleDevices, setSetVisibleDevices] = useState(false);
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
+  const [executionMode, setExecutionMode] = useState<'native' | 'wsl'>('native');
+  const [wslDistro, setWslDistro] = useState('');
   // Runtime-Spec API Token: mode + its per-mode write-only state.
   // `apiTokenHeaderSource`/`apiTokenHeader` are declared here alongside mode,
   // even though their own select + inherited-header display render later in
@@ -2896,6 +2904,8 @@ export function RuntimeAdminSection({
     setRamMeasuredMb(0);
     setSetVisibleDevices(false);
     setVisibleDevicesMode('env');
+    setExecutionMode('native');
+    setWslDistro('');
     setApiTokenMode('app');
     setApiTokenHeaderSource('app');
     setApiTokenHeader('');
@@ -2939,6 +2949,8 @@ export function RuntimeAdminSection({
     setRamMeasuredMb(spec.ram_measured_mb);
     setSetVisibleDevices(spec.set_visible_devices);
     setVisibleDevicesMode(spec.visible_devices_mode);
+    setExecutionMode(spec.execution_mode === 'wsl' ? 'wsl' : 'native');
+    setWslDistro(spec.wsl_distro ?? '');
     setApiTokenMode(spec.api_token_mode);
     setApiTokenHeaderSource(spec.api_token_header_source);
     setApiTokenHeader(spec.api_token_header);
@@ -3352,6 +3364,8 @@ export function RuntimeAdminSection({
       ram_estimate_mb: ramEstimateMb,
       set_visible_devices: setVisibleDevices,
       visible_devices_mode: visibleDevicesMode,
+      execution_mode: executionMode,
+      wsl_distro: executionMode === 'wsl' ? wslDistro.trim() : '',
       api_token_mode: apiTokenMode,
       api_token_header_source: apiTokenHeaderSource,
       api_token_header: apiTokenHeader,
@@ -4008,17 +4022,34 @@ export function RuntimeAdminSection({
       },
       render: (m) => {
         const spec = specsById[m.id];
-        return spec && isClusterHead(spec) ? (
-          <ClusterTotalCell
-            spec={spec}
-            name={m.gateway_model_name}
-            axis="vram"
-            ownMb={totalGpuVram(spec)}
-            t={t}
-          />
-        ) : (
-          formatMb(totalGpuVram(spec))
-        );
+        if (spec && isClusterHead(spec)) {
+          return (
+            <ClusterTotalCell
+              spec={spec}
+              name={m.gateway_model_name}
+              axis="vram"
+              ownMb={totalGpuVram(spec)}
+              t={t}
+            />
+          );
+        }
+        if (spec?.execution_mode === 'wsl') {
+          return (
+            <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'end' }}>
+              <span>{formatMb(totalGpuVram(spec))}</span>
+              <Chip size="small" variant="outlined" label={t.runtimeStatusWSLMarker} />
+              {/* Only a measured figure is attributed from the VM; an estimate
+                  alone is the operator's, and labelling it would claim a
+                  measurement that has not happened. */}
+              {spec.gpus.some((g) => g.vram_measured_mb > 0) && (
+                <Typography variant="caption" color="text.secondary">
+                  {t.runtimeStatusVRAMFromVM}
+                </Typography>
+              )}
+            </Box>
+          );
+        }
+        return formatMb(totalGpuVram(spec));
       },
       filter: 'text',
       searchable: false,
@@ -4784,6 +4815,12 @@ export function RuntimeAdminSection({
     // agentVersion are the report-derived values (:1703-1704); the host OS comes
     // from the hardware report already fetched (:1394-1396) — NOT a new DTO field.
     const agentHasGpuSelection = agentFeatures.includes('gpu_selection');
+    // The execution-mode select appears only where wsl is usable: an agent
+    // declaring runtime_exec_wsl, or a spec already stored as wsl (which must
+    // stay editable, and says why it will not reach this agent).
+    const agentHasExecWsl = agentFeatures.includes(RUNTIME_EXEC_WSL_FEATURE);
+    const showExecutionMode = agentHasExecWsl || executionMode === 'wsl';
+    const showAgentNoWsl = executionMode === 'wsl' && reportReady && !agentHasExecWsl;
     // The config-files editor's live feedback and its agent-capability hint
     // (#257). Advisory like the GPU hints: an old agent still accepts the
     // spec, it just never writes the files -- and ${CONFIG_DIR} stays literal
@@ -4952,7 +4989,7 @@ export function RuntimeAdminSection({
             />
             <BinaryPicker
               id="runtime-spec-binary"
-              label={t.runtimeSpecBinary}
+              label={executionMode === 'wsl' ? t.runtimeSpecBinaryLinux : t.runtimeSpecBinary}
               t={t}
               kind="llama_server"
               value={binary}
@@ -4971,6 +5008,37 @@ export function RuntimeAdminSection({
                 (`currentSpec`) rather than form state, since nothing here
                 ever writes them -- so an operator relying on Auto still sees
                 the detected outcome without guessing. */}
+            {showExecutionMode && (
+              <>
+                <SelectField
+                  id="runtime-spec-execution-mode"
+                  label={t.runtimeSpecExecutionMode}
+                  value={executionMode}
+                  onChange={(e) => setExecutionMode(e.target.value as 'native' | 'wsl')}
+                  sx={{ maxWidth: 340 }}
+                >
+                  <option value="native">{t.runtimeSpecExecutionModeNative}</option>
+                  <option value="wsl">{t.runtimeSpecExecutionModeWSL}</option>
+                </SelectField>
+                {executionMode === 'wsl' && (
+                  <>
+                    <Field
+                      id="runtime-spec-wsl-distro"
+                      label={t.runtimeSpecWSLDistro}
+                      value={wslDistro}
+                      onChange={(e) => setWslDistro(e.target.value)}
+                      sx={{ maxWidth: 340 }}
+                    />
+                    <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                      {t.runtimeSpecWSLHint}
+                    </Typography>
+                  </>
+                )}
+                {showAgentNoWsl && (
+                  <Alert severity="warning">{t.runtimeSpecWSLAgentUnsupported}</Alert>
+                )}
+              </>
+            )}
             <SelectField
               id="runtime-spec-type"
               label={t.runtimeSpecType}
@@ -5184,7 +5252,7 @@ export function RuntimeAdminSection({
             </Box>
             <Field
               id="runtime-spec-work-dir"
-              label={t.runtimeSpecWorkDir}
+              label={executionMode === 'wsl' ? t.runtimeSpecWorkDirLinux : t.runtimeSpecWorkDir}
               value={workDir}
               onChange={(e) => setWorkDir(e.target.value)}
             />
@@ -5729,6 +5797,9 @@ export function RuntimeAdminSection({
                   />
                   <Typography variant="body2" color="text.secondary" sx={{ minWidth: 200 }}>
                     {t.runtimeSpecVramMeasured}: {row.vramMeasuredMb} MB
+                    {executionMode === 'wsl' &&
+                      row.vramMeasuredMb > 0 &&
+                      ` (${t.runtimeStatusVRAMFromVM})`}
                   </Typography>
                   {/* THE THIRD NUMBER, and the only one this form merely
                       OFFERS. Rendered read-only through `Field`'s own prop

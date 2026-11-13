@@ -141,6 +141,7 @@ var migrations = []migration{
 	{version: 106, name: "rpc_member_port_unique", up: migration106Up},
 	{version: 107, name: "application_decision_modes", up: migration107Up},
 	{version: 108, name: "token_decisions_confidence_normalize", up: migration108Up},
+	{version: 109, name: "runtime_spec_execution_mode", up: migration109Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4793,4 +4794,22 @@ func migration107Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // behavior. addColumnIfMissing keeps it re-runnable.
 func migration108Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "decisions_confidence_normalize integer not null default 0")
+}
+
+// migration109Up adds the execution pair to agent_runtime_specs: execution_mode
+// ("native" or "wsl") and wsl_distro (the distro a wsl spec runs in). Both are
+// operator-owned. The defaults make every existing row a native spec with no
+// distro, so the upgrade changes no behavior and a native spec's pushed
+// document stays byte-identical. addColumnIfMissing keeps the step replayable on
+// both dialects.
+func migration109Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"execution_mode text not null default 'native'",
+		"wsl_distro text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", col); err != nil {
+			return err
+		}
+	}
+	return nil
 }

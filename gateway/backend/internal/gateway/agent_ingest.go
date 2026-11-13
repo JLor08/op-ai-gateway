@@ -2215,6 +2215,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	knewFeatures := s.AgentFeatures.Known(serverID)
 	hadInstances := s.AgentFeatures.Has(serverID, runtimeInstancesFeature)
 	hadRPCCluster := s.AgentFeatures.Has(serverID, rpcClusterFeature)
+	hadExecWSL := s.AgentFeatures.Has(serverID, RuntimeExecWSLFeature)
 	if capsReadable {
 		s.AgentFeatures.Set(serverID, caps)
 	} else {
@@ -2230,8 +2231,11 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// document, which may have been held until now, and so does one that
 	// changes runtime_instances, since a document input that changed is pushed
 	// (THE RULE on portal.Service.notifyRuntimeChanged). An unreadable sample
-	// pushes nothing: it holds the document.
-	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances) {
+	// pushes nothing: it holds the document. runtime_exec_wsl is the same kind
+	// of input: a wsl spec is withheld from an agent without it and held while
+	// the declaration is unknown, so a change of it moves the document too.
+	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances ||
+		slices.Contains(caps, RuntimeExecWSLFeature) != hadExecWSL) {
 		s.PushRuntimeConfig(serverID)
 	}
 	// A cluster is pushed only while every agent of it declares rpc_cluster

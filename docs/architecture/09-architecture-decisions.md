@@ -647,7 +647,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -703,7 +703,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -872,7 +872,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1067,7 +1067,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1282,7 +1282,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-108-migrations),
+[§4](reference/data-model.md#4-migration-history-109-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1508,7 +1508,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-108-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-109-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1655,7 +1655,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-108-migrations),
+[§4](reference/data-model.md#4-migration-history-109-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3626,7 +3626,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-108-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-109-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3850,7 +3850,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-108-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-109-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4882,7 +4882,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5008,7 +5008,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-108-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5151,7 +5151,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-108-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-109-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7665,7 +7665,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-108-migrations),
+[Data Model](reference/data-model.md#4-migration-history-109-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7888,7 +7888,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-108-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-109-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8029,7 +8029,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-108-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-109-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8293,7 +8293,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-108-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-109-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -12149,7 +12149,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-108-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-109-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -12406,3 +12406,123 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
 [External Vendor Accounts §4.2 and §6](cross-cutting/external-vendor-accounts.md#42-openai),
 [Routing & Model Selection §2.3](cross-cutting/routing-and-model-selection.md#23-the-capability-gate),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode).
+
+## ADR-101 — WSL2 execution mode: a rootless systemd user scope, cgroup RAM, and VRAM attributed from the VM worker by start delta with the remainder charged
+
+**Context:** the engines worth running on a Windows AI server (vLLM, SGLang, sglang-omni) do not run on Windows; they run in WSL2. Allowlisting
+`wsl.exe` as an ordinary binary looks like it works and breaks four ways: the policy never reads the argv, so an allowlisted `wsl.exe` permits any
+command in any distro as any Linux user, root included; killing `wsl.exe` sends the workload no signal; `wsl.exe` is a thin client, so the one pid
+the agent measures carries no VRAM and a few MB of private working set that count as a *real* RAM figure and end the cold-start bootstrap
+([ADR-086](#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)) with
+most of the model uncharged; and together the last two defeat the VRAM and RAM gates. Windows also hides what the gates need: nothing inside WSL
+reports per-process GPU memory, and Windows charges **all** of the VM's GPU memory to the VM worker process, `vmwp`. Everything WSL is per Windows
+user, and WSL refuses LocalSystem. The facts were measured before the implementation, on a Windows 11 Pro AI server with three NVIDIA GPUs (one RTX
+4090, two RTX 5090) and vLLM 0.33.0: `vmwp` held 12318 MiB for a vLLM at `--gpu-memory-utilization 0.5`, with the host's adapter LUIDs; PDH
+reports one same-named `vmwp` instance per guest GPU process, without identity and in an unstable order (12318 + 7432 + 22 = 19772 MiB for two
+servers, where WMI showed 7432); the adapter total is additive and reversible across a second start (+7578 MiB for a predicted 7.4 GB); host GPU
+indices and PCI bus IDs are the same inside WSL; `systemd-run --user --scope` works without root and its scope's cgroup is readable by the user;
+`memory.current − inactive_file` of that scope was 3705 MiB where the main pid's RSS was 1390 MiB; SIGTERM to the scope reached both vLLM processes,
+which logged "Application shutdown complete" within about a second, and killing `wsl.exe` tears its whole tree down; an NSSM service running as the distro-owning user works, cold, with nobody logged
+on.
+
+**Decision — nine choices, taken together. Migration 109; agent `0.19.0`, feature `runtime_exec_wsl` on the agent's list only.**
+
+- **(a) An execution mode on the spec, negotiated and withheld.** The spec gains an optional `execution` block (`{"mode": "wsl", "wsl":
+  {"distro": …}}`), absent for a native spec, so a native document is byte-for-byte unchanged; the gateway stores `execution_mode` and `wsl_distro`
+  (migration 109) and validates them at the spec PUT with four `400`s. The block is launch-affecting. The agent drops a block it cannot run at parse
+  (an unknown mode, a bad distro name, a `wsl` cluster member or head). A distro name is `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` on both sides, so it
+  never starts with `-` and cannot read as a `wsl.exe` option. **The gateway never sends a `wsl` spec to an agent that does not declare
+  `runtime_exec_wsl`**, because an older agent ignores the block and would run the Linux path natively; it holds the document with
+  `503 runtime_config.agent_features_pending` while the declaration is unknown.
+- **(b) A local policy of its own, fail-closed.** `runtime_wsl_exe`, `runtime_wsl_user`, `runtime_wsl_allowed_distros` and
+  `runtime_wsl_allowed_binaries` must all be set for anything to start; `runtime_wsl_allowed_dirs` empty permits any absolute work dir. The native
+  allowlist is never consulted for a `wsl` spec. The Linux user is the agent's setting, never a spec field.
+- **(c) A rootless launch through the user's own systemd scope, and no shell.** `wsl.exe -d D -u <user> --cd <dir> --exec systemd-run --user
+  --scope --quiet --unit=opagent-<nonce>-<instance key>-<generation> -- <binary> <args…>`. The invariant is that **no process receiving
+  gateway-chosen argv or environment runs as root**: the first Linux process inherits every `WSLENV` variable, so a root wrapper would hand the
+  gateway root through `LD_PRELOAD`. `root` and UID 0 are refused as the user, the UID lookup refuses a UID of 0, and every helper call refuses a
+  refused user again. Every call is `--exec`, never the shell form; the one shell is the agent's fixed RAM script with unit names as positional
+  arguments. Every call names its working directory, `--cd /` for every helper call, so `wsl.exe` never translates the agent's Windows working
+  directory, which need not map into the distro. The environment crosses through `WSLENV` (`/u`), with `CUDA_DEVICE_ORDER=PCI_BUS_ID` beside any `CUDA_VISIBLE_DEVICES`,
+  `PYTHONUNBUFFERED=1`, `XDG_RUNTIME_DIR=/run/user/<uid>` and `WSL_UTF8=1`. The UID is looked up off the owner, one lookup per distro in flight; a
+  `wsl` instance waits for it, and a burst instance is refused at once. Each document starts the lookup of the allowed distros its `wsl` specs
+  name, once per distro, before it admits anything; a document without `wsl` specs calls into no distro, so it never boots the WSL VM.
+- **(d) Stops go through the scope; a sweep removes what a dead agent left.** Terminate is `systemctl --user kill --signal=SIGTERM <unit>.scope`,
+  the kill-grace escalation SIGKILLs the scope and then kills `wsl.exe` as a backstop, all off the owner and bounded to 10 s per call. The unit name
+  carries the generation, so a late signal never reaches a successor, and an agent-run nonce, so at a distro's first UID answer (a distro a
+  document's `wsl` specs name) the agent SIGKILLs
+  every active scope whose name parses back to exactly that shape with another run's nonce; any other `opagent-*` unit is the operator's and is
+  left alone. A `wsl.exe` exit of `-1` gets a `last_error` that says `wsl.exe` could not run the workload.
+- **(e) RAM is the scope's cgroup, against a second pool.** One `sh -c <fixed script>` call per distro per beat reads each scope's
+  `memory.current − inactive_file` (the `docker stats` figure) and the VM's meminfo, behind a sentinel line (`opagent-sample v1`) before which
+  anything `wsl.exe` prints itself is ignored; the `wsl.exe` pid reaches no native measurer. The host pool is
+  unchanged. A **VM pool** is added, `VM MemAvailable + what the scopes held in the same sample − OP_AGENT_WSL_RAM_RESERVE_MB` (default 1024), which a
+  `wsl` candidate must fit as well, drawing victims only from `wsl` processes; it is checked **before** the host pool, narrow before broad, and a
+  demand above the VM's `MemTotal` minus the reserve is terminal. A `wsl` start that waits on the VM pool with nothing `wsl` live asks for a VM-only
+  sample, so a frozen figure cannot strand it.
+- **(f) VRAM is the VM worker's, attributed by start delta.** While a `wsl` generation is live the VRAM measurer is also asked about every
+  `vmwp.exe` (one Toolhelp snapshot), through the PDH array API and never WMI, and their per-GPU sum is the VM's figure. A `wsl` spec that declares
+  a GPU reads it just before its exec (the baseline) and opens a **start window**, which settles on the first measurement dispatched after its first
+  passing health probe; the growth since the baseline, on the spec's declared GPUs, is its attribution and its measured VRAM. GPU-declaring `wsl`
+  starts are **serialized** behind the window, evicting nothing while they wait; **stops never are**: an exit during a window adds the exiting
+  process's attribution back as credit, or voids the window when it had none. A reading that is detectably not the VM's (no worker while a `wsl`
+  generation is live, or nothing held while one is attributed, or nothing held at all at a settle) never ends a delta: a failed baseline opens
+  the window void, a failed settle attributes nothing. The settle re-asks the `wsl` starts that waited for the window and every spec with a
+  queued request or a pin, native ones included, since it changes what the start is charged.
+- **(g) The remainder is charged, and it is what admission relies on.** At every admission, from that admission's reading,
+  `R(g) = VM(g) − Σ attributions charged on g` (floored at 0) is added to rule 3's sum. With every attribution charged as `max(attribution,
+  demand)`, the sum admission sees on a GPU is at least what the VM holds there. While a window is open, its process, charged its demand, has a
+  **provisional attribution** against the remainder only: the window's delta so far, capped at that demand on each GPU it is charged on (none for
+  a void window), so its growth is not charged twice and the sum still covers the VM. A detectably failed reading falls back to the last good one
+  of the current period of WSL activity; the reading is forgotten when the last `wsl` generation exits, so a later period never charges an
+  earlier one's figure.
+- **(h) The VRAM bootstrap is gated per spec.** The one-shot bootstrap eviction is granted only where the spec's VRAM can be measured: for a `wsl`
+  spec that needs the worker finder as well as the measurer.
+- **(i) The agent runs as the distro-owning Windows user, never LocalSystem**, as a service under that account or interactively in its session.
+
+**Rejected:**
+
+- **Allowlisting `wsl.exe` as an ordinary binary.** The four breaks above.
+- **A second, Linux agent inside WSL.** A second admission owner for the same GPUs double-books VRAM against the Windows agent's native children.
+- **A root wrapper (`-u root`) or a root shim.** The wrapper inherits the gateway's environment. Should the user manager prove unreliable, the
+  alternative to consider is a root-free shim, not a root one.
+- **A transient systemd *service* instead of a scope.** Services do not keep the WSL instance alive; a scope's command is run by `systemd-run`
+  itself and stays under the relay.
+- **Measuring the `wsl.exe` pid or the main pid's RSS.** The first holds nothing of the workload; the second was a third of it.
+- **WMI for the VM's GPU memory.** It keys on the instance name and shows one of the same-named instances.
+- **Positional matching of PDH instances to workloads.** They carry no identity and their order changes; matching by value multisets is an open
+  question, not part of this decision.
+- **Holding stops behind a start window.** Crashes, OOM kills and manual stops cannot wait for another workload's settle.
+- **Adding back the live set's RAM to the VM pool.** After a start evicts the last idle `wsl` workload, nothing samples the VM again and the start
+  waits for good.
+- **A per-user helper in the interactive session.** Not needed where a service under the distro-owning user works, as it does on Windows 11 Pro.
+
+**Consequence:**
+
+- **The accounting invariant holds in aggregate; per-workload figures are best effort.** A per-workload VRAM figure is a start delta, not a live
+  reading, and growth after settling is visible only as remainder. While a window is open its growth beyond its demand sits in the remainder
+  beside that demand (all of it, for a void window), and a generation whose window was void (or who started unmeasurable) stays charged its
+  demand plus its share of the remainder for its life, so native starts on that GPU can wait or evict more than strictly necessary; with an
+  unknown demand such a generation is an unknown-demand occupant for its life
+  ([ADR-032](#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts)).
+- **Every `vmwp` is summed**, so another Hyper-V VM's GPU memory is charged as WSL remainder.
+- **A failed read that looks like an empty VM cannot be detected.** At the very first start, with nothing `wsl` live, a failed baseline reads as an
+  empty VM, and the attribution then includes whatever the VM already held; it is written back as `vram_measured_mb`, a demand floor under
+  [ADR-084](#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired).
+  Within a period of WSL activity, a fallback to the last good reading can be older than the VM's state (from before a `wsl` generation
+  exited) and over-charges until the next good reading.
+- **Exit causes stay ambiguous.** `wsl.exe` returns the raw signal number for a signal death, so `exit(9)` and a SIGKILL both read `9`, and no
+  OOM-kill signature is read from the scope.
+- **None of it runs in CI on Windows.** The logic is untagged and unit-tested on Linux against a fake `wsl.exe`; the Toolhelp and PDH syscalls,
+  the sampling script inside a real distro, the `list-units` column layout and a linger-only user manager for a service-started agent with nobody
+  logged on are acceptance steps on a real host.
+- **Wire and negotiation.** One MINOR bump, `ServerAgent` `0.18.2` → `0.19.0`. Mixed fleets need no upgrade order: an older agent never receives a
+  `wsl` spec, and an older gateway never sends the block.
+- **Portal.** An execution selector (shown where the agent declares the feature, or the spec is already `wsl`), a distro field, Linux-path labels,
+  a warning when the agent lacks the feature, and a WSL marker with "VRAM attributed from the WSL VM" beside an attributed figure.
+
+→ [Agent-Managed Model Runtime §3.8](cross-cutting/agent-runtime-manager.md#38-execution-modes-wsl2),
+[§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
+[§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
+[Risks & Technical Debt §11.3 and §11.4](11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember),
+[Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md).

@@ -209,6 +209,17 @@ func (c *ResolvedCommand) bytes() int {
 // error beside the 16 MiB of output retention it sits next to.
 const maxResolvedCommandBytes = 16 << 10
 
+// resolvedWSLCommand is resolvedCommand for a WSL launch: ex must be the result
+// of withWrapper, so Args are the full wsl.exe argv and the operator's args are
+// masked at their shifted indices. Binary is what the agent actually execs, the
+// Windows wsl.exe path, while WorkDir stays the Linux directory the child runs
+// in (resolvedCommand picks it for a WSL spec).
+func (ex expandedSpec) resolvedWSLCommand(spec Spec, exe string, maskSpecEnv bool) ResolvedCommand {
+	out := ex.resolvedCommand(spec, maskSpecEnv)
+	out.Binary = exe
+	return out
+}
+
 // resolvedCommand builds the masked, reportable command from an expansion.
 //
 // maskSpecEnv is the file-mode bit (see case 2 of the masking rule above): true
@@ -224,9 +235,14 @@ const maxResolvedCommandBytes = 16 << 10
 // runs in: an empty spec.WorkDir is reported as the binary's own directory,
 // matching cmd.Dir at exec rather than reporting an empty string.
 func (ex expandedSpec) resolvedCommand(spec Spec, maskSpecEnv bool) ResolvedCommand {
+	workDir := effectiveWorkDir(spec)
+	if spec.IsWSL() {
+		// The directory inside the distro (--cd), not a host path.
+		workDir = effectiveWSLWorkDir(spec)
+	}
 	out := ResolvedCommand{
 		Binary:  spec.Binary,
-		WorkDir: effectiveWorkDir(spec),
+		WorkDir: workDir,
 		Args:    make([]string, 0, len(ex.args)),
 		Env:     make([]string, 0, len(ex.env)),
 	}

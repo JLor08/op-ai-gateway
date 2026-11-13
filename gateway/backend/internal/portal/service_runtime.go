@@ -187,6 +187,22 @@ var (
 	// otherwise demote such a spec to its one instance, a setting that quietly
 	// does something else. HTTP 400.
 	ErrRuntimeSpecInstancesNeedEphemeralPort = errors.New("runtime_spec.instances_need_ephemeral_port")
+	// ErrRuntimeSpecExecutionModeInvalid rejects an execution_mode outside
+	// "native"/"wsl" ("" stores native). HTTP 400.
+	ErrRuntimeSpecExecutionModeInvalid = errors.New("runtime_spec.execution_mode_invalid")
+	// ErrRuntimeSpecWSLDistroInvalid rejects a wsl spec whose wsl_distro is
+	// empty or not a plain distro name (letters, digits, '.', '_', '-', at most
+	// 64). The name reaches wsl.exe as one argv element, never a shell string,
+	// but a name it cannot resolve is refused where it is typed. HTTP 400.
+	ErrRuntimeSpecWSLDistroInvalid = errors.New("runtime_spec.wsl_distro_invalid")
+	// ErrRuntimeSpecWSLPathNotLinux rejects a wsl spec whose binary or work_dir
+	// is not a Linux absolute path: the runtime runs INSIDE the distro, so a
+	// Windows path (C:\...) or a relative one names nothing there. HTTP 400.
+	ErrRuntimeSpecWSLPathNotLinux = errors.New("runtime_spec.wsl_path_not_linux")
+	// ErrRuntimeSpecWSLClusterUnsupported rejects a wsl spec that is an RPC
+	// cluster head: the cluster plumbing addresses members by host network
+	// endpoints a distro's NAT does not expose. HTTP 400.
+	ErrRuntimeSpecWSLClusterUnsupported = errors.New("runtime_spec.wsl_cluster_unsupported")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -611,6 +627,11 @@ type RuntimeSpecDTO struct {
 	// for ("auto", "cuda", "rocm", "vulkan", "metal", "sycl"); never "" on the
 	// wire, a stored "" reads as "auto".
 	DeviceBackend string `json:"device_backend"`
+	// ExecutionMode is where the agent runs the runtime: "native" or "wsl";
+	// never "" on the wire (a stored "" reads as "native"). WSLDistro is the
+	// distro a wsl spec runs in, "" for native.
+	ExecutionMode string `json:"execution_mode"`
+	WSLDistro     string `json:"wsl_distro"`
 	// ClusterEnabled makes the spec a llama.cpp RPC cluster head; MemberMode,
 	// ClusterNetwork, RPCTransport, LANExposureAck and ClusterMembers are its
 	// cluster configuration (see PutRuntimeSpecRequest). MemberMode is never
@@ -756,6 +777,10 @@ type PutRuntimeSpecRequest struct {
 	ConfigFiles []ConfigFileDTO `json:"config_files,omitempty"`
 	// DeviceBackend: see RuntimeSpecDTO; "" stores "auto".
 	DeviceBackend string `json:"device_backend"`
+	// ExecutionMode: see RuntimeSpecDTO; "" stores "native". WSLDistro is
+	// required for "wsl" and stored "" for native whatever the request carried.
+	ExecutionMode string `json:"execution_mode"`
+	WSLDistro     string `json:"wsl_distro"`
 	// ClusterEnabled turns the spec into a llama.cpp RPC cluster head with the
 	// members in ClusterMembers, in that order (the --rpc order, and so the
 	// order of the head's RPC<n> devices). MemberMode is "automatic" (""
@@ -820,6 +845,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			ResolvedContextProbePath: resolvedContext,
 			Role:                     role,
 			DeviceBackend:            deviceBackendAuto,
+			ExecutionMode:            string(routing.ExecutionModeNative),
 			MemberMode:               memberModeAutomatic,
 			ClusterMembers:           []ClusterMemberDTO{},
 			ClusterWarnings:          []string{},
@@ -1206,6 +1232,8 @@ type runtimeSpecFields struct {
 	memberMode         string
 	clusterNetwork     string
 	rpcTransport       string
+	executionMode      routing.ExecutionMode
+	wslDistro          string
 }
 
 // validateRuntimeSpecRequest runs every request validation of a runtime-spec
@@ -1363,6 +1391,12 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	if f.deviceBackend, f.memberMode, f.clusterNetwork, f.rpcTransport, err = validateClusterEnums(req); err != nil {
 		return runtimeSpecFields{}, err
 	}
+	// The execution mode is the newest request validation and so runs last
+	// (the order is part of the API): it cannot rewrite the answer to a body
+	// that was already invalid for a shipped reason.
+	if f.executionMode, f.wslDistro, err = validateRuntimeSpecExecution(req); err != nil {
+		return runtimeSpecFields{}, err
+	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
 	if f.healthPath == "" {
 		f.healthPath = runtimeSpecHealthPathDefault(effectiveSpecKind)
@@ -1376,6 +1410,50 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 		f.startupTimeout = defaultRuntimeSpecStartupTimeoutSeconds
 	}
 	return f, nil
+}
+
+// runtimeSpecWSLDistroPattern is a plain distro name: what `wsl --list` can
+// print and wsl.exe accepts after -d, with no space, quote or path separator,
+// and a letter or digit first, so it can never read as an option. The agent's
+// wslDistroPattern is the same rule.
+var runtimeSpecWSLDistroPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// normalizeExecutionMode reads a stored "" (a row never written with the
+// column) as native.
+func normalizeExecutionMode(m routing.ExecutionMode) routing.ExecutionMode {
+	if m == "" {
+		return routing.ExecutionModeNative
+	}
+	return m
+}
+
+// validateRuntimeSpecExecution resolves the execution mode and distro. An
+// omitted mode is native, and a native spec stores no distro whatever the
+// request carried. A wsl spec needs a plain distro name, Linux absolute
+// binary and work_dir (the runtime runs inside the distro), and cannot be an
+// RPC cluster head.
+func validateRuntimeSpecExecution(req PutRuntimeSpecRequest) (routing.ExecutionMode, string, error) {
+	switch mode := routing.ExecutionMode(strings.TrimSpace(req.ExecutionMode)); mode {
+	case "", routing.ExecutionModeNative:
+		return routing.ExecutionModeNative, "", nil
+	case routing.ExecutionModeWSL:
+		distro := strings.TrimSpace(req.WSLDistro)
+		if !runtimeSpecWSLDistroPattern.MatchString(distro) {
+			return "", "", ErrRuntimeSpecWSLDistroInvalid
+		}
+		if !strings.HasPrefix(strings.TrimSpace(req.Binary), "/") {
+			return "", "", fmt.Errorf("%w: binary %q", ErrRuntimeSpecWSLPathNotLinux, strings.TrimSpace(req.Binary))
+		}
+		if wd := strings.TrimSpace(req.WorkDir); wd != "" && !strings.HasPrefix(wd, "/") {
+			return "", "", fmt.Errorf("%w: work_dir %q", ErrRuntimeSpecWSLPathNotLinux, wd)
+		}
+		if req.ClusterEnabled {
+			return "", "", ErrRuntimeSpecWSLClusterUnsupported
+		}
+		return mode, distro, nil
+	default:
+		return "", "", ErrRuntimeSpecExecutionModeInvalid
+	}
 }
 
 // validateRuntimeSpecShape is the first half of validateRuntimeSpecRequest:
@@ -1658,6 +1736,8 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		Type:                        f.specType,
 		MetricsPath:                 f.metricsPath,
 		ContextProbePath:            f.contextProbePath,
+		ExecutionMode:               f.executionMode,
+		WSLDistro:                   f.wslDistro,
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
 	}
@@ -2241,6 +2321,8 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		ResolvedMetricsPath:         resolvedMetrics,
 		ResolvedContextProbePath:    resolvedContext,
 		DeviceBackend:               normalizeDeviceBackend(spec.DeviceBackend),
+		ExecutionMode:               string(normalizeExecutionMode(spec.ExecutionMode)),
+		WSLDistro:                   spec.WSLDistro,
 		ClusterEnabled:              spec.ClusterEnabled,
 		MemberMode:                  normalizeMemberMode(spec.MemberMode),
 		ClusterNetwork:              spec.ClusterNetwork,
@@ -3147,6 +3229,25 @@ type AgentRuntimeSpecDTO struct {
 	DeviceBackend string               `json:"device_backend,omitempty"`
 	Cluster       *AgentClusterHeadDTO `json:"cluster,omitempty"`
 	RPC           *AgentRPCMemberDTO   `json:"rpc,omitempty"`
+	// Execution says WHERE the agent runs the spec. It is nil -- and the key
+	// absent -- for a native spec, so a native spec's document (ETag included)
+	// is the one it was before the wsl mode existed; the agent reads an absent
+	// block as native. Only a wsl spec carries it, and such a spec is pushed
+	// only to an agent that declares runtime_exec_wsl (an older agent would
+	// ignore the unknown block and run the Linux binary path natively).
+	Execution *AgentExecutionDTO `json:"execution,omitempty"`
+}
+
+// AgentExecutionDTO is the execution block of a pushed spec: the mode, and the
+// WSL parameters when the mode is "wsl".
+type AgentExecutionDTO struct {
+	Mode string                `json:"mode"`
+	WSL  *AgentWSLExecutionDTO `json:"wsl,omitempty"`
+}
+
+// AgentWSLExecutionDTO names the distro a wsl spec runs in.
+type AgentWSLExecutionDTO struct {
+	Distro string `json:"distro"`
 }
 
 // AgentGPUBudgetDTO is one per-GPU VRAM budget row inside the runtime-config
@@ -3372,6 +3473,20 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		gpus, err := s.routes.RuntimeSpecGPUs(ctx, spec.ID)
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
+		}
+		// A wsl spec goes only to an agent that declares runtime_exec_wsl: an
+		// older agent ignores the unknown execution block and would run the
+		// Linux binary path natively, so the spec is withheld (and, being
+		// absent from specIDByMapping, drops out of every co-residency pair).
+		// While the declaration is unknown the document is held, like a
+		// replicable spec's.
+		if spec.ExecutionMode == routing.ExecutionModeWSL {
+			runs, known := s.agentRunsWSL(serverID)
+			if !known {
+				awaitsFeatures = true
+			} else if !runs {
+				continue
+			}
 		}
 		// A cluster head goes out with its cluster block, or not at all: a
 		// head whose cluster cannot be derived in full is withheld (and its
@@ -3630,6 +3745,12 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		dto.MinInstances = spec.MinInstances
 		dto.MaxInstances = spec.MaxInstances
 	}
+	if spec.ExecutionMode == routing.ExecutionModeWSL {
+		dto.Execution = &AgentExecutionDTO{
+			Mode: string(routing.ExecutionModeWSL),
+			WSL:  &AgentWSLExecutionDTO{Distro: spec.WSLDistro},
+		}
+	}
 	return dto, nil
 }
 
@@ -3719,6 +3840,29 @@ func derivedIdleSeconds(factor float64, startupMS int64) int {
 // constant (its runtimeInstancesFeature is defined as it), so the document
 // built here and the declaration the ingest records cannot drift apart.
 const AgentFeatureRuntimeInstances = "runtime_instances"
+
+// AgentFeatureRuntimeExecWSL is the feature an agent declares when it can run
+// a spec inside a WSL distro. Agent-only: the gateway never declares it. The
+// module's one spelling of the name; the gateway package defines its own
+// constant as this one so the document built here and the declaration the
+// ingest records cannot drift apart.
+const AgentFeatureRuntimeExecWSL = "runtime_exec_wsl"
+
+// agentRunsWSL reports whether serverID's agent declares
+// AgentFeatureRuntimeExecWSL, and whether this gateway knows its declaration.
+// A nil reader reports (true, true): a service built without one has no
+// declarations to consult, so the spec is pushed as stored (the same reading
+// the cluster gate gives a nil reader would withhold, but here a withheld spec
+// would make every reader-less deployment and test lose its WSL specs).
+func (s *Service) agentRunsWSL(serverID string) (runs, known bool) {
+	if s.agentFeatures == nil {
+		return true, true
+	}
+	if !s.agentFeatures.Known(serverID) {
+		return false, false
+	}
+	return s.agentFeatures.Has(serverID, AgentFeatureRuntimeExecWSL), true
+}
 
 // agentRunsInstances reports whether serverID's agent declares
 // AgentFeatureRuntimeInstances, and whether this gateway knows its declaration

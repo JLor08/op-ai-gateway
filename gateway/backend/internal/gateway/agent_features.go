@@ -235,6 +235,17 @@ const RuntimeRAMAccountingFeature = "runtime_ram_accounting"
 // equal; TestRuntimeRoleEvictionFeatureName pins this side.
 const RuntimeRoleEvictionFeature = "runtime_role_eviction"
 
+// RuntimeExecWSLFeature is the agent-declared capability meaning: this agent can
+// run a runtime spec inside a WSL distro on its Windows host. Agent-only, so it
+// is not on gatewayAgentFeatures, and the GATEWAY gates on it fail-closed: a spec
+// with execution mode wsl is pushed only to an agent that declared it, because an
+// older agent ignores the unknown execution block and would run the Linux binary
+// path natively. Defined as the portal's constant so the runtime-config document
+// and the ingest's declaration check read one spelling; the agent names the same
+// string in server-agent/internal/agent/features.go (TestRuntimeExecWSLFeatureName
+// pins this side).
+const RuntimeExecWSLFeature = portal.AgentFeatureRuntimeExecWSL
+
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
 // route an image EDIT (POST /v1/images/edits, which is multipart) or an audio

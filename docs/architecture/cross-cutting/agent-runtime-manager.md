@@ -2123,6 +2123,521 @@ hosts ([Telemetry
 §8.4.4](telemetry-usage-observability.md#844-energy-attribution)); closed
 sessions are pruned with the telemetry retention.
 
+### 3.8 Execution modes: WSL2
+
+A spec normally runs **natively**: the agent execs the binary on the host it runs
+on. A spec whose **execution mode** is `wsl` runs inside a **WSL2 distribution** on
+a Windows host instead (issue #381,
+[ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged)).
+It exists because the engines worth running on a Windows AI server do not run on
+Windows: vLLM says it does not support Windows natively and points to WSL, SGLang's
+install documentation targets Linux with NVIDIA GPUs, and sglang-omni documents
+Linux only. A WSL-managed vLLM is also what brings the decision endpoints of #373 to
+a Windows host.
+
+**Allowlisting `wsl.exe` as an ordinary binary looks like it works and breaks in
+four ways**, which is why this is a mode and not a configuration recipe. The
+policy checks the binary and the work dir, never the arguments, so an allowlisted
+`wsl.exe` permits any command in any distro as any Linux user, root included.
+Killing `wsl.exe` sends the Linux process no signal. The agent measures one pid
+per instance, and `wsl.exe` is a thin client: no VRAM is ever found on it, and its
+few MB of private working set count as a *real* RAM measurement, which ends the
+cold-start bootstrap
+([ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path))
+with most of the model uncharged. Together the last two defeat the VRAM and RAM
+gates, the only protection co-resident models have against an OOM. **The resource
+accounting is the point of the mode, not an extra**: a WSL workload that starts and
+stops cleanly but is charged too little breaks the arithmetic of §5.2.
+
+The numbers in this section were measured before the implementation, on a
+Windows 11 Pro AI server with three NVIDIA GPUs (one RTX 4090, two RTX 5090) and
+vLLM 0.33.0 in an Ubuntu 24.04 distro; they are why the design looks as it does.
+
+#### The spec, its validation and its negotiation
+
+The wire spec gains one optional block, `"execution": {"mode": "wsl", "wsl":
+{"distro": "Ubuntu-24.04"}}`. It is **absent for a native spec**, so a native
+spec's document, ETag included, is byte-for-byte what it was before the mode
+existed. In `wsl` mode `binary` and `work_dir` are absolute **Linux** paths inside
+the distro; `args`, `env`, the placeholders (§3.2), `listen_port`, the probe paths,
+the timeouts, `gpus`, `ram_mb` and the instance fields keep their meaning. **The
+Linux user is not a spec field**: it is the agent's own setting, so the gateway can
+never choose root. Type auto-detection (§3.4) still works, because it reads the
+basename of the binary, so `…/bin/vllm` resolves to `vllm`.
+
+- **Agent parse.** `ParseConfig` drops a spec whose block it cannot run, with a
+  Warn, the way it drops an unknown `kind` (`invalidExecutionReason`, beside
+  `withoutInvalidKinds`): an unknown mode (falling back to native would launch it
+  somewhere the gateway did not mean), a `wsl` block without a distro or with a
+  distro outside `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` (the gateway's rule too; the
+  first character is never `-`, so `wsl.exe -d` cannot read the name as an
+  option), and a `wsl` spec that is an
+  `rpc_server` member or a cluster head (the cluster transports bind and dial host
+  addresses a process in the WSL VM does not share). `""` and `native` both read
+  as native.
+- **Launch shape.** `execution` is launch-affecting (§5.6): a change of mode or
+  distro relaunches the generation. `sameLaunchShape` normalises an absent block,
+  an explicit `native` and an empty mode to the same thing, so a gateway that starts
+  sending the explicit form bounces nothing.
+- **Gateway.** Migration 109 adds `agent_runtime_specs.execution_mode` (`text not
+  null default 'native'`) and `wsl_distro` (`text not null default ''`) on both SQL
+  dialects, and the memory store carries the two fields with the rest of the spec
+  ([Data Model](../reference/data-model.md)). The spec PUT validates
+  the pair as the last of the request's own shape checks and answers four new `400`s
+  ([HTTP API Surface](../reference/api-surface.md)): an unknown mode, a distro that
+  is not a plain name, a binary or `work_dir` that is not a Linux absolute path,
+  and a `wsl` spec that is a cluster head. A native spec stores no distro, whatever
+  the request carried.
+- **Negotiation.** The agent declares `runtime_exec_wsl` (§7). **The gateway never
+  sends a `wsl` spec to an agent that does not declare it**: an older agent ignores
+  the unknown block and would run the Linux path as a native binary. Such a spec is
+  left out of that agent's document (and so out of every co-residency pair). While
+  the agent's features are not yet known since a gateway start, the document is
+  **held** with `503 runtime_config.agent_features_pending`, as for a replicable
+  spec (§7), and the ingest pushes it when the declaration arrives or changes.
+
+#### The local policy
+
+A `wsl` spec is judged **only** by a policy block of its own; the native allowlist
+is never consulted for it, nor required to be non-empty. Its binary and work dir are
+POSIX paths inside the distro, which a Windows allowlist can neither express nor
+safely match. Every setting is operator-only, file or environment, never a flag and
+never from the gateway ([§15](#15-configuration-reference)):
+
+| Setting | Rule | Empty means |
+|---|---|---|
+| `runtime_wsl_exe` | The `wsl.exe` to launch through. | **Nothing starts** in `wsl` mode. The default is `C:\Program Files\WSL\wsl.exe` on Windows and empty elsewhere, so on a non-Windows agent every `wsl` spec is `not_permitted` ("WSL is not configured") unless an operator sets one. |
+| `runtime_wsl_user` | The Linux user every `wsl.exe` call runs as (`-u`). `root` and every all-digit spelling of UID 0 (`0`, `00`, …) are refused. | **Nothing starts** in `wsl` mode. |
+| `runtime_wsl_allowed_distros` | Distro names, matched exactly. | **Nothing starts** in `wsl` mode. |
+| `runtime_wsl_allowed_binaries` | Absolute POSIX paths, matched exactly. | **Nothing starts** in `wsl` mode. |
+| `runtime_wsl_allowed_dirs` | POSIX work-dir containment (`withinPosixDir`: `path.Clean`, then equality or a `/` boundary), with the same bare-or-trailing-`/*` subtree semantics as §3.1.1. | Any absolute `work_dir`. |
+
+`permitWSL` checks in that order: the exe, the user, the distro, the binary, then
+the work dir. A `work_dir` that is set must be absolute; an empty one runs beside
+the binary (`path.Dir`), as §3.1's R2 does for a native spec. The empty-list
+asymmetry, and the rule that a refusal names the setting and the entry count but
+never a path, distro or user, are §3.1's. Besides the base names of §3.2, a `wsl`
+spec's `env` may not set `WSLENV`, `WSL_UTF8` or `XDG_RUNTIME_DIR`, in any
+capitalisation: the launcher owns them.
+
+#### The launch chain, and the invariant it keeps
+
+The agent builds the whole wrapper argv itself (`buildWSLLaunch`); nothing in it
+comes from the gateway except the spec's binary, args and env:
+
+```text
+wsl.exe -d <distro> -u <runtime_wsl_user> --cd <work_dir> --exec
+    systemd-run --user --scope --quiet --unit=opagent-<nonce>-<instance key>-<generation>
+    -- <binary> <args…>
+```
+
+**Invariant: no process that receives gateway-chosen argv or environment ever
+runs as root.** The first Linux process `wsl.exe` starts inherits every variable
+`WSLENV` carries, so a root wrapper would run with an environment the gateway
+chose, and an `LD_PRELOAD` would then be root in the distro; the reserved-name list
+does not cover it and should not have to. So the chain uses the configured user's
+**own** systemd manager (`systemd-run --user --scope`), and the agent never passes
+`-u root` itself. Three checks hold the line around the configured user: the policy
+refuses `root` and UID 0 as the user (`wslUserRefused`), the UID lookup refuses a
+user whose `id -u` is 0, and every agent helper call into a distro refuses a refused
+user again (`runWSLHelperCtx`). The scope's cgroup is delegated to the user, so it
+can still be read and signalled. Measured on a stock Ubuntu 24.04 image: a chain of
+this shape (`wsl.exe -d <distro> --exec systemd-run --user --scope --unit=<name> --
+<vllm> serve …`) worked without root with only `XDG_RUNTIME_DIR` carried through
+`WSLENV`, and
+`systemctl --user show <unit>.scope -p ControlGroup` returned a cgroup under
+`user@<uid>.service/app.slice/` that the user could read.
+
+**There is no shell with gateway input.** Every call is `wsl.exe … --exec`, never
+the `--` form, which runs `$SHELL -c`. The one shell the agent ever starts in a
+distro is its own fixed RAM-sampling script (below), with agent-built unit names
+as positional arguments, never spliced into the program text.
+
+**Every call names its working directory.** Without `--cd`, `wsl.exe` starts the
+command in the translation of the caller's Windows working directory, the agent's,
+which need not map into the distro at all (the drive mounts can be turned off,
+below) and then fails or prints a notice on stdout. The launch passes the spec's
+`work_dir`; every agent helper call (the UID lookup, the scope signals, the orphan
+sweep, the RAM sampler) is `wsl.exe -d <distro> -u <runtime_wsl_user> --cd / --exec
+…`, since `/` needs no translation and exists in every distro.
+
+**The unit name** is `opagent-` plus an 8-hex-character nonce drawn once per agent
+run, the instance key (§6.1; `S`, or `S#k` with the `#` written `_`) and the
+generation of the spec's log, which is unique for the agent's lifetime. Anything
+outside `[A-Za-z0-9_-]` becomes `_`, and the key is cut at 64 characters, because
+the name reaches an argv and the sampling script. The generation makes a late stop
+of a predecessor unable to reach a successor (§6); the nonce lets the orphan sweep
+tell this run's units from an earlier run's.
+
+**The UID is looked up off the owner.** `systemd-run --user` finds the user
+manager's bus through `XDG_RUNTIME_DIR=/run/user/<uid>`, so a start needs the
+user's UID in its distro, and asking is a `wsl.exe` call that can take seconds
+(a cold VM boots). §5.5 forbids that on the owner, so the lookup
+(`wsl.exe -d D -u U --cd / --exec id -u`, bounded to 10 s) runs on its own goroutine, at
+most one in flight per distro, and posts its answer back. A `wsl` instance whose
+distro's UID is not cached yet **waits** before admission: queued, its state
+untouched, no `last_error`, nothing evicted, and the answer re-asks it. A **burst**
+instance does not wait: its admission is all-or-nothing and immediate (§5.8), so it
+is refused at once with `ErrInstanceNoCapacity` and the lookup still runs, so the
+gateway's next attempt finds the UID cached. A failed lookup is a `start_failed`
+with the generic `last_error` `runtime: could not resolve the uid of
+runtime_wsl_user in the WSL distro; see the agent log` and the ordinary crash
+backoff, whose retry asks again (failures are never cached). The `last_error`
+names neither the distro nor the user; the agent's own Warn carries the distro and
+what `wsl.exe` or `id -u` printed, and its text names the setting, not the user.
+The configured user is no secret, though: the resolved command the log stream
+reports (§14.7, below) shows `-d <distro>` and `-u <runtime_wsl_user>` by design,
+because it is what ran. **Each `applyConfig` warms the distros its `wsl` specs
+name**: for every allowed distro a `wsl` spec in the document names and no earlier
+document did, it starts the lookup before it admits anything, so a start usually
+finds its UID already cached. A distro no spec names is never called into, because
+a call into a distro starts the WSL VM: an agent whose document runs nothing in WSL
+does not boot the VM at every start.
+
+**The environment** is the spec's expanded `env` and the agent's base and GPU
+variables (§3.2, §3.3), set on `wsl.exe`'s environment, plus four entries the agent
+adds when the spec has not set them: `CUDA_DEVICE_ORDER=PCI_BUS_ID` whenever
+`CUDA_VISIBLE_DEVICES` is present, `PYTHONUNBUFFERED=1` (the streams are pipes, so
+Python would block-buffer the log), `XDG_RUNTIME_DIR=/run/user/<uid>` and
+`WSL_UTF8=1` (so `wsl.exe`'s own errors, which it prints to stdout, are readable).
+`WSLENV` is always the agent's: every name except the Windows base block and
+`WSL_UTF8`, each with `/u` (Windows to Linux only). GPU selection carries over
+unchanged: measured, a WSL distro sees the host's GPU indices and PCI bus IDs, and
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` with `CUDA_VISIBLE_DEVICES=1` put a vLLM's VRAM on
+host index 1 and not on index 2. Secrets in `env` travel through `WSLENV` and stay
+out of the argv, which `ps` inside the VM would show.
+
+**Port, health and config files.** `${PORT}` is chosen on the Windows side, as
+always, and the workload binds `127.0.0.1:${PORT}` inside the VM; WSL's localhost
+forwarding (NAT mode, the default) or mirrored networking makes it reachable from
+Windows, so the router and the 500 ms health poll work unchanged (the forwarder
+scans for new listeners about once a second). Config files are written on the
+Windows side as always (§3.5), and `${CONFIG_DIR}` expands to that directory's
+`/mnt/<drive>/…` path inside the distro; a UNC base directory, or one whose `..`
+climbs above its drive's root, is a placeholder error and so `not_permitted`. Its
+message names the setting, `config_files_dir`, and not the directory, which goes to
+the agent's own log as a Warn: the message travels to the gateway, and §3.1 keeps
+agent-local paths out of what does.
+
+**What the log view shows.** The runtime log is `wsl.exe`'s stdout and stderr,
+which carry the Linux process's own streams. The resolved command (§14.7) reports
+the `wsl.exe` path as the binary, the **whole** wrapper argv (the distro after
+`-d` and `runtime_wsl_user` after `-u` included), with the operator's own secret
+arguments masked at their shifted positions, the Linux work dir, and the environment including
+what the launcher added (`WSLENV` among it).
+
+#### Lifecycle mapping
+
+The nine states, crash backoff, idle unload, pinning, instances, manual start and
+stop, the drain grace (10 s) and the kill grace (5 s) all carry over unchanged
+(§6, §6.1,
+[ADR-095](../09-architecture-decisions.md#adr-095--manual-start-and-stop-are-transient-pin-is-the-persistent-override-and-a-stop-goes-highest-index-first-never-below-the-protected-floor)).
+What differs is how each step reaches the process:
+
+| Step | Native | `wsl` |
+|---|---|---|
+| Start | exec the binary | exec `wsl.exe` with the chain above |
+| Terminate (graceful) | the process group on unix; a kill on Windows (§13) | `systemctl --user kill --signal=SIGTERM <unit>.scope` in the distro |
+| Kill grace expired | `killGroup` | `systemctl --user kill --signal=SIGKILL <unit>.scope`, then kill `wsl.exe` as the backstop, skipped once the generation has exited |
+| Exit code | the process's | `wsl.exe`'s: the workload's `WEXITSTATUS`, or the raw signal number for a death by signal; `-1` (Windows reports `4294967295`) is `wsl.exe`'s own failure |
+| Memory-pressure signature (ADR-086) | SIGKILL (unix) or the last measured RAM at 90 % of the host pool | the last measured RAM at 90 % of the **VM** pool only |
+| Orphan sweep | none | at the distro's first UID answer, kill every scope of another agent run (below) |
+
+**A stop signals the scope, not the process the agent exec'd.** Killing `wsl.exe`
+sends the workload no signal: the relay exits, the workload gets a SIGHUP it has
+no handler for, and a child that called `setsid` survives as an orphan.
+`systemctl --user kill` reaches every process in the scope's cgroup, `setsid`'d ones
+included. Measured: SIGTERM to the scope reached both vLLM processes (the API
+server and the EngineCore), and vLLM logged "Application shutdown complete" within
+about a second. Each signal is a `wsl.exe` call of its own, so `wslControl` runs it
+on a goroutine in the manager's WaitGroup, bounded to 10 s, and returns at once;
+what the signal achieved shows as the generation's exit, as for a native process,
+and a failed call is a Warn left to the kill-grace escalation. **The backstop is
+real**: measured, killing `wsl.exe` (`Stop-Process -Force`) after vLLM answered
+`/health` left no vLLM process in the distro, and the VM's GPU memory fell from
+about 12 GB to the 22 MiB that is there without vLLM. It is not a graceful stop,
+and an engine whose children call `setsid` could still leave orphans, which is why
+the scope is the primary path.
+
+**Exit codes.** A generation whose `wsl.exe` exited `-1` before ever passing a
+health probe never ran the workload at all (no such distro, no systemd, a broken
+VM), so its `last_error` says `wsl.exe could not run the workload (exit <code>);
+see the runtime log` rather than blaming a process that never existed; `wsl.exe`'s
+own error text is in the runtime log. A signal death returns the raw signal number, so
+`exit(9)` and a SIGKILL both read as `9`, and nothing tells them apart today (§13).
+
+**The orphan sweep.** A unit outlives its agent when the agent dies without
+stopping it (a crash, a kill, a host-side update; the agent puts its children in
+no Job Object): its workload still holds the GPU, the RAM and the
+port inside the VM, invisible to the new run. So once per agent lifetime per
+distro, when the distro's first UID lookup answers (the lookup the first document
+whose `wsl` specs name that distro starts), the agent lists
+`systemctl --user list-units --plain --no-legend --all --full 'opagent-*.scope'`
+there (`--full`, so no long name is ellipsized) and SIGKILLs a scope only when its
+name parses back to exactly the shape the agent builds
+(`parseWSLUnitName`, the inverse of `wslUnitName`):
+`opagent-<8 lowercase hex nonce>-<key>-<generation>`, with a non-empty key of at
+most 64 unit-name characters and a plain decimal generation. Such a name with a
+nonce other than this run's is an orphan and is killed; any other `opagent-*` unit
+is not one the agent made, so it is the operator's and is left alone, and so are
+scopes that are `inactive` or `failed` (they hold no process). SIGKILL, not a
+graceful stop: an orphan has nobody waiting for its answers. A distro unreachable
+at startup is swept as soon as a later start reaches it, and this run's units are
+never touched, because each carries its nonce. A distro no `wsl` spec names is not
+called into and so not swept; what an earlier run left there is swept once a
+document names that distro again.
+
+#### RAM: the scope's cgroup, and the VM's own pool
+
+**The source is the scope's cgroup, not the pid.** On the measurement beat (§5.3)
+the agent makes one `wsl.exe --exec sh -c <fixed script> sh <unit…>` call per
+distro with live `wsl` generations, off the owner, all distros under one shared 2 s
+deadline (`wslSampleTimeout`). The script first prints a sentinel line,
+`opagent-sample v1`, because `wsl.exe` may print notices of its own on stdout ahead
+of the command's output: everything before that line is ignored, and an answer
+without it is no answer. It then prints, per unit, `memory.current` and
+`inactive_file` from `…/user@<uid>.service/app.slice/<unit>.scope`, and the VM's
+`MemTotal` and `MemAvailable` from `/proc/meminfo`. A unit's figure is
+`memory.current − inactive_file`, the `docker stats` definition, so the
+**inactive** page cache of the model file is not charged; active file pages are
+(about 380 MiB in the measurement below, `file` minus `inactive_file`). That
+active share is also counted as available in the VM's `MemAvailable`, which the
+VM pool below relies on ([§11.4 of the risk
+register](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). A unit that cannot be read is absent
+(its previous figure stands), and a garbled answer is no answer. The `wsl.exe` pid
+reaches neither native measurer, on the beat or in the admission snapshot.
+
+That figure is what makes the charge honest. Measured on vLLM serving
+Qwen2.5-1.5B at `--gpu-memory-utilization 0.5`: the scope's `memory.current` was
+8030 MiB, of which `anon` 3223 and `file` 4705, with `inactive_file` 4325 MiB of
+safetensors page cache, so the agent's figure is **3705 MiB**. The processes' RSS
+were 1390 (API server), 2851 (EngineCore) and 14 MiB (resource tracker), a sum of
+4255 that double-counts shared pages; **the main pid alone, which is what the
+native path measures, was 1390 MiB, about a third of the workload**.
+
+**Two pools.** The **host pool** (rule 6) is unchanged: the VM's memory is host
+memory, so Windows `MemAvailable` already excludes it and the measured add-back
+stays valid. The **VM pool** is new, because the VM has a ceiling of its own
+(`.wslconfig` `memory=`, half of the host's RAM by default), so WSL workloads can
+exhaust it and meet the VM's OOM killer while the host has memory to spare:
+
+- **The pool** is the VM's `MemAvailable` plus what the agent's scopes held **in
+  the same sample**, minus `OP_AGENT_WSL_RAM_RESERVE_MB` (default 1024), floored at
+  1; `0` (unconstrained) until a sample has answered. The add-back comes from the
+  sample, not from the processes alive when the snapshot is built: the VM is
+  sampled only by the off-owner measurement, never by the admission snapshot, so
+  after a `wsl` start evicts the last idle `wsl`
+  workload to make room, a live-set add-back would lose the victim's share while
+  the stale `MemAvailable` never shows it back, and the start the eviction was for
+  would wait for good.
+- **The rule** (`ruleWSLRAM`) is rule 6's arithmetic against that pool, for a `wsl`
+  candidate only, charging and evicting only `wsl` processes: a native process
+  frees nothing in the VM, and a native candidate takes nothing from it. Its
+  discipline is rule 6's (the bootstrap interlock, the bootstrap guess, unknown
+  occupants neither charged nor drawn, idle victims in role order). It runs
+  **before** the host pool, narrow before broad, as rule 3 runs before rule 6: only
+  a `wsl` process can free VM RAM, so its victims are needed anyway and each also
+  frees host RAM. The other order over-evicts: with a host pool of 12000 MB, a VM
+  pool of 10000 MB, an older idle native process and an idle `wsl` process of
+  6000 MB each, and a `wsl` candidate of 5000 MB, the host pool would draw the
+  native process first and the VM pool would then still need the `wsl` one.
+- **A known demand above the VM's ceiling** (`MemTotal` minus the reserve) is
+  terminal, `not_permitted` with `spec X: RAM demand N MB exceeds the WSL VM RAM
+  budget M MB on its own`, right after the host's own-demand refusal (a spec over
+  both reports the host cause).
+- **A stale VM figure cannot wedge a start.** The VM is sampled only while a `wsl`
+  generation is live, so after the last one exits its figure freezes. A `wsl` start
+  that begins to wait on the VM pool with no `wsl` process live
+  (`Decision.WaitOnWSLVM`) asks for a VM-only sample at once (the script with no
+  units), and the beat repeats it while the start keeps waiting with a queued
+  request or a pin. Nothing samples a VM nobody wants anything from, so an idle VM
+  is never booted by sampling. Every VM sample re-asks the RAM waiters (§5.4).
+
+The cold-start bootstrap (ADR-086) works unchanged once a real measurement exists;
+its memory-pressure classification weighs a `wsl` generation's last figure against
+the VM pool it lived in.
+
+#### VRAM: attributed from the VM worker by start delta, the remainder charged
+
+**There is no per-process VRAM inside WSL** (NVIDIA's WSL guide lists per-process
+queries as unsupported), and **Windows charges all of the VM's GPU memory to one
+host process, the VM worker `vmwp`**, not `vmmem`. Measured with vLLM at
+`--gpu-memory-utilization 0.5` on the 24 GB card: `vmwp` held 12318 MiB on that
+adapter, and that adapter's total (13084 MiB) matched `nvidia-smi`'s
+`memory.used` (13077 MiB). Its PDH instances carry the **same adapter LUIDs as
+ordinary host processes**, so the LUID → PCI → index bridge of §5.3
+([ADR-031](../09-architecture-decisions.md#adr-031--per-process-vram-on-windows-pdh-counters-plus-a-d3dkmt-luid-bridge))
+applies to it unchanged. Read through the agent's own calls
+(`PdhAddEnglishCounterW` plus `PdhGetFormattedCounterArrayW`), PDH reports **one
+same-named instance per guest GPU process**: with two vLLM servers the 24 GB card
+showed instances of 12318, 7432 and 22 MiB, which the measurer's existing sum by
+(pid, adapter) turns into the VM's 19772 MiB, against an adapter total of 20662 MiB
+that also holds about 1.1 GB of host processes. The instances carry no identity and
+their order is not stable (the second server's came first), so positional
+tracking is out. **WMI is never used**: it keys on the instance name and showed
+7432 MiB where the VM held 19750.
+
+**Finding the worker.** `collector.NewWSLVMWorkerPIDs` takes one Toolhelp process
+snapshot and returns the pid of **every** `vmwp.exe`, without opening any process
+(a worker runs under its VM's virtual account, which an unelevated agent could not
+open); it is nil off Windows. Every Hyper-V VM has a worker and nothing in a
+process listing tells the WSL VM's apart, so all are summed, which charges another
+VM's GPU memory as WSL remainder: less free VRAM than there is, never more. The
+VM's figure is read on the beat and synchronously in every admission snapshot
+**only while a `wsl` generation is live** (the VRAM measurer then runs on the beat
+even where no native spec declares a GPU), and just before a GPU `wsl` start's exec,
+as its baseline.
+
+**The start delta.** The engines reserve their VRAM up front as a configured
+fraction of the card (vLLM's `--gpu-memory-utilization`, SGLang's
+`--mem-fraction-static`), so the VM's growth across one start is that workload's
+figure, provided nothing else starts in the VM meanwhile. Measured: a second vLLM at
+0.3 on the same card raised the adapter total from 13084 to 20662 MiB (+7578,
+against about 7.4 GB predicted), and stopping it brought it back to 13221 MiB; the
+adapter level is additive and reversible. So:
+
+- A `wsl` spec that **declares at least one GPU**, on a host where its VRAM can be
+  measured (a VRAM measurer and a worker finder installed), reads the VM's figure as
+  the last thing before its exec: the **baseline**. Once the exec has succeeded, a
+  **start window** opens (`wslStartWindow`); a failed exec opens none.
+- The window **settles** on the first measurement *dispatched after* the
+  instance's first passing health probe (one already out when the probe passed may
+  have caught the load midway and does not count): the VM's growth since the
+  baseline, plus the credit below, floored at 0 and kept **only on the GPUs the
+  spec declares**, is the instance's **attribution**. It becomes the instance's
+  measured VRAM, a ready figure siblings inherit (§5.8), the resolution of its VRAM
+  bootstrap, and the `vram_measured_mb` write-back, exactly as a native first
+  measurement is
+  ([ADR-084](../09-architecture-decisions.md#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired)).
+- **Starts are serialized; stops never are.** While a window is open, every `wsl`
+  candidate that declares a GPU **Waits**, evicting nothing
+  (`PolicySnapshot.WSLStartInFlight`, `Decision.WaitOnWSLStart`), checked right
+  after the own-demand refusals and before anything that could evict; a burst
+  candidate is refused with "it would wait for another WSL start to settle". A
+  native candidate is not held back, and neither is a `wsl` spec with no GPU: it is
+  taken to hold no VRAM, opens no window and is attributed nothing. A window that
+  settles re-asks every spec that waited for it, a `force_running` one with no
+  request included, but such a spec may only start into room that is free now (it
+  may not evict), so two `force_running` specs that cannot run together cannot evict
+  each other at load speed. The settle also re-asks every spec with a queued request
+  or a pin, native ones included (`wakeAfterStart`'s narrowing, once per start): it
+  changes what the start is charged, an unknown demand becoming its attribution, so
+  a request that waited behind it may fit now, and nothing else would re-ask it
+  while the start stays busy. A window that closes because its own process exited
+  is followed by that exit's ordinary admission wake.
+- **An exit during a window corrects it, it does not wait for it.** Manual stops,
+  idle unloads, evictions, removals and crashes go ahead at once. The window's own
+  process exiting closes it without an attribution. An attributed process exiting
+  adds its attribution back as **credit**. A `wsl` process with no attribution
+  exiting **voids** the window, because what it held is unknown; a void window still
+  runs to its settle (the next start's delta must not catch this start's load) and
+  then closes without an attribution. Starts take minutes anyway.
+- **A reading that is not the VM's is never a delta's end.** The measurer answers
+  nothing both when the VM holds nothing and when the read failed, so a reading
+  counts as **failed** where the VM cannot be empty: no worker found while a `wsl`
+  generation is live, or nothing held while a live one is attributed VRAM, and at a
+  settle also nothing held at all, since a start that declares a GPU and has passed
+  its probe holds its weights. A failed baseline
+  opens the window **void**, and a failed settle leaves the instance with **no**
+  attribution: a delta against a failed reading would credit one instance with the
+  whole VM, written back as its demand floor and refused for good once it exceeds
+  its budget. A failure that looks like a genuinely empty VM (at the first start,
+  with nothing `wsl` live) cannot be told apart (§13).
+
+**The remainder is what admission relies on.** Per-instance figures are best
+effort: a delta can come out low (growth after the window closed, a void window)
+or high. So at every admission, from that admission's own reading of the VM, the
+agent computes per GPU `R(g) = VM(g) − Σ attributions charged on g`, floored at 0
+(while a `wsl` generation is live; with none live the VM is not read and nothing is
+charged), and rule 3 adds it to the sum of every budgeted GPU the candidate has a
+known demand on (`PolicySnapshot.UnattributedVRAM`). A `wsl` generation is charged
+`max(attribution, demand)` per declared GPU like any process, so with the remainder
+the sum admission sees is **at least what the VM holds** on that GPU: growth after a
+settle, GPU use in the VM the agent did not start, a low attribution and another
+VM's memory are all covered, and admission never sees room the VM has taken. The
+remainder is never a victim (evicting nothing frees it) and never part of the
+own-demand refusal. A negative remainder is no credit: the attributions stand,
+under ADR-084's max rule. An attribution that came out **high** over-credits only
+its own instance's eviction, and the candidate it was evicted for is admitted on the
+next fresh reading, after the exit.
+
+**While a window is open**, its process has no attribution yet and is charged its
+demand, while its growth since the baseline is already in the VM's figure. Left
+whole in the remainder, that growth would be charged twice, and a native candidate
+on a shared GPU would wait for room that exists, or, between the start's first
+passing probe and its settle (when the process is no longer Starting and so is a
+victim), evict the idle `wsl` model itself although the two fit together. So the
+window's process has a **provisional attribution**, used against the remainder
+only: the window's delta so far (from its baseline and credit), on each GPU it is
+charged on, capped at that charge (`provisionalWSLAttribution`). Its charge stays
+its demand, so the sum admission sees is still at least what the VM holds; whatever
+it holds beyond its demand stays in the remainder until the settle attributes it. A
+void window gets none.
+
+**A failed reading falls back to this period's last good one.** A reading that is
+detectably failed at admission falls back to the **last good** one rather than to
+none, since charged from a failed read the remainder would vanish and the VM's VRAM
+would read as free. That reading belongs to the current **period of WSL activity**,
+a stretch in which at least one `wsl` generation is live: it is forgotten when the
+last `wsl` generation exits (or an admission finds none live), and a measurement
+that lands after its period ended does not record its reading. A later period whose
+first reading fails, as a CPU-only `wsl` generation's does while its VM boots and
+shows no worker yet, therefore falls back to nothing, which is what the booting VM
+holds, never to an earlier period's figure. Within a period the fallback can be
+older than the VM's state, for instance from before a GPU `wsl` generation exited,
+and then over-charges until the next good reading ([§11.4 of the risk
+register](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
+
+**The VRAM bootstrap is gated per spec.** The one-shot bootstrap eviction (§5.3)
+exists to capture a measurement, and a `wsl` spec's measurement needs the worker
+finder as well as the VRAM measurer (`vramMeasurable`). Without the per-spec gate a
+`wsl` spec on a Windows NVIDIA host, which always has the PDH measurer, would be
+granted an eviction for a measurement that could never arrive. A `wsl` spec whose
+VRAM cannot be measured runs on its operator estimate, and an unknown demand
+follows the unknown-VRAM rules of §5.3 (alone on its GPU).
+
+#### The portal
+
+The runtime-spec editor shows an **execution** selector (Native / WSL) only where
+it can matter: for a server whose agent declares `runtime_exec_wsl`, or for a spec
+already stored as `wsl`, which must stay editable. In WSL mode it adds a **distro**
+field and labels the binary and work-dir fields as Linux paths, and it warns, once
+the agent's report has loaded, when the agent does not declare the feature: the
+spec is saved but not pushed. The mapping table marks a `wsl` spec's VRAM total
+with a **WSL** chip and, once a figure has been measured, the caption "VRAM
+attributed from the WSL VM"; the editor's measured-VRAM line carries the same label
+when it shows a measured figure. An operator can tell an attributed figure from a
+per-pid reading, and an estimate alone is never labelled as attributed. German and English strings ship together.
+
+#### What the host needs
+
+Installing and configuring WSL, the distro and the engines stays the operator's
+job; the agent's README carries the setup. Everything WSL is per **Windows user**
+(distros are registered per user, each user gets their own utility VM, and
+`.wslconfig` is read from that user's profile), and WSL refuses LocalSystem. So in
+`wsl` mode the agent runs **as the Windows user that owns the distro**, either as a
+service under that account or as a plain process in that user's interactive
+session, and never as LocalSystem, which is what a service gets unless configured
+otherwise. Measured on Windows 11 Pro: an NSSM service running as the
+distro-owning user ran `wsl.exe --exec` successfully, and after a reboot with the
+service set to start automatically and nobody logged on it cold-started the VM and
+ran 29 s after boot, all three GPUs visible from inside. Run interactively, the
+agent lives as long as the session, and a logoff ends it with every `wsl.exe`
+child. Either way the user's systemd manager has to be running, which is what
+`loginctl enable-linger` is for; `.wslconfig`'s `vmIdleTimeout=-1` and
+`instanceIdleTimeout=-1` keep an idle VM and distro from shutting down under a
+loaded model; and model files belong in the distro's ext4 filesystem, not on
+`/mnt/c`.
+
+**The WSL boundary is not a security boundary, and the mode does not claim it is.**
+A Linux process can read the Windows user's files through `/mnt/c` and, through
+interop, start Windows executables as that user. A `wsl` workload therefore has the
+trust level of a native binary run as the agent's account, which is acceptable only
+because that account is now an unprivileged user and not LocalSystem. A dedicated
+distro with `[interop] enabled=false` narrows it, and where no `wsl` spec needs its
+config files through `/mnt/<drive>`, so does turning the drive mounts off
+(`[automount] enabled=false`).
+
 ## 4. One router port per AI server
 
 The agent listens on a single HTTP port, reads the `model` field out of each
@@ -2934,7 +3449,10 @@ roughly half the host and evicting for starts that fit. Because the pool is buil
 from the **live** available memory, a co-located workload the agent does not
 manage (a container stack on the same host) lowers it on the next sample with
 nothing to reconfigure. Its victims and its wake are
-[§5.4](#54-eviction-queueing-and-drain).
+[§5.4](#54-eviction-queueing-and-drain). A `wsl` candidate must also fit the WSL
+VM's own RAM pool, which is checked just before this one, and rule 3's per-GPU sum
+also carries the WSL VM's unattributed VRAM; both are
+[§3.8](#38-execution-modes-wsl2).
 
 **The pair rule and the arithmetic are not redundant.** The pair rule expresses
 operator *intent* and covers the constraints nobody computes — PCIe bandwidth and
@@ -3195,13 +3713,19 @@ keep the exception from reintroducing the thrash the order closed:
   unknown-demand spec there simply waits behind a busy or pinned holder;
   evicting a working model for a spec that can never be measured is exactly the
   regression the order exists to prevent. So a host with no VRAM measurer never
-  grants the shot.
+  grants the shot. The question is asked **per spec** (`vramMeasurable`): a `wsl`
+  spec's figure is the WSL VM's, so it also needs the VM worker finder
+  ([§3.8](#38-execution-modes-wsl2)), and a Windows NVIDIA host, which always has
+  the PDH measurer, would otherwise grant a `wsl` spec an eviction for a measurement
+  that could never arrive.
 - **It only ever evicts what is evictable.** The same idle, unpinned,
   not-still-loading, nothing-in-flight rule that governs every victim applies.
 
 On an NVIDIA host the agent then measures actual usage of **its own
 child PIDs** — exact because the agent knows which PIDs are its children — and
-writes the measurement back to the gateway. There "unknown" is a self-resolving
+writes the measurement back to the gateway. (A `wsl` generation is the exception:
+its pid is `wsl.exe`, which holds nothing, and its figure is its share of the WSL
+VM's, [§3.8](#38-execution-modes-wsl2).) There "unknown" is a self-resolving
 transient, not a permanent hole in the OOM protection. *How* it measures is
 platform-specific: `nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory`
 everywhere except Windows, and PDH performance counters on Windows, where that
@@ -3388,6 +3912,18 @@ VRAM spillover into host memory**: the neighbouring `Shared Usage` and
 `Non Local Usage` counters read *identically* (4694 MiB) on all three GPUs of
 that host, so they are not per-adapter figures, and only `Dedicated Usage` is
 read.
+
+**The same chain also reads the WSL VM's worker, `vmwp`.** Windows charges all of
+a WSL2 VM's GPU memory to that one host process, as one same-named PDH instance per
+guest GPU process, and its instances carry the host's adapter LUIDs, so the
+measurer's existing sum by (pid, adapter) and the LUID → index bridge give the VM's
+per-GPU figure with no change to the measurer. While a `wsl` generation is live the
+manager adds the pids of every `vmwp.exe` (found by one Toolhelp snapshot,
+`collector.NewWSLVMWorkerPIDs`, installed with `Manager.SetWSLVMPIDs`) to the
+pids it asks about, on the beat and at admission; the `wsl.exe` pids themselves are
+never asked. How that figure is attributed to workloads, and how the rest is
+charged, is [§3.8](#38-execution-modes-wsl2). It is read through the PDH array API
+only: WMI keys on the instance name and shows one of the same-named instances.
 
 **The Windows code is split so that CI can test the half that can be wrong.**
 Every grammar, all the arithmetic and the whole cache-decision logic live in
@@ -4386,13 +4922,13 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Fourteen
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Fifteen
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
 `runtime_config_files`, `runtime_voices`, `fullduplex_proxy`,
 `runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`,
-`runtime_role_eviction`, `runtime_stop`); two,
+`runtime_role_eviction`, `runtime_stop`, `runtime_exec_wsl`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below); and two, `runtime_instances` and `rpc_cluster`, are on **both** lists
 with a different fact behind each declaration, each side reading the other's (below).
@@ -4434,7 +4970,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_instances` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite),
 [§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), `Since: "0.16.0"`, and
 `runtime_stop` ([§4.1](#41-control-routes)), `Since: "0.17.0"`, and
-`rpc_cluster` ([§3.6](#36-rpc-cluster-members-and-heads)), `Since: "0.18.0"`
+`rpc_cluster` ([§3.6](#36-rpc-cluster-members-and-heads)), `Since: "0.18.0"`, and
+`runtime_exec_wsl` ([§3.8](#38-execution-modes-wsl2)), `Since: "0.19.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -4624,6 +5161,30 @@ never reach a child. A document change in either direction bypasses the
 ETag short-circuit, like `runtime_instances`. `server-agent`'s `Version` moved
 `0.17.0` → `0.18.0` for this entry, MINOR per the same rule
 (`FeatureRPCCluster`, pinned with the version by `TestFeaturesDeclareRPCCluster`).
+
+`runtime_exec_wsl` (#381, [§3.8](#38-execution-modes-wsl2),
+[ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged))
+is on the agent's list alone, and **the gateway gates real behaviour on it,
+fail-closed**: it says the agent runs a spec whose `execution` block says `wsl`
+inside a WSL2 distro. The agent declares it unconditionally, whatever host it runs
+on (a non-Windows agent refuses such a spec through its own policy, since its
+default `runtime_wsl_exe` is empty). An agent that predates it decodes the
+document without error and ignores the unknown `execution` block, so it would run
+the Linux binary path as a native binary; the gateway therefore builds a `wsl` spec
+into an agent's document only while that agent declares the name
+(`Service.agentRunsWSL`), leaves it out otherwise (with every co-residency pair that
+names it), and **holds** the document with `503
+runtime_config.agent_features_pending` while the declaration is not yet known since
+a gateway start, as for a replicable spec. A sample that changes the declaration
+pushes the document (`agent_ingest.go`). The portal reads it to offer the execution
+selector and to warn that a `wsl` spec saved for an agent without it is not pushed.
+It is spelled identically on both sides because the agent module imports nothing
+from the gateway (`portal.AgentFeatureRuntimeExecWSL`, which
+`gateway.RuntimeExecWSLFeature` aliases, is deliberately **not** in
+`gatewayAgentFeatures`; `TestRuntimeExecWSLFeatureName` pins the gateway side and
+`TestFeaturesDeclareRuntimeExecWSL` the agent's registry entry and its `Since`).
+`server-agent`'s `Version` moved `0.18.2` → `0.19.0` for this entry, MINOR per the
+same rule.
 
 `runtime_stop` is the same shape as `runtime_ensure`: the gateway gates real
 behaviour on it, fail-closed. It says the router serves `POST /stop/{model}`
@@ -5163,6 +5724,18 @@ additive `runtime_api_version` sample field and a skipped `/props` probe (§3.4)
 which the gateway needs to negotiate. An older agent keeps working against a newer
 gateway and the reverse; there is **no upgrade order**
 ([ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)).
+
+**`0.18.2` → `0.19.0` (the WSL2 execution mode, #381) is MINOR, and one bump for the
+whole branch.** `agent.Features` gained `runtime_exec_wsl` (§7), the spec gained the
+`execution` block, and the agent gained the `runtime_wsl_*` settings and the env-only
+`OP_AGENT_WSL_RAM_RESERVE_MB`, which it logs at startup (`wsl_ram_reserve_mb`)
+([§3.8](#38-execution-modes-wsl2)). `TestFeaturesDeclareRuntimeExecWSL` pins the
+name and its `Since`; the `0.19.0` `Version` assertion sits in the two previous
+features' tests (`TestFeaturesDeclareRuntimeStop`, `TestFeaturesDeclareRPCCluster`),
+which were updated for the bump. Compatibility needs **no
+upgrade order**: the gateway sends a `wsl` spec only to an agent that declares the
+name, and an older gateway never sends the block, so a 0.19.0 agent behind it runs
+every spec natively, as before.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -9371,7 +9944,8 @@ operator meets first:
   (§3.2, §3.6). A `${DEVICES}`-style token renders the declared GPU indices under
   the backend prefix, but the number the backend gives a card is its own:
   CUDA matches `nvidia-smi` only with `CUDA_DEVICE_ORDER=PCI_BUS_ID` (which the
-  agent does not set), and Vulkan and mixed-vendor hosts enumerate
+  agent sets only for a `wsl` spec, [§3.8](#38-execution-modes-wsl2)), and Vulkan
+  and mixed-vendor hosts enumerate
   independently. `device_backend: auto` on a mixed host is the host's vendor set,
   not the vendor of the spec's GPUs. The operator verifies with `--list-devices`;
   matching that output to the host's GPUs is an open follow-up.
@@ -9391,7 +9965,8 @@ operator meets first:
   `ram_estimate_mb` is the only number there will be).
 - **The RAM axis is bounded by what it can see.** The pool follows the live
   available memory, the measured figure is the managed child's *own* pid (workers a
-  server forks are not summed, which errs conservative), the first-start guess
+  server forks are not summed, which errs conservative; a `wsl` spec is the
+  exception, measured over its whole scope, §3.8), the first-start guess
   cannot bound a model's true footprint, and the pool is unconstrained for the
   moments before the first hardware sample. Each is a recorded acceptance, with its
   mitigation, in
@@ -9483,7 +10058,9 @@ operator meets first:
   agent for Windows. The Windows implementation has no graceful-drain
   equivalent — a stop terminates the child rather than letting it finish
   in-flight work. A real fix needs `CREATE_NEW_PROCESS_GROUP` plus
-  `GenerateConsoleCtrlEvent`. **CI does not check it at all** — every job in
+  `GenerateConsoleCtrlEvent`. A `wsl` spec is the exception: it is stopped
+  gracefully from inside its distro, through its systemd scope
+  ([§3.8](#38-execution-modes-wsl2)). **CI does not check it at all** — every job in
   `.github/workflows/ci.yml` runs on `ubuntu-latest` with no `GOOS` set, so
   `proc_windows.go` is never built there
   ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks) and
@@ -9493,6 +10070,22 @@ operator meets first:
   environment base is a union rather than a `GOOS` switch for exactly this
   reason). Cross-compile locally with
   `GOOS=windows GOARCH={amd64,arm64} go vet ./...` before changing it.
+- **The WSL2 execution mode measures what Windows lets it see**
+  ([§3.8](#38-execution-modes-wsl2)). A `wsl` workload's VRAM is a **start delta**,
+  not a live per-process reading: growth after its start settled shows only in
+  aggregate, as the VM's unattributed remainder, which admission charges in full.
+  Every `vmwp` on the host is summed, so another Hyper-V VM's GPU memory counts as
+  WSL remainder (the safe direction). A failed VM reading at the very first start,
+  with nothing `wsl` live, cannot be told from an empty VM ([§11.4 of the risk
+  register](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). GPU-declaring
+  `wsl` starts are serialized, one settle window at a time. A signal death and a
+  workload's own exit code read the same (`exit(9)` and a SIGKILL both read `9`),
+  and no OOM-kill signature is read from the scope, so the memory-pressure
+  classification of a `wsl` bootstrap rests on one criterion alone: its last
+  measured RAM against 90 % of the VM pool. A GPU also used by Windows processes the agent does not manage behaves as it
+  always has: the agent never charges those. The WSL boundary is not a security
+  boundary (§3.8), and the whole mode is outside CI
+  ([§11.3](../11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember)).
 - **Three smaller accepted risks in the agent.** When a spec does not pin a
   listen port the agent binds `127.0.0.1:0`, reads the port back and closes the
   listener — an accepted TOCTOU window before the child's own bind. Measured VRAM
@@ -9877,7 +10470,13 @@ the operator's, and `GGML_RPC_NO_RDMA` and `LLAMA_CACHE` in the environment.
 These are exactly the values `exec.Command` receives, and they carry no secret
 span. A head's `--rpc` and `--device` values come from the
 `${RPC_SERVERS}`/`${RPC_DEVICES}` placeholders, which the expansion resolves,
-so the report shows them expanded.
+so the report shows them expanded. For a `wsl` spec
+([§3.8](#38-execution-modes-wsl2)) the binary is the `wsl.exe` the agent exec'd,
+the argv is the whole wrapper (`-d … --exec systemd-run … -- <binary> <args…>`)
+with the operator's own arguments masked at their shifted positions, the working
+directory is the Linux one inside the distro (`--cd`), and the environment includes
+what the launcher added (`WSLENV`, `XDG_RUNTIME_DIR`, `WSL_UTF8`,
+`PYTHONUNBUFFERED`, and `CUDA_DEVICE_ORDER` beside a `CUDA_VISIBLE_DEVICES`).
 
 **On the marker, and that is the design.** `${PORT}` is resolved afresh on every
 start, so across a crash loop the command *differs* between attempts. Because it
@@ -10029,7 +10628,7 @@ markers.
 
 Agent settings on the agent's existing precedence — flag, then environment,
 then config file — except those marked **no flag form**, which resolve
-environment, then file, then default; the four resource-accounting and eviction
+environment, then file, then default; the five resource-accounting and eviction
 settings at the end of the table are **env-only**: no flag, and no config-file key
 either. Passing a flag the agent does not register
 is a *startup error*, so that marking is load-bearing rather than editorial;
@@ -10044,6 +10643,11 @@ registers, over the authoritative table in
 | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist. **Empty means nothing starts.** |
 | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. |
 | `runtime_allow_binary_dirs` / `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (**no flag form**) | `false` | Auto-allow each allowed binary's parent directory as a `work_dir` subtree (§3.1.2). On while `runtime_allowed_dirs` is empty flips work-dir handling permissive→restrictive. |
+| `runtime_wsl_exe` / `OP_AGENT_RUNTIME_WSL_EXE` (**no flag form**) | `C:\Program Files\WSL\wsl.exe` on Windows, empty elsewhere | The `wsl.exe` a `wsl` spec is launched through ([§3.8](#38-execution-modes-wsl2)). **Empty means no `wsl` spec starts.** |
+| `runtime_wsl_user` / `OP_AGENT_RUNTIME_WSL_USER` (**no flag form**) | empty | The Linux user every `wsl.exe` call runs as (`-u`). `root` and UID 0 are refused. **Empty means no `wsl` spec starts.** |
+| `runtime_wsl_allowed_distros` / `OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS` (**no flag form**) | empty | The distros a `wsl` spec may name, matched exactly. **Empty means no `wsl` spec starts.** |
+| `runtime_wsl_allowed_binaries` / `OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES` (**no flag form**) | empty | The absolute Linux binary paths a `wsl` spec must match exactly; `runtime_allowed_binaries` is never consulted for one. **Empty means no `wsl` spec starts.** |
+| `runtime_wsl_allowed_dirs` / `OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS` (**no flag form**) | empty | Permitted Linux `work_dir` subtrees for a `wsl` spec, with `runtime_allowed_dirs`' semantics. Empty permits any absolute `work_dir`. |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `config_files_dir` / `OP_AGENT_CONFIG_FILES_DIR` | `server-agent-config-files` next to the binary | Base directory the agent writes spec config files under, one `<spec-id>/` subdirectory each; `${CONFIG_DIR}` resolves to it ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). A relative config-file value resolves beside that file. **The gateway never supplies it.** |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
@@ -10052,6 +10656,7 @@ registers, over the authoritative table in
 | `OP_AGENT_VRAM_HEADROOM_MB` (**no flag form**, env-only) | `0` | MB held back from each **auto-detected** per-GPU VRAM budget, for the driver, a display or another tenant; never applied to a budget the operator set ([§5.1](#51-the-per-gpu-data-model), [ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)). `0` is a real value; a negative or malformed one falls back to `0`. |
 | `OP_AGENT_HOST_RAM_RESERVE_MB` (**no flag form**, env-only) | `2048` | Host RAM held back from the host-RAM admission pool (`MemAvailable` + what managed processes hold − this), room for the OS, the agent and whatever else shares the host ([§5.2](#52-the-three-gates), [ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)). `0` is a real value (reserve nothing); a negative or malformed one falls back to the default. |
 | `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB` (**no flag form**, env-only) | `4096` | Conservative host RAM charged to a spec of unknown RAM demand on its first start, until it is measured ([§5.3](#53-unknown-vram-resolves-itself-by-measurement), [ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)). Errs high on purpose; `0` turns the charge off (not the bootstrap interlock); a negative or malformed value falls back to the default. Raise it for a RAM-heavy model whose demand is not yet declared. |
+| `OP_AGENT_WSL_RAM_RESERVE_MB` (**no flag form**, env-only) | `1024` | RAM held back from the WSL VM's own admission pool (the VM's `MemAvailable` + what the agent's scopes held in the same sample − this), which a `wsl` spec must fit besides the host pool ([§3.8](#38-execution-modes-wsl2)). `0` is a real value; a negative or malformed one falls back to the default. |
 | `OP_AGENT_EVICTION_GRACE_SECONDS` (**no flag form**, env-only) | `30` | Seconds after a managed model was last used during which it is never an eviction victim, so a bursty pipeline (a voice chat's speech models, idle between turns) is not broken by a start that needs the room; a start that could only be made room for by evicting one waits, and is woken when the window expires ([§5.4](#54-eviction-queueing-and-drain), [ADR-089](../09-architecture-decisions.md#adr-089--eviction-is-role-aware-and-grace-protected-and-co-residency-rides-the-unchanged-wire-list-so-an-older-agent-stays-correct)). `0` turns the window off (an idle model is evictable at once); a negative, fractional, malformed or above-`86400` value falls back to the default. |
 
 Gateway-side knobs are per-server and per-spec database columns, not environment
@@ -10089,5 +10694,6 @@ mechanics of the generated agent config document are in
   [Data Model](../reference/data-model.md) — the wire contracts and the schema.
 - [Architecture Decisions](../09-architecture-decisions.md) — ADR-024 to
   ADR-029, ADR-031 to ADR-036, ADR-087 to ADR-089 (the co-residency mode,
-  the derived role and role-aware eviction), and ADR-090 to ADR-093 (model
-  instances: addressing, burst admission, the scaler, the audio benchmark).
+  the derived role and role-aware eviction), ADR-090 to ADR-093 (model
+  instances: addressing, burst admission, the scaler, the audio benchmark), and
+  ADR-101 (the WSL2 execution mode).

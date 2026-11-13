@@ -32,6 +32,10 @@ import (
 // tool itself).
 var stubchildPath string
 
+// fakewslPath is testdata/fakewsl, built beside stubchild: the wsl.exe the WSL
+// lifecycle tests launch through (see its package doc).
+var fakewslPath string
+
 func TestMain(m *testing.M) {
 	os.Exit(buildStubchildAndRun(m))
 }
@@ -49,13 +53,18 @@ func buildStubchildAndRun(m *testing.M) int {
 	}
 	defer os.RemoveAll(dir)
 
-	bin := filepath.Join(dir, "stubchild")
-	cmd := exec.Command("go", "build", "-o", bin, "./testdata/stubchild")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "manager_test: build stubchild: %v\n%s", err, out)
-		return 1
+	for _, helper := range []struct {
+		name string
+		dst  *string
+	}{{"stubchild", &stubchildPath}, {"fakewsl", &fakewslPath}} {
+		bin := filepath.Join(dir, helper.name)
+		cmd := exec.Command("go", "build", "-o", bin, "./testdata/"+helper.name)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "manager_test: build %s: %v\n%s", helper.name, err, out)
+			return 1
+		}
+		*helper.dst = bin
 	}
-	stubchildPath = bin
 	return m.Run()
 }
 

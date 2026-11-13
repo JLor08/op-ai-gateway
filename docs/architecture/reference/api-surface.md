@@ -672,7 +672,7 @@ semantics.
 
 | Path | Methods | Scope | Purpose |
 |---|---|---|---|
-| `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping |
+| `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping, including where the agent runs it: `execution_mode` (`native` \| `wsl`) and `wsl_distro` (validation below) |
 | `/api/portal/mappings/{id}/runtime/start` | POST | mapping | **Transient manual start** (the live-status Play): starts one more instance of the mapping's managed model and writes nothing, so it then follows the normal idle, eviction and burst rules. No body. Refused while a benchmark run holds the server (`409 runtime_spec.server_benchmarking`, as the spec PUT). `200 {"instance":k,"state":"running"}` when the agent reports it running within 5 s, the agent's refusal when it answers within 5 s, otherwise `202 {"instance":k,"state":"starting"}` while the start completes in the background. See the start and stop conventions below |
 | `/api/portal/mappings/{id}/runtime/stop` | POST | mapping | **Transient manual stop** (the live-status Stop): `{"instance":k}` (required, 0–63) drains that one instance now and writes nothing, so demand can start it again. Needs the agent feature `runtime_stop` (agent 0.17.0). `200 {"instance":k,"state":"stopping"\|"stopped"}`, the agent's answer passed through. Refused while a benchmark run holds the server, like the start |
 | `/api/portal/mappings/{id}/runtime/cluster-members/{serverID}/reset-usage` | POST | mapping + member server | **Reset a cluster member's stored usage**: clears the stored VRAM per GPU and RAM of the member on `{serverID}` of the llama.cpp RPC cluster head on the mapping, their stale mark and the current run's peaks, and pushes the member server's runtime document (its demand is `max(stored usage, estimate)`). The way out of a stored peak above the member's budget (`cluster_status.peaks_above_budget`). No body. `200` the head's runtime spec; `404 server.not_found` for a member server the caller may not manage, `404 runtime_spec.cluster_member_not_found` for a server that is no member of the head |
@@ -1022,6 +1022,7 @@ sentinel is a breaking API change that must be applied in both places):
 | `runtime_spec.not_found` | 404 |
 | `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
+| `runtime_spec.execution_mode_invalid`, `.wsl_distro_invalid`, `.wsl_path_not_linux`, `.wsl_cluster_unsupported` | 400 — the execution mode (#381): an `execution_mode` other than `native`/`wsl` (`""` stores `native`); for `wsl`, a `wsl_distro` that is empty or not a plain name (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), a `binary` or non-empty `work_dir` that is not a Linux absolute path (no leading `/`), and a spec that is an RPC cluster head (`cluster_enabled`). Checked in that order, as the last of the request's own shape checks |
 | `runtime_spec.instances_invalid`, `runtime_spec.instances_need_ephemeral_port` | 400 — the instance settings (#340): `min_instances` or `max_instances` above 64 (`MaxInstanceIndex` + 1; `instance_parallelism` has no upper bound), or `min_instances` above a set `max_instances`; `replicable` with a fixed `listen_port`. A negative `min_instances`, `max_instances` or `instance_parallelism` is `runtime_spec.tuning_invalid` |
 | `runtime_coresidency.pair_invalid`, `runtime_coresidency.mode_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
@@ -1092,6 +1093,25 @@ a terminal `not_permitted` instead of a form error). Every tuning integer
 `admission_wait_timeout_seconds`, and the spec-level `ram_estimate_mb`) must be
 `>= 0`; `admin_state` must be one of the three valid values; GPU index `>= 0`,
 unique, `vram_estimate_mb >= 0`; and env **keys** must match `^[A-Z_][A-Z0-9_]*$`.
+
+`RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `execution_mode` and `wsl_distro`
+(#381, migration 109, [Agent-Managed Model Runtime
+§3.8](../cross-cutting/agent-runtime-manager.md#38-execution-modes-wsl2)). The GET
+always answers `native` or `wsl`, never `""` (a stored `""` reads as `native`). On
+the PUT an omitted or `""` mode stores `native`, and a native spec stores `""` as
+its distro whatever the request carried. The pair is the **newest** of the
+request's own shape checks (`validateRuntimeSpecRequest`) and so runs **last**
+among them, so it cannot change the answer to a body that was already invalid for
+an older reason; the checks that read the store (a cluster head's, [RPC cluster
+save refusals](#rpc-cluster-save-refusals)) still follow it. For `wsl`, in this order:
+`wsl_distro` (trimmed) must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
+(`runtime_spec.wsl_distro_invalid`); `binary` must start with `/`, and a
+non-empty `work_dir` too, since both name paths inside the distro
+(`runtime_spec.wsl_path_not_linux`; `binary` must still pass the absolute-path
+rule above, which a Linux path does); and the spec may not be an RPC cluster head
+(`runtime_spec.wsl_cluster_unsupported`). Any other mode is
+`runtime_spec.execution_mode_invalid`. A `wsl` spec saved for a server whose
+agent does not declare `runtime_exec_wsl` is stored, but not pushed (below).
 
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `visible_devices_mode`
 (`"env"` | `"args"`, empty on the request defaults to `"env"` in
@@ -1897,7 +1917,9 @@ is on **both** lists with a different fact behind each: the gateway's says it
 understands one status row per instance, and the agent honours a spec's
 `replicable` only while it is declared here; the agent's (in its sample) says it
 runs instances, and the gateway pushes instance settings only to an agent that
-declares it. A **404 is
+declares it. `runtime_exec_wsl` (agent 0.19.0, [ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged))
+is on the agent's list only and gates real behaviour, fail-closed: the gateway puts
+a `wsl` spec into an agent's document only while that agent declares it. A **404 is
 not an error** for an agent — it means an older gateway, and reads as the empty
 feature set.
 
@@ -1919,7 +1941,12 @@ independent implementations must agree on:
   `runtime_instances` — `replicable: true`, `min_instances` and `max_instances`
   (each omitted otherwise, so every other document is byte-for-byte the
   pre-instances one, ETag included; `idle_timeout_seconds` is then the effective
-  value derived from the measured startup) — `type` and the two paths always **resolved, concrete**
+  value derived from the measured startup), and — only for a spec whose execution
+  mode is `wsl` — `execution: {"mode": "wsl", "wsl": {"distro": "<name>"}}`, where
+  `binary` and `work_dir` are then Linux paths inside that distro (#381,
+  [Agent-Managed Model Runtime §3.8](../cross-cutting/agent-runtime-manager.md#38-execution-modes-wsl2);
+  omitted for a native spec, so a native spec's entry is byte-for-byte the one it
+  was before the mode existed) — `type` and the two paths always **resolved, concrete**
   values (`routing.EffectiveRuntimeSpecType` + `routing.DeriveProbePaths`
   already applied gateway-side), never the raw stored `""` an
   auto-detecting/default-using spec has on file, so the agent never
@@ -1960,7 +1987,10 @@ independent implementations must agree on:
   `ram_mb` is an admission demand, not a launch input, so a change in it relaunches
   nothing;
 - only **enabled** specs appear, and a spec whose `mapping_id` no longer resolves
-  is silently skipped;
+  is silently skipped; a `wsl` spec appears only for an agent that declares
+  `runtime_exec_wsl` (an older agent would ignore the `execution` block and run the
+  Linux path as a native binary), and a spec withheld for that reason is also left
+  out of every `coresident` pair;
 - `specs`, `gpu_budgets` and `coresident` are always present arrays.
 
 **A document the gateway cannot yet build for this agent is held, not served.**
@@ -1971,7 +2001,9 @@ document depends on a declaration the gateway does not know, so the fetch answer
 no ETag; the agent keeps the document it applied, as on any non-200, and the
 ingest pushes the document as soon as the declaration arrives. Serving the
 instance-less document instead would drain the protected instances of an agent
-that does run them. A deployment that splits one store across several gateway
+that does run them. An enabled `wsl` spec holds the document the same way, since
+whether it may be sent depends on the agent's `runtime_exec_wsl`, and a sample that
+changes that declaration pushes the document again. A deployment that splits one store across several gateway
 processes, one of which never ingests that agent's telemetry, answers it this 503
 for as long as the spec is replicable.
 

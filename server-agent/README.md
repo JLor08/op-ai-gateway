@@ -64,6 +64,12 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | — (file/env only) | `runtime_allowed_binaries` | — (empty) | Absolute paths a launch spec's `binary` must match **exactly** to be permitted. **Empty means nothing may start at all** — a deliberate hard refusal, not a permissive default. This is the operator's boundary: the gateway decides *when and how* a model process runs, this list decides *whether it may run at all*. Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). A bare entry already permits the directory **and everything beneath it**; a trailing whole-segment wildcard — `/srv/models/*` or `C:\models\*` — is an accepted, exactly-equivalent spelling of that subtree, honoured so a config written that way does what its author expects. It is **not** a glob: a glued `/srv/models*` stays literal (it permits no `/srv/models-evil` sibling), and a bare `*` permits nothing. Env value is comma-separated. |
 | `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` | — (file/env only) | `runtime_allow_binary_dirs` | `false` | When on, each `runtime_allowed_binaries` entry's **parent directory** is treated as an allowed `work_dir` prefix without listing it in `runtime_allowed_dirs` — convenient when a model's `work_dir` sits beside its binary. Same operator-only provenance as the allowlists. The auto-added dirs use the same subtree containment as explicit entries. **Footgun:** turning it on while `runtime_allowed_dirs` is empty flips `work_dir` from "any is accepted" to "only the binary directories and their subtrees" (a spec with no `work_dir` still runs beside its binary either way). |
+| `OP_AGENT_RUNTIME_WSL_EXE` | — (file/env only) | `runtime_wsl_exe` | `C:\Program Files\WSL\wsl.exe` on Windows, empty elsewhere | The `wsl.exe` the agent launches WSL2-hosted model processes through (specs whose execution mode is `wsl`). Empty means WSL is not configured and every WSL spec is refused. Operator-only. |
+| `OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS` | — (file/env only) | `runtime_wsl_allowed_distros` | empty | Comma-separated (env) WSL distributions a spec may run in, matched exactly. Empty refuses every WSL spec. |
+| `OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES` | — (file/env only) | `runtime_wsl_allowed_binaries` | empty | Comma-separated (env) absolute POSIX binary paths inside the distro a WSL spec must match exactly. Separate from `runtime_allowed_binaries`, which is never consulted for a WSL spec. Empty refuses every WSL spec. |
+| `OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS` | — (file/env only) | `runtime_wsl_allowed_dirs` | empty | Comma-separated (env) permitted POSIX `work_dir` prefixes inside the distro, same bare-or-trailing-`/*` subtree semantics as `runtime_allowed_dirs`. Empty permits any absolute `work_dir`. |
+| `OP_AGENT_RUNTIME_WSL_USER` | — (file/env only) | `runtime_wsl_user` | empty | The distro user every WSL process runs as (`wsl.exe -u`). Required for WSL specs; `root` is refused, since no gateway-supplied command line or environment may run with UID 0. |
+| `OP_AGENT_WSL_RAM_RESERVE_MB` | — (env only) | — (env only) | `1024` | RAM (MB) held back from the WSL2 VM's pool that WSL specs are admitted against. `0` is a real value; a negative or malformed value falls back to the default. Operator-only. |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
 | `OP_AGENT_CONFIG_FILES_DIR` | `-config-files-dir` | `config_files_dir` | `server-agent-config-files` next to the binary | Base directory under which the agent writes the config files a managed runtime spec asks for, one subdirectory per spec. Operator-only: the gateway supplies a file's relative name and content, never where on this host it is written. Point it at a directory of your choosing to keep these files out of the agent's own directory. A relative config-file value is resolved beside that config file. |
 | `OP_AGENT_RUNTIME_ROUTER_BIND` | `-runtime-router-bind` | `runtime_router_bind` | — (derive) | Bind host for the managed runtime's router port — the port the gateway sends inference requests to. Operator-only: the gateway supplies the router **port**, never its bind host. Empty means derive: the agent's own mesh identity, read from the **installed mesh leaf in `cert_dir`** — that directory is the only thing consulted (`cert_mode` is not, so a `cert_dir` still populated after the mode went back to `off` does derive an address). With no loadable leaf there, **all interfaces**, with a warning in the agent log. Since the portal's generated config ships `cert_mode: "off"` and `cert_dir: ""`, the default configuration always lands on all interfaces: set this explicitly (mesh IP, or `127.0.0.1`) on any host that is not mesh-only. **Under `cert_mode: "proxy"` it is the other way round** — that mode makes `cert_dir` mandatory, so the empty default resolves to the leaf's mesh address, never all interfaces and never loopback. **Resolved once at process start**, so a boot before the first certificate install binds all interfaces until the agent restarts. See [Managed model runtime](#managed-model-runtime). |
@@ -523,6 +529,82 @@ including hiding start/stop — whoever owns the config owns the operations.
 > line at startup. Nothing agent-side can mask a value the child chose to
 > print. That is a second reason an argument is the wrong place for a secret,
 > and it applies to portal-authored specs too.
+
+#### WSL2 workloads
+
+On a Windows host the agent can run a model server **inside a WSL2
+distribution** — vLLM, SGLang and other Linux-only engines — and manage it like
+any other: start on demand, drain, stop, crash backoff, the runtime log, and the
+memory budgets above. In the portal, set the spec's **Execution** to WSL, name
+the distro, and give the binary and working directory as **Linux paths** inside
+it. The selector appears once this agent (0.19.0 or later) has reported. The
+agent stops the workload through a systemd scope inside the distro, measures its
+RAM from that scope, and attributes its VRAM from the WSL VM's GPU memory.
+
+Installing WSL, the distro and the engines is yours to do; the agent needs:
+
+- **The agent runs as the Windows user that owns the distro**, never as
+  LocalSystem. WSL is per Windows user (distros, the VM and `.wslconfig` all
+  belong to one account) and refuses LocalSystem outright. Run the agent either
+  as a **service under that user's account** (a service runs as LocalSystem
+  unless you set its log-on account; with NSSM, set it on the *Log on* tab), which
+  works with nobody logged on, or as a **plain process in that user's
+  interactive session**, which ends at logoff together with every model it
+  started.
+- **systemd in the distro**, and **linger** for the user the workloads run as:
+  `[boot]` `systemd=true` in the distro's `/etc/wsl.conf`, then
+  `sudo loginctl enable-linger <linux user>` once, so that user's systemd manager
+  is running whenever the agent needs it. That Linux user is
+  `runtime_wsl_user`; it may not be `root` (or UID 0).
+- **Keep the VM up.** In that Windows user's `%UserProfile%\.wslconfig`:
+
+  ```ini
+  [wsl2]
+  vmIdleTimeout=-1
+
+  [general]
+  instanceIdleTimeout=-1
+  ```
+
+  Otherwise WSL shuts an idle distro (after 15 s) and VM (after 60 s) down under
+  a loaded model. `[wsl2]` `memory=` is the VM's own RAM ceiling (half of the
+  host's by default); the agent admits WSL models against it as well, minus
+  `OP_AGENT_WSL_RAM_RESERVE_MB`.
+- **Models in the distro's own ext4 filesystem** (for example under
+  `/opt` or the user's home), not under `/mnt/c`, which is far slower.
+- **`build-essential` in the distro for vLLM** (`sudo apt install
+  build-essential`): its Triton kernels are compiled with the system C compiler
+  when the server starts.
+- **The Windows NVIDIA driver only**: no Linux GPU driver inside the distro.
+  The distro sees the host's GPU indices, so the spec's GPU list means the same
+  cards as for a native spec.
+- **The `runtime_wsl_*` settings** (table above). Nothing starts in WSL mode
+  until `runtime_wsl_user`, `runtime_wsl_allowed_distros` and
+  `runtime_wsl_allowed_binaries` are set (`runtime_wsl_exe` defaults to
+  `C:\Program Files\WSL\wsl.exe`), and `runtime_allowed_binaries` is not
+  consulted for a WSL spec:
+
+  ```json
+  "runtime_wsl_user": "<linux user>",
+  "runtime_wsl_allowed_distros": ["Ubuntu-24.04"],
+  "runtime_wsl_allowed_binaries": ["/opt/vllm/.venv/bin/vllm"],
+  "runtime_wsl_allowed_dirs": ["/opt/vllm"]
+  ```
+
+For vLLM, bind `--host 127.0.0.1 --port ${PORT}` (WSL forwards the port to
+Windows) and set `--gpu-memory-utilization` explicitly: the agent attributes
+VRAM to a WSL model as the VM's growth across that model's start, which is a
+stable figure when the engine reserves a fixed share of the card. Pass the API key
+as `VLLM_API_KEY` in `env` rather than as `--api-key`, since an argument is
+visible to `ps` inside the VM.
+
+**The WSL boundary is not a security boundary.** A Linux process can read the
+Windows user's files under `/mnt/<drive>` and, through interop, start Windows
+programs as that user, so a WSL model has the trust level of a native binary run
+as the agent's account. Use a **dedicated distro** for the models and set
+`[interop]` `enabled=false` in its `/etc/wsl.conf`. If no WSL spec uses config
+files (`${CONFIG_DIR}` resolves to the agent's directory under `/mnt/<drive>`),
+you can also turn the drive mounts off with `[automount]` `enabled=false`.
 
 ## Build & run
 

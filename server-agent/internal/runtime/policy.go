@@ -71,6 +71,12 @@ type RunningProc struct {
 	// and its InFlight is necessarily 0. Such a process is NEVER an eviction
 	// victim (isEvictable), which is the C3 fix. See that function.
 	Starting bool
+	// WSL marks a process that runs inside the WSL VM (execution mode wsl,
+	// #381). Its RAMMB is held by the VM as well as by the host, so it is the
+	// one kind of process charged against PolicySnapshot.WSLRAMBudgetMB and
+	// drawn as a victim for it (ruleWSLRAM); every other rule reads it like
+	// any process.
+	WSL bool
 }
 
 // PolicySnapshot is the pure input to Admit: the currently running set plus
@@ -149,6 +155,43 @@ type PolicySnapshot struct {
 	// computed: Admit then falls back to HostRAMBudgetMB, and a ceiling BELOW the
 	// budget is ignored, so a caller that sets only the budget gets the plain rule.
 	HostRAMCeilingMB int
+	// WSLRAMBudgetMB is the WSL VM's own RAM pool in MB (#381), which a wsl
+	// candidate must fit IN ADDITION to the host pool: the VM has a ceiling of
+	// its own (.wslconfig memory=, half the host's RAM by default), so wsl
+	// workloads can exhaust it, and meet the VM's OOM killer, while the host
+	// still has memory free. Only wsl processes (RunningProc.WSL) are charged
+	// against it. It is a total for the managed wsl set like HostRAMBudgetMB,
+	// built the same way from the VM's own MemAvailable (owner.buildSnapshot,
+	// wslRAMBudgetMB), and 0 is the same UNCONSTRAINED sentinel: no sampling
+	// call has answered yet, so the rule is skipped.
+	WSLRAMBudgetMB int
+	// WSLRAMCeilingMB is the most the VM pool could offer, the VM's MemTotal
+	// minus the reserve: what wslRAMOwnDemandRefusal compares a wsl candidate's
+	// own demand against, for the reason HostRAMCeilingMB exists. 0 falls back
+	// to WSLRAMBudgetMB, and a ceiling below the budget is ignored.
+	WSLRAMCeilingMB int
+	// UnattributedVRAM is, per GPU index, the VRAM the WSL VM holds beyond what
+	// the wsl processes' attributed figures account for (#381): growth after a
+	// workload's start window closed, a start whose window was void, GPU use in
+	// the VM the agent did not start, a figure that came out low -- and, since
+	// every Hyper-V VM worker is summed, another VM's GPU memory. Windows
+	// charges all of it to the VM's worker, so no process can carry it, and
+	// rule 3 charges it to the GPU instead: it is added to the sum of every
+	// GPU the candidate has a known demand on. It is never a victim (evicting
+	// nothing frees it) and never part of the own-demand refusal, which reads
+	// only the candidate and its budget. owner.buildSnapshot reads it fresh from
+	// the VM at every admission (wslRemainder); nil -- every native-only host,
+	// every table test -- charges nothing.
+	UnattributedVRAM map[int]int
+	// WSLStartInFlight is true while a wsl start's VRAM window is open: its
+	// figure is the VM's growth across the start (owner.wslStartWindow), which
+	// holds only if no other wsl start grows the VM meanwhile. So every wsl
+	// candidate that declares a GPU Waits while it is set (wslStartWait), right
+	// after the own-demand refusals and before anything that could evict. A
+	// native candidate is not held back, and neither is a wsl one with no GPU:
+	// it is taken to hold no VRAM, so it grows no window. Stops are never held
+	// back by it.
+	WSLStartInFlight bool
 	// RAMBootstrapInFlight is the cold-start RAM interlock (task 4.1): true while
 	// some managed process is still in its UNACCOUNTED bootstrap window -- unknown
 	// declared RAM and no measurement yet, so rule 6 charges it nothing and the
@@ -251,14 +294,18 @@ type PolicySnapshot struct {
 //     its own: an occupant with idle_timeout_seconds 0 (never unload) holds
 //     the card indefinitely, so the wait is diagnosed from the message rather
 //     than from the absence of a start. The first keeps Message empty -- a
-//     spec queued behind a busy neighbour is ordinary operation.
+//     spec queued behind a busy neighbour is ordinary operation. A wsl
+//     candidate held back by the WSL start interlock (WaitOnWSLStart) also
+//     waits without evicting what could be evicted, but it keeps Message
+//     empty too: the window it waits for always closes, at the latest when
+//     that start settles, fails or times out.
 //   - Reason: OK is false, Wait is false, Evict is empty, and Reason names
 //     a durable, non-transient block -- one that cannot resolve by
 //     eviction OR by waiting, so reporting it as either of the other two
 //     outcomes would be actively misleading (Wait would hang the caller
 //     until its admission-wait timeout on every single request; Evict
 //     would ask for a drain-stop that can never restore a fit). Two
-//     States share this shape, carrying four distinct causes between
+//     States share this shape, carrying five distinct causes between
 //     them, and Message is what tells those causes apart:
 //   - StatePendingVRAMUnknown: a VRAM demand on one of the contested
 //     GPUs is unknown -- the CANDIDATE's own (rule 4) or a running
@@ -277,7 +324,7 @@ type PolicySnapshot struct {
 //     clears with nothing evicted, but measurement is NVIDIA-only
 //     (§5.3), so on an AMD, Apple-silicon or GPU-less host nothing
 //     clears it except an operator filling the estimate in.
-//   - StateNotPermitted: a durable operator-configuration block. Three
+//   - StateNotPermitted: a durable operator-configuration block. Four
 //     causes reach it from here. (1) Spec's own declared demand on
 //     some GPU exceeds that GPU's budget all by itself, whatever else
 //     is running -- an over-estimated VRAM demand, or a budget shrunk
@@ -289,11 +336,14 @@ type PolicySnapshot struct {
 //     actually blocks. (3) Spec's own known RAM demand exceeds the
 //     whole host-RAM budget all by itself -- the host-wide twin of (1),
 //     evaluated just after it for the same reason (ramOwnDemandRefusal).
+//     (4) A wsl spec's own known RAM demand exceeds the WSL VM's whole
+//     RAM ceiling all by itself -- (3) against the VM's pool, evaluated
+//     right after it (wslRAMOwnDemandRefusal).
 //     None resolves by eviction or by waiting. All carry the same
 //     "configuration error, visible in the portal, not transient"
 //     meaning the design doc already assigns StateNotPermitted for a
 //     refused binary/directory, so Message is the only thing separating
-//     all four.
+//     all five.
 type Decision struct {
 	OK     bool
 	Reason State // "" unless a terminal case above applies
@@ -313,8 +363,22 @@ type Decision struct {
 	// that finally shows its freed RAM -- unlike a Wait on the matrix, the
 	// process limit or a VRAM budget, which no new sample can change. The
 	// manager re-asks a WaitOnRAM spec when a sample lands, and nothing else
-	// (see owner.wakeOnHostSample).
+	// (see owner.wakeOnHostSample). The WSL VM pool (ruleWSLRAM) sets it too:
+	// its sample lands with the measurement beat, which re-asks the same
+	// specs (owner.applyMeasurement).
 	WaitOnRAM bool
+	// WaitOnWSLVM is set only together with WaitOnRAM, and only when the WSL
+	// VM pool's arithmetic (ruleWSLRAM) was among what blocked -- not its
+	// bootstrap interlock, which no sample resolves. It tells the caller that a
+	// fresh VM sample may end this Wait: the VM's figure is refreshed only
+	// while a wsl process is live to be measured, so with none live the owner
+	// has to ask for one itself (owner.wslVMWaitDistros).
+	WaitOnWSLVM bool
+	// WaitOnWSLStart is set only together with Wait, and only when a wsl
+	// candidate waits behind another wsl start's open VRAM window
+	// (PolicySnapshot.WSLStartInFlight). The window's close ends it, and the
+	// owner re-asks such a spec when it does (owner.wakeOnWSLSettle).
+	WaitOnWSLStart bool
 	// WaitOnGrace is set only together with Wait, and only when this Wait would
 	// have been a non-Wait (an OK, or an Evict) had NOTHING been grace-protected:
 	// the admission is blocked SOLELY by one or more within-grace victims, each of
@@ -722,6 +786,34 @@ func ramOwnDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
 	}, true
 }
 
+// wslRAMOwnDemandRefusal is ramOwnDemandRefusal against the WSL VM's pool
+// (#381): a wsl spec's KNOWN RAM demand exceeds the VM's whole RAM ceiling all
+// by itself, so no eviction and no wait can make it fit. Everything that
+// function says carries over unchanged -- the pool is a total for the managed
+// wsl set, the comparison is against the CEILING (the VM's MemTotal minus the
+// reserve, WSLRAMCeilingMB) so a transiently low budget never turns into a
+// durable refusal, and both sentinels skip it -- with one more gate: only a
+// wsl candidate lives in the VM, so a native spec is never measured against
+// it. What resolves it is the operator: a larger .wslconfig memory=, a smaller
+// reserve, or a smaller estimate.
+func wslRAMOwnDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
+	if !spec.IsWSL() || snap.WSLRAMBudgetMB <= 0 || spec.RAMMB <= 0 {
+		return Decision{}, false
+	}
+	limit := max(snap.WSLRAMCeilingMB, snap.WSLRAMBudgetMB)
+	if spec.RAMMB <= limit {
+		return Decision{}, false
+	}
+	return Decision{
+		Reason: StateNotPermitted,
+		Message: fmt.Sprintf(
+			"spec %s: RAM demand %d MB exceeds the WSL VM RAM budget %d MB on its own",
+			spec.ID, spec.RAMMB, limit,
+		),
+		Evict: []string{},
+	}, true
+}
+
 // pinnedUnknownOccupantRefusal is step 2's occupant half -- rule 5 against a
 // PINNED occupant -- returning the terminal refusal to report, or ok == false
 // when no pinned occupant of unknown demand holds any card spec wants.
@@ -975,6 +1067,9 @@ type admission struct {
 	// a start waiting on a busy matrix neighbour must not be woken by every
 	// hardware sample, and only the RAM verdict depends on one.
 	ramBlocked bool
+	// vmBlocked records that the WSL VM pool's arithmetic was among the causes
+	// of blocked (Decision.WaitOnWSLVM).
+	vmBlocked bool
 	// waitMessage is set by rule 4 alone, and only ever reaches a Wait: rule 4
 	// setting it also sets blocked, and blocked always answers Wait. See
 	// blockOnKnownTouchers for why that one Wait is the only one that explains
@@ -1147,7 +1242,12 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //     shadow this permanent one (see ownDemandRefusal). Its host-wide
 //     twin follows it: a KNOWN RAM demand that exceeds the whole
 //     host-RAM budget by itself refuses terminally for the same reason
-//     (see ramOwnDemandRefusal).
+//     (see ramOwnDemandRefusal), and so, for a wsl spec, does one that
+//     exceeds the WSL VM's whole RAM ceiling (wslRAMOwnDemandRefusal).
+//     Right after them, a wsl candidate that declares a GPU Waits, evicting
+//     nothing, while another wsl start's VRAM window is open (wslStartWait):
+//     its figure is the VM's growth across that start, so those starts go one
+//     at a time.
 //  2. Unknown-VRAM-vs-pinned short-circuit, for an unknown demand on
 //     EITHER side of the pair. Neither eviction nor waiting can resolve
 //     it, so it is checked, and returned, before any rule that proposes
@@ -1175,14 +1275,21 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //  4. Per-GPU budget (rule 3), evaluated with step 3's already-queued
 //     evictions notionally already gone: for every GPU spec has a KNOWN
 //     demand for, sum spec's own demand plus every remaining toucher's
-//     demand. A GPU absent from Budgets, and one whose budget is 0, are
+//     demand, plus the WSL VM's unattributed VRAM on that GPU
+//     (PolicySnapshot.UnattributedVRAM), which is occupied but no victim.
+//     A GPU absent from Budgets, and one whose budget is 0, are
 //     both unconstrained and are skipped identically (see
 //     PolicySnapshot.Budgets). Overflow evicts idle touchers of THAT gpu
 //     only, oldest LastUsed first, until it fits or idle candidates run
 //     out. Spec's own demand is already known to fit each budget by
 //     itself: step 1 refused it otherwise.
-//  5. Host-RAM pool (rule 6), the host-scoped twin of step 4, evaluated with
-//     steps 3-4's queued evictions notionally already gone: the candidate's RAM
+//  5. RAM pools (rule 6). For a wsl candidate only, the WSL VM's own pool
+//     comes first (PolicySnapshot.WSLRAMBudgetMB): only wsl processes are
+//     summed and drawn, narrow before broad as step 4 runs before this one, so
+//     a wsl victim it needs anyway is already gone for the host pool and is
+//     never joined by a native one the VM did not need (see ruleWSLRAM).
+//     Then the host-RAM pool, the host-scoped twin of step 4, evaluated with
+//     steps 3-5's queued evictions notionally already gone: the candidate's RAM
 //     charge plus every remaining process's RAM, against the one
 //     PolicySnapshot.HostRAMBudgetMB. A budget <= 0 (no sample yet) skips it. The
 //     candidate's charge is its KNOWN demand, or -- when that demand is unknown
@@ -1249,6 +1356,12 @@ func noCapacityCause(dec Decision) string {
 		return "it would evict " + strings.Join(dec.Evict, ", ")
 	case dec.Message != "":
 		return "it would wait: " + dec.Message
+	case dec.WaitOnWSLStart:
+		return "it would wait for another WSL start to settle"
+	case dec.WaitOnWSLVM:
+		// Checked before WaitOnRAM, which is always set with it: the pool the
+		// candidate waits on is the WSL VM's, not the host's.
+		return "it would wait for RAM in the WSL VM RAM pool"
 	case dec.WaitOnRAM:
 		return "it would wait for host RAM"
 	case dec.WaitOnGrace:
@@ -1276,6 +1389,20 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	// the running set. Behind the per-GPU one so that a spec over BOTH budgets
 	// keeps reporting the VRAM cause it always has.
 	if dec, refuse := ramOwnDemandRefusal(snap, spec); refuse {
+		return dec
+	}
+	// And its WSL VM twin (#381), for the same reason and in the same place:
+	// it reads only spec and the VM pool's two figures. Behind the host one,
+	// so that a wsl spec over both pools reports the host cause, the one an
+	// operator of a native spec of the same size would also see.
+	if dec, refuse := wslRAMOwnDemandRefusal(snap, spec); refuse {
+		return dec
+	}
+	// The WSL start interlock (#381): a wsl candidate waits while another wsl
+	// start's VRAM window is open. After the refusals, so a durable verdict is
+	// not hidden behind a transient wait; before everything that could evict,
+	// so nothing is drained for a start that cannot happen yet.
+	if dec, wait := wslStartWait(snap, spec); wait {
 		return dec
 	}
 
@@ -1307,10 +1434,34 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	a.ruleUnknownVRAMCandidate() // rule 4: candidate's own unknown VRAM
 	a.ruleUnknownVRAMOccupant()  // rule 5: an occupant's unknown VRAM
 	a.rulePerGPUVRAM()           // rule 3: per-GPU VRAM arithmetic
+	a.ruleWSLRAM()               // rule 6 against the WSL VM's pool, wsl candidates only
 	a.ruleHostRAM()              // rule 6: host-wide RAM pool
 	a.ruleProcessCount()         // rule 2: process-count limit, last
 
 	return a.decide()
+}
+
+// wslStartWait is Admit's WSL start interlock: a wsl candidate that declares a
+// GPU Waits, evicting nothing, while another wsl start's VRAM window is open
+// (PolicySnapshot.WSLStartInFlight), or ok == false when it does not apply. A
+// wsl candidate with no GPU is taken to hold no VRAM: it opens no window and
+// grows none, so it is not held back.
+//
+// WHY. A wsl workload's VRAM is measured as the WSL VM's growth across its
+// start: Windows charges all of the VM's GPU memory to the VM's worker, and
+// nothing inside the VM reports it per process. A second start growing the VM
+// inside the first one's window would be added to the first one's figure, and
+// its own window would catch the rest of the first one's load. Starts take
+// minutes anyway, so they go one at a time. It is a Wait with no eviction,
+// because evicting for a start that cannot proceed until the window closes
+// would drain a workload for nothing; the window's close re-asks it
+// (Decision.WaitOnWSLStart). Only starts are serialized: a stop never waits for
+// a window, and the window corrects for it instead.
+func wslStartWait(snap PolicySnapshot, spec Spec) (Decision, bool) {
+	if !spec.IsWSL() || !wslDeclaresGPU(spec) || !snap.WSLStartInFlight {
+		return Decision{}, false
+	}
+	return Decision{Wait: true, WaitOnWSLStart: true, Evict: []string{}}, true
 }
 
 // pinnedUnknownCandidateRefusal is step 2's candidate half -- rule 4 against a
@@ -1573,6 +1724,13 @@ func (a *admission) rulePerGPUVRAM() {
 // spec's own demand is already known to fit this budget by itself: step 1
 // (ownDemandRefusal) returned the terminal refusal otherwise, before anything
 // here or in step 2 ran.
+//
+// The WSL VM's unattributed VRAM on this GPU (PolicySnapshot.UnattributedVRAM)
+// is part of the sum as well: memory the VM holds that no process's charge
+// accounts for, so it is occupied whatever is evicted. It is never drawn as a
+// victim, and with it the sum can stay over budget once every idle toucher is
+// queued: the start Waits, and a fresh reading at the next admission sees
+// whatever the VM has given back.
 func (a *admission) chargeGPUBudget(g SpecGPU) {
 	if g.VRAMMB == 0 {
 		return
@@ -1581,7 +1739,7 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 	if budget <= 0 {
 		return
 	}
-	sum := g.VRAMMB
+	sum := g.VRAMMB + a.snap.UnattributedVRAM[g.Index]
 	var touchers []RunningProc
 	for _, r := range a.running {
 		if _, already := a.toEvict[r.SpecID]; already {
@@ -1623,8 +1781,10 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 // a process one of them already queued is guaranteed to be gone, so its RAM is
 // skipped here rather than charged twice, and it is not drawn again -- a VRAM
 // victim that also holds the RAM we need must not be joined by a second,
-// innocent one. It runs before rule 2 for the reason rules 1-5 do: the
-// process-count limit asks only for the victims still missing.
+// innocent one. For the same reason it runs after the WSL VM pool
+// (ruleWSLRAM), the narrower of the two RAM pools. It runs before rule 2 for
+// the reason rules 1-5 do: the process-count limit asks only for the victims
+// still missing.
 //
 // Both ends of the pool follow the 0 sentinels used everywhere else:
 //
@@ -1704,10 +1864,24 @@ func (a *admission) ruleHostRAM() {
 		return
 	}
 
+	sum = a.drawRAMVictims(holders, sum, a.snap.HostRAMBudgetMB)
+	if sum > a.snap.HostRAMBudgetMB {
+		a.blocked = true
+		a.ramBlocked = true
+	}
+}
+
+// drawRAMVictims is the victim draw both RAM pools share (rule 6, ruleHostRAM,
+// and its WSL VM twin, ruleWSLRAM), so the two cannot disagree about it: the
+// idle ones among holders, in orderVictims' order, each asked evictable as it
+// is drawn, join toEvict until sum -- the pool's demand, candidate included --
+// fits budgetMB. It returns what is left of sum, which still exceeds budgetMB
+// when the idle holders could not free enough.
+func (a *admission) drawRAMVictims(holders []RunningProc, sum, budgetMB int) int {
 	idleHolders := a.evictableOf(holders)
 	a.orderVictims(idleHolders)
 	for _, r := range idleHolders {
-		if sum <= a.snap.HostRAMBudgetMB {
+		if sum <= budgetMB {
 			break
 		}
 		if !a.evictable(r) {
@@ -1716,15 +1890,91 @@ func (a *admission) ruleHostRAM() {
 		a.toEvict[r.SpecID] = r
 		sum -= r.RAMMB
 	}
-	if sum > a.snap.HostRAMBudgetMB {
+	return sum
+}
+
+// ruleWSLRAM is rule 6 a second time, against the WSL VM's own RAM pool
+// (#381), for a wsl candidate only. The VM has a ceiling of its own, inside the
+// host's, so a wsl start must fit both: the host pool (rule 6, unchanged --
+// the VM's memory is host memory too, so every wsl process is already in that
+// sum) and this one, which sums only the wsl processes (RunningProc.WSL) and
+// draws its victims only from them. A native process holds nothing in the VM,
+// so draining one frees nothing this arithmetic can count; a native candidate
+// takes nothing from the VM, so the rule does not run for it.
+//
+// Everything else is rule 6's discipline, unchanged, so the two pools cannot
+// disagree about how a pool is read: a budget <= 0 is unconstrained (no
+// sampling call has answered yet); while a RAM bootstrap is in flight the
+// candidate Waits, evicting nothing (an unaccounted bootstrap may be a wsl one,
+// taking VM memory nobody has measured); an unknown-RAM candidate is charged
+// the bootstrap guess; an occupant of unknown RAM is neither charged nor
+// drawn; victims are the idle ones, in orderVictims' order, asked evictable as
+// each is drawn; and what idle victims cannot free makes it a WaitOnRAM, which
+// the next VM sample re-asks, and a WaitOnWSLVM, which asks for that sample
+// when no wsl process is live to bring one (owner.wslVMWaitDistros). The
+// candidate's own demand against the whole VM was decided in step 1
+// (wslRAMOwnDemandRefusal).
+//
+// WHERE IT RUNS. BEFORE the host pool (rule 6), narrow before broad, for the
+// reason rule 3 runs before rule 6. Only a wsl process can free VM RAM, so the
+// wsl victims this pool needs are needed whatever the host pool decides, and
+// each also frees its RAM on the host. Drawn first, they are already gone when
+// the host pool sums and draws, which then asks only for what is still
+// missing. The other order over-evicts: with a host pool of 12000 MB, a VM
+// pool of 10000 MB, an older idle native process and an idle wsl process of
+// 6000 MB each, and a wsl candidate of 5000 MB, the host pool would draw the
+// older native process first (17000 -> 11000 fits the host), and this pool
+// would then still need the wsl one -- two evictions where the wsl one alone
+// fits both pools. After rules 1, 3, 4 and 5 for the reason rule 6 is: a process they
+// queued is gone, never charged twice or drawn again. Before rule 2, for the
+// reason every resource rule runs before it: the process-count limit asks only
+// for the evictions the resources have not already supplied.
+func (a *admission) ruleWSLRAM() {
+	if !a.spec.IsWSL() || a.snap.WSLRAMBudgetMB <= 0 {
+		return
+	}
+	if a.snap.RAMBootstrapInFlight {
 		a.blocked = true
 		a.ramBlocked = true
+		return
+	}
+	candidateRAM := a.spec.RAMMB
+	if specHasUnknownRAM(a.spec) {
+		candidateRAM = a.snap.RAMBootstrapGuessMB
+	}
+	if candidateRAM <= 0 {
+		return
+	}
+	sum := candidateRAM
+	var holders []RunningProc
+	for _, r := range a.running {
+		if !r.WSL {
+			continue // holds nothing in the VM
+		}
+		if _, already := a.toEvict[r.SpecID]; already {
+			continue // already guaranteed to be gone
+		}
+		if r.RAMMB <= 0 {
+			continue // unknown occupancy: nothing to charge, nothing to free
+		}
+		sum += r.RAMMB
+		holders = append(holders, r)
+	}
+	if sum <= a.snap.WSLRAMBudgetMB {
+		return
+	}
+
+	sum = a.drawRAMVictims(holders, sum, a.snap.WSLRAMBudgetMB)
+	if sum > a.snap.WSLRAMBudgetMB {
+		a.blocked = true
+		a.ramBlocked = true
+		a.vmBlocked = true
 	}
 }
 
 // ruleProcessCount is rule 2: the process-count limit, evaluated last so it only
-// asks for as many ADDITIONAL evictions as rules 1, 3, 4, 5 and 6 have not
-// already provided.
+// asks for as many ADDITIONAL evictions as rules 1, 3, 4, 5 and 6 (both of its
+// pools) have not already provided.
 func (a *admission) ruleProcessCount() {
 	if a.snap.MaxProcesses <= 0 {
 		return
@@ -1770,6 +2020,7 @@ func (a *admission) decide() Decision {
 		return Decision{
 			Wait:        true,
 			WaitOnRAM:   a.ramBlocked,
+			WaitOnWSLVM: a.vmBlocked,
 			WaitOnGrace: a.blockedSolelyByGrace(),
 			Message:     a.waitMessage,
 			Evict:       []string{},

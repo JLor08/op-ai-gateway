@@ -157,7 +157,18 @@ func main() {
 	// cfg.Validate and this process would have exited at startup
 	// otherwise.
 	featuresClient := runtimectl.NewFeaturesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
-	localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs, AllowBinaryDirs: cfg.RuntimeAllowBinaryDirs}
+	localPolicy := runtimectl.LocalPolicy{
+		AllowedBinaries: cfg.RuntimeAllowedBinaries,
+		AllowedDirs:     cfg.RuntimeAllowedDirs,
+		AllowBinaryDirs: cfg.RuntimeAllowBinaryDirs,
+		WSL: runtimectl.WSLPolicy{
+			Exe:             cfg.RuntimeWSLExe,
+			AllowedDistros:  cfg.RuntimeWSLAllowedDistros,
+			AllowedBinaries: cfg.RuntimeWSLAllowedBinaries,
+			AllowedDirs:     cfg.RuntimeWSLAllowedDirs,
+			User:            cfg.RuntimeWSLUser,
+		},
+	}
 	// The GPU vendor comes from the SAME detection the telemetry collectors
 	// use (gpus, above): DetectGPUCollectors probes nvidia-smi, then
 	// rocm-smi, then Apple's ioreg, in that fixed order and keeps whichever
@@ -208,6 +219,15 @@ func main() {
 		// never gateway-supplied. config.Load bounds it, so the multiplication
 		// cannot overflow a Duration.
 		EvictionGrace: time.Duration(cfg.EvictionGraceSeconds) * time.Second,
+		// The WSL execution mode's configuration (#381), the same block the
+		// policy above permits wsl specs against: the manager launches, stops
+		// and sweeps with it. Operator-owned (runtime_wsl_*), never
+		// gateway-supplied; empty everywhere but a configured Windows host.
+		WSL: localPolicy.WSL,
+		// Memory held back from the WSL2 VM's RAM pool that wsl processes are
+		// admitted against. Operator-owned (OP_AGENT_WSL_RAM_RESERVE_MB,
+		// default 1024), never gateway-supplied.
+		WSLRAMReserveMB: cfg.WSLRAMReserveMB,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
@@ -235,6 +255,13 @@ func main() {
 	// still unknown: its declared demand is 0 AND no measurement has landed yet.
 	// With no measurer installed, operator RAM demands stand unmeasured.
 	mgr.SetRAMMeasurer(collector.NewRAMMeasurer())
+	// A wsl instance's VRAM is the WSL VM's: Windows charges all of the VM's GPU
+	// memory to its worker process (vmwp), which the VRAM measurer above reads
+	// once it is told the worker's pid. NewWSLVMWorkerPIDs finds every VM
+	// worker on Windows and is nil elsewhere, where SetWSLVMPIDs(nil) is
+	// NewManager's own default: no VM figure, and a wsl spec's VRAM stays its
+	// operator estimate.
+	mgr.SetWSLVMPIDs(collector.NewWSLVMWorkerPIDs())
 
 	var src runtimectl.Source
 	if cfg.RuntimeSource == config.RuntimeSourceFile {
@@ -343,6 +370,7 @@ func main() {
 		"runtime_log_buffer_total_bytes", logBufferTotal,
 		"vram_headroom_mb", cfg.VRAMHeadroomMB,
 		"host_ram_reserve_mb", cfg.HostRAMReserveMB,
+		"wsl_ram_reserve_mb", cfg.WSLRAMReserveMB,
 		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB,
 		"eviction_grace_seconds", cfg.EvictionGraceSeconds)
 	// A loopback runtime_router_bind under cert_mode=proxy is the workaround

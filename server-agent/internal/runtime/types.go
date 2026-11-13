@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -183,6 +184,61 @@ type Spec struct {
 	// RPC, on an rpc_server spec, carries the member's network settings: the
 	// head it serves, how it is exposed, where it binds and who may connect.
 	RPC *RPCMember `json:"rpc,omitempty"`
+	// Execution says WHERE the spec's process runs (#381). nil and mode
+	// "native" are the host the agent itself runs on, which is every document
+	// an older gateway sends; mode "wsl" runs it inside a WSL2 distribution on
+	// a Windows host. It decides what is exec'd and how, so it is
+	// launch-affecting (sameLaunchShape). The agent honours a non-native mode
+	// only while it declares the matching feature (runtime_exec_wsl), and a
+	// spec whose block it cannot run is dropped at parse time
+	// (invalidExecutionReason).
+	Execution *Execution `json:"execution,omitempty"`
+}
+
+// Execution is a spec's execution-environment block. Mode is
+// ExecutionModeNative ("" reads as native) or ExecutionModeWSL; WSL carries the
+// mode's settings and is required exactly when Mode is "wsl".
+type Execution struct {
+	Mode string        `json:"mode"`
+	WSL  *WSLExecution `json:"wsl,omitempty"`
+}
+
+// WSLExecution names the WSL2 distribution a "wsl" spec runs in. The name is
+// the gateway's choice and reaches a wsl.exe argument, so it is validated
+// (wslDistroPattern) rather than trusted.
+type WSLExecution struct {
+	Distro string `json:"distro"`
+}
+
+// ExecutionModeNative and ExecutionModeWSL are the Execution.Mode values this
+// agent knows. Any other value is dropped (invalidExecutionReason): a newer
+// gateway's mode may need handling this agent lacks.
+const (
+	ExecutionModeNative = "native"
+	ExecutionModeWSL    = "wsl"
+)
+
+// wslDistroPattern is what a WSL distribution name may look like: ASCII
+// letters, digits, '.', '_' and '-', 1 to 64 characters, the first a letter or
+// a digit. WSL's own names (Ubuntu-24.04, Debian, docker-desktop) fit, and
+// nothing that could be read as an option (a leading '-' after wsl.exe -d), a
+// path or a shell word does. The gateway's runtimeSpecWSLDistroPattern is the
+// same rule.
+var wslDistroPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// IsWSL reports whether the spec runs inside a WSL2 distribution: its
+// execution block says "wsl" and names a distro.
+func (s Spec) IsWSL() bool {
+	return s.Execution != nil && s.Execution.Mode == ExecutionModeWSL && s.Execution.WSL != nil
+}
+
+// WSLDistro returns the WSL distribution the spec runs in, "" when it is not a
+// WSL spec.
+func (s Spec) WSLDistro() string {
+	if !s.IsWSL() {
+		return ""
+	}
+	return s.Execution.WSL.Distro
 }
 
 // SpecKindModel is the Kind of an ordinary model spec (the zero value, so a
@@ -592,12 +648,46 @@ func withoutInvalidKinds(specs []Spec) ([]Spec, []string) {
 			dropped = append(dropped, spec.ID)
 			continue
 		}
+		if reason := invalidExecutionReason(spec); reason != "" {
+			slog.Warn("runtime: ignoring spec with an invalid execution configuration", "spec", spec.ID, "reason", reason)
+			dropped = append(dropped, spec.ID)
+			continue
+		}
 		kept = append(kept, spec)
 	}
 	if len(dropped) == 0 {
 		return specs, nil
 	}
 	return kept, dropped
+}
+
+// invalidExecutionReason names why spec's execution block is unusable, or ""
+// when it is fine (absent, native, or a complete wsl block). A wsl spec needs a
+// distro that matches wslDistroPattern, and cannot be an rpc_server member or a
+// cluster head: the cluster transports bind and dial host addresses the agent
+// manages natively, which a process inside the WSL VM does not share. An
+// unknown mode is dropped like an unknown kind, since falling back to "native"
+// would launch a spec the gateway meant for somewhere else on the host.
+func invalidExecutionReason(spec Spec) string {
+	if spec.Execution == nil {
+		return ""
+	}
+	switch spec.Execution.Mode {
+	case "", ExecutionModeNative:
+		return ""
+	case ExecutionModeWSL:
+		switch {
+		case spec.Execution.WSL == nil:
+			return "wsl execution has no wsl settings"
+		case !wslDistroPattern.MatchString(spec.Execution.WSL.Distro):
+			return "wsl execution distro is empty, longer than 64 characters or has characters outside A-Z a-z 0-9 . _ -"
+		case spec.IsRPCServer() || spec.Cluster != nil:
+			return "wsl execution does not support rpc cluster members or heads"
+		}
+		return ""
+	default:
+		return "unknown execution mode"
+	}
 }
 
 // invalidKindReason names why spec's kind configuration is unusable, or ""

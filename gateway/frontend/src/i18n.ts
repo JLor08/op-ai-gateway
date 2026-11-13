@@ -2371,6 +2371,24 @@ const de = {
     'Cluster-Flags in den Argumenten müssen als getrennte Tokens stehen (--rpc ${RPC_SERVERS}), nicht in der Form --rpc=…',
   errorRuntimeSpecPortConflictsRpcMember:
     'Der feste Port liegt im RPC-Portbereich 26000-26999 und kollidiert mit einem RPC-Mitglied auf diesem Server.',
+  runtimeSpecExecutionMode: 'Ausführung',
+  runtimeSpecExecutionModeNative: 'Nativ',
+  runtimeSpecExecutionModeWSL: 'WSL (Linux unter Windows)',
+  runtimeSpecWSLDistro: 'WSL-Distribution',
+  runtimeSpecWSLHint:
+    'Programmpfad und Arbeitsverzeichnis sind Linux-Pfade innerhalb der WSL-Distribution und müssen in den Freigaben des Agenten (runtime_wsl_allowed_*) enthalten sein.',
+  runtimeSpecWSLAgentUnsupported:
+    'Dieser Agent unterstützt WSL nicht (runtime_exec_wsl fehlt). Die Spezifikation wird gespeichert, aber nicht an den Agenten übertragen.',
+  runtimeSpecBinaryLinux: 'Programmpfad (Linux-Pfad in WSL)',
+  runtimeSpecWorkDirLinux: 'Arbeitsverzeichnis (Linux-Pfad in WSL)',
+  runtimeStatusWSLMarker: 'WSL',
+  runtimeStatusVRAMFromVM: 'VRAM der WSL-VM zugerechnet',
+  errorRuntimeSpecExecutionModeInvalid: 'Die Ausführung muss nativ oder WSL sein.',
+  errorRuntimeSpecWSLDistroInvalid: 'Der Name der WSL-Distribution ist ungültig.',
+  errorRuntimeSpecWSLPathNotLinux:
+    'Im WSL-Modus müssen Programmpfad und Arbeitsverzeichnis absolute Linux-Pfade sein.',
+  errorRuntimeSpecWSLClusterUnsupported:
+    'Cluster-Spezifikationen können nicht in WSL ausgeführt werden.',
   errorRuntimeSpecDeviceBackendInvalid:
     'Das Geräte-Backend muss auto, cuda, rocm, vulkan, metal oder sycl sein.',
   errorRuntimeSpecMemberFlagReserved:
@@ -6283,6 +6301,23 @@ const en: PortalMessages = {
     'Cluster flags in args must be separate tokens (--rpc ${RPC_SERVERS}), not the --rpc=… form.',
   errorRuntimeSpecPortConflictsRpcMember:
     'The fixed port lies in the RPC range 26000-26999 and collides with an RPC member on this server.',
+  runtimeSpecExecutionMode: 'Execution',
+  runtimeSpecExecutionModeNative: 'Native',
+  runtimeSpecExecutionModeWSL: 'WSL (Linux on Windows)',
+  runtimeSpecWSLDistro: 'WSL distro',
+  runtimeSpecWSLHint:
+    "The binary path and working directory are Linux paths inside the WSL distro and must be within the agent's allowed paths (runtime_wsl_allowed_*).",
+  runtimeSpecWSLAgentUnsupported:
+    'This agent does not support WSL (runtime_exec_wsl is missing). The spec is saved but not pushed to the agent.',
+  runtimeSpecBinaryLinux: 'Binary path (Linux path in WSL)',
+  runtimeSpecWorkDirLinux: 'Working directory (Linux path in WSL)',
+  runtimeStatusWSLMarker: 'WSL',
+  runtimeStatusVRAMFromVM: 'VRAM attributed from the WSL VM',
+  errorRuntimeSpecExecutionModeInvalid: 'The execution mode must be native or WSL.',
+  errorRuntimeSpecWSLDistroInvalid: 'The WSL distro name is invalid.',
+  errorRuntimeSpecWSLPathNotLinux:
+    'In WSL mode the binary path and working directory must be absolute Linux paths.',
+  errorRuntimeSpecWSLClusterUnsupported: 'Cluster specs cannot run in WSL.',
   errorRuntimeSpecDeviceBackendInvalid:
     'The device backend must be one of auto, cuda, rocm, vulkan, metal, sycl.',
   errorRuntimeSpecMemberFlagReserved:

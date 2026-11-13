@@ -415,7 +415,13 @@ import (
 // vllm_srun_queue_depth gauge feeds queue_depth, its /v1/models api_version
 // rides the runtime sample as runtime_api_version, and the /props capability
 // probe is skipped for it.
-const Version = "0.18.2"
+//
+// 0.18.2 -> 0.19.0 is the single bump for the WSL2 execution mode (#381).
+// MINOR: agent.Features gains the runtime_exec_wsl entry, and a spec's
+// execution block (mode "wsl", a distro) is parsed, validated and launch-
+// affecting. This is the ONE bump for the whole branch; later commits on it do
+// not bump again.
+const Version = "0.19.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

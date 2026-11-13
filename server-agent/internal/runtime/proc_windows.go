@@ -31,7 +31,9 @@ func killedBySIGKILL(err error) bool {
 // process-management path is never exercised by tests. A future task
 // should add a real graceful-shutdown path (e.g. CREATE_NEW_PROCESS_GROUP +
 // GenerateConsoleCtrlEvent) if Windows operators need clean model-server
-// shutdown rather than a hard kill.
+// shutdown rather than a hard kill. A wsl spec (#381) is the exception: its
+// workload is stopped gracefully from inside the distro, through its systemd
+// scope (wslControl), and this kill is only that path's backstop.
 func setProcGroup(cmd *exec.Cmd) {}
 
 // terminateGroup has no graceful equivalent on this platform (see the
