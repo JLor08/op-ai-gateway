@@ -255,6 +255,13 @@ func main() {
 	// still unknown: its declared demand is 0 AND no measurement has landed yet.
 	// With no measurer installed, operator RAM demands stand unmeasured.
 	mgr.SetRAMMeasurer(collector.NewRAMMeasurer())
+	// A wsl instance's VRAM is the WSL VM's: Windows charges all of the VM's GPU
+	// memory to its worker process (vmwp), which the VRAM measurer above reads
+	// once it is told the worker's pid. NewWSLVMWorkerPIDs finds every VM
+	// worker on Windows and is nil elsewhere, where SetWSLVMPIDs(nil) is
+	// NewManager's own default: no VM figure, and a wsl spec's VRAM stays its
+	// operator estimate.
+	mgr.SetWSLVMPIDs(collector.NewWSLVMWorkerPIDs())
 
 	var src runtimectl.Source
 	if cfg.RuntimeSource == config.RuntimeSourceFile {

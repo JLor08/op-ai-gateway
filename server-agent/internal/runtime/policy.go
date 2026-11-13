@@ -170,6 +170,26 @@ type PolicySnapshot struct {
 	// own demand against, for the reason HostRAMCeilingMB exists. 0 falls back
 	// to WSLRAMBudgetMB, and a ceiling below the budget is ignored.
 	WSLRAMCeilingMB int
+	// UnattributedVRAM is, per GPU index, the VRAM the WSL VM holds beyond what
+	// the wsl processes' attributed figures account for (#381): growth after a
+	// workload's start window closed, a start whose window was void, GPU use in
+	// the VM the agent did not start, a figure that came out low -- and, since
+	// every Hyper-V VM worker is summed, another VM's GPU memory. Windows
+	// charges all of it to the VM's worker, so no process can carry it, and
+	// rule 3 charges it to the GPU instead: it is added to the sum of every
+	// GPU the candidate has a known demand on. It is never a victim (evicting
+	// nothing frees it) and never part of the own-demand refusal, which reads
+	// only the candidate and its budget. owner.buildSnapshot reads it fresh from
+	// the VM at every admission (wslRemainder); nil -- every native-only host,
+	// every table test -- charges nothing.
+	UnattributedVRAM map[int]int
+	// WSLStartInFlight is true while a wsl start's VRAM window is open: its
+	// figure is the VM's growth across the start (owner.wslStartWindow), which
+	// holds only if no other wsl start grows the VM meanwhile. So every wsl
+	// candidate Waits while it is set (wslStartWait), right after the
+	// own-demand refusals and before anything that could evict -- a native
+	// candidate is not held back. Stops are never held back by it.
+	WSLStartInFlight bool
 	// RAMBootstrapInFlight is the cold-start RAM interlock (task 4.1): true while
 	// some managed process is still in its UNACCOUNTED bootstrap window -- unknown
 	// declared RAM and no measurement yet, so rule 6 charges it nothing and the
@@ -272,7 +292,11 @@ type PolicySnapshot struct {
 //     its own: an occupant with idle_timeout_seconds 0 (never unload) holds
 //     the card indefinitely, so the wait is diagnosed from the message rather
 //     than from the absence of a start. The first keeps Message empty -- a
-//     spec queued behind a busy neighbour is ordinary operation.
+//     spec queued behind a busy neighbour is ordinary operation. A wsl
+//     candidate held back by the WSL start interlock (WaitOnWSLStart) also
+//     waits without evicting what could be evicted, but it keeps Message
+//     empty too: the window it waits for always closes, at the latest when
+//     that start settles, fails or times out.
 //   - Reason: OK is false, Wait is false, Evict is empty, and Reason names
 //     a durable, non-transient block -- one that cannot resolve by
 //     eviction OR by waiting, so reporting it as either of the other two
@@ -348,6 +372,11 @@ type Decision struct {
 	// while a wsl process is live to be measured, so with none live the owner
 	// has to ask for one itself (owner.wslVMWaitDistros).
 	WaitOnWSLVM bool
+	// WaitOnWSLStart is set only together with Wait, and only when a wsl
+	// candidate waits behind another wsl start's open VRAM window
+	// (PolicySnapshot.WSLStartInFlight). The window's close ends it, and the
+	// owner re-asks such a spec when it does (owner.wantsWSLStartWake).
+	WaitOnWSLStart bool
 	// WaitOnGrace is set only together with Wait, and only when this Wait would
 	// have been a non-Wait (an OK, or an Evict) had NOTHING been grace-protected:
 	// the admission is blocked SOLELY by one or more within-grace victims, each of
@@ -1213,6 +1242,9 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //     host-RAM budget by itself refuses terminally for the same reason
 //     (see ramOwnDemandRefusal), and so, for a wsl spec, does one that
 //     exceeds the WSL VM's whole RAM ceiling (wslRAMOwnDemandRefusal).
+//     Right after them, a wsl candidate Waits, evicting nothing, while
+//     another wsl start's VRAM window is open (wslStartWait): its figure is
+//     the VM's growth across that start, so wsl starts go one at a time.
 //  2. Unknown-VRAM-vs-pinned short-circuit, for an unknown demand on
 //     EITHER side of the pair. Neither eviction nor waiting can resolve
 //     it, so it is checked, and returned, before any rule that proposes
@@ -1240,7 +1272,9 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //  4. Per-GPU budget (rule 3), evaluated with step 3's already-queued
 //     evictions notionally already gone: for every GPU spec has a KNOWN
 //     demand for, sum spec's own demand plus every remaining toucher's
-//     demand. A GPU absent from Budgets, and one whose budget is 0, are
+//     demand, plus the WSL VM's unattributed VRAM on that GPU
+//     (PolicySnapshot.UnattributedVRAM), which is occupied but no victim.
+//     A GPU absent from Budgets, and one whose budget is 0, are
 //     both unconstrained and are skipped identically (see
 //     PolicySnapshot.Budgets). Overflow evicts idle touchers of THAT gpu
 //     only, oldest LastUsed first, until it fits or idle candidates run
@@ -1319,6 +1353,8 @@ func noCapacityCause(dec Decision) string {
 		return "it would evict " + strings.Join(dec.Evict, ", ")
 	case dec.Message != "":
 		return "it would wait: " + dec.Message
+	case dec.WaitOnWSLStart:
+		return "it would wait for another WSL start to settle"
 	case dec.WaitOnRAM:
 		return "it would wait for host RAM"
 	case dec.WaitOnGrace:
@@ -1355,6 +1391,13 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	if dec, refuse := wslRAMOwnDemandRefusal(snap, spec); refuse {
 		return dec
 	}
+	// The WSL start interlock (#381): a wsl candidate waits while another wsl
+	// start's VRAM window is open. After the refusals, so a durable verdict is
+	// not hidden behind a transient wait; before everything that could evict,
+	// so nothing is drained for a start that cannot happen yet.
+	if dec, wait := wslStartWait(snap, spec); wait {
+		return dec
+	}
 
 	// Step 2. A pinned process is never an eviction victim and never
 	// finishes, so an unknown demand contested with one resolves by neither
@@ -1389,6 +1432,27 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	a.ruleProcessCount()         // rule 2: process-count limit, last
 
 	return a.decide()
+}
+
+// wslStartWait is Admit's WSL start interlock: a wsl candidate Waits, evicting
+// nothing, while another wsl start's VRAM window is open
+// (PolicySnapshot.WSLStartInFlight), or ok == false when it does not apply.
+//
+// WHY. A wsl workload's VRAM is measured as the WSL VM's growth across its
+// start: Windows charges all of the VM's GPU memory to the VM's worker, and
+// nothing inside the VM reports it per process. A second start growing the VM
+// inside the first one's window would be added to the first one's figure, and
+// its own window would catch the rest of the first one's load. Starts take
+// minutes anyway, so they go one at a time. It is a Wait with no eviction,
+// because evicting for a start that cannot proceed until the window closes
+// would drain a workload for nothing; the window's close re-asks it
+// (Decision.WaitOnWSLStart). Only starts are serialized: a stop never waits for
+// a window, and the window corrects for it instead.
+func wslStartWait(snap PolicySnapshot, spec Spec) (Decision, bool) {
+	if !spec.IsWSL() || !snap.WSLStartInFlight {
+		return Decision{}, false
+	}
+	return Decision{Wait: true, WaitOnWSLStart: true, Evict: []string{}}, true
 }
 
 // pinnedUnknownCandidateRefusal is step 2's candidate half -- rule 4 against a
@@ -1651,6 +1715,13 @@ func (a *admission) rulePerGPUVRAM() {
 // spec's own demand is already known to fit this budget by itself: step 1
 // (ownDemandRefusal) returned the terminal refusal otherwise, before anything
 // here or in step 2 ran.
+//
+// The WSL VM's unattributed VRAM on this GPU (PolicySnapshot.UnattributedVRAM)
+// is part of the sum as well: memory the VM holds that no process's charge
+// accounts for, so it is occupied whatever is evicted. It is never drawn as a
+// victim, and with it the sum can stay over budget once every idle toucher is
+// queued: the start Waits, and a fresh reading at the next admission sees
+// whatever the VM has given back.
 func (a *admission) chargeGPUBudget(g SpecGPU) {
 	if g.VRAMMB == 0 {
 		return
@@ -1659,7 +1730,7 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 	if budget <= 0 {
 		return
 	}
-	sum := g.VRAMMB
+	sum := g.VRAMMB + a.snap.UnattributedVRAM[g.Index]
 	var touchers []RunningProc
 	for _, r := range a.running {
 		if _, already := a.toEvict[r.SpecID]; already {
