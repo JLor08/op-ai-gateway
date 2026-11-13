@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -617,17 +618,93 @@ func speechDurationSeconds(header string) (float64, bool) {
 // setTranscriptionBillingQuantity is its setter. Without that endpoint test a
 // flavor-only guard would log an Error for every successful transcription (no
 // duration header, by design) and still leave its quantity at 0.
-func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.Header, status string) {
+//
+// A target that is not audio.cpp (sglang-omni for one, v0.2.0) sends no duration header.
+// With no usable header the quantity falls back to the audio itself: tally, which the
+// copier fed with the relayed body, reads the byte rate off the WAV's `fmt ` chunk and
+// counts the data bytes that were really relayed (speechWavTally.seconds). audio.cpp's
+// header always wins, so its behaviour and logging are unchanged; a body that is no
+// WAV, or a fallback that finds no duration, keeps the logged zero below (ADR-041).
+func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.Header, tally *speechWavTally, status string) {
 	if ex.req.APIFlavor != apiFlavorSpeech || isTranscriptionEndpoint(ex.endpoint) || status != "success" {
 		return
 	}
 	value := upstream.Get(speechDurationHeader)
 	seconds, ok := speechDurationSeconds(value)
 	if !ok {
+		if seconds, ok = tally.seconds(); ok {
+			meta.BillingQuantity = seconds
+			return
+		}
 		slog.Error("speech relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "header", speechDurationHeader, "value", value)
 		return
 	}
 	meta.BillingQuantity = seconds
+}
+
+// speechWavHeadCap bounds how much of a one-shot speech body speechWavTally keeps to find
+// the `fmt ` and `data` chunk headers in: far more than a WAV header plus a metadata chunk.
+const speechWavHeadCap = 64 << 10
+
+// speechWavTally measures a one-shot speech body that carries no duration header, from the
+// audio itself. The copier feeds it every chunk the client's writer took. It keeps the head
+// of the body (bounded by speechWavHeadCap) and counts all bytes, so the data bytes are
+// what was RELAYED, not what the header's size field claims: a streaming WAV writer leaves
+// 0 or 0xFFFFFFFF there. A tally with a preset byte rate (newSpeechPCMTally) is for the pcm
+// relay, whose WAV header proxyNative already stripped, so every byte it sees is audio.
+//
+// A nil *speechWavTally sees nothing and measures nothing, so a relay without one (a
+// stream, which has its own rule, or a test) needs no guard.
+type speechWavTally struct {
+	presetRate uint32
+	head       []byte
+	total      int64
+}
+
+func newSpeechWavTally() *speechWavTally { return &speechWavTally{} }
+
+// newSpeechPCMTally is the tally of a relay whose bytes are raw PCM at byteRate.
+func newSpeechPCMTally(byteRate uint32) *speechWavTally {
+	return &speechWavTally{presetRate: byteRate}
+}
+
+func (t *speechWavTally) feed(chunk []byte) {
+	if t == nil {
+		return
+	}
+	t.total += int64(len(chunk))
+	if t.presetRate == 0 && len(t.head) < speechWavHeadCap {
+		room := speechWavHeadCap - len(t.head)
+		t.head = append(t.head, chunk[:min(room, len(chunk))]...)
+	}
+}
+
+// seconds returns the duration of the audio fed so far: data bytes / byte rate. It is false
+// when no rate can be read (not a RIFF/WAVE body, no consistent `fmt ` chunk before `data`)
+// or when no audio bytes were relayed, since neither states how much audio was produced.
+// When the `data` chunk declares a size smaller than what follows it, only the declared
+// size counts (trailing metadata chunks are not audio); a declaration of 0 or one past
+// what was relayed is the streaming writers' placeholder, and the relayed bytes count.
+func (t *speechWavTally) seconds() (float64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	rate, data := int64(t.presetRate), t.total
+	if rate == 0 {
+		counting := &wavCountingReader{r: bytes.NewReader(t.head)}
+		format, declared, ok := wavStripToData(counting)
+		if !ok {
+			return 0, false
+		}
+		rate, data = int64(format.ByteRate), t.total-counting.n
+		if declared > 0 && declared < data {
+			data = declared
+		}
+	}
+	if rate <= 0 || data <= 0 {
+		return 0, false
+	}
+	return float64(data) / float64(rate), true
 }
 
 // cachedOutputByteRate returns the PCM byte rate cached for the mapping routeID

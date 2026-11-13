@@ -1183,12 +1183,24 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 // enough to find the request, instead of silently recording a bare zero (ADR-041).
 // Only the body's size is logged: the body is the transcript, which is the user's
 // content and has no business in a log line.
-func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []byte, status string) {
+//
+// When the body states no duration (a target that is not audio.cpp, sglang-omni for one,
+// sends no timing block) the quantity falls back to the duration of the WAV that was
+// UPLOADED (uploadWavDurationMillis, over ex.raw and the client's contentType): the
+// same measurement a streamed transcription is billed by. audio.cpp's own statement
+// always wins, so its behaviour and logging are unchanged. An upload that is no WAV
+// whose header can be believed (an mp3, say) stays the logged zero above: the
+// duration is never guessed (ADR-041).
+func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []byte, contentType, status string) {
 	if !isTranscriptionEndpoint(ex.endpoint) || status != "success" {
 		return
 	}
 	seconds, ok := transcriptionDurationSeconds(body)
 	if !ok {
+		if ms, measured := uploadWavDurationMillis(ex.raw, contentType); measured {
+			meta.BillingQuantity = float64(ms) / 1000
+			return
+		}
 		slog.Error("transcription relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "field", "timing.audio_duration_ms", "body_bytes", len(body))
 		return
 	}
@@ -1354,7 +1366,7 @@ func (s *Server) relayTranscriptionResponse(w http.ResponseWriter, r *http.Reque
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, ex.req, ex.serverName, false, writeErr, ex.start)
 	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}
-	setTranscriptionBillingQuantity(&meta, ex, body, status)
+	setTranscriptionBillingQuantity(&meta, ex, body, r.Header.Get(contentTypeHeader), status)
 	capIn := buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), body, resp.StatusCode, ex.req.APIFlavor)
 	if capIn != nil {
 		capIn.RespBytes = int64(written)

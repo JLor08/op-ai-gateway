@@ -972,6 +972,12 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// setSpeechBillingQuantity below still reads the upstream WAV's duration header, which the
 	// strip leaves in resp.Header.
 	relayBody := io.Reader(resp.Body)
+	// A one-shot speech body is also measured as it is relayed (speechWavTally), for the
+	// target that sends no duration header: setSpeechBillingQuantity falls back to it.
+	var speechTally *speechWavTally
+	if speechRelay && speechScan == nil {
+		speechTally = newSpeechWavTally()
+	}
 	if rel.speechPCMStrip {
 		counting := &wavCountingReader{r: resp.Body}
 		format, dataSize, ok := wavStripToData(counting)
@@ -983,6 +989,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		contentType = "application/octet-stream"
 		w.Header().Set(contentLengthHeader, strconv.FormatInt(dataSize, 10))
 		relayBody = io.LimitReader(resp.Body, dataSize)
+		speechTally = newSpeechPCMTally(format.ByteRate)
 	}
 
 	markServedInstance(w, rel.pfReq, rel.target)
@@ -1061,7 +1068,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	if transcriptScan != nil || speechScan != nil {
 		teeBuf = nil
 	}
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan}
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan, speechWav: speechTally}
 	// relayBody is resp.Body for every relay but the pcm strip, which already consumed the
 	// WAV header above and hands the copier only the data chunk (io.LimitReader).
 	copyErr := copier.run(relayBody)
@@ -1085,7 +1092,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	if speechScan != nil {
 		s.setStreamedSpeechBillingQuantity(ctx, &meta, ex, speechScan, status)
 	} else {
-		setSpeechBillingQuantity(&meta, ex, resp.Header, status)
+		setSpeechBillingQuantity(&meta, ex, resp.Header, speechTally, status)
 	}
 	// The transcription measure, for the one transcription that gets this far: a
 	// streamed one, which states no duration -- it is read off the upload's WAV
@@ -1321,6 +1328,9 @@ type nativeCopier struct {
 	// Fed like transcript, and told at a clean EOF that the upstream closed the body
 	// (the raw shape's completion).
 	speech *speechStreamScan
+	// speechWav measures a one-shot speech body for billing when the upstream sends no
+	// duration header (nil for every other relay).
+	speechWav *speechWavTally
 	// written counts every body byte the client's writer took, past the capture
 	// cap too (respBuf stops growing there), so a capture that does not store the
 	// body can still say how large it was.
@@ -1382,6 +1392,7 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 	c.imgCounter.feed(chunk)
 	c.transcript.feed(chunk)
 	c.speech.feed(chunk)
+	c.speechWav.feed(chunk)
 	if c.respBuf != nil && c.respBuf.Len() <= c.capBytes {
 		c.respBuf.Write(chunk)
 	}
