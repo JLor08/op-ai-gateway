@@ -66,12 +66,12 @@ func TestPermitWSLDistroMustBeNamedByAnEntry(t *testing.T) {
 	mustRefuse(t, p.Permit(s), "runtime_allowed_binaries")
 
 	p.AllowedBinaries = []string{"/usr/bin/native"}
-	mustRefuse(t, p.Permit(wslSpec(wslBin, "")), "runtime_allowed_binaries", "wsl://")
+	mustRefuse(t, p.Permit(wslSpec(wslBin, "")), "runtime_allowed_binaries", "wsl://", "holds 0 wsl:// binary entries")
 
 	// Another distro's entry never permits this distro, even for the same path.
 	p.AllowedBinaries = []string{"wsl://Debian" + wslBin}
 	err := p.Permit(wslSpec(wslBin, ""))
-	mustRefuse(t, err, "runtime_allowed_binaries")
+	mustRefuse(t, err, "runtime_allowed_binaries", "holds 1 wsl:// binary entries")
 	for _, name := range []string{"Debian", "Ubuntu-24.04"} {
 		if strings.Contains(err.Error(), name) {
 			t.Errorf("error leaks distro name %q: %v", name, err)
@@ -101,7 +101,7 @@ func TestPermitWSLBinaryAllowlist(t *testing.T) {
 	p.AllowedBinaries = []string{"wsl://Ubuntu-24.04/vllm", `wsl://Ubuntu-24.04/x\y`, "wsl://Ubuntu-24.04" + wslBin}
 	for _, b := range []string{"vllm", `C:\x\vllm.exe`, ""} {
 		err := p.Permit(wslSpec(b, ""))
-		mustRefuse(t, err, "runtime_allowed_binaries")
+		mustRefuse(t, err, "runtime_allowed_binaries", "2 wsl:// binary entries name this distro")
 		if b != "" && strings.Contains(err.Error(), b) {
 			t.Errorf("error leaks the binary path %q: %v", b, err)
 		}
@@ -132,7 +132,7 @@ func TestPermitWSLWorkDir(t *testing.T) {
 	if err := p.Permit(wslSpec(wslBin, "/srv/models")); err != nil {
 		t.Errorf("/srv/models itself: %v", err)
 	}
-	mustRefuse(t, p.Permit(wslSpec(wslBin, "/srv/modelsx")), "runtime_allowed_dirs")
+	mustRefuse(t, p.Permit(wslSpec(wslBin, "/srv/modelsx")), "runtime_allowed_dirs", "1 wsl:// dir entries name this distro")
 	err := p.Permit(wslSpec(wslBin, "/srv/models/../etc"))
 	mustRefuse(t, err, "runtime_allowed_dirs")
 	if strings.Contains(err.Error(), "/etc") {
@@ -158,7 +158,7 @@ func TestPermitWSLAllowBinaryDirs(t *testing.T) {
 	if err := p.Permit(wslSpec(wslBin, "/home/ai/vllm/.venv/bin/sub")); err != nil {
 		t.Errorf("binary dir subtree: %v", err)
 	}
-	mustRefuse(t, p.Permit(wslSpec(wslBin, "/tmp")), "runtime_allowed_dirs")
+	mustRefuse(t, p.Permit(wslSpec(wslBin, "/tmp")), "runtime_allowed_dirs", "0 wsl:// dir entries name this distro")
 	// The native binary's dir does not count for a WSL spec.
 	mustRefuse(t, p.Permit(wslSpec(wslBin, "/usr/bin")), "runtime_allowed_dirs")
 }

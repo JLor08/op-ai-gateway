@@ -669,8 +669,8 @@ func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(
 				}
 				continue
 			}
-			if len(e) >= 6 && strings.EqualFold(e[:6], runtimectl.WSLEntryScheme) {
-				w = append(w, fmt.Sprintf("%s[%d] looks like a WSL entry but the scheme must be exactly lowercase wsl:// ; as written it permits nothing", list.name, i))
+			if n := len(runtimectl.WSLEntryScheme); len(e) >= n && strings.EqualFold(e[:n], runtimectl.WSLEntryScheme) {
+				w = append(w, fmt.Sprintf("%s[%d] looks like a WSL entry but the scheme must be exactly lowercase wsl://; it is not a WSL entry and is treated as a native path", list.name, i))
 			}
 		}
 	}
@@ -981,7 +981,7 @@ func defaultConfigPath() string {
 // readConfigFile reads and parses the JSON config. A missing file returns a zero
 // fileConfig with no error UNLESS it was explicitly requested (flag/env). Bad
 // JSON is always an error. The second result is the set of top-level keys the
-// file carries, which Load uses to spot a removed setting (fileConfig has no
+// file carries WITH a value (not null, not []), which Load uses to spot a removed setting (fileConfig has no
 // field for those, and unknown keys are otherwise ignored).
 func readConfigFile(path string, explicit bool) (fileConfig, map[string]bool, error) {
 	data, err := os.ReadFile(path)
@@ -999,8 +999,18 @@ func readConfigFile(path string, explicit bool) (fileConfig, map[string]bool, er
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal(data, &raw) // the document parsed above, so this cannot fail on syntax
 	keys := make(map[string]bool, len(raw))
-	for k := range raw {
-		keys[k] = true
+	for k, v := range raw {
+		// Only a key that carries a value counts: null and [] configure nothing
+		// (every config generated since #390 holds the removed keys as []).
+		var compact bytes.Buffer
+		if json.Compact(&compact, v) != nil {
+			continue
+		}
+		switch compact.String() {
+		case "null", "[]":
+		default:
+			keys[k] = true
+		}
 	}
 	return fc, keys, nil
 }

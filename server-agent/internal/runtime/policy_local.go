@@ -518,8 +518,9 @@ func (p LocalPolicy) Permit(spec Spec) error {
 
 // permitWSL is Permit for a WSL spec. Check order: the operator configured WSL
 // at all (exe, then user), the distro, the binary, the work_dir. Every refusal
-// names the setting and, for a list, how many entries it holds -- never a path,
-// distro or user name, so the text is safe to surface as a Status message
+// names the setting and, for a list, how many well-formed wsl:// entries it
+// holds (all distros for the distro check, the spec's distro for the binary and
+// work_dir checks) -- never a path, distro or user name, so the text is safe to surface as a Status message
 // (agent-runtime-manager section 3.1).
 func (p LocalPolicy) permitWSL(spec Spec) error {
 	w := p.WSL
@@ -538,14 +539,18 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 	// A distro is permitted only by being named by a well-formed wsl:// binary
 	// entry. The refusal names the setting, never the distro.
 	if distro == "" || len(wslBinaries[distro]) == 0 {
-		return fmt.Errorf("runtime: the spec's WSL distro is not named by any wsl:// entry in runtime_allowed_binaries (use wsl://<distro>/<absolute Linux path>)")
+		total := 0
+		for _, paths := range wslBinaries {
+			total += len(paths)
+		}
+		return fmt.Errorf("runtime: the spec's WSL distro is not named by any wsl:// entry in runtime_allowed_binaries (use wsl://<distro>/<absolute Linux path>; the list holds %d wsl:// binary entries)", total)
 	}
 	// Absolute POSIX only: a bare name would resolve through the distro's PATH,
 	// and a Windows path can never be an executable inside it. Compared
 	// verbatim against THIS distro's entries; another distro's entry for the
 	// same path permits nothing here.
 	if !strings.HasPrefix(spec.Binary, "/") || !slices.Contains(wslBinaries[distro], spec.Binary) {
-		return fmt.Errorf("runtime: the spec's WSL binary is not an allowed absolute path (add a wsl://<distro>/<absolute Linux path> entry to runtime_allowed_binaries)")
+		return fmt.Errorf("runtime: the spec's WSL binary is not an allowed absolute path (add a wsl://<distro>/<absolute Linux path> entry to runtime_allowed_binaries; %d wsl:// binary entries name this distro)", len(wslBinaries[distro]))
 	}
 	// As for native specs, an empty work_dir runs beside the (allowlisted)
 	// binary and is permitted on its own merit.
@@ -575,7 +580,7 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("runtime: the spec's WSL work_dir is not within any allowed directory (wsl:// entries of runtime_allowed_dirs, or runtime_allow_binary_dirs)")
+	return fmt.Errorf("runtime: the spec's WSL work_dir is not within any allowed directory (wsl:// entries of runtime_allowed_dirs, or runtime_allow_binary_dirs; %d wsl:// dir entries name this distro)", len(wslDirs[distro]))
 }
 
 // isZeroUID reports whether s is all ASCII digits and parses to 0 ("0", "00"):

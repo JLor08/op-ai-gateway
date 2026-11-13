@@ -1758,14 +1758,25 @@ func TestLoadRuntimeWSLSettings(t *testing.T) {
 }
 
 func TestLoadWarnsOnRemovedWSLSettings(t *testing.T) {
+	noEnv := func(string) string { return "" }
 	for _, key := range []string{"runtime_wsl_allowed_distros", "runtime_wsl_allowed_binaries", "runtime_wsl_allowed_dirs"} {
+		// A key that carries a value warns once.
 		path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","`+key+`":["/x"]}`)
-		cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+		cfg, err := Load([]string{"-config", path}, noEnv)
 		if err != nil {
 			t.Fatalf("%s: Load must still succeed: %v", key, err)
 		}
 		if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], key) || !strings.Contains(cfg.Warnings[0], "wsl://") {
 			t.Errorf("%s: Warnings = %v, want one naming the key and wsl://", key, cfg.Warnings)
+		}
+		// An empty or null value configures nothing (generated configs hold [])
+		// and stays silent.
+		for _, empty := range []string{"[]", "null", "[ ]"} {
+			path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","`+key+`":`+empty+`}`)
+			cfg, err := Load([]string{"-config", path}, noEnv)
+			if err != nil || len(cfg.Warnings) != 0 {
+				t.Errorf("%s=%s: err=%v Warnings=%v, want none", key, empty, err, cfg.Warnings)
+			}
 		}
 	}
 
@@ -1776,6 +1787,16 @@ func TestLoadWarnsOnRemovedWSLSettings(t *testing.T) {
 	}
 	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS") || !strings.Contains(cfg.Warnings[0], "wsl://") {
 		t.Errorf("env: Warnings = %v", cfg.Warnings)
+	}
+
+	// The file key and the env var of one setting give exactly one warning.
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_wsl_allowed_distros":["Ubuntu"]}`)
+	cfg, err = Load([]string{"-config", path}, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("Load(both): %v", err)
+	}
+	if len(cfg.Warnings) != 1 {
+		t.Errorf("file+env: Warnings = %v, want exactly one", cfg.Warnings)
 	}
 }
 

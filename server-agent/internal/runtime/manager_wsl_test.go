@@ -712,6 +712,30 @@ func TestWSLUIDIsPrewarmedAtFirstApply(t *testing.T) {
 	}
 }
 
+// TestWSLNoCallIntoDistroWithoutAllowlistEntry: the policy's only wsl:// entry
+// names the test distro, so a spec in Debian is not permitted and its distro is
+// never passed to wsl.exe -d -- no UID lookup, no sweep -- while the allowed
+// distro's spec beside it is warmed (the positive control: the gate lets
+// something through). Fails if the wslDistroAllowed gate of maybeWarmWSL goes.
+func TestWSLNoCallIntoDistroWithoutAllowlistEntry(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManagerWith(t, wslLocalPolicy(), f.runner())
+	debian := wslTestSpec(f, "D", "d")
+	debian.Execution.WSL.Distro = "Debian"
+	m.Apply(Config{ETag: "v1", Specs: []Spec{wslTestSpec(f, "S", "m"), debian}})
+	waitUntil(t, 5*time.Second, "the allowed distro's UID lookup", func() bool {
+		return len(f.find(t, "id", "-u")) >= 1
+	})
+	m.Close() // joins every call the manager started
+	for _, c := range f.calls(t) {
+		if c.Argv[1] == "Debian" {
+			t.Errorf("a call into Debian, which no wsl:// entry names: %q", c.Argv)
+		}
+	}
+}
+
 // TestWSLPrewarmOnlyDistrosNamedBySpecs: a document with no wsl spec calls
 // into no distro at all -- neither a UID lookup nor the orphan sweep, which
 // would boot the VM at every agent start of a host that runs nothing in WSL.
