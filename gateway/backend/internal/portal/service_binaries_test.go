@@ -176,3 +176,55 @@ func TestBinaryIdentityOverrideParsing(t *testing.T) {
 		}
 	}
 }
+
+// An automatic cluster member runs natively, and a wsl:// rpc-server row can
+// never be launched that way: it is never a match, whatever its version.
+func TestMatchingRPCBinarySkipsWSLRows(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newServerTestService(t, rpcMemberTestNow)
+	server := createTestServer(t, svc, "M", "m.example.test")
+	head := routing.ServerBinary{Commit: "2bc46ba"}
+	wsl := routing.ServerBinary{Path: "wsl://Ubuntu-24.04/home/ai/llama/rpc-server", Kind: "rpc_server", Commit: "2bc46ba", Allowed: true}
+	odd := routing.ServerBinary{Path: "WSL://Ubuntu-24.04/home/ai/llama/rpc-server", Kind: "rpc_server", Commit: "2bc46ba", Allowed: true}
+	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, []routing.ServerBinary{wsl, odd}); err != nil {
+		t.Fatal(err)
+	}
+	if b, ok, err := svc.MatchingRPCBinary(ctx, server.ID, head); err != nil || ok {
+		t.Fatalf("only wsl:// rows: match = %+v %v %v, want none", b, ok, err)
+	}
+	// A native row that sorts after the wsl:// ones is still chosen.
+	native := routing.ServerBinary{Path: `z:\llama\rpc-server.exe`, Kind: "rpc_server", Commit: "2bc46ba", Allowed: true}
+	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, []routing.ServerBinary{wsl, odd, native}); err != nil {
+		t.Fatal(err)
+	}
+	if b, ok, err := svc.MatchingRPCBinary(ctx, server.ID, head); err != nil || !ok || b.Path != native.Path {
+		t.Fatalf("match = %+v %v %v, want the native row", b, ok, err)
+	}
+}
+
+// The vectors of the agent's TestParseWSLEntry (server-agent
+// internal/runtime/wsl_allowlist_test.go): both twins must agree on them.
+func TestParseWSLBinaryPathTwinVectors(t *testing.T) {
+	for _, tc := range []struct {
+		entry, distro, path string
+		ok                  bool
+	}{
+		{"wsl://Ubuntu-24.04/home/ai/vllm-env/bin/vllm", "Ubuntu-24.04", "/home/ai/vllm-env/bin/vllm", true},
+		{"wsl://Ubuntu-24.04/", "Ubuntu-24.04", "/", true},
+		{"WSL://Ubuntu-24.04/x", "", "", false},
+		{"wsl:/Ubuntu/x", "", "", false},
+		{"wsl://Ubuntu-24.04", "", "", false},
+		{"wsl:///x", "", "", false},
+		{"wsl://-bad/x", "", "", false},
+		{`wsl://Ubuntu-24.04\home\x`, "", "", false},
+		{`wsl://Ubuntu-24.04/home\x`, "", "", false},
+		{"wsl://Ubuntu/a\x00b", "", "", false},
+		{"/usr/bin/x", "", "", false},
+		{`C:\x.exe`, "", "", false},
+	} {
+		d, p, ok := parseWSLBinaryPath(tc.entry)
+		if d != tc.distro || p != tc.path || ok != tc.ok {
+			t.Errorf("parseWSLBinaryPath(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.entry, d, p, ok, tc.distro, tc.path, tc.ok)
+		}
+	}
+}

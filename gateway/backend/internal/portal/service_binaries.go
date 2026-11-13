@@ -109,6 +109,16 @@ func parseWSLBinaryPath(p string) (distro, linuxPath string, ok bool) {
 	return distro, linuxPath, true
 }
 
+// isWSLBinaryPath reports whether p names a binary inside a WSL distro: a
+// well-formed wsl:// path or, defensively, anything whose lowercased form
+// starts with "wsl:" (a look-alike is never a native path either).
+func isWSLBinaryPath(p string) bool {
+	if _, _, ok := parseWSLBinaryPath(p); ok {
+		return true
+	}
+	return len(p) >= 4 && strings.EqualFold(p[:4], "wsl:")
+}
+
 func serverBinaryDTO(b routing.ServerBinary) ServerBinaryDTO {
 	execution, distro, execPath := BinaryExecutionNative, "", b.Path
 	if d, lp, ok := parseWSLBinaryPath(b.Path); ok {
@@ -423,7 +433,9 @@ func binariesSameVersion(a, b routing.ServerBinary) bool {
 // MatchingRPCBinary returns the rpc_server binary on serverID whose version
 // equals head's (commit, else build); with several matches the first by path.
 // Agent-reported rows the agent does not allow are skipped (they would fail
-// to start); manual rows carry no allowlist status and stay eligible. ok is
+// to start); manual rows carry no allowlist status and stay eligible. A
+// wsl:// row is never a match: an automatic member runs natively, and a WSL
+// binary cannot serve as a cluster member. ok is
 // false when the server has none, or the versions are unknown.
 func (s *Service) MatchingRPCBinary(ctx context.Context, serverID string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
 	rows, err := s.routes.ServerBinaries(ctx, serverID) // ordered by path
@@ -433,7 +445,7 @@ func (s *Service) MatchingRPCBinary(ctx context.Context, serverID string, head r
 	var best routing.ServerBinary
 	found := false
 	for _, b := range rows {
-		if b.Kind != BinaryKindRPCServer || !binariesSameVersion(head, b) {
+		if b.Kind != BinaryKindRPCServer || !binariesSameVersion(head, b) || isWSLBinaryPath(b.Path) {
 			continue
 		}
 		if b.Source == routing.BinarySourceAgent && !b.Allowed {
