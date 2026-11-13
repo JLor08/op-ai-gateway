@@ -785,17 +785,35 @@ function executionModeLabel(mode: string, t: Translation): string {
 // never "needs none") therefore falls back to the estimate. The table shows this
 // number so it cannot disagree with what admission does with the same spec;
 // this is the one place the rule lives.
-function effectiveGpuVram(g: RuntimeSpecGPU): number {
-  return Math.max(g.vram_measured_mb, g.vram_estimate_mb);
+//
+// `live` joins the max() exactly as it does for RAM (effectiveRam): the spec
+// list reads each spec once, and the agent's measurement is written back
+// afterwards, so the running process's figure on the live status stream is the
+// fresher one until the specs are next fetched. Only a card the spec declares
+// is read; an absent or 0 live figure (UNKNOWN) drops out. A wsl spec meets
+// this first: its VRAM is known only once its start window settles, typically
+// after the list was loaded.
+function effectiveGpuVram(g: RuntimeSpecGPU, live?: RuntimeStatus): number {
+  return Math.max(liveGpuVram(live, g.index), g.vram_measured_mb, g.vram_estimate_mb);
+}
+
+// The live status frame's measured VRAM for one card, 0 when it carries none.
+function liveGpuVram(live: RuntimeStatus | undefined, index: number): number {
+  return live?.gpus?.find((g) => g.index === index)?.vram_measured_mb || 0;
+}
+
+// Whether any declared card of spec has a measurement, durable or live.
+function anyGpuMeasured(spec: RuntimeSpec, live?: RuntimeStatus): boolean {
+  return spec.gpus.some((g) => g.vram_measured_mb > 0 || liveGpuVram(live, g.index) > 0);
 }
 
 // The sum of every GPU row's effective VRAM: what the spec demands across the
 // host's cards in total. A card whose demand is still unknown (0) adds nothing,
 // so the total of a partly unknown spec is a floor; 0 means every card is
 // unknown (or there is none).
-function totalGpuVram(spec: RuntimeSpec | undefined): number {
+function totalGpuVram(spec: RuntimeSpec | undefined, live?: RuntimeStatus): number {
   if (!spec) return 0;
-  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(g), 0);
+  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(g, live), 0);
 }
 
 // RAM has no per-card rows: the larger of the agent's measurement and the
@@ -819,9 +837,9 @@ function effectiveRam(spec: RuntimeSpec | undefined, live?: RuntimeStatus): numb
   );
 }
 
-function formatGpus(spec: RuntimeSpec | undefined): string {
+function formatGpus(spec: RuntimeSpec | undefined, live?: RuntimeStatus): string {
   if (!spec || spec.gpus.length === 0) return '—';
-  return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(g)} MB`).join(', ');
+  return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(g, live)} MB`).join(', ');
 }
 
 // A megabyte quantity for the two summary columns: the em-dash when nothing is
@@ -4023,7 +4041,7 @@ export function RuntimeAdminSection({
     {
       id: 'gpus',
       label: t.runtimeSpecGpus,
-      value: (m) => formatGpus(specsById[m.id]),
+      value: (m) => formatGpus(specsById[m.id], statusForMapping(m)),
       filter: 'text',
       searchable: false,
     },
@@ -4059,7 +4077,9 @@ export function RuntimeAdminSection({
       label: t.runtimeSpecVramTotal,
       value: (m) => {
         const spec = specsById[m.id];
-        const total = isClusterHead(spec) ? (spec?.cluster_vram_total_mb ?? 0) : totalGpuVram(spec);
+        const total = isClusterHead(spec)
+          ? (spec?.cluster_vram_total_mb ?? 0)
+          : totalGpuVram(spec, statusForMapping(m));
         return total > 0 ? String(total) : '—';
       },
       render: (m) => {
@@ -4078,18 +4098,21 @@ export function RuntimeAdminSection({
         // How the spec runs is the execution column's job; this cell only says
         // where a WSL spec's VRAM figure comes from. Only a measured figure is
         // attributed from the VM: an estimate alone is the operator's, and
-        // labelling it would claim a measurement that has not happened.
-        if (spec?.execution_mode === 'wsl' && spec.gpus.some((g) => g.vram_measured_mb > 0)) {
+        // labelling it would claim a measurement that has not happened. A
+        // cluster head (above) keeps the durable figures its cluster total is
+        // built from; every other row takes the live frame into the max().
+        const live = statusForMapping(m);
+        if (spec?.execution_mode === 'wsl' && anyGpuMeasured(spec, live)) {
           return (
             <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'end' }}>
-              <span>{formatMb(totalGpuVram(spec))}</span>
+              <span>{formatMb(totalGpuVram(spec, live))}</span>
               <Typography variant="caption" color="text.secondary">
                 {t.runtimeStatusVRAMFromVM}
               </Typography>
             </Box>
           );
         }
-        return formatMb(totalGpuVram(spec));
+        return formatMb(totalGpuVram(spec, live));
       },
       filter: 'text',
       searchable: false,

@@ -7036,8 +7036,13 @@ decides. The live figure joins the same `max()` as the durable measurement and t
 estimate, so a live value below a larger durable one does not shrink the cell. A spec
 with no live row (before the first frame, or after a gateway restart) or whose row
 carries no RAM (a stopped or never-measured one) falls back to the **durable**
-persisted value, which is why the write-back stays. (The per-GPU VRAM cells keep
-reading only the durable spec figures; only the RAM column consults the live frame.)
+persisted value, which is why the write-back stays. The per-GPU VRAM cells and the
+VRAM total follow the same rule per card: each declared GPU row shows
+`max(live gpus[].vram_measured_mb for that index, vram_measured_mb, vram_estimate_mb)`,
+so a measurement shows on the next frame instead of after a reload. A `wsl` spec needs
+this most, since its VRAM is known only once its start window settles (§3.8), usually
+after the list was loaded. A live figure for a card the spec does not declare is
+ignored, and a cluster head keeps the durable figures its cluster total is built from.
 
 For the wire shape of the stream and its unusual envelope key, see
 [HTTP API Surface](../reference/api-surface.md); for the sample's two additive
@@ -7665,17 +7670,17 @@ picks a free ephemeral port", stated as helper text rather than left to look
 like an error.
 
 **The specs table shows the effective values admission uses**, never the bare
-estimate: the per-GPU cell is `max(measured, estimate)` of that row, a **VRAM
+estimate: the per-GPU cell is `max(live, measured, estimate)` of that row, a **VRAM
 total** column sums those across the spec's GPUs (a card whose demand is still
 unknown adds nothing, so a partly unknown total is a floor), and a **RAM** column
-shows `max(live ram_measured_mb, ram_measured_mb, ram_estimate_mb)`, where the live
-figure is the spec's row on the status stream when it has one carrying a RAM
-measurement (§10) and drops out of the `max()` otherwise; an unknown value is an em
-dash, never a `0 MB`. Both summary columns sort by magnitude and the cell text carries
-the unit while the column `value` stays the bare number. The VRAM figures are the
-durable spec values the portal loaded, so an agent's fresh VRAM measurement reaches
-them when the specs are next fetched; the RAM column additionally follows the live
-frame, so the RAM of a spec whose live row carries it updates with the stream.
+shows `max(live ram_measured_mb, ram_measured_mb, ram_estimate_mb)`. The live figure
+is the spec's row on the status stream when it has one carrying the measurement
+(per card for VRAM, `gpus[].vram_measured_mb`; spec-wide for RAM, §10) and drops out
+of the `max()` otherwise; an unknown value is an em dash, never a `0 MB`. Both summary
+columns sort by magnitude and the cell text carries the unit while the column `value`
+stays the bare number. So a fresh measurement updates with the stream rather than
+waiting until the specs are next fetched; a cluster head's VRAM cells are the
+exception and keep the durable figures its cluster total is built from.
 
 **Every launch spec also carries its own API-Varianten block** — the identical
 `openai`/`anthropic`/`openai_images`/`openai_audio` flavor checkboxes and Codex/Claude-Code
@@ -10090,12 +10095,12 @@ operator meets first:
   portal reads either name back today, so an operator who pairs an agent older than
   0.14.0 with a newer gateway gets no portal warning that its pushed `ram_mb` is
   silently ignored (§7).
-- **Only the RAM column follows the live frame; the VRAM cells do not.** The
-  gateway's runtime-status DTO forwards `ram_measured_mb` (§10), so the RAM cell of a
-  spec whose live row carries it updates with the stream, but the per-GPU cells and the
-  VRAM total still read the durable spec values and pick up a new VRAM measurement when
-  the specs are next fetched. The live row is an in-RAM snapshot, so a stopped spec or a gateway restart
-  falls back to the durable value until the next frame.
+- **A cluster head's VRAM cells do not follow the live frame.** The RAM column and
+  every other spec's per-GPU and VRAM-total cells take the live status row into their
+  `max()` (§10), but a head keeps the durable figures, because its cluster total is
+  built from them and a live own figure next to a durable total would not add up. The
+  live row is an in-RAM snapshot, so a stopped spec or a gateway restart falls back to
+  the durable value until the next frame.
 - **A *literal* secret written into a spec reaches the gateway unmasked** — in
   `args` in either mode, or in an `env` value of a gateway-authored spec, where
   the gateway holds the plaintext document anyway. A resolved secret of either
