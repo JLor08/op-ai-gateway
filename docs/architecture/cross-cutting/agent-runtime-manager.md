@@ -2178,8 +2178,9 @@ basename of the binary, so `…/bin/vllm` resolves to `vllm`.
   an explicit `native` and an empty mode to the same thing, so a gateway that starts
   sending the explicit form bounces nothing.
 - **Gateway.** Migration 109 adds `agent_runtime_specs.execution_mode` (`text not
-  null default 'native'`) and `wsl_distro` (`text not null default ''`) on all
-  three drivers ([Data Model](../reference/data-model.md)). The spec PUT validates
+  null default 'native'`) and `wsl_distro` (`text not null default ''`) on both SQL
+  dialects, and the memory store carries the two fields with the rest of the spec
+  ([Data Model](../reference/data-model.md)). The spec PUT validates
   the pair as the last of the request's own shape checks and answers four new `400`s
   ([HTTP API Surface](../reference/api-surface.md)): an unknown mode, a distro that
   is not a plain name, a binary or `work_dir` that is not a Linux absolute path,
@@ -2238,8 +2239,10 @@ does not cover it and should not have to. So the chain uses the configured user'
 refuses `root` and UID 0 as the user (`wslUserRefused`), the UID lookup refuses a
 user whose `id -u` is 0, and every agent helper call into a distro refuses a refused
 user again (`runWSLHelperCtx`). The scope's cgroup is delegated to the user, so it
-can still be read and signalled. Measured on a stock Ubuntu 24.04 image: the chain above worked
-without root with only `XDG_RUNTIME_DIR` carried through `WSLENV`, and
+can still be read and signalled. Measured on a stock Ubuntu 24.04 image: a chain of
+this shape (`wsl.exe -d <distro> --exec systemd-run --user --scope --unit=<name> --
+<vllm> serve …`) worked without root with only `XDG_RUNTIME_DIR` carried through
+`WSLENV`, and
 `systemctl --user show <unit>.scope -p ControlGroup` returned a cgroup under
 `user@<uid>.service/app.slice/` that the user could read.
 
@@ -2269,8 +2272,9 @@ is refused at once with `ErrInstanceNoCapacity` and the lookup still runs, so th
 gateway's next attempt finds the UID cached. A failed lookup is a `start_failed`
 with the generic `last_error` `runtime: could not resolve the uid of
 runtime_wsl_user in the WSL distro; see the agent log` and the ordinary crash
-backoff, whose retry asks again (failures are never cached); the distro, the user
-and what `id -u` printed go to the agent's own log only. When WSL is configured,
+backoff, whose retry asks again (failures are never cached); the distro and the
+lookup's error text go to the agent's own log only, and the configured user is
+logged nowhere. When WSL is configured,
 the first `applyConfig` starts the lookup for every allowed distro before it admits
 anything, so a start usually finds its UID already cached.
 
@@ -2284,7 +2288,7 @@ Python would block-buffer the log), `XDG_RUNTIME_DIR=/run/user/<uid>` and
 `WSL_UTF8`, each with `/u` (Windows to Linux only). GPU selection carries over
 unchanged: measured, a WSL distro sees the host's GPU indices and PCI bus IDs, and
 `CUDA_DEVICE_ORDER=PCI_BUS_ID` with `CUDA_VISIBLE_DEVICES=1` put a vLLM's VRAM on
-host index 1 and nowhere else. Secrets in `env` travel through `WSLENV` and stay
+host index 1 and not on index 2. Secrets in `env` travel through `WSLENV` and stay
 out of the argv, which `ps` inside the VM would show.
 
 **Port, health and config files.** `${PORT}` is chosen on the Windows side, as
@@ -2347,12 +2351,18 @@ stopping it (a crash, a kill, a host-side update; the agent puts its children in
 no Job Object): its workload still holds the GPU, the RAM and the
 port inside the VM, invisible to the new run. So once per agent lifetime, when a
 distro's first UID lookup answers, the agent lists
-`systemctl --user list-units --plain --no-legend --all 'opagent-*.scope'` there and
-SIGKILLs every unit whose nonce is not its own. It skips scopes that are
-`inactive` or `failed` (they hold no process) and names it could not have built.
-SIGKILL, not a graceful stop: an orphan has nobody waiting for its answers. A
-distro unreachable at startup is swept as soon as a later start reaches it, and
-this run's units are never touched, because each carries its nonce.
+`systemctl --user list-units --plain --no-legend --all --full 'opagent-*.scope'`
+there (`--full`, so no long name is ellipsized) and SIGKILLs a scope only when its
+name parses back to exactly the shape the agent builds
+(`parseWSLUnitName`, the inverse of `wslUnitName`):
+`opagent-<8 lowercase hex nonce>-<key>-<generation>`, with a non-empty key of at
+most 64 unit-name characters and a plain decimal generation. Such a name with a
+nonce other than this run's is an orphan and is killed; any other `opagent-*` unit
+is not one the agent made, so it is the operator's and is left alone, and so are
+scopes that are `inactive` or `failed` (they hold no process). SIGKILL, not a
+graceful stop: an orphan has nobody waiting for its answers. A distro unreachable
+at startup is swept as soon as a later start reaches it, and this run's units are
+never touched, because each carries its nonce.
 
 #### RAM: the scope's cgroup, and the VM's own pool
 
@@ -2362,8 +2372,12 @@ distro with live `wsl` generations, off the owner, all distros under one shared 
 deadline (`wslSampleTimeout`). The script prints, per unit, `memory.current` and
 `inactive_file` from `…/user@<uid>.service/app.slice/<unit>.scope`, and the VM's
 `MemTotal` and `MemAvailable` from `/proc/meminfo`. A unit's figure is
-`memory.current − inactive_file`, the `docker stats` definition, so the reclaimable
-page cache of the model file is not charged. A unit that cannot be read is absent
+`memory.current − inactive_file`, the `docker stats` definition, so the
+**inactive** page cache of the model file is not charged; active file pages are
+(about 380 MiB in the measurement below, `file` minus `inactive_file`). That
+active share is also counted as available in the VM's `MemAvailable`, which the
+VM pool below relies on ([§11.4 of the risk
+register](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)). A unit that cannot be read is absent
 (its previous figure stands), and a garbled answer is no answer. The `wsl.exe` pid
 reaches neither native measurer, on the beat or in the admission snapshot.
 
@@ -2517,6 +2531,11 @@ its own instance's eviction, and the candidate it was evicted for is admitted on
 next fresh reading, after the exit. A reading that is detectably failed at
 admission falls back to the **last good** one rather than to none, since charged
 from a failed read the remainder would vanish and the VM's VRAM would read as free.
+That last good reading is kept across periods of WSL activity, so a fallback can be
+stale: one that is higher than what the VM now holds charges a **phantom
+remainder**, which can make a native candidate wait, or evict an idle occupant,
+until a fresh good reading lands ([§11.4 of the risk
+register](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 
 **The VRAM bootstrap is gated per spec.** The one-shot bootstrap eviction (§5.3)
 exists to capture a measurement, and a `wsl` spec's measurement needs the worker

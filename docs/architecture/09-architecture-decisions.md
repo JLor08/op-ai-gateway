@@ -12447,7 +12447,8 @@ on.
 - **(d) Stops go through the scope; a sweep removes what a dead agent left.** Terminate is `systemctl --user kill --signal=SIGTERM <unit>.scope`,
   the kill-grace escalation SIGKILLs the scope and then kills `wsl.exe` as a backstop, all off the owner and bounded to 10 s per call. The unit name
   carries the generation, so a late signal never reaches a successor, and an agent-run nonce, so at a distro's first UID answer the agent SIGKILLs
-  every active `opagent-*.scope` of another run. A `wsl.exe` exit of `-1` gets a `last_error` that says `wsl.exe` could not run the workload.
+  every active scope whose name parses back to exactly that shape with another run's nonce; any other `opagent-*` unit is the operator's and is
+  left alone. A `wsl.exe` exit of `-1` gets a `last_error` that says `wsl.exe` could not run the workload.
 - **(e) RAM is the scope's cgroup, against a second pool.** One `sh -c <fixed script>` call per distro per beat reads each scope's
   `memory.current − inactive_file` (the `docker stats` figure) and the VM's meminfo; the `wsl.exe` pid reaches no native measurer. The host pool is
   unchanged. A **VM pool** is added, `VM MemAvailable + what the scopes held in the same sample − OP_AGENT_WSL_RAM_RESERVE_MB` (default 1024), which a
