@@ -135,6 +135,20 @@ describe('BinaryPicker WSL rows', () => {
     expect(screen.queryByText(/wsl:\/\//)).toBeNull();
   });
 
+  it('renders rows that share a Linux path without duplicate React keys', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      render(<WslHarness kind="llama_server" onSelect={() => {}} onValue={() => {}} />);
+      fireEvent.mouseDown(screen.getByLabelText('Binary'));
+      expect(screen.getByText('WSL2 · Ubuntu-24.04')).toBeTruthy();
+      expect(screen.getByText('WSL2 · Debian')).toBeTruthy();
+      const dup = spy.mock.calls.filter((c) => /same key|unique "key"/.test(String(c[0])));
+      expect(dup).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('does not call onSelect for free text', () => {
     const onSelect = vi.fn();
     render(<WslHarness kind="llama_server" onSelect={onSelect} onValue={() => {}} />);

@@ -99,6 +99,9 @@ export function BinaryPicker({
       onChange={(_e, picked) => {
         if (typeof picked !== 'string' && picked !== null) onSelect?.(picked);
       }}
+      // MUI keys options by label by default; two rows can share a Linux path
+      // (two distros, or a native and a WSL row), but `path` is unique.
+      getOptionKey={(o) => (typeof o === 'string' ? o : o.path)}
       // A WSL option's label is its Linux path: MUI writes the label into the
       // input after a selection, and the spec's binary is that Linux path.
       getOptionLabel={(o) => (typeof o === 'string' ? o : isWsl(o) ? o.exec_path : o.path)}
