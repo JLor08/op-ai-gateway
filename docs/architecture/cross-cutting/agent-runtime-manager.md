@@ -2603,11 +2603,19 @@ it can matter: for a server whose agent declares `runtime_exec_wsl`, or for a sp
 already stored as `wsl`, which must stay editable. In WSL mode it adds a **distro**
 field and labels the binary and work-dir fields as Linux paths, and it warns, once
 the agent's report has loaded, when the agent does not declare the feature: the
-spec is saved but not pushed. The mapping table marks a `wsl` spec's VRAM total
-with a **WSL** chip and, once a figure has been measured, the caption "VRAM
-attributed from the WSL VM"; the editor's measured-VRAM line carries the same label
-when it shows a measured figure. An operator can tell an attributed figure from a
-per-pid reading, and an estimate alone is never labelled as attributed. German and English strings ship together.
+spec is saved but not pushed.
+
+How a model runs is a property of its **runtime spec**, so it is shown in the
+runtime-spec table and nowhere else: the model-mapping table carries capabilities
+and speeds only. The runtime-spec table has its own **Execution** column ("Native",
+or "WSL2" with the distro beneath it; an unconfigured row shows "—"). Its value is
+the raw mode, so its enum filter separates native from WSL specs, and a mode a
+portal build does not know yet (a later Docker mode) shows its raw name instead of
+nothing. The same table's VRAM total carries the caption "VRAM attributed from the
+WSL VM" once a `wsl` spec's figure has been measured, and the editor's measured-VRAM
+line carries the same label when it shows a measured figure. An operator can tell
+an attributed figure from a per-pid reading, and an estimate alone is never
+labelled as attributed. German and English strings ship together.
 
 #### What the host needs
 
