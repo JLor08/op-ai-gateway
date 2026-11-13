@@ -126,8 +126,8 @@ deliberate:
 
 | Check | Rule | Empty list means |
 |---|---|---|
-| Binary allowlist | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES`. `spec.binary` must be absolute (`filepath.IsAbs`) and match an entry **exactly**; non-absolute allowlist entries are skipped when scanning. | **Nothing starts.** An unconfigured agent refuses every spec — enabling the feature is an explicit act on each host. |
-| Work-directory containment | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS`. `filepath.Clean` both sides, then require exact equality or a prefix up to *and including* the separator. A bare entry is already a subtree; `allowedDirBase` accepts a trailing whole-segment wildcard (`<dir>/*` or `<dir>\*`) as an exactly-equivalent synonym by stripping it to `<dir>` before that same check (see §3.1.1). | **Any `work_dir` permitted.** The directory check is defence in depth behind an already-allowlisted binary, not the primary boundary. |
+| Binary allowlist | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES`. `spec.binary` must be absolute (`filepath.IsAbs`) and match an entry **exactly**; non-absolute allowlist entries are skipped when scanning. Only **native** entries count: a `wsl://` entry (§3.8) is never consulted for a native spec, and neither is a malformed or wrong-case one. | **Nothing starts** natively (no native entry). An unconfigured agent refuses every spec — enabling the feature is an explicit act on each host. |
+| Work-directory containment | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS`. `filepath.Clean` both sides, then require exact equality or a prefix up to *and including* the separator. A bare entry is already a subtree; `allowedDirBase` accepts a trailing whole-segment wildcard (`<dir>/*` or `<dir>\*`) as an exactly-equivalent synonym by stripping it to `<dir>` before that same check (see §3.1.1). Only native entries count, so a `wsl://<distro>/…` entry confines `wsl` specs (§3.8) and never a native `work_dir`. | **Any `work_dir` permitted** (no native dir entry and `runtime_allow_binary_dirs` off). The directory check is defence in depth behind an already-allowlisted binary, not the primary boundary. |
 | Placeholder expansion | §3.2. | — |
 
 Three details are one line away from a bypass and must not be "simplified":
@@ -1838,14 +1838,16 @@ loopback and is reached through the router.
 
 The telemetry sample carries a top-level `binaries` list: one entry per path in
 the agent's local `runtime_allowed_binaries` (the gateway can never widen it),
-with `kind` (`llama_server`, `rpc_server` or `other`, from the file name alone,
+native and `wsl://` entries alike, with `kind` (`llama_server`, `rpc_server`, `vllm` or `other`, from the file name alone,
 case-insensitive, without `.exe`), `version`, `build`, `commit`,
 `version_source` and `allowed`. Versions are derived without trusting the
-gateway: only a `llama-server` is ever executed, as `<path> --version` with no
-shell, a 10 s timeout and a minimal environment (only what is needed to find
+gateway: only a `llama-server` or a `vllm` is ever executed, as `<path> --version` with no
+shell, a 10 s timeout (60 s for `vllm`, whose start-up imports a large Python stack) and a minimal environment (only what is needed to find
 shared libraries, so no secret reaches the child); its `version: X (build N,
 commit H)` line gives `version_source: agent`; when the run fails or prints no
-such line, the path-derived version below applies instead. An `rpc-server` is
+such line, the path-derived version below applies instead. A `vllm` takes the
+version from the **last** non-empty output line shaped like `0.11.2` or `v0.11.2` (it
+prints log and warning lines around it), with no build or commit. An `rpc-server` is
 never executed: it inherits the version of a `llama-server` in the same
 directory (`agent`), else whatever its path says (`path`: a `b<digits>` tag as
 the build, a 7 to 40 character hex segment containing at least one a-f letter as
@@ -1866,6 +1868,28 @@ transport accepting the sample, and a frame lost with its connection, or a
 gateway store write that failed, would otherwise leave the gateway without it
 until a binary changes. An empty list means the agent allows no binaries, and an
 unchanged inventory omits the field.
+
+**`wsl://` rows.** A well-formed `wsl://` entry is listed with its `path` the
+entry string verbatim and its kind taken from the Linux path's base name; the
+gateway derives the execution mode, distro and Linux path from that string (no
+extra wire field). Probing one **never boots the WSL VM**. Per scan, when at least
+one well-formed entry exists, `runtime_wsl_exe` is set and the user is not refused,
+the agent makes one `wsl.exe --list --running --quiet` call. Only for an entry whose
+distro is listed (case-insensitive) does it call into the distro: a `stat -L -c
+%s:%Y:%F` of the path (stdout only; exit status 1 means the file is missing and the
+row loses its version), then `<path> --version` (combined output) under the same
+`(size, mtime)` cache and retry backoff as a native entry, all through
+`wsl.exe -d <distro> -u <user> --cd / --exec`. A distro that is not running, or a
+failed list call, is never called: the row keeps its last good version (source
+`agent`) if there is one, else the path-derived one. Any stat failure other than
+status 1, or output that does not parse, is treated the same way. While a distro is
+stopped, a failed version run keeps its cache entry and failure count and pushes its
+retry to at least one rescan interval (5 min) out. With `runtime_wsl_exe` empty or
+the user refused, `wsl://` rows are listed and never probed. An `rpc-server`'s
+sibling inheritance keys a `wsl://` entry by distro and the Linux directory. One
+residual is accepted: the running list is read once per scan, so a distro that idles
+out during a long scan (a `vllm --version` can take up to 60 s) can be started again
+by a later stat of the same scan.
 
 #### Shutdown
 
@@ -2198,27 +2222,59 @@ basename of the binary, so `…/bin/vllm` resolves to `vllm`.
 
 #### The local policy
 
-A `wsl` spec is judged **only** by a policy block of its own; the native allowlist
-is never consulted for it, nor required to be non-empty. Its binary and work dir are
-POSIX paths inside the distro, which a Windows allowlist can neither express nor
-safely match. Every setting is operator-only, file or environment, never a flag and
-never from the gateway ([§15](#15-configuration-reference)):
+A `wsl` spec is judged against the **`wsl://` entries** of the two ordinary
+allowlists and two settings of its own; a native allowlist entry is never
+consulted for it, nor required to exist. Its binary and work dir are POSIX paths
+inside the distro, which a Windows path cannot express or safely match, so they
+are allowlisted in a form that carries the distro
+([ADR-102](../09-architecture-decisions.md#adr-102--one-runtime-allowlist-with-wsl-entries-the-binary-inventory-and-picker-see-wsl-binaries)).
+Every setting is operator-only, file or environment, never a flag and never from
+the gateway ([§15](#15-configuration-reference)).
+
+**Entry form.** `wsl://<distro>/<absolute POSIX path>`, e.g.
+`wsl://Ubuntu-24.04/home/ai/vllm-env/bin/vllm`, valid in `runtime_allowed_binaries`
+and in `runtime_allowed_dirs` (where a trailing `/*` keeps its §3.1.1 meaning).
+The scheme is exactly lowercase `wsl://`. The distro is everything up to the first
+`/` after it and must match the distro-name rule of §3.8's spec validation
+(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`). The Linux path is the rest, including that
+`/`; it starts with `/` and contains no NUL and no backslash, and it is compared
+verbatim, like a native entry. A string that starts with `wsl://` but breaks a
+rule (a Windows-style `wsl://Ubuntu-24.04\home\ai`, a bad distro) is a
+**malformed `wsl://` entry**: it permits nothing, it never appears in the
+inventory, and the agent logs a startup warning naming the setting and the index.
+A wrong-case `WSL://…` is **not a WSL entry at all**: it is a native path (it
+permits no binary, but as a `runtime_allowed_dirs` entry it still turns native
+`work_dir` containment on), it gets the same startup warning, and the inventory
+lists no entry whose lowercased form starts with `wsl:` and that the parser
+rejects.
 
 | Setting | Rule | Empty means |
 |---|---|---|
 | `runtime_wsl_exe` | The `wsl.exe` to launch through. | **Nothing starts** in `wsl` mode. The default is `C:\Program Files\WSL\wsl.exe` on Windows and empty elsewhere, so on a non-Windows agent every `wsl` spec is `not_permitted` ("WSL is not configured") unless an operator sets one. |
 | `runtime_wsl_user` | The Linux user every `wsl.exe` call runs as (`-u`). `root` and every all-digit spelling of UID 0 (`0`, `00`, …) are refused. | **Nothing starts** in `wsl` mode. |
-| `runtime_wsl_allowed_distros` | Distro names, matched exactly. | **Nothing starts** in `wsl` mode. |
-| `runtime_wsl_allowed_binaries` | Absolute POSIX paths, matched exactly. | **Nothing starts** in `wsl` mode. |
-| `runtime_wsl_allowed_dirs` | POSIX work-dir containment (`withinPosixDir`: `path.Clean`, then equality or a `/` boundary), with the same bare-or-trailing-`/*` subtree semantics as §3.1.1. | Any absolute `work_dir`. |
+| `wsl://` entries in `runtime_allowed_binaries` | The spec's distro must be named by at least one well-formed entry, and `spec.binary` must equal the Linux path of an entry **for that distro**, exactly. | **Nothing starts** in `wsl` mode. The same path allowlisted for two distros permits each distro only its own. |
+| `wsl://` entries in `runtime_allowed_dirs` | POSIX work-dir containment for that distro (`withinPosixDir`: `path.Clean`, then equality or a `/` boundary), with the same bare-or-trailing-`/*` subtree semantics as §3.1.1. With `runtime_allow_binary_dirs` on, `path.Dir` of each of that distro's `wsl://` binary entries joins the set. | Any absolute `work_dir` (no `wsl://` dir entry for the distro and the auto-allow contributes none). |
 
 `permitWSL` checks in that order: the exe, the user, the distro, the binary, then
 the work dir. A `work_dir` that is set must be absolute; an empty one runs beside
 the binary (`path.Dir`), as §3.1's R2 does for a native spec. The empty-list
-asymmetry, and the rule that a refusal names the setting and the entry count but
-never a path, distro or user, are §3.1's. Besides the base names of §3.2, a `wsl`
-spec's `env` may not set `WSLENV`, `WSL_UTF8` or `XDG_RUNTIME_DIR`, in any
-capitalisation: the launcher owns them.
+asymmetry is §3.1's. A refusal names the setting and a count, never a path, distro
+or user: the distro refusal counts the well-formed `wsl://` binary entries in the
+list, the binary refusal the entries for this distro, the work-dir refusal the
+`wsl://` dir entries for this distro, and each points at the `wsl://` form.
+`WSLPolicy` carries only `{Exe, User}`; the allowlists are the `LocalPolicy`'s.
+Besides the base names of §3.2, a `wsl` spec's `env` may not set `WSLENV`,
+`WSL_UTF8` or `XDG_RUNTIME_DIR`, in any capitalisation: the launcher owns them.
+
+**The three earlier settings are gone.** `runtime_wsl_allowed_distros`,
+`runtime_wsl_allowed_binaries` and `runtime_wsl_allowed_dirs` (and their
+`OP_AGENT_RUNTIME_WSL_ALLOWED_*` variables) no longer exist, because a separate
+list kept a WSL binary out of the inventory and the picker. An agent whose
+configuration still carries one **starts anyway** and logs one warning per removed
+setting that names the replacement; it warns only when the setting holds a value (a
+non-empty list, a non-list that is not `null`, or a non-empty variable), so `[]`
+and `null` are silent, and a file key plus its variable give one warning. Until the
+entries are moved, a `wsl` spec is refused with the text above.
 
 #### The launch chain, and the invariant it keeps
 
@@ -2608,6 +2664,18 @@ with a **WSL** chip and, once a figure has been measured, the caption "VRAM
 attributed from the WSL VM"; the editor's measured-VRAM line carries the same label
 when it shows a measured figure. An operator can tell an attributed figure from a
 per-pid reading, and an estimate alone is never labelled as attributed. German and English strings ship together.
+
+The binary picker (`shared/BinaryPicker.tsx`) lists the server's inventory, WSL
+rows included (see "Binary inventory" above). For the run-spec binary field its
+options are the `llama_server`, `vllm` and `other` rows, keyed by `path` so the
+same Linux path in two distros stays two options; a WSL option shows its Linux path
+and "WSL2 · <distro>". Choosing an option sets the binary field to its `exec_path`,
+the execution mode to `wsl` or `native` and, for WSL, the distro; typing a free
+path changes only the binary field. The RPC-member picker never offers a WSL row,
+since a `wsl` spec cannot be a cluster member. The Binaries tab has an Execution
+column right after the path ("Native", or "WSL2" with the distro as caption) and
+the manual-add kind select offers `vllm`. The WSL hint under the editor points at
+`wsl://<Distro>/<path>` in `runtime_allowed_binaries`.
 
 #### What the host needs
 
@@ -5736,6 +5804,17 @@ which were updated for the bump. Compatibility needs **no
 upgrade order**: the gateway sends a `wsl` spec only to an agent that declares the
 name, and an older gateway never sends the block, so a 0.19.0 agent behind it runs
 every spec natively, as before.
+
+**`0.19.0` → `0.19.1` (one runtime allowlist with `wsl://` entries) is
+PATCH.** No feature flag changes (`runtime_exec_wsl` keeps `Since: "0.19.0"`; no new
+name is added). The three `runtime_wsl_allowed_*` settings are removed and replaced
+by `wsl://` entries in `runtime_allowed_binaries` / `runtime_allowed_dirs`
+([§3.8](#38-execution-modes-wsl2),
+[ADR-102](../09-architecture-decisions.md#adr-102--one-runtime-allowlist-with-wsl-entries-the-binary-inventory-and-picker-see-wsl-binaries)),
+and the inventory gains the `vllm` kind and `wsl://` rows. The wire is unchanged: a
+`wsl://` row travels as an ordinary inventory path. There is **no upgrade order**:
+an older gateway drops a `wsl://` row (its path is not one it recognises) and lists
+a `vllm` as `other`, and an older agent never sends either.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -10640,14 +10719,11 @@ registers, over the authoritative table in
 |---|---|---|
 | `runtime_source` / `OP_AGENT_RUNTIME_SOURCE` | `gateway` | `gateway` or `file` (§8). |
 | `runtime_config` / `OP_AGENT_RUNTIME_CONFIG` | unset | Path to the local runtime-config JSON; required when the source is `file`. |
-| `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist. **Empty means nothing starts.** |
-| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. |
+| `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist: native absolute paths, and `wsl://<distro>/<absolute Linux path>` entries for binaries inside a WSL2 distro ([§3.8](#38-execution-modes-wsl2)). **Empty means nothing starts** (a `wsl` spec needs a `wsl://` entry for its distro). The earlier `runtime_wsl_allowed_*` settings are removed; an agent that still carries one starts and logs a warning. |
+| `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. `wsl://<distro>/<path>` entries do the same for `wsl` specs of that distro and never affect native ones. |
 | `runtime_allow_binary_dirs` / `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (**no flag form**) | `false` | Auto-allow each allowed binary's parent directory as a `work_dir` subtree (§3.1.2). On while `runtime_allowed_dirs` is empty flips work-dir handling permissive→restrictive. |
 | `runtime_wsl_exe` / `OP_AGENT_RUNTIME_WSL_EXE` (**no flag form**) | `C:\Program Files\WSL\wsl.exe` on Windows, empty elsewhere | The `wsl.exe` a `wsl` spec is launched through ([§3.8](#38-execution-modes-wsl2)). **Empty means no `wsl` spec starts.** |
 | `runtime_wsl_user` / `OP_AGENT_RUNTIME_WSL_USER` (**no flag form**) | empty | The Linux user every `wsl.exe` call runs as (`-u`). `root` and UID 0 are refused. **Empty means no `wsl` spec starts.** |
-| `runtime_wsl_allowed_distros` / `OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS` (**no flag form**) | empty | The distros a `wsl` spec may name, matched exactly. **Empty means no `wsl` spec starts.** |
-| `runtime_wsl_allowed_binaries` / `OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES` (**no flag form**) | empty | The absolute Linux binary paths a `wsl` spec must match exactly; `runtime_allowed_binaries` is never consulted for one. **Empty means no `wsl` spec starts.** |
-| `runtime_wsl_allowed_dirs` / `OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS` (**no flag form**) | empty | Permitted Linux `work_dir` subtrees for a `wsl` spec, with `runtime_allowed_dirs`' semantics. Empty permits any absolute `work_dir`. |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `config_files_dir` / `OP_AGENT_CONFIG_FILES_DIR` | `server-agent-config-files` next to the binary | Base directory the agent writes spec config files under, one `<spec-id>/` subdirectory each; `${CONFIG_DIR}` resolves to it ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). A relative config-file value resolves beside that file. **The gateway never supplies it.** |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
