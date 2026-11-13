@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -212,6 +213,30 @@ type Config struct {
 	// restrictive (binary subtrees only), the same flip adding the first
 	// RuntimeAllowedDirs entry causes.
 	RuntimeAllowBinaryDirs bool
+	// RuntimeWSLExe is the wsl.exe the agent launches WSL2-hosted model
+	// processes through (a spec whose execution.mode is "wsl"). Defaults to
+	// defaultWSLExe(): the Store-package location on Windows, empty elsewhere.
+	// Empty means "WSL is not configured here", and the local policy then
+	// refuses every WSL spec. Same operator-only provenance as the native
+	// allowlists: it comes ONLY from this local config, never from the gateway.
+	RuntimeWSLExe string
+	// RuntimeWSLAllowedDistros lists the WSL distributions a spec may run in,
+	// matched exactly. Empty (unset) refuses every WSL spec, like
+	// RuntimeAllowedBinaries -- not "any distro".
+	RuntimeWSLAllowedDistros []string
+	// RuntimeWSLAllowedBinaries lists the absolute POSIX paths, inside the
+	// distro, a WSL spec's binary must exactly match. A separate list from
+	// RuntimeAllowedBinaries (a Windows path and a Linux path can never be the
+	// same executable); empty refuses every WSL spec.
+	RuntimeWSLAllowedBinaries []string
+	// RuntimeWSLAllowedDirs lists permitted POSIX work_dir prefixes inside the
+	// distro, with the same bare-or-"/*" subtree semantics as RuntimeAllowedDirs.
+	// Empty means any absolute work_dir is permitted.
+	RuntimeWSLAllowedDirs []string
+	// RuntimeWSLUser is the distro user every WSL process runs as (wsl.exe -u).
+	// There is no default and "root" is refused by the local policy: the agent
+	// never hands a gateway-supplied argv or env to a root process.
+	RuntimeWSLUser string
 	// RuntimeCachePath is where the runtime process-state cache is
 	// persisted. Defaults to defaultRuntimeCacheName next to the binary. A
 	// relative value from the config file is anchored beside that config
@@ -317,6 +342,14 @@ type Config struct {
 	// Env-only (OP_AGENT_HOST_RAM_RESERVE_MB), for the same reason as
 	// VRAMHeadroomMB: a host-tuning escape hatch the gateway can never supply.
 	HostRAMReserveMB int
+	// WSLRAMReserveMB is how much memory, in MB, the agent keeps out of the WSL2
+	// VM's RAM pool when it admits WSL specs against it (the VM has its own
+	// memory ceiling, separate from the Windows host's). Same contract as
+	// HostRAMReserveMB: default DefaultWSLRAMReserveMB, 0 is a real value, a
+	// negative or malformed one is not honoured. Env-only
+	// (OP_AGENT_WSL_RAM_RESERVE_MB): a host-tuning knob the gateway never
+	// supplies.
+	WSLRAMReserveMB int
 	// RAMBootstrapGuessMB is the conservative host-RAM footprint, in MB, the agent
 	// charges a spec of UNKNOWN RAM demand (ram_mb 0, no measurement yet) on its
 	// FIRST start, so that cold start is admitted against the host-RAM pool like
@@ -358,6 +391,22 @@ type Config struct {
 // DefaultHostRAMReserveMB is the host-RAM reserve, in MB, an agent holds back
 // when OP_AGENT_HOST_RAM_RESERVE_MB is unset or unusable.
 const DefaultHostRAMReserveMB = 2048
+
+// DefaultWSLRAMReserveMB is the reserve, in MB, an agent holds back from the
+// WSL2 VM's RAM pool when OP_AGENT_WSL_RAM_RESERVE_MB is unset or unusable.
+// Smaller than the host reserve: the VM hosts only the agent's own models plus
+// a minimal init, not a whole operating system's other tenants.
+const DefaultWSLRAMReserveMB = 1024
+
+// defaultWSLExe is where the Store-distributed WSL puts wsl.exe on Windows.
+// Elsewhere there is no wsl.exe, so the default is empty and the local policy
+// refuses WSL specs until an operator configures one explicitly.
+func defaultWSLExe() string {
+	if runtime.GOOS == "windows" {
+		return `C:\Program Files\WSL\wsl.exe`
+	}
+	return ""
+}
 
 // DefaultRAMBootstrapGuessMB is the conservative first-start host-RAM guess, in
 // MB, an agent charges a spec of unknown RAM demand when
@@ -415,10 +464,16 @@ type fileConfig struct {
 	// RuntimeAllowBinaryDirs is a pointer bool (matching TLSInsecure/Verbose)
 	// so an absent key is distinguishable from an explicit false -- required by
 	// the reflection parity test and resolveBool's env>file precedence.
-	RuntimeAllowBinaryDirs *bool  `json:"runtime_allow_binary_dirs"`
-	RuntimeCachePath       string `json:"runtime_cache"`
-	ConfigFilesDir         string `json:"config_files_dir"`
-	RuntimeRouterBindHost  string `json:"runtime_router_bind"`
+	RuntimeAllowBinaryDirs *bool `json:"runtime_allow_binary_dirs"`
+	// The WSL policy family; see the matching Config fields.
+	RuntimeWSLExe             string   `json:"runtime_wsl_exe"`
+	RuntimeWSLAllowedDistros  []string `json:"runtime_wsl_allowed_distros"`
+	RuntimeWSLAllowedBinaries []string `json:"runtime_wsl_allowed_binaries"`
+	RuntimeWSLAllowedDirs     []string `json:"runtime_wsl_allowed_dirs"`
+	RuntimeWSLUser            string   `json:"runtime_wsl_user"`
+	RuntimeCachePath          string   `json:"runtime_cache"`
+	ConfigFilesDir            string   `json:"config_files_dir"`
+	RuntimeRouterBindHost     string   `json:"runtime_router_bind"`
 
 	RuntimeLogBufferBytes      int `json:"runtime_log_buffer_bytes"`
 	RuntimeLogBufferTotalBytes int `json:"runtime_log_buffer_total_bytes"`
@@ -533,20 +588,26 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		TLSInsecure:          resolveBool(set["tls-insecure"], *tlsInsecure, getenv("OP_AGENT_TLS_INSECURE"), file.TLSInsecure),
 		Verbose:              resolveBool(set["v"] || set["verbose"], *vShort || *vLong, getenv("OP_AGENT_VERBOSE"), file.Verbose),
 
-		RuntimeSource:          strings.ToLower(strings.TrimSpace(resolveStr("runtime-source", *runtimeSource, "OP_AGENT_RUNTIME_SOURCE", file.RuntimeSource))),
-		RuntimeConfigPath:      strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
-		RuntimeAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
-		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
-		RuntimeAllowBinaryDirs: resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
-		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
-		ConfigFilesDir:         strings.TrimSpace(resolveStr("config-files-dir", *configFilesDir, "OP_AGENT_CONFIG_FILES_DIR", file.ConfigFilesDir)),
-		RuntimeRouterBindHost:  strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
+		RuntimeSource:             strings.ToLower(strings.TrimSpace(resolveStr("runtime-source", *runtimeSource, "OP_AGENT_RUNTIME_SOURCE", file.RuntimeSource))),
+		RuntimeConfigPath:         strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
+		RuntimeAllowedBinaries:    resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
+		RuntimeAllowedDirs:        resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
+		RuntimeAllowBinaryDirs:    resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
+		RuntimeWSLExe:             resolveWSLExe(getenv("OP_AGENT_RUNTIME_WSL_EXE"), file.RuntimeWSLExe),
+		RuntimeWSLAllowedDistros:  resolveStringList(getenv("OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS"), file.RuntimeWSLAllowedDistros),
+		RuntimeWSLAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES"), file.RuntimeWSLAllowedBinaries),
+		RuntimeWSLAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS"), file.RuntimeWSLAllowedDirs),
+		RuntimeWSLUser:            resolveTrimmed(getenv("OP_AGENT_RUNTIME_WSL_USER"), file.RuntimeWSLUser),
+		RuntimeCachePath:          strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
+		ConfigFilesDir:            strings.TrimSpace(resolveStr("config-files-dir", *configFilesDir, "OP_AGENT_CONFIG_FILES_DIR", file.ConfigFilesDir)),
+		RuntimeRouterBindHost:     strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
 
 		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
 		RuntimeLogBufferTotalBytes: resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES"), file.RuntimeLogBufferTotalBytes),
 
 		VRAMHeadroomMB:      resolveVRAMHeadroomMB(getenv("OP_AGENT_VRAM_HEADROOM_MB")),
 		HostRAMReserveMB:    resolveHostRAMReserveMB(getenv("OP_AGENT_HOST_RAM_RESERVE_MB")),
+		WSLRAMReserveMB:     resolveWSLRAMReserveMB(getenv("OP_AGENT_WSL_RAM_RESERVE_MB")),
 		RAMBootstrapGuessMB: resolveRAMBootstrapGuessMB(getenv("OP_AGENT_RAM_BOOTSTRAP_GUESS_MB")),
 
 		EvictionGraceSeconds: resolveEvictionGraceSeconds(getenv("OP_AGENT_EVICTION_GRACE_SECONDS")),
@@ -631,6 +692,39 @@ func resolveHostRAMReserveMB(envVal string) int {
 		}
 	}
 	return DefaultHostRAMReserveMB
+}
+
+// resolveTrimmed applies env (if non-blank) > file for a plain string setting,
+// trimming whitespace so a stray space in a service definition cannot turn a
+// valid value into an unmatchable one.
+func resolveTrimmed(envVal, fileVal string) string {
+	if v := strings.TrimSpace(envVal); v != "" {
+		return v
+	}
+	return strings.TrimSpace(fileVal)
+}
+
+// resolveWSLExe is resolveTrimmed with the platform default as the last resort:
+// an operator who set nothing gets the standard wsl.exe on Windows and "" (WSL
+// not configured) elsewhere.
+func resolveWSLExe(envVal, fileVal string) string {
+	if v := resolveTrimmed(envVal, fileVal); v != "" {
+		return v
+	}
+	return defaultWSLExe()
+}
+
+// resolveWSLRAMReserveMB parses the env-only OP_AGENT_WSL_RAM_RESERVE_MB with
+// exactly resolveHostRAMReserveMB's rules (non-negative base-10 integer, 0 is a
+// real value, anything unusable yields the default rather than failing the
+// load) and the default DefaultWSLRAMReserveMB.
+func resolveWSLRAMReserveMB(envVal string) int {
+	if v := strings.TrimSpace(envVal); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return DefaultWSLRAMReserveMB
 }
 
 // resolveRAMBootstrapGuessMB parses the env-only OP_AGENT_RAM_BOOTSTRAP_GUESS_MB:

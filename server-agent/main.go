@@ -157,7 +157,18 @@ func main() {
 	// cfg.Validate and this process would have exited at startup
 	// otherwise.
 	featuresClient := runtimectl.NewFeaturesClient(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second))
-	localPolicy := runtimectl.LocalPolicy{AllowedBinaries: cfg.RuntimeAllowedBinaries, AllowedDirs: cfg.RuntimeAllowedDirs, AllowBinaryDirs: cfg.RuntimeAllowBinaryDirs}
+	localPolicy := runtimectl.LocalPolicy{
+		AllowedBinaries: cfg.RuntimeAllowedBinaries,
+		AllowedDirs:     cfg.RuntimeAllowedDirs,
+		AllowBinaryDirs: cfg.RuntimeAllowBinaryDirs,
+		WSL: runtimectl.WSLPolicy{
+			Exe:             cfg.RuntimeWSLExe,
+			AllowedDistros:  cfg.RuntimeWSLAllowedDistros,
+			AllowedBinaries: cfg.RuntimeWSLAllowedBinaries,
+			AllowedDirs:     cfg.RuntimeWSLAllowedDirs,
+			User:            cfg.RuntimeWSLUser,
+		},
+	}
 	// The GPU vendor comes from the SAME detection the telemetry collectors
 	// use (gpus, above): DetectGPUCollectors probes nvidia-smi, then
 	// rocm-smi, then Apple's ioreg, in that fixed order and keeps whichever
@@ -343,6 +354,7 @@ func main() {
 		"runtime_log_buffer_total_bytes", logBufferTotal,
 		"vram_headroom_mb", cfg.VRAMHeadroomMB,
 		"host_ram_reserve_mb", cfg.HostRAMReserveMB,
+		"wsl_ram_reserve_mb", cfg.WSLRAMReserveMB,
 		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB,
 		"eviction_grace_seconds", cfg.EvictionGraceSeconds)
 	// A loopback runtime_router_bind under cert_mode=proxy is the workaround
