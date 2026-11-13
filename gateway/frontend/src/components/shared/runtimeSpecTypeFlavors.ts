@@ -51,13 +51,14 @@ export const vllmSrSpecFlavorDefaults: RuntimeSpecFlavorValues = {
 /**
  * What the form sets when Type switches to sglang_omni: chat plus speech
  * (openai, openai_audio), never anthropic, because sglang-omni serves the
- * OpenAI chat and audio endpoints. The endpoint modes stay at the stock text
- * server's passthrough. sglang itself keeps the stock flavors (no entry).
+ * OpenAI chat and audio endpoints. sglang-omni v0.2.0 has no /v1/responses or
+ * /v1/messages, so both coding modes are disabled, like vllm_sr. sglang itself
+ * keeps the stock flavors (no entry).
  */
 export const sglangOmniSpecFlavorDefaults: RuntimeSpecFlavorValues = {
   apiFlavors: ['openai', 'openai_audio'],
-  responsesMode: applicationTypeDefaults.vllm.responsesMode,
-  messagesMode: applicationTypeDefaults.vllm.messagesMode,
+  responsesMode: 'disabled',
+  messagesMode: 'disabled',
 };
 
 /**

@@ -524,6 +524,8 @@ describe('specFlavorsAfterTypeSwitch for sglang and sglang_omni', () => {
 
   it('defaults sglang_omni to the openai and openai_audio flavors', () => {
     expect(sglangOmniSpecFlavorDefaults.apiFlavors).toEqual(['openai', 'openai_audio']);
+    expect(sglangOmniSpecFlavorDefaults.responsesMode).toBe('disabled');
+    expect(sglangOmniSpecFlavorDefaults.messagesMode).toBe('disabled');
     expect(
       specFlavorsAfterTypeSwitch({
         from: 'llama_cpp',

@@ -1470,6 +1470,8 @@ describe('RuntimeAdminSection sglang launch-spec kinds', { timeout: 15_000 }, ()
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.type).toBe('sglang_omni');
     expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'openai_audio']);
+    expect(putSpecs[0].body.responses_mode).toBe('disabled');
+    expect(putSpecs[0].body.messages_mode).toBe('disabled');
   });
 
   it('renders the api_flavors_no_audio_on_sglang_omni warning by its label', async () => {
