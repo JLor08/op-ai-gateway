@@ -29,15 +29,17 @@ package runtime
 // to hold no VRAM: its start is not serialized and opens no window, and it is
 // attributed nothing, so its exit during another start's window changes
 // nothing there. Should it use a GPU after all, that memory is in the VM's
-// figure and so in the remainder. Likewise an attribution covers only the GPUs
-// its spec declares: growth elsewhere during the window may be anyone's.
+// figure, and so in the remainder -- unless it allocates while a GPU start's
+// window is open: that growth is then counted in that start's delta, on the
+// GPUs the starting spec declares. Likewise an attribution covers only the
+// GPUs its spec declares: growth elsewhere during the window may be anyone's.
 //
 // A READING THAT IS NOT THE VM'S IS NEVER A DELTA'S END. The measurer answers
 // nothing both when the VM holds nothing and when the read failed, so a
 // reading is taken as failed where the VM cannot be empty (vmReadingFailed): no
 // worker found while a wsl process lives in the VM, or nothing held while a
 // live wsl process is attributed VRAM -- and, at a window's settle, nothing held
-// after a baseline that held something. A window whose baseline failed opens
+// at all once a GPU start has passed its probe. A window whose baseline failed opens
 // void, one whose settling reading failed closes void: a delta against a
 // failed reading would credit one instance with the whole VM, which is written
 // back as its measured demand (ADR-084), and a demand over its budget is
@@ -57,7 +59,10 @@ package runtime
 // sees on a GPU is at least what the VM holds there -- it never sees free room
 // the VM has taken. A figure that came out high only over-credits that
 // workload's own eviction, and the candidate it was evicted for is admitted on
-// the next fresh reading, after the exit.
+// the next fresh reading, after the exit. While a window is open its process
+// has no attribution yet and is charged its demand, which already covers its
+// growth so far up to that demand: that much counts against the remainder
+// (provisionalWSLAttribution), so the same memory is not charged twice.
 
 // wslStartWindow is one wsl start's VRAM window: open from just before the
 // exec of proc until the first measurement dispatched after proc's first
@@ -71,14 +76,10 @@ type wslStartWindow struct {
 	// while the window was open, summed per GPU: the VM's figure dropped by
 	// that much for reasons that are not proc's, so it is added back.
 	exitedCredit map[int]int
-	// healthyDispatched is set when the measurement that settles the window
-	// goes out: the first one dispatched once proc has passed a health probe.
-	// A measurement already out when the probe passed was dispatched before it
-	// and may have caught the load midway, so it never settles the window.
-	healthyDispatched bool
-	// void is set when a wsl process with no attribution exited during the
-	// window: what it held left the VM's figure and cannot be added back, so
-	// the delta would be too low by an unknown amount. A void window still
+	// void is set when the baseline could not be read, or when a wsl process
+	// with no attribution exited during the window: what it held left the VM's
+	// figure and cannot be added back, so the delta would be too low by an
+	// unknown amount. A void window still
 	// runs to its settling measurement -- the next start's delta must not
 	// catch proc's own load -- and then closes without an attribution: proc is
 	// covered by the unattributed remainder.
@@ -292,10 +293,12 @@ func (o *owner) settleWSLWindow(w *wslStartWindow, c cmdMeasured) (landed bool) 
 		return false
 	}
 	after := sumVMVRAM(c.byPID, c.vmPIDs)
-	// Nothing held after a baseline that held something is not this start's
-	// growth: the workloads in the baseline cannot all have left without their
-	// exits crediting the window, so the reading failed.
-	if o.vmReadingFailed(c.vmPIDs, after) || (after == nil && len(w.baseline) > 0) {
+	// Nothing held at all is not this start's growth. After a baseline that
+	// held something, the workloads in it cannot all have left without their
+	// exits crediting the window; after an empty one, a start that declares a
+	// GPU and has passed its probe holds its weights. Either way the reading
+	// failed, and the start is left unattributed, not attributed nothing.
+	if o.vmReadingFailed(c.vmPIDs, after) || after == nil {
 		return false
 	}
 	attrib := onGPUs(wslDelta(after, w.baseline, w.exitedCredit), st.spec.GPUs)

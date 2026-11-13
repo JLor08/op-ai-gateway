@@ -3747,7 +3747,9 @@ func (o *owner) dispatchMeasurement() {
 		ramMeasure = *rp
 	}
 	// The open window settles on this measurement when its process has passed
-	// a health probe (wslStartWindow.healthyDispatched).
+	// a health probe: it is then the first one dispatched since, as one that
+	// was already out when the probe passed is still out (o.measuring) and may
+	// have caught the load midway, so it carries no window.
 	settles := o.wslWindow != nil && o.wslWindow.proc.everHealthy
 	if vramMeasure == nil && ramMeasure == nil && wslUnits == nil && !settles {
 		// Nothing any source would be asked: only a VRAM measurer and no
@@ -3757,7 +3759,6 @@ func (o *owner) dispatchMeasurement() {
 	}
 	var window *wslStartWindow
 	if settles {
-		o.wslWindow.healthyDispatched = true
 		window = o.wslWindow
 	}
 	// The sampler's inputs, copied off owner state for the goroutine. Its env

@@ -691,10 +691,11 @@ func TestWSLWindowVoidOnUnreadableBaseline(t *testing.T) {
 }
 
 // TestWSLSettleVoidOnUnreadableReading: the settling reading is checked the
-// same way, plus one rule of its own -- nothing held after a baseline that
-// held something cannot be the start's growth. The window then closes with no
-// attribution at all: not an empty one, which would let a later exit of this
-// process during another window credit 0 instead of voiding that window.
+// same way, plus one rule of its own -- nothing held after a GPU start has
+// passed its probe cannot be the start's growth, whatever the baseline held.
+// The window then closes with no attribution at all: not an empty one, which
+// would let a later exit of this process during another window credit 0
+// instead of voiding that window.
 func TestWSLSettleVoidOnUnreadableReading(t *testing.T) {
 	for name, tc := range map[string]struct {
 		baseline map[int]int
@@ -702,6 +703,7 @@ func TestWSLSettleVoidOnUnreadableReading(t *testing.T) {
 		noWorker bool
 	}{
 		"nothing held after a baseline that held something": {baseline: map[int]int{0: 12340}, reading: nil},
+		"nothing held after an empty baseline":              {baseline: nil, reading: nil},
 		"no worker at the settle":                           {baseline: nil, reading: map[int]int{0: 5000}, noWorker: true},
 	} {
 		t.Run(name, func(t *testing.T) {
