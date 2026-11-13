@@ -1356,7 +1356,9 @@ fact about this runtime is, and why:
   `api_flavors_text_on_stable_diffusion` for an `sd-server` spec whose flavors
   are not images-only, and `api_flavors_not_on_application` for a spec that
   lists `openai_images` alone under a parent that lacks it, which leaves the
-  child served, and listed, under no API at all.
+  child served, and listed, under no API at all. A third, advisory one,
+  `api_flavors_no_audio_on_sglang_omni`, is the audio counterpart for an
+  sglang-omni spec (below).
   Both forms offer `openai_images` as a third flavor checkbox, in the shared
   `ApiVariantControls`: tick it on the
   `server_agent` application for candidacy and on each image spec for the
@@ -7852,7 +7854,8 @@ Auto, its `binary` is unchanged since the form loaded, and the loaded spec was
 Auto and resolved to `stable_diffusion_cpp`. The form does not mirror the
 backend's binary-name detection, so under Auto a changed binary, or a spec
 loaded with an explicit Type, shows no hint; once the spec is saved, the
-warning judges its binary.
+warning judges its binary. The advisory `api_flavors_no_audio_on_sglang_omni`
+has no inline hint: it appears only in the warnings banner of the specs tab.
 
 **A type switch moves untouched flavors and modes, as it moves an untouched
 health path** ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
@@ -7868,8 +7871,9 @@ sd. Switching to Auto moves nothing, for the health path's reason: an Auto spec
 with an `sd-server` binary is still sd. In every other case the values are the
 operator's and stay as they are. Switching Type to `audio_cpp` does the same with
 `["openai_audio"]` and both modes `disabled`, the application form's default for that
-type (`specTypeFlavorDefaults`, one entry per defaulting kind), and a switch between
-the two defaulting kinds moves from one default to the other. "Untouched" is judged
+type (`specTypeFlavorDefaults`, one entry per defaulting kind: `stable_diffusion_cpp`,
+`audio_cpp`, `vllm_sr` and `sglang_omni`; `sglang_omni`'s is `["openai", "openai_audio"]` with both modes
+`disabled`), and a switch between two defaulting kinds moves from one default to the other. "Untouched" is judged
 against the template, not by the form's flavor-touched flag, which resets on every
 open. The hint
 and switch rules live in `runtimeSpecTypeFlavors.ts`
@@ -8075,7 +8079,14 @@ audio.cpp twin** of this warning or of the form's matching inline hint: a spec o
 `audio_cpp` that keeps a text flavor is not flagged, because the agent-managed audio
 path is deferred ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
 
-Both count disabled specs, like `binary_path_os_mismatch` and unlike the
+**`api_flavors_no_audio_on_sglang_omni`** — a spec of a `server_agent` application whose
+effective type is `sglang_omni` lists no `openai_audio` flavor. sglang-omni's speech and
+transcription endpoints are routed only under that flavor, so the model would never be
+offered for audio requests. It is advisory, like the `vllm_sr` warning, and counts disabled
+specs. Its helper is `anySGLangOmniSpecLacksAudioFlavor`
+([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+
+Both of the two warnings above count disabled specs, like `binary_path_os_mismatch` and unlike the
 timeout warning, because dispatch reads a spec's flavors whether it is enabled
 or not (`targetFrom` ignores `Enabled`). Each check is a pure helper beside
 `anySpecBinaryContradictsReportedOS` (`anySpecListsFlavorNotOnApplication`,

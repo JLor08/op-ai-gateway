@@ -833,7 +833,10 @@ from a counter over the body (a binary WAV has nothing to count), but from the
 upstream's own `X-AudioCPP-Audio-Duration-Ms` response header, divided by 1000
 (`setSpeechBillingQuantity`, `internal/gateway/speech_handler.go`; the header is the
 upstream's, passed in beside the exchange because the exchange is built before any
-response exists). It is the same kind of value as the image count, a **measurement**
+response exists). **Where that header is absent or empty** (a target that is not audio.cpp, such as sglang-omni,
+[ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)) the quantity is instead the audio data bytes the relay actually forwarded divided by the byte rate of the
+returned WAV's `fmt ` chunk (a header size field is not trusted; a `pcm` answer is tallied the same way); a present
+but unusable header is not a fallback case and stays the Error log and `0`. It is the same kind of value as the image count, a **measurement**
 taken from the response, and it follows the same rule: set only when the full body
 reached the client (`status == "success"`), `0` on every other outcome. A duration
 is *usable* when it parses as a finite number greater than zero; an absent, empty,
@@ -869,7 +872,9 @@ since the usage scanner is nil for the flavor), and its `provider_path` is
 `/v1/audio/transcriptions` (`/v1/audio/transcriptions/details` for the diarizing route; the endpoint is threaded through `usageMeta.Endpoint`, as for
 an image edit, because `recordUsage` recomputes the path from the flavor and the flavor
 would say speech). The quantity is audio.cpp's own measurement of the **input** audio,
-`timing.audio_duration_ms` of the JSON response divided by 1000. The `timing` block is
+`timing.audio_duration_ms` of the JSON response divided by 1000; when the body has no `timing.audio_duration_ms` key at
+all (a target that is not audio.cpp, [ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)) it is the duration of the uploaded WAV part instead, and a present but
+unusable value or a non-WAV upload stays the logged `0`. The `timing` block is
 the **trailing** field of `{"text": ..., "timing": {...}}`, so the relay buffers the
 whole body, up to the transcription body cap, before it writes (a response over the cap or
 one that breaks off is a 502 `transcription.upstream_error` with quantity `0`; [API

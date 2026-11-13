@@ -63,6 +63,8 @@ paths:
         Session-or-bearer, scope `gateway:use` or `llm:invoke`. The only
         inference path that also accepts the portal session (portal chat runs
         use it over the internal loopback path). Alias: /openai/v1/chat/completions.
+        Against an agent-launched `sglang_omni` target every `image_url.url`
+        must be an inline `data:` URL, else 400 `chat.media_url_unsupported`.
       security: [{ bearerAuth: [] }, { sessionCookie: [], csrfHeader: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -279,7 +281,10 @@ paths:
         mode-mismatch 500 the gateway retries buffered once. A non-boolean
         `stream`, a `stream_format` other than `sse` or `audio`, and a
         `stream_format` on a request that does not stream are 400
-        `speech.stream_unsupported`. A one-shot 200 is the synthesized clip as
+        `speech.stream_unsupported`. Against an agent-launched `sglang_omni`
+        target a `ref_audio`, or a `references[]` element's `audio_path`,
+        `ref_audio` or `audio`, that is not an inline `data:` URL is 400
+        `speech.reference_audio_unsupported`. A one-shot 200 is the synthesized clip as
         one binary `audio/wav` body, relayed without buffering and with the
         upstream's own `Content-Length`. A non-2xx upstream answer keeps the
         upstream's status and is normalised to the OpenAI error shape: an OpenAI
@@ -288,7 +293,9 @@ paths:
         and any other body is relayed as it came. Metered in seconds of audio
         (`billing_unit: audio_second`, read from the upstream's
         `X-AudioCPP-Audio-Duration-Ms` header, a one-shot `pcm` answer
-        included), not in tokens; a `speech.pcm_unavailable` row is
+        included; where that header is absent or empty, as from an
+        sglang-omni target, the audio bytes relayed divided by the WAV `fmt `
+        byte rate), not in tokens; a `speech.pcm_unavailable` row is
         `audio_second` with quantity 0. A streamed call
         has no such header: on a clean completion (`speech.audio.done` then
         `[DONE]`, or a raw body closed cleanly) it is billed from the PCM bytes
@@ -4843,7 +4850,9 @@ components:
         `application/octet-stream` (the `Content-Length` is the data size);
         the upstream's metering
         headers (`X-AudioCPP-*`) are not forwarded, and the gateway reads
-        `X-AudioCPP-Audio-Duration-Ms` for the usage row. A STREAMED answer (a
+        `X-AudioCPP-Audio-Duration-Ms` for the usage row, or, when that header
+        is absent or empty (a target that is not audio.cpp), measures the audio
+        bytes relayed against the WAV `fmt ` byte rate. A STREAMED answer (a
         `mode=streaming` model asked with `stream: true`) is instead
         `text/event-stream` or `application/octet-stream`, chunked and without a
         `Content-Length`, relayed byte for byte and billed from the PCM bytes
