@@ -140,16 +140,50 @@ func isBaseEnvName(k string) bool {
 // inside a distro. An already-POSIX absolute path passes through. UNC and
 // relative paths are refused: neither has a mount the agent can name without
 // guessing, and a wrong guess would point a model server at a different file.
+//
+// Two separators at the start are UNC on Windows in either spelling ("//srv/x"
+// as much as `\\srv\x`), so they are refused even though POSIX would read
+// "//srv/x" as /srv/x. A drive path whose ".." run climbs above the drive's
+// root is refused too, not clamped: path.Clean would turn `C:\a\..\..\x` into
+// /mnt/x, outside the drive's mount, and Windows itself clamps it to C:\x, so
+// neither reading is one the agent can hand over as "the same directory".
 func windowsPathToWSL(p string) (string, error) {
+	if len(p) >= 2 && isWindowsSep(p[0]) && isWindowsSep(p[1]) {
+		return "", fmt.Errorf("runtime: %q is a UNC path, which does not map into a WSL distro", p)
+	}
 	if strings.HasPrefix(p, "/") {
 		return path.Clean(p), nil
 	}
 	if len(p) >= 2 && p[1] == ':' && (p[0] >= 'a' && p[0] <= 'z' || p[0] >= 'A' && p[0] <= 'Z') &&
-		(len(p) == 2 || p[2] == '\\' || p[2] == '/') {
+		(len(p) == 2 || isWindowsSep(p[2])) {
 		rest := strings.ReplaceAll(p[2:], `\`, "/")
+		if climbsAboveRoot(rest) {
+			return "", fmt.Errorf("runtime: %q climbs above its drive's root, which does not map into a WSL distro", p)
+		}
 		return path.Clean("/mnt/" + strings.ToLower(p[:1]) + "/" + rest), nil
 	}
 	return "", fmt.Errorf("runtime: %q is not a drive path that maps into a WSL distro (UNC and relative paths cannot)", p)
+}
+
+func isWindowsSep(c byte) bool { return c == '/' || c == '\\' }
+
+// climbsAboveRoot reports whether the slash-separated path p, read from a
+// root, has a ".." that would step above that root at any point.
+func climbsAboveRoot(p string) bool {
+	depth := 0
+	for seg := range strings.SplitSeq(p, "/") {
+		switch seg {
+		case "", ".":
+		case "..":
+			depth--
+			if depth < 0 {
+				return true
+			}
+		default:
+			depth++
+		}
+	}
+	return false
 }
 
 // withWrapper returns ex rewritten for a WSL launch: args become the full

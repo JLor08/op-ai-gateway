@@ -84,13 +84,24 @@ func TestWSLUnitName(t *testing.T) {
 func TestWindowsPathToWSL(t *testing.T) {
 	for in, want := range map[string]string{
 		`C:\a\b`: "/mnt/c/a/b", "d:/x": "/mnt/d/x", "/already/posix": "/already/posix",
+		`C:`: "/mnt/c", `C:\`: "/mnt/c", `D:\x\`: "/mnt/d/x", `C:\a\..\b`: "/mnt/c/b", `C:\a\..`: "/mnt/c",
 	} {
 		got, err := windowsPathToWSL(in)
 		if err != nil || got != want {
 			t.Errorf("windowsPathToWSL(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	for _, in := range []string{`\\server\share\x`, `relative\x`, ""} {
+	for _, in := range []string{
+		`\\server\share\x`, `relative\x`, "",
+		// A drive-relative path names the drive's current directory, which
+		// the agent cannot know.
+		`c:foo`,
+		// Forward-slash UNC: POSIX would read it as /srv/x, a different file.
+		"//srv/x", `/\srv\x`,
+		// A .. run that climbs out of the drive's mount must not land on
+		// /mnt/<other> or the distro's own tree.
+		`C:\a\..\..\x`, `C:\a\..\..\..`, `C:\..`, "c:/../etc",
+	} {
 		if got, err := windowsPathToWSL(in); err == nil {
 			t.Errorf("windowsPathToWSL(%q) = %q, want an error", in, got)
 		}
