@@ -955,3 +955,155 @@ func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
 		period2(t, o, vm)
 	})
 }
+
+// TestWSLOpenWindowIsNotCountedTwice: while a GPU wsl start's window is open
+// its process is charged its declared demand, and its growth since the
+// baseline is in the VM's figure. Counted in the remainder as well, the same
+// memory would be charged twice. So the window's own process is taken to
+// account, against the remainder only, for its growth so far, capped at its
+// charge -- its provisional attribution, on its declared GPUs. Its charge
+// stays its demand, so what admission sees on a GPU is still at least what the
+// VM holds there. A void window gets no provisional attribution: its delta is
+// known to be wrong.
+func TestWSLOpenWindowIsNotCountedTwice(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		baseline, vm  map[int]int
+		credit        map[int]int
+		void          bool
+		wantRemainder map[int]int
+	}{
+		{name: "growth equal to the demand", vm: map[int]int{0: 12000}},
+		{name: "growth below the demand", vm: map[int]int{0: 5000}},
+		{name: "growth above the demand", vm: map[int]int{0: 15000}, wantRemainder: map[int]int{0: 3000}},
+		{name: "on top of a baseline", baseline: map[int]int{0: 22}, vm: map[int]int{0: 12022}, wantRemainder: map[int]int{0: 22}},
+		{
+			name: "an attributed exit's credit", baseline: map[int]int{0: 7454}, vm: map[int]int{0: 12022},
+			credit: map[int]int{0: 7432}, wantRemainder: map[int]int{0: 22},
+		},
+		{name: "growth on a gpu it does not declare", vm: map[int]int{0: 12000, 1: 900}, wantRemainder: map[int]int{1: 900}},
+		{name: "a void window", vm: map[int]int{0: 12000}, void: true, wantRemainder: map[int]int{0: 12000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := &vmVRAMScript{vm: tc.vm}
+			w := liveWSL(wslVRAMSpec("W", 12000), 300, StateStarting)
+			w.proc.everHealthy = false
+			o := wslVRAMOwner(vm, w)
+			o.wslWindow = &wslStartWindow{proc: w.proc, baseline: tc.baseline, exitedCredit: tc.credit, void: tc.void}
+			snap := o.buildSnapshot()
+			if got := runningRow(t, snap, "W").GPUs; !maps.Equal(got, map[int]int{0: 12000}) {
+				t.Errorf("W charged %v, want its demand {0:12000}", got)
+			}
+			if !maps.Equal(snap.UnattributedVRAM, tc.wantRemainder) {
+				t.Errorf("UnattributedVRAM = %v, want %v (VM %v)", snap.UnattributedVRAM, tc.wantRemainder, tc.vm)
+			}
+			for g, held := range tc.vm {
+				if seen := runningRow(t, snap, "W").GPUs[g] + snap.UnattributedVRAM[g]; seen < held {
+					t.Errorf("GPU %d: admission sees %d, the VM holds %d", g, seen, held)
+				}
+			}
+		})
+	}
+}
+
+// TestWSLOpenWindowDoesNotEvictForANativeCandidate: the gap between a wsl
+// start's first passing probe and its settle. The process is Running, idle
+// and unpinned, so it is a victim like any other, and with its growth counted
+// twice a native candidate that fits beside it (12000 + 6000 of 24000) would
+// evict it, with the eviction grace at 0.
+func TestWSLOpenWindowDoesNotEvictForANativeCandidate(t *testing.T) {
+	vm := &vmVRAMScript{vm: map[int]int{0: 12000}}
+	w := liveWSL(wslVRAMSpec("W", 12000), 300, StateRunning)
+	o := wslVRAMOwner(vm, w)
+	o.wslWindow = &wslStartWindow{proc: w.proc}
+	o.cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 24000}}
+	o.allowedPairs = allowPairs("N", "W")
+	n := Spec{ID: "N", UpstreamModel: "n", GPUs: []SpecGPU{{Index: 0, VRAMMB: 6000}}}
+	assertDecision(t, "a native candidate beside an open window", Admit(o.buildSnapshot(), n), Decision{OK: true, Evict: []string{}})
+}
+
+// TestWSLSettleWakesANativeWaiter: a native request on a GPU a pinned wsl start
+// shares. The start's window settles into room that fits both (12000 + 6000 of
+// 24000); the request must not still be waiting then, with no release, exit or
+// Apply to come and an admission_wait_timeout of 0.
+func TestWSLSettleWakesANativeWaiter(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+	m.SetMeasurer(liveUnitVRAM(f, map[string]int{"W": 12000}))
+	m.SetWSLVMPIDs(func() []int { return []int{vmwpPID} })
+	w := wslTestSpec(f, "W", "w")
+	w.Args = stubArgs(time.Second, 0, 0, "")
+	w.GPUs = []SpecGPU{{Index: 0, VRAMMB: 12000}}
+	w.Pinned = true
+	n := baseSpec("N", "n")
+	n.GPUs = []SpecGPU{{Index: 0, VRAMMB: 6000}}
+	n.AdmissionWaitTimeoutSeconds = 0
+	m.Apply(Config{
+		ETag: "v1", Specs: []Spec{w, n}, Coresident: coresidentAllPairs("W", "N"),
+		GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 24000}},
+	})
+	waitForState(t, m, "W", StateStarting)
+	waitUntil(t, 5*time.Second, "W's unit is recorded by the fake", func() bool {
+		es, _ := os.ReadDir(f.state)
+		return len(es) > 0
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	nDone := ensureAsync(ctx, m, "n")
+	waitUntil(t, 8*time.Second, "W's window settles", func() bool {
+		return maps.Equal(statusFor(m, "W").MeasuredVRAM, map[int]int{0: 12000})
+	})
+	select {
+	case got := <-nDone:
+		if got.err != nil {
+			t.Fatalf("EnsureRunning(n) = %v, want it to start beside W", got.err)
+		}
+		got.release()
+	case <-time.After(3 * time.Second):
+		t.Fatalf("N is still %s 3 s after W's window settled into room that fits (12000+6000 <= 24000): nothing re-asked it", stateOf(m, "N"))
+	}
+	if st := statusFor(m, "W"); st.State != StateRunning {
+		t.Errorf("W is %s, want it left running", st.State)
+	}
+}
+
+// TestWSLSettleReasksABlockedNativeRequest: the settle itself must re-ask. W
+// declares GPU 0 with an unknown demand, so until its window settles it is an
+// unknown-demand occupant, and a native request for that GPU waits behind it
+// while it is busy. The settle gives W a figure (12000), and from then on the
+// request fits beside it -- but W stays busy, so no release follows, and no
+// exit or Apply either. Only the settle can tell the request.
+func TestWSLSettleReasksABlockedNativeRequest(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	n := baseSpec("N", "n")
+	n.GPUs = []SpecGPU{{Index: 0, VRAMMB: 6000}}
+	n.AdmissionWaitTimeoutSeconds = 0
+	o := newWSLExecOwner(t, f, n)
+	vm := &vmVRAMScript{vm: map[int]int{0: 12000}}
+	vm.install(o.m)
+	wSpec := wslVRAMSpec("W", 0) // declares GPU 0, demand unknown
+	w := liveWSL(wSpec, 4242, StateRunning)
+	w.inFlight = 1 // busy: a waiter, never a victim
+	o.specs["W"] = w
+	o.allowedPairs = allowPairs("N", "W")
+	o.cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 24000}}
+	o.wslWindow = &wslStartWindow{proc: w.proc}
+	nst := o.specs["N"]
+	nst.pending = []*ensureWaiter{{reply: make(chan ensureOutcome, 1), queuedAt: time.Now()}}
+
+	o.admitAndStart("N")
+	if nst.proc != nil {
+		t.Fatalf("N started beside a busy unknown-demand occupant: %s", nst.state)
+	}
+	measureNow(t, o) // W's settle: {0:12000}
+	if o.wslWindow != nil || !maps.Equal(w.measuredVRAM, map[int]int{0: 12000}) {
+		t.Fatalf("window %+v, W measured %v: want it settled at {0:12000}", o.wslWindow, w.measuredVRAM)
+	}
+	if nst.proc == nil {
+		t.Errorf("N is %s after W's settle made room for it (12000+6000 <= 24000): the settle re-asked nothing", nst.state)
+	}
+}

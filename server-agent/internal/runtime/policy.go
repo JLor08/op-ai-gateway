@@ -377,7 +377,7 @@ type Decision struct {
 	// WaitOnWSLStart is set only together with Wait, and only when a wsl
 	// candidate waits behind another wsl start's open VRAM window
 	// (PolicySnapshot.WSLStartInFlight). The window's close ends it, and the
-	// owner re-asks such a spec when it does (owner.wakeWSLStartWaiters).
+	// owner re-asks such a spec when it does (owner.wakeOnWSLSettle).
 	WaitOnWSLStart bool
 	// WaitOnGrace is set only together with Wait, and only when this Wait would
 	// have been a non-Wait (an OK, or an Evict) had NOTHING been grace-protected:

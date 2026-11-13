@@ -1526,7 +1526,7 @@ type specState struct {
 	// verdict was a Wait behind another wsl start's VRAM window
 	// (Decision.WaitOnWSLStart). The window's close is what ends it, and
 	// nothing else announces that close, so it re-asks exactly these specs
-	// (wakeWSLStartWaiters). admitAndStart rewrites it on every verdict, like
+	// (wakeOnWSLSettle). admitAndStart rewrites it on every verdict, like
 	// waitingOnRAM.
 	waitingOnWSLStart bool
 
@@ -3254,7 +3254,7 @@ func (o *owner) admitAndStart(specID string) {
 // carried out only when mayEvict holds. A re-ask with mayEvict false starts the
 // spec only into room that is free now and otherwise leaves it as it is,
 // queued and evicting nothing, like a Wait: the shape a wake needs for a spec
-// whose own re-ask must never drain another (wakeWSLStartWaiters).
+// whose own re-ask must never drain another (wakeOnWSLSettle).
 func (o *owner) admitAndStartWith(specID string, mayEvict bool) {
 	if o.closing {
 		// Never start (or restart) anything once shutdown has begun -- a
@@ -4002,8 +4002,9 @@ func realRAM(v int) int {
 // window -- the first dispatched after the window's process passed its probe --
 // settles it (settleWSLWindow): the VM's growth since the baseline becomes that
 // process's attribution and measured VRAM. Settled or not, the window is then
-// closed, so the wsl starts that waited for it are re-asked
-// (wakeWSLStartWaiters): no exit, release or sample would announce that.
+// closed, so the wsl starts that waited for it, and every spec with a queued
+// request or a pin, are re-asked (wakeOnWSLSettle): no exit, release or sample
+// would announce that.
 func (o *owner) applyMeasurement(c cmdMeasured) {
 	o.measuring = false
 	landed := false
@@ -4096,7 +4097,7 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		o.wakeAdmission(wantsHostSampleWake)
 	}
 	if settled {
-		o.wakeWSLStartWaiters()
+		o.wakeOnWSLSettle()
 	}
 	if o.remeasure {
 		o.remeasure = false
@@ -4330,7 +4331,15 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			// its attribution on the GPUs it is charged on, each of which the
 			// max rule above has raised to at least that. An attribution on a
 			// GPU it is not charged on stays in the remainder (wslRemainder).
-			for g, mb := range byGPU {
+			// The open window's own process has no attribution yet, but its
+			// demand already covers its growth so far, up to that demand: its
+			// provisional attribution (provisionalWSLAttribution), so that
+			// growth is not charged a second time as remainder.
+			counted := byGPU
+			if w := o.wslWindow; w != nil && w.proc == st.proc {
+				counted = provisionalWSLAttribution(vmVRAM, w, gpus)
+			}
+			for g, mb := range counted {
 				if _, ok := gpus[g]; ok {
 					if attributedMB == nil {
 						attributedMB = make(map[int]int, len(byGPU))
@@ -6005,7 +6014,7 @@ func (o *owner) wakeAdmission(want func(*specState) bool) {
 }
 
 // wakeAdmissionWith is wakeAdmission with the ask made for each selected spec
-// in that order: reask, or a narrower one (wakeWSLStartWaiters).
+// in that order: reask, or a narrower one (wakeOnWSLSettle).
 func (o *owner) wakeAdmissionWith(want func(*specState) bool, ask func(id string)) {
 	candidates := make([]wakeCandidate, 0, len(o.specs))
 	for id, st := range o.specs {

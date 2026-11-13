@@ -312,6 +312,38 @@ func (o *owner) settleWSLWindow(w *wslStartWindow, c cmdMeasured) (landed bool) 
 	return true
 }
 
+// provisionalWSLAttribution is what the open window w's own process is taken to
+// account for of the VM's figure vm while w is open, against the remainder
+// only: per GPU it is charged on (charged, its RunningProc.GPUs), its growth so
+// far -- the window's delta (wslDelta) from w's baseline and credit -- capped
+// at that charge. nil for a void window, whose delta is known to be wrong.
+//
+// WHY. Until the window settles the process has no attribution, so it is
+// charged its demand, while its growth is already in the VM's figure; left
+// whole in the remainder, the same memory would be charged twice, and a native
+// candidate on a shared GPU would wait, or evict, for room that exists. Capped
+// at the charge, the figure keeps the invariant: the remainder is reduced by
+// no more than the process is charged, so the sum admission sees on a GPU
+// stays at least what the VM holds there. Whatever the process holds beyond
+// its demand stays in the remainder until the settle attributes it.
+func provisionalWSLAttribution(vm map[int]int, w *wslStartWindow, charged map[int]int) map[int]int {
+	if w.void {
+		return nil
+	}
+	var out map[int]int
+	for g, mb := range wslDelta(vm, w.baseline, w.exitedCredit) {
+		c, ok := charged[g]
+		if !ok || c <= 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[int]int, len(charged))
+		}
+		out[g] = min(mb, c)
+	}
+	return out
+}
+
 // onGPUs keeps the entries of byGPU on the GPUs gpus names, nil when none is
 // left.
 func onGPUs(byGPU map[int]int, gpus []SpecGPU) map[int]int {
@@ -360,22 +392,33 @@ func (o *owner) noteWSLExit(proc *runningProc) {
 	delete(o.wslAttrib, proc)
 }
 
-// wakeWSLStartWaiters is the wake a window's close causes (applyMeasurement):
-// every wsl spec that waited for the window (wantsWSLStartWake) is asked again,
-// oldest request first.
+// wakeOnWSLSettle is the wake a window's close by its settling measurement
+// causes (applyMeasurement). Nothing else announces that close -- no exit,
+// release or sample -- and two kinds of spec may have waited for it:
 //
-// The window held back starts that would otherwise have gone ahead, and its
-// close is announced by no exit, release or sample, so it re-asks them all --
-// including a force_running spec with no request, which every other event wake
-// leaves out (wantsWakeAfterStart). That one may only start into room that is
-// free now (admitAndStartWith, mayEvict false): the narrowing exists because
-// two force_running specs that cannot run together would evict each other at
-// load speed if a wake let them evict, and a re-ask that cannot evict cannot
-// do that. Without it, such a spec waiting behind a window would stay down
-// until an unrelated release, exit or Apply, although nothing else stood in
-// its way. A spec with a request or a pin is asked as any event wake asks it.
-func (o *owner) wakeWSLStartWaiters() {
-	o.wakeAdmissionWith(wantsWSLStartWake, func(id string) {
+//   - the wsl starts the window held back (wantsWSLStartWake), all of them,
+//     including a force_running spec with no request, which every other event
+//     wake leaves out (wantsWakeAfterStart). That one may only start into room
+//     that is free now (admitAndStartWith, mayEvict false): the narrowing exists
+//     because two force_running specs that cannot run together would evict
+//     each other at load speed if a wake let them evict, and a re-ask that
+//     cannot evict cannot do that. Without it, such a spec waiting behind a
+//     window would stay down until an unrelated release, exit or Apply,
+//     although nothing else stood in its way;
+//   - any spec with a queued request or a pin (wantsWakeAfterStart), native
+//     ones included: the settle changes what the window's process is charged.
+//     An unknown demand becomes its attribution, a known occupant at last, so
+//     a request that waited behind an unknown-demand occupant may fit now, and
+//     nothing else would re-ask it while that occupant stays busy (or, with an
+//     admission_wait_timeout of 0, ever). The narrowing is wakeAfterStart's, so
+//     this wake, once per start, cannot cause an eviction storm.
+//
+// One pass, oldest request first; a spec in both sets is asked once, as a
+// spec with a request or a pin is asked by any event wake.
+func (o *owner) wakeOnWSLSettle() {
+	o.wakeAdmissionWith(func(st *specState) bool {
+		return wantsWSLStartWake(st) || wantsWakeAfterStart(st)
+	}, func(id string) {
 		if st := o.specs[id]; st != nil && !wantsWakeAfterStart(st) {
 			o.reaskWith(id, false)
 			return
@@ -384,9 +427,9 @@ func (o *owner) wakeWSLStartWaiters() {
 	})
 }
 
-// wantsWSLStartWake is wakeWSLStartWaiters' selection rule: a wsl spec whose
-// last verdict was a Wait behind a window (specState.waitingOnWSLStart) and
-// that still wants up (wantsWake).
+// wantsWSLStartWake selects, for wakeOnWSLSettle, a wsl spec whose last
+// verdict was a Wait behind a window (specState.waitingOnWSLStart) and that
+// still wants up (wantsWake).
 func wantsWSLStartWake(st *specState) bool {
 	return st.waitingOnWSLStart && wantsWake(st)
 }
