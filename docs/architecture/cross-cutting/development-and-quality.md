@@ -32,9 +32,22 @@ dials `/v1/audio/transcriptions/live` with `Expect: 100-continue` (load-bearing,
 `liveBodyCopyLoop` reads the body during the upstream dial (#331), and a client that waits for the
 SSE `200` before sending more audio deadlocks. On Go 1.27 every live-transcription and voice chat
 WebSocket test times out. There is no GODEBUG for it, and dropping the `Expect` header instead
-breaks the early-refusal paths. Move to Go 1.27+ once a Go release takes the body lock out of
-that header-write path; the `TestVoice*` and `TestLiveTranscriptionLoopback*` tests in
-`internal/gateway` show when it is safe.
+breaks the early-refusal paths. A gateway-side workaround was ruled out (#387): the relay must
+read the body during the dial (#331), a body read parked on the wire cannot be released without
+cancelling the request context, and writing the `200` before the dial would turn every post-dial
+refusal into an in-band error. The server-agent is not affected, because the gateway never sends
+it `Expect: 100-continue`.
+
+Go 1.27 is therefore refused explicitly (#387). `cmd/gateway/toolchain_guard_go127.go` and
+`internal/gateway/toolchain_guard_go127_test.go` carry a `//go:build go1.27` constraint and
+reference an undefined identifier that names the issue, so on Go 1.27 the gateway binary and
+the `internal/gateway` tests fail to compile at once instead of shipping the deadlock or hanging
+until the test timeout. A newer local Go wins over a `toolchain` line in `go.mod`, so that line
+cannot pin downward. Build, test and lint with `GOTOOLCHAIN=go1.26.5` on such a machine.
+`TestFullDuplexExpectContinueHeaderFlush` reproduces the regression with net/http alone. Move to
+Go 1.27+ once a Go release takes the body lock out of that header-write path: remove both guard
+files, and the canary plus the `TestVoice*` and `TestLiveTranscriptionLoopback*` tests in
+`internal/gateway` show whether it is safe.
 
 ## 2. Branching & pull requests
 
