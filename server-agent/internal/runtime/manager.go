@@ -963,6 +963,14 @@ func (o *owner) hostInfo() HostInfo {
 // concurrently, so the total bound is drainGrace+killGrace regardless of how
 // many specs are running, not their sum) and blocks until the owner
 // goroutine and every goroutine it spawned have fully exited. Idempotent.
+//
+// On a WSL host the bound is longer by up to wslHelperTimeout (10 s). A wsl
+// generation's stop goes through wsl.exe helper calls (wslControl), and so do
+// the UID lookup and the orphan sweep (proc_control.go); each call is bounded
+// by that timeout, and Close waits for the ones in flight. They run
+// concurrently, but the kill escalation's SIGKILL call to the scope comes
+// before its wsl.exe backstop, so a generation that ignored SIGTERM can take
+// up to one such call past drainGrace+killGrace to exit.
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {
 		m.postCmd(cmdClose{})

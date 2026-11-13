@@ -155,11 +155,23 @@ func TestAdmitWSLRAMWaitOnWSLVM(t *testing.T) {
 	if dec := Admit(snap, wslCandidate("cand", 5000)); !dec.Wait || !dec.WaitOnRAM || !dec.WaitOnWSLVM {
 		t.Errorf("VM pool full: %+v, want Wait, WaitOnRAM and WaitOnWSLVM", dec)
 	}
+	// A burst candidate is refused at once, and the refusal names the pool it
+	// would have waited on: the VM's, not the host's.
+	burst := snap
+	burst.NoEvict = true
+	if dec := Admit(burst, wslCandidate("cand", 5000)); !dec.NoCapacity || !strings.Contains(dec.Message, "WSL VM RAM") || strings.Contains(dec.Message, "host RAM") {
+		t.Errorf("burst on a full VM pool: %+v, want NoCapacity naming the WSL VM RAM pool", dec)
+	}
 
 	host := snap
 	host.WSLRAMBudgetMB, host.HostRAMBudgetMB = 64000, 10000
 	if dec := Admit(host, wslCandidate("cand", 5000)); !dec.Wait || !dec.WaitOnRAM || dec.WaitOnWSLVM {
 		t.Errorf("host pool full: %+v, want a RAM wait without WaitOnWSLVM", dec)
+	}
+	hostBurst := host
+	hostBurst.NoEvict = true
+	if dec := Admit(hostBurst, wslCandidate("cand", 5000)); !dec.NoCapacity || !strings.Contains(dec.Message, "host RAM") {
+		t.Errorf("burst on a full host pool: %+v, want NoCapacity naming host RAM", dec)
 	}
 
 	boot := snap

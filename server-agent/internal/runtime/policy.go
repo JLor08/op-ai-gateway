@@ -1358,6 +1358,10 @@ func noCapacityCause(dec Decision) string {
 		return "it would wait: " + dec.Message
 	case dec.WaitOnWSLStart:
 		return "it would wait for another WSL start to settle"
+	case dec.WaitOnWSLVM:
+		// Checked before WaitOnRAM, which is always set with it: the pool the
+		// candidate waits on is the WSL VM's, not the host's.
+		return "it would wait for RAM in the WSL VM RAM pool"
 	case dec.WaitOnRAM:
 		return "it would wait for host RAM"
 	case dec.WaitOnGrace:
