@@ -88,11 +88,11 @@ func clipText(s string, n int) string {
 	return s + "..."
 }
 
-// wslUserRefused reports whether user may not run anything in a distro: empty,
+// WSLUserRefused reports whether user may not run anything in a distro: empty,
 // root by name, or root by UID ("0", "00", ...), which wsl.exe -u accepts as
 // well. The one rule permitWSL and every helper call share, so no
 // gateway-chosen argv or env and no agent call ever reaches a root process.
-func wslUserRefused(user string) bool {
+func WSLUserRefused(user string) bool {
 	return user == "" || user == "root" || isZeroUID(user)
 }
 
@@ -139,7 +139,7 @@ func runWSLHelper(run wslRunner, pol WSLPolicy, distro string, env []string, com
 // runWSLHelperCtx is runWSLHelper under a deadline the caller sets: the RAM
 // sampler shares one, shorter, across a beat's calls (sampleWSL).
 func runWSLHelperCtx(ctx context.Context, run wslRunner, pol WSLPolicy, distro string, env []string, command ...string) ([]byte, error) {
-	if wslUserRefused(pol.User) {
+	if WSLUserRefused(pol.User) {
 		return nil, fmt.Errorf("runtime: no non-root WSL user is configured (runtime_wsl_user)")
 	}
 	return run(ctx, pol.Exe, wslHelperArgs(pol.User, distro, command...), env)
@@ -361,7 +361,7 @@ func (o *owner) maybeWarmWSL(specs []Spec) {
 		return
 	}
 	pol := o.policy.WSL
-	if pol.Exe == "" || wslUserRefused(pol.User) {
+	if pol.Exe == "" || WSLUserRefused(pol.User) {
 		return
 	}
 	for _, spec := range specs {

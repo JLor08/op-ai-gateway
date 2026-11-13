@@ -530,7 +530,7 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 	// Root is refused by name here; the launcher additionally never passes -u
 	// root, so the two cannot drift into letting a gateway-chosen command line
 	// run with UID 0. "0" is refused as well, since wsl.exe -u accepts a UID.
-	if wslUserRefused(w.User) {
+	if WSLUserRefused(w.User) {
 		return fmt.Errorf("runtime: no non-root WSL user is configured, refusing a wsl spec (set the agent's runtime_wsl_user / OP_AGENT_RUNTIME_WSL_USER to a non-root distro user)")
 	}
 	distro := spec.WSLDistro()

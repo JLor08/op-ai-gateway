@@ -117,16 +117,234 @@ func TestVersionRunCachedByStat(t *testing.T) {
 	}
 }
 
-func TestOnlyLlamaServerIsExecuted(t *testing.T) {
+func TestOnlyVersionedKindsAreExecuted(t *testing.T) {
 	var ran []string
 	run := func(_ context.Context, p string) (string, error) { ran = append(ran, p); return "", errors.New("boom") }
-	got := scanBinaries([]string{"/a/rpc-server", "/a/ggml-rpc-server.exe", "/a/LLAMA-SERVER.EXE", "/a/other"},
+	got := scanBinaries([]string{"/a/rpc-server", "/a/ggml-rpc-server.exe", "/a/LLAMA-SERVER.EXE", "/a/other", "/a/vllm"},
 		statFake(fakeFileInfo{}), run, map[string]cachedVersion{})
-	if len(ran) != 1 || ran[0] != "/a/LLAMA-SERVER.EXE" {
+	if len(ran) != 2 || ran[0] != "/a/LLAMA-SERVER.EXE" || ran[1] != "/a/vllm" {
 		t.Fatalf("executed %v", ran)
 	}
-	if got[0].Kind != "rpc_server" || got[1].Kind != "rpc_server" || got[2].Kind != "llama_server" {
+	if got[0].Kind != "rpc_server" || got[1].Kind != "rpc_server" || got[2].Kind != "llama_server" || got[4].Kind != "vllm" {
 		t.Fatalf("kinds: %+v", got)
+	}
+}
+
+func TestBinaryKindVLLM(t *testing.T) {
+	for p, want := range map[string]string{
+		"/opt/venv/bin/vllm":                           "vllm",
+		`C:\x\vllm.exe`:                                "vllm",
+		"wsl://Ubuntu-24.04/home/ai/venv/bin/vllm":     "vllm",
+		"wsl://Ubuntu-24.04/opt/llama/llama-server":    "llama_server",
+		"wsl://Ubuntu-24.04/opt/llama/ggml-rpc-server": "rpc_server",
+	} {
+		if got := binaryKind(p); got != want {
+			t.Errorf("%s: %s, want %s", p, got, want)
+		}
+	}
+}
+
+func TestParseVLLMVersion(t *testing.T) {
+	cases := []struct {
+		in, want string
+		ok       bool
+	}{
+		{"0.11.0\n", "0.11.0", true},
+		{"INFO 11-13 10:00:00 [__init__.py:216] Automatically detected platform cuda.\n0.11.1rc2.dev123+gabc1234\n", "0.11.1rc2.dev123+gabc1234", true},
+		{"v0.6.3.post1\nWARNING something\n", "0.6.3.post1", true},
+		{"Traceback ...\nModuleNotFoundError: No module named 'vllm'\n", "", false},
+	}
+	for _, c := range cases {
+		got, ok := parseVLLMVersion(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("%q: %q %v, want %q %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestNativeVLLMIsProbedWithLongTimeout(t *testing.T) {
+	var gotArgs []string
+	var left time.Duration
+	run := func(ctx context.Context, p string) (string, error) {
+		gotArgs = append(gotArgs, p)
+		dl, _ := ctx.Deadline()
+		left = time.Until(dl)
+		return "0.11.0\n", nil
+	}
+	got := scanBinaries([]string{"/opt/venv/bin/vllm"}, statFake(fakeFileInfo{size: 1}), run, map[string]cachedVersion{})
+	if len(gotArgs) != 1 || left < 50*time.Second {
+		t.Fatalf("ran %v, deadline in %v", gotArgs, left)
+	}
+	if got[0].Kind != "vllm" || got[0].Version != "0.11.0" || got[0].VersionSource != "agent" || got[0].Build != "" {
+		t.Fatalf("row: %+v", got[0])
+	}
+}
+
+// fakeWSL answers wsl.exe calls by their argv and records them.
+type fakeWSL struct {
+	running string
+	version map[string]string // linux path -> --version output
+	stat    string
+	calls   [][]string
+	envs    [][]string
+}
+
+func (f *fakeWSL) call(_ context.Context, _ string, args, env []string) ([]byte, error) {
+	f.calls = append(f.calls, args)
+	f.envs = append(f.envs, env)
+	if strings.Join(args, " ") == "--list --running --quiet" {
+		return []byte(f.running), nil
+	}
+	for i, a := range args {
+		switch a {
+		case "stat":
+			return []byte(f.stat), nil
+		case "--version":
+			return []byte(f.version[args[i-1]]), nil
+		}
+	}
+	return nil, errors.New("unexpected call")
+}
+
+func (f *fakeWSL) joined() []string {
+	var out []string
+	for _, c := range f.calls {
+		out = append(out, strings.Join(c, " "))
+	}
+	return out
+}
+
+func wslInventory(f *fakeWSL, cfg wslProbeConfig, allowed ...string) *binaryInventory {
+	b := newBinaryInventory(allowed, cfg)
+	b.wslRun = f.call
+	return b
+}
+
+const (
+	wslVLLM  = "wsl://Ubuntu-24.04/home/ai/venv/bin/vllm"
+	wslLlama = "wsl://Debian/opt/llama/llama-server"
+)
+
+func TestWSLEntryProbedOnlyWhenDistroRuns(t *testing.T) {
+	f := &fakeWSL{running: "Ubuntu-24.04\r\n", stat: "100:200:regular file\n", version: map[string]string{"/home/ai/venv/bin/vllm": "INFO log\n0.11.0\n"}}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, wslVLLM, wslLlama)
+	b.rescan(context.Background())
+	want := []string{
+		"--list --running --quiet",
+		"-d Ubuntu-24.04 -u ai --cd / --exec stat -L -c %s:%Y:%F -- /home/ai/venv/bin/vllm",
+		"-d Ubuntu-24.04 -u ai --cd / --exec /home/ai/venv/bin/vllm --version",
+	}
+	if got := f.joined(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("calls:\n%s", strings.Join(got, "\n"))
+	}
+	for _, c := range f.joined() {
+		if strings.Contains(c, "Debian") {
+			t.Fatalf("stopped distro addressed: %s", c)
+		}
+	}
+	for i, env := range f.envs {
+		if !containsStr(env, "WSL_UTF8=1") {
+			t.Fatalf("call %d env lacks WSL_UTF8: %v", i, env)
+		}
+	}
+	list, _ := b.pending()
+	if list == nil || len(*list) != 2 {
+		t.Fatalf("inventory: %+v", list)
+	}
+	r := (*list)[0]
+	if r.Path != wslVLLM || r.Kind != "vllm" || r.Version != "0.11.0" || r.VersionSource != "agent" {
+		t.Fatalf("ubuntu row: %+v", r)
+	}
+	if d := (*list)[1]; d.Path != wslLlama || d.Version != "" {
+		t.Fatalf("debian row: %+v", d)
+	}
+}
+
+func containsStr(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWSLStoppedDistroKeepsLastVersion(t *testing.T) {
+	f := &fakeWSL{running: "Ubuntu-24.04\n", stat: "100:200:regular file\n", version: map[string]string{"/home/ai/venv/bin/vllm": "0.11.0\n"}}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, wslVLLM)
+	b.rescan(context.Background())
+	f.running, f.calls = "", nil
+	b.rescan(context.Background())
+	if got := f.joined(); len(got) != 1 || got[0] != "--list --running --quiet" {
+		t.Fatalf("calls after stop: %v", got)
+	}
+	list, _ := b.pending()
+	if r := (*list)[0]; r.Version != "0.11.0" || r.VersionSource != "agent" {
+		t.Fatalf("row: %+v", r)
+	}
+}
+
+func TestWSLEntriesNotProbedWithoutExeOrUser(t *testing.T) {
+	for name, cfg := range map[string]wslProbeConfig{
+		"no exe":    {User: "ai"},
+		"root user": {Exe: "wsl.exe", User: "root"},
+		"no user":   {Exe: "wsl.exe"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeWSL{running: "Ubuntu-24.04\n"}
+			b := wslInventory(f, cfg, wslVLLM)
+			b.rescan(context.Background())
+			if len(f.calls) != 0 {
+				t.Fatalf("calls: %v", f.joined())
+			}
+			list, _ := b.pending()
+			if len(*list) != 1 || (*list)[0].Path != wslVLLM {
+				t.Fatalf("rows: %+v", list)
+			}
+		})
+	}
+}
+
+func TestMalformedWSLEntryNotListed(t *testing.T) {
+	f := &fakeWSL{}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, "WSL://Ubuntu-24.04/x", "wsl://Ubuntu-24.04\\x", "wsl:/Ubuntu/x", "/opt/l/other")
+	b.rescan(context.Background())
+	list, _ := b.pending()
+	if len(*list) != 1 || (*list)[0].Path != "/opt/l/other" {
+		t.Fatalf("rows: %+v", *list)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("calls: %v", f.joined())
+	}
+}
+
+func TestWSLStatCacheSkipsSecondProbe(t *testing.T) {
+	f := &fakeWSL{running: "Ubuntu-24.04\n", stat: "100:200:regular file\n", version: map[string]string{"/home/ai/venv/bin/vllm": "0.11.0\n"}}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, wslVLLM)
+	b.rescan(context.Background())
+	b.rescan(context.Background())
+	n := 0
+	for _, c := range f.joined() {
+		if strings.HasSuffix(c, "--version") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("--version ran %d times: %v", n, f.joined())
+	}
+}
+
+func TestWSLRPCServerInheritsSiblingPerDistro(t *testing.T) {
+	f := &fakeWSL{running: "Ubuntu-24.04\nDebian\n", stat: "1:2:regular file\n", version: map[string]string{"/opt/l/llama-server": llamaVersionOutput}}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"},
+		"wsl://Ubuntu-24.04/opt/l/llama-server", "wsl://Ubuntu-24.04/opt/l/rpc-server", "wsl://Debian/opt/l/rpc-server")
+	b.rescan(context.Background())
+	list, _ := b.pending()
+	if (*list)[1].Version != "0.9.0-dev" {
+		t.Fatalf("same-distro rpc: %+v", (*list)[1])
+	}
+	if (*list)[2].Version != "" {
+		t.Fatalf("other-distro rpc inherited: %+v", (*list)[2])
 	}
 }
 
@@ -367,7 +585,7 @@ func TestFailedVersionProbeBackoffIsCapped(t *testing.T) {
 // TestInventoryNextRetry: the inventory names the earliest pending retry, so
 // its loop rescans then rather than at the next full interval.
 func TestInventoryNextRetry(t *testing.T) {
-	b := newBinaryInventory([]string{"/opt/l/llama-server"})
+	b := newBinaryInventory([]string{"/opt/l/llama-server"}, wslProbeConfig{})
 	b.stat = statFake(fakeFileInfo{size: 1})
 	b.runVersion = func(context.Context, string) (string, error) { return "", errors.New("boom") }
 	before := time.Now()
@@ -470,7 +688,7 @@ func TestFailedProbeThenFileGoneLeavesNoRetry(t *testing.T) {
 		"directory": statFake(fakeFileInfo{mode: fs.ModeDir}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			b := newBinaryInventory([]string{"/opt/l/llama-server"})
+			b := newBinaryInventory([]string{"/opt/l/llama-server"}, wslProbeConfig{})
 			b.stat = statFake(fakeFileInfo{size: 1})
 			b.runVersion = func(context.Context, string) (string, error) { return "", errors.New("boom") }
 			b.rescan(context.Background())
@@ -489,7 +707,7 @@ func TestFailedProbeThenFileGoneLeavesNoRetry(t *testing.T) {
 // TestNextRetryIgnoresPathsNoLongerAllowed: a failed entry for a path the
 // allowlist no longer names is never rescanned, so it schedules nothing.
 func TestNextRetryIgnoresPathsNoLongerAllowed(t *testing.T) {
-	b := newBinaryInventory([]string{"/opt/l/llama-server"})
+	b := newBinaryInventory([]string{"/opt/l/llama-server"}, wslProbeConfig{})
 	b.cache["/opt/old/llama-server"] = cachedVersion{retryAt: time.Now().Add(-time.Hour), failures: 1}
 	if next, ok := b.nextRetry(); ok {
 		t.Fatalf("nextRetry = %v for a path outside the allowlist, want none", next)
@@ -499,7 +717,7 @@ func TestNextRetryIgnoresPathsNoLongerAllowed(t *testing.T) {
 // TestUntilNextScanHasAFloor: a retry already due never makes the rescan loop
 // wait less than a second.
 func TestUntilNextScanHasAFloor(t *testing.T) {
-	b := newBinaryInventory([]string{"/opt/l/llama-server"})
+	b := newBinaryInventory([]string{"/opt/l/llama-server"}, wslProbeConfig{})
 	b.cache["/opt/l/llama-server"] = cachedVersion{retryAt: time.Now().Add(-time.Hour), failures: 1}
 	if got := b.untilNextScan(); got < time.Second {
 		t.Fatalf("untilNextScan = %v with a retry overdue, want at least 1s", got)

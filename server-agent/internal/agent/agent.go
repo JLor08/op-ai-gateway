@@ -1048,7 +1048,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		hostInfo:        d.HostInfo,
 		gatewayFeatures: d.GatewayFeatures,
 		now:             time.Now,
-		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries),
+		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries, wslProbeConfig{Exe: cfg.RuntimeWSLExe, User: cfg.RuntimeWSLUser}),
 	}
 	if r, ok := d.Poster.(reporter); ok {
 		a.report = r

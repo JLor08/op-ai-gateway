@@ -3855,7 +3855,7 @@ func (o *owner) dispatchMeasurement() {
 // without WSL and without native measurers on dispatchMeasurement's
 // allocate-nothing path.
 func (o *owner) wslSamplable() bool {
-	return o.policy.WSL.Exe != "" && !wslUserRefused(o.policy.WSL.User)
+	return o.policy.WSL.Exe != "" && !WSLUserRefused(o.policy.WSL.User)
 }
 
 // wslLive reports whether any wsl generation is live, i.e. whether the beat
