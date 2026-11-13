@@ -439,6 +439,10 @@ type agentRuntimeReportSpec struct {
 	DeviceBackend string                      `json:"device_backend,omitempty"`
 	Cluster       *portal.AgentClusterHeadDTO `json:"cluster,omitempty"`
 	RPC           *portal.AgentRPCMemberDTO   `json:"rpc,omitempty"`
+	// Execution is the wsl execution block (AgentRuntimeSpecDTO's), omitted for
+	// a native spec like the DTO's. It carries a mode and a distro name, no
+	// secret, so a file-mode agent's report keeps it.
+	Execution *portal.AgentExecutionDTO `json:"execution,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

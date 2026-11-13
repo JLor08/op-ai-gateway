@@ -754,3 +754,39 @@ func TestIngestRuntimeReportKeepsInstanceKeysTyped(t *testing.T) {
 		}
 	}
 }
+
+// TestIngestRuntimeReportKeepsTheExecutionBlock pins that the stored file-mode
+// report keeps a wsl spec's execution block (mode and distro, no secret) as the
+// agent sent it, and that a native spec stores none -- the mirror's field is
+// omitempty, so an absent block is not invented on the way through the
+// sanitizer's re-parse.
+func TestIngestRuntimeReportKeepsTheExecutionBlock(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	const body = `{"source":"file","collected_at":"2026-11-13T09:00:00Z","config":{"router_listen":8081,"max_processes":2,"gpu_budgets":[],"specs":[` +
+		`{"id":"wsl","model":"m","upstream_model":"u","binary":"/usr/bin/x","args":[],"env":{},"gpus":[],"execution":{"mode":"wsl","wsl":{"distro":"Ubuntu-24.04"}}},` +
+		`{"id":"native","model":"m2","upstream_model":"u2","binary":"/usr/bin/x","args":[],"env":{},"gpus":[]}],"coresident":[]}}`
+	if err := srv.ingestRuntimeReport(ctx, "mock-host-qwen", json.RawMessage(body)); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	report, ok, err := srv.Routes.ServerRuntimeReportByServer(ctx, "mock-host-qwen")
+	if err != nil || !ok {
+		t.Fatalf("ServerRuntimeReportByServer ok=%v err=%v", ok, err)
+	}
+	var stored agentRuntimeReport
+	if err := json.Unmarshal([]byte(report.ReportJSON), &stored); err != nil {
+		t.Fatalf("canonical json not parseable: %v", err)
+	}
+	var cfg struct {
+		Specs []map[string]json.RawMessage `json:"specs"`
+	}
+	if err := json.Unmarshal(stored.Config, &cfg); err != nil || len(cfg.Specs) != 2 {
+		t.Fatalf("config specs = %d, err %v, want 2", len(cfg.Specs), err)
+	}
+	if got := string(cfg.Specs[0]["execution"]); got != `{"mode":"wsl","wsl":{"distro":"Ubuntu-24.04"}}` {
+		t.Errorf("wsl spec: stored execution = %q, want the block the agent sent", got)
+	}
+	if v, present := cfg.Specs[1]["execution"]; present {
+		t.Errorf("native spec: stored execution = %s, want the key absent", v)
+	}
+}
