@@ -2253,6 +2253,14 @@ the `--` form, which runs `$SHELL -c`. The one shell the agent ever starts in a
 distro is its own fixed RAM-sampling script (below), with agent-built unit names
 as positional arguments, never spliced into the program text.
 
+**Every call names its working directory.** Without `--cd`, `wsl.exe` starts the
+command in the translation of the caller's Windows working directory, the agent's,
+which need not map into the distro at all (the drive mounts can be turned off,
+below) and then fails or prints a notice on stdout. The launch passes the spec's
+`work_dir`; every agent helper call (the UID lookup, the scope signals, the orphan
+sweep, the RAM sampler) is `wsl.exe -d <distro> -u <runtime_wsl_user> --cd / --exec
+…`, since `/` needs no translation and exists in every distro.
+
 **The unit name** is `opagent-` plus an 8-hex-character nonce drawn once per agent
 run, the instance key (§6.1; `S`, or `S#k` with the `#` written `_`) and the
 generation of the spec's log, which is unique for the agent's lifetime. Anything
@@ -2265,7 +2273,7 @@ tell this run's units from an earlier run's.
 manager's bus through `XDG_RUNTIME_DIR=/run/user/<uid>`, so a start needs the
 user's UID in its distro, and asking is a `wsl.exe` call that can take seconds
 (a cold VM boots). §5.5 forbids that on the owner, so the lookup
-(`wsl.exe -d D -u U --exec id -u`, bounded to 10 s) runs on its own goroutine, at
+(`wsl.exe -d D -u U --cd / --exec id -u`, bounded to 10 s) runs on its own goroutine, at
 most one in flight per distro, and posts its answer back. A `wsl` instance whose
 distro's UID is not cached yet **waits** before admission: queued, its state
 untouched, no `last_error`, nothing evicted, and the answer re-asks it. A **burst**
@@ -2274,11 +2282,17 @@ is refused at once with `ErrInstanceNoCapacity` and the lookup still runs, so th
 gateway's next attempt finds the UID cached. A failed lookup is a `start_failed`
 with the generic `last_error` `runtime: could not resolve the uid of
 runtime_wsl_user in the WSL distro; see the agent log` and the ordinary crash
-backoff, whose retry asks again (failures are never cached); the distro and the
-lookup's error text go to the agent's own log only, and the configured user is
-logged nowhere. When WSL is configured,
-the first `applyConfig` starts the lookup for every allowed distro before it admits
-anything, so a start usually finds its UID already cached.
+backoff, whose retry asks again (failures are never cached). The `last_error`
+names neither the distro nor the user; the agent's own Warn carries the distro and
+what `wsl.exe` or `id -u` printed, and its text names the setting, not the user.
+The configured user is no secret, though: the resolved command the log stream
+reports (§14.7, below) shows `-d <distro>` and `-u <runtime_wsl_user>` by design,
+because it is what ran. **Each `applyConfig` warms the distros its `wsl` specs
+name**: for every allowed distro a `wsl` spec in the document names and no earlier
+document did, it starts the lookup before it admits anything, so a start usually
+finds its UID already cached. A distro no spec names is never called into, because
+a call into a distro starts the WSL VM: an agent whose document runs nothing in WSL
+does not boot the VM at every start.
 
 **The environment** is the spec's expanded `env` and the agent's base and GPU
 variables (§3.2, §3.3), set on `wsl.exe`'s environment, plus four entries the agent
@@ -2308,8 +2322,9 @@ agent-local paths out of what does.
 **What the log view shows.** The runtime log is `wsl.exe`'s stdout and stderr,
 which carry the Linux process's own streams. The resolved command (§14.7) reports
 the `wsl.exe` path as the binary, the **whole** wrapper argv with the operator's
-own arguments masked at their shifted positions, the Linux work dir, and the
-environment including what the launcher added (`WSLENV` among it).
+own arguments masked at their shifted positions (so the distro after `-d` and
+`runtime_wsl_user` after `-u`), the Linux work dir, and the environment including
+what the launcher added (`WSLENV` among it).
 
 #### Lifecycle mapping
 
@@ -2354,8 +2369,9 @@ own error text is in the runtime log. A signal death returns the raw signal numb
 **The orphan sweep.** A unit outlives its agent when the agent dies without
 stopping it (a crash, a kill, a host-side update; the agent puts its children in
 no Job Object): its workload still holds the GPU, the RAM and the
-port inside the VM, invisible to the new run. So once per agent lifetime, when a
-distro's first UID lookup answers, the agent lists
+port inside the VM, invisible to the new run. So once per agent lifetime per
+distro, when the distro's first UID lookup answers (the lookup the first document
+whose `wsl` specs name that distro starts), the agent lists
 `systemctl --user list-units --plain --no-legend --all --full 'opagent-*.scope'`
 there (`--full`, so no long name is ellipsized) and SIGKILLs a scope only when its
 name parses back to exactly the shape the agent builds
@@ -2367,14 +2383,19 @@ is not one the agent made, so it is the operator's and is left alone, and so are
 scopes that are `inactive` or `failed` (they hold no process). SIGKILL, not a
 graceful stop: an orphan has nobody waiting for its answers. A distro unreachable
 at startup is swept as soon as a later start reaches it, and this run's units are
-never touched, because each carries its nonce.
+never touched, because each carries its nonce. A distro no `wsl` spec names is not
+called into and so not swept; what an earlier run left there is swept once a
+document names that distro again.
 
 #### RAM: the scope's cgroup, and the VM's own pool
 
 **The source is the scope's cgroup, not the pid.** On the measurement beat (§5.3)
 the agent makes one `wsl.exe --exec sh -c <fixed script> sh <unit…>` call per
 distro with live `wsl` generations, off the owner, all distros under one shared 2 s
-deadline (`wslSampleTimeout`). The script prints, per unit, `memory.current` and
+deadline (`wslSampleTimeout`). The script first prints a sentinel line,
+`opagent-sample v1`, because `wsl.exe` may print notices of its own on stdout ahead
+of the command's output: everything before that line is ignored, and an answer
+without it is no answer. It then prints, per unit, `memory.current` and
 `inactive_file` from `…/user@<uid>.service/app.slice/<unit>.scope`, and the VM's
 `MemTotal` and `MemAvailable` from `/proc/meminfo`. A unit's figure is
 `memory.current − inactive_file`, the `docker stats` definition, so the
@@ -2498,8 +2519,12 @@ adapter level is additive and reversible. So:
   settles re-asks every spec that waited for it, a `force_running` one with no
   request included, but such a spec may only start into room that is free now (it
   may not evict), so two `force_running` specs that cannot run together cannot evict
-  each other at load speed. A window that closes because its own process exited is
-  followed by that exit's ordinary admission wake.
+  each other at load speed. The settle also re-asks every spec with a queued request
+  or a pin, native ones included (`wakeAfterStart`'s narrowing, once per start): it
+  changes what the start is charged, an unknown demand becoming its attribution, so
+  a request that waited behind it may fit now, and nothing else would re-ask it
+  while the start stays busy. A window that closes because its own process exited
+  is followed by that exit's ordinary admission wake.
 - **An exit during a window corrects it, it does not wait for it.** Manual stops,
   idle unloads, evictions, removals and crashes go ahead at once. The window's own
   process exiting closes it without an attribution. An attributed process exiting
@@ -2511,7 +2536,8 @@ adapter level is additive and reversible. So:
   nothing both when the VM holds nothing and when the read failed, so a reading
   counts as **failed** where the VM cannot be empty: no worker found while a `wsl`
   generation is live, or nothing held while a live one is attributed VRAM, and at a
-  settle also nothing held after a baseline that held something. A failed baseline
+  settle also nothing held at all, since a start that declares a GPU and has passed
+  its probe holds its weights. A failed baseline
   opens the window **void**, and a failed settle leaves the instance with **no**
   attribution: a delta against a failed reading would credit one instance with the
   whole VM, written back as its demand floor and refused for good once it exceeds
@@ -2533,13 +2559,33 @@ remainder is never a victim (evicting nothing frees it) and never part of the
 own-demand refusal. A negative remainder is no credit: the attributions stand,
 under ADR-084's max rule. An attribution that came out **high** over-credits only
 its own instance's eviction, and the candidate it was evicted for is admitted on the
-next fresh reading, after the exit. A reading that is detectably failed at
-admission falls back to the **last good** one rather than to none, since charged
-from a failed read the remainder would vanish and the VM's VRAM would read as free.
-That last good reading is kept across periods of WSL activity, so a fallback can be
-stale: one that is higher than what the VM now holds charges a **phantom
-remainder**, which can make a native candidate wait, or evict an idle occupant,
-until a fresh good reading lands ([§11.4 of the risk
+next fresh reading, after the exit.
+
+**While a window is open**, its process has no attribution yet and is charged its
+demand, while its growth since the baseline is already in the VM's figure. Left
+whole in the remainder, that growth would be charged twice, and a native candidate
+on a shared GPU would wait for room that exists, or, between the start's first
+passing probe and its settle (when the process is no longer Starting and so is a
+victim), evict the idle `wsl` model itself although the two fit together. So the
+window's process has a **provisional attribution**, used against the remainder
+only: the window's delta so far (from its baseline and credit), on each GPU it is
+charged on, capped at that charge (`provisionalWSLAttribution`). Its charge stays
+its demand, so the sum admission sees is still at least what the VM holds; whatever
+it holds beyond its demand stays in the remainder until the settle attributes it. A
+void window gets none.
+
+**A failed reading falls back to this period's last good one.** A reading that is
+detectably failed at admission falls back to the **last good** one rather than to
+none, since charged from a failed read the remainder would vanish and the VM's VRAM
+would read as free. That reading belongs to the current **period of WSL activity**,
+a stretch in which at least one `wsl` generation is live: it is forgotten when the
+last `wsl` generation exits (or an admission finds none live), and a measurement
+that lands after its period ended does not record its reading. A later period whose
+first reading fails, as a CPU-only `wsl` generation's does while its VM boots and
+shows no worker yet, therefore falls back to nothing, which is what the booting VM
+holds, never to an earlier period's figure. Within a period the fallback can be
+older than the VM's state, for instance from before a GPU `wsl` generation exited,
+and then over-charges until the next good reading ([§11.4 of the risk
 register](../11-risks-and-technical-debt.md#114-deliberate-design-acceptances)).
 
 **The VRAM bootstrap is gated per spec.** The one-shot bootstrap eviction (§5.3)
@@ -2558,9 +2604,10 @@ already stored as `wsl`, which must stay editable. In WSL mode it adds a **distr
 field and labels the binary and work-dir fields as Linux paths, and it warns, once
 the agent's report has loaded, when the agent does not declare the feature: the
 spec is saved but not pushed. The mapping table marks a `wsl` spec's VRAM total
-with a **WSL** chip and the caption "VRAM attributed from the WSL VM", and the
-editor's measured-VRAM line carries the same label, so an operator can tell an
-attributed figure from a per-pid reading. German and English strings ship together.
+with a **WSL** chip and, once a figure has been measured, the caption "VRAM
+attributed from the WSL VM"; the editor's measured-VRAM line carries the same label
+when it shows a measured figure. An operator can tell an attributed figure from a
+per-pid reading, and an estimate alone is never labelled as attributed. German and English strings ship together.
 
 #### What the host needs
 

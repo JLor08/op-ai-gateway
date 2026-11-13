@@ -12430,7 +12430,8 @@ on.
 - **(a) An execution mode on the spec, negotiated and withheld.** The spec gains an optional `execution` block (`{"mode": "wsl", "wsl":
   {"distro": …}}`), absent for a native spec, so a native document is byte-for-byte unchanged; the gateway stores `execution_mode` and `wsl_distro`
   (migration 109) and validates them at the spec PUT with four `400`s. The block is launch-affecting. The agent drops a block it cannot run at parse
-  (an unknown mode, a bad distro name, a `wsl` cluster member or head). **The gateway never sends a `wsl` spec to an agent that does not declare
+  (an unknown mode, a bad distro name, a `wsl` cluster member or head). A distro name is `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` on both sides, so it
+  never starts with `-` and cannot read as a `wsl.exe` option. **The gateway never sends a `wsl` spec to an agent that does not declare
   `runtime_exec_wsl`**, because an older agent ignores the block and would run the Linux path natively; it holds the document with
   `503 runtime_config.agent_features_pending` while the declaration is unknown.
 - **(b) A local policy of its own, fail-closed.** `runtime_wsl_exe`, `runtime_wsl_user`, `runtime_wsl_allowed_distros` and
@@ -12441,16 +12442,20 @@ on.
   gateway-chosen argv or environment runs as root**: the first Linux process inherits every `WSLENV` variable, so a root wrapper would hand the
   gateway root through `LD_PRELOAD`. `root` and UID 0 are refused as the user, the UID lookup refuses a UID of 0, and every helper call refuses a
   refused user again. Every call is `--exec`, never the shell form; the one shell is the agent's fixed RAM script with unit names as positional
-  arguments. The environment crosses through `WSLENV` (`/u`), with `CUDA_DEVICE_ORDER=PCI_BUS_ID` beside any `CUDA_VISIBLE_DEVICES`,
+  arguments. Every call names its working directory, `--cd /` for every helper call, so `wsl.exe` never translates the agent's Windows working
+  directory, which need not map into the distro. The environment crosses through `WSLENV` (`/u`), with `CUDA_DEVICE_ORDER=PCI_BUS_ID` beside any `CUDA_VISIBLE_DEVICES`,
   `PYTHONUNBUFFERED=1`, `XDG_RUNTIME_DIR=/run/user/<uid>` and `WSL_UTF8=1`. The UID is looked up off the owner, one lookup per distro in flight; a
-  `wsl` instance waits for it, and a burst instance is refused at once.
+  `wsl` instance waits for it, and a burst instance is refused at once. Each document starts the lookup of the allowed distros its `wsl` specs
+  name, once per distro, before it admits anything; a document without `wsl` specs calls into no distro, so it never boots the WSL VM.
 - **(d) Stops go through the scope; a sweep removes what a dead agent left.** Terminate is `systemctl --user kill --signal=SIGTERM <unit>.scope`,
   the kill-grace escalation SIGKILLs the scope and then kills `wsl.exe` as a backstop, all off the owner and bounded to 10 s per call. The unit name
-  carries the generation, so a late signal never reaches a successor, and an agent-run nonce, so at a distro's first UID answer the agent SIGKILLs
+  carries the generation, so a late signal never reaches a successor, and an agent-run nonce, so at a distro's first UID answer (a distro a
+  document's `wsl` specs name) the agent SIGKILLs
   every active scope whose name parses back to exactly that shape with another run's nonce; any other `opagent-*` unit is the operator's and is
   left alone. A `wsl.exe` exit of `-1` gets a `last_error` that says `wsl.exe` could not run the workload.
 - **(e) RAM is the scope's cgroup, against a second pool.** One `sh -c <fixed script>` call per distro per beat reads each scope's
-  `memory.current − inactive_file` (the `docker stats` figure) and the VM's meminfo; the `wsl.exe` pid reaches no native measurer. The host pool is
+  `memory.current − inactive_file` (the `docker stats` figure) and the VM's meminfo, behind a sentinel line (`opagent-sample v1`) before which
+  anything `wsl.exe` prints itself is ignored; the `wsl.exe` pid reaches no native measurer. The host pool is
   unchanged. A **VM pool** is added, `VM MemAvailable + what the scopes held in the same sample − OP_AGENT_WSL_RAM_RESERVE_MB` (default 1024), which a
   `wsl` candidate must fit as well, drawing victims only from `wsl` processes; it is checked **before** the host pool, narrow before broad, and a
   demand above the VM's `MemTotal` minus the reserve is terminal. A `wsl` start that waits on the VM pool with nothing `wsl` live asks for a VM-only
@@ -12461,11 +12466,16 @@ on.
   passing health probe; the growth since the baseline, on the spec's declared GPUs, is its attribution and its measured VRAM. GPU-declaring `wsl`
   starts are **serialized** behind the window, evicting nothing while they wait; **stops never are**: an exit during a window adds the exiting
   process's attribution back as credit, or voids the window when it had none. A reading that is detectably not the VM's (no worker while a `wsl`
-  generation is live, or nothing held while one is attributed) never ends a delta: a failed baseline opens the window void, a failed settle
-  attributes nothing.
+  generation is live, or nothing held while one is attributed, or nothing held at all at a settle) never ends a delta: a failed baseline opens
+  the window void, a failed settle attributes nothing. The settle re-asks the `wsl` starts that waited for the window and every spec with a
+  queued request or a pin, native ones included, since it changes what the start is charged.
 - **(g) The remainder is charged, and it is what admission relies on.** At every admission, from that admission's reading,
   `R(g) = VM(g) − Σ attributions charged on g` (floored at 0) is added to rule 3's sum. With every attribution charged as `max(attribution,
-  demand)`, the sum admission sees on a GPU is at least what the VM holds there. A detectably failed reading falls back to the last good one.
+  demand)`, the sum admission sees on a GPU is at least what the VM holds there. While a window is open, its process, charged its demand, has a
+  **provisional attribution** against the remainder only: the window's delta so far, capped at that demand on each GPU it is charged on (none for
+  a void window), so its growth is not charged twice and the sum still covers the VM. A detectably failed reading falls back to the last good one
+  of the current period of WSL activity; the reading is forgotten when the last `wsl` generation exits, so a later period never charges an
+  earlier one's figure.
 - **(h) The VRAM bootstrap is gated per spec.** The one-shot bootstrap eviction is granted only where the spec's VRAM can be measured: for a `wsl`
   spec that needs the worker finder as well as the measurer.
 - **(i) The agent runs as the distro-owning Windows user, never LocalSystem**, as a service under that account or interactively in its session.
@@ -12490,15 +12500,17 @@ on.
 **Consequence:**
 
 - **The accounting invariant holds in aggregate; per-workload figures are best effort.** A per-workload VRAM figure is a start delta, not a live
-  reading, and growth after settling is visible only as remainder. While a window is open its process is charged its demand and its live usage also
-  sits in the remainder, and a generation whose window was void (or who started unmeasurable) stays charged its demand plus its share of the
-  remainder for its life, so native starts on that GPU can wait or evict more than strictly necessary; with an unknown demand such a generation is an
-  unknown-demand occupant for its life
+  reading, and growth after settling is visible only as remainder. While a window is open its growth beyond its demand sits in the remainder
+  beside that demand (all of it, for a void window), and a generation whose window was void (or who started unmeasurable) stays charged its
+  demand plus its share of the remainder for its life, so native starts on that GPU can wait or evict more than strictly necessary; with an
+  unknown demand such a generation is an unknown-demand occupant for its life
   ([ADR-032](#adr-032--known-vram-demand-outranks-unknown-the-unknown-side-blocks-never-evicts)).
 - **Every `vmwp` is summed**, so another Hyper-V VM's GPU memory is charged as WSL remainder.
 - **A failed read that looks like an empty VM cannot be detected.** At the very first start, with nothing `wsl` live, a failed baseline reads as an
   empty VM, and the attribution then includes whatever the VM already held; it is written back as `vram_measured_mb`, a demand floor under
   [ADR-084](#adr-084--the-effective-resource-value-is-maxmeasured-manual-the-manual-figure-is-a-floor-and-the-per-spec-vram-lock-is-retired).
+  Within a period of WSL activity, a fallback to the last good reading can be older than the VM's state (from before a `wsl` generation
+  exited) and over-charges until the next good reading.
 - **Exit causes stay ambiguous.** `wsl.exe` returns the raw signal number for a signal death, so `exit(9)` and a SIGKILL both read `9`, and no
   OOM-kill signature is read from the scope.
 - **None of it runs in CI on Windows.** The logic is untagged and unit-tested on Linux against a fake `wsl.exe`; the Toolhelp and PDH syscalls,
