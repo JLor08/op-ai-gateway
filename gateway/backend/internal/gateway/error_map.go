@@ -31,6 +31,12 @@ const (
 	// a mask is sent -- a source image that is not a readable PNG or JPEG, which
 	// is all sd-server's edit route takes and all the size check can read.
 	imagesEditUnsupportedFormat = "images.edit_unsupported_format"
+	// imagesSourceUnsupported: an edit bound for an sglang_omni target names its
+	// source in a way that target would resolve on its own -- a url or url[] field,
+	// an image or image[] part that is no uploaded file -- or carries a part whose
+	// Content-Disposition the gateway and the upstream could read differently
+	// (sglangOmniEditPartHeader). It is answered after routing, with a usage row.
+	imagesSourceUnsupported = "images.source_unsupported"
 )
 
 // errRow is one (sentinel -> HTTP response) mapping row consumed by
