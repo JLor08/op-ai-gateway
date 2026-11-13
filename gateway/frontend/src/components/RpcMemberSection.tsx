@@ -252,7 +252,9 @@ function mbValue(mb: number): string {
   return mb > 0 ? String(mb) : '';
 }
 
-// The columns of the running members' table. Bind mismatch and breaches show
+// The columns of the running members' table. The head server and model are
+// the parts of the name, so the table can sort and filter by them; a member
+// whose name names no head shows a dash in both. Bind mismatch and breaches show
 // as chips beside the state; the spec id and the RPC protocol are columns
 // hidden by default.
 function memberStatusColumns(
@@ -266,6 +268,20 @@ function memberStatusColumns(
       value: memberName,
       render: (row) => <RpcMemberName row={row} variant="body2" />,
       filter: 'text',
+    },
+    {
+      id: 'headServer',
+      label: t.rpcStatusHeadServer,
+      value: (row) => row.head_server ?? '',
+      render: (row) => row.head_server || '—',
+      filter: 'enum',
+    },
+    {
+      id: 'headModel',
+      label: t.rpcStatusHeadModel,
+      value: (row) => row.head_model ?? '',
+      render: (row) => row.head_model || '—',
+      filter: 'enum',
     },
     {
       id: 'status',

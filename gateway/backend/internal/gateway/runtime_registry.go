@@ -218,6 +218,13 @@ type RuntimeStatusDTO struct {
 	// name depends on what the reader may see, so the status stream adds it
 	// per subscriber (rpcMemberNamer). SpecID stays the member's identity.
 	DisplayName string `json:"display_name,omitempty"`
+	// HeadModel and HeadServer are the parts of an RPC member's DisplayName:
+	// the gateway model name of the head it serves and the name of the
+	// server that head runs on. Like DisplayName they are added per reader,
+	// and both stay empty when the name names no head (a head the reader may
+	// not see, a head that is gone, or a manual spec no head uses).
+	HeadModel  string `json:"head_model,omitempty"`
+	HeadServer string `json:"head_server,omitempty"`
 	// ImageOptions is the image-generation options this stable_diffusion_cpp
 	// child's capability document states (sampler/scheduler names, output
 	// formats, size and batch limits, the server's own defaults), as the agent

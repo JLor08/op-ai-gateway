@@ -1901,16 +1901,18 @@ PUT is a full document: a write that omits `cluster_enabled` turns the cluster
 off and clears the membership, like any omitted field, so every portal path that
 PUTs a spec carries the cluster fields along.
 
-The RPC tab lists the live member rows in the portal's standard list table:
-name (`display_name`, else the spec id), state, occupancy (free or held; which
-head a member serves is in its name, resolved for the reader), effective VRAM
-and RAM, and the spec id and the RPC protocol as columns hidden by default. It
-sorts by name until the user picks another sort. The
-status stream sends its rows in no fixed order, so the tab orders them by name,
-spec id and instance first: rows that tie on the sorted column stay put between
-frames. A row's name falls back to its spec id until the stream's first name
-lookup lands and after its names expire, so a row can move once at those
-points.
+The RPC tab lists the live member rows in the portal's standard list table: name
+(`display_name`, else the spec id), head server and model name (the name's
+parts, `head_server` and `head_model`, so the table can sort and filter by them;
+a dash when the name names no head), state, occupancy (free or held), effective
+VRAM and RAM, and the spec id and the RPC protocol as columns hidden by default.
+Which head a member serves is resolved for the reader, so a head the reader may
+not see shows a dash in both head columns. It sorts by name until the user picks
+another sort. The status stream sends its rows in no fixed order, so the tab
+orders them by name, spec id and instance first: rows that tie on the sorted
+column stay put between frames. A row's name falls back to its spec id until the
+stream's first name lookup lands and after its names expire, so a row can move
+once at those points.
 
 **Save checks.** A head write runs the cluster checks after the request
 validations, in a fixed order that is part of the API (the codes and the order
@@ -6403,9 +6405,9 @@ the cache-size measurement are in
 [§3.6](#36-rpc-cluster-members-and-heads); a member row is never HTTP-probed, so
 its `context_size`, `active_requests` and `queue_depth` stay at their zero values.
 The agent knows a member only by its spec id; the readable name the portal shows
-(`display_name`, [HTTP API Surface](../reference/api-surface.md)) is added by the
-gateway's status stream for each reader, from the stored membership, and is never
-pushed to the agent.
+(`display_name` with its parts `head_model` and `head_server`, [HTTP API
+Surface](../reference/api-surface.md)) is added by the gateway's status stream
+for each reader, from the stored membership, and is never pushed to the agent.
 
 **One status row per instance** (#340). `Status()` and the sample's `runtimes`
 carry a row per instance, identified by the pair (`spec_id`, `instance`), never by
