@@ -2300,7 +2300,10 @@ Windows, so the router and the 500 ms health poll work unchanged (the forwarder
 scans for new listeners about once a second). Config files are written on the
 Windows side as always (§3.5), and `${CONFIG_DIR}` expands to that directory's
 `/mnt/<drive>/…` path inside the distro; a UNC base directory, or one whose `..`
-climbs above its drive's root, is a placeholder error and so `not_permitted`.
+climbs above its drive's root, is a placeholder error and so `not_permitted`. Its
+message names the setting, `config_files_dir`, and not the directory, which goes to
+the agent's own log as a Warn: the message travels to the gateway, and §3.1 keeps
+agent-local paths out of what does.
 
 **What the log view shows.** The runtime log is `wsl.exe`'s stdout and stderr,
 which carry the Linux process's own streams. The resolved command (§14.7) reports

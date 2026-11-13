@@ -175,8 +175,17 @@ func TestConfigDirPlaceholderIsLinuxPathForWSL(t *testing.T) {
 	if err != nil || args[0] != "/mnt/c/agent/cfg/spec-1/m.ini" {
 		t.Errorf("args = %q, err = %v", args, err)
 	}
-	if _, _, err := ExpandPlaceholders(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, `\\srv\cfg`); err == nil {
-		t.Error("a UNC config dir must not translate")
+	// The refusal travels upward (a not_permitted message, a last_error), so
+	// it names the setting, never the agent-local directory itself.
+	for _, dir := range []string{`\\fileserver\cfg`, `C:\agent\..\..\cfg`} {
+		_, _, err := ExpandPlaceholders(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, dir)
+		if err == nil {
+			t.Errorf("config dir %q translated, want a refusal", dir)
+			continue
+		}
+		if msg := err.Error(); !strings.Contains(msg, "config_files_dir") || strings.Contains(msg, "fileserver") || strings.Contains(msg, `\`) {
+			t.Errorf("refusal for config dir %q = %q, want it to name config_files_dir and not the path", dir, msg)
+		}
 	}
 	native := Spec{ID: "spec-1", Binary: "/b", Args: []string{"${CONFIG_DIR}"}}
 	args, _, err = ExpandPlaceholders(native, 1, GPUVendorNone, nil, func(string) string { return "" }, "/agent/cfg")

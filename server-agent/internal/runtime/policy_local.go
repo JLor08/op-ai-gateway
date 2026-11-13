@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"fmt"
+	"log/slog"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -1089,11 +1090,16 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 			// The child runs inside the distro, so the agent-side Windows
 			// directory must be named by its /mnt/<drive> path. Joined with
 			// path, not filepath: the result is a POSIX path whatever the
-			// agent's host is. An untranslatable directory (UNC) is a
-			// placeholder error, which the dry run reports as not_permitted.
+			// agent's host is. An untranslatable directory (UNC, or one whose
+			// .. climbs above its drive's root) is a placeholder error, which
+			// the dry run reports as not_permitted and a start as its
+			// last_error -- both travel to the gateway, so the error names the
+			// setting and not the agent-local path, which goes to the agent's
+			// own log (the rule every policy refusal follows, §3.1).
 			dir, derr := windowsPathToWSL(configFilesDir)
 			if derr != nil {
-				return "", true, derr
+				slog.Warn("runtime: config_files_dir does not map into a WSL distro", "spec", spec.ID, "error", derr)
+				return "", true, fmt.Errorf("${CONFIG_DIR} cannot be resolved for a wsl spec: the agent's config_files_dir does not map into a WSL distro (UNC paths and paths climbing above their drive's root cannot); see the agent log")
 			}
 			return path.Join(dir, spec.ID), true, nil
 		}
