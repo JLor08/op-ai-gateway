@@ -1523,7 +1523,7 @@ type specState struct {
 	// verdict was a Wait behind another wsl start's VRAM window
 	// (Decision.WaitOnWSLStart). The window's close is what ends it, and
 	// nothing else announces that close, so it re-asks exactly these specs
-	// (wantsWSLStartWake). admitAndStart rewrites it on every verdict, like
+	// (wakeWSLStartWaiters). admitAndStart rewrites it on every verdict, like
 	// waitingOnRAM.
 	waitingOnWSLStart bool
 
@@ -1647,12 +1647,13 @@ type owner struct {
 	// wslRAMBudgetMB for why. Owner-goroutine state, like specs.
 	wslVM       *wslVMInfo
 	wslVMHeldMB int
-	// vmVRAM is the WSL VM's per-GPU VRAM (sumVMVRAM) from the latest reading:
-	// the measurement beat's, a wsl start's baseline, or -- the one admission
-	// relies on -- the reading buildSnapshot takes synchronously before it
-	// charges the unattributed remainder from it. The VM is read only while a
-	// wsl process is live, and buildSnapshot clears it when none is, so a VM
-	// with no agent workload in it charges nothing.
+	// vmVRAM is the WSL VM's per-GPU VRAM (sumVMVRAM) from the last GOOD
+	// reading -- the beat's, a wsl start's baseline or an admission's; a
+	// reading that is detectably not the VM's (vmReadingFailed) never replaces
+	// it. buildSnapshot charges the remainder from its own fresh reading, and
+	// from this one only when that reading failed, so a failed read never
+	// shows the VM's unattributed VRAM as free. The VM is read only while a wsl
+	// process is live; with none live the remainder is not charged at all.
 	vmVRAM map[int]int
 	// wslAttrib is each wsl generation's attributed VRAM (per GPU, MB): the
 	// VM's growth across its start, recorded when its window closes
@@ -3234,6 +3235,15 @@ func (o *owner) retire(id string, st *specState) {
 // a lower sibling still waits to start (lowerSiblingWaiting), whichever of them
 // is asked first.
 func (o *owner) admitAndStart(specID string) {
+	o.admitAndStartWith(specID, true)
+}
+
+// admitAndStartWith is admitAndStart, with the eviction an admission asks for
+// carried out only when mayEvict holds. A re-ask with mayEvict false starts the
+// spec only into room that is free now and otherwise leaves it as it is,
+// queued and evicting nothing, like a Wait: the shape a wake needs for a spec
+// whose own re-ask must never drain another (wakeWSLStartWaiters).
+func (o *owner) admitAndStartWith(specID string, mayEvict bool) {
 	if o.closing {
 		// Never start (or restart) anything once shutdown has begun -- a
 		// pinned/force_running spec resurrecting itself here would keep
@@ -3453,6 +3463,12 @@ func (o *owner) admitAndStart(specID string) {
 		o.noteAdmissionWait(st, dec.Message)
 		blockedBy = o.claimedMemberBlocking(snap, demand)
 	case len(dec.Evict) > 0:
+		if !mayEvict {
+			// Ahead of the bootstrap burn below: nothing is evicted, so no
+			// shot is spent.
+			slog.Debug("runtime: start would evict and this re-ask may not", "spec", specID, "victims", dec.Evict)
+			return
+		}
 		if dec.VRAMBootstrap {
 			// This Evict spent the candidate's one-shot VRAM bootstrap (rule 4
 			// evicted a known-demand occupant it would otherwise only have
@@ -3974,7 +3990,7 @@ func realRAM(v int) int {
 // settles it (settleWSLWindow): the VM's growth since the baseline becomes that
 // process's attribution and measured VRAM. Settled or not, the window is then
 // closed, so the wsl starts that waited for it are re-asked
-// (wantsWSLStartWake): no exit, release or sample would announce that.
+// (wakeWSLStartWaiters): no exit, release or sample would announce that.
 func (o *owner) applyMeasurement(c cmdMeasured) {
 	o.measuring = false
 	landed := false
@@ -4045,7 +4061,9 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		o.wslVM, o.wslVMHeldMB = c.wslVM, heldMB
 	}
 	if c.vmRead {
-		o.vmVRAM = sumVMVRAM(c.byPID, c.vmPIDs)
+		if vm := sumVMVRAM(c.byPID, c.vmPIDs); !o.vmReadingFailed(c.vmPIDs, vm) {
+			o.vmVRAM = vm
+		}
 	}
 	// Identity, not just presence: a window that closed while this measurement
 	// was out (its process exited) may have been replaced by the next start's.
@@ -4063,7 +4081,7 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 		o.wakeAdmission(wantsHostSampleWake)
 	}
 	if settled {
-		o.wakeAdmission(wantsWSLStartWake)
+		o.wakeWSLStartWaiters()
 	}
 	if o.remeasure {
 		o.remeasure = false
@@ -4162,7 +4180,10 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// its workers (SetWSLVMPIDs): the unattributed remainder below is charged
 	// from it, and it is the one VM reading admission relies on, so it is taken
 	// here, fresh, like every other figure this snapshot charges (wsl_vram.go).
-	// With nothing wsl live the VM is not read and charges nothing.
+	// A reading that is detectably not the VM's falls back to the last good one
+	// (owner.vmVRAM): charged from a failed read, the remainder would vanish and
+	// the VM's unattributed VRAM would read as free. With nothing wsl live the
+	// VM is not read and charges nothing.
 	var measured map[int]map[int]int
 	var vmPIDs []int
 	vmRead := false
@@ -4175,9 +4196,14 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		}
 		measured = (*mp)(ask)
 	}
-	o.vmVRAM = nil
+	var vmVRAM map[int]int
 	if vmRead {
-		o.vmVRAM = sumVMVRAM(measured, vmPIDs)
+		vmVRAM = sumVMVRAM(measured, vmPIDs)
+		if o.vmReadingFailed(vmPIDs, vmVRAM) {
+			vmVRAM = o.vmVRAM
+		} else {
+			o.vmVRAM = vmVRAM
+		}
 	}
 	// Whether host RAM is MEASURABLE at all decides how long the cold-start
 	// interlock below can safely hold. With a RAM measurer a bootstrapping
@@ -4402,7 +4428,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		// start's window is open, which every other wsl start waits behind.
 		// See wsl_vram.go for why the remainder is what keeps admission from
 		// seeing VRAM the VM holds as free.
-		UnattributedVRAM: wslRemainder(o.vmVRAM, attributedMB),
+		UnattributedVRAM: wslRemainder(vmVRAM, attributedMB),
 		WSLStartInFlight: o.wslWindow != nil,
 		Allowed:          o.allowedPairs,
 	}
@@ -4716,13 +4742,14 @@ func (o *owner) startProcess(st *specState) {
 
 	// A wsl start's VRAM is the WSL VM's growth across it (wsl_vram.go), so the
 	// VM's figure is read now, as the last thing before the exec: the window's
-	// baseline. Only where that figure can be read at all (vramMeasurable); the
-	// window itself opens once the exec has succeeded, so a failed exec leaves
-	// none behind.
+	// baseline. Only for a spec that declares a GPU, and only where that figure
+	// can be read at all (vramMeasurable); the window itself opens once the
+	// exec has succeeded (beginWSLVRAM), so a failed exec leaves none behind.
 	var vmBaseline map[int]int
-	openWindow := false
-	if spec.IsWSL() && o.vramMeasurable(spec) {
-		vmBaseline, openWindow = o.readVMVRAM()
+	vramWindow, baselineOK := false, false
+	if spec.IsWSL() && wslDeclaresGPU(spec) && o.vramMeasurable(spec) {
+		vramWindow = true
+		vmBaseline, baselineOK = o.readVMVRAM()
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -4770,8 +4797,8 @@ func (o *owner) startProcess(st *specState) {
 	} else {
 		proc.ctl = nativeControl{cmd: cmd}
 	}
-	if openWindow {
-		o.openWSLWindow(proc, vmBaseline)
+	if wslUnit != "" {
+		o.beginWSLVRAM(proc, spec, vramWindow, vmBaseline, baselineOK)
 	}
 	st.proc = proc
 	o.setState(st, StateStarting)
@@ -5948,6 +5975,12 @@ func (o *owner) rescheduleGraceWake() {
 // wakeAdmission retries admission for every spec that want selects, oldest
 // queued request first (see wakeAdmissionCandidates).
 func (o *owner) wakeAdmission(want func(*specState) bool) {
+	o.wakeAdmissionWith(want, o.reask)
+}
+
+// wakeAdmissionWith is wakeAdmission with the ask made for each selected spec
+// in that order: reask, or a narrower one (wakeWSLStartWaiters).
+func (o *owner) wakeAdmissionWith(want func(*specState) bool, ask func(id string)) {
 	candidates := make([]wakeCandidate, 0, len(o.specs))
 	for id, st := range o.specs {
 		if !want(st) {
@@ -5965,7 +5998,7 @@ func (o *owner) wakeAdmission(want func(*specState) bool) {
 		return lessByQueueAge(candidates[i], candidates[j])
 	})
 	for _, c := range candidates {
-		o.reask(c.id)
+		ask(c.id)
 	}
 }
 
@@ -5982,10 +6015,15 @@ func (o *owner) wakeAdmission(want func(*specState) bool) {
 // would otherwise be decided almost twice over in one wake. An instance only
 // held back since (waitingOnSibling) has no standing decision and is asked.
 func (o *owner) reask(id string) {
+	o.reaskWith(id, true)
+}
+
+// reaskWith is reask with admitAndStartWith's mayEvict.
+func (o *owner) reaskWith(id string, mayEvict bool) {
 	if st := o.specs[id]; st != nil && o.decidedThisTurn(st) {
 		return
 	}
-	o.admitAndStart(id)
+	o.admitAndStartWith(id, mayEvict)
 }
 
 // decidedThisTurn reports whether st's latest full admission decision was taken

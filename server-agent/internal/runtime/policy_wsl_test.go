@@ -170,18 +170,24 @@ func TestAdmitWSLRAMWaitOnWSLVM(t *testing.T) {
 }
 
 // TestAdmitWSLStartInFlightWaits: while one wsl start's VRAM window is open
-// (WSLStartInFlight), every other wsl candidate waits -- evicting nothing,
-// whatever the other rules would have drawn -- so the VM's growth is one
-// start's alone. The durable own-demand refusals still come first, a native
-// candidate is not held back, and a burst candidate is refused at once.
+// (WSLStartInFlight), every other wsl candidate that declares a GPU waits --
+// evicting nothing, whatever the other rules would have drawn -- so the VM's
+// growth is one start's alone. The durable own-demand refusals still come
+// first, a native candidate is not held back, and a burst candidate is refused
+// at once. (A wsl candidate with no GPU: TestWSLCPUOnlyStartIsNotSerialized.)
 func TestAdmitWSLStartInFlightWaits(t *testing.T) {
+	gpuWSL := func(ramMB int) Spec {
+		s := wslCandidate("cand", ramMB)
+		s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+		return s
+	}
 	snap := PolicySnapshot{
 		Running:          []RunningProc{{SpecID: "wsl", RAMMB: 6000, LastUsed: t0, WSL: true}},
 		MaxProcesses:     1, // any start needs the idle wsl process gone
 		WSLStartInFlight: true,
 		Allowed:          allowPairs("cand", "wsl"),
 	}
-	dec := Admit(snap, wslCandidate("cand", 1000))
+	dec := Admit(snap, gpuWSL(1000))
 	assertDecision(t, "wsl start in flight", dec, Decision{Wait: true, Evict: []string{}})
 	if !dec.WaitOnWSLStart {
 		t.Error("WaitOnWSLStart = false, want the wait marked as one the window's close ends")
@@ -190,13 +196,13 @@ func TestAdmitWSLStartInFlightWaits(t *testing.T) {
 	assertDecision(t, "native candidate", Admit(snap, Spec{ID: "cand", RAMMB: 1000}), Decision{Evict: []string{"wsl"}})
 	settled := snap
 	settled.WSLStartInFlight = false
-	if dec := Admit(settled, wslCandidate("cand", 1000)); dec.WaitOnWSLStart || len(dec.Evict) != 1 {
+	if dec := Admit(settled, gpuWSL(1000)); dec.WaitOnWSLStart || len(dec.Evict) != 1 {
 		t.Errorf("no start in flight: %+v, want the ordinary eviction", dec)
 	}
 
 	refused := snap
 	refused.WSLRAMBudgetMB, refused.WSLRAMCeilingMB = 2000, 2000
-	assertDecision(t, "own demand first", Admit(refused, wslCandidate("cand", 9000)), Decision{
+	assertDecision(t, "own demand first", Admit(refused, gpuWSL(9000)), Decision{
 		Reason:  StateNotPermitted,
 		Message: "spec cand: RAM demand 9000 MB exceeds the WSL VM RAM budget 2000 MB on its own",
 		Evict:   []string{},
@@ -204,7 +210,7 @@ func TestAdmitWSLStartInFlightWaits(t *testing.T) {
 
 	burst := snap
 	burst.NoEvict = true
-	dec = Admit(burst, wslCandidate("cand", 1000))
+	dec = Admit(burst, gpuWSL(1000))
 	if !dec.NoCapacity || !strings.Contains(dec.Message, "another WSL start") {
 		t.Errorf("burst during a wsl start: %+v, want NoCapacity naming the WSL start", dec)
 	}

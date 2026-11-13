@@ -25,6 +25,26 @@ package runtime
 // window is corrected for instead (noteWSLExit): an attributed process's figure
 // is added back to the delta, and one with no figure voids it.
 //
+// ONLY A SPEC THAT DECLARES A GPU HAS A WINDOW. A wsl spec with no GPU is taken
+// to hold no VRAM: its start is not serialized and opens no window, and it is
+// attributed nothing, so its exit during another start's window changes
+// nothing there. Should it use a GPU after all, that memory is in the VM's
+// figure and so in the remainder. Likewise an attribution covers only the GPUs
+// its spec declares: growth elsewhere during the window may be anyone's.
+//
+// A READING THAT IS NOT THE VM'S IS NEVER A DELTA'S END. The measurer answers
+// nothing both when the VM holds nothing and when the read failed, so a
+// reading is taken as failed where the VM cannot be empty (vmReadingFailed): no
+// worker found while a wsl process lives in the VM, or nothing held while a
+// live wsl process is attributed VRAM -- and, at a window's settle, nothing held
+// after a baseline that held something. A window whose baseline failed opens
+// void, one whose settling reading failed closes void: a delta against a
+// failed reading would credit one instance with the whole VM, which is written
+// back as its measured demand (ADR-084), and a demand over its budget is
+// refused for good. At admission a failed reading falls back to the last good
+// one (owner.vmVRAM). A failure that looks like an empty VM -- a failed read at
+// the first start, with nothing wsl live -- cannot be told apart from one.
+//
 // THE REMAINDER IS WHAT ADMISSION RELIES ON. Per-workload figures are best
 // effort: a delta can come out low (growth after the window closed, a void
 // window) or high. So at every admission, from a fresh reading, whatever the VM
@@ -117,11 +137,13 @@ func wslDelta(after, baseline, credit map[int]int) map[int]int {
 // max(0, vm - charged), zero entries dropped, nil when there is none.
 //
 // charged is the sum of the attributions on the GPUs their instance is
-// actually charged on (buildSnapshot), not of every attribution: a delta can
-// land on a GPU the spec does not declare -- another process in the VM grew
-// there during the window -- and no RunningProc carries that figure, so taking
-// it off the remainder would leave it charged nowhere. Left in, it is charged
-// as unattributed, and the sum admission sees stays at least the VM's figure.
+// actually charged on (buildSnapshot), not of every attribution. A settle keeps
+// an attribution to the spec's declared GPUs already, and a change of the GPU
+// list relaunches the generation, so the two agree; summing only what is
+// charged makes the invariant hold by construction all the same: a figure no
+// RunningProc carries, taken off the remainder, would be charged nowhere. Left
+// in, it is charged as unattributed, and the sum admission sees stays at least
+// the VM's figure.
 // A remainder below zero (attributions that came out high) is no credit:
 // the attributions stand, as the max rule keeps any figure above its demand.
 func wslRemainder(vm, charged map[int]int) map[int]int {
@@ -147,52 +169,112 @@ func (o *owner) vramMeasurable(spec Spec) bool {
 	return !spec.IsWSL() || o.m.wslVMPIDs.Load() != nil
 }
 
+// wslDeclaresGPU reports whether a wsl spec declares a GPU, which is what gives
+// its start a window and an attribution (see above).
+func wslDeclaresGPU(spec Spec) bool {
+	return len(spec.GPUs) > 0
+}
+
+// vmReadingFailed reports whether a VM reading -- the worker pids the finder
+// named and the figure they summed to -- is detectably a failed one rather
+// than the VM's state: no worker at all while a wsl process is live (the VM it
+// runs in has one), or nothing held while a live wsl process is attributed
+// VRAM (the VM holds at least that). Attributions are deleted on exit, so
+// every one in wslAttrib is a live generation's.
+func (o *owner) vmReadingFailed(vmPIDs []int, vm map[int]int) bool {
+	if len(vmPIDs) == 0 {
+		return o.wslLive()
+	}
+	if vm != nil {
+		return false
+	}
+	for _, a := range o.wslAttrib {
+		if len(a) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // readVMVRAM reads the VM's figure now, synchronously on the owner, and records
-// it as the latest (owner.vmVRAM). ok is false when no reading can be taken: no
-// VRAM measurer or no worker finder. A finder that names no worker reads as an
-// empty VM -- a stopped VM holds nothing -- and so, unavoidably, does a reading
-// that failed: the measurer answers nothing either way.
+// a good reading as the last good one (owner.vmVRAM). ok is false when no
+// reading can be taken -- no VRAM measurer or no worker finder -- or when it is
+// detectably failed (vmReadingFailed). A finder that names no worker with
+// nothing wsl live reads as an empty VM: a stopped VM holds nothing.
 func (o *owner) readVMVRAM() (vm map[int]int, ok bool) {
 	mp, vf := o.m.measurer.Load(), o.m.wslVMPIDs.Load()
 	if mp == nil || vf == nil {
 		return nil, false
 	}
-	if pids := (*vf)(); len(pids) > 0 {
+	pids := (*vf)()
+	if len(pids) > 0 {
 		vm = sumVMVRAM((*mp)(pids), pids)
+	}
+	if o.vmReadingFailed(pids, vm) {
+		return nil, false
 	}
 	o.vmVRAM = vm
 	return vm, true
 }
 
-// openWSLWindow opens proc's window, with baseline the VM's figure read just
-// before its exec. Admission never lets a wsl start through while a window is
-// open (WSLStartInFlight), so there is none here; were there one, the new start
+// beginWSLVRAM sets up the VRAM accounting of proc, a wsl generation of spec
+// that has just been exec'd. A spec with no GPU is attributed nothing at once:
+// it holds no VRAM, so its exit never voids or credits a window. One with a GPU
+// gets a window when its VRAM can be measured (window): baseline is the VM's
+// figure read just before the exec, and a baseline that could not be read
+// (!baselineOK) opens it void -- the next start still waits for it, but it
+// closes without an attribution.
+//
+// Admission never lets a GPU wsl start through while a window is open
+// (WSLStartInFlight), so there is none here; were there one, the new start
 // would be growing the VM inside it, so that window is voided, and proc goes
 // without a window of its own -- unmeasured, covered by the remainder.
-func (o *owner) openWSLWindow(proc *runningProc, baseline map[int]int) {
+func (o *owner) beginWSLVRAM(proc *runningProc, spec Spec, window bool, baseline map[int]int, baselineOK bool) {
+	if !wslDeclaresGPU(spec) {
+		if o.wslAttrib == nil {
+			o.wslAttrib = make(map[*runningProc]map[int]int)
+		}
+		o.wslAttrib[proc] = nil
+		return
+	}
+	if !window {
+		return
+	}
 	if o.wslWindow != nil {
 		o.wslWindow.void = true
 		return
 	}
-	o.wslWindow = &wslStartWindow{proc: proc, baseline: baseline}
+	o.wslWindow = &wslStartWindow{proc: proc, baseline: baseline, void: !baselineOK}
 }
 
 // settleWSLWindow closes w with the measurement c, which was dispatched after
-// w's process first passed a health probe: unless w is void or c carries no VM
-// reading, the VM's growth since the baseline, corrected by what exited
-// processes took with them, is the process's attribution and its measured VRAM
-// -- written back to the gateway as vram_measured_mb, a ready figure siblings
-// inherit, and the resolution of its VRAM bootstrap, exactly as a native
-// process's first measurement is. landed reports a recorded figure (the
-// demand wake's trigger, as in applyMeasurement). The caller wakes the wsl
-// starts that waited for the window.
+// w's process first passed a health probe. Unless w is void or c's VM reading
+// is missing or unreadable, the VM's growth since the baseline, corrected by
+// what exited processes took with them, on the GPUs the spec declares, is the
+// process's attribution and its measured VRAM -- written back to the gateway
+// as vram_measured_mb, a ready figure siblings inherit, and the resolution of
+// its VRAM bootstrap, exactly as a native process's first measurement is.
+// landed reports a recorded figure (the demand wake's trigger, as in
+// applyMeasurement). The caller wakes the wsl starts that waited for the
+// window.
+//
+// An unreadable reading leaves NO attribution entry, not an empty one: the
+// process is then unattributed, so its exit during a later window voids that
+// window instead of crediting it nothing.
 func (o *owner) settleWSLWindow(w *wslStartWindow, c cmdMeasured) (landed bool) {
 	o.wslWindow = nil
 	st := o.specs[w.proc.specID]
 	if w.void || !c.vmRead || st == nil || st.proc != w.proc {
 		return false
 	}
-	attrib := wslDelta(sumVMVRAM(c.byPID, c.vmPIDs), w.baseline, w.exitedCredit)
+	after := sumVMVRAM(c.byPID, c.vmPIDs)
+	// Nothing held after a baseline that held something is not this start's
+	// growth: the workloads in the baseline cannot all have left without their
+	// exits crediting the window, so the reading failed.
+	if o.vmReadingFailed(c.vmPIDs, after) || (after == nil && len(w.baseline) > 0) {
+		return false
+	}
+	attrib := onGPUs(wslDelta(after, w.baseline, w.exitedCredit), st.spec.GPUs)
 	if o.wslAttrib == nil {
 		o.wslAttrib = make(map[*runningProc]map[int]int)
 	}
@@ -206,6 +288,21 @@ func (o *owner) settleWSLWindow(w *wslStartWindow, c cmdMeasured) (landed bool) 
 	return true
 }
 
+// onGPUs keeps the entries of byGPU on the GPUs gpus names, nil when none is
+// left.
+func onGPUs(byGPU map[int]int, gpus []SpecGPU) map[int]int {
+	var out map[int]int
+	for _, g := range gpus {
+		if mb, ok := byGPU[g.Index]; ok {
+			if out == nil {
+				out = make(map[int]int, len(gpus))
+			}
+			out[g.Index] = mb
+		}
+	}
+	return out
+}
+
 // noteWSLExit corrects the open window for the exit of the wsl generation
 // proc, and deletes proc's attribution. Stops are never held back for a
 // window, so an exit can fall inside one at any time:
@@ -215,7 +312,8 @@ func (o *owner) settleWSLWindow(w *wslStartWindow, c cmdMeasured) (landed bool) 
 //     admission wake re-asks the starts that waited for it.
 //   - proc was attributed: the VM's figure drops by about that much during the
 //     window, which is not the window's process shrinking, so the attribution
-//     is added back as credit (wslDelta).
+//     is added back as credit (wslDelta). A CPU-only generation is attributed
+//     nothing (beginWSLVRAM), so its exit adds nothing and voids nothing.
 //   - proc was not attributed: what it held is unknown, so the delta cannot be
 //     corrected, and the window is void (wslStartWindow.void).
 func (o *owner) noteWSLExit(proc *runningProc) {
@@ -238,10 +336,33 @@ func (o *owner) noteWSLExit(proc *runningProc) {
 	delete(o.wslAttrib, proc)
 }
 
-// wantsWSLStartWake is the selection rule for the wake a window's close causes
-// (applyMeasurement): a wsl spec that waited for the window
-// (specState.waitingOnWSLStart), narrowed like the other event wakes to one
-// with a queued request or a pinned one (wantsWakeAfterStart).
+// wakeWSLStartWaiters is the wake a window's close causes (applyMeasurement):
+// every wsl spec that waited for the window (wantsWSLStartWake) is asked again,
+// oldest request first.
+//
+// The window held back starts that would otherwise have gone ahead, and its
+// close is announced by no exit, release or sample, so it re-asks them all --
+// including a force_running spec with no request, which every other event wake
+// leaves out (wantsWakeAfterStart). That one may only start into room that is
+// free now (admitAndStartWith, mayEvict false): the narrowing exists because
+// two force_running specs that cannot run together would evict each other at
+// load speed if a wake let them evict, and a re-ask that cannot evict cannot
+// do that. Without it, such a spec waiting behind a window would stay down
+// until an unrelated release, exit or Apply, although nothing else stood in
+// its way. A spec with a request or a pin is asked as any event wake asks it.
+func (o *owner) wakeWSLStartWaiters() {
+	o.wakeAdmissionWith(wantsWSLStartWake, func(id string) {
+		if st := o.specs[id]; st != nil && !wantsWakeAfterStart(st) {
+			o.reaskWith(id, false)
+			return
+		}
+		o.reask(id)
+	})
+}
+
+// wantsWSLStartWake is wakeWSLStartWaiters' selection rule: a wsl spec whose
+// last verdict was a Wait behind a window (specState.waitingOnWSLStart) and
+// that still wants up (wantsWake).
 func wantsWSLStartWake(st *specState) bool {
-	return st.waitingOnWSLStart && wantsWakeAfterStart(st)
+	return st.waitingOnWSLStart && wantsWake(st)
 }

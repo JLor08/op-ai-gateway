@@ -29,12 +29,29 @@ const vmwpPID = 7777
 // vmVRAMScript is a scripted VRAM measurer: it answers the VM worker with the
 // figure set last and nothing for any other pid, and records every pid list it
 // is asked. hold makes its next call wait for the returned channel to close,
-// answering the figure that was current when the call began.
+// answering the figure that was current when the call began. noWorker makes
+// the finder it installs name no worker at all.
 type vmVRAMScript struct {
-	mu    sync.Mutex
-	vm    map[int]int
-	asked [][]int
-	gate  chan struct{}
+	mu       sync.Mutex
+	vm       map[int]int
+	asked    [][]int
+	gate     chan struct{}
+	noWorker bool
+}
+
+func (s *vmVRAMScript) setNoWorker(none bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noWorker = none
+}
+
+func (s *vmVRAMScript) find() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.noWorker {
+		return nil
+	}
+	return []int{vmwpPID}
 }
 
 func (s *vmVRAMScript) set(vm map[int]int) {
@@ -82,7 +99,7 @@ func (s *vmVRAMScript) askedFor(pid int) [][]int {
 // worker.
 func (s *vmVRAMScript) install(m *Manager) {
 	m.SetMeasurer(s.measure)
-	m.SetWSLVMPIDs(func() []int { return []int{vmwpPID} })
+	m.SetWSLVMPIDs(s.find)
 }
 
 // wslVRAMOwner is a hand-driven owner with the states given, the scripted
@@ -601,5 +618,265 @@ func TestWSLSecondStartWaitsForSettle(t *testing.T) {
 	})
 	if st := statusFor(m, "A"); st.State != StateRunning {
 		t.Errorf("A is %s, want it untouched by B's start", st.State)
+	}
+}
+
+// Fix round 1 (#381 review): unreadable VM readings, the force_running wake,
+// and windows only for GPU specs.
+
+// otherLiveWSL adds a live wsl generation O beside the hand-driven exec
+// owner's specs, with no real process behind it, and opens the pair.
+func otherLiveWSL(o *owner, attrib map[int]int) *specState {
+	other := liveWSL(wslVRAMSpec("O", 1000), 4242, StateRunning)
+	o.specs["O"] = other
+	o.allowedPairs = allowPairs("S", "O")
+	if attrib != nil {
+		o.wslAttrib = map[*runningProc]map[int]int{other.proc: attrib}
+	}
+	return other
+}
+
+// TestWSLWindowVoidOnUnreadableBaseline: a baseline that is detectably not
+// the VM's -- no worker found while a wsl process lives in the VM, or nothing
+// held while a live wsl process is attributed VRAM -- opens a void window:
+// starts stay serialized behind it, but it closes without an attribution,
+// rather than giving the new instance the whole VM. A VM with nothing wsl in
+// it and no worker is simply empty (the first start of a stopped VM).
+func TestWSLWindowVoidOnUnreadableBaseline(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	start := func(t *testing.T, setup func(o *owner, vm *vmVRAMScript)) *wslStartWindow {
+		t.Helper()
+		f := newFakeWSL(t)
+		s := wslTestSpec(f, "S", "m")
+		s.Pinned = true
+		s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+		o := newWSLExecOwner(t, f, s)
+		vm := &vmVRAMScript{vm: map[int]int{0: 5000}}
+		vm.install(o.m)
+		setup(o, vm)
+		o.admitAndStart("S")
+		if o.specs["S"].proc == nil {
+			t.Fatalf("S did not start: %s %+v", o.specs["S"].state, o.specs["S"].lastError)
+		}
+		if o.wslWindow == nil || o.wslWindow.proc != o.specs["S"].proc {
+			t.Fatalf("window = %+v, want one open for S, so wsl starts stay serialized", o.wslWindow)
+		}
+		return o.wslWindow
+	}
+	t.Run("no worker while a wsl process is live", func(t *testing.T) {
+		w := start(t, func(o *owner, vm *vmVRAMScript) {
+			otherLiveWSL(o, nil)
+			vm.setNoWorker(true)
+		})
+		if !w.void {
+			t.Errorf("window = %+v, want it void", w)
+		}
+	})
+	t.Run("nothing held while a live wsl process is attributed", func(t *testing.T) {
+		w := start(t, func(o *owner, vm *vmVRAMScript) {
+			otherLiveWSL(o, map[int]int{0: 5000})
+			vm.set(nil)
+		})
+		if !w.void {
+			t.Errorf("window = %+v, want it void", w)
+		}
+	})
+	t.Run("a stopped VM is empty, not unreadable", func(t *testing.T) {
+		w := start(t, func(_ *owner, vm *vmVRAMScript) { vm.setNoWorker(true) })
+		if w.void || w.baseline != nil {
+			t.Errorf("window = %+v, want an ordinary one with an empty baseline", w)
+		}
+	})
+}
+
+// TestWSLSettleVoidOnUnreadableReading: the settling reading is checked the
+// same way, plus one rule of its own -- nothing held after a baseline that
+// held something cannot be the start's growth. The window then closes with no
+// attribution at all: not an empty one, which would let a later exit of this
+// process during another window credit 0 instead of voiding that window.
+func TestWSLSettleVoidOnUnreadableReading(t *testing.T) {
+	for name, tc := range map[string]struct {
+		baseline map[int]int
+		reading  map[int]int
+		noWorker bool
+	}{
+		"nothing held after a baseline that held something": {baseline: map[int]int{0: 12340}, reading: nil},
+		"no worker at the settle":                           {baseline: nil, reading: map[int]int{0: 5000}, noWorker: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			vm := &vmVRAMScript{vm: tc.reading}
+			b := liveWSL(wslVRAMSpec("B", 6000), 301, StateRunning)
+			o := wslVRAMOwner(vm, b)
+			o.wslWindow = &wslStartWindow{proc: b.proc, baseline: tc.baseline}
+			vm.setNoWorker(tc.noWorker)
+			measureNow(t, o)
+			if o.wslWindow != nil {
+				t.Fatal("the window is still open after its settling measurement")
+			}
+			if a, ok := o.wslAttrib[b.proc]; ok || b.measuredVRAM != nil {
+				t.Errorf("B attributed %v (entry %v), measured %v, want no attribution entry", a, ok, b.measuredVRAM)
+			}
+		})
+	}
+}
+
+// TestWSLAdmissionFallsBackToLastGoodVMReading: a reading at admission that is
+// detectably not the VM's leaves the remainder at the last good reading, so a
+// failed read never shows the VM's unattributed VRAM as free; nor does a
+// failed reading on the beat replace the last good one.
+func TestWSLAdmissionFallsBackToLastGoodVMReading(t *testing.T) {
+	vm := &vmVRAMScript{vm: map[int]int{0: 20000}}
+	s := liveWSL(wslVRAMSpec("S", 6000), 300, StateRunning)
+	o := wslVRAMOwner(vm, s)
+	o.wslAttrib = map[*runningProc]map[int]int{s.proc: {0: 12000}}
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 8000}) {
+		t.Fatalf("good reading: UnattributedVRAM = %v, want {0:8000}", got)
+	}
+
+	vm.set(nil) // nothing held, while S is attributed 12000
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 8000}) {
+		t.Errorf("failed reading: UnattributedVRAM = %v, want the last good {0:8000}", got)
+	}
+	measureNow(t, o) // the beat reads the same failure
+	vm.setNoWorker(true)
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 8000}) {
+		t.Errorf("no worker: UnattributedVRAM = %v, want the last good {0:8000}", got)
+	}
+
+	vm.setNoWorker(false)
+	vm.set(map[int]int{0: 15000})
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 3000}) {
+		t.Errorf("good reading again: UnattributedVRAM = %v, want {0:3000}", got)
+	}
+}
+
+// TestWSLWindowCloseStartsForceRunningWaiter: two force_running wsl specs and
+// no request. The second waits for the first one's window; a force_running
+// spec has neither a queued request nor a pin, so the ordinary event wake
+// would skip it, and its start must still follow the window's close.
+func TestWSLWindowCloseStartsForceRunningWaiter(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+	m.SetMeasurer(liveUnitVRAM(f, map[string]int{"A": 5000, "B": 3000}))
+	m.SetWSLVMPIDs(func() []int { return []int{vmwpPID} })
+	a := wslTestSpec(f, "A", "a")
+	a.AdminState = "force_running"
+	a.Args = stubArgs(300*time.Millisecond, 0, 0, "")
+	a.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	b := wslTestSpec(f, "B", "b")
+	b.AdminState = "force_running"
+	b.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{ETag: "v1", Specs: []Spec{a, b}, Coresident: coresidentAllPairs("A", "B")})
+
+	waitForState(t, m, "A", StateRunning)
+	waitForState(t, m, "B", StateRunning)
+	waitUntil(t, 5*time.Second, "both windows close with their own growth", func() bool {
+		return maps.Equal(statusFor(m, "A").MeasuredVRAM, map[int]int{0: 5000}) &&
+			maps.Equal(statusFor(m, "B").MeasuredVRAM, map[int]int{0: 3000})
+	})
+}
+
+// TestWSLWindowCloseNeverEvictsForAForceRunningWaiter: the re-ask a window's
+// close gives a force_running waiter starts it only into free room. Here B
+// could only start by evicting the idle A (one process at most), and a wake
+// that evicted would have the two evict each other at load speed.
+func TestWSLWindowCloseNeverEvictsForAForceRunningWaiter(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManager(t, f.runner())
+	m.SetMeasurer(liveUnitVRAM(f, map[string]int{"A": 5000, "B": 3000}))
+	m.SetWSLVMPIDs(func() []int { return []int{vmwpPID} })
+	a := wslTestSpec(f, "A", "a")
+	a.AdminState = "force_running"
+	a.Args = stubArgs(300*time.Millisecond, 0, 0, "")
+	a.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	b := wslTestSpec(f, "B", "b")
+	b.AdminState = "force_running"
+	b.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
+	m.Apply(Config{ETag: "v1", Specs: []Spec{a, b}, MaxProcesses: 1, Coresident: coresidentAllPairs("A", "B")})
+
+	waitUntil(t, 5*time.Second, "A's window closes", func() bool {
+		return maps.Equal(statusFor(m, "A").MeasuredVRAM, map[int]int{0: 5000})
+	})
+	time.Sleep(200 * time.Millisecond) // several beats and wakes
+	if st := statusFor(m, "A"); st.State != StateRunning {
+		t.Errorf("A is %s, want it left alone", st.State)
+	}
+	if st := statusFor(m, "B"); st.State != StateStopped {
+		t.Errorf("B is %s, want it to wait rather than evict A", st.State)
+	}
+}
+
+// TestWSLCPUOnlyStartIsNotSerialized: a wsl spec that declares no GPU opens no
+// window, is not held back by another start's window, and counts as holding
+// no VRAM -- so its exit during a window neither voids it nor adds a credit.
+func TestWSLCPUOnlyStartIsNotSerialized(t *testing.T) {
+	t.Run("no window, no VM reading", func(t *testing.T) {
+		skipOnWindows(t)
+		shrinkTimings(t)
+		f := newFakeWSL(t)
+		s := wslTestSpec(f, "S", "m")
+		s.Pinned = true
+		o := newWSLExecOwner(t, f, s)
+		vm := &vmVRAMScript{vm: map[int]int{0: 22}}
+		vm.install(o.m)
+		o.admitAndStart("S")
+		proc := o.specs["S"].proc
+		if proc == nil {
+			t.Fatalf("S did not start: %s", o.specs["S"].state)
+		}
+		if o.wslWindow != nil {
+			t.Errorf("a CPU-only wsl start opened a window: %+v", o.wslWindow)
+		}
+		if len(vm.askedFor(vmwpPID)) != 0 {
+			t.Errorf("a CPU-only wsl start read the VM: %v", vm.askedFor(vmwpPID))
+		}
+		if a, ok := o.wslAttrib[proc]; !ok || len(a) != 0 {
+			t.Errorf("S attribution %v (entry %v), want an empty one: it holds no VRAM", a, ok)
+		}
+	})
+
+	t.Run("not held back by a window", func(t *testing.T) {
+		snap := PolicySnapshot{WSLStartInFlight: true}
+		cpu := wslCandidate("cand", 1000)
+		assertDecision(t, "CPU-only wsl candidate", Admit(snap, cpu), Decision{OK: true, Evict: []string{}})
+		gpu := wslVRAMSpec("cand", 1000)
+		assertDecision(t, "GPU wsl candidate", Admit(snap, gpu), Decision{Wait: true, Evict: []string{}})
+	})
+
+	t.Run("its exit leaves the window as it was", func(t *testing.T) {
+		vm := &vmVRAMScript{}
+		c := liveWSL(wslCandidate("C", 1000), 300, StateRunning)
+		b := liveWSL(wslVRAMSpec("B", 6000), 301, StateStarting)
+		o := wslVRAMOwner(vm, c, b)
+		o.wslAttrib = map[*runningProc]map[int]int{c.proc: nil}
+		o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[int]int{0: 100}}
+		c.state, c.intentionalStop = StateDraining, true
+		o.onProcExited(c, nil)
+		if w := o.wslWindow; w == nil || w.void || len(w.exitedCredit) != 0 {
+			t.Errorf("window after a CPU-only exit = %+v, want it untouched", w)
+		}
+	})
+}
+
+// TestWSLAttributionOnlyOnDeclaredGPUs: the VM's growth on a GPU the spec
+// does not declare is not the instance's figure -- another process in the VM
+// may have grown there -- so it stays in the remainder instead.
+func TestWSLAttributionOnlyOnDeclaredGPUs(t *testing.T) {
+	vm := &vmVRAMScript{}
+	b := liveWSL(wslVRAMSpec("B", 6000), 301, StateRunning)
+	o := wslVRAMOwner(vm, b)
+	o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[int]int{0: 100, 1: 100}}
+	vm.set(map[int]int{0: 7100, 1: 2100})
+	measureNow(t, o)
+	if want := map[int]int{0: 7000}; !maps.Equal(o.wslAttrib[b.proc], want) || !maps.Equal(b.measuredVRAM, want) {
+		t.Errorf("B attributed %v, measured %v, want only the declared GPU %v", o.wslAttrib[b.proc], b.measuredVRAM, want)
+	}
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 100, 1: 2100}) {
+		t.Errorf("UnattributedVRAM = %v, want GPU 1's growth in it {0:100 1:2100}", got)
 	}
 }

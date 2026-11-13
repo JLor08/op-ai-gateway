@@ -186,9 +186,11 @@ type PolicySnapshot struct {
 	// WSLStartInFlight is true while a wsl start's VRAM window is open: its
 	// figure is the VM's growth across the start (owner.wslStartWindow), which
 	// holds only if no other wsl start grows the VM meanwhile. So every wsl
-	// candidate Waits while it is set (wslStartWait), right after the
-	// own-demand refusals and before anything that could evict -- a native
-	// candidate is not held back. Stops are never held back by it.
+	// candidate that declares a GPU Waits while it is set (wslStartWait), right
+	// after the own-demand refusals and before anything that could evict. A
+	// native candidate is not held back, and neither is a wsl one with no GPU:
+	// it is taken to hold no VRAM, so it grows no window. Stops are never held
+	// back by it.
 	WSLStartInFlight bool
 	// RAMBootstrapInFlight is the cold-start RAM interlock (task 4.1): true while
 	// some managed process is still in its UNACCOUNTED bootstrap window -- unknown
@@ -375,7 +377,7 @@ type Decision struct {
 	// WaitOnWSLStart is set only together with Wait, and only when a wsl
 	// candidate waits behind another wsl start's open VRAM window
 	// (PolicySnapshot.WSLStartInFlight). The window's close ends it, and the
-	// owner re-asks such a spec when it does (owner.wantsWSLStartWake).
+	// owner re-asks such a spec when it does (owner.wakeWSLStartWaiters).
 	WaitOnWSLStart bool
 	// WaitOnGrace is set only together with Wait, and only when this Wait would
 	// have been a non-Wait (an OK, or an Evict) had NOTHING been grace-protected:
@@ -1242,9 +1244,10 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 //     host-RAM budget by itself refuses terminally for the same reason
 //     (see ramOwnDemandRefusal), and so, for a wsl spec, does one that
 //     exceeds the WSL VM's whole RAM ceiling (wslRAMOwnDemandRefusal).
-//     Right after them, a wsl candidate Waits, evicting nothing, while
-//     another wsl start's VRAM window is open (wslStartWait): its figure is
-//     the VM's growth across that start, so wsl starts go one at a time.
+//     Right after them, a wsl candidate that declares a GPU Waits, evicting
+//     nothing, while another wsl start's VRAM window is open (wslStartWait):
+//     its figure is the VM's growth across that start, so those starts go one
+//     at a time.
 //  2. Unknown-VRAM-vs-pinned short-circuit, for an unknown demand on
 //     EITHER side of the pair. Neither eviction nor waiting can resolve
 //     it, so it is checked, and returned, before any rule that proposes
@@ -1434,9 +1437,11 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	return a.decide()
 }
 
-// wslStartWait is Admit's WSL start interlock: a wsl candidate Waits, evicting
-// nothing, while another wsl start's VRAM window is open
-// (PolicySnapshot.WSLStartInFlight), or ok == false when it does not apply.
+// wslStartWait is Admit's WSL start interlock: a wsl candidate that declares a
+// GPU Waits, evicting nothing, while another wsl start's VRAM window is open
+// (PolicySnapshot.WSLStartInFlight), or ok == false when it does not apply. A
+// wsl candidate with no GPU is taken to hold no VRAM: it opens no window and
+// grows none, so it is not held back.
 //
 // WHY. A wsl workload's VRAM is measured as the WSL VM's growth across its
 // start: Windows charges all of the VM's GPU memory to the VM's worker, and
@@ -1449,7 +1454,7 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 // (Decision.WaitOnWSLStart). Only starts are serialized: a stop never waits for
 // a window, and the window corrects for it instead.
 func wslStartWait(snap PolicySnapshot, spec Spec) (Decision, bool) {
-	if !spec.IsWSL() || !snap.WSLStartInFlight {
+	if !spec.IsWSL() || !wslDeclaresGPU(spec) || !snap.WSLStartInFlight {
 		return Decision{}, false
 	}
 	return Decision{Wait: true, WaitOnWSLStart: true, Evict: []string{}}, true
