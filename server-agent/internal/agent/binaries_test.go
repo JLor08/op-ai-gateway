@@ -824,3 +824,29 @@ func TestWSLListFailureAddressesNoDistroAndKeepsVersion(t *testing.T) {
 		t.Fatalf("row %+v", r)
 	}
 }
+
+func TestParseRunningDistros(t *testing.T) {
+	utf16 := "\uFEFFU\x00b\x00u\x00n\x00t\x00u\x00\r\x00\n\x00D\x00e\x00b\x00i\x00a\x00n\x00\r\x00\n\x00"
+	for _, tc := range []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"plain", "Ubuntu-24.04\nDebian\n", []string{"ubuntu-24.04", "debian"}},
+		{"crlf and blanks", "Ubuntu-24.04\r\n\r\n  \r\nDebian\r\n", []string{"ubuntu-24.04", "debian"}},
+		{"bom", "\uFEFFUbuntu-24.04\n", []string{"ubuntu-24.04"}},
+		{"case folded", "UBUNTU-24.04\n", []string{"ubuntu-24.04"}},
+		{"utf16 as bytes", utf16, []string{"ubuntu", "debian"}},
+		{"empty", "", nil},
+	} {
+		got := parseRunningDistros([]byte(tc.in))
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+		for _, n := range tc.want {
+			if !got[n] {
+				t.Errorf("%s: %q missing from %v", tc.name, n, got)
+			}
+		}
+	}
+}

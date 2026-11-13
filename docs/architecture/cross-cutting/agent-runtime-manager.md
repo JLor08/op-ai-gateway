@@ -1877,7 +1877,7 @@ one well-formed entry exists, `runtime_wsl_exe` is set and the user is not refus
 the agent makes one `wsl.exe --list --running --quiet` call. Only for an entry whose
 distro is listed (case-insensitive) does it call into the distro: a `stat -L -c
 %s:%Y:%F` of the path (stdout only; exit status 1 means the file is missing and the
-row loses its version), then `<path> --version` (combined output) under the same
+row loses its agent-run version; a path-derived `llama-server` version can remain), then `<path> --version` (combined output) under the same
 `(size, mtime)` cache and retry backoff as a native entry, all through
 `wsl.exe -d <distro> -u <user> --cd / --exec`. A distro that is not running, or a
 failed list call, is never called: the row keeps its last good version (source
@@ -2244,16 +2244,28 @@ rule (a Windows-style `wsl://Ubuntu-24.04\home\ai`, a bad distro) is a
 inventory, and the agent logs a startup warning naming the setting and the index.
 A wrong-case `WSL://…` is **not a WSL entry at all**: it is a native path (it
 permits no binary, but as a `runtime_allowed_dirs` entry it still turns native
-`work_dir` containment on), it gets the same startup warning, and the inventory
-lists no entry whose lowercased form starts with `wsl:` and that the parser
-rejects.
+`work_dir` containment on), it gets its own startup warning (that it is treated as
+a native path, not as a WSL entry), and the inventory lists no entry whose
+lowercased form starts with `wsl:` and that the parser rejects.
+
+**A malformed dir entry fails closed.** If `runtime_allowed_dirs` holds any
+malformed or look-alike entry (its lowercased form starts with `wsl:` and the
+parser rejects it, including a wrong-case `WSL://…` and a `wsl:/` typo), WSL
+`work_dir` containment stays on for **every** distro, as if the operator's
+attempt to restrict had succeeded: each distro accepts only a `work_dir` within
+its well-formed `wsl://` dir entries (plus the binary dirs with
+`runtime_allow_binary_dirs`), and an empty `work_dir` stays permitted. Without
+this, dropping the bad entry would leave the distro's set empty, which means any
+`work_dir`. The startup warning for such a dir entry says containment stays on;
+the refusal text still carries only the setting and the well-formed per-distro
+count. Native containment is unchanged.
 
 | Setting | Rule | Empty means |
 |---|---|---|
 | `runtime_wsl_exe` | The `wsl.exe` to launch through. | **Nothing starts** in `wsl` mode. The default is `C:\Program Files\WSL\wsl.exe` on Windows and empty elsewhere, so on a non-Windows agent every `wsl` spec is `not_permitted` ("WSL is not configured") unless an operator sets one. |
 | `runtime_wsl_user` | The Linux user every `wsl.exe` call runs as (`-u`). `root` and every all-digit spelling of UID 0 (`0`, `00`, …) are refused. | **Nothing starts** in `wsl` mode. |
 | `wsl://` entries in `runtime_allowed_binaries` | The spec's distro must be named by at least one well-formed entry, and `spec.binary` must equal the Linux path of an entry **for that distro**, exactly. | **Nothing starts** in `wsl` mode. The same path allowlisted for two distros permits each distro only its own. |
-| `wsl://` entries in `runtime_allowed_dirs` | POSIX work-dir containment for that distro (`withinPosixDir`: `path.Clean`, then equality or a `/` boundary), with the same bare-or-trailing-`/*` subtree semantics as §3.1.1. With `runtime_allow_binary_dirs` on, `path.Dir` of each of that distro's `wsl://` binary entries joins the set. | Any absolute `work_dir` (no `wsl://` dir entry for the distro and the auto-allow contributes none). |
+| `wsl://` entries in `runtime_allowed_dirs` | POSIX work-dir containment for that distro (`withinPosixDir`: `path.Clean`, then equality or a `/` boundary), with the same bare-or-trailing-`/*` subtree semantics as §3.1.1. With `runtime_allow_binary_dirs` on, `path.Dir` of each of that distro's `wsl://` binary entries joins the set. | Any absolute `work_dir` (no `wsl://` dir entry for the distro and the auto-allow contributes none), unless a malformed `wsl:` dir entry exists (then containment stays on, see above). |
 
 `permitWSL` checks in that order: the exe, the user, the distro, the binary, then
 the work dir. A `work_dir` that is set must be absolute; an empty one runs beside
@@ -2344,7 +2356,7 @@ what `wsl.exe` or `id -u` printed, and its text names the setting, not the user.
 The configured user is no secret, though: the resolved command the log stream
 reports (§14.7, below) shows `-d <distro>` and `-u <runtime_wsl_user>` by design,
 because it is what ran. **Each `applyConfig` warms the distros its `wsl` specs
-name**: for every allowed distro a `wsl` spec in the document names and no earlier
+name**: for every distro named by a `wsl://` binary entry that a `wsl` spec in the document names and no earlier
 document did, it starts the lookup before it admits anything, so a start usually
 finds its UID already cached. A distro no spec names is never called into, because
 a call into a distro starts the WSL VM: an agent whose document runs nothing in WSL
@@ -5818,7 +5830,9 @@ only: an older gateway stores and lists a `wsl://` row verbatim, without
 `execution`, `distro` or `exec_path` (its Binaries tab shows the raw path and its
 picker would offer it as a native binary) and stores a `vllm` as `other`. Upgrade
 the gateway, with its portal, together with or before agents that list `wsl://`
-entries.
+entries. An agent **before 0.19.1** ignores `wsl://` entries and still needs the
+old `runtime_wsl_allowed_*` settings, so upgrade the agent before switching its
+config to `wsl://` entries.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/

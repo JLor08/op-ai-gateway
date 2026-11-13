@@ -2493,7 +2493,7 @@ const de = {
   clusterIncompleteNeutral: 'Mindestwert: mindestens diese Summe',
   binariesTab: 'Binaries',
   binariesIntro:
-    'Die llama-server- und ggml-rpc-server-Binaries dieses Servers: vom Agent gemeldete (nur die Version lässt sich überschreiben) und von Hand ergänzte.',
+    'Die Runtime-Binaries dieses Servers (llama-server, ggml-rpc-server, vLLM u. a.), nativ oder in WSL: vom Agent gemeldete (nur die Version lässt sich überschreiben) und von Hand ergänzte.',
   binariesEmpty: 'Keine Binaries bekannt.',
   binariesAdd: 'Binary hinzufügen',
   binariesNewTitle: 'Neues Binary',
@@ -6423,7 +6423,7 @@ const en: PortalMessages = {
   clusterIncompleteNeutral: 'Lower bound: at least this total',
   binariesTab: 'Binaries',
   binariesIntro:
-    'The llama-server and ggml-rpc-server binaries on this server: those the agent reports (only the version can be overridden) and ones added by hand.',
+    'The runtime binaries on this server (llama-server, ggml-rpc-server, vLLM and others), native or in WSL: those the agent reports (only the version can be overridden) and ones added by hand.',
   binariesEmpty: 'No binaries known.',
   binariesAdd: 'Add binary',
   binariesNewTitle: 'New binary',

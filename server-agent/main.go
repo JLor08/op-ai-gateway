@@ -219,9 +219,10 @@ func main() {
 		// never gateway-supplied. config.Load bounds it, so the multiplication
 		// cannot overflow a Duration.
 		EvictionGrace: time.Duration(cfg.EvictionGraceSeconds) * time.Second,
-		// The WSL execution mode's configuration (#381), the same block the
-		// policy above permits wsl specs against: the manager launches, stops
-		// and sweeps with it. Operator-owned (runtime_wsl_*), never
+		// The WSL execution mode's configuration (#381), the same wsl.exe
+		// and user the policy above permits wsl specs with: the manager
+		// launches, stops and sweeps with them. Operator-owned (runtime_wsl_exe,
+		// runtime_wsl_user), never
 		// gateway-supplied; empty everywhere but a configured Windows host.
 		WSL: localPolicy.WSL,
 		// Memory held back from the WSL2 VM's RAM pool that wsl processes are

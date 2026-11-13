@@ -125,7 +125,9 @@
   // An entry of the form wsl://<distro>/<absolute Linux path> (for example
   // "wsl://Ubuntu-24.04/srv/models/*") bounds the work_dir of WSL specs in
   // that distro only; with no entry for a distro, any absolute work_dir is
-  // accepted there.
+  // accepted there, unless runtime_allow_binary_dirs below restricts it to the
+  // binary directories or a malformed wsl: entry in this list keeps WSL
+  // work_dir containment on (then only well-formed entries permit one).
   "runtime_allowed_dirs": [],
 
   // When true, each runtime_allowed_binaries entry's PARENT directory is

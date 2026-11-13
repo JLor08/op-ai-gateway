@@ -96,14 +96,14 @@ func WSLUserRefused(user string) bool {
 	return user == "" || user == "root" || isZeroUID(user)
 }
 
-// wslHelperArgs is the wsl.exe argv of a helper call: the distro, always the
+// WSLHelperArgs is the wsl.exe argv of a helper call: the distro, always the
 // configured user, "/" as the working directory, and the command through
 // --exec, never a shell. Without --cd, wsl.exe starts the command in the
 // translation of the caller's Windows working directory -- the agent's, which
 // may have no mount in the distro at all (an operator may turn the drive
 // mounts off) -- and fails or warns on stdout when it cannot; "/" needs no
 // translation and exists in every distro.
-func wslHelperArgs(user, distro string, command ...string) []string {
+func WSLHelperArgs(user, distro string, command ...string) []string {
 	return append([]string{"-d", distro, "-u", user, "--cd", "/", "--exec"}, command...)
 }
 
@@ -129,7 +129,9 @@ func wslHelperEnv(getenv func(string) string, uid int) []string {
 
 // runWSLHelper runs one helper call into distro, bounded by wslHelperTimeout.
 // It refuses a root user itself rather than trusting every caller to have
-// checked: this is the one way the agent's own calls reach a distro.
+// checked: every call the manager makes into a distro goes through here (the
+// binary inventory's own probes build the same argv with WSLHelperArgs and
+// refuse root through wslProbeConfig.usable()).
 func runWSLHelper(run wslRunner, pol WSLPolicy, distro string, env []string, command ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), wslHelperTimeout)
 	defer cancel()
@@ -142,7 +144,7 @@ func runWSLHelperCtx(ctx context.Context, run wslRunner, pol WSLPolicy, distro s
 	if WSLUserRefused(pol.User) {
 		return nil, fmt.Errorf("runtime: no non-root WSL user is configured (runtime_wsl_user)")
 	}
-	return run(ctx, pol.Exe, wslHelperArgs(pol.User, distro, command...), env)
+	return run(ctx, pol.Exe, WSLHelperArgs(pol.User, distro, command...), env)
 }
 
 // wslUIDFailureMessage is the last_error of a wsl start whose UID lookup
