@@ -1714,7 +1714,7 @@ func (_d *APIWithTracing) PutRuntimeSpec(ctx context.Context, t1 auth.Token, s1 
 	return _d.API.PutRuntimeSpec(ctx, t1, s1, p1)
 }
 
-func (_d *APIWithTracing) RPCMemberDisplayNames(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (m1 map[string]string, err error) {
+func (_d *APIWithTracing) RPCMemberDisplayNames(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (m1 map[string]RPCMemberName, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RPCMemberDisplayNames")
 	defer span.End()
 	defer func() {

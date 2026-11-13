@@ -614,6 +614,12 @@ export interface RuntimeStatus {
   // model>)(<head server>)" ("RPC (—)" for a head the reader may not see).
   // spec_id stays the member's identity; absent from an older gateway.
   display_name?: string;
+  // The parts of display_name: the head's gateway model name and the name of
+  // the server the head runs on. Absent when the name names no head (a head
+  // the reader may not see, a head that is gone, a manual spec no head uses)
+  // and from an older gateway.
+  head_model?: string;
+  head_server?: string;
   rpc?: RuntimeRpcStatus;
   cluster?: RuntimeClusterStatus;
   // On a waiting spec: the member spec holding the resource it needs.
