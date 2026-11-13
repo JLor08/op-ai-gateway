@@ -1253,6 +1253,8 @@ const de = {
   runtimeSpecTypeOllama: 'Ollama',
   runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
+  runtimeSpecTypeSglang: 'SGLang',
+  runtimeSpecTypeSglangOmni: 'sglang-omni',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Benutzerdefiniert',
   runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
@@ -1427,6 +1429,8 @@ const de = {
     'Eine Runtime-Spezifikation für stable-diffusion.cpp nennt eine Text-API-Variante (openai oder anthropic) oder gar keine Variante. sd-server hat keinen Chat-Endpunkt, deshalb schlagen Textanfragen an ihr Modell fehl.',
   runtimeTextOnVllmSrWarning:
     'Eine Runtime-Spezifikation für vLLM Semantic Router nennt eine Text-API-Variante (openai oder anthropic). Der Worker bedient nur POST /v1/systemone, deshalb schlagen Textanfragen an sein Modell fehl.',
+  runtimeNoAudioOnSglangOmniWarning:
+    'Die Runtime-Spezifikation für sglang-omni nennt keine Variante openai_audio. Deshalb werden Sprachsynthese- und Transkriptionsanfragen nicht an sie geleitet.',
   runtimeSpecsIntro: 'Startkonfigurationen der Modell-Zuordnungen dieser Anwendung verwalten.',
   runtimeSpecCreate: 'Spezifikation anlegen',
   runtimeSpecEditAction: 'Bearbeiten',
@@ -1604,6 +1608,10 @@ const de = {
     'audiocpp_server liefert nur Sprachsynthese. Unter „API-Varianten“ hier nur „openai_audio (Sprachsynthese)“ ankreuzen und openai sowie anthropic abwählen; an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein.',
   runtimeSpecTypeVllmSrNote:
     'vllm-srun startet vLLM Semantic Router als Worker. Startvorlage: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (Gerät 0, weil die GPU durch die sichtbaren Geräte neu zugeordnet wird). vllm-srun aus einem Checkout des festgelegten Commits (vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd) installieren (pip install ./src/model-runtime) und dessen venv in runtime_allow_binary_dirs aufnehmen. Der erste Start lädt das Modell herunter – den Start-Timeout entsprechend erhöhen. Der Worker hat keine Authentifizierung und muss auf Loopback bleiben. Das Portal warnt, wenn der Worker eine api_version mit einer anderen als der unterstützten Hauptversion meldet. Unter „API-Varianten“ hier nur „decisions“ ankreuzen; an der übergeordneten server_agent-Anwendung muss „decisions“ ebenfalls angekreuzt sein. Decisions-Durchreichen wird nicht angeboten.',
+  runtimeSpecTypeSglangNote:
+    'SGLang bedient Chat über /v1/chat/completions. Startvorlage: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Auf einer geteilten Karte --mem-fraction-static setzen, denn der automatische Standard belegt den Großteil des Speichers. Mit --api-key bleiben /health und /metrics offen. Unter Windows im WSL-Ausführungsmodus starten.',
+  runtimeSpecTypeSglangOmniNote:
+    'sglang-omni bedient Chat, Sprachsynthese und Transkription. Startvorlage: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. --host 127.0.0.1 beibehalten: sglang-omni prüft keine Anmeldung und lauscht standardmäßig auf 0.0.0.0. Sprache und Transkription brauchen manuelle Fähigkeitsurteile. Stimmreferenzen und Chat-Medien werden nur inline als data:-URL angenommen. Unter Windows im WSL-Ausführungsmodus starten.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -5287,6 +5295,8 @@ const en: PortalMessages = {
   runtimeSpecTypeOllama: 'Ollama',
   runtimeSpecTypeStableDiffusionCpp: 'stable-diffusion.cpp',
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
+  runtimeSpecTypeSglang: 'SGLang',
+  runtimeSpecTypeSglangOmni: 'sglang-omni',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Custom',
   runtimeSpecMetricsPath: 'Metrics path (override)',
@@ -5449,6 +5459,8 @@ const en: PortalMessages = {
     'A stable-diffusion.cpp launch spec lists a text API flavor (openai or anthropic), or no flavor at all. sd-server has no chat endpoint, so text requests to its model fail.',
   runtimeTextOnVllmSrWarning:
     'A runtime spec for vLLM Semantic Router lists a text API flavor (openai or anthropic). The worker serves POST /v1/systemone only, so text requests to its model fail.',
+  runtimeNoAudioOnSglangOmniWarning:
+    'The sglang-omni runtime spec lists no openai_audio flavor, so speech and transcription requests are not routed to it.',
   runtimeSpecsIntro: "Manage this application's model-mapping launch configurations.",
   runtimeSpecCreate: 'Create spec',
   runtimeSpecEditAction: 'Edit',
@@ -5610,6 +5622,10 @@ const en: PortalMessages = {
     'audiocpp_server serves speech synthesis only. Under "API flavors", tick only "openai_audio (speech synthesis)" here, with openai and anthropic unticked; the parent server_agent application needs "openai_audio (speech synthesis)" ticked too.',
   runtimeSpecTypeVllmSrNote:
     'vllm-srun launches vLLM Semantic Router as a worker. Launch template: serve ${MODEL} --device cuda:0 --host 127.0.0.1 --port ${PORT} (device 0, because the GPU is remapped by the visible devices). Install vllm-srun from a checkout of the pinned commit (vllm-project/semantic-router@4ec449f358ce7805228fb341bdc55ea5211707fd) (pip install ./src/model-runtime) and add its venv to runtime_allow_binary_dirs. The first start downloads the model, so raise the startup timeout. The worker has no authentication and must stay on loopback. The portal warns when the worker reports an api_version with a major other than the supported one. Under "API flavors", tick only "decisions" here; the parent server_agent application needs "decisions" ticked too. Decisions passthrough is not offered.',
+  runtimeSpecTypeSglangNote:
+    'SGLang serves chat over /v1/chat/completions. Launch template: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Set --mem-fraction-static when the card is shared, because the automatic default takes most of it. With --api-key, /health and /metrics stay open. On Windows, run it in the WSL execution mode.',
+  runtimeSpecTypeSglangOmniNote:
+    'sglang-omni serves chat, speech and transcription. Launch template: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. Keep --host 127.0.0.1: sglang-omni authenticates nothing and listens on 0.0.0.0 by default. Speech and transcription need manual capability verdicts. Voice references and chat media are accepted only inline, as data: URLs. On Windows, run it in the WSL execution mode.',
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:

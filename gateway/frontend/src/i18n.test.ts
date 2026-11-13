@@ -4734,3 +4734,29 @@ describe('vllm_sr i18n keys', () => {
     expect(messages.en.applicationTypeVllmSrNote).toContain('clear the verdict in the portal');
   });
 });
+
+describe('sglang i18n keys', () => {
+  it('defines the type labels, notes and the warning in de and en', () => {
+    const keys = [
+      'runtimeSpecTypeSglang',
+      'runtimeSpecTypeSglangNote',
+      'runtimeSpecTypeSglangOmni',
+      'runtimeSpecTypeSglangOmniNote',
+      'runtimeNoAudioOnSglangOmniWarning',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      // The product names are the same in both locales; everything else is text.
+      if (k !== 'runtimeSpecTypeSglang' && k !== 'runtimeSpecTypeSglangOmni') {
+        expect(messages.en[k]).not.toBe(messages.de[k]);
+      }
+    }
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('--mem-fraction-static');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('--model-path ${MODEL}');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('data:');
+    }
+  });
+});

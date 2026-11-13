@@ -266,6 +266,7 @@ const runtimeWarningLabelByCode: Record<string, MessageKey> = {
   api_flavors_not_on_application: 'runtimeFlavorNotOnApplicationWarning',
   api_flavors_text_on_stable_diffusion: 'runtimeTextOnStableDiffusionWarning',
   api_flavors_text_on_vllm_sr: 'runtimeTextOnVllmSrWarning',
+  api_flavors_no_audio_on_sglang_omni: 'runtimeNoAudioOnSglangOmniWarning',
 };
 
 // admin_state's three valid wire values (service_runtime.go): "" (no
@@ -760,6 +761,8 @@ function runtimeSpecTypeNote(type: RuntimeSpec['type'], t: Translation): string 
   if (type === 'stable_diffusion_cpp') return t.runtimeSpecTypeStableDiffusionCppNote;
   if (type === 'audio_cpp') return t.runtimeSpecTypeAudioCppNote;
   if (type === 'vllm_sr') return t.runtimeSpecTypeVllmSrNote;
+  if (type === 'sglang') return t.runtimeSpecTypeSglangNote;
+  if (type === 'sglang_omni') return t.runtimeSpecTypeSglangOmniNote;
   return undefined;
 }
 
@@ -5139,6 +5142,8 @@ export function RuntimeAdminSection({
               <option value="stable_diffusion_cpp">{t.runtimeSpecTypeStableDiffusionCpp}</option>
               <option value="audio_cpp">{t.runtimeSpecTypeAudioCpp}</option>
               <option value="vllm_sr">{t.runtimeSpecTypeVllmSr}</option>
+              <option value="sglang">{t.runtimeSpecTypeSglang}</option>
+              <option value="sglang_omni">{t.runtimeSpecTypeSglangOmni}</option>
               <option value="custom">{t.runtimeSpecTypeCustom}</option>
             </SelectField>
             <Field
