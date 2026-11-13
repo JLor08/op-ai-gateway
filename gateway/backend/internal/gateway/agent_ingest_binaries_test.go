@@ -121,6 +121,43 @@ func TestManualVersionOverrideSurvivesRescan(t *testing.T) {
 	}
 }
 
+func TestIngestAcceptsVLLMKind(t *testing.T) {
+	srv := NewTestServer()
+	ingestBinaries(t, srv, `[
+		{"path":"wsl://Ubuntu-24.04/home/ai/venv/bin/vllm","kind":"vllm","version":"0.11.0","version_source":"agent","allowed":true},
+		{"path":"/opt/x/tool","kind":"mystery"}]`)
+	got := storedBinaries(t, srv)
+	if k := got["wsl://Ubuntu-24.04/home/ai/venv/bin/vllm"].Kind; k != "vllm" {
+		t.Errorf("vllm kind = %q", k)
+	}
+	if k := got["/opt/x/tool"].Kind; k != "other" {
+		t.Errorf("unknown kind = %q, want other", k)
+	}
+}
+
+func TestBinariesAPIVLLMAndExecution(t *testing.T) {
+	srv := NewTestServer()
+	serverID := seedGPUBudgetServer(t, srv)
+	base := "/api/portal/servers/" + serverID + "/binaries"
+	rec := rpcMemberDo(t, srv, http.MethodPost, base, `{"path":"wsl://Ubuntu-24.04/home/ai/venv/bin/vllm","kind":"vllm"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{`"kind":"vllm"`, `"execution":"wsl"`, `"distro":"Ubuntu-24.04"`, `"exec_path":"/home/ai/venv/bin/vllm"`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("body lacks %s: %s", want, rec.Body.String())
+		}
+	}
+	rec = rpcMemberDo(t, srv, http.MethodPost, base, `{"path":"/usr/bin/llama-server","kind":"llama_server"}`)
+	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"execution":"native"`) || !strings.Contains(rec.Body.String(), `"distro":""`) {
+		t.Fatalf("native create = %d %s", rec.Code, rec.Body.String())
+	}
+	rec = rpcMemberDo(t, srv, http.MethodPost, base, `{"path":"wsl://Ubuntu-24.04","kind":"vllm"}`)
+	if rec.Code != http.StatusBadRequest || rpcMemberErrCode(t, rec) != "binary.path_invalid" {
+		t.Fatalf("malformed = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestBinariesAPI(t *testing.T) {
 	srv := NewTestServer()
 	serverID := seedGPUBudgetServer(t, srv)

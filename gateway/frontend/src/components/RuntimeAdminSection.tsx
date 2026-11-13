@@ -5034,6 +5034,11 @@ export function RuntimeAdminSection({
               kind="llama_server"
               value={binary}
               onChange={setBinary}
+              onSelect={(b) => {
+                // An inventory row carries its own execution mode and distro.
+                setExecutionMode(b.execution === 'wsl' ? 'wsl' : 'native');
+                if (b.execution === 'wsl') setWslDistro(b.distro);
+              }}
               binaries={serverBinaries}
               required
               placeholder="/usr/local/bin/llama-server"

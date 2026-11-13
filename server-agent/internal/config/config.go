@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"op-ai-server-agent/internal/wslentry"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -119,6 +120,11 @@ const defaultConfigFilesDirName = "server-agent-config-files"
 // Config holds the resolved agent settings. The server identity is derived from
 // the token by the gateway, so there is no hostname field.
 type Config struct {
+	// Warnings are human-readable startup warnings Load found (removed
+	// settings still present, malformed wsl:// allowlist entries). main logs
+	// them once, after the logger is configured.
+	Warnings []string
+
 	GatewayURL string        // gateway base URL, e.g. https://gw.example
 	Token      string        // per-server agent bearer token
 	Interval   time.Duration // collection cadence (default 1s)
@@ -198,10 +204,15 @@ type Config struct {
 	// what may run here. Nil (unset) means the operator has configured
 	// nothing, which LocalPolicy treats as "refuse everything", not
 	// "anything goes".
+	//
+	// An entry of the form wsl://<distro>/<absolute Linux path> allowlists a
+	// binary inside a WSL2 distro (the form is checked by Load into Warnings).
 	RuntimeAllowedBinaries []string
 	// RuntimeAllowedDirs lists permitted work_dir prefixes for the local
 	// policy, with the same operator-only provenance as
 	// RuntimeAllowedBinaries. Nil (unset) means any work_dir is permitted.
+	// wsl://<distro>/<path> entries bound the work_dir of WSL specs in that
+	// distro only.
 	RuntimeAllowedDirs []string
 	// RuntimeAllowBinaryDirs, when true, treats each RuntimeAllowedBinaries
 	// entry's PARENT directory as an allowed work_dir prefix WITHOUT the
@@ -219,20 +230,10 @@ type Config struct {
 	// Empty means "WSL is not configured here", and the local policy then
 	// refuses every WSL spec. Same operator-only provenance as the native
 	// allowlists: it comes ONLY from this local config, never from the gateway.
+	// WHICH binaries, distros and directories a WSL spec may use is not a
+	// setting of its own: it is wsl://<distro>/<absolute Linux path> entries in
+	// RuntimeAllowedBinaries and RuntimeAllowedDirs.
 	RuntimeWSLExe string
-	// RuntimeWSLAllowedDistros lists the WSL distributions a spec may run in,
-	// matched exactly. Empty (unset) refuses every WSL spec, like
-	// RuntimeAllowedBinaries -- not "any distro".
-	RuntimeWSLAllowedDistros []string
-	// RuntimeWSLAllowedBinaries lists the absolute POSIX paths, inside the
-	// distro, a WSL spec's binary must exactly match. A separate list from
-	// RuntimeAllowedBinaries (a Windows path and a Linux path can never be the
-	// same executable); empty refuses every WSL spec.
-	RuntimeWSLAllowedBinaries []string
-	// RuntimeWSLAllowedDirs lists permitted POSIX work_dir prefixes inside the
-	// distro, with the same bare-or-"/*" subtree semantics as RuntimeAllowedDirs.
-	// Empty means any absolute work_dir is permitted.
-	RuntimeWSLAllowedDirs []string
 	// RuntimeWSLUser is the distro user every WSL process runs as (wsl.exe -u).
 	// There is no default and "root" is refused by the local policy: the agent
 	// never hands a gateway-supplied argv or env to a root process.
@@ -465,15 +466,13 @@ type fileConfig struct {
 	// so an absent key is distinguishable from an explicit false -- required by
 	// the reflection parity test and resolveBool's env>file precedence.
 	RuntimeAllowBinaryDirs *bool `json:"runtime_allow_binary_dirs"`
-	// The WSL policy family; see the matching Config fields.
-	RuntimeWSLExe             string   `json:"runtime_wsl_exe"`
-	RuntimeWSLAllowedDistros  []string `json:"runtime_wsl_allowed_distros"`
-	RuntimeWSLAllowedBinaries []string `json:"runtime_wsl_allowed_binaries"`
-	RuntimeWSLAllowedDirs     []string `json:"runtime_wsl_allowed_dirs"`
-	RuntimeWSLUser            string   `json:"runtime_wsl_user"`
-	RuntimeCachePath          string   `json:"runtime_cache"`
-	ConfigFilesDir            string   `json:"config_files_dir"`
-	RuntimeRouterBindHost     string   `json:"runtime_router_bind"`
+	// The WSL launcher settings; see the matching Config fields. (The three
+	// removed WSL allowlist keys are detected by readConfigFile, not decoded.)
+	RuntimeWSLExe         string `json:"runtime_wsl_exe"`
+	RuntimeWSLUser        string `json:"runtime_wsl_user"`
+	RuntimeCachePath      string `json:"runtime_cache"`
+	ConfigFilesDir        string `json:"config_files_dir"`
+	RuntimeRouterBindHost string `json:"runtime_router_bind"`
 
 	RuntimeLogBufferBytes      int `json:"runtime_log_buffer_bytes"`
 	RuntimeLogBufferTotalBytes int `json:"runtime_log_buffer_total_bytes"`
@@ -536,7 +535,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if path == "" {
 		path = defaultConfigPath()
 	}
-	file, err := readConfigFile(path, explicit)
+	file, fileKeys, err := readConfigFile(path, explicit)
 	if err != nil {
 		return Config{}, err
 	}
@@ -588,19 +587,16 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		TLSInsecure:          resolveBool(set["tls-insecure"], *tlsInsecure, getenv("OP_AGENT_TLS_INSECURE"), file.TLSInsecure),
 		Verbose:              resolveBool(set["v"] || set["verbose"], *vShort || *vLong, getenv("OP_AGENT_VERBOSE"), file.Verbose),
 
-		RuntimeSource:             strings.ToLower(strings.TrimSpace(resolveStr("runtime-source", *runtimeSource, "OP_AGENT_RUNTIME_SOURCE", file.RuntimeSource))),
-		RuntimeConfigPath:         strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
-		RuntimeAllowedBinaries:    resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
-		RuntimeAllowedDirs:        resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
-		RuntimeAllowBinaryDirs:    resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
-		RuntimeWSLExe:             resolveWSLExe(getenv("OP_AGENT_RUNTIME_WSL_EXE"), file.RuntimeWSLExe),
-		RuntimeWSLAllowedDistros:  resolveStringList(getenv("OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS"), file.RuntimeWSLAllowedDistros),
-		RuntimeWSLAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES"), file.RuntimeWSLAllowedBinaries),
-		RuntimeWSLAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS"), file.RuntimeWSLAllowedDirs),
-		RuntimeWSLUser:            resolveTrimmed(getenv("OP_AGENT_RUNTIME_WSL_USER"), file.RuntimeWSLUser),
-		RuntimeCachePath:          strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
-		ConfigFilesDir:            strings.TrimSpace(resolveStr("config-files-dir", *configFilesDir, "OP_AGENT_CONFIG_FILES_DIR", file.ConfigFilesDir)),
-		RuntimeRouterBindHost:     strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
+		RuntimeSource:          strings.ToLower(strings.TrimSpace(resolveStr("runtime-source", *runtimeSource, "OP_AGENT_RUNTIME_SOURCE", file.RuntimeSource))),
+		RuntimeConfigPath:      strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
+		RuntimeAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
+		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
+		RuntimeAllowBinaryDirs: resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
+		RuntimeWSLExe:          resolveWSLExe(getenv("OP_AGENT_RUNTIME_WSL_EXE"), file.RuntimeWSLExe),
+		RuntimeWSLUser:         resolveTrimmed(getenv("OP_AGENT_RUNTIME_WSL_USER"), file.RuntimeWSLUser),
+		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
+		ConfigFilesDir:         strings.TrimSpace(resolveStr("config-files-dir", *configFilesDir, "OP_AGENT_CONFIG_FILES_DIR", file.ConfigFilesDir)),
+		RuntimeRouterBindHost:  strings.TrimSpace(resolveStr("runtime-router-bind", *runtimeRouterBindHost, "OP_AGENT_RUNTIME_ROUTER_BIND", file.RuntimeRouterBindHost)),
 
 		RuntimeLogBufferBytes:      resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_BYTES"), file.RuntimeLogBufferBytes),
 		RuntimeLogBufferTotalBytes: resolveInt(getenv("OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES"), file.RuntimeLogBufferTotalBytes),
@@ -638,7 +634,74 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
+	cfg.Warnings = runtimeAllowlistWarnings(cfg, fileKeys, getenv)
 	return cfg, nil
+}
+
+// removedWSLSettings maps each removed WSL allowlist setting (config key and
+// env var) to the list its wsl:// entries now belong in.
+var removedWSLSettings = []struct{ key, env string }{
+	{"runtime_wsl_allowed_distros", "OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS"},
+	{"runtime_wsl_allowed_binaries", "OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES"},
+	{"runtime_wsl_allowed_dirs", "OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS"},
+}
+
+// runtimeAllowlistWarnings builds Config.Warnings: one per removed WSL setting
+// still present (file key or non-empty env var), and one per malformed wsl://
+// or look-alike entry in the two allowlists. The agent starts regardless. A
+// removed setting is ignored. A malformed wsl:// entry permits nothing; in
+// runtime_allowed_dirs it is also ignored but keeps WSL work_dir containment
+// on. A look-alike (a wsl: entry whose scheme is not exactly lowercase wsl://)
+// is not a WSL entry and is treated as a native path.
+func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(string) string) []string {
+	w := removedWSLSettingWarnings(fileKeys, getenv)
+	for _, list := range []struct {
+		name    string
+		entries []string
+	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}} {
+		for i, e := range list.entries {
+			if msg := allowlistEntryWarning(list.name, i, e); msg != "" {
+				w = append(w, msg)
+			}
+		}
+	}
+	return w
+}
+
+// removedWSLSettingWarnings returns one warning per removed WSL setting that is
+// still present (file key or non-empty env var).
+func removedWSLSettingWarnings(fileKeys map[string]bool, getenv func(string) string) []string {
+	var w []string
+	for _, r := range removedWSLSettings {
+		if fileKeys[r.key] || strings.TrimSpace(getenv(r.env)) != "" {
+			w = append(w, fmt.Sprintf("%s (env %s) is no longer supported and is ignored: allowlist a WSL binary as a wsl://<distro>/<absolute Linux path> entry in runtime_allowed_binaries and a WSL work_dir prefix in runtime_allowed_dirs", r.key, r.env))
+		}
+	}
+	return w
+}
+
+// allowlistEntryWarning returns the warning for entry e at index i of the named
+// allowlist, or "" when the entry is fine.
+func allowlistEntryWarning(listName string, i int, e string) string {
+	isDirs := listName == "runtime_allowed_dirs"
+	if wslentry.Is(e) {
+		if _, _, ok := wslentry.Parse(e); ok {
+			return ""
+		}
+		msg := "%s[%d] is a malformed wsl:// entry and permits nothing (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
+		if isDirs {
+			msg = "%s[%d] is a malformed wsl:// entry and is ignored, but WSL work_dir containment stays on: only well-formed wsl:// dir entries (and binary dirs with runtime_allow_binary_dirs) permit a WSL work_dir (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
+		}
+		return fmt.Sprintf(msg, listName, i)
+	}
+	if !wslentry.LooksLike(e) {
+		return ""
+	}
+	msg := "%s[%d] looks like a WSL entry but is not wsl:// (the scheme must be exactly lowercase wsl://); it is not a WSL entry and is treated as a native path"
+	if isDirs {
+		msg += ", and WSL work_dir containment stays on"
+	}
+	return fmt.Sprintf(msg, listName, i)
 }
 
 // resolveInt applies env > file for a plain integer setting that (per the
@@ -944,20 +1007,40 @@ func defaultConfigPath() string {
 
 // readConfigFile reads and parses the JSON config. A missing file returns a zero
 // fileConfig with no error UNLESS it was explicitly requested (flag/env). Bad
-// JSON is always an error.
-func readConfigFile(path string, explicit bool) (fileConfig, error) {
+// JSON is always an error. The second result is the set of top-level keys the
+// file carries WITH a value (not null, not []), which Load uses to spot a
+// removed setting (fileConfig has no field for those, and unknown keys are
+// otherwise ignored).
+func readConfigFile(path string, explicit bool) (fileConfig, map[string]bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) && !explicit {
-			return fileConfig{}, nil
+			return fileConfig{}, nil, nil
 		}
-		return fileConfig{}, fmt.Errorf("read config %s: %w", path, err)
+		return fileConfig{}, nil, fmt.Errorf("read config %s: %w", path, err)
 	}
+	data = stripJSONLineComments(data)
 	var fc fileConfig
-	if err := json.Unmarshal(stripJSONLineComments(data), &fc); err != nil {
-		return fileConfig{}, fmt.Errorf("parse config %s: %w", path, err)
+	if err := json.Unmarshal(data, &fc); err != nil {
+		return fileConfig{}, nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	return fc, nil
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(data, &raw) // the document parsed above, so this cannot fail on syntax
+	keys := make(map[string]bool, len(raw))
+	for k, v := range raw {
+		// Only a key that carries a value counts: null and [] configure nothing
+		// (every config generated since #390 holds the removed keys as []).
+		var compact bytes.Buffer
+		if json.Compact(&compact, v) != nil {
+			continue
+		}
+		switch compact.String() {
+		case "null", "[]":
+		default:
+			keys[k] = true
+		}
+	}
+	return fc, keys, nil
 }
 
 // stripJSONLineComments removes whole-line `//` comments so the config file can carry

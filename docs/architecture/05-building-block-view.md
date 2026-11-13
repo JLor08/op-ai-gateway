@@ -278,8 +278,9 @@ Additions worth knowing when looking for code on this side:
   Two server tabs belong to it: **RPC** (`RpcMemberSection.tsx`: the server's RPC
   membership and consent, its manual member specs and the live member rows;
   hidden for a file-mode agent) and **Binaries** (`BinariesSection.tsx`: the
-  inventory with version overrides and manual rows), whose entries
-  `shared/BinaryPicker.tsx` offers to every binary field. The API modules are
+  inventory with an Execution column, version overrides and manual rows), whose
+  entries, WSL ones included, `shared/BinaryPicker.tsx` offers to every binary
+  field and fills the execution mode and distro from. The API modules are
   `api/rpcMembers.ts` and `api/binaries.ts`.
 - **The live transcription client** (`gateway/frontend/src/components/chat/`, issue #266, [ADR-073](09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)) is the portal's microphone-to-gateway streaming path. `captureWorklet.ts` (an `AudioWorkletProcessor`, bundled
   separately by Vite as `?worker&url`) takes the microphone as one channel, resamples it to 16 kHz and posts

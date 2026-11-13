@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"op-ai-server-agent/internal/wslentry"
 	"os"
 	"os/exec"
 	"path"
@@ -177,12 +178,22 @@ func processAlive(pid int) bool {
 }
 
 func wslTestPolicy() WSLPolicy {
-	return WSLPolicy{
-		Exe:             fakewslPath,
-		AllowedDistros:  []string{wslTestDistro},
-		AllowedBinaries: []string{stubchildPath},
-		User:            "ai",
+	return WSLPolicy{Exe: fakewslPath, User: "ai"}
+}
+
+// wslLocalPolicy is the whole local policy of a WSL test: the native allowlist
+// admits stubchild, and one wsl:// entry per distro (default: the test distro)
+// admits it inside that distro.
+func wslLocalPolicy(distros ...string) LocalPolicy {
+	if len(distros) == 0 {
+		distros = []string{wslTestDistro}
 	}
+	pol := allowlistPolicy()
+	for _, d := range distros {
+		pol.AllowedBinaries = append(pol.AllowedBinaries, wslentry.Scheme+d+stubchildPath)
+	}
+	pol.WSL = wslTestPolicy()
+	return pol
 }
 
 // wslTestSpec is baseSpec run in the test distro. Its env carries the fake's
@@ -196,15 +207,15 @@ func wslTestSpec(f *fakeWSL, id, model string) Spec {
 
 func newWSLTestManager(t *testing.T, run wslRunner) *Manager {
 	t.Helper()
-	return newWSLTestManagerWith(t, wslTestPolicy(), run)
+	return newWSLTestManagerWith(t, wslLocalPolicy(), run)
 }
 
 // newWSLTestManagerWith is newWSLTestManager with its own WSL policy. The
 // native allowlist admits stubchild too, so a test can run a native spec
 // beside the wsl one.
-func newWSLTestManagerWith(t *testing.T, pol WSLPolicy, run wslRunner) *Manager {
+func newWSLTestManagerWith(t *testing.T, pol LocalPolicy, run wslRunner) *Manager {
 	t.Helper()
-	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), WSL: pol, WSLRunner: run, Getenv: func(string) string { return "" }})
+	m := NewManager(ManagerOptions{Policy: pol, WSLRunner: run, Getenv: func(string) string { return "" }})
 	t.Cleanup(m.Close)
 	return m
 }
@@ -498,8 +509,8 @@ func TestWSLUIDLookupFailureIsStartFailure(t *testing.T) {
 				}
 				return f.runner()(ctx, exe, args, env)
 			}
-			pol := wslTestPolicy()
-			pol.User = user
+			pol := wslLocalPolicy()
+			pol.WSL.User = user
 			m := newWSLTestManagerWith(t, pol, run)
 			m.Apply(Config{ETag: "v1", Specs: []Spec{wslTestSpec(f, "S", "m")}})
 
@@ -673,8 +684,7 @@ func TestWSLUIDIsPrewarmedAtFirstApply(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
 	f := newFakeWSL(t)
-	pol := wslTestPolicy()
-	pol.AllowedDistros = []string{wslTestDistro, "Debian"}
+	pol := wslLocalPolicy(wslTestDistro, "Debian")
 	m := newWSLTestManagerWith(t, pol, f.runner())
 	// A wsl spec nobody has asked for: not pinned, no request.
 	m.Apply(Config{ETag: "v1", Specs: []Spec{wslTestSpec(f, "S", "m")}})
@@ -703,6 +713,30 @@ func TestWSLUIDIsPrewarmedAtFirstApply(t *testing.T) {
 	}
 }
 
+// TestWSLNoCallIntoDistroWithoutAllowlistEntry: the policy's only wsl:// entry
+// names the test distro, so a spec in Debian is not permitted and its distro is
+// never passed to wsl.exe -d -- no UID lookup, no sweep -- while the allowed
+// distro's spec beside it is warmed (the positive control: the gate lets
+// something through). Fails if the wslDistroAllowed gate of maybeWarmWSL goes.
+func TestWSLNoCallIntoDistroWithoutAllowlistEntry(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	f := newFakeWSL(t)
+	m := newWSLTestManagerWith(t, wslLocalPolicy(), f.runner())
+	debian := wslTestSpec(f, "D", "d")
+	debian.Execution.WSL.Distro = "Debian"
+	m.Apply(Config{ETag: "v1", Specs: []Spec{wslTestSpec(f, "S", "m"), debian}})
+	waitUntil(t, 5*time.Second, "the allowed distro's UID lookup", func() bool {
+		return len(f.find(t, "id", "-u")) >= 1
+	})
+	m.Close() // joins every call the manager started
+	for _, c := range f.calls(t) {
+		if c.Argv[1] == "Debian" {
+			t.Errorf("a call into Debian, which no wsl:// entry names: %q", c.Argv)
+		}
+	}
+}
+
 // TestWSLPrewarmOnlyDistrosNamedBySpecs: a document with no wsl spec calls
 // into no distro at all -- neither a UID lookup nor the orphan sweep, which
 // would boot the VM at every agent start of a host that runs nothing in WSL.
@@ -713,8 +747,7 @@ func TestWSLPrewarmOnlyDistrosNamedBySpecs(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
 	f := newFakeWSL(t)
-	pol := wslTestPolicy()
-	pol.AllowedDistros = []string{wslTestDistro, "Debian"}
+	pol := wslLocalPolicy(wslTestDistro, "Debian")
 	native := baseSpec("N", "n")
 	native.Pinned = true
 
@@ -1397,8 +1430,7 @@ func TestWSLVMWaitAsksForASampleAtOnce(t *testing.T) {
 		mu.Unlock()
 		return []byte(sampleOut("meminfo " + strconv.Itoa(12000<<10) + " " + strconv.Itoa(9000<<10) + "\n")), nil
 	}
-	pol := allowlistPolicy()
-	pol.WSL = wslTestPolicy()
+	pol := wslLocalPolicy()
 	b := wslCandidate("B", 5000)
 	b.Binary, b.UpstreamModel, b.Pinned = stubchildPath, "b", true
 	m := &Manager{cmds: make(chan command, 4), done: make(chan struct{})}

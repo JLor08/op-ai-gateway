@@ -1710,19 +1710,16 @@ func TestEvictionGraceSecondsFromEnv(t *testing.T) {
 	}
 }
 
-// TestLoadRuntimeWSLSettings pins the five operator-owned WSL policy keys: the
-// env form splits and trims the three lists exactly as resolveStringList does
-// for the native allowlists, and the file form is read verbatim. Env wins over
-// the file, per key.
+// TestLoadRuntimeWSLSettings pins the two operator-owned WSL launcher keys
+// (runtime_wsl_exe, runtime_wsl_user; env wins over the file) and the fate of
+// the three removed allowlist settings: an old config still carrying one loads
+// without error and yields a warning naming the replacement.
 func TestLoadRuntimeWSLSettings(t *testing.T) {
 	base := []string{"-gateway-url=https://gw.example", "-token=x"}
 
 	env := map[string]string{
-		"OP_AGENT_RUNTIME_WSL_EXE":              `C:\wsl\wsl.exe`,
-		"OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS":  "Ubuntu-24.04, Debian ",
-		"OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES": "/home/ai/vllm/.venv/bin/vllm,/usr/bin/python3",
-		"OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS":     "/home/ai/*, /srv/models",
-		"OP_AGENT_RUNTIME_WSL_USER":             " ai ",
+		"OP_AGENT_RUNTIME_WSL_EXE":  `C:\wsl\wsl.exe`,
+		"OP_AGENT_RUNTIME_WSL_USER": " ai ",
 	}
 	cfg, err := Load(base, func(k string) string { return env[k] })
 	if err != nil {
@@ -1731,28 +1728,17 @@ func TestLoadRuntimeWSLSettings(t *testing.T) {
 	if cfg.RuntimeWSLExe != `C:\wsl\wsl.exe` || cfg.RuntimeWSLUser != "ai" {
 		t.Errorf("exe/user = %q/%q", cfg.RuntimeWSLExe, cfg.RuntimeWSLUser)
 	}
-	if want := []string{"Ubuntu-24.04", "Debian"}; !reflect.DeepEqual(cfg.RuntimeWSLAllowedDistros, want) {
-		t.Errorf("distros = %#v, want %#v", cfg.RuntimeWSLAllowedDistros, want)
-	}
-	if want := []string{"/home/ai/vllm/.venv/bin/vllm", "/usr/bin/python3"}; !reflect.DeepEqual(cfg.RuntimeWSLAllowedBinaries, want) {
-		t.Errorf("binaries = %#v, want %#v", cfg.RuntimeWSLAllowedBinaries, want)
-	}
-	if want := []string{"/home/ai/*", "/srv/models"}; !reflect.DeepEqual(cfg.RuntimeWSLAllowedDirs, want) {
-		t.Errorf("dirs = %#v, want %#v", cfg.RuntimeWSLAllowedDirs, want)
+	if len(cfg.Warnings) != 0 {
+		t.Errorf("Warnings = %v, want none", cfg.Warnings)
 	}
 
 	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x",
-		"runtime_wsl_exe":"D:\\wsl.exe","runtime_wsl_allowed_distros":["Ubuntu"],
-		"runtime_wsl_allowed_binaries":["/opt/vllm"],"runtime_wsl_allowed_dirs":["/opt"],
-		"runtime_wsl_user":"svc"}`)
+		"runtime_wsl_exe":"D:\\wsl.exe","runtime_wsl_user":"svc"}`)
 	cfg, err = Load([]string{"-config", path}, func(string) string { return "" })
 	if err != nil {
 		t.Fatalf("Load(file): %v", err)
 	}
-	if cfg.RuntimeWSLExe != `D:\wsl.exe` || cfg.RuntimeWSLUser != "svc" ||
-		!reflect.DeepEqual(cfg.RuntimeWSLAllowedDistros, []string{"Ubuntu"}) ||
-		!reflect.DeepEqual(cfg.RuntimeWSLAllowedBinaries, []string{"/opt/vllm"}) ||
-		!reflect.DeepEqual(cfg.RuntimeWSLAllowedDirs, []string{"/opt"}) {
+	if cfg.RuntimeWSLExe != `D:\wsl.exe` || cfg.RuntimeWSLUser != "svc" {
 		t.Errorf("file form not honoured: %+v", cfg)
 	}
 
@@ -1768,6 +1754,65 @@ func TestLoadRuntimeWSLSettings(t *testing.T) {
 	}
 	if cfg.RuntimeWSLUser != "envuser" {
 		t.Errorf("RuntimeWSLUser = %q, want env to win", cfg.RuntimeWSLUser)
+	}
+}
+
+func TestLoadWarnsOnRemovedWSLSettings(t *testing.T) {
+	noEnv := func(string) string { return "" }
+	for _, key := range []string{"runtime_wsl_allowed_distros", "runtime_wsl_allowed_binaries", "runtime_wsl_allowed_dirs"} {
+		// A key that carries a value warns once.
+		path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","`+key+`":["/x"]}`)
+		cfg, err := Load([]string{"-config", path}, noEnv)
+		if err != nil {
+			t.Fatalf("%s: Load must still succeed: %v", key, err)
+		}
+		if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], key) || !strings.Contains(cfg.Warnings[0], "wsl://") {
+			t.Errorf("%s: Warnings = %v, want one naming the key and wsl://", key, cfg.Warnings)
+		}
+		// An empty or null value configures nothing (generated configs hold [])
+		// and stays silent.
+		for _, empty := range []string{"[]", "null", "[ ]"} {
+			path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","`+key+`":`+empty+`}`)
+			cfg, err := Load([]string{"-config", path}, noEnv)
+			if err != nil || len(cfg.Warnings) != 0 {
+				t.Errorf("%s=%s: err=%v Warnings=%v, want none", key, empty, err, cfg.Warnings)
+			}
+		}
+	}
+
+	env := map[string]string{"OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS": "Ubuntu"}
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x"}, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("Load(env): %v", err)
+	}
+	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS") || !strings.Contains(cfg.Warnings[0], "wsl://") {
+		t.Errorf("env: Warnings = %v", cfg.Warnings)
+	}
+
+	// The file key and the env var of one setting give exactly one warning.
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","runtime_wsl_allowed_distros":["Ubuntu"]}`)
+	cfg, err = Load([]string{"-config", path}, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("Load(both): %v", err)
+	}
+	if len(cfg.Warnings) != 1 {
+		t.Errorf("file+env: Warnings = %v, want exactly one", cfg.Warnings)
+	}
+}
+
+func TestLoadWarnsOnMalformedWSLEntries(t *testing.T) {
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x",
+		"runtime_allowed_binaries":["WSL://Ubuntu/x","/usr/bin/ok","wsl://Ubuntu-24.04/home/ai/vllm"],
+		"runtime_allowed_dirs":["wsl://Ubuntu-24.04\\home","wsl://Ubuntu-24.04/srv/*"]}`)
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Warnings) != 2 {
+		t.Fatalf("Warnings = %v, want 2", cfg.Warnings)
+	}
+	if !strings.Contains(cfg.Warnings[0], "runtime_allowed_binaries[0]") || !strings.Contains(cfg.Warnings[1], "runtime_allowed_dirs[0]") {
+		t.Errorf("Warnings = %v", cfg.Warnings)
 	}
 }
 
@@ -1819,5 +1864,47 @@ func TestDefaultWSLExe(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("defaultWSLExe() = %q on %s, want empty", got, runtime.GOOS)
+	}
+}
+
+// A malformed or wrong-case WSL entry in runtime_allowed_dirs warns that WSL
+// work_dir containment stays on; the binaries list has no such clause.
+func TestRuntimeAllowlistWarningsDirContainment(t *testing.T) {
+	noenv := func(string) string { return "" }
+	cfg := Config{
+		RuntimeAllowedBinaries: []string{`wsl://Ubuntu-24.04\x`, "WSL://Ubuntu-24.04/x"},
+		RuntimeAllowedDirs:     []string{`wsl://Ubuntu-24.04\srv`, "WSL://Ubuntu-24.04/srv"},
+	}
+	w := runtimeAllowlistWarnings(cfg, nil, noenv)
+	if len(w) != 4 {
+		t.Fatalf("warnings = %v, want 4", w)
+	}
+	for i, wantContain := range []bool{false, false, true, true} {
+		if got := strings.Contains(w[i], "containment stays on"); got != wantContain {
+			t.Errorf("warning %d %q: containment clause = %v, want %v", i, w[i], got, wantContain)
+		}
+	}
+}
+
+// A look-alike that is not even a wsl:// prefix (wsl:/ typo, wsl:x, WSL:/...)
+// warns exactly like a wrong-case WSL:// entry: it is a native path, and in
+// runtime_allowed_dirs it also keeps WSL work_dir containment on.
+func TestRuntimeAllowlistWarningsLookAlikes(t *testing.T) {
+	noenv := func(string) string { return "" }
+	cfg := Config{
+		RuntimeAllowedBinaries: []string{"/usr/bin/ok", "wsl:x", "WSL:/Ubuntu-24.04/x"},
+		RuntimeAllowedDirs:     []string{"wsl:/Ubuntu-24.04/srv", "/srv/ok"},
+	}
+	w := runtimeAllowlistWarnings(cfg, nil, noenv)
+	if len(w) != 3 {
+		t.Fatalf("warnings = %v, want 3", w)
+	}
+	for i, want := range []string{"runtime_allowed_binaries[1]", "runtime_allowed_binaries[2]", "runtime_allowed_dirs[0]"} {
+		if !strings.Contains(w[i], want) {
+			t.Errorf("warning %d = %q, want it to name %s", i, w[i], want)
+		}
+	}
+	if strings.Contains(w[0], "containment stays on") || !strings.Contains(w[2], "containment stays on") {
+		t.Errorf("containment clause wrong: %v", w)
 	}
 }

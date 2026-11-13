@@ -19,7 +19,7 @@ Two test families per module:
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
    compared against a checked-in allowlist — 68 edges across 29 packages in
-   `op-ai-gateway`, 25 edges across 13 packages in `op-ai-server-agent`. Any
+   `op-ai-gateway`, 28 edges across 14 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
    deliberate act. The allowlist is frozen **in both directions**: a listed
    edge that no longer exists fails too, so an over-generous entry cannot sit
@@ -46,14 +46,17 @@ Server-agent (`op-ai-server-agent`):
 
 | Rule | Why |
 |---|---|
-| `gwapi`, `certfiles` are stdlib-only | leaf contracts (gateway transport, cert-dir file layout) shared by the feature packages |
+| `gwapi`, `certfiles`, `wslentry` are stdlib-only | leaf contracts (gateway transport, cert-dir file layout, `wsl://` allowlist-entry grammar) shared by the feature packages |
 | `collector` ↛ `proxy`, `trust`, `client`, `agent` | telemetry collection is independent of transport and TLS machinery |
 | `sample` imports no internal package | the wire-format vocabulary is a leaf |
 | `trust`, `proxy`, `certinstall` do not import each other | their only integration is the shared `certfiles`/`gwapi` leaves and the filesystem contract |
 
 `internal/runtime` (the [agent-managed model runtime](agent-runtime-manager.md))
-is a deliberately narrow addition: its only allowed module-internal import is
-`internal/gwapi`, and the two edges toward it are `internal/agent → runtime` and
+is a deliberately narrow addition: its only allowed module-internal imports are
+`internal/gwapi` and the stdlib-only leaf `internal/wslentry` (the `wsl://`
+allowlist-entry grammar, shared by the config warnings, the policy and the
+inventory; `internal/config` must not import the runtime to read it). The two
+edges toward the runtime are `internal/agent → runtime` and
 `main → runtime`. That shape is what keeps the admission policy a pure function
 over snapshots — anything the policy would need from the agent's own packages is
 a signal it belongs in the manager instead. The reverse edge is impossible

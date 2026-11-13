@@ -25,8 +25,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
+	"op-ai-server-agent/internal/wslentry"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -205,7 +205,7 @@ type Execution struct {
 
 // WSLExecution names the WSL2 distribution a "wsl" spec runs in. The name is
 // the gateway's choice and reaches a wsl.exe argument, so it is validated
-// (wslDistroPattern) rather than trusted.
+// (wslentry.DistroPattern) rather than trusted.
 type WSLExecution struct {
 	Distro string `json:"distro"`
 }
@@ -217,14 +217,6 @@ const (
 	ExecutionModeNative = "native"
 	ExecutionModeWSL    = "wsl"
 )
-
-// wslDistroPattern is what a WSL distribution name may look like: ASCII
-// letters, digits, '.', '_' and '-', 1 to 64 characters, the first a letter or
-// a digit. WSL's own names (Ubuntu-24.04, Debian, docker-desktop) fit, and
-// nothing that could be read as an option (a leading '-' after wsl.exe -d), a
-// path or a shell word does. The gateway's runtimeSpecWSLDistroPattern is the
-// same rule.
-var wslDistroPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // IsWSL reports whether the spec runs inside a WSL2 distribution: its
 // execution block says "wsl" and names a distro.
@@ -663,7 +655,7 @@ func withoutInvalidKinds(specs []Spec) ([]Spec, []string) {
 
 // invalidExecutionReason names why spec's execution block is unusable, or ""
 // when it is fine (absent, native, or a complete wsl block). A wsl spec needs a
-// distro that matches wslDistroPattern, and cannot be an rpc_server member or a
+// distro that matches wslentry.DistroPattern, and cannot be an rpc_server member or a
 // cluster head: the cluster transports bind and dial host addresses the agent
 // manages natively, which a process inside the WSL VM does not share. An
 // unknown mode is dropped like an unknown kind, since falling back to "native"
@@ -679,7 +671,7 @@ func invalidExecutionReason(spec Spec) string {
 		switch {
 		case spec.Execution.WSL == nil:
 			return "wsl execution has no wsl settings"
-		case !wslDistroPattern.MatchString(spec.Execution.WSL.Distro):
+		case !wslentry.ValidDistro(spec.Execution.WSL.Distro):
 			return "wsl execution distro is empty, longer than 64 characters or has characters outside A-Z a-z 0-9 . _ -"
 		case spec.IsRPCServer() || spec.Cluster != nil:
 			return "wsl execution does not support rpc cluster members or heads"

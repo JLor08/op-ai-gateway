@@ -11738,7 +11738,7 @@ unauthenticated port to the network, lets one head take another's member, or poi
   agent cannot tell them apart. Several members of different heads may share a server; overlapping GPU selections only
   warn, because whether a GPU is free is the member host's admission's decision at start time, never a save rule.
 - **(d) A binary inventory per server, and version matching.** The agent reports every allowlisted binary with its
-  kind and version (it executes only `llama-server --version`; a `ggml-rpc-server` inherits the version of a
+  kind and version (it executes only `llama-server --version` (and, since ADR-102, `vllm --version`); a `ggml-rpc-server` inherits the version of a
   `llama-server` beside it, else its path's), the portal adds manual rows and a version override kept in its own
   column, and specs pick binaries from it. Head and members must run the same build (same RPC protocol, same graph
   limits): an automatic member gets the member server's `ggml-rpc-server` whose commit, else build, equals the head
@@ -12436,7 +12436,10 @@ on.
   `503 runtime_config.agent_features_pending` while the declaration is unknown.
 - **(b) A local policy of its own, fail-closed.** `runtime_wsl_exe`, `runtime_wsl_user`, `runtime_wsl_allowed_distros` and
   `runtime_wsl_allowed_binaries` must all be set for anything to start; `runtime_wsl_allowed_dirs` empty permits any absolute work dir. The native
-  allowlist is never consulted for a `wsl` spec. The Linux user is the agent's setting, never a spec field.
+  allowlist is never consulted for a `wsl` spec. The Linux user is the agent's setting, never a spec field. **Partly superseded by
+  [ADR-102](#adr-102--one-runtime-allowlist-with-wsl-entries-the-binary-inventory-and-picker-see-wsl-binaries):** the three `runtime_wsl_allowed_*`
+  settings are gone; `wsl://<distro>/<path>` entries in `runtime_allowed_binaries` and `runtime_allowed_dirs` replace them, and the fail-closed
+  rule (exe, user and a matching entry all required) is unchanged.
 - **(c) A rootless launch through the user's own systemd scope, and no shell.** `wsl.exe -d D -u <user> --cd <dir> --exec systemd-run --user
   --scope --quiet --unit=opagent-<nonce>-<instance key>-<generation> -- <binary> <args…>`. The invariant is that **no process receiving
   gateway-chosen argv or environment runs as root**: the first Linux process inherits every `WSLENV` variable, so a root wrapper would hand the
@@ -12445,7 +12448,7 @@ on.
   arguments. Every call names its working directory, `--cd /` for every helper call, so `wsl.exe` never translates the agent's Windows working
   directory, which need not map into the distro. The environment crosses through `WSLENV` (`/u`), with `CUDA_DEVICE_ORDER=PCI_BUS_ID` beside any `CUDA_VISIBLE_DEVICES`,
   `PYTHONUNBUFFERED=1`, `XDG_RUNTIME_DIR=/run/user/<uid>` and `WSL_UTF8=1`. The UID is looked up off the owner, one lookup per distro in flight; a
-  `wsl` instance waits for it, and a burst instance is refused at once. Each document starts the lookup of the allowed distros its `wsl` specs
+  `wsl` instance waits for it, and a burst instance is refused at once. Each document starts the lookup of the distros (named by a `wsl://` binary entry) its `wsl` specs
   name, once per distro, before it admits anything; a document without `wsl` specs calls into no distro, so it never boots the WSL VM.
 - **(d) Stops go through the scope; a sweep removes what a dead agent left.** Terminate is `systemctl --user kill --signal=SIGTERM <unit>.scope`,
   the kill-grace escalation SIGKILLs the scope and then kills `wsl.exe` as a backstop, all off the owner and bounded to 10 s per call. The unit name
@@ -12527,3 +12530,54 @@ on.
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Risks & Technical Debt §11.3 and §11.4](11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember),
 [Data Model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md).
+
+## ADR-102 — One runtime allowlist with `wsl://` entries: the binary inventory and picker see WSL binaries
+
+**Context.** ADR-101 gave a `wsl` spec its own three allowlists (`runtime_wsl_allowed_distros`, `_binaries`, `_dirs`). A binary inside a distro was
+therefore in no list the agent's binary inventory reads, so the portal's Binaries tab and the run-spec binary picker could not show it, and an
+operator had to type the Linux path and the distro by hand. The inventory could not report a vLLM version either, because it knew only `llama-server`.
+Configs generated since #390 carry the removed keys, so removing them must not stop the agent.
+
+**Decision.**
+
+- **One list, a distro-carrying entry form.** `runtime_allowed_binaries` and `runtime_allowed_dirs` take `wsl://<distro>/<absolute POSIX path>`
+  entries beside native paths. The scheme is exactly lowercase `wsl://`; the distro follows the ADR-101 name rule; the path is absolute, has no NUL or
+  backslash and is compared verbatim. A malformed `wsl://` entry permits nothing and warns at startup; a wrong-case `WSL://…` is a native path (it
+  permits no binary and warns). A malformed or look-alike `wsl:` entry in `runtime_allowed_dirs` fails closed: WSL `work_dir` containment stays on for
+  every distro (only well-formed `wsl://` dir entries, and binary dirs with `runtime_allow_binary_dirs`, permit a `work_dir`), because dropping the
+  entry would otherwise read as "no restriction". Native checks consider only native entries, WSL checks only well-formed `wsl://` ones, so neither list leaks into the
+  other, and a native `work_dir` that is literally `wsl://…` can never pass through a `wsl://` dir entry.
+- **The WSL policy keeps its order and its refusals.** Exe, user, distro, binary, work dir. The binary must equal the path of an entry **for the
+  spec's distro**, so the same path allowlisted for two distros permits each only its own. `runtime_allow_binary_dirs` adds the parent directories of
+  a distro's own `wsl://` binary entries. Refusal texts name the setting and a count and never a path, distro or user. `runtime_wsl_exe` and
+  `runtime_wsl_user` stay.
+- **The inventory lists and probes WSL entries, and knows `vllm`.** A well-formed entry is listed with its string as `path` and the kind of the Linux
+  path's base name. `llama_server` and `vllm` are version-probed (10 s and 60 s; the last version-shaped output line wins for `vllm`), native and WSL
+  alike; `rpc_server` and `other` are never executed.
+- **Probing never boots the VM.** One `wsl.exe --list --running --quiet` per scan; only a distro in that list receives a `stat` or a `--version`
+  call. A stopped distro keeps its last good version and its cache entry, and its retry is deferred a rescan interval.
+- **Removed settings warn instead of failing.** An agent whose config still carries one of the three removed settings (or its environment variable)
+  starts and logs one warning per setting that names the replacement; an empty value is silent.
+- **The gateway derives, the portal fills.** `execution`, `distro` and `exec_path` are derived from `path` on read (no migration, no new column); a
+  malformed `wsl://` path stored earlier reads as native, and manual writes reject one. The picker's options for a run-spec binary are the
+  `llama_server`, `vllm` and `other` rows keyed by `path`; choosing one sets the binary, the execution mode and the distro, free typing sets only the
+  binary, and the RPC-member picker never offers WSL. An automatic cluster member gets a native `ggml-rpc-server` only: a `wsl://` rpc-server row is never a match. Agent `0.19.0` → `0.19.1`, PATCH: no feature flag.
+
+**Rejected:**
+
+- **Keeping three WSL lists and teaching the inventory to read them.** Two sources of truth for what may run, and the picker would still have to
+  merge them.
+- **A new inventory wire field for the execution mode.** The `wsl://` string is already unambiguous, so the gateway derives the rest and an older
+  agent or gateway needs no negotiation.
+- **Probing a stopped distro to get its version.** Any `wsl.exe -d` call boots the VM; a stale version is cheaper than a started VM.
+- **Failing to start on an old config.** An operator would lose telemetry and every native spec over a setting that only affects `wsl` specs.
+
+**Consequence:**
+
+- **An old config needs editing.** Its `wsl` specs are refused with a text that points at the `wsl://` form until the entries are moved; native specs
+  and telemetry are unaffected.
+- **A `wsl://` row is listed whether or not its file exists.** The version is probed only while the distro runs; a row for a distro that is stopped
+  shows its last good version, or the one its path implies.
+- **Accepted residual.** The running-list snapshot is taken once per scan, so a distro that idles out during a long scan (a `vllm --version` can take
+  up to 60 s) can be started again by a later `stat` in the same scan.
+- **Running things needs no upgrade order; display does.** The agent's policy decides what runs. An older gateway stores and lists a `wsl://` row verbatim, without `execution`, `distro` or `exec_path`: its Binaries tab shows the raw `wsl://…` path, its picker would offer that string as a native binary path, and a `vllm` is stored as `other`. Upgrade the gateway (and its portal) together with, or before, agents that list `wsl://` entries. An agent before 0.19.1 has no `wsl://` concept: such a string in `runtime_allowed_binaries` is a useless native entry, and in `runtime_allowed_dirs` a native dir entry that turns native `work_dir` containment on. It still needs the old `runtime_wsl_allowed_*` settings: upgrade the agent before switching its config.

@@ -234,8 +234,7 @@ func TestWSLDelta(t *testing.T) {
 // owner's loop -- the test hands it each command (pumpOwner).
 func newWSLExecOwner(t *testing.T, f *fakeWSL, specs ...Spec) *owner {
 	t.Helper()
-	pol := allowlistPolicy()
-	pol.WSL = wslTestPolicy()
+	pol := wslLocalPolicy()
 	m := &Manager{cmds: make(chan command, 64), done: make(chan struct{}), logs: NewLogStore(0, 0)}
 	o := &owner{
 		m:         m,

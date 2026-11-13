@@ -340,15 +340,16 @@ type ManagerOptions struct {
 	// nothing, such as most tests) turns the protection off, so an idle process is
 	// evictable at once as before, and a negative value is treated as zero.
 	EvictionGrace time.Duration
-	// WSL is the agent's WSL configuration (#381): the wsl.exe, the distros and
-	// binaries a wsl spec may name, and the distro user everything runs as.
+	// WSL is the agent's WSL configuration (#381): the wsl.exe and the distro
+	// user everything runs as (which distros and binaries a wsl spec may name
+	// is the wsl:// entries of the allowlist, not this block).
 	// OPERATOR configuration from the agent's own local settings
-	// (runtime_wsl_*), never gateway-supplied, and fixed for the process
-	// lifetime. When set it REPLACES Policy.WSL: the manager keeps one WSL
-	// policy, so the block a spec is permitted against is the very block it is
-	// launched, stopped and swept with -- above all the same user, which must
-	// never be root. Left zero, Policy.WSL stands; both zero means no wsl spec
-	// is permitted (permitWSL) and no distro is ever called.
+	// (runtime_wsl_exe, runtime_wsl_user), never gateway-supplied, and fixed
+	// for the process lifetime. When set it REPLACES Policy.WSL: the manager
+	// keeps one WSL policy, so the block a spec is permitted against is the
+	// very block it is launched, stopped and swept with -- above all the same
+	// user, which must never be root. Left zero, Policy.WSL stands; both zero
+	// means no wsl spec is permitted (permitWSL) and no distro is ever called.
 	WSL WSLPolicy
 	// WSLRAMReserveMB is the memory, in MB, held back from the WSL2 VM's RAM
 	// pool that admission budgets wsl processes against: the WSL twin of
@@ -3855,7 +3856,7 @@ func (o *owner) dispatchMeasurement() {
 // without WSL and without native measurers on dispatchMeasurement's
 // allocate-nothing path.
 func (o *owner) wslSamplable() bool {
-	return o.policy.WSL.Exe != "" && !wslUserRefused(o.policy.WSL.User)
+	return o.policy.WSL.Exe != "" && !WSLUserRefused(o.policy.WSL.User)
 }
 
 // wslLive reports whether any wsl generation is live, i.e. whether the beat

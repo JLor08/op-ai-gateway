@@ -295,6 +295,9 @@ describe('RpcMemberSection binary picker', () => {
     source: 'agent',
     allowed: false,
     reported_at: '',
+    execution: 'native',
+    distro: '',
+    exec_path: '/opt/llama/rpc-server',
   } satisfies ServerBinary;
 
   it('offers the inventory with the allow mark and fills the binary field', async () => {
@@ -306,6 +309,27 @@ describe('RpcMemberSection binary picker', () => {
     fireEvent.click(screen.getByText('/opt/llama/rpc-server'));
     expect((field as HTMLInputElement).value).toBe('/opt/llama/rpc-server');
     expect(api.serverBinaries).toHaveBeenCalledWith('srv_1');
+  });
+
+  it('never lists a WSL row', async () => {
+    setup({
+      binaries: [
+        rpcBinary,
+        {
+          ...rpcBinary,
+          path: 'wsl://Ubuntu-24.04/opt/llama/rpc-server',
+          execution: 'wsl',
+          distro: 'Ubuntu-24.04',
+          exec_path: '/opt/llama/rpc-server',
+        },
+      ],
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.rpcMemberAdd }));
+    fireEvent.mouseDown(await screen.findByLabelText(t.rpcMemberBinary));
+    // Only the native row is offered: its path appears once, the WSL row's
+    // identical Linux path never does.
+    expect(await screen.findAllByText('/opt/llama/rpc-server')).toHaveLength(1);
+    expect(screen.queryByText(/WSL2/)).toBeNull();
   });
 
   it('saves a typed path that is not in the inventory', async () => {

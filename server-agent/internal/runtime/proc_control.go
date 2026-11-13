@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"op-ai-server-agent/internal/wslentry"
 	"os/exec"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,22 +89,22 @@ func clipText(s string, n int) string {
 	return s + "..."
 }
 
-// wslUserRefused reports whether user may not run anything in a distro: empty,
+// WSLUserRefused reports whether user may not run anything in a distro: empty,
 // root by name, or root by UID ("0", "00", ...), which wsl.exe -u accepts as
 // well. The one rule permitWSL and every helper call share, so no
 // gateway-chosen argv or env and no agent call ever reaches a root process.
-func wslUserRefused(user string) bool {
+func WSLUserRefused(user string) bool {
 	return user == "" || user == "root" || isZeroUID(user)
 }
 
-// wslHelperArgs is the wsl.exe argv of a helper call: the distro, always the
+// WSLHelperArgs is the wsl.exe argv of a helper call: the distro, always the
 // configured user, "/" as the working directory, and the command through
 // --exec, never a shell. Without --cd, wsl.exe starts the command in the
 // translation of the caller's Windows working directory -- the agent's, which
 // may have no mount in the distro at all (an operator may turn the drive
 // mounts off) -- and fails or warns on stdout when it cannot; "/" needs no
 // translation and exists in every distro.
-func wslHelperArgs(user, distro string, command ...string) []string {
+func WSLHelperArgs(user, distro string, command ...string) []string {
 	return append([]string{"-d", distro, "-u", user, "--cd", "/", "--exec"}, command...)
 }
 
@@ -130,7 +130,9 @@ func wslHelperEnv(getenv func(string) string, uid int) []string {
 
 // runWSLHelper runs one helper call into distro, bounded by wslHelperTimeout.
 // It refuses a root user itself rather than trusting every caller to have
-// checked: this is the one way the agent's own calls reach a distro.
+// checked: every helper call goes through here (the workload launch is not a
+// helper call, and the binary inventory's own probes build the same argv with
+// WSLHelperArgs and refuse root through wslProbeConfig.usable()).
 func runWSLHelper(run wslRunner, pol WSLPolicy, distro string, env []string, command ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), wslHelperTimeout)
 	defer cancel()
@@ -140,10 +142,10 @@ func runWSLHelper(run wslRunner, pol WSLPolicy, distro string, env []string, com
 // runWSLHelperCtx is runWSLHelper under a deadline the caller sets: the RAM
 // sampler shares one, shorter, across a beat's calls (sampleWSL).
 func runWSLHelperCtx(ctx context.Context, run wslRunner, pol WSLPolicy, distro string, env []string, command ...string) ([]byte, error) {
-	if wslUserRefused(pol.User) {
+	if WSLUserRefused(pol.User) {
 		return nil, fmt.Errorf("runtime: no non-root WSL user is configured (runtime_wsl_user)")
 	}
-	return run(ctx, pol.Exe, wslHelperArgs(pol.User, distro, command...), env)
+	return run(ctx, pol.Exe, WSLHelperArgs(pol.User, distro, command...), env)
 }
 
 // wslUIDFailureMessage is the last_error of a wsl start whose UID lookup
@@ -353,16 +355,16 @@ func wslExitMessage(exitCode int) string {
 // VM when it is not running: a host whose document runs nothing in WSL must
 // not have its VM booted at every agent start, and a distro no spec names has
 // nothing of this agent's to sweep unless an earlier run's document named it
-// -- the next document that names it again sweeps it then. A distro outside
-// runtime_wsl_allowed_distros is never called into: such a spec is not
-// permitted anyway. A manager that is never configured never calls into a
+// -- the next document that names it again sweeps it then. A distro that no
+// wsl:// entry in runtime_allowed_binaries names is never called into: such a
+// spec is not permitted anyway. A manager that is never configured never calls into a
 // distro.
 func (o *owner) maybeWarmWSL(specs []Spec) {
 	if o.closing {
 		return
 	}
 	pol := o.policy.WSL
-	if pol.Exe == "" || wslUserRefused(pol.User) {
+	if pol.Exe == "" || WSLUserRefused(pol.User) {
 		return
 	}
 	for _, spec := range specs {
@@ -370,7 +372,7 @@ func (o *owner) maybeWarmWSL(specs []Spec) {
 		// A distro outside the allowlist is never passed to wsl.exe -d, and
 		// neither is one a spec could not carry (ParseConfig drops it; this
 		// covers a Config handed to Apply directly).
-		if distro == "" || o.wslWarmed[distro] || !slices.Contains(pol.AllowedDistros, distro) || !wslDistroPattern.MatchString(distro) {
+		if distro == "" || o.wslWarmed[distro] || !o.policy.wslDistroAllowed(distro) || !wslentry.ValidDistro(distro) {
 			continue
 		}
 		if o.wslWarmed == nil {

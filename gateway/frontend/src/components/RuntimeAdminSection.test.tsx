@@ -1766,6 +1766,103 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
         ...over,
       });
 
+    describe('binary picker fills mode and distro', () => {
+      const native = {
+        path: '/opt/llama/llama-server',
+        kind: 'llama_server',
+        version: 'b1',
+        version_override: '',
+        effective_version: 'b1',
+        build: '',
+        commit: '',
+        version_source: 'agent',
+        source: 'agent',
+        allowed: true,
+        reported_at: '',
+        execution: 'native',
+        distro: '',
+        exec_path: '/opt/llama/llama-server',
+      } satisfies ServerBinary;
+      const wslRow = (distro: string) =>
+        ({
+          ...native,
+          path: `wsl://${distro}/home/ai/venv/bin/vllm`,
+          kind: 'vllm',
+          execution: 'wsl',
+          distro,
+          exec_path: '/home/ai/venv/bin/vllm',
+        }) satisfies ServerBinary;
+      const binaries = [native, wslRow('Ubuntu-24.04'), wslRow('Debian')];
+
+      async function openForm() {
+        const out = renderSection({ report: wslReport, binaries });
+        fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+        fireEvent.change(screen.getByLabelText(t.mappingAppName), {
+          target: { value: 'app-new' },
+        });
+        return out;
+      }
+      const modeSelect = () => screen.getByRole('combobox', { name: t.runtimeSpecExecutionMode });
+
+      it('sets path, mode and distro from a WSL option, and mode native from a native one', async () => {
+        const { putSpecs } = await openForm();
+        fireEvent.mouseDown(await screen.findByLabelText(t.runtimeSpecBinary));
+        fireEvent.click(
+          (await screen.findByText('WSL2 · Ubuntu-24.04')).closest('li') as HTMLElement,
+        );
+        const field = (await screen.findByLabelText(t.runtimeSpecBinaryLinux)) as HTMLInputElement;
+        expect(field.value).toBe('/home/ai/venv/bin/vllm');
+        expect(modeSelect().textContent).toContain(t.runtimeSpecExecutionModeWSL);
+        expect((screen.getByLabelText(t.runtimeSpecWSLDistro) as HTMLInputElement).value).toBe(
+          'Ubuntu-24.04',
+        );
+        fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+        await waitFor(() => expect(putSpecs).toHaveLength(1));
+        expect(putSpecs[0].body.binary).toBe('/home/ai/venv/bin/vllm');
+        expect(putSpecs[0].body.execution_mode).toBe('wsl');
+        expect(putSpecs[0].body.wsl_distro).toBe('Ubuntu-24.04');
+      });
+
+      it('switches back to native when a native option is chosen', async () => {
+        await openForm();
+        fireEvent.mouseDown(await screen.findByLabelText(t.runtimeSpecBinary));
+        fireEvent.click(
+          (await screen.findByText('WSL2 · Ubuntu-24.04')).closest('li') as HTMLElement,
+        );
+        fireEvent.mouseDown(await screen.findByLabelText(t.runtimeSpecBinaryLinux));
+        fireEvent.click(await screen.findByText('/opt/llama/llama-server'));
+        expect(modeSelect().textContent).toContain(t.runtimeSpecExecutionModeNative);
+        expect(screen.queryByLabelText(t.runtimeSpecWSLDistro)).toBeNull();
+        expect(
+          ((await screen.findByLabelText(t.runtimeSpecBinary)) as HTMLInputElement).value,
+        ).toBe('/opt/llama/llama-server');
+      });
+
+      it('takes the distro of the chosen row when two distros share a path', async () => {
+        await openForm();
+        fireEvent.mouseDown(await screen.findByLabelText(t.runtimeSpecBinary));
+        fireEvent.click((await screen.findByText('WSL2 · Debian')).closest('li') as HTMLElement);
+        expect((screen.getByLabelText(t.runtimeSpecWSLDistro) as HTMLInputElement).value).toBe(
+          'Debian',
+        );
+      });
+
+      it('leaves mode and distro alone when a free path is typed', async () => {
+        await openForm();
+        fireEvent.mouseDown(await screen.findByLabelText(t.runtimeSpecBinary));
+        fireEvent.click(
+          (await screen.findByText('WSL2 · Ubuntu-24.04')).closest('li') as HTMLElement,
+        );
+        fireEvent.change(await screen.findByLabelText(t.runtimeSpecBinaryLinux), {
+          target: { value: '/somewhere/else' },
+        });
+        expect(modeSelect().textContent).toContain(t.runtimeSpecExecutionModeWSL);
+        expect((screen.getByLabelText(t.runtimeSpecWSLDistro) as HTMLInputElement).value).toBe(
+          'Ubuntu-24.04',
+        );
+      });
+    });
+
     it('defaults execution_mode to native', async () => {
       const { putSpecs } = renderSection({ report: wslReport });
       fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -5400,6 +5497,9 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
           source: 'agent',
           allowed: true,
           reported_at: '',
+          execution: 'native',
+          distro: '',
+          exec_path: '/opt/llama/llama-server',
         } satisfies ServerBinary,
       ],
     });

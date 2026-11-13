@@ -24,6 +24,9 @@ function bin(over: Partial<ServerBinary> = {}): ServerBinary {
     source: 'agent',
     allowed: true,
     reported_at: '2026-11-05T10:00:00Z',
+    execution: 'native',
+    distro: '',
+    exec_path: '/opt/llama/llama-server',
     ...over,
   };
 }
@@ -66,6 +69,35 @@ describe('BinariesSection', () => {
     const mrow = screen.getByText('/srv/custom/rpc-server').closest('tr') as HTMLElement;
     expect(within(mrow).getByText(t.binariesSourceManual)).toBeTruthy();
     expect(within(mrow).getByText(t.binariesVersionUnknown)).toBeTruthy();
+  });
+
+  it('shows the execution column: Native, WSL2 with the distro, and the vLLM kind', async () => {
+    setup([
+      bin(),
+      bin({
+        path: 'wsl://Ubuntu-24.04/home/ai/venv/bin/vllm',
+        kind: 'vllm',
+        execution: 'wsl',
+        distro: 'Ubuntu-24.04',
+        exec_path: '/home/ai/venv/bin/vllm',
+      }),
+    ]);
+    expect(await screen.findByRole('columnheader', { name: t.binariesColExecution })).toBeTruthy();
+    const native = screen.getByText('/opt/llama/llama-server').closest('tr') as HTMLElement;
+    expect(within(native).getByText(t.runtimeSpecExecutionModeNative)).toBeTruthy();
+    const wsl = screen
+      .getByText('wsl://Ubuntu-24.04/home/ai/venv/bin/vllm')
+      .closest('tr') as HTMLElement;
+    expect(within(wsl).getByText('WSL2')).toBeTruthy();
+    expect(within(wsl).getByText('Ubuntu-24.04')).toBeTruthy();
+    expect(within(wsl).getByText('vLLM')).toBeTruthy();
+  });
+
+  it('offers vllm in the manual-add kind select', async () => {
+    setup([]);
+    fireEvent.click(await screen.findByRole('button', { name: t.binariesAdd }));
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.binariesKind }));
+    expect(await screen.findByRole('option', { name: t.binariesKindVllm })).toBeTruthy();
   });
 
   it('marks a path the agent does not allow', async () => {

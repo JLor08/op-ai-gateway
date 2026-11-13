@@ -105,6 +105,12 @@
   // binary is listed here. Comes ONLY from this local file, and it is the
   // operator's half of the contract: the gateway decides when and how a model
   // process runs, this list decides whether it may run at all.
+  // A binary INSIDE a WSL2 distro is an entry of the form
+  // wsl://<distro>/<absolute Linux path>, for example
+  // "wsl://Ubuntu-24.04/home/ai/vllm-env/bin/vllm" (lowercase scheme, forward
+  // slashes). Such an entry permits only specs that run in that distro, and
+  // native specs ignore it. A malformed one permits nothing and is reported
+  // in the agent log at startup.
   "runtime_allowed_binaries": [],
 
   // Permitted "work_dir" prefixes for launch specs. Empty (the default) means
@@ -116,6 +122,12 @@
   // "/srv/models/*" are the same), permits that directory and its whole
   // subtree; it is not a glob. Containment is a lexical path-prefix check that
   // does not resolve symlinks: defense in depth, not the boundary.
+  // An entry of the form wsl://<distro>/<absolute Linux path> (for example
+  // "wsl://Ubuntu-24.04/srv/models/*") bounds the work_dir of WSL specs in
+  // that distro only; with no entry for a distro, any absolute work_dir is
+  // accepted there, unless runtime_allow_binary_dirs below restricts it to the
+  // binary directories or a malformed wsl: entry in this list keeps WSL
+  // work_dir containment on (then only well-formed entries permit one).
   "runtime_allowed_dirs": [],
 
   // When true, each runtime_allowed_binaries entry's PARENT directory is
@@ -133,23 +145,6 @@
   // elsewhere, in which case every WSL spec is refused. Comes ONLY from this
   // local file.
   "runtime_wsl_exe": "",
-
-  // WSL distributions a spec may run in, matched exactly (for example
-  // "Ubuntu-24.04"). Empty (the default) refuses every WSL spec, like
-  // runtime_allowed_binaries -- it does not mean "any distro".
-  "runtime_wsl_allowed_distros": [],
-
-  // Absolute POSIX paths, INSIDE the distro, a WSL spec's binary must match
-  // exactly (for example "/home/ai/vllm/.venv/bin/vllm"). Separate from
-  // runtime_allowed_binaries, which is never consulted for a WSL spec. Empty
-  // (the default) refuses every WSL spec.
-  "runtime_wsl_allowed_binaries": [],
-
-  // Permitted POSIX "work_dir" prefixes inside the distro, with the same
-  // bare-or-trailing-"/*" subtree semantics as runtime_allowed_dirs. Empty
-  // (the default) permits any absolute work_dir; a spec without one runs
-  // beside its binary.
-  "runtime_wsl_allowed_dirs": [],
 
   // The distro user every WSL process runs as (wsl.exe -u). No default: empty
   // refuses every WSL spec. "root" is refused too -- the agent never hands a

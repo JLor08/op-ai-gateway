@@ -16,9 +16,9 @@
 //  2. TestForbiddenEdges asserts specific import directions/leaf
 //     properties that must never exist, independent of the allowlist
 //     above -- these encode the load-bearing parts of the architecture
-//     (mainly: gwapi and certfiles are stdlib-only transport/cert-path
-//     contracts, and trust/proxy/certinstall must not depend on each
-//     other).
+//     (mainly: gwapi, certfiles and wslentry are stdlib-only
+//     transport/cert-path/entry-grammar contracts, and
+//     trust/proxy/certinstall must not depend on each other).
 package archtest
 
 import "testing"
@@ -63,6 +63,7 @@ var allowedDeps = map[string][]string{
 		"internal/rpcrelay",
 		"internal/runtime",
 		"internal/sample",
+		"internal/wslentry",
 	},
 	"internal/certfiles": {},
 	"internal/certinstall": {
@@ -76,8 +77,10 @@ var allowedDeps = map[string][]string{
 	"internal/collector": {
 		"internal/sample",
 	},
-	"internal/config": {},
-	"internal/gwapi":  {},
+	"internal/config": {
+		"internal/wslentry",
+	},
+	"internal/gwapi": {},
 	"internal/proxy": {
 		"internal/certfiles",
 		"internal/gwapi",
@@ -85,12 +88,14 @@ var allowedDeps = map[string][]string{
 	"internal/rpcrelay": {},
 	"internal/runtime": {
 		"internal/gwapi",
+		"internal/wslentry",
 	},
 	"internal/sample": {},
 	"internal/trust": {
 		"internal/certfiles",
 		"internal/gwapi",
 	},
+	"internal/wslentry": {},
 }
 
 // TestAllowlistFrozen freezes the current module-internal import graph. Any
@@ -154,13 +159,14 @@ func TestForbiddenEdges(t *testing.T) {
 	pkgs := loadPackages(t)
 	graph := loadInternalGraph(t)
 
-	t.Run("gwapi and certfiles are stdlib-only leaves", func(t *testing.T) {
+	t.Run("gwapi, certfiles and wslentry are stdlib-only leaves", func(t *testing.T) {
 		// internal/gwapi is the agent<->gateway transport contract and
-		// internal/certfiles is the shared cert-path leaf; both must stay
-		// free of any dependency (module-internal or third-party) so every
+		// internal/certfiles is the shared cert-path leaf, and
+		// internal/wslentry is the wsl:// allowlist-entry grammar (config must
+		// not import the runtime to read it); all must stay free of any dependency (module-internal or third-party) so every
 		// other package can depend on them without dragging anything else
 		// in.
-		for _, pkg := range []string{"internal/gwapi", "internal/certfiles"} {
+		for _, pkg := range []string{"internal/gwapi", "internal/certfiles", "internal/wslentry"} {
 			info, ok := pkgs[pkg]
 			if !ok {
 				t.Fatalf("package %q not found in loaded packages", pkg)

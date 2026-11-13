@@ -48,6 +48,14 @@ export function binaryVersionFor(binaries: ServerBinary[], path: string): string
   return binaries.find((b) => b.path === path)?.effective_version ?? '';
 }
 
+const isWsl = (b: ServerBinary) => b.execution === 'wsl';
+
+function optionLabel(o: string | ServerBinary): string {
+  if (typeof o === 'string') return o;
+  if (isWsl(o)) return o.exec_path;
+  return o.path;
+}
+
 export function BinaryPicker({
   id,
   label,
@@ -55,6 +63,7 @@ export function BinaryPicker({
   kind,
   value,
   onChange,
+  onSelect,
   binaries,
   error,
   helperText,
@@ -68,14 +77,21 @@ export function BinaryPicker({
   kind: PickerKind;
   value: string;
   onChange: (value: string) => void;
+  // Called when an inventory option (not free text) is chosen, so the form can
+  // also take the row's execution mode and distro.
+  onSelect?: (binary: ServerBinary) => void;
   binaries: ServerBinary[];
   error?: boolean;
   helperText?: string;
   required?: boolean;
   placeholder?: string;
 }>) {
-  const options = binaries.filter(
-    (b) => b.kind === kind || (kind === 'llama_server' && b.kind === 'other'),
+  // llama_server offers llama_server, vllm and other binaries; the RPC member
+  // picker only its own kind and never a WSL entry.
+  const options = binaries.filter((b) =>
+    kind === 'rpc_server'
+      ? b.kind === 'rpc_server' && !isWsl(b)
+      : b.kind === 'llama_server' || b.kind === 'vllm' || b.kind === 'other',
   );
   return (
     <Autocomplete<ServerBinary, false, false, true>
@@ -86,7 +102,15 @@ export function BinaryPicker({
       options={options}
       inputValue={value}
       onInputChange={(_e, next) => onChange(next)}
-      getOptionLabel={(o) => (typeof o === 'string' ? o : o.path)}
+      onChange={(_e, picked) => {
+        if (typeof picked !== 'string' && picked !== null) onSelect?.(picked);
+      }}
+      // MUI keys options by label by default; two rows can share a Linux path
+      // (two distros, or a native and a WSL row), but `path` is unique.
+      getOptionKey={(o) => (typeof o === 'string' ? o : o.path)}
+      // A WSL option's label is its Linux path: MUI writes the label into the
+      // input after a selection, and the spec's binary is that Linux path.
+      getOptionLabel={optionLabel}
       isOptionEqualToValue={(o, v) => o.path === (typeof v === 'string' ? v : v.path)}
       renderOption={(props, option) => {
         const { key, ...rest } = props as { key?: string } & Record<string, unknown>;
@@ -98,8 +122,13 @@ export function BinaryPicker({
             sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}
           >
             <Box component="span" sx={{ fontFamily: 'monospace' }}>
-              {option.path}
+              {isWsl(option) ? option.exec_path : option.path}
             </Box>
+            {isWsl(option) && (
+              <Typography component="span" variant="caption" color="text.secondary">
+                {`WSL2 · ${option.distro}`}
+              </Typography>
+            )}
             <Typography component="span" variant="caption" color="text.secondary">
               {option.effective_version || t.binariesVersionUnknown}
             </Typography>
