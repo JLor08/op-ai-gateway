@@ -265,14 +265,17 @@ func (ex expandedSpec) withWrapper(l wslLaunch) expandedSpec {
 // wslUnitName -- arrive as positional arguments, read only as "$@" and quoted
 // words, never spliced into the program text.
 //
-// For each unit it prints "unit <u> <memory.current> <inactive_file>" from the
+// It first prints its sentinel line, wslSampleSentinel: wsl.exe may print
+// messages of its own on stdout ahead of the command's output, so
+// parseWSLSample takes nothing before that line for the script's. For each
+// unit it then prints "unit <u> <memory.current> <inactive_file>" from the
 // unit's scope cgroup under the calling user's systemd manager (the path
 // systemd-run --user --scope gives it; Phase 0 B6), or "unit <u> -" when those
 // files cannot be read: a unit that has already gone, or a cgroup layout the
 // agent does not know. It ends with "meminfo <MemTotal kB> <MemAvailable kB>"
-// for the whole VM, which every distro shares. POSIX sh with cat and awk (and
-// id for the uid in the path), nothing a minimal distro lacks.
-const wslSampleScript = `uid=$(id -u)
+// for the whole VM, which every distro shares. POSIX sh with printf, cat and
+// awk (and id for the uid in the path), nothing a minimal distro lacks.
+const wslSampleScript = "printf '%s\\n' '" + wslSampleSentinel + "'\n" + `uid=$(id -u)
 app=/sys/fs/cgroup/user.slice/user-$uid.slice/user@$uid.service/app.slice
 for u in "$@"; do
 	s=$app/$u.scope
@@ -286,6 +289,11 @@ for u in "$@"; do
 done
 awk '$1 == "MemTotal:" { t = $2 } $1 == "MemAvailable:" { a = $2 } END { print "meminfo", t, a }' /proc/meminfo
 `
+
+// wslSampleSentinel is the first line wslSampleScript prints, versioned so a
+// change of the script's output grammar can change it too. It holds no quote:
+// the script prints it from a single-quoted word.
+const wslSampleSentinel = "opagent-sample v1"
 
 // wslSampleTimeout bounds one beat's sampling calls, all distros together:
 // the same 2 s the native measurers bound themselves to, because the calls
@@ -305,15 +313,33 @@ type wslVMInfo struct {
 // MiB, memory.current minus inactive_file (the docker stats definition, so the
 // figure does not count reclaimable page cache such as a model file's), and
 // the VM's meminfo. A figure that is not positive is absent, like a unit
-// printed as "-": realRAM's rule, "unknown", never "uses nothing". Any line it
-// does not recognise, or a missing or repeated meminfo line, fails the whole
-// answer: a garbled sample is no sample.
+// printed as "-": realRAM's rule, "unknown", never "uses nothing".
+//
+// Everything before the script's sentinel line (wslSampleSentinel) is
+// wsl.exe's, not the script's, and is skipped; an answer without that line
+// holds nothing that is certainly the script's, and fails. After it, any line
+// it does not recognise, or a missing or repeated meminfo line, fails the
+// whole answer: a garbled sample is no sample.
 func parseWSLSample(out []byte) (ramByUnit map[string]int, vm wslVMInfo, err error) {
 	garbage := func(line string) error {
 		return fmt.Errorf("runtime: unexpected line in the WSL RAM sample: %q", clipText(strings.TrimSpace(line), 120))
 	}
+	text := string(out)
+	// body is where the script's own output starts: just past the sentinel.
+	body, found := 0, false
+	for line := range strings.Lines(text) {
+		body += len(line)
+		if strings.TrimSpace(line) == wslSampleSentinel {
+			found = true
+			break
+		}
+	}
+	if !found {
+		first, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
+		return nil, wslVMInfo{}, fmt.Errorf("runtime: the WSL RAM sample has no %q line; its output began %q", wslSampleSentinel, clipText(strings.TrimSpace(first), 120))
+	}
 	seenMeminfo := false
-	for line := range strings.Lines(string(out)) {
+	for line := range strings.Lines(text[body:]) {
 		f := strings.Fields(line)
 		switch {
 		case len(f) == 0:

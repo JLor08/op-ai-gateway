@@ -41,8 +41,10 @@ type fakeWSL struct {
 
 // fakeWSLIdleSample is the sampling answer newFakeWSL starts with: no scope
 // figures, and a roomy VM, so a test that does not look at RAM gets a sample
-// that parses and constrains nothing it starts.
-const fakeWSLIdleSample = "meminfo 67108864 67108864\n"
+// that parses and constrains nothing it starts. The fake prints a sample file
+// verbatim, as all of wsl.exe's stdout, so every one opens with the script's
+// sentinel line (sampleOut).
+const fakeWSLIdleSample = wslSampleSentinel + "\nmeminfo 67108864 67108864\n"
 
 func newFakeWSL(t *testing.T) *fakeWSL {
 	t.Helper()
@@ -235,7 +237,7 @@ func waitForState(t *testing.T, m *Manager, specID string, want State) *Status {
 // as the only variable carried across.
 func assertHelperCall(t *testing.T, c fakeWSLCall) {
 	t.Helper()
-	if want := []string{"-d", wslTestDistro, "-u", "ai", "--exec"}; !slices.Equal(c.Argv[:5], want) {
+	if want := []string{"-d", wslTestDistro, "-u", "ai", "--cd", "/", "--exec"}; !slices.Equal(c.Argv[:7], want) {
 		t.Errorf("helper call argv %q, want it to open with %q", c.Argv, want)
 	}
 	if got := c.Env["XDG_RUNTIME_DIR"]; got != "/run/user/1000" {
@@ -285,7 +287,7 @@ func TestWSLSpecStartsAndServes(t *testing.T) {
 		t.Fatalf("id -u calls = %d, want 1", len(ids))
 	}
 	for _, c := range ids {
-		if want := []string{"-d", wslTestDistro, "-u", "ai", "--exec"}; !slices.Equal(c.Argv[:5], want) {
+		if want := []string{"-d", wslTestDistro, "-u", "ai", "--cd", "/", "--exec"}; !slices.Equal(c.Argv[:7], want) {
 			t.Errorf("id -u argv %q, want it to open with %q", c.Argv, want)
 		}
 		if _, ok := c.Env["XDG_RUNTIME_DIR"]; ok {
@@ -871,13 +873,20 @@ func TestWSLOrphanUnits(t *testing.T) {
 
 func TestExecWSLRunnerReportsStderr(t *testing.T) {
 	skipOnWindows(t)
-	out, err := execWSLRunner(context.Background(), fakewslPath, []string{"-d", wslTestDistro, "-u", "ai", "--exec", "id", "-u"}, nil)
+	out, err := execWSLRunner(context.Background(), fakewslPath, []string{"-d", wslTestDistro, "-u", "ai", "--cd", "/", "--exec", "id", "-u"}, nil)
 	if err != nil || strings.TrimSpace(string(out)) != "1000" {
 		t.Fatalf("id -u = %q, %v, want 1000", out, err)
 	}
-	_, err = execWSLRunner(context.Background(), fakewslPath, []string{"-d", wslTestDistro, "-u", "ai", "--exec", "frobnicate"}, nil)
+	_, err = execWSLRunner(context.Background(), fakewslPath, []string{"-d", wslTestDistro, "-u", "ai", "--cd", "/", "--exec", "frobnicate"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "unsupported command") {
 		t.Fatalf("a failing call returned %v, want an error carrying its stderr", err)
+	}
+	// The fake refuses a call without --cd, as every call the agent makes
+	// names its directory: so every helper call these tests drive through the
+	// fake proves it does.
+	_, err = execWSLRunner(context.Background(), fakewslPath, []string{"-d", wslTestDistro, "-u", "ai", "--exec", "id", "-u"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "no --cd") {
+		t.Fatalf("a call without --cd returned %v, want the fake to refuse it", err)
 	}
 }
 
@@ -927,7 +936,8 @@ func TestWSLTargetsNeverReachThePIDRAMMeasurer(t *testing.T) {
 	sStatus := waitForState(t, m, "S", StateRunning)
 	unit := f.onlyLaunchedUnit(t)
 
-	f.writeSample(t, "unit "+unit+" 8419880960 4535152640\nmeminfo 28763116 21000000\n")
+	// wsl.exe's own notice ahead of the script's output is ignored.
+	f.writeSample(t, "wsl: a notice of wsl.exe's own\n"+sampleOut("unit "+unit+" 8419880960 4535152640\nmeminfo 28763116 21000000\n"))
 	waitUntil(t, 5*time.Second, "S reports its scope's RAM", func() bool {
 		st := statusFor(m, "S")
 		return st != nil && st.MeasuredRAMMB == 3704
@@ -956,7 +966,7 @@ func TestWSLTargetsNeverReachThePIDRAMMeasurer(t *testing.T) {
 		t.Fatal("no sampling call was made")
 	}
 	for _, c := range samples {
-		want := []string{"-d", wslTestDistro, "-u", "ai", "--exec", "sh", "-c", wslSampleScript, "sh", unit}
+		want := []string{"-d", wslTestDistro, "-u", "ai", "--cd", "/", "--exec", "sh", "-c", wslSampleScript, "sh", unit}
 		if !slices.Equal(c.Argv, want) {
 			t.Errorf("sampling argv %q\nwant %q", c.Argv, want)
 		}
@@ -1150,7 +1160,7 @@ func TestWSLEvictionForVMRoomStartsTheCandidate(t *testing.T) {
 	unitA := f.onlyLaunchedUnit(t)
 	// A's scope holds 6000 MB of a VM with 4000 MB available: a pool of 10000,
 	// and 6000 + 5000 does not fit it.
-	f.writeSample(t, "unit "+unitA+" "+strconv.Itoa(6000<<20)+" 0\nmeminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(4000<<10)+"\n")
+	f.writeSample(t, sampleOut("unit "+unitA+" "+strconv.Itoa(6000<<20)+" 0\nmeminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(4000<<10)+"\n"))
 	waitUntil(t, 5*time.Second, "A's sample lands", func() bool {
 		st := statusFor(m, "A")
 		return st != nil && st.MeasuredRAMMB == 6000
@@ -1180,7 +1190,7 @@ func TestWSLVMSampleWakesARAMWaiter(t *testing.T) {
 	waitForState(t, m, "A", StateRunning)
 	unitA := f.onlyLaunchedUnit(t)
 	sample := func(availMB int) string {
-		return "unit " + unitA + " " + strconv.Itoa(1000<<20) + " 0\nmeminfo " + strconv.Itoa(12000<<10) + " " + strconv.Itoa(availMB<<10) + "\n"
+		return sampleOut("unit " + unitA + " " + strconv.Itoa(1000<<20) + " 0\nmeminfo " + strconv.Itoa(12000<<10) + " " + strconv.Itoa(availMB<<10) + "\n")
 	}
 	// A pool of 2000 + 1000 = 3000: B's 5000 does not fit beside A.
 	f.writeSample(t, sample(2000))
@@ -1233,7 +1243,7 @@ func stopWSLAfterSample(t *testing.T, m *Manager, f *fakeWSL, specID, model stri
 	t.Helper()
 	ensureWSL(t, m, model)
 	unit := f.onlyLaunchedUnit(t)
-	f.writeSample(t, "unit "+unit+" "+strconv.Itoa(heldMB<<20)+" 0\nmeminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(availMB<<10)+"\n")
+	f.writeSample(t, sampleOut("unit "+unit+" "+strconv.Itoa(heldMB<<20)+" 0\nmeminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(availMB<<10)+"\n"))
 	waitUntil(t, 5*time.Second, specID+"'s sample lands", func() bool {
 		st := statusFor(m, specID)
 		return st != nil && st.MeasuredRAMMB == heldMB
@@ -1261,7 +1271,7 @@ func TestWSLStaleVMSampleIsRefreshedForAWaitingStart(t *testing.T) {
 	shrinkTimings(t)
 	f := newFakeWSL(t)
 	fresh := filepath.Join(t.TempDir(), "fresh")
-	if err := os.WriteFile(fresh, []byte("meminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(9000<<10)+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(fresh, []byte(sampleOut("meminfo "+strconv.Itoa(12000<<10)+" "+strconv.Itoa(9000<<10)+"\n")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	run := func(ctx context.Context, exe string, args, env []string) ([]byte, error) {
@@ -1286,7 +1296,7 @@ func TestWSLStaleVMSampleIsRefreshedForAWaitingStart(t *testing.T) {
 
 	// A sample dispatched while A was still live may be logged after the
 	// stop, so the refresh is looked for, not assumed to be the next call.
-	want := []string{"-d", wslTestDistro, "-u", "ai", "--exec", "sh", "-c", wslSampleScript, "sh"}
+	want := []string{"-d", wslTestDistro, "-u", "ai", "--cd", "/", "--exec", "sh", "-c", wslSampleScript, "sh"}
 	if !slices.ContainsFunc(f.wslSampleCalls(t)[before:], func(c fakeWSLCall) bool { return slices.Equal(c.Argv, want) }) {
 		t.Errorf("no VM-only sampling call (%q) after the start began to wait: %+v", want, f.wslSampleCalls(t)[before:])
 	}
@@ -1338,7 +1348,7 @@ func TestWSLVMWaitAsksForASampleAtOnce(t *testing.T) {
 		mu.Lock()
 		calls = append(calls, slices.Clone(args))
 		mu.Unlock()
-		return []byte("meminfo " + strconv.Itoa(12000<<10) + " " + strconv.Itoa(9000<<10) + "\n"), nil
+		return []byte(sampleOut("meminfo " + strconv.Itoa(12000<<10) + " " + strconv.Itoa(9000<<10) + "\n")), nil
 	}
 	pol := allowlistPolicy()
 	pol.WSL = wslTestPolicy()
@@ -1370,7 +1380,7 @@ func TestWSLVMWaitAsksForASampleAtOnce(t *testing.T) {
 		t.Fatal("the wait on the VM pool dispatched no sample")
 	}
 	m.wg.Wait()
-	want := []string{"-d", wslTestDistro, "-u", "ai", "--exec", "sh", "-c", wslSampleScript, "sh"}
+	want := []string{"-d", wslTestDistro, "-u", "ai", "--cd", "/", "--exec", "sh", "-c", wslSampleScript, "sh"}
 	if len(calls) != 1 || !slices.Equal(calls[0], want) {
 		t.Errorf("sampling calls %q, want one VM-only call %q", calls, want)
 	}

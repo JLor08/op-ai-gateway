@@ -97,9 +97,14 @@ func wslUserRefused(user string) bool {
 }
 
 // wslHelperArgs is the wsl.exe argv of a helper call: the distro, always the
-// configured user, and the command through --exec, never a shell.
+// configured user, "/" as the working directory, and the command through
+// --exec, never a shell. Without --cd, wsl.exe starts the command in the
+// translation of the caller's Windows working directory -- the agent's, which
+// may have no mount in the distro at all (an operator may turn the drive
+// mounts off) -- and fails or warns on stdout when it cannot; "/" needs no
+// translation and exists in every distro.
 func wslHelperArgs(user, distro string, command ...string) []string {
-	return append([]string{"-d", distro, "-u", user, "--exec"}, command...)
+	return append([]string{"-d", distro, "-u", user, "--cd", "/", "--exec"}, command...)
 }
 
 // wslHelperEnv is the environment of a helper call: the agent's base variables

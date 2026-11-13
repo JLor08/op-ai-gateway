@@ -3,7 +3,7 @@
 
 // Command fakewsl is a test-only stand-in for wsl.exe, built by TestMain beside
 // stubchild. It understands exactly the invocations the agent's WSL launcher and
-// its helper calls make -- "-d D -u U [--cd DIR] --exec <command...>" -- and
+// its helper calls make -- "-d D -u U --cd DIR --exec <command...>" -- and
 // plays the part of the distro's systemd user manager for them:
 //
 //   - systemd-run --user --scope --quiet --unit=U -- BIN ARGS...: records its
@@ -17,12 +17,16 @@
 //     process is alive;
 //   - id -u: prints 1000;
 //   - sh -c <script> sh <units...>: prints the contents of $FAKEWSL_SAMPLE (the
-//     agent's own fixed sampling script; the fake does not run it).
+//     agent's own fixed sampling script; the fake does not run it) verbatim, as
+//     all of wsl.exe's stdout: a test writes the script's sentinel line into
+//     it, and anything wsl.exe itself would print ahead of that.
 //
 // Every invocation first appends one JSON line {argv, env} to $FAKEWSL_LOG, so a
 // test can read back exactly what the agent ran and with which of the
 // boundary-relevant variables. "-u root" and the shell form ("--" instead of
-// "--exec") are refused: the agent must never use either.
+// "--exec") are refused: the agent must never use either. So is a call without
+// "--cd": without it a real wsl.exe translates the caller's Windows working
+// directory, which need not map into the distro, so every call names one.
 //
 // Never part of the module's production build: "testdata" directories are
 // excluded from `go build ./...`, `go vet ./...`, and internal/archtest's package
@@ -71,6 +75,9 @@ func main() {
 	}
 	if len(args) == 0 {
 		fail(2, "fakewsl: no --exec: the shell form must never be used")
+	}
+	if dir == "" {
+		fail(2, "fakewsl: no --cd: wsl.exe would have to translate the caller's Windows working directory")
 	}
 	if user == "" || user == "root" || strings.Trim(user, "0") == "" {
 		fail(2, "fakewsl: refusing user %q: the agent must name a non-root user", user)
