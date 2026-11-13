@@ -723,6 +723,33 @@ func TestEndpointModeForMapsFlavorToTargetMode(t *testing.T) {
 	}
 }
 
+// A passthrough mode on an sglang_omni target is answered as translate; disabled stays
+// disabled, and every other kind keeps its passthrough.
+func TestEndpointModeForServesSGLangOmniPassthroughAsTranslate(t *testing.T) {
+	omni := routing.Target{
+		Provider:             routing.ProviderServerAgent,
+		LiveProgressSpecType: string(routing.RuntimeSpecTypeSGLangOmni),
+		ResponsesMode:        routing.EndpointModePassthrough,
+		MessagesMode:         routing.EndpointModeDisabled,
+	}
+	if path, mode := endpointModeFor(omni, "openai_responses"); path != "/v1/responses" || mode != routing.EndpointModeTranslate {
+		t.Fatalf("sglang_omni responses = (%q, %q), want (/v1/responses, translate)", path, mode)
+	}
+	if _, mode := endpointModeFor(omni, "anthropic_messages"); mode != routing.EndpointModeDisabled {
+		t.Fatalf("sglang_omni messages = %q, want disabled", mode)
+	}
+	if got := upstreamPath(omni, "openai_responses", endpointResponses); got != "/v1/chat/completions" {
+		t.Fatalf("sglang_omni upstreamPath = %q, want /v1/chat/completions", got)
+	}
+	for _, kind := range []routing.RuntimeSpecType{routing.RuntimeSpecTypeSGLang, routing.RuntimeSpecTypeVLLM, ""} {
+		other := omni
+		other.LiveProgressSpecType = string(kind)
+		if _, mode := endpointModeFor(other, "openai_responses"); mode != routing.EndpointModePassthrough {
+			t.Fatalf("%q responses = %q, want passthrough", kind, mode)
+		}
+	}
+}
+
 // TestUpstreamPathImagesFlavorBypassesModeAndProviderFallbacks proves
 // upstreamPath's apiFlavorImages branch fires BEFORE both the endpointModeFor
 // lookup (which has no case for images and would answer ("", "")) and the
