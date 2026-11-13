@@ -2758,8 +2758,9 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 }
 
 // anySpecBinaryContradictsReportedOS backs runtimeBinaryPathOSMismatchWarning:
-// it reads serverID's latest reported GOOS and reports whether any of specs
-// carries a binary path absolute for the other platform.
+// it reads serverID's latest reported GOOS and reports whether any native spec
+// carries a binary path absolute for the other platform. A wsl spec is skipped:
+// its binary is a path inside the distro, not on the reported host.
 //
 // Unlike the timeout warning, this pass does NOT skip disabled specs. That one
 // describes a consequence of RUNNING (a disabled spec never cold-starts); this
@@ -2784,6 +2785,12 @@ func (s *Service) anySpecBinaryContradictsReportedOS(ctx context.Context, server
 	}
 	reportedOS := strings.ToLower(strings.TrimSpace(telemetry.OS))
 	for _, spec := range specs {
+		// A wsl spec runs inside a Linux distro, not on the host whose GOOS
+		// the agent reports: its binary is a Linux path by design, and the
+		// spec PUT already refused anything else (validateRuntimeSpecExecution).
+		if normalizeExecutionMode(spec.ExecutionMode) == routing.ExecutionModeWSL {
+			continue
+		}
 		if runtimeSpecBinaryContradictsOS(spec.Binary, reportedOS) {
 			return true, nil
 		}

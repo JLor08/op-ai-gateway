@@ -7984,9 +7984,12 @@ checking in, which is why the spec PUT accepts either platform's absolute form
 unconditionally and only this advisory carries the OS knowledge. It does **not**
 skip disabled specs, unlike the timeout warning above: that one describes a
 consequence of *running*, this one describes a value the operator just typed,
-and a spec is routinely created disabled and enabled afterwards. And a path
+and a spec is routinely created disabled and enabled afterwards. A path
 absolute under **both** rules (a UNC share spelled with forward slashes,
-`//host/share/x`) contradicts nothing and stays silent.
+`//host/share/x`) contradicts nothing and stays silent. And a **`wsl` spec is
+never checked**: its `binary` is a Linux path inside the distro, not a path on
+the windows host the agent reports, and the spec PUT already refuses a wsl spec
+whose binary is not an absolute Linux path.
 
 **`api_flavors_not_on_application`** — a spec of a `server_agent` application
 lists a flavor the application does not declare. Candidacy reads the
