@@ -4022,30 +4022,34 @@ export function RuntimeAdminSection({
       },
       render: (m) => {
         const spec = specsById[m.id];
-        return spec && isClusterHead(spec) ? (
-          <ClusterTotalCell
-            spec={spec}
-            name={m.gateway_model_name}
-            axis="vram"
-            ownMb={totalGpuVram(spec)}
-            t={t}
-          />
-        ) : spec?.execution_mode === 'wsl' ? (
-          <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'end' }}>
-            <span>{formatMb(totalGpuVram(spec))}</span>
-            <Chip size="small" variant="outlined" label={t.runtimeStatusWSLMarker} />
-            {/* Only a measured figure is attributed from the VM; an estimate
-                alone is the operator's, and labelling it would claim a
-                measurement that has not happened. */}
-            {spec.gpus.some((g) => g.vram_measured_mb > 0) && (
-              <Typography variant="caption" color="text.secondary">
-                {t.runtimeStatusVRAMFromVM}
-              </Typography>
-            )}
-          </Box>
-        ) : (
-          formatMb(totalGpuVram(spec))
-        );
+        if (spec && isClusterHead(spec)) {
+          return (
+            <ClusterTotalCell
+              spec={spec}
+              name={m.gateway_model_name}
+              axis="vram"
+              ownMb={totalGpuVram(spec)}
+              t={t}
+            />
+          );
+        }
+        if (spec?.execution_mode === 'wsl') {
+          return (
+            <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'end' }}>
+              <span>{formatMb(totalGpuVram(spec))}</span>
+              <Chip size="small" variant="outlined" label={t.runtimeStatusWSLMarker} />
+              {/* Only a measured figure is attributed from the VM; an estimate
+                  alone is the operator's, and labelling it would claim a
+                  measurement that has not happened. */}
+              {spec.gpus.some((g) => g.vram_measured_mb > 0) && (
+                <Typography variant="caption" color="text.secondary">
+                  {t.runtimeStatusVRAMFromVM}
+                </Typography>
+              )}
+            </Box>
+          );
+        }
+        return formatMb(totalGpuVram(spec));
       },
       filter: 'text',
       searchable: false,

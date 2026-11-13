@@ -37,6 +37,10 @@ function curlCommand(base: string, token: string, b: { os: string; arch: string 
   return `curl -fL -H "Authorization: Bearer ${token}" ${url} -o server-agent && chmod +x server-agent`;
 }
 
+// The agent's default runtime_wsl_exe on Windows, as buildServerAgentConfig's
+// comment names it: kept raw here so the template carries no escaped backslash.
+const DEFAULT_WINDOWS_WSL_EXE = String.raw`C:\Program Files\WSL\wsl.exe`;
+
 // buildServerAgentConfig produces a ready-to-use, ANNOTATED server-agent.json:
 // gateway_url + token filled in and every other key pre-set to the agent's own
 // default, each preceded by an English comment explaining it. Output is JSONC — the
@@ -196,7 +200,7 @@ export function buildServerAgentConfig(config: AgentConfigMaterial, token: strin
 
   // Path of the wsl.exe the agent launches WSL2-hosted model processes through
   // (a launch spec whose execution mode is "wsl"). Empty (the default) means
-  // C:\\Program Files\\WSL\\wsl.exe on Windows and "WSL not configured"
+  // ${DEFAULT_WINDOWS_WSL_EXE} on Windows and "WSL not configured"
   // elsewhere, in which case every WSL spec is refused. Comes ONLY from this
   // local file.
   "runtime_wsl_exe": "",
