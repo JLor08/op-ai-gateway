@@ -53,6 +53,9 @@ func main() {
 	// -v/verbose lowers the log level to Debug; otherwise Info. All packages log
 	// through the default slog logger.
 	slog.SetDefault(newLogger(cfg.Verbose))
+	for _, w := range cfg.Warnings {
+		slog.Warn("config: " + w)
+	}
 	trustStore, err := trust.New(trust.Options{
 		CAFile:      cfg.CAFile,
 		CertDir:     cfg.CertDir,
@@ -162,11 +165,8 @@ func main() {
 		AllowedDirs:     cfg.RuntimeAllowedDirs,
 		AllowBinaryDirs: cfg.RuntimeAllowBinaryDirs,
 		WSL: runtimectl.WSLPolicy{
-			Exe:             cfg.RuntimeWSLExe,
-			AllowedDistros:  cfg.RuntimeWSLAllowedDistros,
-			AllowedBinaries: cfg.RuntimeWSLAllowedBinaries,
-			AllowedDirs:     cfg.RuntimeWSLAllowedDirs,
-			User:            cfg.RuntimeWSLUser,
+			Exe:  cfg.RuntimeWSLExe,
+			User: cfg.RuntimeWSLUser,
 		},
 	}
 	// The GPU vendor comes from the SAME detection the telemetry collectors

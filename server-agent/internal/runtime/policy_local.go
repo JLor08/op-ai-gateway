@@ -345,13 +345,17 @@ func deviceList(spec Spec, prefix string) string {
 // may run AT ALL.
 type LocalPolicy struct {
 	// AllowedBinaries lists the absolute paths a spec's Binary must exactly
-	// match to be permitted. EMPTY (the default, meaning the operator has
+	// match to be permitted. An entry of the form wsl://<distro>/<absolute
+	// Linux path> allowlists a binary inside a WSL2 distro instead (see
+	// WSLEntryScheme); only WSL specs consult those, and only native specs
+	// consult the rest. EMPTY (the default, meaning the operator has
 	// configured nothing) means NOTHING may start -- a deliberate hard
 	// refusal, not a permissive default: a freshly provisioned agent must
 	// not execute whatever the gateway happens to ask for.
 	AllowedBinaries []string
 	// AllowedDirs lists permitted work_dir prefixes. EMPTY means any
-	// work_dir is permitted -- unlike AllowedBinaries, an operator who does
+	// work_dir is permitted (for native specs: no native entry; for a WSL
+	// spec: no wsl:// entry of its distro) -- unlike AllowedBinaries, an operator who does
 	// not care about work_dir containment is not forced to enumerate one.
 	AllowedDirs []string
 	// AllowBinaryDirs (R3), when true, treats each allowed binary's PARENT
@@ -367,28 +371,20 @@ type LocalPolicy struct {
 	// adding the first AllowedDirs entry does. Same operator-only provenance as
 	// the two allowlists: it comes ONLY from the agent's own config.
 	AllowBinaryDirs bool
-	// WSL is the operator's policy for specs that run inside a WSL2
-	// distribution (Spec.IsWSL). It is a separate block, not extra entries on
-	// the lists above: a WSL spec's binary and work_dir are POSIX paths inside
-	// the distro, which a Windows allowlist can neither express nor safely
-	// match. Same operator-only provenance as everything else here.
+	// WSL is the launcher configuration for specs that run inside a WSL2
+	// distribution (Spec.IsWSL): the wsl.exe and the user. WHICH binaries,
+	// distros and directories are permitted is not here but in the two lists
+	// above, as wsl://<distro>/<path> entries. Same operator-only provenance
+	// as everything else here.
 	WSL WSLPolicy
 }
 
-// WSLPolicy is the local policy for WSL specs. The zero value refuses every WSL
-// spec: nothing is permitted until the operator names the wsl.exe, a user, a
-// distro and a binary.
+// WSLPolicy is the launcher configuration for WSL specs. The zero value refuses
+// every WSL spec: nothing is permitted until the operator names the wsl.exe, a
+// user and, as wsl:// entries in LocalPolicy.AllowedBinaries, a binary.
 type WSLPolicy struct {
 	// Exe is the wsl.exe to launch through; empty means WSL is not configured.
 	Exe string
-	// AllowedDistros lists the distros a spec may name, matched exactly.
-	AllowedDistros []string
-	// AllowedBinaries lists the absolute POSIX binary paths a spec must match
-	// exactly.
-	AllowedBinaries []string
-	// AllowedDirs lists permitted POSIX work_dir prefixes; empty permits any
-	// absolute work_dir.
-	AllowedDirs []string
 	// User is the distro user the process runs as. Empty and "root" are
 	// refused: no gateway-chosen argv or env may reach a root process.
 	User string
@@ -396,7 +392,7 @@ type WSLPolicy struct {
 
 // isZero reports whether w configures nothing at all (ManagerOptions.WSL).
 func (w WSLPolicy) isZero() bool {
-	return w.Exe == "" && w.User == "" && len(w.AllowedDistros) == 0 && len(w.AllowedBinaries) == 0 && len(w.AllowedDirs) == 0
+	return w.Exe == "" && w.User == ""
 }
 
 // effectiveWorkDir is the directory a spec's child process ACTUALLY runs in
@@ -439,7 +435,11 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	if spec.IsWSL() {
 		return p.permitWSL(spec)
 	}
-	if len(p.AllowedBinaries) == 0 {
+	// Only native entries count here: a wsl:// entry (well-formed or not) names
+	// a path inside a distro and can never permit a native binary or dir.
+	nativeBinaries, _ := splitAllowlist(p.AllowedBinaries)
+	nativeDirs, _ := splitAllowlist(p.AllowedDirs)
+	if len(nativeBinaries) == 0 {
 		return fmt.Errorf("runtime: binary allowlist is empty, refusing to start %q (configure the agent's runtime_allowed_binaries / OP_AGENT_RUNTIME_ALLOWED_BINARIES)", spec.Binary)
 	}
 	// Absolute paths only -- this also closes the concrete bypass where a
@@ -451,7 +451,7 @@ func (p LocalPolicy) Permit(spec Spec) error {
 		return fmt.Errorf("runtime: binary %q must be an absolute path", spec.Binary)
 	}
 	binaryAllowed := false
-	for _, b := range p.AllowedBinaries {
+	for _, b := range nativeBinaries {
 		if !filepath.IsAbs(b) {
 			continue // a non-absolute allowlist entry can never permit anything
 		}
@@ -492,10 +492,10 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	// on, each allowlisted binary's PARENT directory. An entirely empty set --
 	// no AllowedDirs and the toggle off -- means containment was never
 	// configured, so any work_dir is permitted (unchanged from before R3).
-	if len(p.AllowedDirs) == 0 && !p.AllowBinaryDirs {
+	if len(nativeDirs) == 0 && !p.AllowBinaryDirs {
 		return nil
 	}
-	for _, dir := range p.AllowedDirs {
+	for _, dir := range nativeDirs {
 		if withinDir(spec.WorkDir, allowedDirBase(dir)) { // R4: <dir>/* is an accepted synonym for the bare subtree
 			return nil
 		}
@@ -507,7 +507,7 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	// at least one dir to add. A non-absolute entry can never permit anything
 	// (it was skipped by the binary match above), so it contributes no dir.
 	if p.AllowBinaryDirs {
-		for _, b := range p.AllowedBinaries {
+		for _, b := range nativeBinaries {
 			if filepath.IsAbs(b) && withinDir(spec.WorkDir, filepath.Dir(b)) {
 				return nil
 			}
@@ -532,16 +532,20 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 	if wslUserRefused(w.User) {
 		return fmt.Errorf("runtime: no non-root WSL user is configured, refusing a wsl spec (set the agent's runtime_wsl_user / OP_AGENT_RUNTIME_WSL_USER to a non-root distro user)")
 	}
-	// The empty-distro guard keeps this self-contained against a file-sourced
-	// [""] allowlist entry, which survives as a non-empty list.
-	if spec.WSLDistro() == "" || !slices.Contains(w.AllowedDistros, spec.WSLDistro()) {
-		return fmt.Errorf("runtime: the spec's WSL distro is not in the allowed-distros list (runtime_wsl_allowed_distros holds %d entries)", len(w.AllowedDistros))
+	distro := spec.WSLDistro()
+	_, wslBinaries := splitAllowlist(p.AllowedBinaries)
+	_, wslDirs := splitAllowlist(p.AllowedDirs)
+	// A distro is permitted only by being named by a well-formed wsl:// binary
+	// entry. The refusal names the setting, never the distro.
+	if distro == "" || len(wslBinaries[distro]) == 0 {
+		return fmt.Errorf("runtime: the spec's WSL distro is not named by any wsl:// entry in runtime_allowed_binaries (use wsl://<distro>/<absolute Linux path>)")
 	}
 	// Absolute POSIX only: a bare name would resolve through the distro's PATH,
-	// and a Windows path can never be an executable inside it. Non-absolute
-	// allowlist entries (including a file-sourced "") can never permit anything.
-	if !strings.HasPrefix(spec.Binary, "/") || !slices.Contains(w.AllowedBinaries, spec.Binary) {
-		return fmt.Errorf("runtime: the spec's WSL binary is not an allowed absolute path (runtime_wsl_allowed_binaries holds %d entries)", len(w.AllowedBinaries))
+	// and a Windows path can never be an executable inside it. Compared
+	// verbatim against THIS distro's entries; another distro's entry for the
+	// same path permits nothing here.
+	if !strings.HasPrefix(spec.Binary, "/") || !slices.Contains(wslBinaries[distro], spec.Binary) {
+		return fmt.Errorf("runtime: the spec's WSL binary is not an allowed absolute path (add a wsl://<distro>/<absolute Linux path> entry to runtime_allowed_binaries)")
 	}
 	// As for native specs, an empty work_dir runs beside the (allowlisted)
 	// binary and is permitted on its own merit.
@@ -551,15 +555,27 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 	if !strings.HasPrefix(spec.WorkDir, "/") {
 		return fmt.Errorf("runtime: a WSL work_dir must be an absolute POSIX path")
 	}
-	if len(w.AllowedDirs) == 0 {
+	// The allowed set of the distro: its wsl:// dir entries plus, with
+	// runtime_allow_binary_dirs, the directory of each of its binary entries.
+	// An empty set means containment was never configured for this distro.
+	dirs := make([]string, 0, len(wslDirs[distro])+len(wslBinaries[distro]))
+	for _, d := range wslDirs[distro] {
+		dirs = append(dirs, allowedDirBase(d))
+	}
+	if p.AllowBinaryDirs {
+		for _, b := range wslBinaries[distro] {
+			dirs = append(dirs, path.Dir(b))
+		}
+	}
+	if len(dirs) == 0 {
 		return nil
 	}
-	for _, dir := range w.AllowedDirs {
-		if withinPosixDir(spec.WorkDir, allowedDirBase(dir)) {
+	for _, dir := range dirs {
+		if withinPosixDir(spec.WorkDir, dir) {
 			return nil
 		}
 	}
-	return fmt.Errorf("runtime: the spec's WSL work_dir is not within any allowed directory (runtime_wsl_allowed_dirs holds %d entries)", len(w.AllowedDirs))
+	return fmt.Errorf("runtime: the spec's WSL work_dir is not within any allowed directory (wsl:// entries of runtime_allowed_dirs, or runtime_allow_binary_dirs)")
 }
 
 // isZeroUID reports whether s is all ASCII digits and parses to 0 ("0", "00"):

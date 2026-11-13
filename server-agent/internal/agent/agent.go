@@ -421,7 +421,13 @@ import (
 // execution block (mode "wsl", a distro) is parsed, validated and launch-
 // affecting. This is the ONE bump for the whole branch; later commits on it do
 // not bump again.
-const Version = "0.19.0"
+//
+// 0.19.0 -> 0.19.1 is the single bump for the unified binary allowlist: a WSL
+// binary or directory is a wsl://<distro>/<path> entry of
+// runtime_allowed_binaries / runtime_allowed_dirs, and the three
+// runtime_wsl_allowed_* settings are gone. PATCH: no agent.Features entry
+// changes (runtime_exec_wsl keeps Since 0.19.0).
+const Version = "0.19.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

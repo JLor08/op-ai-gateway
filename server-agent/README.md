@@ -61,13 +61,10 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_CA_PEM` | `-ca-pem` | `ca_pem` | — | Optional inline public CA bootstrap bundle, generated only when the currently served gateway leaf uses the internal CA. |
 | `OP_AGENT_RUNTIME_SOURCE` | `-runtime-source` | `runtime_source` | `gateway` | Where the agent-managed model runtime's launch specs come from: `gateway` (fetched from `GET /api/agent/v1/runtime-config`, portal-maintained) or `file` (read from `runtime_config` locally and reported upward read-only). See [Managed model runtime](#managed-model-runtime). |
 | `OP_AGENT_RUNTIME_CONFIG` | `-runtime-config` | `runtime_config` | — | Path to the local runtime-config JSON file. **Required** when `runtime_source` is `file`; ignored otherwise. |
-| `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | — (file/env only) | `runtime_allowed_binaries` | — (empty) | Absolute paths a launch spec's `binary` must match **exactly** to be permitted. **Empty means nothing may start at all** — a deliberate hard refusal, not a permissive default. This is the operator's boundary: the gateway decides *when and how* a model process runs, this list decides *whether it may run at all*. Env value is comma-separated. |
-| `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). A bare entry already permits the directory **and everything beneath it**; a trailing whole-segment wildcard — `/srv/models/*` or `C:\models\*` — is an accepted, exactly-equivalent spelling of that subtree, honoured so a config written that way does what its author expects. It is **not** a glob: a glued `/srv/models*` stays literal (it permits no `/srv/models-evil` sibling), and a bare `*` permits nothing. Env value is comma-separated. |
+| `OP_AGENT_RUNTIME_ALLOWED_BINARIES` | — (file/env only) | `runtime_allowed_binaries` | — (empty) | Absolute paths a launch spec's `binary` must match **exactly** to be permitted. **Empty means nothing may start at all** — a deliberate hard refusal, not a permissive default. This is the operator's boundary: the gateway decides *when and how* a model process runs, this list decides *whether it may run at all*. Env value is comma-separated. A binary inside a WSL2 distro is an entry `wsl://<distro>/<absolute Linux path>` (see [WSL2 workloads](#wsl2-workloads)); native specs ignore such entries, and a malformed one permits nothing and is logged at startup. |
+| `OP_AGENT_RUNTIME_ALLOWED_DIRS` | — (file/env only) | `runtime_allowed_dirs` | — (empty) | Permitted `work_dir` prefixes for launch specs. Unlike the binary allowlist, **empty means any `work_dir`** — an operator who does not care is not forced to enumerate one. Containment is a lexical, path-boundary check; symlinks are not resolved (see `withinDir` in `internal/runtime/policy_local.go` for the reasoning). A bare entry already permits the directory **and everything beneath it**; a trailing whole-segment wildcard — `/srv/models/*` or `C:\models\*` — is an accepted, exactly-equivalent spelling of that subtree, honoured so a config written that way does what its author expects. It is **not** a glob: a glued `/srv/models*` stays literal (it permits no `/srv/models-evil` sibling), and a bare `*` permits nothing. Env value is comma-separated. `wsl://<distro>/<path>` entries bound the `work_dir` of WSL specs in that distro only (no entry for a distro: any absolute `work_dir`). |
 | `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` | — (file/env only) | `runtime_allow_binary_dirs` | `false` | When on, each `runtime_allowed_binaries` entry's **parent directory** is treated as an allowed `work_dir` prefix without listing it in `runtime_allowed_dirs` — convenient when a model's `work_dir` sits beside its binary. Same operator-only provenance as the allowlists. The auto-added dirs use the same subtree containment as explicit entries. **Footgun:** turning it on while `runtime_allowed_dirs` is empty flips `work_dir` from "any is accepted" to "only the binary directories and their subtrees" (a spec with no `work_dir` still runs beside its binary either way). |
 | `OP_AGENT_RUNTIME_WSL_EXE` | — (file/env only) | `runtime_wsl_exe` | `C:\Program Files\WSL\wsl.exe` on Windows, empty elsewhere | The `wsl.exe` the agent launches WSL2-hosted model processes through (specs whose execution mode is `wsl`). Empty means WSL is not configured and every WSL spec is refused. Operator-only. |
-| `OP_AGENT_RUNTIME_WSL_ALLOWED_DISTROS` | — (file/env only) | `runtime_wsl_allowed_distros` | empty | Comma-separated (env) WSL distributions a spec may run in, matched exactly. Empty refuses every WSL spec. |
-| `OP_AGENT_RUNTIME_WSL_ALLOWED_BINARIES` | — (file/env only) | `runtime_wsl_allowed_binaries` | empty | Comma-separated (env) absolute POSIX binary paths inside the distro a WSL spec must match exactly. Separate from `runtime_allowed_binaries`, which is never consulted for a WSL spec. Empty refuses every WSL spec. |
-| `OP_AGENT_RUNTIME_WSL_ALLOWED_DIRS` | — (file/env only) | `runtime_wsl_allowed_dirs` | empty | Comma-separated (env) permitted POSIX `work_dir` prefixes inside the distro, same bare-or-trailing-`/*` subtree semantics as `runtime_allowed_dirs`. Empty permits any absolute `work_dir`. |
 | `OP_AGENT_RUNTIME_WSL_USER` | — (file/env only) | `runtime_wsl_user` | empty | The distro user every WSL process runs as (`wsl.exe -u`). Required for WSL specs; `root` is refused, since no gateway-supplied command line or environment may run with UID 0. |
 | `OP_AGENT_WSL_RAM_RESERVE_MB` | — (env only) | — (env only) | `1024` | RAM (MB) held back from the WSL2 VM's pool that WSL specs are admitted against. `0` is a real value; a negative or malformed value falls back to the default. Operator-only. |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
@@ -578,18 +575,25 @@ Installing WSL, the distro and the engines is yours to do; the agent needs:
 - **The Windows NVIDIA driver only**: no Linux GPU driver inside the distro.
   The distro sees the host's GPU indices, so the spec's GPU list means the same
   cards as for a native spec.
-- **The `runtime_wsl_*` settings** (table above). Nothing starts in WSL mode
-  until `runtime_wsl_user`, `runtime_wsl_allowed_distros` and
-  `runtime_wsl_allowed_binaries` are set (`runtime_wsl_exe` defaults to
-  `C:\Program Files\WSL\wsl.exe`), and `runtime_allowed_binaries` is not
-  consulted for a WSL spec:
+- **The WSL settings.** Nothing starts in WSL mode until `runtime_wsl_user` is
+  set and `runtime_allowed_binaries` holds a `wsl://<distro>/<absolute Linux
+  path>` entry for the binary (`runtime_wsl_exe` defaults to
+  `C:\Program Files\WSL\wsl.exe`). The same list holds your native binaries;
+  a spec in a distro is permitted only by an entry for that distro, and native
+  specs ignore `wsl://` entries. `runtime_allowed_dirs` takes `wsl://` entries
+  the same way (and `runtime_allow_binary_dirs` covers the directory of each
+  `wsl://` binary):
 
   ```json
   "runtime_wsl_user": "<linux user>",
-  "runtime_wsl_allowed_distros": ["Ubuntu-24.04"],
-  "runtime_wsl_allowed_binaries": ["/opt/vllm/.venv/bin/vllm"],
-  "runtime_wsl_allowed_dirs": ["/opt/vllm"]
+  "runtime_allowed_binaries": ["wsl://Ubuntu-24.04/opt/vllm/.venv/bin/vllm"],
+  "runtime_allowed_dirs": ["wsl://Ubuntu-24.04/opt/vllm"]
   ```
+
+  The earlier `runtime_wsl_allowed_distros`, `runtime_wsl_allowed_binaries` and
+  `runtime_wsl_allowed_dirs` settings (and their `OP_AGENT_RUNTIME_WSL_ALLOWED_*`
+  environment variables) are gone. An old config that still carries one starts
+  anyway; the agent logs a warning naming the replacement and ignores it.
 
 For vLLM, bind `--host 127.0.0.1 --port ${PORT}` (WSL forwards the port to
 Windows) and set `--gpu-memory-utilization` explicitly: the agent attributes

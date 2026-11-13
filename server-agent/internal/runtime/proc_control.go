@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"math"
 	"os/exec"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -353,9 +352,9 @@ func wslExitMessage(exitCode int) string {
 // VM when it is not running: a host whose document runs nothing in WSL must
 // not have its VM booted at every agent start, and a distro no spec names has
 // nothing of this agent's to sweep unless an earlier run's document named it
-// -- the next document that names it again sweeps it then. A distro outside
-// runtime_wsl_allowed_distros is never called into: such a spec is not
-// permitted anyway. A manager that is never configured never calls into a
+// -- the next document that names it again sweeps it then. A distro that no
+// wsl:// entry in runtime_allowed_binaries names is never called into: such a
+// spec is not permitted anyway. A manager that is never configured never calls into a
 // distro.
 func (o *owner) maybeWarmWSL(specs []Spec) {
 	if o.closing {
@@ -370,7 +369,7 @@ func (o *owner) maybeWarmWSL(specs []Spec) {
 		// A distro outside the allowlist is never passed to wsl.exe -d, and
 		// neither is one a spec could not carry (ParseConfig drops it; this
 		// covers a Config handed to Apply directly).
-		if distro == "" || o.wslWarmed[distro] || !slices.Contains(pol.AllowedDistros, distro) || !wslDistroPattern.MatchString(distro) {
+		if distro == "" || o.wslWarmed[distro] || !o.policy.wslDistroAllowed(distro) || !wslDistroPattern.MatchString(distro) {
 			continue
 		}
 		if o.wslWarmed == nil {
