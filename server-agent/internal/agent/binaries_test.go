@@ -188,11 +188,23 @@ type fakeWSL struct {
 	stat    string
 	calls   [][]string
 	envs    [][]string
+	failing func(args string) error // an error to answer a call with, nil to answer it
 }
 
-func (f *fakeWSL) call(_ context.Context, _ string, args, env []string) ([]byte, error) {
+// exitErr is an error carrying a process exit status.
+type exitErr int
+
+func (e exitErr) Error() string { return "exit status " + strconv.Itoa(int(e)) }
+func (e exitErr) ExitCode() int { return int(e) }
+
+func (f *fakeWSL) call(_ context.Context, _ string, args, env []string, _ bool) ([]byte, error) {
 	f.calls = append(f.calls, args)
 	f.envs = append(f.envs, env)
+	if f.failing != nil {
+		if err := f.failing(strings.Join(args, " ")); err != nil {
+			return nil, err
+		}
+	}
 	if strings.Join(args, " ") == "--list --running --quiet" {
 		return []byte(f.running), nil
 	}
@@ -722,5 +734,93 @@ func TestUntilNextScanHasAFloor(t *testing.T) {
 	b.cache["/opt/l/llama-server"] = cachedVersion{retryAt: time.Now().Add(-time.Hour), failures: 1}
 	if got := b.untilNextScan(); got < time.Second {
 		t.Fatalf("untilNextScan = %v with a retry overdue, want at least 1s", got)
+	}
+}
+
+func TestWSLStoppedDistroKeepsFailedBackoff(t *testing.T) {
+	f := &fakeWSL{running: "Ubuntu-24.04\n", stat: "100:200:regular file\n", version: map[string]string{"/home/ai/venv/bin/vllm": "garbage\n"}}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, wslVLLM)
+	b.rescan(context.Background())
+	if cv := b.cache[wslVLLM]; cv.ok || cv.failures != 1 {
+		t.Fatalf("after failed probe: %+v", cv)
+	}
+	f.running = ""
+	before := time.Now()
+	b.rescan(context.Background())
+	cv, ok := b.cache[wslVLLM]
+	if !ok || cv.failures != 1 {
+		t.Fatalf("entry lost or reset while the distro is stopped: %+v %v", cv, ok)
+	}
+	if next, ok := b.nextRetry(); !ok || next.Before(before.Add(binaryRescanInterval)) {
+		t.Fatalf("nextRetry %v is earlier than a rescan interval from now", next)
+	}
+}
+
+func TestWSLStatFailureKeepsVersionUnlessMissing(t *testing.T) {
+	statFails := func(err error) func(string) error {
+		return func(a string) error {
+			if strings.Contains(a, " stat ") {
+				return err
+			}
+			return nil
+		}
+	}
+	for name, tc := range map[string]struct {
+		err      error
+		wantKept bool
+	}{
+		"wsl failure keeps":   {exitErr(-1), true},
+		"other status keeps":  {exitErr(2), true},
+		"plain error keeps":   {errors.New("timeout"), true},
+		"status 1 is missing": {exitErr(1), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeWSL{running: "Ubuntu-24.04\n", stat: "100:200:regular file\n", version: map[string]string{"/home/ai/venv/bin/vllm": "0.11.0\n"}}
+			b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, wslVLLM)
+			b.rescan(context.Background())
+			f.failing = statFails(tc.err)
+			b.rescan(context.Background())
+			list, _ := b.pending()
+			r := (*list)[0]
+			if kept := r.Version == "0.11.0"; kept != tc.wantKept {
+				t.Fatalf("row %+v, wantKept %v", r, tc.wantKept)
+			}
+			if _, cached := b.cache[wslVLLM]; cached != tc.wantKept {
+				t.Fatalf("cached = %v, want %v", cached, tc.wantKept)
+			}
+		})
+	}
+}
+
+func TestWSLStatGarbageOutputKeepsVersion(t *testing.T) {
+	f := &fakeWSL{running: "Ubuntu-24.04\n", stat: "100:200:regular file\n", version: map[string]string{"/home/ai/venv/bin/vllm": "0.11.0\n"}}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, wslVLLM)
+	b.rescan(context.Background())
+	f.stat = "warning: something odd\n"
+	b.rescan(context.Background())
+	list, _ := b.pending()
+	if r := (*list)[0]; r.Version != "0.11.0" {
+		t.Fatalf("row %+v", r)
+	}
+}
+
+func TestWSLListFailureAddressesNoDistroAndKeepsVersion(t *testing.T) {
+	f := &fakeWSL{running: "Ubuntu-24.04\n", stat: "100:200:regular file\n", version: map[string]string{"/home/ai/venv/bin/vllm": "0.11.0\n"}}
+	b := wslInventory(f, wslProbeConfig{Exe: "wsl.exe", User: "ai"}, wslVLLM)
+	b.rescan(context.Background())
+	f.calls = nil
+	f.failing = func(a string) error {
+		if strings.HasPrefix(a, "--list") {
+			return exitErr(1)
+		}
+		return nil
+	}
+	b.rescan(context.Background())
+	if got := f.joined(); len(got) != 1 || got[0] != "--list --running --quiet" {
+		t.Fatalf("calls: %v", got)
+	}
+	list, _ := b.pending()
+	if r := (*list)[0]; r.Version != "0.11.0" || r.VersionSource != "agent" {
+		t.Fatalf("row %+v", r)
 	}
 }

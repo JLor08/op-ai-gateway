@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	runtimectl "op-ai-server-agent/internal/runtime"
@@ -205,18 +206,36 @@ func (c wslProbeConfig) usable() bool {
 	return c.Exe != "" && !runtimectl.WSLUserRefused(c.User)
 }
 
-// wslCall runs wsl.exe with args and env and returns its combined output.
-type wslCall func(ctx context.Context, exe string, args, env []string) ([]byte, error)
+// wslCall runs wsl.exe with args and env and returns its stdout, or, with
+// combined, its stdout and stderr together (a --version run may print its
+// version on either).
+type wslCall func(ctx context.Context, exe string, args, env []string, combined bool) ([]byte, error)
 
 // execWSLCall is the production wslCall.
-func execWSLCall(ctx context.Context, exe string, args, env []string) ([]byte, error) {
+func execWSLCall(ctx context.Context, exe string, args, env []string, combined bool) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, exe, args...) //nolint:gosec // exe is the operator's runtime_wsl_exe; args are built by the agent
 	cmd.Env = env
 	cmd.WaitDelay = binaryWaitDelay
 	var buf limitedBuffer
-	cmd.Stdout, cmd.Stderr = &buf, &buf
+	cmd.Stdout = &buf
+	if combined {
+		cmd.Stderr = &buf
+	}
 	err := cmd.Run()
 	return buf.buf.Bytes(), err
+}
+
+// errWSLUnavailable marks a failed WSL stat that does not say the file is
+// gone: the distro may have stopped since it was listed, or wsl.exe failed or
+// timed out. The entry is then treated like one of a distro that is not
+// running, and keeps its last good version.
+var errWSLUnavailable = errors.New("wsl stat unavailable")
+
+// wslStatMissing reports whether err is a stat that exited with status 1,
+// which is how stat says the file does not exist.
+func wslStatMissing(err error) bool {
+	var ee interface{ ExitCode() int }
+	return errors.As(err, &ee) && ee.ExitCode() == 1
 }
 
 // wslEnv is the environment of a wsl.exe call: the minimal env (wsl.exe needs
@@ -292,7 +311,7 @@ func (w *wslProbes) prober(distro string) *prober {
 	if !w.loaded {
 		w.loaded = true
 		ctx, cancel := context.WithTimeout(w.ctx, binaryWSLCallTimeout)
-		out, err := w.call(ctx, w.cfg.Exe, []string{"--list", "--running", "--quiet"}, wslEnv())
+		out, err := w.call(ctx, w.cfg.Exe, []string{"--list", "--running", "--quiet"}, wslEnv(), false)
 		cancel()
 		if err == nil {
 			w.up = parseRunningDistros(out)
@@ -308,14 +327,21 @@ func (w *wslProbes) prober(distro string) *prober {
 		stat: func(p string) (fs.FileInfo, error) {
 			ctx, cancel := context.WithTimeout(w.ctx, binaryWSLCallTimeout)
 			defer cancel()
-			out, err := w.call(ctx, w.cfg.Exe, args("stat", "-L", "-c", "%s:%Y:%F", "--", p), wslEnv())
+			out, err := w.call(ctx, w.cfg.Exe, args("stat", "-L", "-c", "%s:%Y:%F", "--", p), wslEnv(), false)
 			if err != nil {
-				return nil, err
+				if wslStatMissing(err) {
+					return nil, fs.ErrNotExist
+				}
+				return nil, errors.Join(errWSLUnavailable, err)
 			}
-			return parseWSLStat(string(out))
+			fi, perr := parseWSLStat(string(out))
+			if perr != nil {
+				return nil, errors.Join(errWSLUnavailable, perr)
+			}
+			return fi, nil
 		},
 		runVersion: func(ctx context.Context, p string) (string, error) {
-			out, err := w.call(ctx, w.cfg.Exe, args(p, "--version"), wslEnv())
+			out, err := w.call(ctx, w.cfg.Exe, args(p, "--version"), wslEnv(), true)
 			return string(out), err
 		},
 	}
@@ -386,13 +412,17 @@ type binaryScan struct {
 func (sc *binaryScan) add(entry, target string, pr *prober) bool {
 	bi := BinaryInfo{Path: entry, Kind: binaryKind(target), Allowed: true}
 	probe, probed := probeFor(bi.Kind)
-	if pr == nil {
+	var fi fs.FileInfo
+	var err error
+	if pr != nil {
+		fi, err = pr.stat(target)
+	}
+	if pr == nil || errors.Is(err, errWSLUnavailable) {
 		sc.addOffline(&bi, target, probed)
 		sc.indexSibling(bi, bi.VersionSource == versionSourceAgent)
 		sc.out = append(sc.out, bi)
 		return true
 	}
-	fi, err := pr.stat(target)
 	if err != nil || !fi.Mode().IsRegular() {
 		// Nothing here can be run: forget any cached run, so a failed
 		// one leaves no retry behind that could never happen.
@@ -430,19 +460,29 @@ func (sc *binaryScan) indexSibling(bi BinaryInfo, agentVersioned bool) {
 
 // addOffline versions bi without running anything: a WSL entry whose distro is
 // not running keeps the version of its last good run, else what its path says.
-// A failed run's cache entry is dropped (no retry can happen while the distro
-// is away); a good one stays for when it is back.
+// Cache entries stay, so a binary that never answers keeps its backoff across
+// distro restarts; a failed one is only pushed out by a rescan interval, since
+// no retry can happen while the distro is away and a retry time in the past
+// would make the rescan loop spin at its minimum gap.
 func (sc *binaryScan) addOffline(bi *BinaryInfo, target string, probed bool) {
 	cv, hit := sc.cache[bi.Path]
 	switch {
 	case hit && cv.ok:
 		bi.Version, bi.Build, bi.Commit, bi.VersionSource = cv.version, cv.build, cv.commit, versionSourceAgent
 	case hit:
-		delete(sc.cache, bi.Path)
+		cv.retryAt = later(cv.retryAt, sc.now.Add(binaryRescanInterval))
+		sc.cache[bi.Path] = cv
 	}
 	if probed {
 		sc.pathVersion(bi, target)
 	}
+}
+
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 
 // pathVersion fills bi from its path when no version is known yet; only a
