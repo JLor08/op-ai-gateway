@@ -129,6 +129,19 @@ These fallbacks apply only when audio.cpp's signal is missing, so audio.cpp beha
   - An mp3 upload without timing → logged zero.
 - [ ] Step 2: FAIL. Step 3: implement D5 with the smallest change at the two setters. Step 4: `GOTOOLCHAIN=go1.26.5 go test ./internal/gateway/ -run 'Speech|Transcription|WAV|Billing' -skip 'TestVoice|TestLiveTranscriptionLoopback'` and then the whole package + Go gates. Step 5: commit `feat(gateway): audio duration fallbacks for non-audio.cpp targets`.
 
+### Task 3b: Speech to sglang_omni refuses server-local voice references
+
+Owner target model: Ming-3.0-TTS. In sglang-omni v0.2.0 (`docs/cookbook/ming3_tts.md`) voice cloning takes `ref_audio`, and a bare path is read by the SERVER from its working directory. A `data:` URL is also accepted. The speech body otherwise reaches the upstream unexamined (`validateSpeechRequest`).
+
+**Files:** `gateway/backend/internal/gateway/speech_handler.go` (+ test).
+
+- [ ] Step 1: failing tests. For a speech request routed to a target whose effective runtime spec type is `sglang_omni`:
+  - `ref_audio: "data:audio/wav;base64,..."` is relayed;
+  - `ref_audio` values `"tests/data/x.wav"`, `"/etc/passwd"`, `"file:///x.wav"` and `"https://host/x.wav"` are refused with a 400 `speech.reference_audio_unsupported`;
+  - the same rule applies to each `references[].audio_path`;
+  - a request to an audio.cpp target is relayed unchanged whatever it carries.
+- [ ] Step 2: FAIL. Step 3: implement. The check runs where the resolved target is known; the refusal text names the field, never echoes the value. Step 4: gateway gates. Step 5: commit `feat(gateway): sglang_omni speech accepts only inline voice references`.
+
 ### Task 4: Portal
 
 **Files:** `gateway/frontend/src/api/runtime.ts`, `gateway/frontend/src/components/RuntimeAdminSection.tsx` (select options, `runtimeSpecTypeNote`, warning map), `gateway/frontend/src/components/shared/runtimeSpecTypeFlavors.ts`, `gateway/frontend/src/components/shared/liveTimings.test.ts`, `gateway/frontend/src/i18n.ts` (+ `i18n.test.ts`), `gateway/frontend/src/components/RuntimeAdminSection.test.tsx`.
