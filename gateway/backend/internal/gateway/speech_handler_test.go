@@ -1423,6 +1423,17 @@ func TestSpeechToSGLangOmniAcceptsOnlyInlineVoiceReferences(t *testing.T) {
 		{"empty string", `{"model":"agent-voice","input":"hi","ref_audio":""}`, true},
 		{"non-string", `{"model":"agent-voice","input":"hi","ref_audio":["` + inline + `"]}`, true},
 		{"path in references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd"}]}`, true},
+		{"ref_audio in references", `{"model":"agent-voice","input":"hi","references":[{"ref_audio":"/etc/passwd"}]}`, true},
+		{"audio in references", `{"model":"agent-voice","input":"hi","references":[{"audio":"https://example.com/x.wav"}]}`, true},
+		{"null audio_path then ref_audio", `{"model":"agent-voice","input":"hi","references":[{"audio_path":null,"ref_audio":"/x"}]}`, true},
+		{"inline audio_path with a path audio", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"` + inline + `","audio":"/x"}]}`, true},
+		{"case-variant duplicate ref_audio", `{"model":"agent-voice","input":"hi","ref_audio":"/etc/passwd","Ref_Audio":"` + inline + `"}`, true},
+		{"case-variant duplicate references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd"}],"References":[{"audio_path":"` + inline + `"}]}`, true},
+		{"case-variant audio_path in an element", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd","AUDIO_PATH":"` + inline + `"}]}`, true},
+		{"mixed array", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd"},1]}`, true},
+		{"undecodable references", `{"model":"agent-voice","input":"hi","references":"/etc/passwd"}`, true},
+		{"single object references", `{"model":"agent-voice","input":"hi","references":{"audio_path":"/etc/passwd"}}`, true},
+		{"upper-case DATA scheme", `{"model":"agent-voice","input":"hi","ref_audio":"DATA:audio/wav;base64,UklGRg=="}`, false},
 		{"file url in references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"` + inline + `"},{"audio_path":"file:///x.wav"}]}`, true},
 	}
 	for _, tc := range cases {
@@ -1445,7 +1456,11 @@ func TestSpeechToSGLangOmniAcceptsOnlyInlineVoiceReferences(t *testing.T) {
 			if prov.proxyCalls != 0 {
 				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
 			}
-			for _, leak := range []string{"passwd", "x.wav", "tests/data", "host"} {
+			events := srv.Usage.All()
+			if len(events) != 1 || events[0].ErrorCode != "speech.reference_audio_unsupported" || events[0].HTTPStatus != http.StatusBadRequest {
+				t.Fatalf("usage events = %+v, want one 400 speech.reference_audio_unsupported row", events)
+			}
+			for _, leak := range []string{"passwd", "x.wav", "tests/data", "host", "example.com"} {
 				if strings.Contains(rec.Body.String(), leak) {
 					t.Fatalf("refusal echoes the value (%q): %s", leak, rec.Body.String())
 				}
@@ -1458,7 +1473,7 @@ func TestSpeechToSGLangOmniAcceptsOnlyInlineVoiceReferences(t *testing.T) {
 // the speech endpoint.
 func TestSpeechToOtherTargetsRelaysReferencesUnchanged(t *testing.T) {
 	body := `{"model":"agent-voice","input":"hi","ref_audio":"/etc/passwd","references":[{"audio_path":"file:///x.wav"}]}`
-	for _, specType := range []routing.RuntimeSpecType{"", routing.RuntimeSpecTypeSGLang, routing.RuntimeSpecTypeLlamaCpp} {
+	for _, specType := range []routing.RuntimeSpecType{"", routing.RuntimeSpecTypeSGLang, routing.RuntimeSpecTypeLlamaCpp, routing.RuntimeSpecTypeAudioCpp} {
 		t.Run("agent "+string(specType), func(t *testing.T) {
 			prov := &recordingProxyProvider{respBody: "RIFF"}
 			srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIAudio}, specType)
@@ -1479,4 +1494,22 @@ func TestSpeechToOtherTargetsRelaysReferencesUnchanged(t *testing.T) {
 			t.Fatalf("upstream body = %q, want the field relayed", got.body)
 		}
 	})
+}
+
+// The refusal names the offending field, and each guarded field of a reference is
+// named as itself.
+func TestSpeechReferenceRefusalNamesTheField(t *testing.T) {
+	for field, body := range map[string]string{
+		"ref_audio":               `{"model":"agent-voice","input":"hi","ref_audio":"/a"}`,
+		"references[].audio_path": `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/a"}]}`,
+		"references[].ref_audio":  `{"model":"agent-voice","input":"hi","references":[{"ref_audio":"/a"}]}`,
+		"references[].audio":      `{"model":"agent-voice","input":"hi","references":[{"audio":"/a"}]}`,
+	} {
+		prov := &recordingProxyProvider{respBody: "RIFF"}
+		srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIAudio}, routing.RuntimeSpecTypeSGLangOmni)
+		rec := postSpeech(t, srv, body)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), field+" must be") {
+			t.Errorf("%s: status %d body %s, want 400 naming the field", field, rec.Code, rec.Body.String())
+		}
+	}
 }

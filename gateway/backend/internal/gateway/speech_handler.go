@@ -51,7 +51,7 @@ const (
 	speechStreamUnsupported = "speech.stream_unsupported"
 	// speechReferenceAudioUnsupported is the code for a voice reference an sglang_omni
 	// target cannot be given safely: anything but an inline data: URL; see
-	// refuseServerLocalVoiceReference. Unlike the codes above it is decided after the
+	// nonInlineVoiceReferenceField. Unlike the codes above it is decided after the
 	// route is resolved, because it depends on the target.
 	speechReferenceAudioUnsupported = "speech.reference_audio_unsupported"
 	// speechPcmUnavailable is the code for a one-shot request that asked for
@@ -384,58 +384,103 @@ func (s *Server) resolveSpeechTarget(w http.ResponseWriter, r *http.Request, tok
 		s.recordSpeechRoutingFailure(w, r, *token, req, raw, start, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
-	if err := refuseServerLocalVoiceReference(raw, target); err != nil {
-		slog.Debug("speech request rejected: voice reference is not inline",
-			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
-			"route_id", target.RouteID, "field", err.Message)
-		writeRequestError(w, err)
+	if field := nonInlineVoiceReferenceField(raw, target); field != "" {
+		s.recordSpeechReferenceRefusal(w, r, *token, req, raw, start, field)
 		return routing.Target{}, false
 	}
 	return target, true
 }
 
-// refuseServerLocalVoiceReference refuses a voice reference an sglang_omni target
-// would resolve on its own: its ref_audio and references[].audio_path take a bare
-// path (read from the model host's working directory), a file:// path or a URL, and
+// recordSpeechReferenceRefusal answers a refused voice reference and records the
+// usage row the neighbouring flavor refusal records (a row that claims no upstream
+// call). It logs at Warn: a path or URL aimed at an sglang_omni target is probing.
+func (s *Server) recordSpeechReferenceRefusal(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, start time.Time, field string) {
+	refusal := speechReferenceError(field)
+	slog.Warn("speech request rejected: voice reference is not inline",
+		"path", r.URL.Path, "model", req.Model, "field", field)
+	id := nextRequestID()
+	capturing := s.capturingEnabled(token)
+	body := writeJSONCaptured(w, http.StatusBadRequest, apierror.Response(refusal.Code, refusal.Message, ""))
+	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, refusal.Code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadRequest, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: endpointSpeech}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadRequest, req.APIFlavor), nil)
+}
+
+// nonInlineVoiceReferenceField returns the name of the first voice reference field that must be refused, "" for none. It refuses a voice reference an sglang_omni target
+// would resolve on its own: ref_audio and each reference's audio_path, ref_audio and
+// audio take a bare path (read from the model host), a file:// path or a URL, and
 // sglang-omni authenticates nothing, so relaying one lets any gateway key holder read
 // a file on that host or make it fetch an arbitrary URL. Only an inline data: URL is
 // accepted. The rule applies to a target whose EFFECTIVE runtime spec type is
-// sglang_omni (target.LiveProgressSpecType, filled for an agent-launched child);
-// every other target is relayed unchanged. The message names the field and never the
-// value.
-func refuseServerLocalVoiceReference(raw []byte, target routing.Target) *inference.Error {
+// sglang_omni (target.LiveProgressSpecType, filled for an agent-launched child); every
+// other target is relayed unchanged.
+//
+// Objects are decoded into maps, not structs: encoding/json matches struct fields
+// case-insensitively and lets the last key win, while sglang-omni (Python) reads the
+// exact key, so {"ref_audio":"/etc/passwd","Ref_Audio":"data:..."} would pass a struct
+// check and be read from disk upstream. Every key that EqualFolds a guarded name is
+// checked. The refusal names the field and never the value (the returned name is
+// what the log carries).
+func nonInlineVoiceReferenceField(raw []byte, target routing.Target) string {
 	if target.LiveProgressSpecType != string(routing.RuntimeSpecTypeSGLangOmni) {
-		return nil
+		return ""
 	}
-	var body struct {
-		RefAudio   json.RawMessage `json:"ref_audio"`
-		References json.RawMessage `json:"references"`
+	var body map[string]json.RawMessage
+	if json.Unmarshal(raw, &body) != nil {
+		return "" // validateSpeechRequest has accepted the body; not an object is not expected
 	}
-	_ = json.Unmarshal(raw, &body)
-	if !inlineVoiceReference(body.RefAudio) {
-		return speechReferenceError("ref_audio")
-	}
-	refs := bytes.TrimSpace(body.References)
-	if len(refs) > 0 && refs[0] == '{' {
-		refs = append(append([]byte{'['}, refs...), ']')
-	}
-	var list []struct {
-		AudioPath json.RawMessage `json:"audio_path"`
-	}
-	if json.Unmarshal(refs, &list) == nil {
-		for _, ref := range list {
-			if !inlineVoiceReference(ref.AudioPath) {
-				return speechReferenceError("references[].audio_path")
+	for key, v := range body {
+		switch {
+		case strings.EqualFold(key, "ref_audio"):
+			if !inlineVoiceReference(v) {
+				return "ref_audio"
+			}
+		case strings.EqualFold(key, "references"):
+			if field := nonInlineReferenceField(v); field != "" {
+				return "references[]." + field
 			}
 		}
 	}
-	return nil
+	return ""
 }
 
-// inlineVoiceReference reports whether a reference field is absent (or null) or a
-// string holding a data: URL.
+// nonInlineReferenceField checks a references value (an array of objects, or one
+// object) and returns the name of the first element field that is not inline, "" when
+// all are. A present, non-null value that cannot be read as objects counts as a
+// failure under the name "audio_path", since nothing can be said about what the
+// upstream would read from it.
+func nonInlineReferenceField(v json.RawMessage) string {
+	v = bytes.TrimSpace(v)
+	if len(v) == 0 || string(v) == "null" {
+		return ""
+	}
+	var elems []json.RawMessage
+	if v[0] == '{' {
+		elems = []json.RawMessage{v}
+	} else if json.Unmarshal(v, &elems) != nil {
+		return "audio_path"
+	}
+	for _, e := range elems {
+		if string(bytes.TrimSpace(e)) == "null" {
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(e, &obj) != nil {
+			return "audio_path"
+		}
+		for key, val := range obj {
+			for _, guarded := range []string{"audio_path", "ref_audio", "audio"} {
+				if strings.EqualFold(key, guarded) && !inlineVoiceReference(val) {
+					return guarded
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// inlineVoiceReference reports whether a reference field is null or a string holding
+// a data: URL (the scheme is case-insensitive).
 func inlineVoiceReference(v json.RawMessage) bool {
-	if len(v) == 0 || string(bytes.TrimSpace(v)) == "null" {
+	if string(bytes.TrimSpace(v)) == "null" {
 		return true
 	}
 	var s string
