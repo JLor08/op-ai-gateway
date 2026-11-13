@@ -665,12 +665,20 @@ func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(
 		for i, e := range list.entries {
 			if runtimectl.IsWSLEntry(e) {
 				if _, _, ok := runtimectl.ParseWSLEntry(e); !ok {
-					w = append(w, fmt.Sprintf("%s[%d] is a malformed wsl:// entry and permits nothing (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)", list.name, i))
+					msg := "%s[%d] is a malformed wsl:// entry and permits nothing (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
+					if list.name == "runtime_allowed_dirs" {
+						msg = "%s[%d] is a malformed wsl:// entry and is ignored, but WSL work_dir containment stays on: only well-formed wsl:// dir entries (and binary dirs with runtime_allow_binary_dirs) permit a WSL work_dir (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
+					}
+					w = append(w, fmt.Sprintf(msg, list.name, i))
 				}
 				continue
 			}
 			if n := len(runtimectl.WSLEntryScheme); len(e) >= n && strings.EqualFold(e[:n], runtimectl.WSLEntryScheme) {
-				w = append(w, fmt.Sprintf("%s[%d] looks like a WSL entry but the scheme must be exactly lowercase wsl://; it is not a WSL entry and is treated as a native path", list.name, i))
+				msg := "%s[%d] looks like a WSL entry but the scheme must be exactly lowercase wsl://; it is not a WSL entry and is treated as a native path"
+				if list.name == "runtime_allowed_dirs" {
+					msg += ", and WSL work_dir containment stays on"
+				}
+				w = append(w, fmt.Sprintf(msg, list.name, i))
 			}
 		}
 	}
@@ -981,8 +989,9 @@ func defaultConfigPath() string {
 // readConfigFile reads and parses the JSON config. A missing file returns a zero
 // fileConfig with no error UNLESS it was explicitly requested (flag/env). Bad
 // JSON is always an error. The second result is the set of top-level keys the
-// file carries WITH a value (not null, not []), which Load uses to spot a removed setting (fileConfig has no
-// field for those, and unknown keys are otherwise ignored).
+// file carries WITH a value (not null, not []), which Load uses to spot a
+// removed setting (fileConfig has no field for those, and unknown keys are
+// otherwise ignored).
 func readConfigFile(path string, explicit bool) (fileConfig, map[string]bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

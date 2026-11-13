@@ -429,9 +429,9 @@ func effectiveWorkDir(spec Spec) string {
 // spec.Env or spec.Args -- so it is always safe to log verbatim or surface
 // as a Status.LastError.Message alongside StateNotPermitted.
 func (p LocalPolicy) Permit(spec Spec) error {
-	// A WSL spec is judged ONLY by the WSL policy: its binary is a path inside
-	// the distro, so the native allowlist (Windows or host paths) is neither
-	// consulted nor required to be non-empty.
+	// A WSL spec is judged ONLY by its wsl:// entries (permitWSL): its binary
+	// is a path inside the distro, so the native entries (Windows or host
+	// paths) are neither consulted nor required to be non-empty.
 	if spec.IsWSL() {
 		return p.permitWSL(spec)
 	}
@@ -502,9 +502,9 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	}
 	// The auto-added binary dirs are plain paths handed to the SAME withinDir
 	// subtree check R4's non-wildcard path uses, so R3 and R4 agree on
-	// semantics by construction. AllowedBinaries is guaranteed non-empty here
-	// (the empty-allowlist gate returned early above), so the toggle always has
-	// at least one dir to add. A non-absolute entry can never permit anything
+	// semantics by construction. The native binary entries are guaranteed non-empty
+	// here (the empty-allowlist gate returned early above), so the toggle always
+	// has at least one dir to add. A non-absolute entry can never permit anything
 	// (it was skipped by the binary match above), so it contributes no dir.
 	if p.AllowBinaryDirs {
 		for _, b := range nativeBinaries {
@@ -520,8 +520,8 @@ func (p LocalPolicy) Permit(spec Spec) error {
 // at all (exe, then user), the distro, the binary, the work_dir. Every refusal
 // names the setting and, for a list, how many well-formed wsl:// entries it
 // holds (all distros for the distro check, the spec's distro for the binary and
-// work_dir checks) -- never a path, distro or user name, so the text is safe to surface as a Status message
-// (agent-runtime-manager section 3.1).
+// work_dir checks) -- never a path, distro or user name, so the text is safe to
+// surface as a Status message (agent-runtime-manager section 3.1).
 func (p LocalPolicy) permitWSL(spec Spec) error {
 	w := p.WSL
 	if w.Exe == "" {
@@ -562,7 +562,10 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 	}
 	// The allowed set of the distro: its wsl:// dir entries plus, with
 	// runtime_allow_binary_dirs, the directory of each of its binary entries.
-	// An empty set means containment was never configured for this distro.
+	// An empty set means containment was never configured for this distro --
+	// unless a malformed or look-alike wsl: dir entry shows the operator tried
+	// to configure it: then it stays on for every distro and permits only the
+	// well-formed entries (and binary dirs), failing closed.
 	dirs := make([]string, 0, len(wslDirs[distro])+len(wslBinaries[distro]))
 	for _, d := range wslDirs[distro] {
 		dirs = append(dirs, allowedDirBase(d))
@@ -572,7 +575,7 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 			dirs = append(dirs, path.Dir(b))
 		}
 	}
-	if len(dirs) == 0 {
+	if len(dirs) == 0 && !hasMalformedWSLEntry(p.AllowedDirs) {
 		return nil
 	}
 	for _, dir := range dirs {

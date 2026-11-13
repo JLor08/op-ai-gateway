@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"path"
 	"strings"
 	"testing"
 )
@@ -232,4 +233,40 @@ func TestCheckSpecEnvRefusesWSLOwnedNames(t *testing.T) {
 	if err := checkSpecEnv(wslSpec(wslBin, ""), []string{"HF_HOME"}, ""); err != nil {
 		t.Errorf("unrelated env must be accepted: %v", err)
 	}
+}
+
+// A malformed or look-alike wsl: dir entry must not switch WSL work_dir
+// containment off: it is the operator's failed attempt to restrict, so the
+// policy stays contained for every distro (fail closed).
+func TestPermitWSLMalformedDirEntryKeepsContainment(t *testing.T) {
+	for _, bad := range []string{`wsl://Ubuntu-24.04\srv\models`, "WSL://Ubuntu-24.04/srv", "wsl://Ubuntu-24.04", "wsl:/Ubuntu-24.04/srv", "wsl://-bad/srv"} {
+		p := wslPolicy()
+		p.AllowedDirs = []string{bad}
+		err := p.Permit(wslSpec(wslBin, "/etc"))
+		mustRefuse(t, err, "runtime_allowed_dirs", "0 wsl:// dir entries name this distro")
+		if strings.Contains(err.Error(), "/etc") || strings.Contains(err.Error(), "Ubuntu") {
+			t.Errorf("%q: error leaks a path or distro: %v", bad, err)
+		}
+		if err := p.Permit(wslSpec(wslBin, "")); err != nil {
+			t.Errorf("%q: empty work_dir must stay permitted: %v", bad, err)
+		}
+		// A well-formed sibling entry still permits its subtree only.
+		p.AllowedDirs = []string{bad, "wsl://Ubuntu-24.04/srv/models"}
+		if err := p.Permit(wslSpec(wslBin, "/srv/models/a")); err != nil {
+			t.Errorf("%q: sibling entry must permit its subtree: %v", bad, err)
+		}
+		mustRefuse(t, p.Permit(wslSpec(wslBin, "/etc")), "runtime_allowed_dirs")
+		// Another distro is contained too.
+		p.AllowedBinaries = []string{"wsl://Debian" + wslBin}
+		p.AllowedDirs = []string{bad}
+		mustRefuse(t, p.Permit(Spec{Binary: wslBin, WorkDir: "/etc", Execution: &Execution{Mode: ExecutionModeWSL, WSL: &WSLExecution{Distro: "Debian"}}}), "runtime_allowed_dirs")
+	}
+	// With runtime_allow_binary_dirs the binary dir is the only way in.
+	p := wslPolicy()
+	p.AllowedDirs = []string{`wsl://Ubuntu-24.04\srv`}
+	p.AllowBinaryDirs = true
+	if err := p.Permit(wslSpec(wslBin, path.Dir(wslBin)+"/x")); err != nil {
+		t.Errorf("binary dir must permit: %v", err)
+	}
+	mustRefuse(t, p.Permit(wslSpec(wslBin, "/etc")), "runtime_allowed_dirs")
 }

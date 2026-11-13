@@ -56,6 +56,23 @@ func splitAllowlist(list []string) (native []string, wsl map[string][]string) {
 	return native, wsl
 }
 
+// hasMalformedWSLEntry reports whether list holds an entry that looks like a
+// WSL entry (its lowercased form starts with "wsl:") but that ParseWSLEntry
+// rejects: a malformed wsl:// entry, a wrong-case WSL:// one, or a wsl:/
+// typo. For a directory list that is the operator's failed attempt to
+// restrict WSL work_dirs, so WSL containment must stay on (fail closed)
+// rather than fall back to "any work_dir".
+func hasMalformedWSLEntry(list []string) bool {
+	for _, e := range list {
+		if len(e) >= 4 && strings.EqualFold(e[:4], "wsl:") {
+			if _, _, ok := ParseWSLEntry(e); !ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // wslDistroAllowed reports whether a well-formed wsl:// binary entry names
 // distro. It gates every call into a distro the agent makes on its own
 // (pre-warm, orphan sweep): a distro no entry names is never passed to

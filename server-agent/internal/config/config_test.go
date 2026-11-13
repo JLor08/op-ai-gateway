@@ -1866,3 +1866,22 @@ func TestDefaultWSLExe(t *testing.T) {
 		t.Errorf("defaultWSLExe() = %q on %s, want empty", got, runtime.GOOS)
 	}
 }
+
+// A malformed or wrong-case WSL entry in runtime_allowed_dirs warns that WSL
+// work_dir containment stays on; the binaries list has no such clause.
+func TestRuntimeAllowlistWarningsDirContainment(t *testing.T) {
+	noenv := func(string) string { return "" }
+	cfg := Config{
+		RuntimeAllowedBinaries: []string{`wsl://Ubuntu-24.04\x`, "WSL://Ubuntu-24.04/x"},
+		RuntimeAllowedDirs:     []string{`wsl://Ubuntu-24.04\srv`, "WSL://Ubuntu-24.04/srv"},
+	}
+	w := runtimeAllowlistWarnings(cfg, nil, noenv)
+	if len(w) != 4 {
+		t.Fatalf("warnings = %v, want 4", w)
+	}
+	for i, wantContain := range []bool{false, false, true, true} {
+		if got := strings.Contains(w[i], "containment stays on"); got != wantContain {
+			t.Errorf("warning %d %q: containment clause = %v, want %v", i, w[i], got, wantContain)
+		}
+	}
+}
