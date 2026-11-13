@@ -530,6 +530,82 @@ including hiding start/stop — whoever owns the config owns the operations.
 > print. That is a second reason an argument is the wrong place for a secret,
 > and it applies to portal-authored specs too.
 
+#### WSL2 workloads
+
+On a Windows host the agent can run a model server **inside a WSL2
+distribution** — vLLM, SGLang and other Linux-only engines — and manage it like
+any other: start on demand, drain, stop, crash backoff, the runtime log, and the
+memory budgets above. In the portal, set the spec's **Execution** to WSL, name
+the distro, and give the binary and working directory as **Linux paths** inside
+it. The selector appears once this agent (0.19.0 or later) has reported. The
+agent stops the workload through a systemd scope inside the distro, measures its
+RAM from that scope, and attributes its VRAM from the WSL VM's GPU memory.
+
+Installing WSL, the distro and the engines is yours to do; the agent needs:
+
+- **The agent runs as the Windows user that owns the distro**, never as
+  LocalSystem. WSL is per Windows user (distros, the VM and `.wslconfig` all
+  belong to one account) and refuses LocalSystem outright. Run the agent either
+  as a **service under that user's account** (a service runs as LocalSystem
+  unless you set its log-on account; with NSSM, set it on the *Log on* tab), which
+  works with nobody logged on, or as a **plain process in that user's
+  interactive session**, which ends at logoff together with every model it
+  started.
+- **systemd in the distro**, and **linger** for the user the workloads run as:
+  `[boot]` `systemd=true` in the distro's `/etc/wsl.conf`, then
+  `sudo loginctl enable-linger <linux user>` once, so that user's systemd manager
+  is running whenever the agent needs it. That Linux user is
+  `runtime_wsl_user`; it may not be `root` (or UID 0).
+- **Keep the VM up.** In that Windows user's `%UserProfile%\.wslconfig`:
+
+  ```ini
+  [wsl2]
+  vmIdleTimeout=-1
+
+  [general]
+  instanceIdleTimeout=-1
+  ```
+
+  Otherwise WSL shuts an idle distro (after 15 s) and VM (after 60 s) down under
+  a loaded model. `[wsl2]` `memory=` is the VM's own RAM ceiling (half of the
+  host's by default); the agent admits WSL models against it as well, minus
+  `OP_AGENT_WSL_RAM_RESERVE_MB`.
+- **Models in the distro's own ext4 filesystem** (for example under
+  `/opt` or the user's home), not under `/mnt/c`, which is far slower.
+- **`build-essential` in the distro for vLLM** (`sudo apt install
+  build-essential`): its Triton kernels are compiled with the system C compiler
+  when the server starts.
+- **The Windows NVIDIA driver only**: no Linux GPU driver inside the distro.
+  The distro sees the host's GPU indices, so the spec's GPU list means the same
+  cards as for a native spec.
+- **The `runtime_wsl_*` settings** (table above). Nothing starts in WSL mode
+  until `runtime_wsl_user`, `runtime_wsl_allowed_distros` and
+  `runtime_wsl_allowed_binaries` are set (`runtime_wsl_exe` defaults to
+  `C:\Program Files\WSL\wsl.exe`), and `runtime_allowed_binaries` is not
+  consulted for a WSL spec:
+
+  ```json
+  "runtime_wsl_user": "<linux user>",
+  "runtime_wsl_allowed_distros": ["Ubuntu-24.04"],
+  "runtime_wsl_allowed_binaries": ["/opt/vllm/.venv/bin/vllm"],
+  "runtime_wsl_allowed_dirs": ["/opt/vllm"]
+  ```
+
+For vLLM, bind `--host 127.0.0.1 --port ${PORT}` (WSL forwards the port to
+Windows) and set `--gpu-memory-utilization` explicitly: the agent attributes
+VRAM to a WSL model as the VM's growth across that model's start, which is a
+stable figure when the engine reserves a fixed share of the card. Pass the API key
+as `VLLM_API_KEY` in `env` rather than as `--api-key`, since an argument is
+visible to `ps` inside the VM.
+
+**The WSL boundary is not a security boundary.** A Linux process can read the
+Windows user's files under `/mnt/<drive>` and, through interop, start Windows
+programs as that user, so a WSL model has the trust level of a native binary run
+as the agent's account. Use a **dedicated distro** for the models and set
+`[interop]` `enabled=false` in its `/etc/wsl.conf`. If no WSL spec uses config
+files (`${CONFIG_DIR}` resolves to the agent's directory under `/mnt/<drive>`),
+you can also turn the drive mounts off with `[automount]` `enabled=false`.
+
 ## Build & run
 
 ```sh
