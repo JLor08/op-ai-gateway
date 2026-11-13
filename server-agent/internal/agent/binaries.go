@@ -292,11 +292,11 @@ type wslProbes struct {
 
 // parseRunningDistros reads `wsl.exe --list --running --quiet` output: one
 // name per line. A wsl.exe that ignores WSL_UTF8 answers in UTF-16LE, which
-// reads as NUL-interleaved bytes, so every NUL and the BOM are dropped before
-// splitting; CRs and blanks are trimmed per line.
+// reads as NUL-interleaved bytes, so every NUL and the BOM (UTF-8 EF BB BF, or
+// FF FE as UTF-16LE bytes) are dropped before splitting; CRs and blanks are trimmed per line.
 func parseRunningDistros(out []byte) map[string]bool {
 	up := map[string]bool{}
-	clean := strings.NewReplacer("\x00", "", "\ufeff", "").Replace(string(out))
+	clean := strings.NewReplacer("\x00", "", "\ufeff", "", "\xff\xfe", "").Replace(string(out))
 	for _, line := range strings.Split(clean, "\n") {
 		if name := strings.TrimSpace(line); name != "" {
 			up[strings.ToLower(name)] = true

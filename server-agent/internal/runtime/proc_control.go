@@ -129,9 +129,9 @@ func wslHelperEnv(getenv func(string) string, uid int) []string {
 
 // runWSLHelper runs one helper call into distro, bounded by wslHelperTimeout.
 // It refuses a root user itself rather than trusting every caller to have
-// checked: every call the manager makes into a distro goes through here (the
-// binary inventory's own probes build the same argv with WSLHelperArgs and
-// refuse root through wslProbeConfig.usable()).
+// checked: every helper call goes through here (the workload launch is not a
+// helper call, and the binary inventory's own probes build the same argv with
+// WSLHelperArgs and refuse root through wslProbeConfig.usable()).
 func runWSLHelper(run wslRunner, pol WSLPolicy, distro string, env []string, command ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), wslHelperTimeout)
 	defer cancel()

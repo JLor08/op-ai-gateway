@@ -1885,3 +1885,26 @@ func TestRuntimeAllowlistWarningsDirContainment(t *testing.T) {
 		}
 	}
 }
+
+// A look-alike that is not even a wsl:// prefix (wsl:/ typo, wsl:x, WSL:/...)
+// warns exactly like a wrong-case WSL:// entry: it is a native path, and in
+// runtime_allowed_dirs it also keeps WSL work_dir containment on.
+func TestRuntimeAllowlistWarningsLookAlikes(t *testing.T) {
+	noenv := func(string) string { return "" }
+	cfg := Config{
+		RuntimeAllowedBinaries: []string{"/usr/bin/ok", "wsl:x", "WSL:/Ubuntu-24.04/x"},
+		RuntimeAllowedDirs:     []string{"wsl:/Ubuntu-24.04/srv", "/srv/ok"},
+	}
+	w := runtimeAllowlistWarnings(cfg, nil, noenv)
+	if len(w) != 3 {
+		t.Fatalf("warnings = %v, want 3", w)
+	}
+	for i, want := range []string{"runtime_allowed_binaries[1]", "runtime_allowed_binaries[2]", "runtime_allowed_dirs[0]"} {
+		if !strings.Contains(w[i], want) {
+			t.Errorf("warning %d = %q, want it to name %s", i, w[i], want)
+		}
+	}
+	if strings.Contains(w[0], "containment stays on") || !strings.Contains(w[2], "containment stays on") {
+		t.Errorf("containment clause wrong: %v", w)
+	}
+}

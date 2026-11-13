@@ -345,11 +345,11 @@ type ManagerOptions struct {
 	// is the wsl:// entries of the allowlist, not this block).
 	// OPERATOR configuration from the agent's own local settings
 	// (runtime_wsl_exe, runtime_wsl_user), never gateway-supplied, and fixed
-	// for the process lifetime. When set it REPLACES Policy.WSL: the manager keeps one WSL
-	// policy, so the block a spec is permitted against is the very block it is
-	// launched, stopped and swept with -- above all the same user, which must
-	// never be root. Left zero, Policy.WSL stands; both zero means no wsl spec
-	// is permitted (permitWSL) and no distro is ever called.
+	// for the process lifetime. When set it REPLACES Policy.WSL: the manager
+	// keeps one WSL policy, so the block a spec is permitted against is the
+	// very block it is launched, stopped and swept with -- above all the same
+	// user, which must never be root. Left zero, Policy.WSL stands; both zero
+	// means no wsl spec is permitted (permitWSL) and no distro is ever called.
 	WSL WSLPolicy
 	// WSLRAMReserveMB is the memory, in MB, held back from the WSL2 VM's RAM
 	// pool that admission budgets wsl processes against: the WSL twin of

@@ -221,9 +221,9 @@ func main() {
 		EvictionGrace: time.Duration(cfg.EvictionGraceSeconds) * time.Second,
 		// The WSL execution mode's configuration (#381), the same wsl.exe
 		// and user the policy above permits wsl specs with: the manager
-		// launches, stops and sweeps with them. Operator-owned (runtime_wsl_exe,
-		// runtime_wsl_user), never
-		// gateway-supplied; empty everywhere but a configured Windows host.
+		// launches, stops and sweeps with them. Operator-owned
+		// (runtime_wsl_exe, runtime_wsl_user), never gateway-supplied; empty
+		// everywhere but a configured Windows host.
 		WSL: localPolicy.WSL,
 		// Memory held back from the WSL2 VM's RAM pool that wsl processes are
 		// admitted against. Operator-owned (OP_AGENT_WSL_RAM_RESERVE_MB,

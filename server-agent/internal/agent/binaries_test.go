@@ -826,7 +826,7 @@ func TestWSLListFailureAddressesNoDistroAndKeepsVersion(t *testing.T) {
 }
 
 func TestParseRunningDistros(t *testing.T) {
-	utf16 := "\uFEFFU\x00b\x00u\x00n\x00t\x00u\x00\r\x00\n\x00D\x00e\x00b\x00i\x00a\x00n\x00\r\x00\n\x00"
+	utf16 := "\xff\xfeU\x00b\x00u\x00n\x00t\x00u\x00\r\x00\n\x00D\x00e\x00b\x00i\x00a\x00n\x00\r\x00\n\x00"
 	for _, tc := range []struct {
 		name string
 		in   string

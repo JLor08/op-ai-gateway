@@ -502,10 +502,11 @@ func (p LocalPolicy) Permit(spec Spec) error {
 	}
 	// The auto-added binary dirs are plain paths handed to the SAME withinDir
 	// subtree check R4's non-wildcard path uses, so R3 and R4 agree on
-	// semantics by construction. The native binary entries are guaranteed non-empty
-	// here (the empty-allowlist gate returned early above), so the toggle always
-	// has at least one dir to add. A non-absolute entry can never permit anything
-	// (it was skipped by the binary match above), so it contributes no dir.
+	// semantics by construction. The native binary entries are guaranteed
+	// non-empty here (the empty-allowlist gate returned early above), so the
+	// toggle always has at least one dir to add. A non-absolute entry can never
+	// permit anything (it was skipped by the binary match above), so it
+	// contributes no dir.
 	if p.AllowBinaryDirs {
 		for _, b := range nativeBinaries {
 			if filepath.IsAbs(b) && withinDir(spec.WorkDir, filepath.Dir(b)) {

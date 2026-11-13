@@ -2048,8 +2048,8 @@ stage that finds a reason stops it:
    `server_agent` application on the member server), `.cluster_port_unknown`;
    each member runs all five before the next member is looked at.
 4. **Binaries, over all members**: `.cluster_member_no_matching_binary` when an
-   automatic member's server has no `ggml-rpc-server` of the head binary's
-   version, and also when the **head** binary's own version is unknown (no
+   automatic member's server has no **native** `ggml-rpc-server` of the head
+   binary's version, and also when the **head** binary's own version is unknown (no
    inventory row, or one with neither commit nor build), since then nothing can
    match. A manual member takes its spec's binary and never fails here. An agent
    re-report of a binary without a probed version (a `--version` probe that
@@ -2244,8 +2244,8 @@ rule (a Windows-style `wsl://Ubuntu-24.04\home\ai`, a bad distro) is a
 inventory, and the agent logs a startup warning naming the setting and the index.
 A wrong-case `WSL://…` is **not a WSL entry at all**: it is a native path (it
 permits no binary, but as a `runtime_allowed_dirs` entry it still turns native
-`work_dir` containment on), it gets its own startup warning (that it is treated as
-a native path, not as a WSL entry), and the inventory lists no entry whose
+`work_dir` containment on), it (like a `wsl:/` or `wsl:x` typo) gets its own startup
+warning (that it is treated as a native path, not as a WSL entry), and the inventory lists no entry whose
 lowercased form starts with `wsl:` and that the parser rejects.
 
 **A malformed dir entry fails closed.** If `runtime_allowed_dirs` holds any
@@ -5830,9 +5830,12 @@ only: an older gateway stores and lists a `wsl://` row verbatim, without
 `execution`, `distro` or `exec_path` (its Binaries tab shows the raw path and its
 picker would offer it as a native binary) and stores a `vllm` as `other`. Upgrade
 the gateway, with its portal, together with or before agents that list `wsl://`
-entries. An agent **before 0.19.1** ignores `wsl://` entries and still needs the
-old `runtime_wsl_allowed_*` settings, so upgrade the agent before switching its
-config to `wsl://` entries.
+entries. An agent **before 0.19.1** has no `wsl://` concept: such a string in
+`runtime_allowed_binaries` is a useless native entry, and in
+`runtime_allowed_dirs` it is a native dir entry that turns native `work_dir`
+containment on (a native spec with an explicit `work_dir` outside it is
+refused). It still needs the old `runtime_wsl_allowed_*` settings, so upgrade the
+agent before switching its config to `wsl://` entries.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/

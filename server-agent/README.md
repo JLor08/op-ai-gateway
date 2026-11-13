@@ -590,12 +590,16 @@ Installing WSL, the distro and the engines is yours to do; the agent needs:
   "runtime_allowed_dirs": ["wsl://Ubuntu-24.04/opt/vllm"]
   ```
 
-  A malformed `wsl:` entry in `runtime_allowed_dirs` (a backslash, a bad
-  distro name, a wrong-case `WSL://`) is ignored and logged at startup, but it
-  keeps WSL `work_dir` containment on: only well-formed `wsl://` dir entries
-  (and the binary directories with `runtime_allow_binary_dirs`) then permit a
-  `work_dir`. An agent before 0.19.1 ignores `wsl://` entries altogether and
-  still needs the old settings, so upgrade the agent first.
+  A malformed `wsl:` entry in `runtime_allowed_dirs` (a backslash or a bad
+  distro name after `wsl://`) is ignored and logged at startup, and so is a
+  look-alike such as a wrong-case `WSL://` or a `wsl:/` typo, which is not a WSL
+  entry but a native dir entry (it turns native `work_dir` containment on).
+  Either way WSL `work_dir` containment stays on: only well-formed `wsl://` dir
+  entries (and the binary directories with `runtime_allow_binary_dirs`) then
+  permit a `work_dir`. An agent before 0.19.1 has no `wsl://` concept (such an
+  entry is a useless native binary entry, or a native dir entry that turns
+  native `work_dir` containment on) and still needs the old settings, so
+  upgrade the agent first.
 
   The earlier `runtime_wsl_allowed_distros`, `runtime_wsl_allowed_binaries` and
   `runtime_wsl_allowed_dirs` settings (and their `OP_AGENT_RUNTIME_WSL_ALLOWED_*`

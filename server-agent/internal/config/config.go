@@ -673,8 +673,8 @@ func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(
 				}
 				continue
 			}
-			if n := len(runtimectl.WSLEntryScheme); len(e) >= n && strings.EqualFold(e[:n], runtimectl.WSLEntryScheme) {
-				msg := "%s[%d] looks like a WSL entry but the scheme must be exactly lowercase wsl://; it is not a WSL entry and is treated as a native path"
+			if runtimectl.LooksLikeWSLEntry(e) {
+				msg := "%s[%d] looks like a WSL entry but is not wsl:// (the scheme must be exactly lowercase wsl://); it is not a WSL entry and is treated as a native path"
 				if list.name == "runtime_allowed_dirs" {
 					msg += ", and WSL work_dir containment stays on"
 				}
