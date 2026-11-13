@@ -50,6 +50,12 @@ export function binaryVersionFor(binaries: ServerBinary[], path: string): string
 
 const isWsl = (b: ServerBinary) => b.execution === 'wsl';
 
+function optionLabel(o: string | ServerBinary): string {
+  if (typeof o === 'string') return o;
+  if (isWsl(o)) return o.exec_path;
+  return o.path;
+}
+
 export function BinaryPicker({
   id,
   label,
@@ -104,7 +110,7 @@ export function BinaryPicker({
       getOptionKey={(o) => (typeof o === 'string' ? o : o.path)}
       // A WSL option's label is its Linux path: MUI writes the label into the
       // input after a selection, and the spec's binary is that Linux path.
-      getOptionLabel={(o) => (typeof o === 'string' ? o : isWsl(o) ? o.exec_path : o.path)}
+      getOptionLabel={optionLabel}
       isOptionEqualToValue={(o, v) => o.path === (typeof v === 'string' ? v : v.path)}
       renderOption={(props, option) => {
         const { key, ...rest } = props as { key?: string } & Record<string, unknown>;

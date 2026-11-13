@@ -648,40 +648,60 @@ var removedWSLSettings = []struct{ key, env string }{
 
 // runtimeAllowlistWarnings builds Config.Warnings: one per removed WSL setting
 // still present (file key or non-empty env var), and one per malformed wsl://
-// entry in the two allowlists. The agent starts regardless; a malformed entry
-// simply permits nothing and a removed setting is ignored.
+// or look-alike entry in the two allowlists. The agent starts regardless. A
+// removed setting is ignored. A malformed wsl:// entry permits nothing; in
+// runtime_allowed_dirs it is also ignored but keeps WSL work_dir containment
+// on. A look-alike (a wsl: entry whose scheme is not exactly lowercase wsl://)
+// is not a WSL entry and is treated as a native path.
 func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(string) string) []string {
+	w := removedWSLSettingWarnings(fileKeys, getenv)
+	for _, list := range []struct {
+		name    string
+		entries []string
+	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}} {
+		for i, e := range list.entries {
+			if msg := allowlistEntryWarning(list.name, i, e); msg != "" {
+				w = append(w, msg)
+			}
+		}
+	}
+	return w
+}
+
+// removedWSLSettingWarnings returns one warning per removed WSL setting that is
+// still present (file key or non-empty env var).
+func removedWSLSettingWarnings(fileKeys map[string]bool, getenv func(string) string) []string {
 	var w []string
 	for _, r := range removedWSLSettings {
 		if fileKeys[r.key] || strings.TrimSpace(getenv(r.env)) != "" {
 			w = append(w, fmt.Sprintf("%s (env %s) is no longer supported and is ignored: allowlist a WSL binary as a wsl://<distro>/<absolute Linux path> entry in runtime_allowed_binaries and a WSL work_dir prefix in runtime_allowed_dirs", r.key, r.env))
 		}
 	}
-	for _, list := range []struct {
-		name    string
-		entries []string
-	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}} {
-		for i, e := range list.entries {
-			if wslentry.Is(e) {
-				if _, _, ok := wslentry.Parse(e); !ok {
-					msg := "%s[%d] is a malformed wsl:// entry and permits nothing (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
-					if list.name == "runtime_allowed_dirs" {
-						msg = "%s[%d] is a malformed wsl:// entry and is ignored, but WSL work_dir containment stays on: only well-formed wsl:// dir entries (and binary dirs with runtime_allow_binary_dirs) permit a WSL work_dir (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
-					}
-					w = append(w, fmt.Sprintf(msg, list.name, i))
-				}
-				continue
-			}
-			if wslentry.LooksLike(e) {
-				msg := "%s[%d] looks like a WSL entry but is not wsl:// (the scheme must be exactly lowercase wsl://); it is not a WSL entry and is treated as a native path"
-				if list.name == "runtime_allowed_dirs" {
-					msg += ", and WSL work_dir containment stays on"
-				}
-				w = append(w, fmt.Sprintf(msg, list.name, i))
-			}
-		}
-	}
 	return w
+}
+
+// allowlistEntryWarning returns the warning for entry e at index i of the named
+// allowlist, or "" when the entry is fine.
+func allowlistEntryWarning(listName string, i int, e string) string {
+	isDirs := listName == "runtime_allowed_dirs"
+	if wslentry.Is(e) {
+		if _, _, ok := wslentry.Parse(e); ok {
+			return ""
+		}
+		msg := "%s[%d] is a malformed wsl:// entry and permits nothing (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
+		if isDirs {
+			msg = "%s[%d] is a malformed wsl:// entry and is ignored, but WSL work_dir containment stays on: only well-formed wsl:// dir entries (and binary dirs with runtime_allow_binary_dirs) permit a WSL work_dir (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
+		}
+		return fmt.Sprintf(msg, listName, i)
+	}
+	if !wslentry.LooksLike(e) {
+		return ""
+	}
+	msg := "%s[%d] looks like a WSL entry but is not wsl:// (the scheme must be exactly lowercase wsl://); it is not a WSL entry and is treated as a native path"
+	if isDirs {
+		msg += ", and WSL work_dir containment stays on"
+	}
+	return fmt.Sprintf(msg, listName, i)
 }
 
 // resolveInt applies env > file for a plain integer setting that (per the
