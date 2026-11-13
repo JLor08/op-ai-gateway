@@ -570,7 +570,8 @@ func liveUnitVRAM(f *fakeWSL, perSpec map[string]int) func([]int) map[int]map[in
 // TestWSLSecondStartWaitsForSettle: while one wsl start's window is open a
 // second wsl start waits -- evicting nothing -- and it proceeds once that
 // window has closed. Serialized, each start's delta is its own: started side by
-// side, the first would be attributed the second's growth too.
+// side, the first would be attributed the second's growth too. A's load ends
+// when the test says so (its health gate), not after a delay the checks race.
 func TestWSLSecondStartWaitsForSettle(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
@@ -578,8 +579,9 @@ func TestWSLSecondStartWaitsForSettle(t *testing.T) {
 	m := newWSLTestManager(t, f.runner())
 	m.SetMeasurer(liveUnitVRAM(f, map[string]int{"A": 5000, "B": 3000}))
 	m.SetWSLVMPIDs(func() []int { return []int{vmwpPID} })
+	gate := filepath.Join(t.TempDir(), "a-loaded")
 	a := wslTestSpec(f, "A", "a")
-	a.Args = stubArgs(time.Second, 0, 0, "")
+	a.Args = append(stubArgs(0, 0, 0, ""), "-health-gate", gate)
 	a.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
 	b := wslTestSpec(f, "B", "b")
 	b.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
@@ -590,9 +592,9 @@ func TestWSLSecondStartWaitsForSettle(t *testing.T) {
 	aDone := ensureAsync(ctx, m, "a")
 	waitForState(t, m, "A", StateStarting)
 	bDone := ensureAsync(ctx, m, "b")
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond) // B's request reaches admission meanwhile
 	if st := statusFor(m, "A"); st.State != StateStarting {
-		t.Fatalf("A is %s, want it still loading for this check", st.State)
+		t.Fatalf("A is %s before its health gate opened, want it still loading", st.State)
 	}
 	if st := statusFor(m, "B"); st.State != StateStopped {
 		t.Errorf("B is %s while A's window is open, want it waiting", st.State)
@@ -601,6 +603,9 @@ func TestWSLSecondStartWaitsForSettle(t *testing.T) {
 		if strings.Contains(c.unit(), "-B-") {
 			t.Errorf("B was launched while A's window was open: %s", c.unit())
 		}
+	}
+	if err := os.WriteFile(gate, nil, 0o644); err != nil {
+		t.Fatalf("open A's health gate: %v", err)
 	}
 
 	for model, done := range map[string]<-chan queuedEnsure{"a": aDone, "b": bDone} {
