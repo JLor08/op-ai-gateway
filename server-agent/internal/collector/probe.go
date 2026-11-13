@@ -945,7 +945,9 @@ func capVerdict(v any) string {
 // extractContext dispatches to the per-specType extraction rule.
 func extractContext(specType string, v any) (int, bool) {
 	switch specType {
-	case "vllm":
+	case "vllm", "sglang":
+		// sglang (v0.5.23, protocol.py ModelCard) serves the same
+		// data[].max_model_len shape as vLLM.
 		return extractVLLMContext(v)
 	case "llama_cpp":
 		return extractLlamaCppContext(v)

@@ -427,7 +427,14 @@ import (
 // runtime_allowed_binaries / runtime_allowed_dirs, and the three
 // runtime_wsl_allowed_* settings are gone. PATCH: no agent.Features entry
 // changes (runtime_exec_wsl keeps Since 0.19.0).
-const Version = "0.19.1"
+//
+// 0.19.1 -> 0.19.2 is the single bump for the sglang and sglang_omni runtime
+// spec types (#395). PATCH: no agent.Features entry changes, but a sglang
+// child's sglang:num_queue_reqs / sglang:num_running_reqs gauges (tp_rank 0
+// series only) feed queue_depth and active, its context size is read from
+// /v1/models data[].max_model_len, and the /props capability probe is skipped
+// for both types.
+const Version = "0.19.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1747,15 +1754,18 @@ type runtimeCapabilityEntry struct {
 //     worker serves no /props and no capability document, so a probe would
 //     spend a request to learn nothing. Its context probe still runs (the
 //     /v1/models read is also where its api_version comes from).
+//   - "sglang" and "sglang_omni": no /props either -- neither serves it.
+//     (The agent never imports the gateway's routing package; these are
+//     literal copies of its type strings.)
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
 
 	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
-	if st.Type == "vllm_sr" {
-		// No capability probe: the vLLM Semantic Router worker serves no
-		// /props and no capability document, so nothing is requested and
-		// nothing is sent.
+	if st.Type == "vllm_sr" || st.Type == "sglang" || st.Type == "sglang_omni" {
+		// No capability probe: the vLLM Semantic Router worker and the SGLang
+		// servers serve no /props and no capability document, so nothing is
+		// requested and nothing is sent.
 		return
 	}
 	a.probeRuntimeChildProps(ctx, client, base, st, rs)

@@ -37,6 +37,11 @@ const (
 	// vllm-sr (vLLM Semantic Router worker) exports only a queue-depth gauge;
 	// no running/in-flight metric exists for it, so active stays 0.
 	vllmSRWaitingMetric = "vllm_srun_queue_depth"
+	// SGLang (v0.5.23, python/sglang/srt/observability/metrics_collector.py)
+	// gauges. The scheduler emits one series per rank, labelled tp_rank,
+	// dp_rank, pp_rank and moe_ep_rank; see parsePromText for how they sum.
+	sglangRunningMetric = "sglang:num_running_reqs"
+	sglangWaitingMetric = "sglang:num_queue_reqs"
 )
 
 // parsePromText parses a Prometheus text-exposition body into a map summing the
@@ -61,15 +66,31 @@ func parsePromText(data []byte) map[string]float64 {
 			continue
 		}
 		name := strings.TrimSpace(line[:idx])
+		labels := ""
 		if brace := strings.IndexByte(name, '{'); brace >= 0 {
+			labels = name[brace:]
 			name = name[:brace]
 		}
 		if name == "" {
 			continue
 		}
+		if strings.HasPrefix(name, "sglang:") && !isTPRankZero(labels) {
+			continue
+		}
 		out[name] += v
 	}
 	return out
+}
+
+// isTPRankZero reports whether a label block ("{a=\"b\",...}", or "") carries no
+// tp_rank label or tp_rank="0".
+func isTPRankZero(labels string) bool {
+	for _, key := range []string{`{tp_rank="`, `,tp_rank="`} {
+		if i := strings.Index(labels, key); i >= 0 {
+			return strings.HasPrefix(labels[i+len(key):], `0"`)
+		}
+	}
+	return true
 }
 
 // promScraper scrapes an inference server's Prometheus /metrics endpoint.
@@ -114,8 +135,8 @@ func (s *promScraper) Scrape(ctx context.Context) (active int, queue int, err er
 		return 0, 0, err
 	}
 	m := parsePromText(body)
-	active = int(firstPresent(m, vllmRunningMetric, llamacppRunningMetric, tgiRunningMetric))
-	queue = int(firstPresent(m, vllmWaitingMetric, llamacppWaitingMetric, tgiWaitingMetric, vllmSRWaitingMetric))
+	active = int(firstPresent(m, vllmRunningMetric, llamacppRunningMetric, tgiRunningMetric, sglangRunningMetric))
+	queue = int(firstPresent(m, vllmWaitingMetric, llamacppWaitingMetric, tgiWaitingMetric, vllmSRWaitingMetric, sglangWaitingMetric))
 	return active, queue, nil
 }
 

@@ -1554,3 +1554,17 @@ func TestProbeContextInfo_VLLMSRAPIVersionWithoutLimit(t *testing.T) {
 		t.Errorf("info = %+v, want api_version 5.0.0 and size 0", info)
 	}
 }
+
+func TestExtractContext_SGLangReadsMaxModelLen(t *testing.T) {
+	var v any
+	// A LoRA adapter card carries max_model_len null; the first positive wins.
+	if err := json.Unmarshal([]byte(`{"data":[{"id":"m","max_model_len":32768},{"id":"lora","max_model_len":null}]}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := extractContext("sglang", v); !ok || n != 32768 {
+		t.Errorf("extractContext(sglang) = %d, %v; want 32768, true", n, ok)
+	}
+	if _, ok := extractContext("sglang", map[string]any{"data": []any{}}); ok {
+		t.Error("extractContext(sglang) on empty data = ok, want false")
+	}
+}

@@ -5511,3 +5511,51 @@ func TestCollectOnceVLLMSRAPIVersionWithoutContextLimit(t *testing.T) {
 		})
 	}
 }
+
+// TestCollectOnceSGLangTypesSkipProps proves a sglang child's context comes
+// from /v1/models and its queue from the rank-0 series, and that neither
+// sglang nor sglang_omni ever GETs /props.
+func TestCollectOnceSGLangTypesSkipProps(t *testing.T) {
+	var propsHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"m","max_model_len":32768}]}`))
+		case "/metrics":
+			_, _ = w.Write([]byte("sglang:num_queue_reqs{tp_rank=\"0\"} 3\nsglang:num_queue_reqs{tp_rank=\"1\"} 3\n"))
+		case "/props":
+			atomic.AddInt32(&propsHits, 1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	for _, typ := range []string{"sglang", "sglang_omni"} {
+		drv := newFakeRuntimeDriver()
+		drv.setActive(true)
+		st := runtimectl.Status{
+			SpecID: "rspec_sgl", Model: "m", State: runtimectl.StateRunning, PID: 4546,
+			Port: portFromURL(t, srv.URL), Type: typ,
+		}
+		if typ == "sglang" {
+			st.MetricsPath, st.ContextProbePath = "/metrics", "/v1/models"
+		}
+		drv.setStatuses([]runtimectl.Status{st})
+		poster := &capturePoster{}
+		a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+		a.collectOnce(context.Background())
+		last := poster.last()
+		if last == nil || len(last.Runtimes) != 1 {
+			t.Fatalf("%s: Runtimes = %+v", typ, last)
+		}
+		rs := last.Runtimes[0]
+		if typ == "sglang" && (rs.ContextSize != 32768 || rs.QueueDepth != 3) {
+			t.Errorf("sglang sample = ctx %d queue %d; want 32768 / 3", rs.ContextSize, rs.QueueDepth)
+		}
+		if n := atomic.LoadInt32(&propsHits); n != 0 {
+			t.Errorf("/props hits after %s = %d, want 0", typ, n)
+		}
+	}
+}
