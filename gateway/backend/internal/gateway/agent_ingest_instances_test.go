@@ -131,6 +131,35 @@ func TestIngestPushesTheRuntimeConfigWhenRuntimeInstancesFlips(t *testing.T) {
 	spy.expectPush(t, "a readable declaration after an unreadable one", "mock-host-qwen")
 }
 
+// TestIngestPushesTheRuntimeConfigWhenRuntimeExecWSLFlips pins the push that
+// follows a change of the agent's runtime_exec_wsl declaration: a wsl spec is
+// withheld from an agent without it, so the declaration is an input of the
+// document and a sample that changes it pushes at once. Repeating it, or an
+// unreadable sample, pushes nothing.
+func TestIngestPushesTheRuntimeConfigWhenRuntimeExecWSLFlips(t *testing.T) {
+	srv := NewTestServer()
+	spy := spyRuntimeConfigPushes(srv)
+	ingest := func(t *testing.T, capabilities string) {
+		t.Helper()
+		req, raw := ingestReq(t, `{"host":{"cpu_util_pct":1},"capabilities":`+capabilities+`}`)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+	}
+	ingest(t, `{"features":["runtime_manager"]}`)
+	spy.expectPush(t, "a first sample, which makes the declaration known", "mock-host-qwen")
+	ingest(t, `{"features":["runtime_manager"]}`)
+	spy.expectNoPush(t, "the same declaration again", "mock-host-qwen")
+	ingest(t, `{"features":["runtime_manager","runtime_exec_wsl"]}`)
+	spy.expectPush(t, "runtime_exec_wsl declared", "mock-host-qwen")
+	ingest(t, `{"features":["runtime_manager","runtime_exec_wsl"]}`)
+	spy.expectNoPush(t, "the same declaration again", "mock-host-qwen")
+	ingest(t, `{"features":["runtime_manager"]}`)
+	spy.expectPush(t, "runtime_exec_wsl withdrawn", "mock-host-qwen")
+	ingest(t, `"not-an-object"`)
+	spy.expectNoPush(t, "an unreadable declaration", "mock-host-qwen")
+}
+
 // instanceIngestStore wraps a MemoryStore and records every write the
 // telemetry ingest's write-backs make, so a test can assert what was written
 // and how often, not only the final stored state (a fold and an alternating

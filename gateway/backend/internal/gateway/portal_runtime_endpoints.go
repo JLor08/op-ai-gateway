@@ -142,6 +142,10 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
+	{err: portal.ErrRuntimeSpecExecutionModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.execution_mode_invalid", msg: "execution_mode must be \"native\" or \"wsl\""},
+	{err: portal.ErrRuntimeSpecWSLDistroInvalid, status: http.StatusBadRequest, code: "runtime_spec.wsl_distro_invalid", msg: "a wsl runtime spec needs a wsl_distro of letters, digits, '.', '_' and '-' (at most 64)"},
+	{err: portal.ErrRuntimeSpecWSLPathNotLinux, status: http.StatusBadRequest, code: "runtime_spec.wsl_path_not_linux", msg: "a wsl runtime spec runs inside the distro: binary and work_dir must be Linux absolute paths"},
+	{err: portal.ErrRuntimeSpecWSLClusterUnsupported, status: http.StatusBadRequest, code: "runtime_spec.wsl_cluster_unsupported", msg: "a wsl runtime spec cannot be an rpc cluster head"},
 	{err: portal.ErrRuntimeSpecTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.type_invalid", msg: "runtime spec type must be one of vllm, llama_cpp, tgi, ollama, stable_diffusion_cpp, audio_cpp, vllm_sr, custom (or empty for auto)"},
 	// The one row in this table with a dynamic message. The service wraps the
 	// sentinel with the offending EFFECTIVE kind (fmt.Errorf("%w: ...")), and

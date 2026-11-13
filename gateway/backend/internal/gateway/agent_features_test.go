@@ -341,3 +341,23 @@ func TestRuntimeRoleEvictionFeatureName(t *testing.T) {
 		t.Fatalf("a server that declared %q must read as having it", RuntimeRoleEvictionFeature)
 	}
 }
+
+// TestRuntimeExecWSLFeatureName pins the literal the agent declares for running
+// a spec inside a WSL distro, and that it is agent-only: the gateway never
+// declares it, and reads it fail-closed.
+func TestRuntimeExecWSLFeatureName(t *testing.T) {
+	if RuntimeExecWSLFeature != "runtime_exec_wsl" {
+		t.Fatalf("RuntimeExecWSLFeature = %q, want the agent's literal %q", RuntimeExecWSLFeature, "runtime_exec_wsl")
+	}
+	if slices.Contains(gatewayAgentFeatures, RuntimeExecWSLFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, RuntimeExecWSLFeature)
+	}
+	srv := NewTestServer()
+	if srv.AgentFeatures.Has("wsl-host", RuntimeExecWSLFeature) {
+		t.Fatalf("a server that declared nothing must not read as having %q (fail-closed)", RuntimeExecWSLFeature)
+	}
+	srv.AgentFeatures.Set("wsl-host", []string{RuntimeExecWSLFeature})
+	if !srv.AgentFeatures.Has("wsl-host", RuntimeExecWSLFeature) {
+		t.Fatalf("a server that declared %q must read as having it", RuntimeExecWSLFeature)
+	}
+}

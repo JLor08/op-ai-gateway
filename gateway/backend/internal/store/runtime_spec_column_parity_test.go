@@ -135,6 +135,12 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 		clusterNetworks := [runtimeSpecParityRows]string{"lan", "mesh", "lan"}
 		rpcTransports := [runtimeSpecParityRows]string{"relay", "direct", "relay"}
 		deviceBackends := [runtimeSpecParityRows]string{"cuda", "vulkan", "rocm"}
+		// The execution pair, distinct per row and none of the column defaults
+		// ('native' / ''), so an omitted column cannot read back as its default.
+		executionModes := [runtimeSpecParityRows]routing.ExecutionMode{
+			routing.ExecutionModeWSL, routing.ExecutionModeNative, routing.ExecutionModeWSL,
+		}
+		wslDistros := [runtimeSpecParityRows]string{"Ubuntu-24.04", "Debian-12", "Alpine.3_19"}
 
 		want := make([]routing.RuntimeSpec, 0, runtimeSpecParityRows)
 		for i := 0; i < runtimeSpecParityRows; i++ {
@@ -184,6 +190,8 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				RPCTransport:                rpcTransports[i],
 				LANExposureAck:              runtimeSpecParityBools[6][i],
 				DeviceBackend:               deviceBackends[i],
+				ExecutionMode:               executionModes[i],
+				WSLDistro:                   wslDistros[i],
 				APIFlavors:                  apiFlavors[i],
 				ResponsesMode:               responsesModes[i],
 				MessagesMode:                messagesModes[i],
@@ -284,7 +292,7 @@ func TestAgentRuntimeSpecsSchemaColumnsAllCovered(t *testing.T) {
 				"admin_state", "admission_wait_timeout_seconds", "api_flavors", "api_token",
 				"api_token_header", "api_token_header_source", "decisions_mode", "systemone_mode", "api_token_mode", "args", "binary_path",
 				"cluster_network", "config_files", "context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
-				"device_backend", "id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
+				"device_backend", "execution_mode", "wsl_distro", "id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
 				"max_instances", "member_mode", "messages_mode", "metrics_path", "min_instances", "ram_estimate_mb",
 				"ram_measured_mb", "responses_mode", "rpc_transport", "startup_measured_ms", "startup_timeout_seconds",
 				"type", "updated_at", "visible_devices_mode", "work_dir",

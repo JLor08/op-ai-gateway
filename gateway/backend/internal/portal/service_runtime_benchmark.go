@@ -113,6 +113,8 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		MetricsPath:                 dto.MetricsPath,
 		ContextProbePath:            dto.ContextProbePath,
 		DeviceBackend:               dto.DeviceBackend,
+		ExecutionMode:               dto.ExecutionMode,
+		WSLDistro:                   dto.WSLDistro,
 		ClusterEnabled:              dto.ClusterEnabled,
 		MemberMode:                  dto.MemberMode,
 		ClusterNetwork:              dto.ClusterNetwork,
