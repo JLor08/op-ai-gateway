@@ -523,10 +523,12 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 	// Root is refused by name here; the launcher additionally never passes -u
 	// root, so the two cannot drift into letting a gateway-chosen command line
 	// run with UID 0. "0" is refused as well, since wsl.exe -u accepts a UID.
-	if w.User == "" || w.User == "root" || w.User == "0" {
+	if w.User == "" || w.User == "root" || isZeroUID(w.User) {
 		return fmt.Errorf("runtime: no non-root WSL user is configured, refusing a wsl spec (set the agent's runtime_wsl_user / OP_AGENT_RUNTIME_WSL_USER to a non-root distro user)")
 	}
-	if !slices.Contains(w.AllowedDistros, spec.WSLDistro()) {
+	// The empty-distro guard keeps this self-contained against a file-sourced
+	// [""] allowlist entry, which survives as a non-empty list.
+	if spec.WSLDistro() == "" || !slices.Contains(w.AllowedDistros, spec.WSLDistro()) {
 		return fmt.Errorf("runtime: the spec's WSL distro is not in the allowed-distros list (runtime_wsl_allowed_distros holds %d entries)", len(w.AllowedDistros))
 	}
 	// Absolute POSIX only: a bare name would resolve through the distro's PATH,
@@ -552,6 +554,20 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 		}
 	}
 	return fmt.Errorf("runtime: the spec's WSL work_dir is not within any allowed directory (runtime_wsl_allowed_dirs holds %d entries)", len(w.AllowedDirs))
+}
+
+// isZeroUID reports whether s is all ASCII digits and parses to 0 ("0", "00"):
+// wsl.exe -u takes a numeric UID, so every spelling of 0 is root.
+func isZeroUID(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return strings.Trim(s, "0") == ""
 }
 
 // withinPosixDir is withinDir for POSIX paths inside a distro: path.Clean (not
@@ -1064,6 +1080,18 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 	// non-empty default at runtime, and spec.ID is the spec's identity,
 	// so the join is never a hole in a path.
 	if inner == "CONFIG_DIR" {
+		if spec.IsWSL() {
+			// The child runs inside the distro, so the agent-side Windows
+			// directory must be named by its /mnt/<drive> path. Joined with
+			// path, not filepath: the result is a POSIX path whatever the
+			// agent's host is. An untranslatable directory (UNC) is a
+			// placeholder error, which the dry run reports as not_permitted.
+			dir, derr := windowsPathToWSL(configFilesDir)
+			if derr != nil {
+				return "", true, derr
+			}
+			return path.Join(dir, spec.ID), true, nil
+		}
 		return filepath.Join(configFilesDir, spec.ID), true, nil
 	}
 

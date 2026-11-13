@@ -51,11 +51,19 @@ func TestPermitWSLUnconfigured(t *testing.T) {
 }
 
 func TestPermitWSLRefusesRootUser(t *testing.T) {
-	for _, u := range []string{"", "root"} {
+	for _, u := range []string{"", "root", "0", "00"} {
 		p := wslPolicy()
 		p.WSL.User = u
 		mustRefuse(t, p.Permit(wslSpec(wslBin, "")), "runtime_wsl_user")
 	}
+}
+
+func TestPermitWSLRefusesEmptyDistroEvenIfListed(t *testing.T) {
+	p := wslPolicy()
+	p.WSL.AllowedDistros = []string{""} // a file-sourced [""] survives as non-empty
+	s := wslSpec(wslBin, "")
+	s.Execution.WSL.Distro = ""
+	mustRefuse(t, p.Permit(s), "runtime_wsl_allowed_distros")
 }
 
 func TestPermitWSLDistroAllowlist(t *testing.T) {
