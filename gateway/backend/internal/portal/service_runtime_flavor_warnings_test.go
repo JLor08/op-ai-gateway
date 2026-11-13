@@ -284,3 +284,29 @@ func TestViewRuntimeTypeVllmSRApplication(t *testing.T) {
 		t.Fatalf("viewRuntimeType = %q, want vllm_sr", got)
 	}
 }
+
+// TestAnySGLangOmniSpecLacksAudioFlavor is the truth table behind
+// api_flavors_no_audio_on_sglang_omni: a sglang_omni spec (explicit, or Auto
+// with an omni-named binary) without openai_audio warns.
+func TestAnySGLangOmniSpecLacksAudioFlavor(t *testing.T) {
+	agent := flavorWarningAgentApp(routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio)
+	cases := []struct {
+		name  string
+		app   routing.Application
+		specs []routing.RuntimeSpec
+		want  bool
+	}{
+		{"explicit, openai only", agent, []routing.RuntimeSpec{{Type: "sglang_omni", APIFlavors: []string{routing.APIFlavorOpenAI}}}, true},
+		{"detected, openai only", agent, []routing.RuntimeSpec{{Binary: "/x/sglang-omni", APIFlavors: []string{routing.APIFlavorOpenAI}}}, true},
+		{"openai and openai_audio", agent, []routing.RuntimeSpec{{Type: "sglang_omni", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}}}, false},
+		{"plain sglang with openai", agent, []routing.RuntimeSpec{{Type: "sglang", APIFlavors: []string{routing.APIFlavorOpenAI}}}, false},
+		{"non-agent application", routing.Application{Type: routing.ProviderVLLM}, []routing.RuntimeSpec{{Type: "sglang_omni", APIFlavors: []string{routing.APIFlavorOpenAI}}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := anySGLangOmniSpecLacksAudioFlavor(tc.app, tc.specs); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

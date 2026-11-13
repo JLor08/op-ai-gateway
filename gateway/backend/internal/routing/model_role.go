@@ -87,6 +87,10 @@ var chatCapabilities = [...]string{
 // transcribes and synthesises speech (rare: one model rarely does both) is
 // RoleASR, by rule 1 over rule 2.
 //
+// sglang_omni is not a type fallback either: one sglang-omni server may host a
+// text, speech or ASR model, so its capabilities decide and a bare one is
+// RoleOther.
+//
 // audio_cpp is deliberately not a type fallback: one audio.cpp server hosts asr
 // or tts models and the type cannot say which, so a bare audio_cpp model is
 // RoleOther until a verdict (which the audio.cpp probe writes from the model's
@@ -109,7 +113,7 @@ func DeriveRole(specType RuntimeSpecType, caps map[string]bool) ModelRole {
 	switch specType {
 	case RuntimeSpecTypeStableDiffusionCpp:
 		return RoleImage
-	case RuntimeSpecTypeVLLM, RuntimeSpecTypeLlamaCpp, RuntimeSpecTypeTGI, RuntimeSpecTypeOllama:
+	case RuntimeSpecTypeVLLM, RuntimeSpecTypeLlamaCpp, RuntimeSpecTypeTGI, RuntimeSpecTypeOllama, RuntimeSpecTypeSGLang:
 		return RoleChat
 	}
 

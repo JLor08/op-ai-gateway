@@ -263,3 +263,53 @@ func TestVllmSRAPIVersionUnsupported(t *testing.T) {
 		}
 	}
 }
+
+// TestDetectRuntimeSpecTypeSGLang pins SGLang (v0.5.23) and sglang-omni
+// (v0.2.0) detection: an omni-named binary must never detect as sglang, both
+// cases sit ahead of the vllm substring, and every name that detected before
+// keeps its type.
+func TestDetectRuntimeSpecTypeSGLang(t *testing.T) {
+	cases := []struct {
+		binary string
+		want   RuntimeSpecType
+	}{
+		{"/home/ai/sglang-env/bin/sglang", RuntimeSpecTypeSGLang},
+		{"SGLANG", RuntimeSpecTypeSGLang},
+		{"python -m sglang.launch_server", RuntimeSpecTypeSGLang},
+		{"sgl-omni", RuntimeSpecTypeSGLangOmni},
+		{"/x/sglang-omni", RuntimeSpecTypeSGLangOmni},
+		{"/x/sglang_omni", RuntimeSpecTypeSGLangOmni},
+		{"sgl_omni", RuntimeSpecTypeSGLangOmni},
+		{"SGL_OMNI", RuntimeSpecTypeSGLangOmni},
+		{"/opt/sglang-omni/bin/sglang", RuntimeSpecTypeSGLang},
+		{"vllm", RuntimeSpecTypeVLLM},
+		{"vllm-srun", RuntimeSpecTypeVllmSR},
+		{"llama-server", RuntimeSpecTypeLlamaCpp},
+		{"ollama", RuntimeSpecTypeOllama},
+		{"text-generation-launcher", RuntimeSpecTypeTGI},
+		{"sd-server", RuntimeSpecTypeStableDiffusionCpp},
+		{"audiocpp_server", RuntimeSpecTypeAudioCpp},
+		{"python3", RuntimeSpecTypeCustom},
+	}
+	for _, tc := range cases {
+		if got := DetectRuntimeSpecType(tc.binary); got != tc.want {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", tc.binary, got, tc.want)
+		}
+	}
+}
+
+func TestDeriveProbePathsSGLang(t *testing.T) {
+	metrics, context := DeriveProbePaths(RuntimeSpecTypeSGLang, "", "")
+	if metrics != "/metrics" || context != "/v1/models" {
+		t.Fatalf("sglang probe paths = (%q, %q), want (/metrics, /v1/models)", metrics, context)
+	}
+	metrics, context = DeriveProbePaths(RuntimeSpecTypeSGLangOmni, "", "")
+	if metrics != "" || context != "" {
+		t.Fatalf("sglang_omni probe paths = (%q, %q), want both empty", metrics, context)
+	}
+	for _, typ := range []RuntimeSpecType{RuntimeSpecTypeSGLang, RuntimeSpecTypeSGLangOmni} {
+		if m, c := DeriveProbePaths(typ, "/m", "/c"); m != "/m" || c != "/c" {
+			t.Fatalf("%s overrides = (%q, %q), want (/m, /c)", typ, m, c)
+		}
+	}
+}

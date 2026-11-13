@@ -62,7 +62,7 @@ package routing
 // stable_diffusion_cpp (an image server -- /v1/responses, the one endpoint
 // this opt-in governs, does not even apply to it), audio_cpp (an audio server,
 // likewise without /v1/responses), vllm_sr (a router, not an inference
-// server), custom, mock, and "" -- the empty spec type, which means
+// server), sglang and sglang_omni (neither is measured for the opt-in), custom, mock, and "" -- the empty spec type, which means
 // "auto-detect from the binary" and is a legitimate STORED value, so it has to
 // be answered for rather than assumed absent. Together with the member above
 // that is every string the two vocabularies (Application.Type and
