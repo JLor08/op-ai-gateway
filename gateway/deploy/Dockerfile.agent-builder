@@ -8,9 +8,10 @@
 # module's go.mod `go 1.26`): the floating `golang:1.26` tag pulled go1.26.0, which
 # ICEs cross-compiling the std `bytes` package for windows/amd64 ("internal compiler
 # error: 'Replace': two final stores"). Pinning to a patched toolchain fixes it; bump
-# this when you want a newer Go, but never below 1.26. Not to 1.27 yet: its net/http
-# regression deadlocks the live-transcription relay (docs/architecture/cross-cutting/
-# development-and-quality.md, section 1).
+# this when you want a newer Go, but never below 1.26. Not to 1.26.11+ or 1.27 yet: their
+# net/http regression deadlocks the gateway's live-transcription relay (#387; docs/architecture/
+# cross-cutting/development-and-quality.md, section 1). The agent itself does not hit it
+# (the gateway never sends it Expect: 100-continue); the pin keeps both Go builds in step.
 FROM golang:1.26.5
 WORKDIR /src
 # Dependency layer cached separately from the source. NOTE: no BuildKit cache
