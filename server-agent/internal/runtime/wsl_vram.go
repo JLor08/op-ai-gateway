@@ -42,8 +42,11 @@ package runtime
 // failed reading would credit one instance with the whole VM, which is written
 // back as its measured demand (ADR-084), and a demand over its budget is
 // refused for good. At admission a failed reading falls back to the last good
-// one (owner.vmVRAM). A failure that looks like an empty VM -- a failed read at
-// the first start, with nothing wsl live -- cannot be told apart from one.
+// one of the current period of WSL activity (owner.vmVRAM), and to nothing in
+// a period that has had none yet: once no wsl generation is live the last
+// reading is forgotten (endVMPeriodIfIdle). A failure that looks like an empty
+// VM -- a failed read at the first start, with nothing wsl live -- cannot be
+// told apart from one.
 //
 // THE REMAINDER IS WHAT ADMISSION RELIES ON. Per-workload figures are best
 // effort: a delta can come out low (growth after the window closed, a void
@@ -215,6 +218,27 @@ func (o *owner) readVMVRAM() (vm map[int]int, ok bool) {
 	}
 	o.vmVRAM = vm
 	return vm, true
+}
+
+// endVMPeriodIfIdle ends the period of WSL activity once no wsl generation is
+// live: the last good VM reading (owner.vmVRAM) is forgotten, and a
+// measurement still out from that period will not record its reading
+// (owner.vmPeriod). The fallback to the last good reading then spans only the
+// current period. Kept across periods, an earlier period's figure would be
+// charged as the remainder whenever the next period's reading fails -- above
+// all a CPU-only wsl generation's first one, taken while its VM boots and has
+// no worker yet (vmReadingFailed) -- although the booting VM holds nothing; a
+// native candidate would be charged a whole earlier period's VM VRAM, and could
+// evict an idle occupant or wait with nothing to wake it. Forgotten, such a
+// failed reading falls back to nothing, which is what the booting VM holds.
+// Called where a period can end: a wsl generation's exit, and an admission
+// snapshot that finds nothing wsl live.
+func (o *owner) endVMPeriodIfIdle() {
+	if o.wslLive() {
+		return
+	}
+	o.vmVRAM = nil
+	o.vmPeriod++
 }
 
 // beginWSLVRAM sets up the VRAM accounting of proc, a wsl generation of spec

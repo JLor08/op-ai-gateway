@@ -880,3 +880,78 @@ func TestWSLAttributionOnlyOnDeclaredGPUs(t *testing.T) {
 		t.Errorf("UnattributedVRAM = %v, want GPU 1's growth in it {0:100 1:2100}", got)
 	}
 }
+
+// Final review (#381): the last good VM reading, the settle wake and the
+// open window's provisional attribution.
+
+// TestWSLVMReadingDoesNotOutliveItsPeriod: the last good VM reading, which an
+// admission falls back to when its own reading is detectably failed, belongs
+// to the period of WSL activity it was taken in. Once no wsl generation is
+// live it is forgotten, so a later period that begins with a CPU-only wsl
+// generation -- the VM still booting, no worker found yet, which reads as
+// failed -- charges no remainder from an earlier period's figure: the booting
+// VM holds nothing. A measurement still out when the period ended does not
+// bring that figure back either.
+func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
+	// period1 runs a GPU wsl generation G attributed 12000 of the VM's 12022,
+	// so the last good reading is {0:12022}.
+	period1 := func(t *testing.T) (*owner, *vmVRAMScript, *specState) {
+		t.Helper()
+		vm := &vmVRAMScript{vm: map[int]int{0: 12022}}
+		g := liveWSL(wslVRAMSpec("G", 12000), 300, StateRunning)
+		o := wslVRAMOwner(vm, g)
+		o.wslAttrib = map[*runningProc]map[int]int{g.proc: {0: 12000}}
+		if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 22}) {
+			t.Fatalf("period 1: remainder %v, want {0:22}", got)
+		}
+		t.Cleanup(func() {
+			close(o.m.done)
+			o.m.wg.Wait()
+		})
+		return o, vm, g
+	}
+	// period2 starts a CPU-only wsl generation C while the VM boots: the
+	// finder names no worker, and the reading counts as failed.
+	period2 := func(t *testing.T, o *owner, vm *vmVRAMScript) {
+		t.Helper()
+		c := liveWSL(wslCandidate("C", 1000), 301, StateStarting)
+		c.spec.UpstreamModel = "c"
+		o.specs["C"] = c
+		o.wslAttrib[c.proc] = nil
+		vm.setNoWorker(true)
+		if got := o.buildSnapshot().UnattributedVRAM; got != nil {
+			t.Errorf("period 2, VM booting: UnattributedVRAM = %v, want nil: the booting VM holds nothing, and %v was an earlier period's", got, map[int]int{0: 12022})
+		}
+	}
+
+	t.Run("an admission between the periods", func(t *testing.T) {
+		o, vm, g := period1(t)
+		o.noteWSLExit(g.proc)
+		g.proc = nil
+		vm.set(map[int]int{0: 22})
+		if got := o.buildSnapshot().UnattributedVRAM; got != nil {
+			t.Fatalf("between periods: remainder %v, want nil", got)
+		}
+		period2(t, o, vm)
+	})
+
+	t.Run("no admission between the periods", func(t *testing.T) {
+		o, vm, g := period1(t)
+		g.state, g.intentionalStop = StateDraining, true
+		o.onProcExited(g, nil)
+		vm.set(map[int]int{0: 22})
+		period2(t, o, vm)
+	})
+
+	t.Run("a measurement that lands after its period ended", func(t *testing.T) {
+		o, vm, g := period1(t)
+		gate := vm.hold()
+		o.dispatchMeasurement() // reads the VM while G is still live
+		g.state, g.intentionalStop = StateDraining, true
+		o.onProcExited(g, nil)
+		close(gate)
+		handleNextMeasurement(t, o)
+		vm.set(map[int]int{0: 22})
+		period2(t, o, vm)
+	})
+}

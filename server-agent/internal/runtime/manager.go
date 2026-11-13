@@ -1186,9 +1186,11 @@ type measureTarget struct {
 //
 // vmRead reports that the VRAM measurer was also asked about the WSL VM's
 // workers, vmPIDs (SetWSLVMPIDs), so byPID holds the VM's figure: their per-GPU
-// sum (sumVMVRAM). window is the wsl start window this measurement settles --
+// sum (sumVMVRAM); vmPeriod is owner.vmPeriod when it was dispatched, so a
+// reading that lands after its period of WSL activity ended is not kept as the
+// last good one. window is the wsl start window this measurement settles --
 // the open one, when it was dispatched after the window's process first passed
-// a health probe (wslStartWindow.healthyDispatched) -- and nil otherwise.
+// a health probe -- and nil otherwise.
 type cmdMeasured struct {
 	targets   []measureTarget
 	byPID     map[int]map[int]int
@@ -1197,6 +1199,7 @@ type cmdMeasured struct {
 	wslVM     *wslVMInfo
 	vmRead    bool
 	vmPIDs    []int
+	vmPeriod  uint64
 	window    *wslStartWindow
 }
 
@@ -1654,7 +1657,16 @@ type owner struct {
 	// from this one only when that reading failed, so a failed read never
 	// shows the VM's unattributed VRAM as free. The VM is read only while a wsl
 	// process is live; with none live the remainder is not charged at all.
-	vmVRAM map[int]int
+	//
+	// It is the reading of the CURRENT period of WSL activity (a stretch in
+	// which at least one wsl generation is live) only: once none is live it is
+	// forgotten (endVMPeriodIfIdle), so an earlier period's figure is never
+	// charged in a later one. vmPeriod counts the periods that ended; a
+	// measurement carries the count it was dispatched under
+	// (cmdMeasured.vmPeriod), and one that lands in a later period does not
+	// record its reading here.
+	vmVRAM   map[int]int
+	vmPeriod uint64
 	// wslAttrib is each wsl generation's attributed VRAM (per GPU, MB): the
 	// VM's growth across its start, recorded when its window closes
 	// (settleWSLWindow) and deleted when it exits (noteWSLExit). A generation
@@ -3756,6 +3768,7 @@ func (o *owner) dispatchMeasurement() {
 	if wslUnits != nil {
 		env = wslHelperEnv(o.getenv, -1)
 	}
+	vmPeriod := o.vmPeriod
 	o.measuring = true
 	// Tracked in m.wg like every other goroutine the owner spawns, so Close
 	// cannot return while a measurer is still running (which would let a
@@ -3779,7 +3792,7 @@ func (o *owner) dispatchMeasurement() {
 		// in-process reads and returns at once, the WSL sampler and the VRAM
 		// measurer 2 s each), and one cmdMeasured keeps the
 		// one-measurement-outstanding invariant.
-		c := cmdMeasured{targets: targets, window: window}
+		c := cmdMeasured{targets: targets, window: window, vmPeriod: vmPeriod}
 		if ramMeasure != nil {
 			c.ramByPID = ramMeasure(pids)
 		}
@@ -4060,7 +4073,9 @@ func (o *owner) applyMeasurement(c cmdMeasured) {
 	if c.wslVM != nil {
 		o.wslVM, o.wslVMHeldMB = c.wslVM, heldMB
 	}
-	if c.vmRead {
+	// A reading taken in a period of WSL activity that has ended since is not
+	// this period's last good one (owner.vmVRAM).
+	if c.vmRead && c.vmPeriod == o.vmPeriod {
 		if vm := sumVMVRAM(c.byPID, c.vmPIDs); !o.vmReadingFailed(c.vmPIDs, vm) {
 			o.vmVRAM = vm
 		}
@@ -4182,8 +4197,12 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// here, fresh, like every other figure this snapshot charges (wsl_vram.go).
 	// A reading that is detectably not the VM's falls back to the last good one
 	// (owner.vmVRAM): charged from a failed read, the remainder would vanish and
-	// the VM's unattributed VRAM would read as free. With nothing wsl live the
-	// VM is not read and charges nothing.
+	// the VM's unattributed VRAM would read as free. That last good reading is
+	// this period's: with nothing wsl live the VM is not read, charges nothing,
+	// and its last reading is forgotten (endVMPeriodIfIdle), so a later period
+	// whose first reading fails -- a CPU-only wsl generation whose VM is still
+	// booting has no worker yet -- falls back to nothing, which is what a booting
+	// VM holds, never to an earlier period's figure.
 	var measured map[int]map[int]int
 	var vmPIDs []int
 	vmRead := false
@@ -4204,6 +4223,8 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		} else {
 			o.vmVRAM = vmVRAM
 		}
+	} else {
+		o.endVMPeriodIfIdle()
 	}
 	// Whether host RAM is MEASURABLE at all decides how long the cold-start
 	// interlock below can safely hold. With a RAM measurer a bootstrapping
@@ -5120,6 +5141,11 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		o.noteWSLExit(proc)
 	}
 	st.proc = nil
+	if proc.wslUnit != "" {
+		// The last wsl generation's exit ends the period of WSL activity: its
+		// VM reading is not the next period's (endVMPeriodIfIdle).
+		o.endVMPeriodIfIdle()
+	}
 	st.rpcProtocol = ""
 	st.relaunchDeferred = false
 	// A hold and a reservation are claims on a running member: with its process
