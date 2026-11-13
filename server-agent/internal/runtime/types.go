@@ -219,10 +219,12 @@ const (
 )
 
 // wslDistroPattern is what a WSL distribution name may look like: ASCII
-// letters, digits, '.', '_' and '-', 1 to 64 characters. WSL's own names
-// (Ubuntu-24.04, Debian, docker-desktop) fit, and nothing that could be read
-// as an option, a path or a shell word does.
-var wslDistroPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+// letters, digits, '.', '_' and '-', 1 to 64 characters, the first a letter or
+// a digit. WSL's own names (Ubuntu-24.04, Debian, docker-desktop) fit, and
+// nothing that could be read as an option (a leading '-' after wsl.exe -d), a
+// path or a shell word does. The gateway's runtimeSpecWSLDistroPattern is the
+// same rule.
+var wslDistroPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // IsWSL reports whether the spec runs inside a WSL2 distribution: its
 // execution block says "wsl" and names a distro.

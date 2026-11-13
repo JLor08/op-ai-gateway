@@ -1022,7 +1022,7 @@ sentinel is a breaking API change that must be applied in both places):
 | `runtime_spec.not_found` | 404 |
 | `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
-| `runtime_spec.execution_mode_invalid`, `.wsl_distro_invalid`, `.wsl_path_not_linux`, `.wsl_cluster_unsupported` | 400 — the execution mode (#381): an `execution_mode` other than `native`/`wsl` (`""` stores `native`); for `wsl`, a `wsl_distro` that is empty or not a plain name (`^[A-Za-z0-9._-]{1,64}$`), a `binary` or non-empty `work_dir` that is not a Linux absolute path (no leading `/`), and a spec that is an RPC cluster head (`cluster_enabled`). Checked in that order, as the last of the request's own shape checks |
+| `runtime_spec.execution_mode_invalid`, `.wsl_distro_invalid`, `.wsl_path_not_linux`, `.wsl_cluster_unsupported` | 400 — the execution mode (#381): an `execution_mode` other than `native`/`wsl` (`""` stores `native`); for `wsl`, a `wsl_distro` that is empty or not a plain name (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), a `binary` or non-empty `work_dir` that is not a Linux absolute path (no leading `/`), and a spec that is an RPC cluster head (`cluster_enabled`). Checked in that order, as the last of the request's own shape checks |
 | `runtime_spec.instances_invalid`, `runtime_spec.instances_need_ephemeral_port` | 400 — the instance settings (#340): `min_instances` or `max_instances` above 64 (`MaxInstanceIndex` + 1; `instance_parallelism` has no upper bound), or `min_instances` above a set `max_instances`; `replicable` with a fixed `listen_port`. A negative `min_instances`, `max_instances` or `instance_parallelism` is `runtime_spec.tuning_invalid` |
 | `runtime_coresidency.pair_invalid`, `runtime_coresidency.mode_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
@@ -1104,7 +1104,7 @@ request's own shape checks (`validateRuntimeSpecRequest`) and so runs **last**
 among them, so it cannot change the answer to a body that was already invalid for
 an older reason; the checks that read the store (a cluster head's, [RPC cluster
 save refusals](#rpc-cluster-save-refusals)) still follow it. For `wsl`, in this order:
-`wsl_distro` (trimmed) must match `^[A-Za-z0-9._-]{1,64}$`
+`wsl_distro` (trimmed) must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`
 (`runtime_spec.wsl_distro_invalid`); `binary` must start with `/`, and a
 non-empty `work_dir` too, since both name paths inside the distro
 (`runtime_spec.wsl_path_not_linux`; `binary` must still pass the absolute-path

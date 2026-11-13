@@ -37,8 +37,11 @@ func TestParseConfigDropsInvalidExecution(t *testing.T) {
 		"empty distro":      `,"execution":{"mode":"wsl","wsl":{"distro":""}}`,
 		"distro with space": `,"execution":{"mode":"wsl","wsl":{"distro":"Ubuntu 24.04"}}`,
 		"distro too long":   `,"execution":{"mode":"wsl","wsl":{"distro":"` + strings.Repeat("a", 65) + `"}}`,
-		"rpc member":        `,` + rpc + `,"execution":{"mode":"wsl","wsl":{"distro":"Ubuntu"}}`,
-		"cluster head":      `,"cluster":{"endpoints":[{"address":"a:1","device_count":1}],"transport":"direct","network":"lan"},"execution":{"mode":"wsl","wsl":{"distro":"Ubuntu"}}`,
+		// wsl.exe would read a leading '-' as an option of its own.
+		"distro like an option":    `,"execution":{"mode":"wsl","wsl":{"distro":"-d"}}`,
+		"distro with a dash first": `,"execution":{"mode":"wsl","wsl":{"distro":"-Ubuntu"}}`,
+		"rpc member":               `,` + rpc + `,"execution":{"mode":"wsl","wsl":{"distro":"Ubuntu"}}`,
+		"cluster head":             `,"cluster":{"endpoints":[{"address":"a:1","device_count":1}],"transport":"direct","network":"lan"},"execution":{"mode":"wsl","wsl":{"distro":"Ubuntu"}}`,
 	}
 	for name, extra := range cases {
 		t.Run(name, func(t *testing.T) {

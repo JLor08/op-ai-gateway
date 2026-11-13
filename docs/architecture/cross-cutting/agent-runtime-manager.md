@@ -2169,7 +2169,9 @@ basename of the binary, so `…/bin/vllm` resolves to `vllm`.
   Warn, the way it drops an unknown `kind` (`invalidExecutionReason`, beside
   `withoutInvalidKinds`): an unknown mode (falling back to native would launch it
   somewhere the gateway did not mean), a `wsl` block without a distro or with a
-  distro outside `^[A-Za-z0-9._-]{1,64}$`, and a `wsl` spec that is an
+  distro outside `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` (the gateway's rule too; the
+  first character is never `-`, so `wsl.exe -d` cannot read the name as an
+  option), and a `wsl` spec that is an
   `rpc_server` member or a cluster head (the cluster transports bind and dial host
   addresses a process in the WSL VM does not share). `""` and `native` both read
   as native.

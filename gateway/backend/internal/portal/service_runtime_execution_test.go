@@ -29,6 +29,11 @@ func TestPutRuntimeSpecExecutionValidation(t *testing.T) {
 		{"unknown mode", func(r *PutRuntimeSpecRequest) { r.ExecutionMode = "docker" }, ErrRuntimeSpecExecutionModeInvalid, "", ""},
 		{"wsl without a distro", func(r *PutRuntimeSpecRequest) { r.ExecutionMode = "wsl" }, ErrRuntimeSpecWSLDistroInvalid, "", ""},
 		{"wsl with a spaced distro", func(r *PutRuntimeSpecRequest) { r.ExecutionMode, r.WSLDistro = "wsl", "a b" }, ErrRuntimeSpecWSLDistroInvalid, "", ""},
+		{"wsl with an option-like distro", func(r *PutRuntimeSpecRequest) { r.ExecutionMode, r.WSLDistro = "wsl", "-d" }, ErrRuntimeSpecWSLDistroInvalid, "", ""},
+		{"wsl with a leading-dash distro", func(r *PutRuntimeSpecRequest) { r.ExecutionMode, r.WSLDistro = "wsl", "-Ubuntu" }, ErrRuntimeSpecWSLDistroInvalid, "", ""},
+		{"wsl with a 64 char distro", func(r *PutRuntimeSpecRequest) {
+			r.ExecutionMode, r.WSLDistro = "wsl", "a123456789a123456789a123456789a123456789a123456789a123456789a123"
+		}, nil, "wsl", "a123456789a123456789a123456789a123456789a123456789a123456789a123"},
 		{"wsl with a 65 char distro", func(r *PutRuntimeSpecRequest) {
 			r.ExecutionMode, r.WSLDistro = "wsl", "a123456789a123456789a123456789a123456789a123456789a123456789a1234"
 		}, ErrRuntimeSpecWSLDistroInvalid, "", ""},
