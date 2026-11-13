@@ -494,6 +494,35 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
   // (a spec that sets no work_dir still runs beside its binary either way).
   "runtime_allow_binary_dirs": false,
 
+  // Path of the wsl.exe the agent launches WSL2-hosted model processes through
+  // (a launch spec whose execution mode is "wsl"). Empty (the default) means
+  // C:\Program Files\WSL\wsl.exe on Windows and "WSL not configured"
+  // elsewhere, in which case every WSL spec is refused. Comes ONLY from this
+  // local file.
+  "runtime_wsl_exe": "",
+
+  // WSL distributions a spec may run in, matched exactly (for example
+  // "Ubuntu-24.04"). Empty (the default) refuses every WSL spec, like
+  // runtime_allowed_binaries -- it does not mean "any distro".
+  "runtime_wsl_allowed_distros": [],
+
+  // Absolute POSIX paths, INSIDE the distro, a WSL spec's binary must match
+  // exactly (for example "/home/ai/vllm/.venv/bin/vllm"). Separate from
+  // runtime_allowed_binaries, which is never consulted for a WSL spec. Empty
+  // (the default) refuses every WSL spec.
+  "runtime_wsl_allowed_binaries": [],
+
+  // Permitted POSIX "work_dir" prefixes inside the distro, with the same
+  // bare-or-trailing-"/*" subtree semantics as runtime_allowed_dirs. Empty
+  // (the default) permits any absolute work_dir; a spec without one runs
+  // beside its binary.
+  "runtime_wsl_allowed_dirs": [],
+
+  // The distro user every WSL process runs as (wsl.exe -u). No default: empty
+  // refuses every WSL spec. "root" is refused too -- the agent never hands a
+  // gateway-supplied command line or environment to a root process.
+  "runtime_wsl_user": "",
+
   // Where the last known-good runtime-config document from the gateway is
   // cached, so the agent can start (and keep) model processes before its first
   // successful gateway contact. Empty (the default) means
