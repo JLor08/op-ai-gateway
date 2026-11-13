@@ -49,6 +49,11 @@ const (
 	// no stream or outside the two audio.cpp emits, or a stream asking for wav; see
 	// validateSpeechRequest.
 	speechStreamUnsupported = "speech.stream_unsupported"
+	// speechReferenceAudioUnsupported is the code for a voice reference an sglang_omni
+	// target cannot be given safely: anything but an inline data: URL; see
+	// refuseServerLocalVoiceReference. Unlike the codes above it is decided after the
+	// route is resolved, because it depends on the target.
+	speechReferenceAudioUnsupported = "speech.reference_audio_unsupported"
 	// speechPcmUnavailable is the code for a one-shot request that asked for
 	// response_format "pcm" whose synthesized clip cannot be served as such: the mapped
 	// model's native format is not 16-bit mono PCM. Unlike the codes above it is a
@@ -379,7 +384,69 @@ func (s *Server) resolveSpeechTarget(w http.ResponseWriter, r *http.Request, tok
 		s.recordSpeechRoutingFailure(w, r, *token, req, raw, start, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
+	if err := refuseServerLocalVoiceReference(raw, target); err != nil {
+		slog.Debug("speech request rejected: voice reference is not inline",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+			"route_id", target.RouteID, "field", err.Message)
+		writeRequestError(w, err)
+		return routing.Target{}, false
+	}
 	return target, true
+}
+
+// refuseServerLocalVoiceReference refuses a voice reference an sglang_omni target
+// would resolve on its own: its ref_audio and references[].audio_path take a bare
+// path (read from the model host's working directory), a file:// path or a URL, and
+// sglang-omni authenticates nothing, so relaying one lets any gateway key holder read
+// a file on that host or make it fetch an arbitrary URL. Only an inline data: URL is
+// accepted. The rule applies to a target whose EFFECTIVE runtime spec type is
+// sglang_omni (target.LiveProgressSpecType, filled for an agent-launched child);
+// every other target is relayed unchanged. The message names the field and never the
+// value.
+func refuseServerLocalVoiceReference(raw []byte, target routing.Target) *inference.Error {
+	if target.LiveProgressSpecType != string(routing.RuntimeSpecTypeSGLangOmni) {
+		return nil
+	}
+	var body struct {
+		RefAudio   json.RawMessage `json:"ref_audio"`
+		References json.RawMessage `json:"references"`
+	}
+	_ = json.Unmarshal(raw, &body)
+	if !inlineVoiceReference(body.RefAudio) {
+		return speechReferenceError("ref_audio")
+	}
+	refs := bytes.TrimSpace(body.References)
+	if len(refs) > 0 && refs[0] == '{' {
+		refs = append(append([]byte{'['}, refs...), ']')
+	}
+	var list []struct {
+		AudioPath json.RawMessage `json:"audio_path"`
+	}
+	if json.Unmarshal(refs, &list) == nil {
+		for _, ref := range list {
+			if !inlineVoiceReference(ref.AudioPath) {
+				return speechReferenceError("references[].audio_path")
+			}
+		}
+	}
+	return nil
+}
+
+// inlineVoiceReference reports whether a reference field is absent (or null) or a
+// string holding a data: URL.
+func inlineVoiceReference(v json.RawMessage) bool {
+	if len(v) == 0 || string(bytes.TrimSpace(v)) == "null" {
+		return true
+	}
+	var s string
+	if json.Unmarshal(v, &s) != nil {
+		return false
+	}
+	return len(s) >= len("data:") && strings.EqualFold(s[:len("data:")], "data:")
+}
+
+func speechReferenceError(field string) *inference.Error {
+	return &inference.Error{Code: speechReferenceAudioUnsupported, Message: field + " must be an inline data: URL; this model server cannot read a server-side path or fetch a URL"}
 }
 
 // relaySpeech relays an already-gated speech request via proxyNative, following

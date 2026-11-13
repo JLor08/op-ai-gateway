@@ -149,6 +149,7 @@ func TestSpeechErrorCodesAreStable(t *testing.T) {
 		speechInputRequired:             "speech.input_required",
 		speechResponseFormatUnsupported: "speech.response_format_unsupported",
 		speechStreamUnsupported:         "speech.stream_unsupported",
+		speechReferenceAudioUnsupported: "speech.reference_audio_unsupported",
 		speechPcmUnavailable:            "speech.pcm_unavailable",
 	} {
 		if got != want {
@@ -598,6 +599,13 @@ func TestSpeechRunAsWithoutPortalIsRefused(t *testing.T) {
 // request is served.
 func newServerAgentSpeechSpecTestServer(t *testing.T, prov provider.Client, specFlavors []string) *Server {
 	t.Helper()
+	return newTypedServerAgentSpeechSpecTestServer(t, prov, specFlavors, "")
+}
+
+// newTypedServerAgentSpeechSpecTestServer is newServerAgentSpeechSpecTestServer with
+// the spec's explicit Type set.
+func newTypedServerAgentSpeechSpecTestServer(t *testing.T, prov provider.Client, specFlavors []string, specType routing.RuntimeSpecType) *Server {
+	t.Helper()
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
@@ -620,7 +628,7 @@ func newServerAgentSpeechSpecTestServer(t *testing.T, prov provider.Client, spec
 	if err := routeStore.UpsertMappingCapabilities(ctx, "route-agent-audio", []routing.CapabilityRow{{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now}}); err != nil {
 		t.Fatalf("UpsertMappingCapabilities: %v", err)
 	}
-	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-agent-audio", MappingID: "route-agent-audio", APIFlavors: specFlavors, ResponsesMode: routing.EndpointModeDisabled, MessagesMode: routing.EndpointModeDisabled, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-agent-audio", MappingID: "route-agent-audio", Type: string(specType), APIFlavors: specFlavors, ResponsesMode: routing.EndpointModeDisabled, MessagesMode: routing.EndpointModeDisabled, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("UpsertRuntimeSpec: %v", err)
 	}
 	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-agent-audio", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
@@ -1391,4 +1399,84 @@ func TestSpeechPCMRefusesAWAVWithoutAContentLength(t *testing.T) {
 	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
 		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
 	}
+}
+
+// A speech request routed to an sglang_omni target may carry a voice reference only
+// inline: sglang-omni reads a bare ref_audio path from ITS OWN working directory and
+// fetches a URL, so relaying one would let a gateway key holder read a file on the
+// model host or make it request an arbitrary URL.
+func TestSpeechToSGLangOmniAcceptsOnlyInlineVoiceReferences(t *testing.T) {
+	const inline = "data:audio/wav;base64,UklGRg=="
+	cases := []struct {
+		name    string
+		body    string
+		refused bool
+	}{
+		{"inline ref_audio", `{"model":"agent-voice","input":"hi","ref_audio":"` + inline + `"}`, false},
+		{"inline references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"` + inline + `","text":"x"}]}`, false},
+		{"no reference", `{"model":"agent-voice","input":"hi"}`, false},
+		{"null ref_audio", `{"model":"agent-voice","input":"hi","ref_audio":null}`, false},
+		{"relative path", `{"model":"agent-voice","input":"hi","ref_audio":"tests/data/x.wav"}`, true},
+		{"absolute path", `{"model":"agent-voice","input":"hi","ref_audio":"/etc/passwd"}`, true},
+		{"file url", `{"model":"agent-voice","input":"hi","ref_audio":"file:///x.wav"}`, true},
+		{"https url", `{"model":"agent-voice","input":"hi","ref_audio":"https://host/x.wav"}`, true},
+		{"empty string", `{"model":"agent-voice","input":"hi","ref_audio":""}`, true},
+		{"non-string", `{"model":"agent-voice","input":"hi","ref_audio":["` + inline + `"]}`, true},
+		{"path in references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd"}]}`, true},
+		{"file url in references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"` + inline + `"},{"audio_path":"file:///x.wav"}]}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: "RIFF"}
+			srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIAudio}, routing.RuntimeSpecTypeSGLangOmni)
+
+			rec := postSpeech(t, srv, tc.body)
+
+			if !tc.refused {
+				if rec.Code != http.StatusOK || prov.proxyCalls != 1 {
+					t.Fatalf("status = %d, ProxyNative calls = %d, want a relayed 200; body = %s", rec.Code, prov.proxyCalls, rec.Body.String())
+				}
+				return
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "speech.reference_audio_unsupported")
+			if prov.proxyCalls != 0 {
+				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+			}
+			for _, leak := range []string{"passwd", "x.wav", "tests/data", "host"} {
+				if strings.Contains(rec.Body.String(), leak) {
+					t.Fatalf("refusal echoes the value (%q): %s", leak, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+// Every other target is relayed unchanged: the rule belongs to sglang_omni, not to
+// the speech endpoint.
+func TestSpeechToOtherTargetsRelaysReferencesUnchanged(t *testing.T) {
+	body := `{"model":"agent-voice","input":"hi","ref_audio":"/etc/passwd","references":[{"audio_path":"file:///x.wav"}]}`
+	for _, specType := range []routing.RuntimeSpecType{"", routing.RuntimeSpecTypeSGLang, routing.RuntimeSpecTypeLlamaCpp} {
+		t.Run("agent "+string(specType), func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: "RIFF"}
+			srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIAudio}, specType)
+			rec := postSpeech(t, srv, body)
+			if rec.Code != http.StatusOK || prov.proxyCalls != 1 || string(prov.gotBody) != body {
+				t.Fatalf("status = %d, calls = %d, body %q, want a verbatim relay", rec.Code, prov.proxyCalls, prov.gotBody)
+			}
+		})
+	}
+	t.Run("static application", func(t *testing.T) {
+		up, calls := newSpeechUpstream(t, speechTestWAV())
+		srv, _ := newSpeechCapableTestServer(t, up.URL)
+		rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","ref_audio":"/etc/passwd"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		}
+		if got := <-calls; !strings.Contains(string(got.body), "/etc/passwd") {
+			t.Fatalf("upstream body = %q, want the field relayed", got.body)
+		}
+	})
 }
