@@ -152,6 +152,7 @@ func TestParseVLLMVersion(t *testing.T) {
 		{"0.11.0\n", "0.11.0", true},
 		{"INFO 11-13 10:00:00 [__init__.py:216] Automatically detected platform cuda.\n0.11.1rc2.dev123+gabc1234\n", "0.11.1rc2.dev123+gabc1234", true},
 		{"v0.6.3.post1\nWARNING something\n", "0.6.3.post1", true},
+		{"0.9.9\nINFO another line\n1.0.0\nWARNING tail\n", "1.0.0", true}, // two version-shaped lines: the last wins
 		{"Traceback ...\nModuleNotFoundError: No module named 'vllm'\n", "", false},
 	}
 	for _, c := range cases {
