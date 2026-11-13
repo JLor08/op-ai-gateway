@@ -12519,7 +12519,8 @@ on.
 - **Wire and negotiation.** One MINOR bump, `ServerAgent` `0.18.2` → `0.19.0`. Mixed fleets need no upgrade order: an older agent never receives a
   `wsl` spec, and an older gateway never sends the block.
 - **Portal.** An execution selector (shown where the agent declares the feature, or the spec is already `wsl`), a distro field, Linux-path labels,
-  a warning when the agent lacks the feature, and a WSL marker with "VRAM attributed from the WSL VM" beside an attributed figure.
+  a warning when the agent lacks the feature, an **Execution** column in the runtime-spec table (Native / WSL2 with the distro; never in the
+  model-mapping table, which carries capabilities and speeds only), and the caption "VRAM attributed from the WSL VM" beside a measured figure.
 
 → [Agent-Managed Model Runtime §3.8](cross-cutting/agent-runtime-manager.md#38-execution-modes-wsl2),
 [§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
