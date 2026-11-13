@@ -2321,9 +2321,9 @@ agent-local paths out of what does.
 
 **What the log view shows.** The runtime log is `wsl.exe`'s stdout and stderr,
 which carry the Linux process's own streams. The resolved command (§14.7) reports
-the `wsl.exe` path as the binary, the **whole** wrapper argv with the operator's
-own arguments masked at their shifted positions (so the distro after `-d` and
-`runtime_wsl_user` after `-u`), the Linux work dir, and the environment including
+the `wsl.exe` path as the binary, the **whole** wrapper argv (the distro after
+`-d` and `runtime_wsl_user` after `-u` included), with the operator's own secret
+arguments masked at their shifted positions, the Linux work dir, and the environment including
 what the launcher added (`WSLENV` among it).
 
 #### Lifecycle mapping
