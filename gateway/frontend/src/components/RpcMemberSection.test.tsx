@@ -317,16 +317,18 @@ describe('RpcMemberSection binary picker', () => {
         rpcBinary,
         {
           ...rpcBinary,
-          path: 'wsl://Ubuntu-24.04/home/ai/rpc-server',
+          path: 'wsl://Ubuntu-24.04/opt/llama/rpc-server',
           execution: 'wsl',
           distro: 'Ubuntu-24.04',
-          exec_path: '/home/ai/rpc-server',
+          exec_path: '/opt/llama/rpc-server',
         },
       ],
     });
     fireEvent.click(await screen.findByRole('button', { name: t.rpcMemberAdd }));
     fireEvent.mouseDown(await screen.findByLabelText(t.rpcMemberBinary));
-    await screen.findByText('/opt/llama/rpc-server');
+    // Only the native row is offered: its path appears once, the WSL row's
+    // identical Linux path never does.
+    expect(await screen.findAllByText('/opt/llama/rpc-server')).toHaveLength(1);
     expect(screen.queryByText(/WSL2/)).toBeNull();
   });
 

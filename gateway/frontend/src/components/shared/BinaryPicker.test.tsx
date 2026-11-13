@@ -77,6 +77,14 @@ const wslDebian = bin({
   exec_path: '/home/ai/venv/bin/vllm',
 });
 
+const wslRpc = bin({
+  path: 'wsl://Ubuntu-24.04/opt/llama/rpc-server',
+  kind: 'rpc_server',
+  execution: 'wsl',
+  distro: 'Ubuntu-24.04',
+  exec_path: '/opt/llama/rpc-server',
+});
+
 describe('BinaryPicker WSL rows', () => {
   function WslHarness({
     kind,
@@ -95,7 +103,17 @@ describe('BinaryPicker WSL rows', () => {
         t={t}
         kind={kind}
         value={value}
-        binaries={[bin({}), wslVllm, wslDebian]}
+        binaries={[
+          bin({}),
+          bin({
+            path: '/opt/old/rpc-server',
+            kind: 'rpc_server',
+            exec_path: '/opt/old/rpc-server',
+          }),
+          wslVllm,
+          wslDebian,
+          wslRpc,
+        ]}
         onChange={(v) => {
           setValue(v);
           onValue(v);
@@ -121,12 +139,19 @@ describe('BinaryPicker WSL rows', () => {
     const onSelect = vi.fn();
     render(<WslHarness kind="llama_server" onSelect={onSelect} onValue={() => {}} />);
     fireEvent.change(screen.getByLabelText('Binary'), { target: { value: '/x/vllm' } });
+    // Even typing exactly an inventory row's Linux path is free text.
+    fireEvent.change(screen.getByLabelText('Binary'), {
+      target: { value: '/home/ai/venv/bin/vllm' },
+    });
     expect(onSelect).not.toHaveBeenCalled();
   });
 
   it('never offers a WSL row to the rpc_server picker', () => {
     render(<WslHarness kind="rpc_server" onSelect={() => {}} onValue={() => {}} />);
     fireEvent.mouseDown(screen.getByLabelText('Binary'));
+    // A native rpc_server row is still offered, so the list is open.
+    expect(screen.getByText('/opt/old/rpc-server')).toBeTruthy();
+    expect(screen.queryByText('/opt/llama/rpc-server')).toBeNull();
     expect(screen.queryByText(/WSL2/)).toBeNull();
   });
 });
