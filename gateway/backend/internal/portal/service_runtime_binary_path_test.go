@@ -214,14 +214,18 @@ func TestRuntimeSpecBinaryContradictsOS(t *testing.T) {
 
 // TestRuntimeWarningsBinaryPathOSMismatch drives the real warnings endpoint
 // through all three states an operator can be in: no telemetry at all, a
-// contradicting OS, and a matching OS.
+// contradicting OS, and a matching OS. A wsl spec's binary is a Linux path
+// inside the distro, so it never contradicts the windows host the agent
+// reports.
 func TestRuntimeWarningsBinaryPathOSMismatch(t *testing.T) {
 	cases := []struct {
 		name   string
 		binary string
 		// reportedOS "" means: never upsert a telemetry row at all.
 		reportedOS string
-		want       bool
+		// wsl puts the spec in execution mode "wsl" (distro Ubuntu-24.04).
+		wsl  bool
+		want bool
 	}{
 		{name: "windows path on linux server", binary: `C:\llama\llama-server.exe`, reportedOS: "linux", want: true},
 		{name: "posix path on windows server", binary: `/opt/llama/llama-server`, reportedOS: "windows", want: true},
@@ -229,6 +233,7 @@ func TestRuntimeWarningsBinaryPathOSMismatch(t *testing.T) {
 		{name: "posix path on linux server", binary: `/opt/llama/llama-server`, reportedOS: "linux", want: false},
 		{name: "windows path, agent never reported", binary: `C:\llama\llama-server.exe`, reportedOS: "", want: false},
 		{name: "posix path, agent never reported", binary: `/opt/llama/llama-server`, reportedOS: "", want: false},
+		{name: "wsl spec on windows server", binary: `/home/ai/vllm-env/bin/vllm`, reportedOS: "windows", wsl: true, want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -252,7 +257,11 @@ func TestRuntimeWarningsBinaryPathOSMismatch(t *testing.T) {
 			// Enabled:false on purpose -- the mismatch advisory must fire for
 			// a spec that has not been enabled yet, which is the state an
 			// operator is in while filling the form out.
-			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{Binary: tc.binary, Enabled: false}); err != nil {
+			req := PutRuntimeSpecRequest{Binary: tc.binary, Enabled: false}
+			if tc.wsl {
+				req.ExecutionMode, req.WSLDistro = "wsl", "Ubuntu-24.04"
+			}
+			if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, req); err != nil {
 				t.Fatalf("PutRuntimeSpec: %v", err)
 			}
 			warnings, err := svc.RuntimeWarnings(ctx, ownerToken(), app.ID)

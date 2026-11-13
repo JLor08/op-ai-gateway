@@ -410,7 +410,8 @@ so a spec's live figure reaches the portal on the next frame and a frame that
 measured nothing clears it; it does **not** stamp `measured_at`, which stays the
 per-GPU watermark, so there is no RAM counterpart of it. The portal's RAM column takes
 `max(live, durable, estimate)` and falls back to the durable spec value when there is no
-live figure
+live figure; the per-GPU and VRAM-total cells apply the same rule per card to the
+frame's `gpus[]`
 ([Agent-Managed Model Runtime
 §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
 A measured `0` or an absent key is dropped from both homes and never zeroes a stored

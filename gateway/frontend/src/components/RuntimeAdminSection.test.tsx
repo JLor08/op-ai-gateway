@@ -1002,6 +1002,86 @@ describe('RuntimeAdminSection launch specs list', () => {
   // joins its status row through its own `id`, the key the stream carries as
   // spec_id. Its own describe, not more rows in the one above: the list pages
   // at 10 rows.
+  describe('live VRAM in the GPU and VRAM columns', () => {
+    // The spec list reads each spec once; the agent's measurement is written
+    // back afterwards. Like the RAM column, the GPU columns therefore take the
+    // live status frame into the max() rule, so a measurement shows without a
+    // page reload -- the case a wsl spec hits first, since its VRAM is only
+    // known once the start window settles.
+    const vramSpecs = {
+      map_wsl_live: makeSpec({
+        configured: true,
+        mapping_id: 'map_wsl_live',
+        id: 'spec_wsl_live',
+        execution_mode: 'wsl',
+        wsl_distro: 'Ubuntu-24.04',
+        gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+      }),
+      map_native_under: makeSpec({
+        configured: true,
+        mapping_id: 'map_native_under',
+        id: 'spec_native_under',
+        gpus: [{ index: 0, vram_estimate_mb: 4000, vram_measured_mb: 5000 }],
+      }),
+      map_other_index: makeSpec({
+        configured: true,
+        mapping_id: 'map_other_index',
+        id: 'spec_other_index',
+        gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+      }),
+    };
+    const vramFrame = [
+      makeStatus({ spec_id: 'spec_wsl_live', gpus: [{ index: 0, vram_measured_mb: 9000 }] }),
+      makeStatus({ spec_id: 'spec_native_under', gpus: [{ index: 0, vram_measured_mb: 3000 }] }),
+      // A card the spec does not declare adds nothing to any row.
+      makeStatus({ spec_id: 'spec_other_index', gpus: [{ index: 1, vram_measured_mb: 7000 }] }),
+    ];
+
+    function renderVram(statusRows: RuntimeStatus[] = vramFrame) {
+      return renderSection({
+        mappings: Object.keys(vramSpecs).map((id) =>
+          makeMapping({ id, gateway_model_name: `gw-${id}` }),
+        ),
+        specsByMappingId: vramSpecs,
+        statusRows,
+      });
+    }
+
+    async function expectCell(rowKey: string, column: string, text: string) {
+      await waitFor(() =>
+        expect(cellForColumn(`gw-${rowKey}`, column)).toHaveTextContent(new RegExp(`^${text}`)),
+      );
+    }
+
+    it('shows a live measurement of a wsl spec in the GPU and VRAM columns before any write-back', async () => {
+      renderVram();
+      await expectCell('map_wsl_live', t.runtimeSpecGpus, '0: 9000 MB');
+      await expectCell('map_wsl_live', t.runtimeSpecVramTotal, '9000 MB');
+      expect(cellForColumn('gw-map_wsl_live', t.runtimeSpecVramTotal)).toHaveTextContent(
+        t.runtimeStatusVRAMFromVM,
+      );
+    });
+
+    it('keeps the max rule when the live figure is the smaller one', async () => {
+      renderVram();
+      await expectCell('map_native_under', t.runtimeSpecGpus, '0: 5000 MB');
+      await expectCell('map_native_under', t.runtimeSpecVramTotal, '5000 MB');
+    });
+
+    it('ignores a live figure for a card the spec does not declare', async () => {
+      renderVram();
+      await expectCell('map_other_index', t.runtimeSpecGpus, '0: 0 MB');
+      await expectCell('map_other_index', t.runtimeSpecVramTotal, '—');
+    });
+
+    it('drops back to the durable figure when a frame stops carrying VRAM', async () => {
+      const { stream } = renderVram();
+      await expectCell('map_wsl_live', t.runtimeSpecGpus, '0: 9000 MB');
+      stream.push([makeStatus({ spec_id: 'spec_wsl_live', state: 'stopped' })]);
+      await expectCell('map_wsl_live', t.runtimeSpecGpus, '0: 0 MB');
+    });
+  });
+
   describe('live RAM in the RAM column', () => {
     // Durable figures are 5000 measured / 4000 estimated unless stated.
     const liveSpecs = {
