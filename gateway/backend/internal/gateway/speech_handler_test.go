@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -1511,5 +1513,97 @@ func TestSpeechReferenceRefusalNamesTheField(t *testing.T) {
 		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), field+" must be") {
 			t.Errorf("%s: status %d body %s, want 400 naming the field", field, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// captureCompleteProvider counts the chat requests that reach the provider and keeps the
+// last one.
+type captureCompleteProvider struct {
+	recordingProxyProvider
+	completes int
+	last      inference.Request
+}
+
+func (p *captureCompleteProvider) Complete(ctx context.Context, t routing.Target, req inference.Request) (provider.Response, error) {
+	p.completes++
+	p.last = req
+	return p.recordingProxyProvider.Complete(ctx, t, req)
+}
+
+func (p *captureCompleteProvider) CompleteStream(ctx context.Context, t routing.Target, req inference.Request, emit provider.StreamEmit) error {
+	p.completes++
+	p.last = req
+	return p.recordingProxyProvider.CompleteStream(ctx, t, req, emit)
+}
+
+// A chat request routed to an sglang_omni target carries images only inline: the
+// upstream reads a bare image_url path from the model host and fetches any URL.
+func TestChatToSGLangOmniAcceptsOnlyInlineImages(t *testing.T) {
+	chat := func(url string) string {
+		return `{"model":"agent-voice","messages":[{"role":"user","content":[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"` + url + `"}}]}]}`
+	}
+	cases := []struct {
+		name, url string
+		specType  routing.RuntimeSpecType
+		refused   bool
+	}{
+		{"data url", "data:image/png;base64,iVBORw0=", routing.RuntimeSpecTypeSGLangOmni, false},
+		{"upper-case DATA", "DATA:image/png;base64,iVBORw0=", routing.RuntimeSpecTypeSGLangOmni, false},
+		{"bare path", "/etc/passwd", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"relative path", "tests/secret.png", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"file url", "file:///etc/passwd", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"https url", "https://169.254.169.254/x.png", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"path to a vllm target", "/etc/passwd", routing.RuntimeSpecTypeVLLM, false},
+		{"url to an untyped agent", "https://host/x.png", "", false},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("%s stream=%v", tc.name, stream), func(t *testing.T) {
+				prov := &captureCompleteProvider{recordingProxyProvider: recordingProxyProvider{respBody: "x"}}
+				srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, tc.specType)
+				body := chat(tc.url)
+				if stream {
+					body = strings.Replace(body, `"model"`, `"stream":true,"model"`, 1)
+				}
+				rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"})
+				if !tc.refused {
+					if rec.Code != http.StatusOK || prov.completes != 1 {
+						t.Fatalf("status = %d, provider calls = %d, want a relayed 200; body = %s", rec.Code, prov.completes, rec.Body.String())
+					}
+					return
+				}
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+				}
+				requireErrorCode(t, rec.Body.String(), "chat.media_url_unsupported")
+				if prov.completes != 0 {
+					t.Fatalf("provider calls = %d, want 0", prov.completes)
+				}
+				if !strings.Contains(rec.Body.String(), "image_url.url") {
+					t.Fatalf("refusal does not name the field: %s", rec.Body.String())
+				}
+				for _, leak := range []string{"passwd", "secret.png", "169.254", "host"} {
+					if strings.Contains(rec.Body.String(), leak) {
+						t.Fatalf("refusal echoes the value (%q): %s", leak, rec.Body.String())
+					}
+				}
+			})
+		}
+	}
+}
+
+// The upstream's top-level audios, images and videos fields (local paths or URLs) never
+// reach the provider: the chat body is parsed into a typed request and rebuilt from known
+// fields only.
+func TestChatToSGLangOmniDropsTopLevelMediaFields(t *testing.T) {
+	prov := &captureCompleteProvider{recordingProxyProvider: recordingProxyProvider{respBody: "x"}}
+	srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, routing.RuntimeSpecTypeSGLangOmni)
+	body := `{"model":"agent-voice","audios":["/etc/passwd"],"images":["https://x/y.png"],"videos":["/v.mp4"],"messages":[{"role":"user","content":"hi"}]}`
+	rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"})
+	if rec.Code != http.StatusOK || prov.completes != 1 {
+		t.Fatalf("status = %d, calls = %d; body %s", rec.Code, prov.completes, rec.Body.String())
+	}
+	if b, _ := json.Marshal(prov.last); strings.Contains(string(b), "passwd") || strings.Contains(string(b), "v.mp4") {
+		t.Fatalf("the provider request carries the top-level media fields: %s", b)
 	}
 }

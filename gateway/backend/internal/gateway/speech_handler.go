@@ -487,6 +487,11 @@ func inlineVoiceReference(v json.RawMessage) bool {
 	if json.Unmarshal(v, &s) != nil {
 		return false
 	}
+	return isDataURL(s)
+}
+
+// isDataURL reports whether s is an inline data: URL (the scheme is case-insensitive).
+func isDataURL(s string) bool {
 	return len(s) >= len("data:") && strings.EqualFold(s[:len("data:")], "data:")
 }
 

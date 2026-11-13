@@ -1106,6 +1106,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, errTranscriptionTooLarge) {
 		message = fmt.Sprintf("the transcription is too large for this model's server: its request limit is %d MiB, counted after the model name is prepared", agentRouterMaxBodyBytes>>20)
 	}
+	if errors.Is(err, errMediaURLUnsupported) {
+		message = "image_url.url must be an inline data: URL; this model server cannot read a server-side path or fetch a URL"
+	}
 	if errors.Is(err, errTranscriptionLiveBusy) {
 		message = "a live transcription session is already active for this model; retry once it ends"
 	}
@@ -1169,6 +1172,10 @@ func completionHTTPStatus(err error) int {
 	}
 	if errors.Is(err, errTranscriptionTooLarge) {
 		return http.StatusRequestEntityTooLarge
+	}
+	// An image reference an sglang_omni target cannot take safely (errMediaURLUnsupported).
+	if errors.Is(err, errMediaURLUnsupported) {
+		return http.StatusBadRequest
 	}
 	// A transcription refused because a live session holds its instance's one slot
 	// (errTranscriptionLiveBusy): the same transient 503 the live bearer path's busy
@@ -1272,6 +1279,8 @@ func completionErrorCode(err error) string {
 		return codeTranscriptionUnavailable
 	case errors.Is(err, errTranscriptionTooLarge):
 		return codeRequestBodyTooLarge
+	case errors.Is(err, errMediaURLUnsupported):
+		return codeMediaURLUnsupported
 	case errors.Is(err, errTranscriptionLiveBusy):
 		return liveBearerBusyCode
 	case errors.Is(err, routing.ErrNoHealthyHost):

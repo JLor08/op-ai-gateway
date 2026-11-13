@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/auth"
@@ -105,5 +106,44 @@ func (s *Server) resolveTranslateTarget(r *http.Request, token *auth.Token, req 
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
 		return routing.Target{}, routing.ErrNoModelRoute
 	}
+	if mediaURLsRefused(target, req) {
+		slog.Warn("inference request rejected: image_url is not inline for an sglang_omni target",
+			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
+			"server", s.serverName(target.ServerID), "route_id", target.RouteID, "field", "image_url.url")
+		return routing.Target{}, errMediaURLUnsupported
+	}
 	return target, nil
+}
+
+// errMediaURLUnsupported is the refusal of a request whose image reference an
+// sglang_omni target cannot be given safely; completionHTTPStatus answers it 400 with
+// codeMediaURLUnsupported. Like the other resolve sentinels it is recorded as a row
+// without an upstream call.
+var errMediaURLUnsupported = errors.New(codeMediaURLUnsupported)
+
+// codeMediaURLUnsupported is API surface: clients branch on it.
+const codeMediaURLUnsupported = "chat.media_url_unsupported"
+
+// mediaURLsRefused reports whether req carries an image whose URL is not an inline
+// data: URL while target's effective runtime spec type is sglang_omni. sglang-omni
+// reads a bare image_url path from the model host and fetches any URL (private and
+// metadata addresses included) and authenticates nothing, so only inline media is
+// relayed to it. It runs in resolveTranslateTarget, the one place every request that
+// reaches a provider as inference messages (chat, and the translated Responses and
+// Messages) passes after routing. Every other target is unchanged. The upstream's
+// top-level audios, images and videos fields never reach it: the chat body is parsed
+// into a typed request (compat.openAIChatRequest) and rebuilt from known fields only
+// (provider.OpenAICompatibleClient.Complete and streamRequestBody).
+func mediaURLsRefused(target routing.Target, req inference.Request) bool {
+	if target.LiveProgressSpecType != string(routing.RuntimeSpecTypeSGLangOmni) {
+		return false
+	}
+	for _, m := range req.Messages {
+		for _, p := range m.Content {
+			if p.Type == inference.ContentImage && !isDataURL(p.ImageURL) {
+				return true
+			}
+		}
+	}
+	return false
 }
