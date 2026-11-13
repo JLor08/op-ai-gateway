@@ -26,6 +26,14 @@ export const RUNTIME_STOP_FEATURE = 'runtime_stop';
  */
 export const RUNTIME_INSTANCES_FEATURE = 'runtime_instances';
 
+/**
+ * The agent feature naming the wsl execution mode (agent 0.19.0). The gateway
+ * stores a wsl spec for an agent that does not declare it but never pushes it,
+ * so the editor warns instead of letting the operator wait for a process that
+ * will never start.
+ */
+export const RUNTIME_EXEC_WSL_FEATURE = 'runtime_exec_wsl';
+
 /** The spec fields the plan reads. */
 export type RowPlanSpec = Pick<
   RuntimeSpec,

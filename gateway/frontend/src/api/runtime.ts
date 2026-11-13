@@ -210,6 +210,15 @@ export interface RuntimeSpec {
   // Only meaningful when set_visible_devices is on; default 'env'. Mirrors the
   // Go RuntimeSpecDTO.visible_devices_mode.
   visible_devices_mode: 'env' | 'args';
+  // Where the child runs: 'native' (a host process) or 'wsl' (inside a WSL2
+  // distro on a Windows agent). The gateway always serves one of the two on a
+  // GET; optional here, like the cluster fields, so existing RuntimeSpec
+  // fixtures compile unchanged. A wsl spec saved for an agent that does not
+  // declare runtime_exec_wsl is stored but never pushed to it.
+  execution_mode?: 'native' | 'wsl';
+  // The WSL distro a wsl spec runs in; empty for native specs and for wsl
+  // specs that use the agent's default distro.
+  wsl_distro?: string;
   gpus: RuntimeSpecGPU[];
   // This spec's resident HOST RAM demand, in MB. RAM is host-scoped, so both
   // numbers are single scalars on the spec -- not per-GPU rows like `gpus`

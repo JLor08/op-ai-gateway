@@ -161,6 +161,8 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     admin_state: '',
     set_visible_devices: false,
     visible_devices_mode: 'env',
+    execution_mode: 'native',
+    wsl_distro: '',
     gpus: [],
     ram_estimate_mb: 0,
     ram_measured_mb: 0,
@@ -1745,6 +1747,122 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.visible_devices_mode).toBe('env');
+  });
+
+  describe('wsl execution mode', () => {
+    const wslReport = makeReport({
+      agent_version: '0.19.0',
+      agent_features: ['runtime_manager', 'runtime_exec_wsl'],
+    });
+    const wslSpec = (over: Partial<RuntimeSpec> = {}) =>
+      makeSpec({
+        configured: true,
+        id: 'spec_1',
+        mapping_id: 'map_1',
+        binary: '/opt/llama/llama-server',
+        work_dir: '/opt/llama',
+        execution_mode: 'wsl',
+        wsl_distro: 'Ubuntu-24.04',
+        ...over,
+      });
+
+    it('defaults execution_mode to native', async () => {
+      const { putSpecs } = renderSection({ report: wslReport });
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+      fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+        target: { value: '/usr/bin/llama-server' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.execution_mode).toBe('native');
+      expect(putSpecs[0].body.wsl_distro).toBe('');
+    });
+
+    it('sends execution_mode and wsl_distro in the spec PUT body', async () => {
+      const { putSpecs } = renderSection({ report: wslReport });
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+      fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+      fireEvent.mouseDown(
+        await screen.findByRole('combobox', { name: t.runtimeSpecExecutionMode }),
+      );
+      fireEvent.click(await screen.findByRole('option', { name: t.runtimeSpecExecutionModeWSL }));
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecBinaryLinux), {
+        target: { value: '/opt/llama/llama-server' },
+      });
+      fireEvent.change(screen.getByLabelText(t.runtimeSpecWSLDistro), {
+        target: { value: ' Ubuntu-24.04 ' },
+      });
+      expect(screen.getByText(t.runtimeSpecWSLHint)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.execution_mode).toBe('wsl');
+      expect(putSpecs[0].body.wsl_distro).toBe('Ubuntu-24.04');
+    });
+
+    it('shows the execution-mode select only when the agent declares runtime_exec_wsl', async () => {
+      const spec = { map_1: makeSpec({ configured: true, id: 'spec_1', mapping_id: 'map_1' }) };
+      const first = renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: spec,
+        report: makeReport({ agent_version: '0.18.2', agent_features: ['runtime_manager'] }),
+      });
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+      await screen.findByLabelText(t.runtimeSpecBinary);
+      expect(
+        screen.queryByRole('combobox', { name: t.runtimeSpecExecutionMode }),
+      ).not.toBeInTheDocument();
+      first.unmount();
+
+      renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: spec,
+        report: wslReport,
+      });
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+      expect(
+        await screen.findByRole('combobox', { name: t.runtimeSpecExecutionMode }),
+      ).toBeInTheDocument();
+    });
+
+    it('keeps a wsl spec editable and warns when the agent lacks runtime_exec_wsl', async () => {
+      renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: wslSpec() },
+        report: makeReport({ agent_version: '0.18.2', agent_features: ['runtime_manager'] }),
+      });
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+      expect(
+        await screen.findByRole('combobox', { name: t.runtimeSpecExecutionMode }),
+      ).toHaveTextContent(t.runtimeSpecExecutionModeWSL);
+      expect(screen.getByLabelText(t.runtimeSpecWSLDistro)).toHaveValue('Ubuntu-24.04');
+      expect(screen.getByText(t.runtimeSpecWSLAgentUnsupported)).toBeInTheDocument();
+    });
+
+    it('labels binary and work dir as Linux paths in WSL mode', async () => {
+      renderSection({
+        mappings: [makeMapping({ id: 'map_1' })],
+        specsByMappingId: { map_1: wslSpec() },
+        report: wslReport,
+      });
+      fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+      expect(await screen.findByLabelText(t.runtimeSpecBinaryLinux)).toBeInTheDocument();
+      expect(screen.getByLabelText(t.runtimeSpecWorkDirLinux)).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeSpecWSLAgentUnsupported)).not.toBeInTheDocument();
+    });
+
+    it('marks a wsl spec row and labels its measured VRAM as attributed from the WSL VM', async () => {
+      renderSection({
+        mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-wsl' })],
+        specsByMappingId: {
+          map_1: wslSpec({ gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }] }),
+        },
+        report: wslReport,
+      });
+      await screen.findByText('gw-wsl');
+      expect(await screen.findByText(t.runtimeStatusWSLMarker)).toBeInTheDocument();
+      expect(screen.getByText(t.runtimeStatusVRAMFromVM)).toBeInTheDocument();
+    });
   });
 
   it('rejects a reserved env key before ever calling the API', async () => {
@@ -3583,6 +3701,10 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     admin_state: adminState,
     set_visible_devices: spec.set_visible_devices,
     visible_devices_mode: spec.visible_devices_mode,
+    // The execution mode rides the override PUT verbatim: an absent one would
+    // reset a wsl spec to native on a Start/Stop/Pin click.
+    execution_mode: spec.execution_mode,
+    wsl_distro: spec.wsl_distro,
     api_token_mode: spec.api_token_mode,
     api_token_header_source: spec.api_token_header_source,
     api_token_header: spec.api_token_header,
