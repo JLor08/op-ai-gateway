@@ -336,6 +336,26 @@ type ManagerOptions struct {
 	// nothing, such as most tests) turns the protection off, so an idle process is
 	// evictable at once as before, and a negative value is treated as zero.
 	EvictionGrace time.Duration
+	// WSL is the agent's WSL configuration (#381): the wsl.exe, the distros and
+	// binaries a wsl spec may name, and the distro user everything runs as.
+	// OPERATOR configuration from the agent's own local settings
+	// (runtime_wsl_*), never gateway-supplied, and fixed for the process
+	// lifetime. When set it REPLACES Policy.WSL: the manager keeps one WSL
+	// policy, so the block a spec is permitted against is the very block it is
+	// launched, stopped and swept with -- above all the same user, which must
+	// never be root. Left zero, Policy.WSL stands; both zero means no wsl spec
+	// is permitted (permitWSL) and no distro is ever called.
+	WSL WSLPolicy
+	// WSLRAMReserveMB is the memory, in MB, held back from the WSL2 VM's RAM
+	// pool that admission budgets wsl processes against: the WSL twin of
+	// HostRAMReserveMB, operator configuration (OP_AGENT_WSL_RAM_RESERVE_MB,
+	// default 1024). Fixed for the process lifetime; a negative value is treated
+	// as zero.
+	WSLRAMReserveMB int
+	// WSLRunner runs the agent's helper calls into a distro (the UID lookup,
+	// scope signals, the orphan sweep). nil, the production case, is
+	// execWSLRunner; a test injects one to observe or fail single calls.
+	WSLRunner wslRunner
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -443,9 +463,17 @@ func NewManager(opts ManagerOptions) *Manager {
 		hostWake:    make(chan struct{}, 1),
 		logs:        NewLogStore(opts.LogBufferBytes, opts.LogBufferTotalBytes),
 	}
+	policy := opts.Policy
+	if !opts.WSL.isZero() {
+		policy.WSL = opts.WSL
+	}
+	run := opts.WSLRunner
+	if run == nil {
+		run = execWSLRunner
+	}
 	o := &owner{
 		m:                   m,
-		policy:              opts.Policy,
+		policy:              policy,
 		getenv:              getenv,
 		gpuVendor:           opts.GPUVendor,
 		gpuVendors:          opts.GPUVendors,
@@ -455,6 +483,10 @@ func NewManager(opts ManagerOptions) *Manager {
 		hostRAMReserveMB:    max(0, opts.HostRAMReserveMB),
 		ramBootstrapGuessMB: max(0, opts.RAMBootstrapGuessMB),
 		evictionGrace:       max(0, opts.EvictionGrace),
+		wslRunner:           run,
+		wslNonce:            newWSLNonce(),
+		wslRAMReserveMB:     max(0, opts.WSLRAMReserveMB),
+		wslUIDs:             newWSLUIDCache(),
 		specs:               make(map[string]*specState),
 		allowedPairs:        map[[2]string]bool{},
 		logs:                m.logs,
@@ -1176,6 +1208,25 @@ type runningProc struct {
 	drainTimer  *time.Timer // pending "drain grace exceeded, terminate anyway" callback
 	killTimer   *time.Timer // pending "kill grace exceeded, SIGKILL" callback
 	stableTimer *time.Timer // pending "this run has been stable long enough" callback
+
+	// ctl signals this generation (terminate, then kill): nativeControl for a
+	// process the agent exec'd directly, wslControl for a wsl spec, whose
+	// workload is reached through its systemd scope. nil reads as nativeControl
+	// (control), so a runningProc built without one behaves as before.
+	ctl procControl
+	// wslUnit and wslDistro name a wsl generation's scope (wslUnitName) and the
+	// distro it runs in; both empty for a native process. wslUnit carries the
+	// generation, so it identifies exactly this process inside the distro.
+	wslUnit   string
+	wslDistro string
+}
+
+// control is p.ctl, or the native control for a runningProc built without one.
+func (p *runningProc) control() procControl {
+	if p.ctl == nil {
+		return nativeControl{cmd: p.cmd}
+	}
+	return p.ctl
 }
 
 // specState is one INSTANCE's complete owner-side bookkeeping (#340): a spec
@@ -1486,6 +1537,24 @@ type owner struct {
 	// one place that interprets it) and by the bootstrap escalation's own victim
 	// pick, so the two never disagree about who is protected.
 	evictionGrace time.Duration
+	// wslRunner is ManagerOptions.WSLRunner (execWSLRunner when unset): every
+	// helper call into a distro goes through it. Fixed for the process
+	// lifetime; copied into each wslControl and the orphan sweep.
+	wslRunner wslRunner
+	// wslNonce is this manager's run identity in WSL unit names (wslUnitName):
+	// 8 hex characters from crypto/rand, drawn once in NewManager. The orphan
+	// sweep kills only units whose nonce differs, which is what makes it safe to
+	// run while this run's own units are starting.
+	wslNonce string
+	// wslRAMReserveMB is ManagerOptions.WSLRAMReserveMB, never negative. Fixed
+	// for the process lifetime, like hostRAMReserveMB.
+	wslRAMReserveMB int
+	// wslUIDs caches the configured user's UID per distro (wslUID). It carries
+	// its own mutex: the orphan sweep fills and reads it off the owner.
+	wslUIDs *wslUIDCache
+	// wslSwept is set by the first applyConfig, which starts the one orphan
+	// sweep of the manager's lifetime (maybeSweepWSLOrphans).
+	wslSwept bool
 	// ramFreedMB is the host RAM that managed processes held when they exited
 	// and that the hardware sample has not necessarily caught up with yet, valid
 	// while hostSeq is below ramFreedUntilSeq (see noteRAMFreed). It only ever
@@ -1718,6 +1787,10 @@ func (o *owner) applyConfig(cfg Config) {
 	}
 	defer o.purgeChangedHeadCaches(memberHeads, cfg.Specs)
 	defer o.maybeSweepMemberCaches(cfg.Specs)
+	// The first document starts the sweep of WSL units an earlier agent run
+	// left behind (once per manager lifetime). Starts this document triggers
+	// run concurrently with it; the nonce keeps their units out of its reach.
+	defer o.maybeSweepWSLOrphans()
 
 	newIDs := make(map[string]bool, len(cfg.Specs))
 	bases := make(map[string]Spec, len(cfg.Specs))
@@ -2093,8 +2166,9 @@ func sameLaunchShape(a, b Spec) bool {
 		// decide which process is exec'd and where. Only the spelling is
 		// normalised, so an absent block and an explicit native one -- the same
 		// launch -- do not bounce a healthy child when a gateway starts sending
-		// the explicit form.
-		if s.Execution != nil && s.Execution.Mode == ExecutionModeNative {
+		// the explicit form. An empty mode is native too (invalidExecutionReason
+		// accepts it as such), so it is normalised the same way.
+		if s.Execution != nil && (s.Execution.Mode == ExecutionModeNative || s.Execution.Mode == "") {
 			s.Execution = nil
 		}
 		// Kind, DeviceBackend, Cluster and RPC stay in the comparison: they
@@ -4119,6 +4193,25 @@ func (o *owner) startProcess(st *specState) {
 	// not protect.
 	resolved := ex.resolvedCommand(spec, o.specsFromLocalFile)
 
+	// A wsl spec runs as the configured distro user under that user's own
+	// systemd manager, whose bus is named after the user's UID inside the
+	// distro, so the launch cannot be built without it. A failed lookup is a
+	// start failure that backs off and retries, like the port and config-file
+	// failures above: the distro may simply not be up yet, so it is not a
+	// not_permitted verdict. Nothing is exec'd and no generation is opened.
+	distroUID := -1
+	if spec.IsWSL() {
+		uid, err := o.wslUID(spec.WSLDistro())
+		if err != nil {
+			o.setState(st, StateStartFailed)
+			o.recordFailure(st, err.Error(), 0, "")
+			o.failPending(st, ErrStartFailed)
+			o.enterBackoff(st) // I2 fix: rate-limit / retry a persistently failing start, same as any other start_failed
+			return
+		}
+		distroUID = uid
+	}
+
 	// One writer for BOTH streams: the requirement is stdout AND stderr, and
 	// sharing the writer means the interleaving an operator reads back is
 	// the interleaving the process actually produced. procLog.Write is
@@ -4130,18 +4223,42 @@ func (o *owner) startProcess(st *specState) {
 	// instances can be told apart there. Instance 0 writes exactly as a spec
 	// that never replicates always has.
 	plog := o.logs.newInstanceProc(specBase(spec), st.instance)
-	cmd := exec.Command(spec.Binary, args...) //nolint:gosec // spec.Binary is allowlisted by LocalPolicy.Permit above
-	cmd.Env = env
-	// R2: an empty work_dir runs beside the binary. effectiveWorkDir returns
-	// spec.WorkDir verbatim when set, else filepath.Dir(spec.Binary) -- which,
-	// for an allowlisted (absolute) binary, is never empty, so cmd.Dir is now
-	// always set. The reported ResolvedCommand (command.go) reads the same
-	// helper, so the log panel always names the directory the child really ran
-	// in. Never write this back into st.spec.WorkDir: reconcile diffs the stored
-	// spec with reflect.DeepEqual, and a rewrite would read as a changed spec.
-	cmd.Dir = effectiveWorkDir(spec)
+	var cmd *exec.Cmd
+	var wslUnit string
+	execPath := spec.Binary
+	if spec.IsWSL() {
+		// wsl.exe -d <distro> -u <user> --cd <dir> --exec systemd-run --user
+		// --scope --unit=<unit> -- <binary> <args...> (buildWSLLaunch). The unit
+		// is named after plog's generation, which is unique for the agent's
+		// lifetime, plus this run's nonce, so it addresses this generation and
+		// nothing else: a late stop of a predecessor cannot reach a successor,
+		// and the orphan sweep can tell this run's units from an earlier run's.
+		// cmd.Dir stays empty: the directory that matters is inside the distro
+		// (--cd), and wsl.exe needs none of its own. The reported command is
+		// the wrapper as exec'd, with the operator's arguments masked at their
+		// shifted positions (withWrapper).
+		wslUnit = wslUnitName(o.wslNonce, spec.ID, plog.gen)
+		l := buildWSLLaunch(o.policy.WSL, distroUID, spec.WSLDistro(), wslUnit, effectiveWSLWorkDir(spec), spec.Binary, args, env)
+		resolved = ex.withWrapper(l).resolvedWSLCommand(spec, l.Exe, o.specsFromLocalFile)
+		execPath = l.Exe
+		cmd = exec.Command(l.Exe, l.Args...) //nolint:gosec // l.Exe is the operator's runtime_wsl_exe; the distro, binary and user were permitted by LocalPolicy.Permit above
+		cmd.Env = l.Env
+	} else {
+		cmd = exec.Command(spec.Binary, args...) //nolint:gosec // spec.Binary is allowlisted by LocalPolicy.Permit above
+		cmd.Env = env
+		// R2: an empty work_dir runs beside the binary. effectiveWorkDir returns
+		// spec.WorkDir verbatim when set, else filepath.Dir(spec.Binary) -- which,
+		// for an allowlisted (absolute) binary, is never empty, so cmd.Dir is now
+		// always set. The reported ResolvedCommand (command.go) reads the same
+		// helper, so the log panel always names the directory the child really ran
+		// in. Never write this back into st.spec.WorkDir: reconcile diffs the stored
+		// spec with reflect.DeepEqual, and a rewrite would read as a changed spec.
+		cmd.Dir = effectiveWorkDir(spec)
+	}
 	cmd.Stdout = plog
 	cmd.Stderr = plog
+	// For wsl.exe too: on unix (the test fake) the group is what killGroup, the
+	// wsl kill's backstop, signals; on Windows it is a no-op either way.
 	setProcGroup(cmd)
 
 	if err := cmd.Start(); err != nil {
@@ -4151,7 +4268,7 @@ func (o *owner) startProcess(st *specState) {
 		// actually tried" is usually the answer.
 		plog.StartFailed(resolved)
 		o.setState(st, StateStartFailed)
-		o.recordFailure(st, fmt.Sprintf("runtime: exec %s: %s", spec.Binary, err.Error()), 0, "")
+		o.recordFailure(st, fmt.Sprintf("runtime: exec %s: %s", execPath, err.Error()), 0, "")
 		o.failPending(st, ErrStartFailed)
 		o.enterBackoff(st) // I2 fix: rate-limit / retry a persistently failing start, same as any other start_failed
 		return
@@ -4173,6 +4290,22 @@ func (o *owner) startProcess(st *specState) {
 		startedAt: time.Now(),
 		exited:    make(chan struct{}),
 	}
+	if wslUnit != "" {
+		proc.wslUnit, proc.wslDistro = wslUnit, spec.WSLDistro()
+		proc.ctl = wslControl{
+			run:    o.wslRunner,
+			pol:    o.policy.WSL,
+			distro: proc.wslDistro,
+			unit:   wslUnit,
+			env:    wslHelperEnv(o.getenv, distroUID),
+			cmd:    cmd,
+			wg:     &o.m.wg,
+			exited: proc.exited,
+			specID: spec.ID,
+		}
+	} else {
+		proc.ctl = nativeControl{cmd: cmd}
+	}
 	st.proc = proc
 	o.setState(st, StateStarting)
 	// I3 fix: an admission-wait timer exists to bound how long a request
@@ -4186,7 +4319,11 @@ func (o *owner) startProcess(st *specState) {
 	for _, w := range st.pending {
 		cancelTimer(o.m, &w.timer)
 	}
-	slog.Info("runtime: process starting", "spec", spec.ID, "binary", spec.Binary, "port", port, "pid", proc.pid)
+	if wslUnit != "" {
+		slog.Info("runtime: process starting", "spec", spec.ID, "binary", spec.Binary, "port", port, "pid", proc.pid, "wsl_distro", proc.wslDistro, "wsl_unit", wslUnit)
+	} else {
+		slog.Info("runtime: process starting", "spec", spec.ID, "binary", spec.Binary, "port", port, "pid", proc.pid)
+	}
 
 	o.m.wg.Add(1)
 	go o.waitForExit(proc)
@@ -4694,8 +4831,16 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		// re-execs once per incoming request with no rate limit, and a
 		// PINNED spec whose start always fails never retries at all (stuck
 		// in start_failed until an unrelated config edit).
+		message := fmt.Sprintf("runtime: process exited before becoming healthy (exit code %d)", exitCode)
+		// A wsl generation whose wsl.exe exited -1 never ran the workload at
+		// all (no such distro, no systemd, a broken VM): say so, rather than
+		// blame a process that never existed. Read off the generation, not
+		// st.spec, which a push may have changed since this one started.
+		if proc.wslUnit != "" && wslLaunchFailed(exitCode) {
+			message = wslExitMessage(exitCode)
+		}
 		o.setState(st, StateStartFailed)
-		o.recordFailure(st, fmt.Sprintf("runtime: process exited before becoming healthy (exit code %d)", exitCode), exitCode, tail)
+		o.recordFailure(st, message, exitCode, tail)
 		o.failPending(st, ErrStartFailed)
 		o.enterBackoff(st)
 	}
@@ -4991,7 +5136,9 @@ func (o *owner) handleKillGraceExpired(c cmdKillGraceExpired) {
 		return
 	}
 	c.proc.killTimer = nil
-	if err := killGroup(c.proc.cmd); err != nil {
+	// The process group for a native process; the scope, then wsl.exe as the
+	// backstop, for a wsl one -- off the owner (wslControl).
+	if err := c.proc.control().kill(); err != nil {
 		slog.Debug("runtime: SIGKILL failed", "spec", c.specID, "error", err)
 	}
 	// State transitions to Stopped/Crashed once waitForExit actually reports
@@ -4999,7 +5146,8 @@ func (o *owner) handleKillGraceExpired(c cmdKillGraceExpired) {
 	// after SIGKILL is delivered.
 }
 
-// terminateNow sends SIGTERM to proc's process group and schedules a
+// terminateNow sends SIGTERM to proc (its process group, or a wsl
+// generation's scope -- runningProc.control) and schedules a
 // SIGKILL escalation after killGrace if it has not exited by then. Marks
 // st.intentionalStop so the eventual exit report is classified as a clean
 // stop, not a crash.
@@ -5024,7 +5172,10 @@ func (o *owner) terminateNow(st *specState, proc *runningProc) {
 	}
 	st.intentionalStop = true
 	cancelTimer(o.m, &proc.drainTimer)
-	if err := terminateGroup(proc.cmd); err != nil {
+	// SIGTERM to the process group for a native process, to the systemd scope
+	// for a wsl one (wslControl, off the owner); either way the killTimer below
+	// escalates if the generation has not exited by then.
+	if err := proc.control().terminate(); err != nil {
 		slog.Debug("runtime: SIGTERM failed", "spec", st.spec.ID, "error", err)
 	}
 	specID := st.spec.ID

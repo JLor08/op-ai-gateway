@@ -30,6 +30,16 @@ type wslLaunch struct {
 // names are limited to 255 bytes and the key is gateway-chosen.
 const wslUnitNameKeyMax = 64
 
+// wslUnitPrefix opens every unit name the agent launches, and is what the
+// orphan sweep lists by.
+const wslUnitPrefix = "opagent-"
+
+// wslUnitRune reports whether r may appear in a unit name as the agent builds
+// it: [A-Za-z0-9_-].
+func wslUnitRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-'
+}
+
 // wslUnitName builds the systemd unit name for one launch. The nonce makes it
 // unique to this agent run, the generation to this launch of the instance. Any
 // character outside [A-Za-z0-9_-] becomes "_": the name ends up in an argv
@@ -39,8 +49,7 @@ const wslUnitNameKeyMax = 64
 func wslUnitName(nonce, instanceKey string, gen uint64) string {
 	clean := func(s string) string {
 		return strings.Map(func(r rune) rune {
-			switch {
-			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			if wslUnitRune(r) {
 				return r
 			}
 			return '_'
@@ -50,7 +59,7 @@ func wslUnitName(nonce, instanceKey string, gen uint64) string {
 	if len(key) > wslUnitNameKeyMax {
 		key = key[:wslUnitNameKeyMax]
 	}
-	return "opagent-" + clean(nonce) + "-" + key + "-" + strconv.FormatUint(gen, 10)
+	return wslUnitPrefix + clean(nonce) + "-" + key + "-" + strconv.FormatUint(gen, 10)
 }
 
 // buildWSLLaunch assembles the wsl.exe command. It is pure: no process, no

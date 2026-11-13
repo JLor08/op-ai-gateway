@@ -83,6 +83,14 @@ func TestSameLaunchShapeTreatsExecutionAsLaunchShape(t *testing.T) {
 	if !sameLaunchShape(Spec{ID: "S"}, Spec{ID: "S", Execution: &Execution{Mode: ExecutionModeNative}}) {
 		t.Fatal("nil execution and native execution differ in launch shape, want the same")
 	}
+	// An empty mode reads as native (invalidExecutionReason), so it is the same
+	// launch as well.
+	if !sameLaunchShape(Spec{ID: "S"}, Spec{ID: "S", Execution: &Execution{}}) {
+		t.Fatal("nil execution and an empty-mode execution differ in launch shape, want the same")
+	}
+	if !sameLaunchShape(Spec{ID: "S", Execution: &Execution{}}, Spec{ID: "S", Execution: &Execution{Mode: ExecutionModeNative}}) {
+		t.Fatal("empty-mode and native execution differ in launch shape, want the same")
+	}
 	if sameLaunchShape(Spec{ID: "S"}, wsl("Ubuntu")) {
 		t.Fatal("native and WSL share a launch shape, want a relaunch")
 	}

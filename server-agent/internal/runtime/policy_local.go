@@ -393,6 +393,11 @@ type WSLPolicy struct {
 	User string
 }
 
+// isZero reports whether w configures nothing at all (ManagerOptions.WSL).
+func (w WSLPolicy) isZero() bool {
+	return w.Exe == "" && w.User == "" && len(w.AllowedDistros) == 0 && len(w.AllowedBinaries) == 0 && len(w.AllowedDirs) == 0
+}
+
 // effectiveWorkDir is the directory a spec's child process ACTUALLY runs in
 // (R2). An explicit spec.WorkDir is returned verbatim; an EMPTY one means "run
 // beside the binary" and resolves to filepath.Dir(spec.Binary).
@@ -523,7 +528,7 @@ func (p LocalPolicy) permitWSL(spec Spec) error {
 	// Root is refused by name here; the launcher additionally never passes -u
 	// root, so the two cannot drift into letting a gateway-chosen command line
 	// run with UID 0. "0" is refused as well, since wsl.exe -u accepts a UID.
-	if w.User == "" || w.User == "root" || isZeroUID(w.User) {
+	if wslUserRefused(w.User) {
 		return fmt.Errorf("runtime: no non-root WSL user is configured, refusing a wsl spec (set the agent's runtime_wsl_user / OP_AGENT_RUNTIME_WSL_USER to a non-root distro user)")
 	}
 	// The empty-distro guard keeps this self-contained against a file-sourced
