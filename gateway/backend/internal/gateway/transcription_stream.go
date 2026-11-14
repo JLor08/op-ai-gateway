@@ -15,22 +15,31 @@ import (
 
 // The frames of the event stream audio.cpp answers a streamed transcription with
 // (OpenAI-style SSE): a transcript.text.delta per increment, a transcript.text.done
-// that restates the whole text, then the [DONE] sentinel.
+// that restates the whole text, then the [DONE] sentinel. sglang-omni answers with the
+// same frames, its done event adding a usage statement (ADR-103).
 const (
 	transcriptionEventDelta = "transcript.text.delta"
 	transcriptionEventDone  = "transcript.text.done"
 	sseDoneSentinel         = "[DONE]"
 )
 
-// transcriptionEvent is one JSON frame of that stream, as far as either reader of it --
-// the relay's scan below and the portal run's consumer (chat_runs_transcription.go) --
-// needs it: its type, the increment a delta carries and the whole text a done event
-// restates. Text is a pointer so a done event that states no text is told from one that
-// states an empty one.
+// transcriptionEvent is one JSON frame of that stream, as far as its readers -- the
+// relay's scan below, the portal run's consumer (chat_runs_transcription.go) and the live
+// relay (live_transcription_ws.go) -- need it: its type, the increment a delta carries, the
+// whole text a done event restates and the usage it states. Text is a pointer so a done
+// event that states no text is told from one that states an empty one.
+//
+// Usage is kept as the raw JSON the frame carried, and only the relay's scan reads it
+// (doneUsage), for billing. Decoded into a typed field it would make an event whose usage
+// has another shape -- a numeric string, a value past float range -- fail to decode as a
+// whole, and every reader would then lose the done event it rides on: its text and, for
+// the scan, the stream's completion. Raw, it decodes whatever value the upstream wrote, so
+// the frames every reader acted on before it existed are read exactly as they were.
 type transcriptionEvent struct {
-	Type  string  `json:"type"`
-	Delta string  `json:"delta"`
-	Text  *string `json:"text"`
+	Type  string          `json:"type"`
+	Delta string          `json:"delta"`
+	Text  *string         `json:"text"`
+	Usage json.RawMessage `json:"usage"`
 }
 
 // decodeTranscriptionEvent decodes the payload of a `data:` line as a JSON event. It
@@ -50,7 +59,7 @@ func decodeTranscriptionEvent(payload []byte) (transcriptionEvent, bool) {
 // transcriptionStreamScan is the SSE-aware tee a streamed transcription is relayed
 // through. nativeCopier feeds it every chunk AFTER that chunk has been written to the
 // client and flushed, so it only ever looks: it never holds a byte back, and the stream
-// is as unbuffered as it was without it. What it reads is two things the relay cannot
+// is as unbuffered as it was without it. What it reads is three things the relay cannot
 // get any other way:
 //
 //   - whether the stream COMPLETED: a transcript.text.done event followed by [DONE]. A
@@ -64,6 +73,10 @@ func decodeTranscriptionEvent(payload []byte) (transcriptionEvent, bool) {
 //     which is what a stream that broke off delivered. Kept only when the request is
 //     being captured, and bounded by the capture cap (one byte past it, so the capture
 //     can tell a clipped transcript from one that fits exactly).
+//   - the USAGE the done event states, sglang-omni's {"type":"duration","seconds":N}
+//     (ADR-103): the billing's fallback when the upload is no WAV whose duration can be
+//     read. Only the done event's counts, and the last one's: a delta states nothing
+//     about the transcription as a whole.
 //
 // A nil *transcriptionStreamScan is a scan that sees nothing: a relay that is not a
 // streamed transcription carries no scan. The methods nativeCopier and proxyNative
@@ -93,6 +106,13 @@ type transcriptionStreamScan struct {
 	doneText []byte // the done event's text
 	sawDone  bool   // a transcript.text.done event was seen
 	sawEnd   bool   // [DONE] was seen AFTER it
+
+	// usageStated says the last done event carried a usage (a value other than null), and
+	// usageSeconds is the duration it states when that is a usable statement
+	// (transcriptionUsage.durationSeconds), 0 otherwise. Only the duration is kept, never
+	// the statement's bytes.
+	usageStated  bool
+	usageSeconds float64
 }
 
 // newTranscriptionStreamScan returns the scan for a relay of endpoint -- nil for every
@@ -200,7 +220,26 @@ func (s *transcriptionStreamScan) scanLine(line []byte) {
 		if event.Text != nil {
 			s.setDoneText(*event.Text)
 		}
+		s.usageStated, s.usageSeconds = doneUsage(event.Usage)
 	}
+}
+
+// doneUsage reads the usage a done event states, raw as transcriptionEvent keeps it: stated
+// says the event carried one at all (absent and null state nothing), and seconds is its
+// duration when it is a statement the one-shot relay would bill too
+// (transcriptionUsage.durationSeconds), else 0. A usage of another shape -- no object, a
+// type or seconds of the wrong JSON type, seconds past float range -- is stated but
+// unusable.
+func doneUsage(raw json.RawMessage) (stated bool, seconds float64) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, 0
+	}
+	var usage *transcriptionUsage
+	if json.Unmarshal(raw, &usage) != nil {
+		return true, 0
+	}
+	seconds, _ = usage.durationSeconds()
+	return true, seconds
 }
 
 // room is how many more bytes of transcript may be kept after have: one byte past the
@@ -268,15 +307,28 @@ func (s *transcriptionStreamScan) stampCapture(in *captureInput) {
 // other endpoint or a relay that did not finish cleanly (status == "success"), leaving
 // BillingQuantity at 0 as setTranscriptionBillingQuantity does for a one-shot body.
 //
-// A stream states no duration (its done event carries a time to first token, not
-// audio_duration_ms), so the quantity is the duration of the WAV that was UPLOADED,
-// read from its header (uploadWavDurationMillis) -- and is billed only for a stream
-// that COMPLETED (scan.complete()): a transcript cut short is not the audio
-// transcribed. Every case that cannot be billed is a loud zero (ADR-041), said once at
-// Error with enough to find the request, never a silent bare zero:
+// A quantity is billed only for a stream that COMPLETED (scan.complete()): a transcript
+// cut short is not the audio transcribed. audio.cpp's stream states no duration (its done
+// event carries a time to first token, not audio_duration_ms), so the quantity is, in
+// this order:
+//
+//  1. the duration of the WAV that was UPLOADED, read from its header
+//     (uploadWavDurationMillis): exact to the millisecond, and the same measurement the
+//     one-shot relay falls back to;
+//  2. the usage the done event states (scan.usageSeconds), sglang-omni's
+//     {"type":"duration","seconds":N} held to the one-shot rule (transcriptionUsage):
+//     sglang-omni measures the audio it decoded, which closes the gaps step 1 leaves --
+//     an upload that is no WAV, and a WAV whose header cannot be believed (ADR-103).
+//
+// This is not keyed on the target's kind, mirroring the one-shot fallback: a done event
+// that states no usage, audio.cpp's, leaves the stream exactly where it was. Every case
+// that cannot be billed is a loud zero (ADR-041), said once at Error with enough to find
+// the request, never a silent bare zero:
 //
 //   - the stream ended without the done event and [DONE];
-//   - the upload is no WAV the header of which can be believed (uploadWavDurationMillis).
+//   - the upload is no WAV the header of which can be believed, and the done event
+//     states no usage ("absent") or one that cannot be believed ("unusable"); a present
+//     but unusable statement is never billed.
 //
 // A clip that measures zero (shorter than a millisecond) is a measurement, not a gap:
 // it bills 0 and logs nothing.
@@ -291,12 +343,19 @@ func setStreamedTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange,
 		slog.Error("streamed transcription ended without both transcript.text.done and [DONE]: billed zero", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "saw_done", scan != nil && scan.sawDone, "saw_end", scan != nil && scan.sawEnd)
 		return
 	}
-	ms, ok := uploadWavDurationMillis(ex.raw, contentType)
-	if !ok {
-		slog.Error("streamed transcription completed but its upload's duration could not be read from a WAV header: billed zero", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName)
+	if ms, ok := uploadWavDurationMillis(ex.raw, contentType); ok {
+		meta.BillingQuantity = float64(ms) / 1000
 		return
 	}
-	meta.BillingQuantity = float64(ms) / 1000
+	if scan.usageSeconds > 0 {
+		meta.BillingQuantity = scan.usageSeconds
+		return
+	}
+	usage := "absent"
+	if scan.usageStated {
+		usage = "unusable"
+	}
+	slog.Error("streamed transcription completed but neither its upload's WAV header nor its done event's usage stated a usable duration: billed zero", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "usage", usage)
 }
 
 // uploadWavDurationMillis returns the duration of the audio the client uploaded to a

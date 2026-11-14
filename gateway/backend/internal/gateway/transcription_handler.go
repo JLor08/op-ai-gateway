@@ -869,8 +869,9 @@ func peekTranscriptionFileByte(part *multipart.Part) (first []byte, empty bool, 
 // the endpoint (the openai_audio flavor is speech's too): a non-2xx answer is
 // normalised (relayTranscriptionUpstreamError); a 2xx event stream of a streamed
 // request is relayed unbuffered by the native copier (isStreamedTranscription), read on
-// its way by transcriptionStreamScan, billed from the upload's WAV header once the
-// stream completed (setStreamedTranscriptionBillingQuantity) and captured as its
+// its way by transcriptionStreamScan, billed from the upload's WAV header -- else from
+// the usage its done event states -- once the stream completed
+// (setStreamedTranscriptionBillingQuantity) and captured as its
 // transcript; any other 2xx one is buffered, metered from the timing block of its body
 // and written verbatim (relayTranscriptionResponse).
 func (s *Server) relayTranscription(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, endpoint sessionEndpoint, form transcriptionForm, raw []byte) {
@@ -1163,27 +1164,44 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 	return ms / 1000, true
 }
 
-// transcriptionUsageSeconds reads sglang-omni's usage statement out of a transcription
-// body (v0.2.0: sglang_omni/serve/protocol.py TranscriptionUsage, a usage object of type
-// "duration"; speech_to_text.py and transcriptions.py set its seconds to
-// math.ceil of the decoded audio's length), and reports whether it is one: the type
-// exactly "duration" and the seconds a positive finite number. Any other shape -- no
-// usage, another type, a zero, a string -- states nothing.
-func transcriptionUsageSeconds(body []byte) (float64, bool) {
-	var doc struct {
-		Usage *struct {
-			Type    string   `json:"type"`
-			Seconds *float64 `json:"seconds"`
-		} `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &doc); err != nil || doc.Usage == nil || doc.Usage.Type != "duration" || doc.Usage.Seconds == nil {
+// transcriptionUsage is sglang-omni's usage statement for a transcription (v0.2.0:
+// sglang_omni/serve/protocol.py TranscriptionUsage, a usage object of type "duration";
+// speech_to_text.py and transcriptions.py set its seconds to math.ceil of the decoded
+// audio's length). It rides on a one-shot body and on a streamed transcription's done
+// event alike (ADR-103), and both are read by the one rule durationSeconds holds it to, so
+// a statement the one-shot relay would not bill is never billed on a stream either.
+type transcriptionUsage struct {
+	Type    string   `json:"type"`
+	Seconds *float64 `json:"seconds"`
+}
+
+// durationSeconds reports whether the statement is one a duration can be billed from: the
+// type exactly "duration" and the seconds a positive finite number. Any other shape --
+// no usage (a nil receiver), another type, no seconds, a zero, a negative -- states
+// nothing.
+func (u *transcriptionUsage) durationSeconds() (float64, bool) {
+	if u == nil || u.Type != "duration" || u.Seconds == nil {
 		return 0, false
 	}
-	seconds := *doc.Usage.Seconds
+	seconds := *u.Seconds
 	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
 		return 0, false
 	}
 	return seconds, true
+}
+
+// transcriptionUsageSeconds reads sglang-omni's usage statement out of a one-shot
+// transcription body and reports whether it is a usable one (transcriptionUsage). A body
+// that is no JSON object, or whose usage is of another JSON type than an object or holds a
+// type or seconds of the wrong JSON type (a numeric string included), states nothing.
+func transcriptionUsageSeconds(body []byte) (float64, bool) {
+	var doc struct {
+		Usage *transcriptionUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return 0, false
+	}
+	return doc.Usage.durationSeconds()
 }
 
 // transcriptionDurationAbsent reports whether body states no audio duration at all: no

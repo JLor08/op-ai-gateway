@@ -18,6 +18,7 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -334,7 +335,8 @@ func TestMeasureTTSStreamMath(t *testing.T) {
 	checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 150, TTFTMS: 300, WallMS: 2300, AudioSeconds: 10, RateX: 5.0, RTF: 0.23})
 
 	// One streamed SSE synthesis of the passage, sent to the instance by its own address, with
-	// no voice for a model that needs none and no response_format (a stream is pcm).
+	// no voice for a model that needs none and no response_format (audio.cpp's stream is pcm
+	// without being told).
 	checkAudioSentTo(t, up, target, "/v1/audio/speech", "application/json")
 	body := audioSentJSON(t, up)
 	if body["model"] != "voice-model#2" || body["input"] != audioBenchmarkPassage || body["stream"] != true || body["stream_format"] != "sse" {
@@ -471,6 +473,119 @@ func TestMeasureTTSStreamRefusals(t *testing.T) {
 			up := tc.upstream(clock)
 			got, err := clock.measurer().measureTTSStream(context.Background(), up, audioMeasureTarget(), audioBenchmarkPassage, "", tc.byteRate)
 			checkAudioRefusal(t, got, err, tc.kind, tc.want, up, tc.byteRate <= 0)
+		})
+	}
+}
+
+// sglangOmniMeasureTarget is audioMeasureTarget served by sglang-omni: an agent-managed model
+// whose runtime spec type is sglang_omni, the kind (routing.Target.EffectiveKind) a
+// measurement tells it by.
+func sglangOmniMeasureTarget() routing.Target {
+	target := audioMeasureTarget()
+	target.LiveProgressSpecType = string(routing.RuntimeSpecTypeSGLangOmni)
+	return target
+}
+
+// sseSpeechDoneSGLangOmni is how sglang-omni (v0.2.0 openai_api.py _sse_body) ends a whole
+// synthesis stream: speech.audio.done, written by Python's json.dumps, and then the end of the
+// body -- there is no [DONE].
+const sseSpeechDoneSGLangOmni = "data: {\"type\": \"speech.audio.done\", \"usage\": null, \"finish_reason\": \"stop\"}\n\n"
+
+// TestMeasureTTSStreamSGLangOmni: sglang-omni ends a whole synthesis stream at
+// speech.audio.done with no [DONE] (ADR-103), so for an sglang_omni target the body closing
+// cleanly after done is the stream's end, and the stream is measured exactly as one that ended
+// on [DONE] -- the timed pass and the cold pass alike, a done frame the body leaves
+// unterminated included, and a [DONE] it does send still ends it. sglang-omni refuses a stream
+// whose response_format is not pcm and defaults to wav, so the request says pcm.
+func TestMeasureTTSStreamSGLangOmni(t *testing.T) {
+	delta := sseSpeechDelta(48000)
+	cases := []struct {
+		name   string
+		chunks []measureChunk
+	}{
+		{"done, then the body ends", []measureChunk{measureAt(200, delta), measureAt(1200, sseSpeechDoneSGLangOmni)}},
+		{"a done frame left unterminated", []measureChunk{measureAt(200, delta), measureAt(1200, strings.TrimSuffix(sseSpeechDoneSGLangOmni, "\n\n"))}},
+		{"done, then [DONE]", []measureChunk{measureAt(200, delta), measureAt(1200, sseSpeechDone)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A scripted body spends its chunks as it delivers them, so each pass gets its own.
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "text/event-stream", slices.Clone(tc.chunks)...)
+			target := sglangOmniMeasureTarget()
+			got, err := clock.measurer().measureTTSStream(context.Background(), up, target, audioBenchmarkPassage, "", 48000)
+			if err != nil {
+				t.Fatalf("measureTTSStream: %v", err)
+			}
+			checkAudioMeasurement(t, got, audioMeasurement{FirstByteMS: 1, TTFTMS: 200, WallMS: 1200, AudioSeconds: 1, RateX: 1.0, RTF: 1.2})
+
+			checkAudioSentTo(t, up, target, "/v1/audio/speech", "application/json")
+			body := audioSentJSON(t, up)
+			if body["stream"] != true || body["stream_format"] != "sse" || body["response_format"] != "pcm" {
+				t.Fatalf("request body = %v; want stream true, stream_format sse and response_format pcm", body)
+			}
+
+			clock = &measureClock{}
+			up = scriptedAudioUpstream(clock, "text/event-stream", slices.Clone(tc.chunks)...)
+			times, err := clock.measurer().measureTTSStreamTimes(context.Background(), up, target, audioBenchmarkPassage, "")
+			if err != nil {
+				t.Fatalf("measureTTSStreamTimes: %v", err)
+			}
+			checkAudioMeasurement(t, times, audioMeasurement{FirstByteMS: 1, TTFTMS: 200, WallMS: 1200})
+		})
+	}
+}
+
+// TestMeasureTTSStreamSGLangOmniRefusals: only a CLEAN end after speech.audio.done ends an
+// sglang-omni stream. An error frame in place of done is the upstream's refusal, a body that
+// ends before done is no whole synthesis, and a connection that breaks after done is the
+// stream's error, not its end.
+func TestMeasureTTSStreamSGLangOmniRefusals(t *testing.T) {
+	cases := []struct {
+		name     string
+		upstream func(*measureClock) *measureUpstream
+		kind     string
+		want     string
+	}{
+		{"an error frame in place of done", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream",
+				measureAt(300, sseSpeechDelta(48000)),
+				measureAt(500, "data: {\"type\": \"error\", \"error\": {\"message\": \"out of memory\", \"type\": \"server_error\", \"param\": null, \"code\": null}}\n\n"))
+		}, audioMeasureUpstreamRefused, "out of memory"},
+		{"the body ends before done", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream", measureAt(300, sseSpeechDelta(48000)), measureAt(800, sseSpeechDelta(48000)))
+		}, audioMeasureProtocol, "ended before speech.audio.done"},
+		{"the connection breaks after done", func(c *measureClock) *measureUpstream {
+			return breakingAudioUpstream(c, "text/event-stream", measureAt(300, sseSpeechDelta(48000)), measureAt(800, sseSpeechDoneSGLangOmni))
+		}, audioMeasureTransport, "connection reset by peer"},
+		{"done without audio", func(c *measureClock) *measureUpstream {
+			return scriptedAudioUpstream(c, "text/event-stream", measureAt(800, sseSpeechDoneSGLangOmni))
+		}, audioMeasureProtocol, "no audio"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &measureClock{}
+			up := tc.upstream(clock)
+			got, err := clock.measurer().measureTTSStream(context.Background(), up, sglangOmniMeasureTarget(), audioBenchmarkPassage, "", 48000)
+			checkAudioRefusal(t, got, err, tc.kind, tc.want, up, false)
+		})
+	}
+}
+
+// TestMeasureTTSStreamAudioCppStillNeedsDone: the clean end that ends an sglang-omni stream is
+// no end for any other target -- an agent instance, a plain agent model and a direct audio_cpp
+// application all still need [DONE] after speech.audio.done -- and none of their requests says
+// response_format.
+func TestMeasureTTSStreamAudioCppStillNeedsDone(t *testing.T) {
+	for _, kind := range audioMeasureTargetKinds() {
+		t.Run(kind.name, func(t *testing.T) {
+			clock := &measureClock{}
+			up := scriptedAudioUpstream(clock, "text/event-stream", measureAt(300, sseSpeechDelta(48000)), measureAt(800, sseSpeechDoneSGLangOmni))
+			got, err := clock.measurer().measureTTSStream(context.Background(), up, kind.target, audioBenchmarkPassage, "", 48000)
+			checkAudioRefusal(t, got, err, audioMeasureProtocol, "the synthesis stream ended without [DONE] after speech.audio.done", up, false)
+			if _, ok := audioSentJSON(t, up)["response_format"]; ok {
+				t.Fatalf("request body = %s carries response_format", up.sent)
+			}
 		})
 	}
 }

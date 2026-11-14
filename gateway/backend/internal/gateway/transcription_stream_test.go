@@ -929,11 +929,12 @@ func TestTranscriptionStreamLoudZeroOnIncompleteStream(t *testing.T) {
 	}
 }
 
-// A clean stream whose upload cannot be measured is a loud zero too: the upload is no
-// WAV (webm bytes), or its header contradicts itself (an inflated byte rate would bill
-// a long clip as a short one), the `data` chunk is longer than what was uploaded, or it
-// declares less than the upload holds after it (the audio hidden behind an empty chunk).
-// The transcript still reaches the client.
+// A clean stream whose upload cannot be measured, and whose done event states no usage
+// (audio.cpp's never does), is a loud zero too: the upload is no WAV (webm bytes), or
+// its header contradicts itself (an inflated byte rate would bill a long clip as a short
+// one), the `data` chunk is longer than what was uploaded, or it declares less than the
+// upload holds after it (the audio hidden behind an empty chunk). The transcript still
+// reaches the client.
 func TestTranscriptionStreamLoudZeroOnAnUploadWithNoBillableDuration(t *testing.T) {
 	inflated := wavFile(t, wavFmtChunkWith(t, 1, 16000, 3200000, 2, 16), wavDataChunk(t, 32000)) // 1 s of audio claiming 10 ms
 	truncated := wavFile(t, wavFmtChunk(t, 16000, 1, 16), wavChunk(t, "data", 64000, make([]byte, 100)))
@@ -967,7 +968,7 @@ func TestTranscriptionStreamLoudZeroOnAnUploadWithNoBillableDuration(t *testing.
 			requireSpeechNonTokenRow(t, ev)
 			errs := errorLogs(buf)
 			if len(errs) != 1 || !strings.Contains(errs[0].Msg, "streamed transcription") || !strings.Contains(errs[0].Msg, "WAV") {
-				t.Fatalf("Error logs = %+v, want exactly one saying the upload's duration could not be read from a WAV header", errs)
+				t.Fatalf("Error logs = %+v, want exactly one saying neither the upload's WAV header nor the done event's usage stated a duration", errs)
 			}
 		})
 	}
