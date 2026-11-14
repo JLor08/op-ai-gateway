@@ -126,7 +126,65 @@ func (c *OpenAIResponsesClient) CompleteStream(ctx context.Context, target routi
 // doNativeProxy so this ONE client serves both the passthrough and the translate
 // paths of an OpenAI subscription target.
 func (c *OpenAIResponsesClient) ProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
-	return doNativeProxy(ctx, c.http, target, path, body, contentType)
+	return doNativeProxy(ctx, c.http, target, path, sanitizeResponsesReasoning(body), contentType)
+}
+
+// sanitizeResponsesReasoning makes a replayed Codex history acceptable to the
+// ChatGPT backend. A conversation that began on another model (a local one served
+// through this gateway, say) carries `reasoning` items whose `content` holds
+// reasoning_text and whose encrypted_content is empty; the backend rejects those
+// (`input[n].content: array too long ... maximum length 0`) and cannot use them
+// anyway. Items without a real encrypted_content are dropped; the remaining ones
+// lose their `content`, which the backend only ever returns empty. A body that
+// needs no change, or that is not a Responses request with an input array, is
+// returned byte-for-byte.
+func sanitizeResponsesReasoning(body []byte) []byte {
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil {
+		return body
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(top["input"], &items) != nil {
+		return body
+	}
+	out := make([]json.RawMessage, 0, len(items))
+	changed := false
+	for _, raw := range items {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(raw, &item) != nil || string(item["type"]) != `"reasoning"` {
+			out = append(out, raw)
+			continue
+		}
+		var enc string
+		_ = json.Unmarshal(item["encrypted_content"], &enc)
+		if enc == "" {
+			changed = true
+			continue
+		}
+		if _, has := item["content"]; has {
+			delete(item, "content")
+			cleaned, err := json.Marshal(item)
+			if err != nil {
+				return body
+			}
+			raw = cleaned
+			changed = true
+		}
+		out = append(out, raw)
+	}
+	if !changed {
+		return body
+	}
+	input, err := json.Marshal(out)
+	if err != nil {
+		return body
+	}
+	top["input"] = input
+	rewritten, err := json.Marshal(top)
+	if err != nil {
+		return body
+	}
+	return rewritten
 }
 
 // stream POSTs body and runs the Responses SSE parse, emitting neutral events. It
