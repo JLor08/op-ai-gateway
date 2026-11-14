@@ -502,6 +502,11 @@ type Server struct {
 	// (realtime_ws.go: realtimeIdleTimeout) when positive. Zero, the default and
 	// every production value, keeps the constant; only tests set it.
 	realtimeIdle time.Duration
+	// realtimeSessions counts the open /v1/realtime sessions so the shutdown can
+	// wait for them (WaitRealtimeSessions): a session runs on a hijacked
+	// connection, which http.Server.Shutdown neither tracks nor waits for. The
+	// zero value is ready to use.
+	realtimeSessions realtimeSessionSet
 	// instanceScaler starts another instance of a replicable spec when requests
 	// park because every instance of their model is busy (instance_scaler.go).
 	// New builds it whenever it builds the resolver's instance source and installs

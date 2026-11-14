@@ -5,7 +5,9 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
@@ -83,8 +85,9 @@ func recvWSSeen(t *testing.T, seen <-chan wsSeen) wsSeen {
 	}
 }
 
-// DialWebSocket dials endpoint+path?rawQuery, keeps the upgrade on HTTP/1.1 even over a
-// transport that negotiates HTTP/2, applies the upstream credential (and its static
+// DialWebSocket dials endpoint+path?rawQuery, keeps the upgrade on HTTP/1.1 over a
+// transport that negotiates HTTP/2 with net/http's own TLS handshake (a custom TLS
+// dialer is the next test's), applies the upstream credential (and its static
 // extra headers) from the context the way every other upstream call does, and sends
 // neither an Origin nor any subprotocol offer -- also when the caller's header carries
 // them. The dialed socket relays a message both ways.
@@ -294,5 +297,83 @@ func TestDialWebSocketOutlivesItsContext(t *testing.T) {
 	}
 	if err := conn.Close(websocket.StatusNormalClosure, ""); err != nil {
 		t.Fatalf("close handshake after the dial context ended: %v", err)
+	}
+}
+
+// customTLSDialTransport is built like the gateway's production outbound transport
+// (cmd/gateway appCAPool.transport): a custom DialTLSContext doing its own handshake
+// that offers h2 and http/1.1 by ALPN. net/http keeps an upgrade off HTTP/2 only for
+// the handshakes it performs itself, so such a dialer must leave h2 out on its own
+// for a context RequiresHTTP1 marks; honorMark says whether this one does.
+func customTLSDialTransport(cfg *tls.Config, honorMark bool) *http.Transport {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	dial := base.DialContext
+	base.TLSClientConfig = nil
+	base.ForceAttemptHTTP2 = true
+	base.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		raw, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		c := cfg.Clone()
+		c.NextProtos = []string{"h2", "http/1.1"}
+		if honorMark && RequiresHTTP1(ctx) {
+			c.NextProtos = []string{"http/1.1"}
+		}
+		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
+			c.ServerName = host
+		}
+		tc := tls.Client(raw, c)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		return tc, nil
+	}
+	return base
+}
+
+// A WebSocket dial marks its context RequiresHTTP1, so a transport with a custom TLS
+// dialer that honors the mark completes the upgrade over HTTP/1.1 against an
+// h2-enabled server -- while the same transport keeps negotiating HTTP/2 for an
+// ordinary request. Without the mark's effect the dial fails (the control), which is
+// what the production transport did before it honored the mark.
+func TestDialWebSocketMarksTheHandshakeHTTP1OnlyForACustomTLSDialer(t *testing.T) {
+	srv, seen := newWSEchoUpstream(t, true)
+	tlsCfg := srv.Client().Transport.(*http.Transport).TLSClientConfig
+	ctx, cancel := context.WithTimeout(context.Background(), wsDialWait)
+	defer cancel()
+	target := routing.Target{Provider: routing.ProviderServerAgent, Endpoint: srv.URL}
+
+	if _, _, err := NewOpenAICompatibleClient(&http.Client{Transport: customTLSDialTransport(tlsCfg, false)}).DialWebSocket(ctx, target, "/realtime/m", "", nil); err == nil {
+		t.Fatal("control: a custom TLS dialer that offers h2 regardless completed the upgrade; the fixture does not reproduce the h2 negotiation")
+	}
+
+	transport := customTLSDialTransport(tlsCfg, true)
+	conn, resp, err := NewOpenAICompatibleClient(&http.Client{Transport: transport}).DialWebSocket(ctx, target, "/realtime/m", "", nil)
+	if err != nil {
+		t.Fatalf("DialWebSocket over a mark-honoring custom TLS dialer: %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("handshake status = %d, want 101", resp.StatusCode)
+	}
+	if got := recvWSSeen(t, seen); got.protoMajor != 1 {
+		t.Fatalf("the upgrade arrived over HTTP/%d, want HTTP/1.1", got.protoMajor)
+	}
+	plain, err := (&http.Client{Transport: transport}).Get(srv.URL + "/plain")
+	if err != nil {
+		t.Fatalf("plain GET: %v", err)
+	}
+	_ = plain.Body.Close()
+	if plain.ProtoMajor != 2 {
+		t.Fatalf("plain GET over HTTP/%d; an unmarked request must keep HTTP/2", plain.ProtoMajor)
+	}
+}
+
+// RequiresHTTP1 is false for every context the dial did not mark.
+func TestRequiresHTTP1IsFalseUnmarked(t *testing.T) {
+	if RequiresHTTP1(context.Background()) {
+		t.Fatal("RequiresHTTP1(Background) = true")
 	}
 }

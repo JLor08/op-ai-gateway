@@ -93,9 +93,14 @@ type NativeDuplexProxyClient interface {
 //     ever forwarded. The per-app upstream credential and its static extra headers
 //     are then applied from ctx exactly as on every other upstream call
 //     (applyUpstreamAuth).
-//   - The upgrade stays on HTTP/1.1 over any transport, HTTP/2-capable ones included:
-//     net/http never sends a request carrying "Connection: Upgrade" and
-//     "Upgrade: websocket" over HTTP/2 (the request requires HTTP/1).
+//   - The upgrade must stay on HTTP/1.1 (HTTP/2 cannot carry it). net/http sees to
+//     that only for the TLS handshakes it performs itself: it leaves h2 out of the
+//     ALPN offer of a connection dialed for a request that requires HTTP/1. A
+//     transport with its own DialTLSContext -- the gateway's outbound CA-pool
+//     transport is one -- does its own handshake and must leave h2 out itself for a
+//     context RequiresHTTP1 reports; DialWebSocket marks the handshake's context so.
+//     A transport whose dialer offers h2 regardless fails the dial against an
+//     h2-enabled upstream ("http2: invalid Upgrade request header").
 //   - A refused handshake is an error built as a chat completion's refusal is
 //     (chatStatusError): an agent router's answer becomes a RouterError carrying its
 //     status and code, any other upstream's non-101 answer ErrUnavailable (or its
@@ -192,6 +197,22 @@ func sendNativeProxy(ctx context.Context, httpClient *http.Client, httpReq *http
 	return &ProxyResponse{StatusCode: httpResp.StatusCode, Header: httpResp.Header, Body: httpResp.Body}, nil
 }
 
+// requiresHTTP1Key marks a context whose request must reach the upstream over
+// HTTP/1.1 (RequiresHTTP1).
+type requiresHTTP1Key struct{}
+
+// RequiresHTTP1 reports whether ctx belongs to a request that must reach the upstream
+// over HTTP/1.1: a WebSocket handshake DialWebSocket sent. A transport with a custom
+// DialTLSContext reads it to leave h2 out of the ALPN offer of the connection it
+// dials. net/http hands the dialer the context of the request the connection is
+// dialed for (its values kept), and keeps the connections of requests that require
+// HTTP/1 apart from all others, so the mark never narrows a connection another
+// request shares.
+func RequiresHTTP1(ctx context.Context) bool {
+	marked, _ := ctx.Value(requiresHTTP1Key{}).(bool)
+	return marked
+}
+
 // dialNativeWebSocket is DialWebSocket over httpClient's transport (the default
 // transport for a nil client or a nil Transport). The handshake runs on a client of its
 // own that shares only the transport: no Timeout, no cookie jar, and no redirects.
@@ -210,6 +231,7 @@ func dialNativeWebSocket(ctx context.Context, httpClient *http.Client, target ro
 			return http.ErrUseLastResponse
 		},
 	}
+	ctx = context.WithValue(ctx, requiresHTTP1Key{}, true)
 	conn, resp, err := websocket.Dial(ctx, u, &websocket.DialOptions{
 		HTTPClient: dialClient,
 		HTTPHeader: webSocketDialHeader(ctx, header),

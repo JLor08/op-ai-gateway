@@ -915,8 +915,8 @@ func TestRealtimeUsageFallsBackToAppendedAudio(t *testing.T) {
 }
 
 // A frame stream with nothing countable in it -- text that is not JSON, binary frames,
-// an append whose audio is not base64, an append that is no object, a response.done
-// with no usage -- is relayed unchanged and bills a zero that is logged.
+// an append whose audio holds no base64 character, an append that is no object, a
+// response.done with no usage -- is relayed unchanged and bills a zero that is logged.
 func TestRealtimeMalformedFramesBillALoggedZero(t *testing.T) {
 	logs := captureRTLog(t)
 	rig := newRTRig(t)
@@ -927,7 +927,7 @@ func TestRealtimeMalformedFramesBillALoggedZero(t *testing.T) {
 	}{
 		{websocket.MessageText, `not json at all`},
 		{websocket.MessageBinary, `{"type":"input_audio_buffer.append","audio":"AAAA"}`},
-		{websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"!!!not base64!!!"}`},
+		{websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"!!! ==="}`},
 		{websocket.MessageText, `["input_audio_buffer.append"]`},
 		{websocket.MessageText, `{"type":"input_audio_buffer.append","audio":42}`},
 		{websocket.MessageText, `{"type":"response.done"}`},
@@ -1166,4 +1166,151 @@ func TestSendableRealtimeCode(t *testing.T) {
 			t.Errorf("sendableRealtimeCode(%d) = %d, want 1011", code, got)
 		}
 	}
+}
+
+// The audio meter reads a client's append the way the upstream does: sglang-omni
+// parses the frame with Python's json (keys exact and case-sensitive, the last
+// duplicate wins, escapes decoded) and its base64 decode skips characters outside
+// the alphabet. A frame the upstream takes as an append of N bytes must count N
+// bytes here, so no spelling of the frame lets a client bill its audio as zero.
+func TestRealtimeMeterCountsAppendsAsTheUpstreamReadsThem(t *testing.T) {
+	audio := base64.StdEncoding.EncodeToString(make([]byte, 32000))
+	escapedSlashes := strings.ReplaceAll(base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xff}, 30)), "/", `\/`)
+	for _, tc := range []struct {
+		name  string
+		typ   websocket.MessageType
+		frame string
+		want  int64
+	}{
+		{"plain", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + audio + `"}`, 32000},
+		{"escaped type", websocket.MessageText, `{"type":"input_audio_buffer\u002eappend","audio":"` + audio + `"}`, 32000},
+		{"escaped type, fully", websocket.MessageText, `{"\u0074ype":"\u0069nput_audio_buffer.append","audio":"` + audio + `"}`, 32000},
+		{"a case-folded duplicate key", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + audio + `","AUDIO":""}`, 32000},
+		{"a case-folded type key is not the type", websocket.MessageText, `{"Type":"input_audio_buffer.append","audio":"` + audio + `"}`, 0},
+		{"the last duplicate audio wins", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"","audio":"` + audio + `"}`, 32000},
+		{"the last duplicate audio wins, empty", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + audio + `","audio":""}`, 0},
+		{"the last duplicate type wins", websocket.MessageText, `{"type":"session.update","type":"input_audio_buffer.append","audio":"` + audio + `"}`, 32000},
+		{"a stray character in the base64", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + audio[:100] + ` ` + audio[100:] + `"}`, 32000},
+		{"unpadded base64", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + base64.RawStdEncoding.EncodeToString(make([]byte, 31999)) + `"}`, 31999},
+		{"escaped slashes", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + escapedSlashes + `"}`, 30},
+		{"another type", websocket.MessageText, `{"type":"Input_Audio_Buffer.Append","audio":"` + audio + `"}`, 0},
+		{"a binary frame", websocket.MessageBinary, `{"type":"input_audio_buffer.append","audio":"` + audio + `"}`, 0},
+		{"audio that is no string", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":42}`, 0},
+		{"no object", websocket.MessageText, `["input_audio_buffer.append"]`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var m realtimeMeter
+			m.observeClient(tc.typ, []byte(tc.frame))
+			if m.appendBytes != tc.want {
+				t.Fatalf("appendBytes = %d, want %d", m.appendBytes, tc.want)
+			}
+		})
+	}
+}
+
+// The subprotocol key's edges: of several key offers the first is used, an empty one
+// is skipped (so an empty key alone authenticates nothing), and an Authorization
+// header is used over any subprotocol key, right or wrong.
+func TestRealtimeSubprotocolKeyEdges(t *testing.T) {
+	rig := newRTRig(t)
+	for _, tc := range []struct {
+		name   string
+		header http.Header
+		offers []string
+		status int // 0: the session opens
+	}{
+		{"the first of two keys is used", nil, []string{"realtime", "openai-insecure-api-key." + rtSecret, "openai-insecure-api-key.nope"}, 0},
+		{"the first of two keys is used, wrong", nil, []string{"realtime", "openai-insecure-api-key.nope", "openai-insecure-api-key." + rtSecret}, http.StatusUnauthorized},
+		{"an empty key alone", nil, []string{"realtime", "openai-insecure-api-key."}, http.StatusUnauthorized},
+		{"an empty key is skipped", nil, []string{"realtime", "openai-insecure-api-key.", "openai-insecure-api-key." + rtSecret}, 0},
+		{"a right header over a wrong key", http.Header{"Authorization": {"Bearer " + rtSecret}}, []string{"realtime", "openai-insecure-api-key.nope"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, resp, err := rig.dialWith(t, "/v1/realtime", "model="+rtModel, &websocket.DialOptions{HTTPHeader: tc.header, Subprotocols: tc.offers})
+			if tc.status != 0 {
+				if err == nil || statusOf(resp) != tc.status {
+					t.Fatalf("status = %d, want %d", statusOf(resp), tc.status)
+				}
+				rig.waitHandled(t)
+				return
+			}
+			if err != nil {
+				t.Fatalf("dial: %v (status %d)", err, statusOf(resp))
+			}
+			if conn.Subprotocol() != realtimeSubprotocol {
+				t.Fatalf("subprotocol = %q, want realtime", conn.Subprotocol())
+			}
+			roundTrip(t, conn)
+			_ = conn.Close(websocket.StatusNormalClosure, "")
+			rig.waitHandled(t)
+		})
+	}
+}
+
+// WaitRealtimeSessions is the shutdown's wait for the sessions the gateway's lifetime
+// ended: the open session is closed with 1001 on both sides and its usage row is
+// written before the wait returns, a handshake after it is refused, and the wait is
+// bounded.
+func TestRealtimeWaitSessionsOnShutdown(t *testing.T) {
+	t.Run("no session", func(t *testing.T) {
+		if !newRTRig(t).srv.WaitRealtimeSessions(rtWait) {
+			t.Fatal("the wait for no session timed out")
+		}
+	})
+	t.Run("an open session ends and is recorded", func(t *testing.T) {
+		rig := newRTRig(t)
+		lifetime, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		rig.srv.SetBaseContext(lifetime)
+		conn := rig.dial(t, "model="+rtModel)
+		roundTrip(t, conn)
+		// A client keeps reading, which is what answers the gateway's close.
+		clientClose := make(chan websocket.StatusCode, 1)
+		go func() {
+			for {
+				if _, _, err := conn.Read(context.Background()); err != nil {
+					clientClose <- websocket.CloseStatus(err)
+					return
+				}
+			}
+		}()
+		cancel()
+		if !rig.srv.WaitRealtimeSessions(rtWait) {
+			t.Fatal("the wait timed out")
+		}
+		if rows := rig.srv.Usage.All(); len(rows) != 1 {
+			t.Fatalf("usage rows after the wait = %d, want 1", len(rows))
+		}
+		if code := <-clientClose; code != websocket.StatusGoingAway {
+			t.Fatalf("client close = %d, want 1001", code)
+		}
+		if end := recvEnd(t, rig.agent); end.code != websocket.StatusGoingAway {
+			t.Fatalf("agent end = %+v, want 1001", end)
+		}
+		rig.waitHandled(t)
+
+		_, resp, err := rig.dialWith(t, "/v1/realtime", "model="+rtModel, &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer " + rtSecret}}})
+		if err == nil || statusOf(resp) != http.StatusServiceUnavailable {
+			t.Fatalf("a handshake after the wait: status = %d, want 503", statusOf(resp))
+		}
+		body, _ := io.ReadAll(resp.Body)
+		requireErrorCode(t, string(body), realtimeShuttingDown)
+		rig.waitHandled(t)
+		if n := rig.agent.dials.Load(); n != 1 {
+			t.Fatalf("agent dials = %d, want only the first session's", n)
+		}
+	})
+	t.Run("the wait is bounded", func(t *testing.T) {
+		srv := &Server{}
+		if !srv.realtimeSessions.begin() {
+			t.Fatal("begin refused before any wait")
+		}
+		defer srv.realtimeSessions.finish()
+		if srv.WaitRealtimeSessions(10 * time.Millisecond) {
+			t.Fatal("the wait for a session that never ends returned true")
+		}
+		if srv.realtimeSessions.begin() {
+			t.Fatal("begin admitted a session after the wait")
+		}
+	})
 }

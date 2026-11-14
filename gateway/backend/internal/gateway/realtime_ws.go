@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -38,6 +37,9 @@ const (
 	// can accept: 426 without the upgrade itself, 400 for a malformed one (a version
 	// other than 13, a missing or malformed key).
 	realtimeUpgradeRequired = "realtime.upgrade_required"
+	// realtimeShuttingDown: the gateway is shutting down and opens no new session.
+	// 503.
+	realtimeShuttingDown = "realtime.shutting_down"
 )
 
 // codeRealtimeAcceptFailed is the usage row's error code of a session whose upstream
@@ -98,12 +100,13 @@ const (
 	realtimeReasonTooBig   = "message too big"
 )
 
-// The two client events billing reads. Only frames that contain the type at all are
-// decoded.
-var (
-	realtimeAppendEvent = []byte("input_audio_buffer.append")
-	realtimeDoneEvent   = []byte("response.done")
-)
+// The two events billing reads: the client's audio append, decoded from every client
+// text frame (observeClient), and the upstream's response.done, decoded only from an
+// upstream frame that contains its name -- the upstream is the gateway's own trusted
+// child, which writes its events with Python's json and has no reason to escape one.
+const realtimeAppendEvent = "input_audio_buffer.append"
+
+var realtimeDoneEvent = []byte("response.done")
 
 // realtimeInferenceShape is the shape handleRealtime hands the one preflight gate.
 // The flavor is the coarse openai_audio family realtime is served in, the endpoint
@@ -374,7 +377,16 @@ type realtimeOutcome struct {
 // shows in Active Requests. The agent is dialed with r's context, so a client that
 // leaves during the dial abandons it; once the socket is accepted the session ends
 // only as relayRealtime describes.
+//
+// The session is counted in s.realtimeSessions until its row is written, which is
+// what the shutdown waits for (WaitRealtimeSessions); once that wait has begun a new
+// session is refused 503 realtime.shutting_down, before anything is registered.
 func (s *Server) serveRealtimeSession(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, target routing.Target) {
+	if !s.realtimeSessions.begin() {
+		writeJSON(w, http.StatusServiceUnavailable, apierror.Response(realtimeShuttingDown, "the gateway is shutting down", ""))
+		return
+	}
+	defer s.realtimeSessions.finish()
 	start := time.Now()
 	id := nextRequestID()
 	path := realtimeUpstreamPath(target)
@@ -382,9 +394,9 @@ func (s *Server) serveRealtimeSession(w http.ResponseWriter, r *http.Request, to
 		ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name,
 		ServiceID: token.ServiceID, ServiceName: token.ServiceName,
 		ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, InstanceKey: target.InstanceKey,
-		Model: req.Model, RequestedModel: req.RequestedModel,
+		Model: target.Model, RequestedModel: req.RequestedModel,
 		APIFlavor: req.APIFlavor, BillingUnit: billingUnitFor(req.APIFlavor),
-		ReqPath: r.URL.Path, ProviderPath: path, ProviderModel: effectiveProviderModel(target, req.Model),
+		ReqPath: r.URL.Path, ProviderPath: path, ProviderModel: effectiveProviderModel(target, target.Model),
 		SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID,
 		Stream: true, StartedAt: start,
 	})
@@ -422,6 +434,65 @@ func (s *Server) serveRealtimeSession(w http.ResponseWriter, r *http.Request, to
 	end := s.relayRealtime(r.Context(), client, upstream, &meter)
 	out = realtimeOutcomeOf(end)
 	slog.Debug("realtime session ended", "id", id, "model", req.Model, "code", int(end.code), "cause", end.cause.String())
+}
+
+// realtimeSessionSet counts the open realtime sessions, so the shutdown can wait for
+// them to close and write their usage rows. closed refuses new sessions once the wait
+// has begun, under mu, so no wg.Add can race the wait's wg.Wait.
+type realtimeSessionSet struct {
+	mu     sync.Mutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+// begin counts a new session in, or refuses it once the shutdown waits.
+func (rs *realtimeSessionSet) begin() bool {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.closed {
+		return false
+	}
+	rs.wg.Add(1)
+	return true
+}
+
+// finish counts a session out: its usage row is written and its active request
+// removed.
+func (rs *realtimeSessionSet) finish() {
+	rs.wg.Done()
+}
+
+// wait refuses new sessions and waits at most bound for the open ones; it reports
+// whether they all finished in time.
+func (rs *realtimeSessionSet) wait(bound time.Duration) bool {
+	rs.mu.Lock()
+	rs.closed = true
+	rs.mu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		rs.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// WaitRealtimeSessions is the shutdown's wait for the open /v1/realtime sessions,
+// for main to call once the server's lifetime (SetBaseContext) is canceled:
+// http.Server.Shutdown does not track a hijacked connection, so without it the
+// process could exit before a session has sent its 1001 close and written its usage
+// row. It refuses new sessions (503 realtime.shutting_down), waits at most bound,
+// and reports whether every session finished in time. A session whose peer does not
+// answer its close handshake can outlast a short bound (coder/websocket allows the
+// handshake 5 s each way); that session's row is then lost with the process.
+func (s *Server) WaitRealtimeSessions(bound time.Duration) bool {
+	return s.realtimeSessions.wait(bound)
 }
 
 // dialRealtimeUpstream dials the agent's realtime route for target with the
@@ -496,25 +567,54 @@ type realtimeMeter struct {
 	outputTokens int64
 }
 
-// observeClient counts the decoded audio of a client's input_audio_buffer.append that
-// was relayed upstream. A frame that is not a text JSON object of that type, or whose
-// audio is not base64, counts nothing: billing never alters or refuses a frame.
+// observeClient counts the audio of a client's input_audio_buffer.append that was
+// relayed upstream, reading the frame the way the upstream does, so that no spelling
+// of an append the upstream takes bills as zero here. sglang-omni parses the frame with
+// Python's json and reads the exact keys:
+//   - the frame is decoded as an object of raw values and "type" and "audio" are
+//     looked up exactly -- case-sensitive, and the last of duplicate keys wins, as in
+//     Python -- never through a struct, whose keys encoding/json matches without
+//     regard to case (an "AUDIO":"" after the real "audio" would win there);
+//   - there is no byte-level pre-filter: a type spelled with JSON escapes is the same
+//     type once decoded;
+//   - the audio is counted leniently, as Python's default base64 decode reads it:
+//     every character of the standard alphabet counts 3/4 of a byte, and anything
+//     else (padding, a stray character) is skipped, so a malformed character or a
+//     missing pad cannot zero the whole frame. No base64 decoder runs: the count is
+//     one pass over the audio string.
+//
+// A binary frame, a frame that is not a JSON object, another type, or an audio that is
+// not a string counts nothing. Billing never alters or refuses a frame.
 func (m *realtimeMeter) observeClient(typ websocket.MessageType, data []byte) {
-	if typ != websocket.MessageText || !bytes.Contains(data, realtimeAppendEvent) {
+	if typ != websocket.MessageText {
 		return
 	}
-	var ev struct {
-		Type  string `json:"type"`
-		Audio string `json:"audio"`
-	}
-	if json.Unmarshal(data, &ev) != nil || ev.Type != string(realtimeAppendEvent) || ev.Audio == "" {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(data, &fields) != nil {
 		return
 	}
-	n, err := io.Copy(io.Discard, base64.NewDecoder(base64.StdEncoding, strings.NewReader(ev.Audio)))
-	if err != nil {
+	var eventType, audio string
+	if json.Unmarshal(fields["type"], &eventType) != nil || eventType != realtimeAppendEvent {
 		return
 	}
-	m.appendBytes += n
+	if json.Unmarshal(fields["audio"], &audio) != nil {
+		return
+	}
+	m.appendBytes += base64AlphabetBytes(audio)
+}
+
+// base64AlphabetBytes is the byte count a lenient base64 decode yields for s: the
+// number of standard-alphabet characters ([A-Za-z0-9+/]) times 3/4, rounded down.
+// For well-formed base64 it is exactly the decoded length, padded or not.
+func base64AlphabetBytes(s string) int64 {
+	var n int64
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '+', c == '/':
+			n++
+		}
+	}
+	return n * 3 / 4
 }
 
 // observeUpstream adds the usage of a response.done whose response.usage is an object:

@@ -103,7 +103,20 @@ func main() {
 	if err := serveMainListener(mainSrv, cfg.Addr); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err) //nolint:gocritic // process is exiting; defer cleanup is moot
 	}
+	// Serve returns as soon as Shutdown closes the listener, and Shutdown never
+	// tracks a hijacked connection: an open /v1/realtime session would die with the
+	// process before it sent its 1001 close and wrote its usage row. The lifetime is
+	// canceled already (the signal handler cancels it first; canceling again is a
+	// no-op), which ends every session, so wait a short while for them to finish.
+	cancelBase()
+	if !srv.WaitRealtimeSessions(realtimeShutdownBound) {
+		slog.Warn("realtime sessions still closing at shutdown; their usage rows may be lost", "bound", realtimeShutdownBound)
+	}
 }
+
+// realtimeShutdownBound is how long the shutdown waits for the open /v1/realtime
+// sessions to close and record their usage (gateway.Server.WaitRealtimeSessions).
+const realtimeShutdownBound = 2 * time.Second
 
 // certEdgeGateTestRemoteAddrEnv, when set, makes the main listener report a
 // FIXED, caller-supplied address as the RemoteAddr of every accepted
