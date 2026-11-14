@@ -381,6 +381,14 @@ func (s *SQLiteStore) resolveBearer(ctx context.Context, header string) (auth.To
 		projRow := s.queryRow(ctx, `select name from projects where id = ?`, record.ProjectID)
 		_ = projRow.Scan(&projectName)
 	}
+	// The best-effort read above swallows its error, so a context that ended during
+	// it would otherwise hand back a token whose reads did not all run. A re-check
+	// promises that any non-refusal answer is a whole one, so an ended context is
+	// the read failure it is. LookupBearer's background context never ends, so its
+	// answer is unchanged.
+	if err := ctx.Err(); err != nil {
+		return auth.Token{}, fmt.Errorf("resolve bearer: %w", err)
+	}
 
 	return auth.Token{
 		ID:                             record.ID,

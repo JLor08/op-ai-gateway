@@ -12849,7 +12849,8 @@ billed by the one row written when it ends, its consumption reached the aggregat
     taken as definite. The loopback leg needs the internal secret and a user lookup in the store; a user that is gone
     (`store.ErrNotFound`) or disabled is definite. On either leg only a definite answer ends the session: any other read error is
     transient, logged (unless the session itself canceled the check) and retried on the next tick, so a store hiccup never cuts a live
-    session. A failure closes both hops with 1008 `token_invalid`.
+    session. A store that fails every read therefore keeps the session until the maximum lifetime ends it, and without bound when the
+    lifetime is set to `0`, with a Warn each tick. A failure closes both hops with 1008 `token_invalid`.
   - **Token quota and cost budget** through the new `PrincipalLimiter.Check`, which runs only `Admit`'s two spend checks (shared code) over
     the same config and aggregate caches. A breach closes both hops with 1008 `token_quota_exceeded` or `cost_budget_exceeded`. Like
     `Admit`, `Check` fails open on a store error.
