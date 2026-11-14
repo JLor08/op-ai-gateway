@@ -211,3 +211,30 @@ func TestResponsesPassthroughToSGLangStaysPassthrough(t *testing.T) {
 		t.Fatalf("upstream calls = %+v, want one raw /v1/responses relay", got)
 	}
 }
+
+// chatWithImage is a chat completions body whose one user message carries an image.
+func chatWithImage(imageURL string) string {
+	return `{"model":"agent-omni","messages":[{"role":"user","content":[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"` + imageURL + `"}}]}]}`
+}
+
+// `sglang serve --model-type omni` is sglang-omni behind SGLang's console script: an
+// Auto-typed spec with those args is guarded as sglang_omni (inline images only, and
+// its passthrough served as translate), not as plain sglang.
+func TestSGLangServeModelTypeOmniIsGuardedAsSGLangOmni(t *testing.T) {
+	spec := autoOmniPassthroughSpec()
+	spec.Binary, spec.Args = "/home/ai/sglang-env/bin/sglang", `["serve","--model-type","omni","--model-path","inclusionAI/Ming-3.0-tts-tiny"]`
+	up, calls := newWireUpstream(t)
+	srv := newWireSpecTestServer(t, up.URL, spec)
+	rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", chatWithImage("https://169.254.169.254/x.png"), map[string]string{"Authorization": "Bearer dev-secret"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	requireErrorCode(t, rec.Body.String(), "chat.media_url_unsupported")
+	rec = postImagesWithHeaders(t, srv, "/v1/responses", `{"model":"agent-omni","input":"hi"}`, map[string]string{"Authorization": "Bearer dev-secret"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("responses status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	if got := calls.all(); len(got) != 1 || got[0].path != "/v1/chat/completions" {
+		t.Fatalf("upstream calls = %+v, want only the translated /v1/chat/completions", got)
+	}
+}

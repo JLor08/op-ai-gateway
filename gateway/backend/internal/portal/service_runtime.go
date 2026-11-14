@@ -1343,6 +1343,9 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	// here for the application side's 409 sentinel to answer. The stored row
 	// is read later (priorRuntimeSpec), for the default-versus-preserve
 	// decision only, never here.
+	// The args are not encoded yet, so an `sglang serve --model-type omni` spec reads as
+	// sglang here (routing.EffectiveRuntimeSpecType): harmless, because sglang and
+	// sglang_omni answer every check that reads this kind alike.
 	effectiveSpecKind := routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: f.specType, Binary: f.binary})
 	f.liveTimingsCapable = routing.LiveTimingsCapableKind(string(effectiveSpecKind))
 	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled && !f.liveTimingsCapable {

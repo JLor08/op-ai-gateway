@@ -4,6 +4,7 @@
 package routing
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -116,12 +117,40 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 
 // EffectiveRuntimeSpecType resolves the RuntimeSpecType that governs a given
 // spec: the explicit spec.Type when set, else the type detected from
-// spec.Binary.
+// spec.Binary -- except that a binary detected as sglang whose args select the
+// omni serve backend (sglangArgsSelectOmni) is sglang_omni.
 func EffectiveRuntimeSpecType(spec RuntimeSpec) RuntimeSpecType {
 	if spec.Type != "" {
 		return RuntimeSpecType(spec.Type)
 	}
-	return DetectRuntimeSpecType(spec.Binary)
+	detected := DetectRuntimeSpecType(spec.Binary)
+	if detected == RuntimeSpecTypeSGLang && sglangArgsSelectOmni(spec.Args) {
+		return RuntimeSpecTypeSGLangOmni
+	}
+	return detected
+}
+
+// sglangArgsSelectOmni reports whether args (a spec's Args, an opaque JSON array of
+// strings) hold `--model-type omni` or `--model-type=omni`. That is the upstream
+// `sglang serve --model-type omni` form: SGLang v0.5.23's serve CLI
+// (python/sglang/cli/serve.py, _extract_model_type_override) hands the value of either
+// spelling to the serve backend registry, and sglang-omni v0.2.0 registers its server
+// as the "omni" backend (pyproject.toml, sglang.serve_backends), which is selected by
+// that flag alone -- its auto-detection never picks it. Any occurrence counts, even
+// one a later --model-type overrides upstream: reading the spec as sglang_omni turns
+// on the stricter media guards, which is the safe side to err on. Args that are no
+// JSON array select nothing.
+func sglangArgsSelectOmni(args string) bool {
+	var list []string
+	if json.Unmarshal([]byte(args), &list) != nil {
+		return false
+	}
+	for i, arg := range list {
+		if arg == "--model-type=omni" || (arg == "--model-type" && i+1 < len(list) && list[i+1] == "omni") {
+			return true
+		}
+	}
+	return false
 }
 
 // DeriveProbePaths resolves the metrics and context-probe paths to use for a

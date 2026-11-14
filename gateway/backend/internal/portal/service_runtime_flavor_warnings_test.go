@@ -300,6 +300,8 @@ func TestAnySGLangOmniSpecLacksAudioFlavor(t *testing.T) {
 		{"detected, openai only", agent, []routing.RuntimeSpec{{Binary: "/x/sglang-omni", APIFlavors: []string{routing.APIFlavorOpenAI}}}, true},
 		{"openai and openai_audio", agent, []routing.RuntimeSpec{{Type: "sglang_omni", APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}}}, false},
 		{"plain sglang with openai", agent, []routing.RuntimeSpec{{Type: "sglang", APIFlavors: []string{routing.APIFlavorOpenAI}}}, false},
+		{"sglang serve --model-type omni, openai only", agent, []routing.RuntimeSpec{{Binary: "/home/ai/sglang-env/bin/sglang", Args: `["serve","--model-type","omni"]`, APIFlavors: []string{routing.APIFlavorOpenAI}}}, true},
+		{"sglang serve without --model-type omni", agent, []routing.RuntimeSpec{{Binary: "/home/ai/sglang-env/bin/sglang", Args: `["serve","x"]`, APIFlavors: []string{routing.APIFlavorOpenAI}}}, false},
 		{"non-agent application", routing.Application{Type: routing.ProviderVLLM}, []routing.RuntimeSpec{{Type: "sglang_omni", APIFlavors: []string{routing.APIFlavorOpenAI}}}, false},
 	}
 	for _, tc := range cases {
