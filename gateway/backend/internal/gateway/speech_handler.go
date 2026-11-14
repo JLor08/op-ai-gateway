@@ -417,15 +417,18 @@ func (s *Server) recordSpeechReferenceRefusal(w http.ResponseWriter, r *http.Req
 // case-insensitively and lets the last key win, while sglang-omni (Python) reads the
 // exact key, so {"ref_audio":"/etc/passwd","Ref_Audio":"data:..."} would pass a struct
 // check and be read from disk upstream. Every key that EqualFolds a guarded name is
-// checked. The refusal names the field and never the value (the returned name is
-// what the log carries).
+// checked. A body that is not one JSON object is refused as "body". The refusal names
+// the field and never the value (the returned name is what the log carries).
 func nonInlineVoiceReferenceField(raw []byte, target routing.Target) string {
 	if target.LiveProgressSpecType != string(routing.RuntimeSpecTypeSGLangOmni) {
 		return ""
 	}
 	var body map[string]json.RawMessage
-	if json.Unmarshal(raw, &body) != nil {
-		return "" // validateSpeechRequest has accepted the body; not an object is not expected
+	if json.Unmarshal(raw, &body) != nil || body == nil {
+		// Not one JSON object (a null decodes to a nil map): nothing can be said about
+		// what the upstream would read from it, so it fails closed. validateSpeechRequest
+		// refuses every such body first today; this guard does not rely on that.
+		return "body"
 	}
 	for key, v := range body {
 		switch {
@@ -496,6 +499,9 @@ func isDataURL(s string) bool {
 }
 
 func speechReferenceError(field string) *inference.Error {
+	if field == "body" {
+		return &inference.Error{Code: speechReferenceAudioUnsupported, Message: "body must be one JSON object for this model server, whose voice references must be inline data: URLs"}
+	}
 	return &inference.Error{Code: speechReferenceAudioUnsupported, Message: field + " must be an inline data: URL; this model server cannot read a server-side path or fetch a URL"}
 }
 

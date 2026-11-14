@@ -1593,17 +1593,32 @@ func TestChatToSGLangOmniAcceptsOnlyInlineImages(t *testing.T) {
 }
 
 // The upstream's top-level audios, images and videos fields (local paths or URLs) never
-// reach the provider: the chat body is parsed into a typed request and rebuilt from known
-// fields only.
+// reach the upstream: the chat body is parsed into a typed request and rebuilt from known
+// fields only. The assertion is on the bytes the real provider client puts on the wire,
+// streamed and not.
 func TestChatToSGLangOmniDropsTopLevelMediaFields(t *testing.T) {
-	prov := &captureCompleteProvider{recordingProxyProvider: recordingProxyProvider{respBody: "x"}}
-	srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, routing.RuntimeSpecTypeSGLangOmni)
-	body := `{"model":"agent-voice","audios":["/etc/passwd"],"images":["https://x/y.png"],"videos":["/v.mp4"],"messages":[{"role":"user","content":"hi"}]}`
-	rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"})
-	if rec.Code != http.StatusOK || prov.completes != 1 {
-		t.Fatalf("status = %d, calls = %d; body %s", rec.Code, prov.completes, rec.Body.String())
-	}
-	if b, _ := json.Marshal(prov.last); strings.Contains(string(b), "passwd") || strings.Contains(string(b), "v.mp4") {
-		t.Fatalf("the provider request carries the top-level media fields: %s", b)
+	for _, stream := range []string{"", `"stream":true,`} {
+		up, calls := newWireUpstream(t)
+		srv := newWireSpecTestServer(t, up.URL, routing.RuntimeSpec{Type: string(routing.RuntimeSpecTypeSGLangOmni), APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}})
+		body := `{"model":"agent-omni",` + stream + `"audios":["/etc/passwd"],"images":["https://x/y.png"],"videos":["/v.mp4"],"messages":[{"role":"user","content":"hi"}]}`
+		rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"})
+		got := calls.all()
+		if rec.Code != http.StatusOK || len(got) != 1 || got[0].path != "/v1/chat/completions" {
+			t.Fatalf("status = %d, upstream calls = %+v; body %s", rec.Code, got, rec.Body.String())
+		}
+		var wire map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(got[0].body), &wire); err != nil {
+			t.Fatalf("upstream body is no JSON object: %v (%s)", err, got[0].body)
+		}
+		for _, field := range []string{"audios", "images", "videos"} {
+			if _, ok := wire[field]; ok {
+				t.Fatalf("the upstream body carries the top-level %q field: %s", field, got[0].body)
+			}
+		}
+		for _, leak := range []string{"passwd", "y.png", "v.mp4"} {
+			if strings.Contains(got[0].body, leak) {
+				t.Fatalf("the upstream body carries %q: %s", leak, got[0].body)
+			}
+		}
 	}
 }

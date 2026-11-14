@@ -29,7 +29,8 @@ type wireCall struct {
 }
 
 // wireUpstream records every request an httptest upstream receives and answers a
-// chat completion, so a test reads what the provider actually put on the wire.
+// chat completion (an event stream when the request asks for one), so a test reads
+// what the provider actually put on the wire.
 type wireUpstream struct {
 	mu    sync.Mutex
 	calls []wireCall
@@ -43,6 +44,10 @@ func (u *wireUpstream) all() []wireCall {
 
 const wireChatCompletion = `{"id":"c1","object":"chat.completion","created":1,"model":"agent-omni","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
 
+const wireChatStream = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"agent-omni\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n" +
+	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"agent-omni\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+	"data: [DONE]\n\n"
+
 func newWireUpstream(t *testing.T) (*httptest.Server, *wireUpstream) {
 	t.Helper()
 	rec := &wireUpstream{}
@@ -51,6 +56,11 @@ func newWireUpstream(t *testing.T) (*httptest.Server, *wireUpstream) {
 		rec.mu.Lock()
 		rec.calls = append(rec.calls, wireCall{path: r.URL.Path, body: string(body)})
 		rec.mu.Unlock()
+		if strings.Contains(string(body), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, wireChatStream)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, wireChatCompletion)
 	}))
@@ -236,5 +246,103 @@ func TestSGLangServeModelTypeOmniIsGuardedAsSGLangOmni(t *testing.T) {
 	}
 	if got := calls.all(); len(got) != 1 || got[0].path != "/v1/chat/completions" {
 		t.Fatalf("upstream calls = %+v, want only the translated /v1/chat/completions", got)
+	}
+}
+
+// A chat request routed to an sglang target may carry an image as a data: URL or an
+// http(s) URL (the scheme case-insensitive). SGLang reads any reference starting with
+// "/" or "file://" from the model host (python/sglang/srt/utils/common.py,
+// get_image_bytes), and no gateway client has a reason to name a model-host path, so
+// every other reference is refused. sglang_omni stays data: only.
+func TestChatToSGLangRefusesHostPathImages(t *testing.T) {
+	cases := []struct {
+		url      string
+		specType routing.RuntimeSpecType
+		refused  bool
+	}{
+		{"data:image/png;base64,iVBORw0=", routing.RuntimeSpecTypeSGLang, false},
+		{"DATA:image/png;base64,iVBORw0=", routing.RuntimeSpecTypeSGLang, false},
+		{"http://images.example.test/x.png", routing.RuntimeSpecTypeSGLang, false},
+		{"https://images.example.test/x.png", routing.RuntimeSpecTypeSGLang, false},
+		{"HTTPS://images.example.test/x.png", routing.RuntimeSpecTypeSGLang, false},
+		{"/etc/passwd", routing.RuntimeSpecTypeSGLang, true},
+		{"file:///etc/passwd", routing.RuntimeSpecTypeSGLang, true},
+		{"FILE:///etc/passwd", routing.RuntimeSpecTypeSGLang, true},
+		{"secret.png", routing.RuntimeSpecTypeSGLang, true},
+		{" /etc/passwd", routing.RuntimeSpecTypeSGLang, true},
+		{"ftp://images.example.test/x.png", routing.RuntimeSpecTypeSGLang, true},
+		{"iVBORw0KGgo=", routing.RuntimeSpecTypeSGLang, true},
+		{"https://images.example.test/x.png", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"/etc/passwd", routing.RuntimeSpecTypeVLLM, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.specType)+" "+tc.url, func(t *testing.T) {
+			prov := &captureCompleteProvider{recordingProxyProvider: recordingProxyProvider{respBody: "x"}}
+			srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, tc.specType)
+			body := strings.Replace(chatWithImage(tc.url), "agent-omni", "agent-voice", 1)
+			rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"})
+			if !tc.refused {
+				if rec.Code != http.StatusOK || prov.completes != 1 {
+					t.Fatalf("status = %d, provider calls = %d, want a relayed 200; body = %s", rec.Code, prov.completes, rec.Body.String())
+				}
+				return
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "chat.media_url_unsupported")
+			if prov.completes != 0 {
+				t.Fatalf("provider calls = %d, want 0", prov.completes)
+			}
+			if !strings.Contains(rec.Body.String(), "image_url.url") {
+				t.Fatalf("refusal does not name the field: %s", rec.Body.String())
+			}
+			for _, leak := range []string{"passwd", "secret.png", "images.example.test", "iVBOR"} {
+				if strings.Contains(rec.Body.String(), leak) {
+					t.Fatalf("refusal echoes the value (%q): %s", leak, rec.Body.String())
+				}
+			}
+			ev := lastUsageEvent(t, srv)
+			if ev.ErrorCode != "chat.media_url_unsupported" || ev.HTTPStatus != http.StatusBadRequest {
+				t.Fatalf("usage row = %+v, want a 400 chat.media_url_unsupported row", ev)
+			}
+		})
+	}
+}
+
+// The sglang refusal says what the sglang target accepts, which is not the sglang_omni
+// sentence.
+func TestChatMediaRefusalMessageFollowsTheTargetType(t *testing.T) {
+	refusal := func(specType routing.RuntimeSpecType) string {
+		prov := &captureCompleteProvider{recordingProxyProvider: recordingProxyProvider{respBody: "x"}}
+		srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI}, specType)
+		body := strings.Replace(chatWithImage("/etc/passwd"), "agent-omni", "agent-voice", 1)
+		return postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"}).Body.String()
+	}
+	sglang, omni := refusal(routing.RuntimeSpecTypeSGLang), refusal(routing.RuntimeSpecTypeSGLangOmni)
+	if !strings.Contains(sglang, "http") || sglang == omni {
+		t.Fatalf("sglang refusal = %s, omni refusal = %s; want an sglang sentence that names http(s)", sglang, omni)
+	}
+}
+
+// The speech guard fails closed: a body that does not decode as one JSON object says
+// nothing about what the upstream would read from it, so for an sglang_omni target it
+// is refused under the field name "body" (validateSpeechRequest refuses every such body
+// first today; the guard does not rely on that).
+func TestSpeechReferenceGuardFailsClosedOnANonObjectBody(t *testing.T) {
+	omni := routing.Target{LiveProgressSpecType: string(routing.RuntimeSpecTypeSGLangOmni)}
+	for _, raw := range []string{`["/etc/passwd"]`, `"/etc/passwd"`, `null`, `1`, `{"ref_audio":"/etc/passwd"`, ``, `{"model":"m"} {"ref_audio":"/etc/passwd"}`} {
+		if got := nonInlineVoiceReferenceField([]byte(raw), omni); got != "body" {
+			t.Errorf("nonInlineVoiceReferenceField(%q) = %q, want body", raw, got)
+		}
+	}
+	if got := nonInlineVoiceReferenceField([]byte(`{}`), omni); got != "" {
+		t.Errorf("an empty object = %q, want accepted", got)
+	}
+	if got := nonInlineVoiceReferenceField([]byte(`["/etc/passwd"]`), routing.Target{}); got != "" {
+		t.Errorf("another target = %q, want unchecked", got)
+	}
+	if msg := speechReferenceError("body").Message; !strings.Contains(msg, "JSON object") {
+		t.Errorf("body refusal message = %q, want it to say the body must be a JSON object", msg)
 	}
 }

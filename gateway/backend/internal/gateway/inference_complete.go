@@ -1109,6 +1109,9 @@ func completionErrorResponse(err error) apierror.Body {
 	if errors.Is(err, errMediaURLUnsupported) {
 		message = "image_url.url must be an inline data: URL; this model server cannot read a server-side path or fetch a URL"
 	}
+	if errors.Is(err, errMediaPathUnsupported) {
+		message = "image_url.url must be a data:, http:// or https:// URL; this model server would read any other reference from its own host"
+	}
 	if errors.Is(err, errTranscriptionLiveBusy) {
 		message = "a live transcription session is already active for this model; retry once it ends"
 	}
