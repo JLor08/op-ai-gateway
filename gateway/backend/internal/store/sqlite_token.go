@@ -318,57 +318,13 @@ func (s *SQLiteStore) RecheckBearer(ctx context.Context, header string) (auth.To
 // service id, whose service is gone or disabled -- and any other error when a read
 // failed.
 func (s *SQLiteStore) resolveBearer(ctx context.Context, header string) (auth.Token, error) {
-	secret, ok := auth.ExtractBearerSecret(header)
-	if !ok {
-		return auth.Token{}, auth.ErrBearerRefused
-	}
-	hash := auth.HashSecret(secret)
-	row := s.queryRow(ctx, `
-		select `+tokenColumns+`
-		from api_tokens
-		where secret_hash = ?`, hash)
-	record, err := scanToken(row)
-	if errors.Is(err, ErrNotFound) { // scanToken's sql.ErrNoRows
-		return auth.Token{}, auth.ErrBearerRefused
-	}
+	record, err := s.readLiveBearerRecord(ctx, header)
 	if err != nil {
-		return auth.Token{}, fmt.Errorf("read bearer token: %w", err)
+		return auth.Token{}, err
 	}
-	if record.Status != TokenStatusActive {
-		return auth.Token{}, auth.ErrBearerRefused
-	}
-	if record.ExpiresAt != nil && !record.ExpiresAt.After(time.Now().UTC()) {
-		return auth.Token{}, auth.ErrBearerRefused
-	}
-
-	// A service token additionally needs its service's name (display) + live
-	// disabled-gate + model allowlist. Any read error here fails the whole
-	// lookup closed (never falls back to an unrestricted/empty allowlist —
-	// that would be a privilege escalation for a token meant to be limited).
-	var serviceName string
-	var allowedModels []string
-	if record.Kind == TokenKindService {
-		if record.ServiceID == "" {
-			// A service-kind token with no service_id is a data-integrity
-			// anomaly; never treat it as a valid, unbound service token.
-			return auth.Token{}, auth.ErrBearerRefused
-		}
-		var status string
-		svcRow := s.queryRow(ctx, `select name, status from services where id = ?`, record.ServiceID)
-		if err := svcRow.Scan(&serviceName, &status); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return auth.Token{}, auth.ErrBearerRefused
-			}
-			return auth.Token{}, fmt.Errorf("read bearer token's service: %w", err)
-		}
-		if status == routing.ServerStatusDisabled {
-			return auth.Token{}, auth.ErrBearerRefused
-		}
-		models, err := s.ServiceAllowedModels(ctx, record.ServiceID)
-		if err != nil {
-			return auth.Token{}, fmt.Errorf("read bearer token's service allowlist: %w", err)
-		}
-		allowedModels = models
+	serviceName, allowedModels, err := s.resolveBearerService(ctx, record)
+	if err != nil {
+		return auth.Token{}, err
 	}
 
 	// ProjectName is resolved best-effort (unlike serviceName above, which
@@ -418,6 +374,68 @@ func (s *SQLiteStore) resolveBearer(ctx context.Context, header string) (auth.To
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 	}, nil
+}
+
+// readLiveBearerRecord reads the token the header's bearer secret names, under ctx, and
+// refuses one that cannot authenticate on its own record: no bearer secret, no token with
+// that hash, a token that is not active or has expired (auth.ErrBearerRefused). Any other
+// error is a read that failed.
+func (s *SQLiteStore) readLiveBearerRecord(ctx context.Context, header string) (TokenRecord, error) {
+	secret, ok := auth.ExtractBearerSecret(header)
+	if !ok {
+		return TokenRecord{}, auth.ErrBearerRefused
+	}
+	row := s.queryRow(ctx, `
+		select `+tokenColumns+`
+		from api_tokens
+		where secret_hash = ?`, auth.HashSecret(secret))
+	record, err := scanToken(row)
+	if errors.Is(err, ErrNotFound) { // scanToken's sql.ErrNoRows
+		return TokenRecord{}, auth.ErrBearerRefused
+	}
+	if err != nil {
+		return TokenRecord{}, fmt.Errorf("read bearer token: %w", err)
+	}
+	if record.Status != TokenStatusActive {
+		return TokenRecord{}, auth.ErrBearerRefused
+	}
+	if record.ExpiresAt != nil && !record.ExpiresAt.After(time.Now().UTC()) {
+		return TokenRecord{}, auth.ErrBearerRefused
+	}
+	return record, nil
+}
+
+// resolveBearerService reads what a SERVICE token additionally needs, under ctx: its
+// service's name (display), the live disabled-gate and the model allowlist. Any other
+// kind of token needs none of it and gets empty values. A read error fails the whole
+// lookup closed (never falls back to an unrestricted/empty allowlist -- that would be a
+// privilege escalation for a token meant to be limited); a service-kind token without a
+// service id, or whose service is gone or disabled, is refused (auth.ErrBearerRefused).
+func (s *SQLiteStore) resolveBearerService(ctx context.Context, record TokenRecord) (serviceName string, allowedModels []string, err error) {
+	if record.Kind != TokenKindService {
+		return "", nil, nil
+	}
+	if record.ServiceID == "" {
+		// A service-kind token with no service_id is a data-integrity anomaly; never
+		// treat it as a valid, unbound service token.
+		return "", nil, auth.ErrBearerRefused
+	}
+	var status string
+	svcRow := s.queryRow(ctx, `select name, status from services where id = ?`, record.ServiceID)
+	if err := svcRow.Scan(&serviceName, &status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, auth.ErrBearerRefused
+		}
+		return "", nil, fmt.Errorf("read bearer token's service: %w", err)
+	}
+	if status == routing.ServerStatusDisabled {
+		return "", nil, auth.ErrBearerRefused
+	}
+	models, err := s.ServiceAllowedModels(ctx, record.ServiceID)
+	if err != nil {
+		return "", nil, fmt.Errorf("read bearer token's service allowlist: %w", err)
+	}
+	return serviceName, models, nil
 }
 
 func tokenScopes(scopesJSON string) []string {
