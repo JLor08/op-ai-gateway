@@ -1332,44 +1332,71 @@ func TestNewSpeechStreamScanReadsTheHeaderRateForSGLangOmniOnly(t *testing.T) {
 	}
 }
 
-// A format header that is not a plain decimal positive integer, a bit depth that is no
-// whole number of bytes, and a product that is no usable rate (routing.ParseOutputByteRate's
-// rule: positive, within a uint32) all mean no header rate: it is never guessed.
+// A format header that is not a plain decimal positive integer, one stated more than once,
+// one missing beside the others, a bit depth that is no whole number of bytes, and a product
+// that is no usable rate (routing.ParseOutputByteRate's rule: positive, within a uint32) all
+// mean no header rate: it is never guessed. The scan keeps which header made it unusable,
+// for the warning the billing logs when it would have used the rate; a response that states
+// no format headers at all is no such case and keeps nothing.
 func TestNewSpeechStreamScanRefusesAnUnusableHeaderRate(t *testing.T) {
+	const allThree = "X-Sample-Rate, X-Channels, X-Bit-Depth"
 	for _, tc := range []struct {
 		name                           string
 		sampleRate, channels, bitDepth string
+		header                         string // the header the scan names
 	}{
-		{"a zero sample rate", "0", "1", "16"},
-		{"zero channels", "24000", "0", "16"},
-		{"a zero bit depth", "24000", "1", "0"},
-		{"a negative sample rate", "-24000", "1", "16"},
-		{"a signed sample rate", "+24000", "1", "16"},
-		{"a fractional sample rate", "24000.0", "1", "16"},
-		{"a unit suffix", "24kHz", "1", "16"},
-		{"a hexadecimal sample rate", "0x5dc0", "1", "16"},
-		{"surrounding space", " 24000", "1", "16"},
-		{"a 12-bit depth", "24000", "1", "12"},
-		{"a 4-bit depth", "24000", "1", "4"},
-		{"a missing sample rate", "", "1", "16"},
-		{"missing channels", "24000", "", "16"},
-		{"a missing bit depth", "24000", "1", ""},
-		{"a sample rate past a uint32", "4294967296", "1", "16"},
-		{"a product past a uint32", "4294967295", "1", "16"},
-		{"a product past a uint64", "4294967295", "4294967295", "4294967288"},
+		{"a zero sample rate", "0", "1", "16", "X-Sample-Rate"},
+		{"zero channels", "24000", "0", "16", "X-Channels"},
+		{"a zero bit depth", "24000", "1", "0", "X-Bit-Depth"},
+		{"a negative sample rate", "-24000", "1", "16", "X-Sample-Rate"},
+		{"a signed sample rate", "+24000", "1", "16", "X-Sample-Rate"},
+		{"a fractional sample rate", "24000.0", "1", "16", "X-Sample-Rate"},
+		{"a unit suffix", "24kHz", "1", "16", "X-Sample-Rate"},
+		{"a hexadecimal sample rate", "0x5dc0", "1", "16", "X-Sample-Rate"},
+		{"surrounding space", " 24000", "1", "16", "X-Sample-Rate"},
+		{"a 12-bit depth", "24000", "1", "12", "X-Bit-Depth"},
+		{"a 4-bit depth", "24000", "1", "4", "X-Bit-Depth"},
+		{"a missing sample rate", "", "1", "16", "X-Sample-Rate"},
+		{"missing channels", "24000", "", "16", "X-Channels"},
+		{"a missing bit depth", "24000", "1", "", "X-Bit-Depth"},
+		{"a sample rate past a uint32", "4294967296", "1", "16", "X-Sample-Rate"},
+		{"a product past a uint32", "4294967295", "1", "16", allThree},
+		{"a product past a uint64", "4294967295", "4294967295", "4294967288", allThree},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, contentType := range []string{"text/event-stream", "audio/pcm"} {
-				scan := newSpeechStreamScan(omniFormatHeader(contentType, tc.sampleRate, tc.channels, tc.bitDepth), omniKind)
+				header := omniFormatHeader(contentType, tc.sampleRate, tc.channels, tc.bitDepth)
+				for name, values := range header {
+					if len(values) == 1 && values[0] == "" {
+						delete(header, name)
+					}
+				}
+				scan := newSpeechStreamScan(header, omniKind)
 				if scan == nil || scan.headerRate != 0 {
 					t.Fatalf("%s: scan = %+v, want a scan with no header rate", contentType, scan)
+				}
+				if scan.headerIssue.header != tc.header || scan.headerIssue.reason == "" {
+					t.Fatalf("%s: header issue = %+v, want one naming %s", contentType, scan.headerIssue, tc.header)
 				}
 			}
 		})
 	}
+	for _, name := range []string{"X-Sample-Rate", "X-Channels", "X-Bit-Depth"} {
+		t.Run(name+" stated twice", func(t *testing.T) {
+			header := omniFormatHeader("text/event-stream", "24000", "1", "16")
+			header.Add(name, header.Get(name))
+			scan := newSpeechStreamScan(header, omniKind)
+			if scan == nil || scan.headerRate != 0 || scan.headerIssue.header != name {
+				t.Fatalf("scan = %+v, want no header rate and an issue naming %s", scan, name)
+			}
+		})
+	}
 	scan := newSpeechStreamScan(http.Header{"Content-Type": {"text/event-stream"}}, omniKind)
-	if scan == nil || scan.headerRate != 0 || !scan.writeEnd {
-		t.Fatalf("no format headers: scan = %+v, want an event stream the relay ends, with no header rate", scan)
+	if scan == nil || scan.headerRate != 0 || !scan.writeEnd || scan.headerIssue != (speechHeaderRateIssue{}) {
+		t.Fatalf("no format headers: scan = %+v, want an event stream the relay ends, with no header rate and no issue", scan)
+	}
+	if scan := newSpeechStreamScan(omniFormatHeader("text/event-stream", "24000", "1", "16"), omniKind); scan.headerIssue != (speechHeaderRateIssue{}) {
+		t.Fatalf("usable headers: issue = %+v, want none", scan.headerIssue)
 	}
 }
 
@@ -1379,8 +1406,10 @@ func omniSSEScan() *speechStreamScan {
 }
 
 // The frame the relay ends an sglang-omni event stream with: only for a body the upstream
-// closed cleanly after a done event, with no [DONE] of its own and nothing lost -- and
-// always an event of its own, so after a frame left unterminated it starts with \n\n.
+// closed cleanly after a done event, with no [DONE] of its own, no error event and nothing
+// lost -- and always an event of its own: after a frame left unterminated it starts with
+// \n\n, after one ended by a single newline with \n, and after a whole frame with nothing.
+// A CRLF counts as one newline.
 func TestSpeechStreamScanEndFrame(t *testing.T) {
 	delta := omniFrameDelta(speechPCM(10, 1))
 	done := omniSSEDone
@@ -1391,9 +1420,15 @@ func TestSpeechStreamScanEndFrame(t *testing.T) {
 		closed bool
 		want   string // "" is no frame
 	}{
-		{name: "done, closed after a whole frame", scan: omniSSEScan, stream: delta + done, closed: true, want: "\ndata: [DONE]\n\n"},
+		{name: "done, closed after a whole frame", scan: omniSSEScan, stream: delta + done, closed: true, want: "data: [DONE]\n\n"},
+		{name: "done, closed after more than one blank line", scan: omniSSEScan, stream: delta + done + "\n\n", closed: true, want: "data: [DONE]\n\n"},
 		{name: "done, closed after one newline", scan: omniSSEScan, stream: delta + strings.TrimSuffix(done, "\n"), closed: true, want: "\ndata: [DONE]\n\n"},
 		{name: "done, closed mid-line", scan: omniSSEScan, stream: delta + strings.TrimRight(done, "\n"), closed: true, want: "\n\ndata: [DONE]\n\n"},
+		{name: "done, closed after a whole CRLF frame", scan: omniSSEScan, stream: delta + strings.TrimRight(done, "\n") + "\r\n\r\n", closed: true, want: "data: [DONE]\n\n"},
+		{name: "done, closed after one CRLF", scan: omniSSEScan, stream: delta + strings.TrimRight(done, "\n") + "\r\n", closed: true, want: "\ndata: [DONE]\n\n"},
+		{name: "done, closed after a carriage return", scan: omniSSEScan, stream: delta + strings.TrimRight(done, "\n") + "\r", closed: true, want: "\n\ndata: [DONE]\n\n"},
+		{name: "done and then an error event", scan: omniSSEScan, stream: delta + done + omniSSEError, closed: true},
+		{name: "an error event and then done", scan: omniSSEScan, stream: delta + omniSSEError + done, closed: true},
 		{name: "done, not closed", scan: omniSSEScan, stream: delta + done},
 		{name: "no done event", scan: omniSSEScan, stream: delta, closed: true},
 		{name: "an error event", scan: omniSSEScan, stream: delta + omniSSEError, closed: true},

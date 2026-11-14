@@ -547,7 +547,8 @@ func speechReferenceError(field string) *inference.Error {
 // upstream call. The preflight request is not marked a stream, so the gate and the
 // resolve judged the same request a one-shot call would be. A stream relayed to an
 // sglang-omni target states response_format pcm on its upstream body when the client
-// stated none, because that upstream refuses a stream in its own default, wav (ADR-103).
+// stated none under that exact name, because that upstream refuses a stream in its own
+// default, wav (ADR-103).
 //
 // proxyNative then finishes the exchange: a 2xx event stream (or raw PCM) of a streamed
 // request is relayed unbuffered by the native copier, read on its way by
@@ -584,8 +585,11 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 			// told pcm, the one format a stream carries (validateSpeechRequest admits nothing
 			// else on one), and every other field is relayed as the client wrote it. A client
 			// that already said pcm is relayed untouched; the buffered retry above is built
-			// from the client's body and still leaves the field out.
-			if target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni) && sniffSpeechResponseFormat(raw) != speechFormatPCM {
+			// from the client's body and still leaves the field out. "Said pcm" is judged
+			// by sglang-omni's reading, not the gateway's: it matches field names exactly,
+			// where encoding/json (sniffSpeechResponseFormat) folds their case, so pcm under
+			// a key spelled another way is no pcm to it and gets the exact key added.
+			if target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni) && !speechBodyStatesExactPCM(raw) {
 				body, err := speechBodyWithResponseFormat(raw, speechFormatPCM)
 				if err != nil {
 					// Not expected for a body validateSpeechRequest accepted (it found a string
@@ -701,6 +705,19 @@ func speechBufferedBody(raw []byte) ([]byte, error) {
 // already ruled out (it found a string input), mirroring speechBufferedBody.
 func speechPCMUpstreamBody(raw []byte) ([]byte, error) {
 	return speechBodyWithResponseFormat(raw, speechFormatWAV)
+}
+
+// speechBodyStatesExactPCM reports whether the body's field named exactly response_format
+// -- case and all, as sglang-omni's request model reads it -- holds the JSON string "pcm".
+// A key that differs only in case, which encoding/json would fold onto the field, does not
+// count. Where the key is repeated the last one counts, as with Python's json and Go's map.
+func speechBodyStatesExactPCM(raw []byte) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return false
+	}
+	var format string
+	return json.Unmarshal(fields["response_format"], &format) == nil && format == speechFormatPCM
 }
 
 // The two response_format values a speech relay ever writes onto an upstream body: wav,

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"op-ai-gateway/internal/logbuffer"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
 	"strconv"
@@ -32,8 +33,8 @@ const (
 	omniSSEError = `data: {"type": "error", "error": {"message": "generation failed", "type": "server_error", "param": null, "code": null}}` + "\n\n"
 
 	// gatewaySpeechEnd is the frame the gateway ends an sglang-omni event stream with after
-	// a frame the upstream terminated: one extra newline, a no-op in SSE, then the sentinel.
-	gatewaySpeechEnd = "\n" + "data: [DONE]\n\n"
+	// a whole frame (one the upstream ended with its blank line): the sentinel alone.
+	gatewaySpeechEnd = "data: [DONE]\n\n"
 )
 
 // omniFrameDelta builds the speech.audio.delta frame sglang-omni streams for pcm.
@@ -244,16 +245,16 @@ func TestSpeechStreamSGLangOmniThatSentDONEGetsNoSecond(t *testing.T) {
 
 // The gateway's sentinel is always an event of its own: after a frame the upstream left
 // unterminated it starts with a blank line's worth of newlines (\n\n), so it never fuses
-// into the data of the done frame; after a frame ended by one newline or two, one more
-// newline is enough. The unterminated done frame is still read as the done event, so
-// the stream completes.
+// into the data of the done frame; after a frame ended by one newline, one more newline is
+// enough; after a whole frame it needs none. The unterminated done frame is still read as
+// the done event, so the stream completes.
 func TestSpeechStreamSGLangOmniSentinelAfterAnUnterminatedFrame(t *testing.T) {
 	done := strings.TrimRight(omniSSEDone, "\n")
 	for _, tc := range []struct {
 		name, ending, sentinel string
 	}{
 		{"no newline", "", "\n\n" + "data: [DONE]\n\n"},
-		{"one newline", "\n", gatewaySpeechEnd},
+		{"one newline", "\n", "\n" + gatewaySpeechEnd},
 		{"a whole frame", "\n\n", gatewaySpeechEnd},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -301,6 +302,68 @@ func TestSpeechStreamSGLangOmniRawPCMBillsTheHeaderRate(t *testing.T) {
 	requireStreamedSpeechRow(t, ev, usage.BillingUnitAudioSecond, 2)
 	if errs := errorLogs(buf); len(errs) != 0 {
 		t.Fatalf("a clean sglang-omni raw stream logged at Error: %+v", errs)
+	}
+}
+
+// Format headers sglang-omni stated but the gateway cannot use -- a value that is no plain
+// decimal positive integer, one stated twice -- give no rate, so a completed stream on a
+// mapping without a cached rate bills its bytes, as one with no headers at all does. That
+// fallback is said once at Warn, naming the header, so an upstream whose headers stopped
+// parsing is visible; a stream that stated no format headers, and one whose mapping has a
+// cached rate (the headers are then never consulted), log nothing.
+func TestSpeechStreamSGLangOmniWarnsOfAnUnusableHeaderRate(t *testing.T) {
+	pcm := speechPCM(48000, 1)
+	for _, tc := range []struct {
+		name       string
+		header     func(http.Header)
+		cachedRate string
+		unit       string
+		quantity   float64
+		warnHeader string // the header the one warning names; "" is no warning
+	}{
+		{"a sample rate with a unit", func(h http.Header) { setOmniFormatHeaders(h, "24kHz") }, "", usage.BillingUnitAudioBytes, 48000, "X-Sample-Rate"},
+		{"channels stated twice", func(h http.Header) { setOmniFormatHeaders(h, "24000"); h.Add("X-Channels", "1") }, "", usage.BillingUnitAudioBytes, 48000, "X-Channels"},
+		{"a cached rate: the headers are not consulted", func(h http.Header) { setOmniFormatHeaders(h, "24kHz") }, "48000", usage.BillingUnitAudioSecond, 1, ""},
+		{"no format headers", func(http.Header) {}, "", usage.BillingUnitAudioBytes, 48000, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			up, _ := newScriptedSpeechUpstream(t, func(_ int, w http.ResponseWriter, _ speechUpstreamCall) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				tc.header(w.Header())
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, omniFrameDelta(pcm)+omniSSEDone)
+			})
+			srv := newSGLangOmniSpeechTestServer(t, up.URL)
+			if tc.cachedRate != "" {
+				seedSpeechOutputByteRate(t, srv, omniSpeechMapping, tc.cachedRate)
+			}
+
+			if rec := postSpeech(t, srv, omniStreamBody); rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+
+			requireStreamedSpeechRow(t, onlyUsageEvent(t, srv), tc.unit, tc.quantity)
+			var warns []logbuffer.Record
+			for _, rec := range buf.Snapshot() {
+				if rec.Level == "WARN" && strings.Contains(rec.Msg, "format headers") {
+					warns = append(warns, rec)
+				}
+			}
+			if tc.warnHeader == "" {
+				if len(warns) != 0 {
+					t.Fatalf("warnings = %+v, want none", warns)
+				}
+				return
+			}
+			if len(warns) != 1 || warns[0].Attrs["header"] != tc.warnHeader || warns[0].Attrs["id"] == "" || warns[0].Attrs["id"] == nil {
+				t.Fatalf("warnings = %+v, want one naming %s and the request id", warns, tc.warnHeader)
+			}
+			if errs := errorLogs(buf); len(errs) != 0 {
+				t.Fatalf("a completed stream logged at Error: %+v", errs)
+			}
+		})
 	}
 }
 
@@ -400,6 +463,8 @@ func TestSpeechStreamAudioCppGetsNoSentinelAndNoHeaderRate(t *testing.T) {
 // default -- would be refused. The relay states pcm on the upstream body when the client
 // stated none (absent, null or empty), and touches nothing else; a client that said pcm
 // is relayed byte for byte, and so is every stream to audio.cpp, whose default pcm is.
+// sglang-omni reads its fields by their exact names, so pcm under a key spelled in another
+// case is no pcm to it: the exact key is added, and the client's own key stays.
 func TestSpeechStreamToSGLangOmniStatesPCM(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -410,6 +475,7 @@ func TestSpeechStreamToSGLangOmniStatesPCM(t *testing.T) {
 		{name: "a null response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":null}`},
 		{name: "an empty response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":""}`},
 		{name: "the raw shape, no response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"stream_format":"audio"}`},
+		{name: "pcm under a key of another case", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"Response_Format":"pcm"}`},
 		{name: "pcm already", body: `{"model":"omni-voice","input":"Hello there.", "stream":true,"response_format":"pcm"}`, unchanged: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

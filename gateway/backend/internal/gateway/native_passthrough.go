@@ -1139,8 +1139,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		setSpeechBillingQuantity(&meta, ex, resp.Header, speechTally, status)
 	}
 	// The transcription measure, for the one transcription that gets this far: a
-	// streamed one, which states no duration -- it is read off the upload's WAV
-	// header, and only for a stream that completed. See
+	// streamed one, which states no audio_duration_ms -- it is read off the upload's
+	// WAV header, or, where that measures nothing, from the usage seconds the done
+	// event states (sglang-omni's), and only for a stream that completed. See
 	// setStreamedTranscriptionBillingQuantity.
 	setStreamedTranscriptionBillingQuantity(&meta, ex, r.Header.Get(contentTypeHeader), transcriptScan, status)
 	// The capture is told how many bytes were actually relayed, and (speech only)
@@ -1384,9 +1385,12 @@ type nativeCopier struct {
 
 // run streams the upstream body to the client chunk by chunk and returns the
 // terminal copy error (nil on a clean EOF, unless the [DONE] it then writes to end
-// an sglang-omni speech stream fails to reach the client). Extracted from proxyNative —
-// behavior-identical: same read/write order, same error precedence (a write
-// error terminates before the read error is inspected). The deferred
+// an sglang-omni speech stream fails to reach the client). Extracted from proxyNative
+// with the same read/write order and the same error precedence (a write error
+// terminates before the read error is inspected); the one thing it adds is that end
+// frame, written at a clean EOF and only for an sglang-omni speech event stream that
+// asks for it (speechStreamScan.endFrame), so every other relay's bytes are exactly
+// what proxyNative relayed before. The deferred
 // scanner.finish call runs exactly once no matter how run() returns, so the
 // final frame — which, for a buffered non-streaming response, normally never
 // gets its own trailing newline — is still scanned; see usageScanner.finish.
@@ -1422,8 +1426,11 @@ func (c *nativeCopier) run(body io.Reader) error {
 	}
 }
 
-// writeChunk forwards one upstream chunk: re-arm the idle watchdog + write
-// deadline (streams only), write, flush (so SSE frames reach the client live),
+// writeChunk forwards one chunk to the client -- an upstream chunk, or the end frame
+// the gateway itself writes to close an sglang-omni speech event stream (run), which
+// takes the same path so it is flushed and scanned like the upstream's bytes: re-arm
+// the idle watchdog + write deadline (streams only), write, flush (so SSE frames reach
+// the client live),
 // feed the usage scanner and (images only) the image-count scanner, and tee
 // into the bounded respBuf. Both scanners are fed BEFORE the capture-cap check
 // so their accounting never depends on the capture budget — that check bounds
