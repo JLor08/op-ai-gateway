@@ -4772,3 +4772,34 @@ describe('sglang i18n keys', () => {
     expect(messages.en.runtimeSpecTypeSglangNote).toContain('Translate');
   });
 });
+
+describe('realtime capability i18n keys', () => {
+  it('has the form control, hint and chip keys in de and en, and they differ', () => {
+    for (const key of [
+      'mappingRealtimeCapable',
+      'mappingRealtimeCapableUnknownHint',
+      'capabilityRealtime',
+    ] as const) {
+      expect(messages.de[key], key).toBeTruthy();
+      expect(messages.en[key], key).toBeTruthy();
+    }
+    expect(messages.en.mappingRealtimeCapable).toBe('Realtime (WebSocket)');
+    expect(messages.de.mappingRealtimeCapable).toBe('Realtime (WebSocket)');
+    expect(messages.en.capabilityRealtime).toBe('Realtime (WebSocket)');
+    expect(messages.en.mappingRealtimeCapableUnknownHint).toContain('/v1/realtime');
+    expect(messages.en.mappingRealtimeCapableUnknownHint).toContain('0.20.0');
+    expect(messages.de.mappingRealtimeCapableUnknownHint).toContain('0.20.0');
+    expect(messages.de.mappingRealtimeCapableUnknownHint).not.toBe(
+      messages.en.mappingRealtimeCapableUnknownHint,
+    );
+  });
+
+  it('names --enable-realtime and the realtime verdict in the sglang_omni type note', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].runtimeSpecTypeSglangOmniNote;
+      expect(note).toContain('--enable-realtime');
+      expect(note).toContain('/v1/realtime');
+      expect(note).toContain('realtime');
+    }
+  });
+});

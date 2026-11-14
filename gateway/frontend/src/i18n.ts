@@ -1206,6 +1206,8 @@ const de = {
   mappingRerankCapable: 'Reranker-Modell',
   mappingRerankCapableUnknownHint:
     'Unbekannt = keine Festlegung. Das Gateway erkennt Reranker-Modelle nicht; sie werden ausschließlich vom Betreiber gekennzeichnet. Setze es auf Ja, um das Modell als Reranker (bewertet Anfrage-Dokument-Paare, kein Textgenerator) zu kennzeichnen. Das Gateway leitet daraus die Rolle des Modells ab.',
+  mappingRealtimeCapable: 'Realtime (WebSocket)',
+  mappingRealtimeCapableUnknownHint: 'Erlaubt /v1/realtime; erfordert Agent 0.20.0 oder neuer',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -1611,7 +1613,7 @@ const de = {
   runtimeSpecTypeSglangNote:
     'SGLang bedient Chat über /v1/chat/completions. Startvorlage: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Auf einer geteilten Karte --mem-fraction-static setzen, denn der automatische Standard belegt den Großteil des Speichers. Mit --api-key bleiben /health und /metrics offen, /v1/models verlangt dann aber den Schlüssel, sodass die Kontextabfrage nichts liest. Chat-Bilder nimmt das Gateway nur als data:-, http://- oder https://-URL an, einen Pfad auf dem Modell-Host lehnt es ab. Steht Codex (Responses-API) oder Claude Code (Anthropic Messages) auf „Durchreichen“, prüft das Gateway diese Anfragen (/v1/responses, /v1/messages) nicht; mit „Umwandlung“ gilt die Prüfung auch für sie. Unter Windows im WSL-Ausführungsmodus starten.',
   runtimeSpecTypeSglangOmniNote:
-    'sglang-omni bedient Chat, Sprachsynthese und Transkription. Startvorlage: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. --host 127.0.0.1 beibehalten: sglang-omni prüft keine Anmeldung und lauscht standardmäßig auf 0.0.0.0. Sprache und Transkription brauchen manuelle Fähigkeitsurteile, und an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein. Stimmreferenzen und Chat-Bilder werden nur inline als data:-URL angenommen, eine Bildbearbeitung nur mit hochgeladener Quelldatei. Audio im Chat (input_audio, modalities/audio) reicht das Gateway nicht weiter: Den Chat von sglang-omni erreichen nur Text und Inline-Bilder. Unter Windows im WSL-Ausführungsmodus starten.',
+    'sglang-omni bedient Chat, Sprachsynthese und Transkription. Startvorlage: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. --host 127.0.0.1 beibehalten: sglang-omni prüft keine Anmeldung und lauscht standardmäßig auf 0.0.0.0. Sprache und Transkription brauchen manuelle Fähigkeitsurteile, und an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein. Stimmreferenzen und Chat-Bilder werden nur inline als data:-URL angenommen, eine Bildbearbeitung nur mit hochgeladener Quelldatei. Audio im Chat (input_audio, modalities/audio) reicht das Gateway nicht weiter: Den Chat von sglang-omni erreichen nur Text und Inline-Bilder. Für /v1/realtime --enable-realtime anhängen und das Fähigkeitsurteil „realtime“ auf Ja setzen. Unter Windows im WSL-Ausführungsmodus starten.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -2088,6 +2090,7 @@ const de = {
   // bzw. Reranker); beide stammen vom Betreiber, siehe das Zuordnungsformular.
   capabilityEmbedding: 'Embedding',
   capabilityRerank: 'Reranker',
+  capabilityRealtime: 'Realtime (WebSocket)',
   capabilityTranscription: 'Transkription',
   // Refines "Transkription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.
@@ -5251,6 +5254,8 @@ const en: PortalMessages = {
   mappingRerankCapable: 'Reranker model',
   mappingRerankCapableUnknownHint:
     "Unknown = no verdict on file. The gateway does not detect reranker models; only an operator marks them. Set it to Yes to mark the model as a reranker (it scores query/document pairs, it does not generate text). The gateway derives the model's role from it.",
+  mappingRealtimeCapable: 'Realtime (WebSocket)',
+  mappingRealtimeCapableUnknownHint: 'Allows /v1/realtime; requires agent 0.20.0 or later',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',
@@ -5625,7 +5630,7 @@ const en: PortalMessages = {
   runtimeSpecTypeSglangNote:
     'SGLang serves chat over /v1/chat/completions. Launch template: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Set --mem-fraction-static when the card is shared, because the automatic default takes most of it. With --api-key, /health and /metrics stay open, but /v1/models then needs the key, so the context probe reads nothing. The gateway accepts chat images only as data:, http:// or https:// URLs and refuses a path on the model host. While Codex (Responses API) or Claude Code (Anthropic Messages) is set to Pass-through, the gateway does not check those requests (/v1/responses, /v1/messages); with Translate the check covers them too. On Windows, run it in the WSL execution mode.',
   runtimeSpecTypeSglangOmniNote:
-    'sglang-omni serves chat, speech and transcription. Launch template: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. Keep --host 127.0.0.1: sglang-omni authenticates nothing and listens on 0.0.0.0 by default. Speech and transcription need manual capability verdicts, and the parent server_agent application needs "openai_audio (speech synthesis)" ticked too. Voice references and chat images are accepted only inline, as data: URLs, and an image edit only with an uploaded source file. The gateway does not relay chat audio (input_audio, modalities/audio): only text and inline images reach sglang-omni chat. On Windows, run it in the WSL execution mode.',
+    'sglang-omni serves chat, speech and transcription. Launch template: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. Keep --host 127.0.0.1: sglang-omni authenticates nothing and listens on 0.0.0.0 by default. Speech and transcription need manual capability verdicts, and the parent server_agent application needs "openai_audio (speech synthesis)" ticked too. Voice references and chat images are accepted only inline, as data: URLs, and an image edit only with an uploaded source file. The gateway does not relay chat audio (input_audio, modalities/audio): only text and inline images reach sglang-omni chat. For /v1/realtime, add --enable-realtime and set the realtime capability verdict to yes. On Windows, run it in the WSL execution mode.',
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:
@@ -6057,6 +6062,7 @@ const en: PortalMessages = {
   // reranker); both are operator-stated, see the mapping form.
   capabilityEmbedding: 'Embedding',
   capabilityRerank: 'Reranker',
+  capabilityRealtime: 'Realtime (WebSocket)',
   capabilityTranscription: 'Transcription',
   // Refines "Transcription": the model delivers the transcript incrementally
   // (audio.cpp mode=streaming) instead of as one document at the end.

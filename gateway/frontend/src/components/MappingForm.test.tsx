@@ -532,6 +532,38 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     }
 
+    // realtime gates GET /v1/realtime. Nothing probes it, so the operator's verdict is the
+    // only source and all three states are offered, like embedding and rerank.
+    describe('realtime verdict', () => {
+      const label = t.mappingRealtimeCapable;
+
+      it('offers unknown, yes and no, with its own hint', async () => {
+        renderForm({ row: makeMapping({ capabilities: [] }) });
+        expect(screen.getByText(t.mappingRealtimeCapableUnknownHint)).toBeInTheDocument();
+        fireEvent.mouseDown(screen.getByRole('combobox', { name: label }));
+        expect(
+          await screen.findByRole('option', { name: t.mappingCapabilityUnknown }),
+        ).toBeInTheDocument();
+        expect(screen.getByRole('option', { name: t.mappingCapabilityYes })).toBeInTheDocument();
+        expect(screen.getByRole('option', { name: t.mappingCapabilityNo })).toBeInTheDocument();
+      });
+
+      it('sends yes once picked and nothing when untouched', async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await save();
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0]).not.toHaveProperty('capability_verdicts');
+      });
+
+      it('saves the realtime verdict when moved to yes', async () => {
+        const { submitted } = renderForm({ row: makeMapping({ capabilities: [] }) });
+        await pickOption(label, t.mappingCapabilityYes);
+        await save();
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ realtime: 'yes' });
+      });
+    });
+
     // decision is the speech twin for System One decision models: yes is the
     // operator's override of the decision probe, and (decision, no) is reserved
     // for that probe, so no is shown only when it is already stored.

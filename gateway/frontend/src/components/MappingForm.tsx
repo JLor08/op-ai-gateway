@@ -343,6 +343,8 @@ export function MappingForm({
   );
   const [transcriptionCapable, setTranscriptionCapable] =
     useState<CapabilityChoice>(transcriptionCapableSeed);
+  const [realtimeCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'realtime'));
+  const [realtimeCapable, setRealtimeCapable] = useState<CapabilityChoice>(realtimeCapableSeed);
   const [decisionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'decision'));
   const [decisionCapable, setDecisionCapable] = useState<CapabilityChoice>(decisionCapableSeed);
   const decisionsRouteLabel = decisionsRouteText(row?.decisions_route, t);
@@ -486,6 +488,7 @@ export function MappingForm({
       { capability: 'image_edit', value: imageEdit, seed: imageEditSeed },
       { capability: 'speech', value: speechCapable, seed: speechCapableSeed },
       { capability: 'transcription', value: transcriptionCapable, seed: transcriptionCapableSeed },
+      { capability: 'realtime', value: realtimeCapable, seed: realtimeCapableSeed },
       { capability: 'decision', value: decisionCapable, seed: decisionCapableSeed },
       {
         capability: 'decision_openai',
@@ -846,6 +849,20 @@ export function MappingForm({
               {t.mappingCapabilityNo}
             </option>
           )}
+        </SelectField>
+        {/* realtime gates GET /v1/realtime. It is operator-stated only (no probe writes
+            it, see routing.CapabilityRealtime), so, like embedding and rerank below, all
+            three states are offered. */}
+        <SelectField
+          id="mapping-realtime-capable"
+          label={t.mappingRealtimeCapable}
+          value={realtimeCapable}
+          onChange={(e) => setRealtimeCapable(e.target.value as CapabilityChoice)}
+          {...unknownHint(realtimeCapable, t.mappingRealtimeCapableUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          <option value="no">{t.mappingCapabilityNo}</option>
         </SelectField>
         {/* decision follows speech: yes is the operator's override of the
             decision-model probe, and (decision, no) is reserved for that
