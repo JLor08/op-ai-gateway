@@ -144,7 +144,12 @@ things this repository's conventions require and nothing else enforces:
    (block mappings and sequences, single-line flow collections, block scalars)
    and *fails* on anything outside it rather than skipping it, so a silent pass
    cannot mean "did not understand". It also catches tabs in indentation,
-   indentation that lands between levels, and duplicate keys in one mapping.
+   indentation that lands between levels, duplicate keys in one mapping, and a
+   plain (unquoted) scalar that contains `": "`, on its first line or a
+   continuation line: YAML reads that as a nested mapping, so a conforming
+   parser rejects the whole document. One such line sat in the spec unnoticed
+   until a real parser was run against it; such a value is quoted or written as
+   a `>` block scalar.
 
 Deliberately **out of scope**: `http(s)` links (they fail for reasons that have
 nothing to do with the repository and would make the gate flaky); prose style,
@@ -187,7 +192,8 @@ audit; nothing here re-checks that they stay gone.
 git repository, one case per failure mode (broken link, wrong anchor, wrong
 duplicate-heading suffix, unindexed architecture file, severed reachability
 path, dangling `$ref`, non-local `$ref`, duplicate key, bad indent, tab,
-unparsable line, multi-line flow, a forbidden string outside the allowlist)
+unparsable line, multi-line flow, a plain scalar containing `": "`, a forbidden
+string outside the allowlist)
 **and** one case per thing it must stay quiet about (links and headings inside
 fenced code blocks, links inside inline code, external URLs, branch-local
 scratch documents, the allowlisted files themselves saying the forbidden

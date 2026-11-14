@@ -392,6 +392,29 @@ run
 expect "a multi-line flow collection is refused, not silently mis-read" 1 \
   "multi-line flow collections are not supported"
 
+build
+sed 's/^    description: Local$/    description: Local: the dev gateway/' \
+  "$FIX/docs/architecture/reference/openapi.yaml" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/docs/architecture/reference/openapi.yaml"
+run
+expect "a plain scalar containing \": \" fails (a conforming YAML parser rejects it)" 1 \
+  'plain scalar contains ": "'
+
+build
+sed 's/^    description: Bundled$/    description: Bundled\n      deployment: nginx in front/' \
+  "$FIX/docs/architecture/reference/openapi.yaml" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/docs/architecture/reference/openapi.yaml"
+run
+expect "a plain-scalar continuation line containing \": \" fails too" 1 \
+  'plain scalar contains ": "'
+
+build
+sed "s/^    description: Local$/    description: 'Local: the dev gateway' # quoted: fine/" \
+  "$FIX/docs/architecture/reference/openapi.yaml" >"$FIX/t" \
+  && mv "$FIX/t" "$FIX/docs/architecture/reference/openapi.yaml"
+run
+expect "a quoted value with \": \" and a comment containing \": \" pass" 0 "check-docs: OK"
+
 # --------------------------------------------------------------------------
 # 4: config-env.md's agent table vs. the flags server-agent registers
 # --------------------------------------------------------------------------
