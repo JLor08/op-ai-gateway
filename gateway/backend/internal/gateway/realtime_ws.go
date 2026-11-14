@@ -18,6 +18,7 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
 	"op-ai-gateway/internal/usage"
 	"slices"
 	"strconv"
@@ -47,6 +48,20 @@ const (
 // cannot be hijacked). It is never sent to a client: websocket.Accept answers it.
 const codeRealtimeAcceptFailed = "realtime.accept_failed"
 
+// The usage row's error codes of the session ends the gateway decides after the
+// upgrade, each distinct from the generic realtime.close_1008 that the idle bound
+// and a peer's own 1008 record, so a row says why the gateway cut the session.
+// Never sent to a client: the client gets the matching close reason. A session a
+// re-check ends on a spend limit records that limit's own code
+// (codeLimitTokenQuotaExceeded, codeLimitCostBudgetExceeded) instead.
+const (
+	// codeRealtimeMaxSession: the session reached its maximum lifetime.
+	codeRealtimeMaxSession = "realtime.max_session_duration"
+	// codeRealtimeTokenInvalid: a re-check found that the credential the session
+	// was admitted with no longer authenticates it.
+	codeRealtimeTokenInvalid = "realtime.token_invalid"
+)
+
 // realtimeCloseCodePrefix prefixes the usage row's error code of a session that
 // ended with a close status other than 1000, 1001 or 1005: "realtime.close_1011".
 const realtimeCloseCodePrefix = "realtime.close_"
@@ -71,6 +86,25 @@ const realtimeMessageLimit = 4 << 20
 // that a session whose agent connection is lost without a FIN cannot hold its active
 // request -- and so its instance's capacity -- for good.
 const realtimeIdleTimeout = 15 * time.Minute
+
+// DefaultRealtimeMaxSession is the maximum lifetime of a /v1/realtime session when
+// the operator sets none (OP_AI_GATEWAY_REALTIME_MAX_SESSION; config.Load repeats
+// the literal): the cap OpenAI's Realtime API applies. A session is admitted once
+// and billed by the one row written when it ends, so without a bound a busy
+// session could run, and consume, for hours past the limits it was admitted under.
+const DefaultRealtimeMaxSession = 60 * time.Minute
+
+// realtimeRecheckInterval is how often an open session re-checks its principal
+// (recheckRealtime): its credential still authenticates and its spend limits are
+// not exhausted. A minute bounds how long a revoked key or an exhausted budget
+// keeps a session relaying, at the cost of one in-memory lookup and at most a few
+// limit reads from the store per session and minute.
+const realtimeRecheckInterval = time.Minute
+
+// realtimeRecheckTimeout bounds one re-check, so a store that stops answering
+// leaves the session as it is until the next tick instead of holding the check
+// goroutine.
+const realtimeRecheckTimeout = 10 * time.Second
 
 // realtimeCauseGrace is how long a session that ended on a failed write waits for the
 // read that names the cause (settleRealtimeEnd).
@@ -98,7 +132,19 @@ const (
 	realtimeReasonIdle     = "idle_timeout"
 	realtimeReasonShutdown = "gateway shutting down"
 	realtimeReasonTooBig   = "message too big"
+	// realtimeReasonMaxSession names the session's maximum lifetime
+	// (DefaultRealtimeMaxSession) as the reason it ended.
+	realtimeReasonMaxSession = "max_session_duration"
+	// The re-check's reasons: the credential no longer authenticates, or the
+	// principal's token quota or cost budget is exhausted.
+	realtimeReasonTokenInvalid = "token_invalid"
+	realtimeReasonTokenQuota   = "token_quota_exceeded"
+	realtimeReasonCostBudget   = "cost_budget_exceeded"
 )
+
+// realtimeScopes are the scopes a realtime credential must carry one of, at the
+// handshake and at every re-check.
+var realtimeScopes = []string{scopeGatewayUse, scopeLLMInvoke}
 
 // The two events billing reads: the client's audio append, decoded from every client
 // text frame (observeClient), and the upstream's response.done, decoded only from an
@@ -146,7 +192,10 @@ func realtimeInferenceShape(model string) inferenceShape {
 //  4. model is the query's model, required: 400 realtime.model_required.
 //  5. The one admission of the session: inferencePreflight over
 //     realtimeInferenceShape (model override, server override, allowlist,
-//     rate/quota/budget) -- once, however long the session lasts.
+//     rate/quota/budget) -- once, however long the session lasts. What can change
+//     while it runs is re-checked instead (recheckRealtime): every minute the
+//     credential is authenticated again and the token quota and cost budget are
+//     checked, and a session never outlives its maximum lifetime (ADR-104).
 //  6. The target: only an agent that declared realtime_proxy can serve a session
 //     (realtimeTargetServed); selectRealtimeTarget resolves until it finds one, or
 //     answers the routing refusal a model with no candidate gets.
@@ -172,7 +221,8 @@ func (s *Server) handleRealtime(w http.ResponseWriter, r *http.Request) {
 	if !requireMethod(w, r, http.MethodGet) {
 		return
 	}
-	token, ok := s.requireInternalOrBearerAnyScope(w, realtimeAuthRequest(r), scopeGatewayUse, scopeLLMInvoke)
+	authReq := realtimeAuthRequest(r)
+	token, ok := s.requireInternalOrBearerAnyScope(w, authReq, realtimeScopes...)
 	if !ok {
 		return
 	}
@@ -207,7 +257,23 @@ func (s *Server) handleRealtime(w http.ResponseWriter, r *http.Request) {
 		writeRealtimeRefusal(w, r, req, err)
 		return
 	}
-	s.serveRealtimeSession(w, r, token, req, target)
+	s.serveRealtimeSession(w, r, realtimeGrant{authReq: authReq, token: token, loopback: token.ID == "" && s.presentsInternalSecret(authReq)}, req, target)
+}
+
+// realtimeGrant is what admitted a session, kept so that its periodic re-check
+// (recheckRealtime) re-runs the same authentication against the same request:
+//   - authReq is the request the handshake authenticated, realtimeAuthRequest's
+//     clone when the key came as a subprotocol, so the subprotocol key is
+//     re-checked too;
+//   - token is the principal it resolved;
+//   - loopback says the internal loopback leg resolved it. That leg yields a
+//     session principal, which never carries a token ID, while every bearer token
+//     has one, so a principal without an ID on a request that presents the
+//     internal secret can only have come from that leg.
+type realtimeGrant struct {
+	authReq  *http.Request
+	token    auth.Token
+	loopback bool
 }
 
 // realtimeAuthRequest is the request handleRealtime authenticates: r itself, unless r
@@ -381,7 +447,8 @@ type realtimeOutcome struct {
 // The session is counted in s.realtimeSessions until its row is written, which is
 // what the shutdown waits for (WaitRealtimeSessions); once that wait has begun a new
 // session is refused 503 realtime.shutting_down, before anything is registered.
-func (s *Server) serveRealtimeSession(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, target routing.Target) {
+func (s *Server) serveRealtimeSession(w http.ResponseWriter, r *http.Request, grant realtimeGrant, req inference.Request, target routing.Target) {
+	token := grant.token
 	if !s.realtimeSessions.begin() {
 		writeJSON(w, http.StatusServiceUnavailable, apierror.Response(realtimeShuttingDown, "the gateway is shutting down", ""))
 		return
@@ -431,7 +498,7 @@ func (s *Server) serveRealtimeSession(w http.ResponseWriter, r *http.Request, to
 	}
 	client.SetReadLimit(realtimeMessageLimit)
 	upstream.SetReadLimit(realtimeMessageLimit)
-	end := s.relayRealtime(r.Context(), client, upstream, &meter)
+	end := s.relayRealtime(r.Context(), client, upstream, &meter, grant)
 	out = realtimeOutcomeOf(end)
 	slog.Debug("realtime session ended", "id", id, "model", req.Model, "code", int(end.code), "cause", end.cause.String())
 }
@@ -507,12 +574,17 @@ func (s *Server) dialRealtimeUpstream(ctx context.Context, target routing.Target
 	return conn, err
 }
 
-// realtimeOutcomeOf is the outcome of a relayed session that ended with end: a
-// success when it closed normally (1000), went away (1001) or closed without a status
-// (1005), an error row naming the close status otherwise. Either way the HTTP status
-// is the handshake's 101.
+// realtimeOutcomeOf is the outcome of a relayed session that ended with end: an error
+// row with the end's own code when the gateway decided it for a reason that has one
+// (the maximum lifetime, a failed re-check), a success when it closed normally
+// (1000), went away (1001) or closed without a status (1005), an error row naming the
+// close status otherwise. Either way the HTTP status is the handshake's 101.
 func realtimeOutcomeOf(end realtimeEnd) realtimeOutcome {
 	out := realtimeOutcome{httpStatus: http.StatusSwitchingProtocols, status: "success", upgraded: true}
+	if end.errorCode != "" {
+		out.status, out.errorCode = "error", end.errorCode
+		return out
+	}
 	switch end.code {
 	case websocket.StatusNormalClosure, websocket.StatusGoingAway, websocket.StatusNoStatusRcvd:
 	default:
@@ -543,6 +615,10 @@ type realtimeSessionEnd struct {
 // transcription pass that is never billed, so token precedence would let a key holder
 // get free ASR after one normal turn. Every sglang-omni flavor takes audio input, so a
 // session with appends is an audio session.
+//
+// How the session ended never changes the measure: a session the gateway cut (the
+// idle bound, the maximum lifetime, a failed re-check) is an error row that still
+// bills everything it relayed, so ending a session early never makes it free.
 func (s *Server) recordRealtimeUsage(start time.Time, id string, r *http.Request, token auth.Token, req inference.Request, target routing.Target, end realtimeSessionEnd) {
 	out, meter := end.outcome, end.meter
 	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: out.httpStatus, Endpoint: endpointRealtime}
@@ -809,11 +885,22 @@ func (s realtimeSide) other() realtimeSide {
 // with, and the side whose socket caused it (realtimeSideNone when the gateway ended
 // it). write marks an end a failed write reported, which names the cause's socket as
 // lost though its own read usually says why a moment later (settleRealtimeEnd).
+// errorCode is the usage row's code of an end the gateway decided for a reason that
+// has its own (realtimeGatewayEnd); it is empty for every other end, whose row names
+// the close status.
 type realtimeEnd struct {
-	code   websocket.StatusCode
-	reason string
-	cause  realtimeSide
-	write  bool
+	code      websocket.StatusCode
+	reason    string
+	cause     realtimeSide
+	write     bool
+	errorCode string
+}
+
+// realtimeGatewayEnd is an end the gateway decides on a policy -- the maximum
+// lifetime, a failed re-check: both sides are closed with 1008 and reason, and the
+// row records code.
+func realtimeGatewayEnd(reason, code string) realtimeEnd {
+	return realtimeEnd{code: websocket.StatusPolicyViolation, reason: reason, cause: realtimeSideNone, errorCode: code}
 }
 
 // realtimeIdleBound is a session's idle bound: the Server's realtimeIdle when set
@@ -825,13 +912,135 @@ func (s *Server) realtimeIdleBound() time.Duration {
 	return realtimeIdleTimeout
 }
 
+// realtimeRecheckEvery is a session's re-check interval: the Server's realtimeRecheck
+// when set (tests), realtimeRecheckInterval otherwise.
+func (s *Server) realtimeRecheckEvery() time.Duration {
+	if s.realtimeRecheck > 0 {
+		return s.realtimeRecheck
+	}
+	return realtimeRecheckInterval
+}
+
+// realtimeRecheck is a running re-check of one session (startRealtimeRecheck): ends
+// carries the end of a failed check, at most once; cancel stops the checking (a check
+// in flight sees its context end) and done is closed once the goroutine has exited.
+type realtimeRecheck struct {
+	ends   <-chan realtimeEnd
+	cancel context.CancelFunc
+	done   <-chan struct{}
+}
+
+// startRealtimeRecheck runs recheckRealtime for grant every realtimeRecheckEvery on a
+// goroutine of its own, so a slow check never stalls the relay: the relay only reads
+// the outcome of a check that failed. Each check gets its own realtimeRecheckTimeout.
+//
+// The checks run under a context of their own, detached from ctx (the request's) with
+// context.WithoutCancel, which keeps its values (the trace) but not its cancellation:
+// net/http keeps a hijacked request's context live while the handler runs, but that is
+// not a contract the checks should depend on. The session's end is what stops them
+// instead: the relay cancels that context and then waits on done, so the goroutine
+// never outlives its session. Every call a check makes (the in-memory token store,
+// the user lookup, the limiter's store reads) honors its context, so that wait is
+// short.
+func (s *Server) startRealtimeRecheck(ctx context.Context, grant realtimeGrant) realtimeRecheck {
+	ends := make(chan realtimeEnd, 1) // one report at most, so it never blocks
+	done := make(chan struct{})
+	checkCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	interval := s.realtimeRecheckEvery()
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-checkCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			onceCtx, cancelOnce := context.WithTimeout(checkCtx, realtimeRecheckTimeout)
+			end, failed := s.recheckRealtime(onceCtx, grant)
+			cancelOnce()
+			if failed {
+				ends <- end
+				return
+			}
+		}
+	}()
+	return realtimeRecheck{ends: ends, cancel: cancel, done: done}
+}
+
+// recheckRealtime re-checks an open session's principal and reports the end it must
+// close with when it may no longer run: the credential must still authenticate
+// (realtimeGrantHolds), else 1008 token_invalid; and the principal's token quota and
+// cost budget must not be exhausted (PrincipalLimiter.Check), else 1008 with the
+// limit's reason, recorded under the limit's own code. The rate limit and the request
+// quota are not re-checked: they govern admitting requests, and the session was
+// admitted.
+//
+// The session's own consumption so far is not part of the aggregate the limits read:
+// it is billed by the one row written when the session ends (and priced in the store).
+// A single session can therefore overrun a limit by what it consumes before it ends;
+// the maximum lifetime is what bounds that overrun.
+func (s *Server) recheckRealtime(ctx context.Context, grant realtimeGrant) (realtimeEnd, bool) {
+	if !s.realtimeGrantHolds(ctx, grant) {
+		return realtimeGatewayEnd(realtimeReasonTokenInvalid, codeRealtimeTokenInvalid), true
+	}
+	p, ok := principalFor(grant.token)
+	if !ok {
+		return realtimeEnd{}, false
+	}
+	switch _, reason := s.Limiter.Check(ctx, p); reason {
+	case "token_quota":
+		return realtimeGatewayEnd(realtimeReasonTokenQuota, codeLimitTokenQuotaExceeded), true
+	case "cost_budget":
+		return realtimeGatewayEnd(realtimeReasonCostBudget, codeLimitCostBudgetExceeded), true
+	}
+	return realtimeEnd{}, false
+}
+
+// realtimeGrantHolds re-runs the authentication leg that admitted the session against
+// the request it read.
+//
+// The bearer leg is the in-memory token store, so its answer is definite: the key must
+// still resolve (not revoked, active, unexpired), to the same token, which must still
+// carry gateway:use or llm:invoke.
+//
+// The loopback leg is the internal secret plus a user lookup in the store, which can
+// fail for reasons that say nothing about the user. Only a definite answer ends the
+// session: a user that is gone (store.ErrNotFound, which every driver returns for a
+// missing user) or disabled. Any other lookup error is transient: it is logged and the
+// session is kept until the next tick, so a store hiccup never cuts a live session.
+func (s *Server) realtimeGrantHolds(ctx context.Context, grant realtimeGrant) bool {
+	if grant.loopback {
+		if s.users == nil || !s.presentsInternalSecret(grant.authReq) {
+			return false
+		}
+		user, err := s.users.UserByID(ctx, grant.authReq.Header.Get(internalUserHeaderName))
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return false
+		case err != nil:
+			slog.Warn("realtime: the session's user lookup failed; the session stays open until the next re-check",
+				"user", grant.token.UserID, "err", err)
+			return true
+		}
+		return user.Status != store.UserStatusDisabled
+	}
+	if s.Tokens == nil {
+		return false
+	}
+	token, ok := s.Tokens.LookupBearer(grant.authReq.Header.Get("Authorization"))
+	return ok && token.ID == grant.token.ID && hasAnyScope(token, realtimeScopes)
+}
+
 // relayRealtime pumps messages between client and upstream until the session ends,
 // closes both sides and returns why it ended -- the agent router's relay, mirrored, so
 // a session ends the same way on both hops. One goroutine per direction reads a
 // message from one side and writes it to the other with its type; meter observes
 // each one (an upstream message as it is read, since the upstream did that work
 // whether or not the client is still there to get it; a client message once it was
-// relayed); this goroutine watches the pumps, the idle timer and the shutdown.
+// relayed); this goroutine watches the pumps, the idle and lifetime timers, the
+// re-check (startRealtimeRecheck) and the shutdown.
 //
 // The session ends at the first of:
 //   - a side's close frame: the other side is closed with the same status and reason.
@@ -844,12 +1053,17 @@ func (s *Server) realtimeIdleBound() time.Duration {
 //     offending side 1009, and the other side is closed with 1009 too.
 //   - the idle bound without a message in either direction (pings do not count):
 //     both sides are closed with 1008 "idle_timeout".
+//   - the maximum lifetime (realtimeMaxSession, none when 0), however busy the
+//     session is: both sides are closed with 1008 "max_session_duration".
+//   - a failed re-check of the session's principal (recheckRealtime): both sides
+//     are closed with 1008 and the check's reason.
 //   - the request context ending or the gateway shutting down: both sides are closed
 //     with 1001.
 //
-// It returns only once both sockets are closed and both pumps have exited, so the
-// caller's usage row and active-request removal follow the session on both sides.
-func (s *Server) relayRealtime(ctx context.Context, client, upstream *websocket.Conn, meter *realtimeMeter) realtimeEnd {
+// It returns only once both sockets are closed and both pumps and the re-check have
+// exited, so the caller's usage row and active-request removal follow the session on
+// both sides.
+func (s *Server) relayRealtime(ctx context.Context, client, upstream *websocket.Conn, meter *realtimeMeter, grant realtimeGrant) realtimeEnd {
 	activity := make(chan struct{}, 1)
 	ends := make(chan realtimeEnd, 2) // each pump reports exactly once, so a report never blocks
 	var pumps sync.WaitGroup
@@ -866,6 +1080,15 @@ func (s *Server) relayRealtime(ctx context.Context, client, upstream *websocket.
 	idleBound := s.realtimeIdleBound()
 	idle := time.NewTimer(idleBound)
 	defer idle.Stop()
+	// A nil channel never fires: with no lifetime bound the case below is inert,
+	// rather than a zero-length timer that would end the session at once.
+	var lifetime <-chan time.Time
+	if bound := s.realtimeMaxSession; bound > 0 {
+		timer := time.NewTimer(bound)
+		defer timer.Stop()
+		lifetime = timer.C
+	}
+	recheck := s.startRealtimeRecheck(ctx, grant)
 	var end realtimeEnd
 wait:
 	for {
@@ -878,6 +1101,11 @@ wait:
 		case <-idle.C:
 			end = realtimeEnd{code: websocket.StatusPolicyViolation, reason: realtimeReasonIdle, cause: realtimeSideNone}
 			break wait
+		case <-lifetime:
+			end = realtimeGatewayEnd(realtimeReasonMaxSession, codeRealtimeMaxSession)
+			break wait
+		case end = <-recheck.ends:
+			break wait
 		case <-ctx.Done():
 			end = realtimeEnd{code: websocket.StatusGoingAway, reason: realtimeReasonShutdown, cause: realtimeSideNone}
 			break wait
@@ -887,8 +1115,12 @@ wait:
 		}
 	}
 
+	// The re-check is canceled before the close handshake, which can take seconds,
+	// and joined after it, so a check in flight winds down meanwhile.
+	recheck.cancel()
 	closeRealtime(client, upstream, end)
 	pumps.Wait() // both sockets are closed now, so both pumps' reads fail at once
+	<-recheck.done
 	return end
 }
 

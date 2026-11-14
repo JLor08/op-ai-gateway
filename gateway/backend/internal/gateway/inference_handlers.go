@@ -637,6 +637,15 @@ func offeringFlavor(apiFlavor string) string {
 	return routing.NormalizeAPIFlavor(apiFlavor)
 }
 
+// The stable error codes of the two spend limits. writeLimitDenied answers a
+// denied request with them, and a /v1/realtime session that a re-check ends on
+// the same limit records them as its usage row's error code, so one limit has
+// one code wherever it stops consumption.
+const (
+	codeLimitTokenQuotaExceeded = "limit.token_quota_exceeded"
+	codeLimitCostBudgetExceeded = "limit.cost_budget_exceeded"
+)
+
 // writeLimitDenied writes the HTTP response for a PrincipalLimiter.Admit
 // denial, mapping each limit reason to its stable error code and status per
 // design spec §8: rate-limit and both quotas -> 429, cost budget -> 402. Only
@@ -655,9 +664,9 @@ func writeLimitDenied(w http.ResponseWriter, reason string, retryAfter time.Dura
 	case "request_quota":
 		code, message = "limit.request_quota_exceeded", "request quota exceeded"
 	case "token_quota":
-		code, message = "limit.token_quota_exceeded", "token quota exceeded"
+		code, message = codeLimitTokenQuotaExceeded, "token quota exceeded"
 	case "cost_budget":
-		status, code, message = http.StatusPaymentRequired, "limit.cost_budget_exceeded", "cost budget exceeded"
+		status, code, message = http.StatusPaymentRequired, codeLimitCostBudgetExceeded, "cost budget exceeded"
 	}
 	if reason == "rate" {
 		seconds := int(math.Ceil(retryAfter.Seconds()))

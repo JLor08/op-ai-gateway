@@ -1158,6 +1158,8 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		VoiceCoLoadTimeout:              cfg.VoiceCoLoadTimeout,
 		VoiceTiming:                     voiceTimingFromConfig(cfg),
 		VoicePrewarmEnabled:             cfg.VoicePrewarmEnabled,
+		RealtimeMaxSession:              cfg.RealtimeMaxSession,
+		RealtimeMaxSessionOff:           cfg.RealtimeMaxSession == 0, // the operator's explicit 0 (no bound), which a zero RealtimeMaxSession would read as the default
 		SwapProtectWindow:               time.Duration(cfg.SwapProtectWindowSeconds) * time.Second,
 		SessionReservationWindow:        time.Duration(cfg.SessionReservationWindowSeconds) * time.Second,
 		CapacityVRAMSafetyMarginPercent: cfg.CapacityVRAMSafetyMarginPercent,

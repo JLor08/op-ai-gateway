@@ -108,6 +108,16 @@ type ServerDeps struct {
 	// synthesis for the session's voice once the co-load gate has passed. The zero value is OFF,
 	// so a bare ServerDeps never primes; cmd/gateway carries the config's (default true) value.
 	VoicePrewarmEnabled bool
+	// RealtimeMaxSession is the longest one /v1/realtime session may run before the
+	// gateway ends it with 1008 max_session_duration (config
+	// OP_AI_GATEWAY_REALTIME_MAX_SESSION). <= 0 defaults in New to
+	// DefaultRealtimeMaxSession, so a bare ServerDeps keeps the bound.
+	RealtimeMaxSession time.Duration
+	// RealtimeMaxSessionOff lifts the session lifetime entirely, whatever
+	// RealtimeMaxSession says. It carries the operator's explicit 0, which
+	// RealtimeMaxSession alone cannot: a zero duration there reads as "use the
+	// default", like every other duration in ServerDeps.
+	RealtimeMaxSessionOff bool
 	// SwapProtectWindow is the recency window for routing swap-protection: a
 	// server that served a request within this window is protected from eviction
 	// by a request for a different model. <= 0 defaults to 30s in New.
@@ -502,6 +512,17 @@ type Server struct {
 	// (realtime_ws.go: realtimeIdleTimeout) when positive. Zero, the default and
 	// every production value, keeps the constant; only tests set it.
 	realtimeIdle time.Duration
+	// realtimeMaxSession is a /v1/realtime session's maximum lifetime
+	// (realtime_ws.go: relayRealtime), resolved in New from
+	// ServerDeps.RealtimeMaxSession and RealtimeMaxSessionOff. Zero is no bound,
+	// which is also what a bare &Server{} gets. Tests set it directly to a short
+	// bound.
+	realtimeMaxSession time.Duration
+	// realtimeRecheck overrides the interval at which a /v1/realtime session
+	// re-checks its principal (realtime_ws.go: realtimeRecheckInterval) when
+	// positive. Zero, the default and every production value, keeps the constant;
+	// only tests set it.
+	realtimeRecheck time.Duration
 	// realtimeSessions counts the open /v1/realtime sessions so the shutdown can
 	// wait for them (WaitRealtimeSessions): a session runs on a hijacked
 	// connection, which http.Server.Shutdown neither tracks nor waits for. The
@@ -974,6 +995,13 @@ func New(deps ServerDeps) *Server {
 		voiceCoLoadTimeout = DefaultVoiceCoLoadTimeout
 	}
 	voiceTiming := resolveVoiceTiming(deps.VoiceTiming)
+	realtimeMaxSession := deps.RealtimeMaxSession
+	switch {
+	case deps.RealtimeMaxSessionOff:
+		realtimeMaxSession = 0
+	case realtimeMaxSession <= 0:
+		realtimeMaxSession = DefaultRealtimeMaxSession
+	}
 	serverPerf := deps.ServerPerf
 	if serverPerf == nil {
 		serverPerf = NewServerPerfRegistry()
@@ -1165,6 +1193,7 @@ func New(deps ServerDeps) *Server {
 		SessionMaxAge:               deps.SessionMaxAge,
 		PublicURL:                   deps.PublicURL,
 		streamIdleTimeout:           deps.StreamIdleTimeout,
+		realtimeMaxSession:          realtimeMaxSession,
 		pushRuntimeConfigTimeout:    defaultPushRuntimeConfigTimeout,
 		pushRuntimeConfigSpacing:    defaultPushRuntimeConfigSpacing,
 		selfBaseURL:                 deps.SelfBaseURL,

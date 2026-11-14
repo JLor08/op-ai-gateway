@@ -104,6 +104,16 @@ type Config struct {
 	// variable stays distinguishable from a deliberate 0 -- cmd/gateway maps 0 onto
 	// gateway.VoiceTiming.MuteKeepalive.
 	VoiceMuteTeardown time.Duration
+	// RealtimeMaxSession (OP_AI_GATEWAY_REALTIME_MAX_SESSION, a Go duration string) is the
+	// longest a /v1/realtime session may run before the gateway ends it (1008
+	// max_session_duration). It bounds how far one session can overrun the limits it was
+	// admitted under, since its own consumption is billed only by the row written when it
+	// ends. Like VoiceMuteTeardown, an explicit 0 is a real value and is KEPT as 0: it means
+	// no bound. Only an absent, empty, junk or negative value falls back to the default (60m,
+	// the cap OpenAI's Realtime API applies and the literal of
+	// gateway.DefaultRealtimeMaxSession), so an absent variable stays distinguishable from a
+	// deliberate 0 -- cmd/gateway maps 0 onto gateway.ServerDeps.RealtimeMaxSessionOff.
+	RealtimeMaxSession time.Duration
 	// VoiceTTSConcurrency (OP_AI_GATEWAY_VOICE_TTS_CONCURRENCY, an integer) is how many speech
 	// sections one Voice Chat run synthesizes at once. A cap of 0 would admit no synthesis, so
 	// it follows the plain rule: an absent, empty, junk or <= 0 value uses the default 2 (the
@@ -363,6 +373,10 @@ func Load() (Config, error) {
 		// The mute teardown is the exception to "0 -> the default" above: an explicit 0 is
 		// keepalive and must survive, so it is parsed with durationAllowZero.
 		VoiceMuteTeardown: l.durationAllowZero("OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN", 10*time.Second),
+		// The realtime session lifetime is another knob where an explicit 0 (no bound) must
+		// survive, so it is parsed with durationAllowZero too (see the RealtimeMaxSession field
+		// doc). 60m repeats gateway.DefaultRealtimeMaxSession (this package cannot import gateway).
+		RealtimeMaxSession: l.durationAllowZero("OP_AI_GATEWAY_REALTIME_MAX_SESSION", 60*time.Minute),
 		// Voice Chat speech generation (see the field docs). Both defaults repeat the literals
 		// of gateway.VoiceTTS*Default (this package cannot import gateway). The cap follows the
 		// plain integer rule (a cap of 0 admits nothing); the retry count is the other knob

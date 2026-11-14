@@ -1419,3 +1419,467 @@ func TestRealtimeRelaysANonFiniteAppendUnchangedAndBillsIt(t *testing.T) {
 		t.Fatalf("billing = %v %q, want 1 audio_second", ev.BillingQuantity, ev.BillingUnit)
 	}
 }
+
+// rtRecheck is the re-check interval the lifetime and re-check tests run at: short
+// enough that a revocation is noticed at once, and long enough not to spin.
+const rtRecheck = 10 * time.Millisecond
+
+// rtLimitStore is a principal-limit store a realtime test controls while a session
+// runs: every PrincipalLimits read (one per Admit or Check whose config is not
+// cached) signals calls, and with blocking set a read signals blocked, waits until
+// its context ends (and then, when hold is set, until hold is closed: a call slow to
+// return once canceled), signals released, and fails. hold is set before blocking,
+// whose atomic store publishes it.
+type rtLimitStore struct {
+	*fakePrincipalStore
+	calls    chan struct{}
+	blocked  chan struct{}
+	released chan struct{}
+	hold     chan struct{}
+	blocking atomic.Bool
+}
+
+func newRTLimitStore() *rtLimitStore {
+	return &rtLimitStore{fakePrincipalStore: newFakePrincipalStore(), calls: make(chan struct{}, 256), blocked: make(chan struct{}, 16), released: make(chan struct{}, 16)}
+}
+
+func (s *rtLimitStore) PrincipalLimits(ctx context.Context, principalType, principalID string) (routing.LimitConfig, bool, error) {
+	if s.blocking.Load() {
+		s.blocked <- struct{}{}
+		<-ctx.Done()
+		if s.hold != nil {
+			<-s.hold
+		}
+		s.released <- struct{}{}
+		return routing.LimitConfig{}, false, ctx.Err()
+	}
+	cfg, ok, err := s.fakePrincipalStore.PrincipalLimits(ctx, principalType, principalID)
+	select {
+	case s.calls <- struct{}{}:
+	default:
+	}
+	return cfg, ok, err
+}
+
+// useRTLimits installs store as the rig's limiter, with no caching, so every
+// re-check reads the store, and the short re-check interval.
+func (rig *rtRig) useRTLimits(store *rtLimitStore) {
+	rig.srv.Limiter = NewPrincipalLimiter(store, PrincipalLimiterOptions{CacheTTL: time.Nanosecond})
+	rig.srv.realtimeRecheck = rtRecheck
+}
+
+// waitSignals discards what ch already holds, then waits for n more signals: n
+// whole re-checks that started after the caller's change.
+func waitSignals(t *testing.T, ch <-chan struct{}, n int) {
+	t.Helper()
+	for drained := false; !drained; {
+		select {
+		case <-ch:
+		default:
+			drained = true
+		}
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-ch:
+		case <-time.After(rtWait):
+			t.Fatalf("saw %d of %d re-checks", i, n)
+		}
+	}
+}
+
+// tokenStore is the rig's bearer store, which a test edits mid-session.
+func (rig *rtRig) tokenStore(t *testing.T) *auth.TokenStore {
+	t.Helper()
+	ts, ok := rig.srv.Tokens.(*auth.TokenStore)
+	if !ok {
+		t.Fatalf("the rig's token store is a %T", rig.srv.Tokens)
+	}
+	return ts
+}
+
+// devToken is the dev bearer's stored token, as the store holds it now.
+func (rig *rtRig) devToken(t *testing.T) auth.Token {
+	t.Helper()
+	tok, ok := rig.tokenStore(t).LookupBearer("Bearer " + rtSecret)
+	if !ok {
+		t.Fatal("the dev bearer does not resolve")
+	}
+	return tok
+}
+
+// rtUsers is a user lookup a loopback test controls while a session runs. A missing
+// user is store.ErrNotFound, as the real stores answer it; err, when set, is
+// returned for every lookup instead. Every lookup signals calls.
+type rtUsers struct {
+	mu    sync.Mutex
+	users map[string]store.User
+	err   error
+	calls chan struct{}
+}
+
+func (u *rtUsers) UserByID(_ context.Context, id string) (store.User, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	defer func() {
+		select {
+		case u.calls <- struct{}{}:
+		default:
+		}
+	}()
+	if u.err != nil {
+		return store.User{}, u.err
+	}
+	user, ok := u.users[id]
+	if !ok {
+		return store.User{}, store.ErrNotFound
+	}
+	return user, nil
+}
+
+func (u *rtUsers) edit(f func(*rtUsers)) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	f(u)
+}
+
+const rtInternalSecret = "rt-internal-secret"
+
+// useRTLoopback lets the rig take the internal loopback pair for usr_dev.
+func (rig *rtRig) useRTLoopback() *rtUsers {
+	users := &rtUsers{users: map[string]store.User{"usr_dev": {ID: "usr_dev", DisplayName: "Dev User", Role: "user", Status: store.UserStatusActive}}, calls: make(chan struct{}, 256)}
+	rig.srv.internalAuthSecret = rtInternalSecret
+	rig.srv.users = users
+	rig.srv.realtimeRecheck = rtRecheck
+	return users
+}
+
+// dialLoopback opens a session over the internal loopback pair, without a bearer.
+func (rig *rtRig) dialLoopback(t *testing.T) *websocket.Conn {
+	t.Helper()
+	conn, resp, err := rig.dialWith(t, "/v1/realtime", "model="+rtModel, &websocket.DialOptions{HTTPHeader: http.Header{internalAuthHeaderName: {rtInternalSecret}, internalUserHeaderName: {"usr_dev"}}})
+	if err != nil {
+		t.Fatalf("dial /v1/realtime over the loopback pair: %v (status %d)", err, statusOf(resp))
+	}
+	return conn
+}
+
+// requireGatewayEnd requires the session to end with 1008 and reason on both hops,
+// and one error row with code; it returns that row.
+func requireGatewayEnd(t *testing.T, rig *rtRig, conn *websocket.Conn, reason, code string) usage.Event {
+	t.Helper()
+	if gotCode, gotReason := rtReadClose(t, conn); gotCode != websocket.StatusPolicyViolation || gotReason != reason {
+		t.Fatalf("client close = %d %q, want 1008 %q", gotCode, gotReason, reason)
+	}
+	if end := recvEnd(t, rig.agent); end.code != websocket.StatusPolicyViolation || end.reason != reason {
+		t.Fatalf("agent end = %+v, want 1008 %q", end, reason)
+	}
+	ev := rig.oneRow(t)
+	if ev.Status != "error" || ev.ErrorCode != code || ev.HTTPStatus != http.StatusSwitchingProtocols {
+		t.Fatalf("row = status %q code %q http %d, want error %q 101", ev.Status, ev.ErrorCode, ev.HTTPStatus, code)
+	}
+	return ev
+}
+
+// requireStillRelaying proves the session is open after the re-checks, then closes it
+// normally and requires its one success row.
+func requireStillRelaying(t *testing.T, rig *rtRig, conn *websocket.Conn) {
+	t.Helper()
+	roundTrip(t, conn)
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+	if ev := rig.oneRow(t); ev.Status != "success" || ev.ErrorCode != "" {
+		t.Fatalf("row = status %q code %q, want a success: the session must have stayed open", ev.Status, ev.ErrorCode)
+	}
+}
+
+// Every end the gateway itself decides -- the idle bound, the maximum lifetime, a
+// key that no longer authenticates, an exhausted token quota or cost budget -- closes
+// both hops with 1008 and its own reason, records exactly one row with its own error
+// code, and bills what the session relayed exactly as the idle end does: an error
+// row whose measure is the appended audio.
+func TestRealtimeGatewayEndsCloseBothHopsAndBillLikeIdle(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   func(*rtRig)
+		trigger func(*testing.T, *rtRig, *rtLimitStore)
+		reason  string
+		code    string
+	}{
+		{name: "idle bound", setup: func(rig *rtRig) { rig.srv.realtimeIdle = 300 * time.Millisecond }, reason: "idle_timeout", code: "realtime.close_1008"},
+		{name: "maximum lifetime", setup: func(rig *rtRig) { rig.srv.realtimeMaxSession = 500 * time.Millisecond }, reason: "max_session_duration", code: "realtime.max_session_duration"},
+		{name: "key revoked", trigger: func(t *testing.T, rig *rtRig, _ *rtLimitStore) {
+			rig.tokenStore(t).RemoveToken("tok_dev")
+		}, reason: "token_invalid", code: "realtime.token_invalid"},
+		{name: "token quota exhausted", trigger: func(_ *testing.T, _ *rtRig, limits *rtLimitStore) {
+			limits.setAggregate(Principal{Type: routing.PrincipalTypeUser, ID: "usr_dev"}, 0, 100, 0)
+		}, reason: "token_quota_exceeded", code: "limit.token_quota_exceeded"},
+		{name: "cost budget exhausted", trigger: func(_ *testing.T, _ *rtRig, limits *rtLimitStore) {
+			limits.setAggregate(Principal{Type: routing.PrincipalTypeUser, ID: "usr_dev"}, 0, 0, 5)
+		}, reason: "cost_budget_exceeded", code: "limit.cost_budget_exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newRTRig(t)
+			limits := newRTLimitStore()
+			limits.setConfig(Principal{Type: routing.PrincipalTypeUser, ID: "usr_dev"}, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day", CostBudget: 5, CostBudgetPeriod: "day"})
+			rig.useRTLimits(limits)
+			if tc.setup != nil {
+				tc.setup(rig)
+			}
+			conn := rig.dial(t, "model="+rtModel)
+			rtWrite(t, conn, websocket.MessageText, appendEvent(32000))
+			rtRead(t, conn)
+			if tc.trigger != nil {
+				tc.trigger(t, rig, limits)
+			}
+			ev := requireGatewayEnd(t, rig, conn, tc.reason, tc.code)
+			if ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 1 {
+				t.Fatalf("billing = %v %q, want the 1 audio_second the session appended", ev.BillingQuantity, ev.BillingUnit)
+			}
+			if err := usage.ValidateBillingXOR(ev); err != nil {
+				t.Fatalf("billing XOR: %v", err)
+			}
+		})
+	}
+}
+
+// A lifetime of 0 is no bound at all, not a bound that has already passed: the
+// session keeps relaying until the client closes it.
+func TestRealtimeMaxSessionZeroIsOff(t *testing.T) {
+	rig := newRTRig(t)
+	rig.srv.realtimeMaxSession = 0
+	conn := rig.dial(t, "model="+rtModel)
+	for i := 0; i < 3; i++ {
+		roundTrip(t, conn)
+	}
+	requireStillRelaying(t, rig, conn)
+}
+
+// New resolves the configured lifetime: an unset or non-positive value is the 60m
+// default, a positive one is kept, and RealtimeMaxSessionOff -- the operator's
+// explicit 0 -- lifts the bound whatever the duration says.
+func TestRealtimeMaxSessionFromDeps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		deps ServerDeps
+		want time.Duration
+	}{
+		{"unset", ServerDeps{}, 60 * time.Minute},
+		{"negative", ServerDeps{RealtimeMaxSession: -time.Minute}, 60 * time.Minute},
+		{"configured", ServerDeps{RealtimeMaxSession: 5 * time.Minute}, 5 * time.Minute},
+		{"off", ServerDeps{RealtimeMaxSessionOff: true, RealtimeMaxSession: 5 * time.Minute}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := New(tc.deps).realtimeMaxSession; got != tc.want {
+				t.Fatalf("realtimeMaxSession = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	if DefaultRealtimeMaxSession != 60*time.Minute {
+		t.Fatalf("DefaultRealtimeMaxSession = %v, want 60m (config.Load repeats the literal)", DefaultRealtimeMaxSession)
+	}
+}
+
+// A re-check that blocks never stalls the relay: frames keep crossing while the check
+// waits, and the lifetime still closes both hops on time. The blocked check is
+// canceled when the session ends, and the session waits for it to return before its
+// row is written -- the re-check never outlives its session, even when the call it
+// blocks in takes a while to give up.
+func TestRealtimeBlockedRecheckDoesNotStallTheRelay(t *testing.T) {
+	rig := newRTRig(t)
+	limits := newRTLimitStore()
+	rig.useRTLimits(limits)
+	rig.srv.realtimeMaxSession = time.Second
+	conn := rig.dial(t, "model="+rtModel)
+	limits.hold = make(chan struct{})
+	limits.blocking.Store(true)
+	select {
+	case <-limits.blocked:
+	case <-time.After(rtWait):
+		t.Fatal("no re-check reached the store")
+	}
+	for i := 0; i < 3; i++ {
+		roundTrip(t, conn)
+	}
+	if code, reason := rtReadClose(t, conn); code != websocket.StatusPolicyViolation || reason != "max_session_duration" {
+		t.Fatalf("client close = %d %q, want 1008 max_session_duration", code, reason)
+	}
+	if end := recvEnd(t, rig.agent); end.code != websocket.StatusPolicyViolation || end.reason != "max_session_duration" {
+		t.Fatalf("agent end = %+v, want 1008 max_session_duration", end)
+	}
+	// The check is still held after both hops closed: the handler must not return,
+	// and no row may be written, until it does.
+	select {
+	case <-rig.handled:
+		t.Fatal("the session finished while its re-check was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if rows := rig.srv.Usage.All(); len(rows) != 0 {
+		t.Fatalf("usage rows while the re-check runs = %d, want 0", len(rows))
+	}
+	close(limits.hold)
+	rig.waitHandled(t)
+	select {
+	case <-limits.released:
+	default:
+		t.Fatal("the session finished before its blocked re-check returned")
+	}
+	if rows := rig.srv.Usage.All(); len(rows) != 1 || rows[0].ErrorCode != "realtime.max_session_duration" {
+		t.Fatalf("usage rows = %+v, want one realtime.max_session_duration row", rows)
+	}
+}
+
+// A key that stops authenticating mid-session ends it at the next re-check: revoked,
+// deactivated, expired, now naming another token, or stripped of both inference
+// scopes.
+func TestRealtimeRecheckRefusesAKeyThatNoLongerAuthenticates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*testing.T, *rtRig)
+	}{
+		{"deactivated", func(t *testing.T, rig *rtRig) {
+			tok := rig.devToken(t)
+			tok.Active = false
+			rig.tokenStore(t).UpdateToken(tok)
+		}},
+		{"expired", func(t *testing.T, rig *rtRig) {
+			tok := rig.devToken(t)
+			past := time.Now().UTC().Add(-time.Minute)
+			tok.ExpiresAt = &past
+			rig.tokenStore(t).UpdateToken(tok)
+		}},
+		{"names another token", func(t *testing.T, rig *rtRig) {
+			tok := rig.devToken(t)
+			rig.tokenStore(t).RemoveToken(tok.ID)
+			tok.ID = "tok_other"
+			rig.tokenStore(t).AddPlainToken(tok, rtSecret)
+		}},
+		{"inference scopes removed", func(t *testing.T, rig *rtRig) {
+			tok := rig.devToken(t)
+			tok.Scopes = []string{"admin"}
+			rig.tokenStore(t).UpdateToken(tok)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newRTRig(t)
+			rig.srv.realtimeRecheck = rtRecheck
+			conn := rig.dial(t, "model="+rtModel)
+			roundTrip(t, conn)
+			tc.edit(t, rig)
+			requireGatewayEnd(t, rig, conn, "token_invalid", "realtime.token_invalid")
+		})
+	}
+	t.Run("llm:invoke alone still authenticates", func(t *testing.T) {
+		rig := newRTRig(t)
+		limits := newRTLimitStore()
+		rig.useRTLimits(limits)
+		conn := rig.dial(t, "model="+rtModel)
+		tok := rig.devToken(t)
+		tok.Scopes = []string{"llm:invoke"}
+		rig.tokenStore(t).UpdateToken(tok)
+		waitSignals(t, limits.calls, 2)
+		requireStillRelaying(t, rig, conn)
+	})
+}
+
+// A session that authenticated with the subprotocol key is re-checked against that
+// key: it passes while the key is valid (the limit read follows a passed
+// authentication), and ends once the key is revoked.
+func TestRealtimeRecheckReadsTheSubprotocolKey(t *testing.T) {
+	rig := newRTRig(t)
+	limits := newRTLimitStore()
+	rig.useRTLimits(limits)
+	conn, resp, err := rig.dialWith(t, "/v1/realtime", "model="+rtModel, &websocket.DialOptions{Subprotocols: []string{"realtime", "openai-insecure-api-key." + rtSecret}})
+	if err != nil {
+		t.Fatalf("dial: %v (status %d)", err, statusOf(resp))
+	}
+	waitSignals(t, limits.calls, 3)
+	roundTrip(t, conn)
+	rig.tokenStore(t).RemoveToken("tok_dev")
+	requireGatewayEnd(t, rig, conn, "token_invalid", "realtime.token_invalid")
+}
+
+// A loopback session re-runs its own leg: a user that is gone or disabled ends it,
+// while a lookup that fails for any other reason is transient and keeps it open (and
+// is logged).
+func TestRealtimeRecheckLoopbackUser(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(*rtUsers)
+	}{
+		{"user gone", func(u *rtUsers) { delete(u.users, "usr_dev") }},
+		{"user disabled", func(u *rtUsers) {
+			user := u.users["usr_dev"]
+			user.Status = store.UserStatusDisabled
+			u.users["usr_dev"] = user
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newRTRig(t)
+			users := rig.useRTLoopback()
+			conn := rig.dialLoopback(t)
+			roundTrip(t, conn)
+			users.edit(tc.edit)
+			ev := requireGatewayEnd(t, rig, conn, "token_invalid", "realtime.token_invalid")
+			if ev.UserID != "usr_dev" || ev.TokenID != "" {
+				t.Fatalf("row attribution = %q/%q, want the loopback principal usr_dev", ev.UserID, ev.TokenID)
+			}
+		})
+	}
+	t.Run("transient lookup error keeps the session", func(t *testing.T) {
+		logs := captureRTLog(t)
+		rig := newRTRig(t)
+		users := rig.useRTLoopback()
+		conn := rig.dialLoopback(t)
+		users.edit(func(u *rtUsers) { u.err = errors.New("database is locked") })
+		waitSignals(t, users.calls, 3)
+		users.edit(func(u *rtUsers) { u.err = nil })
+		requireStillRelaying(t, rig, conn)
+		if !strings.Contains(logs.String(), "realtime: the session's user lookup failed") {
+			t.Fatal("the transient lookup failure was not logged")
+		}
+	})
+}
+
+// The limits re-check fails open: a store error reading the config or an aggregate
+// keeps the session open, as it admits a request.
+func TestRealtimeRecheckStoreErrorKeepsTheSession(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		cfgErr, aggErr error
+	}{
+		{"config read", errors.New("db unavailable"), nil},
+		{"aggregate read", nil, errors.New("db unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newRTRig(t)
+			limits := newRTLimitStore()
+			p := Principal{Type: routing.PrincipalTypeUser, ID: "usr_dev"}
+			limits.setConfig(p, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day", CostBudget: 5, CostBudgetPeriod: "day"})
+			rig.useRTLimits(limits)
+			conn := rig.dial(t, "model="+rtModel)
+			// The error goes in before the breaching aggregate and comes out after it
+			// is gone, so no check ever reads the aggregate without the error.
+			limits.setErrors(tc.cfgErr, tc.aggErr)
+			limits.setAggregate(p, 0, 1000, 1000)
+			waitSignals(t, limits.calls, 3)
+			limits.setAggregate(p, 0, 0, 0)
+			limits.setErrors(nil, nil)
+			requireStillRelaying(t, rig, conn)
+		})
+	}
+}
+
+// The re-check never applies the rate limit or the request quota, which govern
+// admitting requests: a principal at its rate limit and past its request quota keeps
+// the session it was admitted for.
+func TestRealtimeRecheckIgnoresRateAndRequestQuota(t *testing.T) {
+	rig := newRTRig(t)
+	limits := newRTLimitStore()
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "usr_dev"}
+	limits.setConfig(p, routing.LimitConfig{RateRequests: 1, RateWindowSeconds: 3600, RequestQuota: 1, RequestQuotaPeriod: "day"})
+	rig.useRTLimits(limits)
+	conn := rig.dial(t, "model="+rtModel)
+	limits.setAggregate(p, 100, 0, 0)
+	waitSignals(t, limits.calls, 3)
+	requireStillRelaying(t, rig, conn)
+}
