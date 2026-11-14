@@ -561,7 +561,9 @@ func speechReferenceError(field string) *inference.Error {
 // where the client stated no value under those exact names (sglangOmniSpeechStreamBody),
 // because that upstream refuses a stream in its own response_format default, wav, and
 // would answer its own stream_format default, raw audio, where the gateway's default shape
-// is the event stream (ADR-103).
+// is the event stream (ADR-103). That body shaping is done by setupSpeechStream (and
+// setupSGLangOmniSpeechStreamBody) for a stream and by setupSpeechPCMBody for a one-shot
+// pcm request.
 //
 // proxyNative then finishes the exchange: a 2xx event stream (or raw PCM) of a streamed
 // request is relayed unbuffered by the native copier, read on its way by
@@ -585,77 +587,111 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 	}
 	_, wantsStream := sniffRoutingModel(raw)
 	if wantsStream {
-		if s.mappingStreamsSpeech(r.Context(), target.RouteID) {
-			rel.pfReq.Stream = true
-			rel.streamRefusal = speechStreamingRefusal
-			rel.bufferedRetry = func() ([]byte, string, error) {
-				body, err := speechBufferedBody(raw)
-				return body, jsonContentType, err
-			}
-			// Two of sglang-omni's defaults are not a stream the gateway documents (ADR-103):
-			// its response_format defaults to wav, which it refuses to stream, so a stream
-			// that states none -- the portal's, and any client relying on the documented
-			// default -- would be refused; and its stream_format defaults to raw audio, so a
-			// client relying on the documented event-stream default would be answered in the
-			// other shape. The upstream is told what the client left unstated, pcm and sse,
-			// and every other field is relayed as the client wrote it; a client that stated
-			// both is relayed untouched (sglangOmniSpeechStreamBody). The buffered retry above
-			// is built from the client's body and still leaves both fields out.
-			if isSGLangOmniTarget(target) {
-				body, changed, err := sglangOmniSpeechStreamBody(raw)
-				if err != nil {
-					// Not expected for a body validateSpeechRequest accepted (it found a string
-					// input, so the body is a JSON object); answered as a failed relay, as the
-					// two body builders below are.
-					slog.Error("speech: building the sglang-omni stream body failed",
-						"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
-					s.recordSpeechRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("build sglang-omni speech stream body: %w", err))
-					return
-				}
-				if changed {
-					rel.upstreamBody = body
-				}
-			}
-		} else {
-			slog.Debug("speech asked to stream but the route is not known to: answering buffered",
-				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
-				"route_id", target.RouteID, "capability", routing.CapabilitySpeechStreaming)
-			body, err := speechBufferedBody(raw)
-			if err != nil {
-				// Not expected for a body validateSpeechRequest accepted: it found an input in
-				// it, which only a JSON object has. Were it to happen it is answered as a failed
-				// relay (and recorded) rather than sending the upstream a stream request it would
-				// refuse.
-				slog.Error("speech: building the buffered body failed",
-					"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
-				s.recordSpeechRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("build buffered speech body: %w", err))
-				return
-			}
-			rel.upstreamBody = body
-		}
-	}
-	// A one-shot pcm request (#253): the upstream is forced to wav -- audio.cpp's only
-	// one-shot format, which it answers whatever response_format it is handed -- and
-	// proxyNative strips the WAV header to relay the raw data chunk. Gated on the CLIENT's
-	// own stream intent (wantsStream), not rel.pfReq.Stream, so a stream request downgraded
-	// to a one-shot WAV (the route is not known to stream) is NOT stripped: it kept
-	// response_format off the upstream body (speechBufferedBody) and is relayed as the WAV
-	// it asked to become.
-	if !wantsStream && sniffSpeechResponseFormat(raw) == speechFormatPCM {
-		body, err := speechPCMUpstreamBody(raw)
-		if err != nil {
-			// Not expected for a body validateSpeechRequest accepted (it found a string input,
-			// so the body is a JSON object). Answered as a failed relay rather than guessing a
-			// body, exactly as the buffered-body-error branch above does.
-			slog.Error("speech: building the pcm upstream body failed",
-				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
-			s.recordSpeechRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("build pcm speech body: %w", err))
+		if !s.setupSpeechStream(w, r, &rel, req, start) {
 			return
 		}
-		rel.speechPCMStrip = true
-		rel.upstreamBody = body
+	} else if sniffSpeechResponseFormat(raw) == speechFormatPCM {
+		// A one-shot pcm request (#253). Gated on the CLIENT's own stream intent
+		// (wantsStream), not rel.pfReq.Stream, so a stream request downgraded to a one-shot
+		// WAV (the route is not known to stream) is NOT stripped: it kept response_format off
+		// the upstream body (speechBufferedBody) and is relayed as the WAV it asked to become.
+		if !s.setupSpeechPCMBody(w, r, &rel, req, start) {
+			return
+		}
 	}
 	s.proxyNative(w, r, rel)
+}
+
+// setupSpeechStream prepares rel for a request that asked to stream, and reports whether
+// the relay may go on; false means the failure has already been answered and recorded. It
+// is relaySpeech's streamed-versus-buffered decision, kept apart so the relay reads as
+// resolve, shape the body, proxy: a route known to stream (mappingStreamsSpeech) is relayed
+// as a stream with its buffered retry as the net, any other is answered buffered up front
+// with the stream-only fields left off the body (speechBufferedBody), so the upstream is
+// never asked for what it would refuse. req is the preflight request as relaySpeech
+// received it -- not rel.pfReq, which a stream marks -- so a failure is recorded and logged
+// against the request the client sent.
+func (s *Server) setupSpeechStream(w http.ResponseWriter, r *http.Request, rel *nativeRelay, req inference.Request, start time.Time) bool {
+	raw, target := rel.raw, rel.target
+	if !s.mappingStreamsSpeech(r.Context(), target.RouteID) {
+		slog.Debug("speech asked to stream but the route is not known to: answering buffered",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
+			"route_id", target.RouteID, "capability", routing.CapabilitySpeechStreaming)
+		body, err := speechBufferedBody(raw)
+		if err != nil {
+			// Not expected for a body validateSpeechRequest accepted: it found an input in
+			// it, which only a JSON object has. Were it to happen it is answered as a failed
+			// relay (and recorded) rather than sending the upstream a stream request it would
+			// refuse.
+			slog.Error("speech: building the buffered body failed",
+				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
+			s.recordSpeechRoutingFailure(w, r, rel.token, req, raw, start, fmt.Errorf("build buffered speech body: %w", err))
+			return false
+		}
+		rel.upstreamBody = body
+		return true
+	}
+	rel.pfReq.Stream = true
+	rel.streamRefusal = speechStreamingRefusal
+	rel.bufferedRetry = func() ([]byte, string, error) {
+		body, err := speechBufferedBody(raw)
+		return body, jsonContentType, err
+	}
+	if !isSGLangOmniTarget(target) {
+		return true
+	}
+	return s.setupSGLangOmniSpeechStreamBody(w, r, rel, req, start)
+}
+
+// setupSGLangOmniSpeechStreamBody sets the upstream body of a stream relayed to an
+// sglang-omni target, and reports whether the relay may go on; false means the failure has
+// already been answered and recorded. Two of sglang-omni's defaults are not a stream the
+// gateway documents (ADR-103): its response_format defaults to wav, which it refuses to
+// stream, so a stream that states none -- the portal's, and any client relying on the
+// documented default -- would be refused; and its stream_format defaults to raw audio, so
+// a client relying on the documented event-stream default would be answered in the other
+// shape. The upstream is told what the client left unstated, pcm and sse, and every other
+// field is relayed as the client wrote it; a client that stated both is relayed untouched
+// (sglangOmniSpeechStreamBody leaves rel.upstreamBody unset). The buffered retry
+// setupSpeechStream installed is built from the client's body and still leaves both
+// fields out.
+func (s *Server) setupSGLangOmniSpeechStreamBody(w http.ResponseWriter, r *http.Request, rel *nativeRelay, req inference.Request, start time.Time) bool {
+	body, changed, err := sglangOmniSpeechStreamBody(rel.raw)
+	if err != nil {
+		// Not expected for a body validateSpeechRequest accepted (it found a string
+		// input, so the body is a JSON object); answered as a failed relay, as the
+		// buffered and pcm body builders' failures are.
+		slog.Error("speech: building the sglang-omni stream body failed",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(rel.target.ServerID), "err", err)
+		s.recordSpeechRoutingFailure(w, r, rel.token, req, rel.raw, start, fmt.Errorf("build sglang-omni speech stream body: %w", err))
+		return false
+	}
+	if changed {
+		rel.upstreamBody = body
+	}
+	return true
+}
+
+// setupSpeechPCMBody prepares rel for a one-shot pcm request (#253), and reports whether
+// the relay may go on; false means the failure has already been answered and recorded.
+// The upstream is forced to wav -- audio.cpp's only one-shot format, which it answers
+// whatever response_format it is handed (speechPCMUpstreamBody) -- and rel is marked so
+// proxyNative strips the WAV header to relay the raw data chunk. req is the preflight
+// request as relaySpeech received it, which a failure is recorded against.
+func (s *Server) setupSpeechPCMBody(w http.ResponseWriter, r *http.Request, rel *nativeRelay, req inference.Request, start time.Time) bool {
+	body, err := speechPCMUpstreamBody(rel.raw)
+	if err != nil {
+		// Not expected for a body validateSpeechRequest accepted (it found a string input,
+		// so the body is a JSON object). Answered as a failed relay rather than guessing a
+		// body, exactly as a failure to build the buffered body is (setupSpeechStream).
+		slog.Error("speech: building the pcm upstream body failed",
+			"path", r.URL.Path, "model", req.Model, "server", s.serverName(rel.target.ServerID), "err", err)
+		s.recordSpeechRoutingFailure(w, r, rel.token, req, rel.raw, start, fmt.Errorf("build pcm speech body: %w", err))
+		return false
+	}
+	rel.speechPCMStrip = true
+	rel.upstreamBody = body
+	return true
 }
 
 // speechStreamingRefusal is the sentence audio.cpp's error carries when stream=true
