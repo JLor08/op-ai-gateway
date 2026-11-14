@@ -430,10 +430,10 @@ import (
 //
 // 0.19.1 -> 0.19.2 is the single bump for the sglang and sglang_omni runtime
 // spec types (#395). PATCH: no agent.Features entry changes, but a sglang
-// child's sglang:num_queue_reqs / sglang:num_running_reqs gauges (tp_rank 0
-// series only) feed queue_depth and active, its context size is read from
-// /v1/models data[].max_model_len, and the /props capability probe is skipped
-// for both types.
+// child's sglang:num_queue_reqs / sglang:num_running_reqs gauges (the largest
+// series of each dp_rank group, summed over the groups) feed queue_depth and
+// active, its context size is read from /v1/models data[].max_model_len (else the
+// best-effort scan), and the /props capability probe is skipped for both types.
 const Version = "0.19.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged

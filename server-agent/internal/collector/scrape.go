@@ -39,7 +39,7 @@ const (
 	vllmSRWaitingMetric = "vllm_srun_queue_depth"
 	// SGLang (v0.5.23, python/sglang/srt/observability/metrics_collector.py)
 	// gauges. The scheduler emits one series per rank, labelled tp_rank,
-	// dp_rank, pp_rank and moe_ep_rank; see parsePromText for how they sum.
+	// dp_rank, pp_rank and moe_ep_rank; see parsePromText for how they add up.
 	sglangRunningMetric = "sglang:num_running_reqs"
 	sglangWaitingMetric = "sglang:num_queue_reqs"
 )
@@ -48,8 +48,12 @@ const (
 // values of each metric name (labels ignored). Comment (`#`) and blank lines are
 // skipped, and any line that does not end in a parseable float is skipped
 // without error.
+//
+// The sglang: gauges are the exception (addSGLangGauge): their series are grouped by
+// dp_rank, each group counts its largest value, and the groups are summed.
 func parsePromText(data []byte) map[string]float64 {
 	out := make(map[string]float64)
+	sglang := make(map[string]map[string]float64)
 	for _, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -74,23 +78,96 @@ func parsePromText(data []byte) map[string]float64 {
 		if name == "" {
 			continue
 		}
-		if strings.HasPrefix(name, "sglang:") && !isTPRankZero(labels) {
+		if strings.HasPrefix(name, "sglang:") {
+			addSGLangGauge(sglang, name, labels, v)
 			continue
 		}
 		out[name] += v
 	}
+	for name, groups := range sglang {
+		for _, v := range groups {
+			out[name] += v
+		}
+	}
 	return out
 }
 
-// isTPRankZero reports whether a label block ("{a=\"b\",...}", or "") carries no
-// tp_rank label or tp_rank="0".
-func isTPRankZero(labels string) bool {
-	for _, key := range []string{`{tp_rank="`, `,tp_rank="`} {
-		if i := strings.Index(labels, key); i >= 0 {
-			return strings.HasPrefix(labels[i+len(key):], `0"`)
+// addSGLangGauge records one series of an sglang: gauge in groups (name, then dp_rank
+// value, at the largest value seen). SGLang's scheduler emits one series per rank: the
+// tensor-parallel ranks of a group repeat its numbers, and the pipeline stages of a
+// group share its queue, so a group counts once, at its largest value; the
+// data-parallel groups (DP attention included) hold disjoint requests, so they add up.
+// A series without a dp_rank label is one group of its own.
+func addSGLangGauge(groups map[string]map[string]float64, name, labels string, v float64) {
+	dp, _ := promLabelValue(labels, "dp_rank")
+	byGroup := groups[name]
+	if byGroup == nil {
+		byGroup = make(map[string]float64)
+		groups[name] = byGroup
+	}
+	if cur, seen := byGroup[dp]; !seen || v > cur {
+		byGroup[dp] = v
+	}
+}
+
+// promLabelValue returns the value of the label key in a Prometheus label block
+// (`{a="b",c="d"}`, or "") and whether the block carries it. The block is read pair by
+// pair, unescaping each quoted value, so neither a label whose name only ends in key
+// (my_dp_rank) nor a quoted value that contains key="..." is taken for it. A block that
+// does not parse carries no label.
+func promLabelValue(labels, key string) (string, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(labels), "{")
+	if !ok {
+		return "", false
+	}
+	for {
+		rest = strings.TrimLeft(rest, " \t")
+		eq := strings.IndexByte(rest, '=')
+		if eq < 0 {
+			return "", false
+		}
+		name := strings.TrimSpace(rest[:eq])
+		value, tail, ok := promQuotedValue(strings.TrimLeft(rest[eq+1:], " \t"))
+		if !ok {
+			return "", false
+		}
+		if name == key {
+			return value, true
+		}
+		rest = strings.TrimLeft(tail, " \t")
+		if next, more := strings.CutPrefix(rest, ","); more {
+			rest = next
+			continue
+		}
+		return "", false
+	}
+}
+
+// promQuotedValue reads one double-quoted label value off the front of s, undoing the
+// exposition format's three escapes (\\, \" and \n), and returns it with what follows the
+// closing quote.
+func promQuotedValue(s string) (value, tail string, ok bool) {
+	body, ok := strings.CutPrefix(s, `"`)
+	if !ok {
+		return "", "", false
+	}
+	var b strings.Builder
+	for i := 0; i < len(body); i++ {
+		switch c := body[i]; {
+		case c == '"':
+			return b.String(), body[i+1:], true
+		case c == '\\' && i+1 < len(body):
+			i++
+			if body[i] == 'n' {
+				b.WriteByte('\n')
+			} else {
+				b.WriteByte(body[i])
+			}
+		default:
+			b.WriteByte(c)
 		}
 	}
-	return true
+	return "", "", false
 }
 
 // promScraper scrapes an inference server's Prometheus /metrics endpoint.
