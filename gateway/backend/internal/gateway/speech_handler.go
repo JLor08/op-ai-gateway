@@ -462,19 +462,39 @@ func nonInlineReferenceField(v json.RawMessage) string {
 		return "audio_path"
 	}
 	for _, e := range elems {
-		if string(bytes.TrimSpace(e)) == "null" {
-			continue
+		if field := nonInlineElementField(e); field != "" {
+			return field
 		}
-		var obj map[string]json.RawMessage
-		if json.Unmarshal(e, &obj) != nil {
-			return "audio_path"
+	}
+	return ""
+}
+
+// nonInlineElementField checks one element of a references value and returns the
+// guarded field of it that is not inline, "" when none is (a null element is nothing
+// to read). An element that is no object counts as "audio_path", like in
+// nonInlineReferenceField.
+func nonInlineElementField(e json.RawMessage) string {
+	if string(bytes.TrimSpace(e)) == "null" {
+		return ""
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(e, &obj) != nil {
+		return "audio_path"
+	}
+	for key, val := range obj {
+		if guarded := guardedReferenceField(key); guarded != "" && !inlineVoiceReference(val) {
+			return guarded
 		}
-		for key, val := range obj {
-			for _, guarded := range []string{"audio_path", "ref_audio", "audio"} {
-				if strings.EqualFold(key, guarded) && !inlineVoiceReference(val) {
-					return guarded
-				}
-			}
+	}
+	return ""
+}
+
+// guardedReferenceField returns the canonical name of the reference field key names
+// (case-insensitively) when the upstream would read a path or URL from it, else "".
+func guardedReferenceField(key string) string {
+	for _, guarded := range []string{"audio_path", "ref_audio", "audio"} {
+		if strings.EqualFold(key, guarded) {
+			return guarded
 		}
 	}
 	return ""
