@@ -199,6 +199,30 @@ func TestTranscriptionStreamScanReadsTheLastDoneEventsUsage(t *testing.T) {
 	}
 }
 
+// [DONE] ends a completed stream, and what follows it is no part of the transcription: a
+// done event after it is not read, so it neither replaces the usage nor restates the text
+// of the done event the stream completed with -- whether it states another usage or none.
+func TestTranscriptionStreamScanIgnoresADoneEventAfterDONE(t *testing.T) {
+	completed := transcriptionFrameDoneWithUsage("first", `{"type":"duration","seconds":3}`) + transcriptionSSEEnd
+	for _, tc := range []struct {
+		name  string
+		after string
+	}{
+		{"one stating another usage", transcriptionFrameDoneWithUsage("second", `{"type":"duration","seconds":9}`)},
+		{"one stating no usage", transcriptionFrameDone("second")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, size := range []int{0, 1} {
+				scan := scanOf(newTestTranscriptionScan(), completed+tc.after, size)
+				if !scan.complete() || scan.usageSeconds != 3 || !scan.usageStated || string(scan.transcript()) != "first" {
+					t.Fatalf("complete = %v, usage = %v stated %v, transcript = %q (chunks of %d); want the completed stream's usage 3 and text %q",
+						scan.complete(), scan.usageSeconds, scan.usageStated, scan.transcript(), size, "first")
+				}
+			}
+		})
+	}
+}
+
 // A done event whose usage is of a shape the gateway does not read is still the done
 // event, to every reader of the shared decoder: the relay's scan (it completes the stream
 // and keeps the text), the portal run's consumer (parseTranscriptionSSELine) and the live

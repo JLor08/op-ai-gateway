@@ -24,15 +24,14 @@ import (
 // a speech.audio.done that states NO duration. audio.cpp's done event states a time to
 // first token and is followed by the [DONE] sentinel (sseDoneSentinel). sglang-omni's
 // (v0.2.0) states token usage, and its body then simply ends: it writes no [DONE], and on
-// a failure it writes an `error` event in the done event's place. The relay writes the
-// sentinel for it once the body has closed cleanly after the done event
-// (speechStreamScan.endFrame, ADR-103), so every speech event stream the gateway relays
-// ends the same way. With stream_format=audio the body is instead headerless raw PCM
-// under application/octet-stream (audio/pcm from sglang-omni).
+// a failure it writes an `error` event in the done event's place (an error frame by
+// isSSEErrorEvent's rule). The relay writes the sentinel for it once the body has closed
+// cleanly after the done event (speechStreamScan.endFrame, ADR-103), so every speech event
+// stream the gateway relays ends the same way. With stream_format=audio the body is
+// instead headerless raw PCM under application/octet-stream (audio/pcm from sglang-omni).
 const (
 	speechEventDelta = "speech.audio.delta"
 	speechEventDone  = "speech.audio.done"
-	speechEventError = "error"
 )
 
 // speechStreamEndFrame is the [DONE] frame the relay ends an sglang-omni event stream
@@ -140,7 +139,7 @@ type speechStreamScan struct {
 	sawDone     bool  // a speech.audio.done event was seen
 	sawEnd      bool  // [DONE] was seen AFTER it
 	sawSentinel bool  // [DONE] was seen at all, wherever it came
-	sawError    bool  // an error event was seen
+	sawError    bool  // an error frame was seen (isSSEErrorEvent)
 	closed      bool  // the upstream closed the body cleanly
 }
 
@@ -149,16 +148,15 @@ type speechStreamScan struct {
 // -- the one-shot audio/wav of an upstream that did not stream, a JSON document -- is no
 // stream and gets no scan (nil), and is relayed and billed as the document it is.
 //
-// kind is the target's effective kind (routing.Target.EffectiveKind). For sglang-omni the
-// scan reads the byte rate its format headers state (headerRate), on either shape, and an
-// event stream from it is one the relay ends itself (writeEnd); every other kind gets
-// neither.
-func newSpeechStreamScan(header http.Header, kind string) *speechStreamScan {
+// target is the relay's target. For an sglang-omni one (isSGLangOmniTarget) the scan reads
+// the byte rate its format headers state (headerRate), on either shape, and an event
+// stream from it is one the relay ends itself (writeEnd); every other target gets neither.
+func newSpeechStreamScan(header http.Header, target routing.Target) *speechStreamScan {
 	mediaType, _, err := mime.ParseMediaType(header.Get(contentTypeHeader))
 	if err != nil {
 		return nil
 	}
-	omni := kind == string(routing.RuntimeSpecTypeSGLangOmni)
+	omni := isSGLangOmniTarget(target)
 	var scan *speechStreamScan
 	switch mediaType {
 	case speechStreamSSEType:
@@ -323,11 +321,12 @@ func (s *speechStreamScan) cleanClose() {
 // endFrame returns the frame the relay writes to end an sglang-omni event stream, or nil
 // when it writes none. It is the [DONE] that stream lacks, and it is written only for a
 // stream that is done: the upstream closed the body cleanly (cleanClose) after a
-// speech.audio.done event, sent no [DONE] of its own, anywhere, sent no error event, and
-// nothing of it was lost. Every other stream -- one that ended in an error event, one cut
-// or ended before its done event, one whose audio could not be counted, any stream from
-// another upstream, and the raw shape -- gets nothing, and stays the incomplete stream it
-// is. sglang-omni (v0.2.0) writes either the done event or an error event, never both; a
+// speech.audio.done event, sent no [DONE] of its own, anywhere, sent no error frame
+// (isSSEErrorEvent: sglang-omni's error event, or the agent router's untyped error frame
+// that may follow even the done event when the child dies mid-body), and nothing of it was
+// lost. Every other stream -- one that ended in an error frame, one cut or ended before its
+// done event, one whose audio could not be counted, any stream from another upstream, and
+// the raw shape -- gets nothing, and stays the incomplete stream it is. sglang-omni (v0.2.0) writes either the done event or an error event, never both; a
 // stream that carries both is refused the sentinel all the same, because an upstream that
 // reported a failure has not plainly delivered a whole synthesis.
 //
@@ -376,7 +375,8 @@ func (s *speechStreamScan) endLine(tail []byte) {
 // scanLine reads one line: only a `data:` line carries anything, and what it carries is
 // either the [DONE] sentinel or a JSON event; every other line (a comment, an `event:`
 // field, a blank separator) and every event of another type is ignored -- except an error
-// event, which is noted so the relay never ends that stream with a [DONE] (endFrame).
+// frame (isSSEErrorEvent), which is noted so the relay never ends that stream with a
+// [DONE] (endFrame).
 func (s *speechStreamScan) scanLine(line []byte) {
 	line = bytes.TrimSuffix(line, []byte("\r"))
 	payload, ok := bytes.CutPrefix(line, []byte("data:"))
@@ -396,8 +396,9 @@ func (s *speechStreamScan) scanLine(line []byte) {
 		return
 	}
 	var event struct {
-		Type  string `json:"type"`
-		Audio string `json:"audio"`
+		Type  string          `json:"type"`
+		Audio string          `json:"audio"`
+		Error json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &event); err != nil {
 		// A frame that is JSON in shape and cannot be read -- cut mid-frame, or malformed --
@@ -405,12 +406,16 @@ func (s *speechStreamScan) scanLine(line []byte) {
 		s.lost = true
 		return
 	}
-	switch event.Type {
-	case speechEventDelta:
+	switch {
+	case event.Type == speechEventDelta:
 		s.addDelta(event.Audio)
-	case speechEventDone:
+	case event.Type == speechEventDone:
 		s.sawDone = true
-	case speechEventError:
+	case isSSEErrorEvent(event.Type, event.Error):
+		// The upstream's own error event, or the agent's runtime router's untyped
+		// {"error":{...}} frame, which it writes when the child fails after the stream was
+		// committed -- possibly after the done event. Either says the synthesis was not
+		// plainly delivered whole, by the same rule the benchmark refuses a stream on.
 		s.sawError = true
 	}
 }
@@ -501,8 +506,9 @@ func (s *speechStreamScan) stampCapture(in *captureInput) {
 // whether its rate is known, rather than from the endpoint alone; that is ADR-068's one
 // amendment of ADR-041(c), confined to the success path.
 //
-// When sglang-omni stated its format but a header of it could not be read
-// (scan.headerIssue), the bytes fallback is said once at Warn, naming the header -- here,
+// When sglang-omni stated its format but a header of it could not be read or was missing
+// beside the others, or the three gave no usable rate (scan.headerIssue), the bytes
+// fallback is said once at Warn, naming the header, or all three for the product -- here,
 // where the request's id is known, and only when the header rate would have been used (no
 // cached rate), so a mapping whose benchmark measured its rate is not warned about headers
 // nothing reads. A stream that stated no format headers is not warned about.

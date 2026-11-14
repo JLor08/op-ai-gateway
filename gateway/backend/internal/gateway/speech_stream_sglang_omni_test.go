@@ -172,12 +172,15 @@ func TestSpeechStreamSGLangOmniGatewayEndsTheEventStream(t *testing.T) {
 
 // The gateway's [DONE] stands for one thing only: an sglang-omni stream that completed.
 // A stream that ended with an error event in the done event's place, one with no done
-// event at all, one cut before it, one whose [DONE] came ahead of the done event, and one
-// whose audio could not be counted all reach the client exactly as the upstream sent them,
-// and bill zero -- loudly where the row would otherwise look like a success.
+// event at all, one cut before it, one whose [DONE] came ahead of the done event, one
+// whose audio could not be counted, and one whose done event the agent's runtime router
+// followed with its error frame (an untyped {"error":{...}} event, written when the child
+// fails mid-body) all reach the client exactly as the upstream sent them, and bill zero --
+// loudly where the row would otherwise look like a success.
 func TestSpeechStreamSGLangOmniWithoutACompletionGetsNoSentinel(t *testing.T) {
 	delta := omniFrameDelta(speechPCM(1000, 1))
 	badDelta := `data: {"type": "speech.audio.delta", "audio": "***not base64***"}` + "\n\n"
+	routerError := `data: {"error":{"code":"runtime.instance_failed","message":"the model process exited"}}` + "\n\n"
 	for _, tc := range []struct {
 		name       string
 		body       string
@@ -188,6 +191,7 @@ func TestSpeechStreamSGLangOmniWithoutACompletionGetsNoSentinel(t *testing.T) {
 		{name: "deltas and then nothing", body: delta, wantStatus: "success"},
 		{name: "[DONE] ahead of the done event", body: delta + speechSSEEnd + omniSSEDone, wantStatus: "success"},
 		{name: "a delta that cannot be counted", body: delta + badDelta + omniSSEDone, wantStatus: "success"},
+		{name: "the done event and then the router's error frame", body: delta + omniSSEDone + routerError, wantStatus: "success"},
 		{name: "cut before the done event", body: delta, abort: true, wantStatus: "error"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -367,9 +371,10 @@ func TestSpeechStreamSGLangOmniWarnsOfAnUnusableHeaderRate(t *testing.T) {
 	}
 }
 
-// sentinelRefusingWriter is a client that goes away exactly when the gateway writes its
-// [DONE]: the write fails and the request's context is cancelled, as a closed connection
-// does to a real one.
+// sentinelRefusingWriter is a client whose write of the gateway's [DONE] fails. With a
+// cancel it is a client that goes away exactly then: the request's context is cancelled
+// too, as a closed connection does to a real one. Without one the request stays live, as
+// it does when the write fails for a reason of its own (a write deadline, say).
 type sentinelRefusingWriter struct {
 	*httptest.ResponseRecorder
 	cancel context.CancelFunc
@@ -377,7 +382,9 @@ type sentinelRefusingWriter struct {
 
 func (w *sentinelRefusingWriter) Write(p []byte) (int, error) {
 	if bytes.Contains(p, []byte("[DONE]")) {
-		w.cancel()
+		if w.cancel != nil {
+			w.cancel()
+		}
 		return 0, errors.New("write: broken pipe")
 	}
 	return w.ResponseRecorder.Write(p)
@@ -411,6 +418,37 @@ func TestSpeechStreamSGLangOmniClientGoneWhileTheSentinelIsWritten(t *testing.T)
 	for _, rec := range errorLogs(buf) {
 		if strings.Contains(rec.Msg, "streamed speech") {
 			t.Fatalf("a client that went away logged at Error: %+v", rec)
+		}
+	}
+}
+
+// A sentinel write that fails while the request is still live is the copy's own error:
+// the client did not receive the stream's end, so the row is provider.stream_copy_error,
+// billed zero, and that error row's own log line is the one said at Error -- the billing
+// adds no second one about a stream that ended without its terminal events.
+func TestSpeechStreamSGLangOmniSentinelWriteFailsOnALiveRequest(t *testing.T) {
+	buf, restore := withCapturedSlog(t)
+	t.Cleanup(restore)
+	up, _ := newOmniSSEUpstream(t, "24000", omniFrameDelta(speechPCM(48000, 1)), omniSSEDone)
+	srv := newSGLangOmniSpeechTestServer(t, up.URL)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/audio/speech", strings.NewReader(omniStreamBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer dev-secret")
+	w := &sentinelRefusingWriter{ResponseRecorder: httptest.NewRecorder()}
+
+	srv.ServeHTTP(w, req)
+
+	if strings.Contains(w.Body.String(), "[DONE]") || !strings.HasSuffix(w.Body.String(), omniSSEDone) {
+		t.Fatalf("client body = %q, want the upstream's frames and no sentinel", w.Body.String())
+	}
+	ev := onlyUsageEvent(t, srv)
+	if ev.Status != "error" || ev.ErrorCode != "provider.stream_copy_error" {
+		t.Fatalf("usage row = %q/%q, want error/provider.stream_copy_error", ev.Status, ev.ErrorCode)
+	}
+	requireStreamedSpeechRow(t, ev, usage.BillingUnitAudioSecond, 0)
+	for _, rec := range errorLogs(buf) {
+		if strings.Contains(rec.Msg, "streamed speech") {
+			t.Fatalf("the billing logged the copy error's row a second time: %+v", rec)
 		}
 	}
 }
@@ -460,23 +498,30 @@ func TestSpeechStreamAudioCppGetsNoSentinelAndNoHeaderRate(t *testing.T) {
 
 // sglang-omni refuses a stream whose response_format is not pcm, and its own default is
 // wav, so a streamed request that leaves the field out -- the portal's, the documented
-// default -- would be refused. The relay states pcm on the upstream body when the client
-// stated none (absent, null or empty), and touches nothing else; a client that said pcm
-// is relayed byte for byte, and so is every stream to audio.cpp, whose default pcm is.
-// sglang-omni reads its fields by their exact names, so pcm under a key spelled in another
-// case is no pcm to it: the exact key is added, and the client's own key stays.
-func TestSpeechStreamToSGLangOmniStatesPCM(t *testing.T) {
+// default -- would be refused; and its stream_format defaults to raw "audio", where the
+// gateway documents the event stream as a stream's default shape. So the relay states pcm
+// on the upstream body when the client stated no response_format (absent, null or empty),
+// and sse when it stated no stream_format, in one rewrite that touches nothing else; a
+// client that said pcm and either stream shape is relayed byte for byte, and so is every
+// stream to audio.cpp, whose defaults those are. sglang-omni reads its fields by their
+// exact names, so a value under a key spelled in another case is no statement to it: the
+// exact key is added, and the client's own key stays.
+func TestSpeechStreamToSGLangOmniStatesPCMAndSSE(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		body      string
-		unchanged bool // the upstream body is the client's, byte for byte
+		name  string
+		body  string
+		added map[string]any // the exact keys the relay adds or sets; nil: the client's body, byte for byte
 	}{
-		{name: "no response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"voice":"alba","speed":1.25}`},
-		{name: "a null response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":null}`},
-		{name: "an empty response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":""}`},
-		{name: "the raw shape, no response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"stream_format":"audio"}`},
-		{name: "pcm under a key of another case", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"Response_Format":"pcm"}`},
-		{name: "pcm already", body: `{"model":"omni-voice","input":"Hello there.", "stream":true,"response_format":"pcm"}`, unchanged: true},
+		{name: "neither field", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"voice":"alba","speed":1.25}`, added: map[string]any{"response_format": "pcm", "stream_format": "sse"}},
+		{name: "a null response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":null,"stream_format":"sse"}`, added: map[string]any{"response_format": "pcm"}},
+		{name: "an empty response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":"","stream_format":"sse"}`, added: map[string]any{"response_format": "pcm"}},
+		{name: "the raw shape, no response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"stream_format":"audio"}`, added: map[string]any{"response_format": "pcm"}},
+		{name: "pcm under a key of another case", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"Response_Format":"pcm","stream_format":"sse"}`, added: map[string]any{"response_format": "pcm"}},
+		{name: "pcm, no stream_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":"pcm"}`, added: map[string]any{"stream_format": "sse"}},
+		{name: "pcm, a null stream_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":"pcm","stream_format":null}`, added: map[string]any{"stream_format": "sse"}},
+		{name: "pcm, the raw shape under a key of another case", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":"pcm","Stream_Format":"audio"}`, added: map[string]any{"stream_format": "sse"}},
+		{name: "pcm and sse already", body: `{"model":"omni-voice","input":"Hello there.", "stream":true,"response_format":"pcm","stream_format":"sse"}`},
+		{name: "pcm and the raw shape already", body: `{"model":"omni-voice","input":"Hello there.", "stream":true,"stream_format":"audio","response_format":"pcm"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			up, calls := newOmniSSEUpstream(t, "24000", omniFrameDelta(speechPCM(100, 1)), omniSSEDone)
@@ -490,24 +535,23 @@ func TestSpeechStreamToSGLangOmniStatesPCM(t *testing.T) {
 			if len(all) != 1 {
 				t.Fatalf("upstream calls = %d, want 1", len(all))
 			}
-			if tc.unchanged {
+			if tc.added == nil {
 				if string(all[0].body) != tc.body {
 					t.Fatalf("upstream body = %s, want the client's byte for byte", all[0].body)
 				}
 				return
 			}
 			sent := speechUpstreamFields(t, all[0])
-			if sent["response_format"] != "pcm" {
-				t.Fatalf("upstream response_format = %#v, want \"pcm\"", sent["response_format"])
-			}
 			want := speechUpstreamFields(t, speechUpstreamCall{body: []byte(tc.body)})
-			want["response_format"] = "pcm"
+			for k, v := range tc.added {
+				want[k] = v
+			}
 			if len(sent) != len(want) {
-				t.Fatalf("upstream body = %v, want the client's fields %v with response_format pcm", sent, want)
+				t.Fatalf("upstream body = %v, want the client's fields with %v: %v", sent, tc.added, want)
 			}
 			for k, v := range want {
 				if sent[k] != v {
-					t.Fatalf("upstream %s = %#v, want the client's %#v", k, sent[k], v)
+					t.Fatalf("upstream %s = %#v, want %#v", k, sent[k], v)
 				}
 			}
 		})
@@ -542,10 +586,54 @@ func TestSpeechStreamToSGLangOmniStatesPCM(t *testing.T) {
 	})
 }
 
+// The rewrite on its own, for the values validateSpeechRequest refuses before a relay
+// could show them: an empty stream_format is no statement either, a value of another type
+// is none, and a body that needs nothing comes back as the very bytes it was. A body that
+// is no JSON object is the one error.
+func TestSGLangOmniSpeechStreamBody(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       map[string]any // nil: unchanged
+	}{
+		{"both empty", `{"input":"x","response_format":"","stream_format":""}`, map[string]any{"input": "x", "response_format": "pcm", "stream_format": "sse"}},
+		{"values of another type", `{"input":"x","response_format":7,"stream_format":["sse"]}`, map[string]any{"input": "x", "response_format": "pcm", "stream_format": "sse"}},
+		{"a stream_format in another case of its value", `{"input":"x","response_format":"pcm","stream_format":"SSE"}`, map[string]any{"input": "x", "response_format": "pcm", "stream_format": "sse"}},
+		{"the last of a repeated key counts", `{"input":"x","response_format":"pcm","stream_format":"","stream_format":"audio"}`, nil},
+		{"both stated", `{ "input" : "x", "response_format":"pcm","stream_format":"sse" }`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed, err := sglangOmniSpeechStreamBody([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if tc.want == nil {
+				if changed || string(got) != tc.body {
+					t.Fatalf("body = %s (changed %v), want the client's byte for byte", got, changed)
+				}
+				return
+			}
+			fields := speechUpstreamFields(t, speechUpstreamCall{body: got})
+			if !changed || len(fields) != len(tc.want) {
+				t.Fatalf("body = %s (changed %v), want %v", got, changed, tc.want)
+			}
+			for k, v := range tc.want {
+				if fields[k] != v {
+					t.Fatalf("%s = %#v, want %#v", k, fields[k], v)
+				}
+			}
+		})
+	}
+	for _, raw := range []string{`null`, `[]`, `"x"`, `{`} {
+		if _, _, err := sglangOmniSpeechStreamBody([]byte(raw)); err == nil {
+			t.Errorf("sglangOmniSpeechStreamBody(%s) err = nil, want an error", raw)
+		}
+	}
+}
+
 // The buffered retry of an sglang-omni stream is built from the client's body, as every
-// buffered retry is, so it leaves response_format out like the other stream-only fields:
-// the pcm the stream stated is the stream's alone.
-func TestSpeechStreamToSGLangOmniBufferedRetryDropsPCM(t *testing.T) {
+// buffered retry is, so it leaves response_format and stream_format out like the other
+// stream-only fields: the pcm and sse the stream stated are the stream's alone.
+func TestSpeechStreamToSGLangOmniBufferedRetryDropsPCMAndSSE(t *testing.T) {
 	wav := speechTestWAV()
 	up, calls := newScriptedSpeechUpstream(t, func(n int, w http.ResponseWriter, _ speechUpstreamCall) {
 		if n == 1 {
@@ -569,14 +657,13 @@ func TestSpeechStreamToSGLangOmniBufferedRetryDropsPCM(t *testing.T) {
 	if len(all) != 2 {
 		t.Fatalf("upstream calls = %d, want the stream and its buffered retry", len(all))
 	}
-	if first := speechUpstreamFields(t, all[0]); first["response_format"] != "pcm" || first["stream"] != true {
-		t.Fatalf("first upstream body = %v, want the stream stating pcm", first)
+	if first := speechUpstreamFields(t, all[0]); first["response_format"] != "pcm" || first["stream_format"] != "sse" || first["stream"] != true {
+		t.Fatalf("first upstream body = %v, want the stream stating pcm and sse", first)
 	}
 	retry := speechUpstreamFields(t, all[1])
-	if _, ok := retry["response_format"]; ok {
-		t.Fatalf("retry body = %v, want no response_format", retry)
-	}
-	if _, ok := retry["stream"]; ok {
-		t.Fatalf("retry body = %v, want no stream", retry)
+	for _, field := range speechStreamOnlyFields {
+		if _, ok := retry[field]; ok {
+			t.Fatalf("retry body = %v, want no %s", retry, field)
+		}
 	}
 }

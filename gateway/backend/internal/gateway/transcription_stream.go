@@ -216,6 +216,12 @@ func (s *transcriptionStreamScan) scanLine(line []byte) {
 	case transcriptionEventDelta:
 		s.addDelta(event.Delta)
 	case transcriptionEventDone:
+		if s.sawEnd {
+			// [DONE] has ended the stream the done event before it completed, so a done
+			// event after it is no part of that transcription: it must neither replace the
+			// usage that is billed nor the text that is captured.
+			return
+		}
 		s.sawDone = true
 		if event.Text != nil {
 			s.setDoneText(*event.Text)

@@ -79,6 +79,16 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 	return path, sglangOmniPassthroughAsTranslate(target, mode)
 }
 
+// isSGLangOmniTarget reports whether target's effective kind (routing.Target.EffectiveKind)
+// is sglang_omni: in practice an agent-launched child whose runtime spec type is
+// sglang_omni, since no application type is ever that name. Every rule the gateway keeps
+// for that upstream -- its media guards, its passthrough rule, its speech stream contract
+// and the benchmark's reading of it -- asks this one question, so none of them can come to
+// mean a different set of targets than the others.
+func isSGLangOmniTarget(target routing.Target) bool {
+	return target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni)
+}
+
 // sglangOmniPassthroughAsTranslate returns translate for a passthrough mode on a
 // target whose effective kind (routing.Target.EffectiveKind) is sglang_omni, and mode
 // unchanged otherwise. A raw /v1/responses or /v1/messages body would reach
@@ -90,7 +100,7 @@ func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.E
 // passthrough, so the rule is the gateway's own (sglang-omni v0.2.0 serves neither
 // route either).
 func sglangOmniPassthroughAsTranslate(target routing.Target, mode routing.EndpointMode) routing.EndpointMode {
-	if mode == routing.EndpointModePassthrough && target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni) {
+	if mode == routing.EndpointModePassthrough && isSGLangOmniTarget(target) {
 		return routing.EndpointModeTranslate
 	}
 	return mode
@@ -987,12 +997,12 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// The speech scan exists only for a speech request that asked for a stream AND was
 	// answered with one (newSpeechStreamScan reads the answer's Content-Type): a stream
 	// request answered with a plain audio/wav is no stream, and is relayed and billed like
-	// any one-shot synthesis. The target's effective kind tells it an sglang-omni stream,
-	// whose format headers state a byte rate and whose event stream the relay ends itself.
+	// any one-shot synthesis. The target tells it an sglang-omni stream, whose format
+	// headers state a byte rate and whose event stream the relay ends itself.
 	speechRelay := rel.pfReq.APIFlavor == apiFlavorSpeech && !isTranscriptionEndpoint(rel.endpoint)
 	var speechScan *speechStreamScan
 	if speechRelay && rel.pfReq.Stream {
-		speechScan = newSpeechStreamScan(resp.Header, rel.target.EffectiveKind())
+		speechScan = newSpeechStreamScan(resp.Header, rel.target)
 	}
 
 	// A one-shot pcm request (rel.speechPCMStrip, set only by relaySpeech, never on a stream

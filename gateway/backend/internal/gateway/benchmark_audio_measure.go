@@ -229,8 +229,7 @@ func sseStreamError(line []byte, messageOf func(payload []byte) string) (code, m
 	}
 	// A member of another type is a member not stated; json decodes the others regardless.
 	_ = json.Unmarshal(payload, &frame)
-	hasError := len(frame.Error) > 0 && string(frame.Error) != "null"
-	if frame.Type != liveEventError && (frame.Type != "" || !hasError) {
+	if !isSSEErrorEvent(frame.Type, frame.Error) {
 		return "", "", false
 	}
 	code = liveErrorCode(payload)
@@ -238,6 +237,18 @@ func sseStreamError(line []byte, messageOf func(payload []byte) string) (code, m
 		code = own
 	}
 	return code, truncateRunes(messageOf(payload), speechBenchmarkErrorRunes), true
+}
+
+// isSSEErrorEvent is the one rule for which decoded SSE event is an error frame
+// (sseStreamError's two shapes): an event of type "error", or an event with no type whose
+// error member is stated and not null. The benchmark's measurements and the speech relay's
+// scan (speechStreamScan) both judge a frame by it, so a frame one of them takes for the
+// upstream's failure is never a frame the other lets pass.
+func isSSEErrorEvent(eventType string, errorMember json.RawMessage) bool {
+	if eventType == liveEventError {
+		return true
+	}
+	return eventType == "" && len(errorMember) > 0 && string(errorMember) != "null"
 }
 
 // speechStreamErrorMessage is what an error frame of a streamed synthesis says: the event's
@@ -295,9 +306,10 @@ func measureASRLive(ctx context.Context, client provider.NativeDuplexProxyClient
 // benchmark's request (the target's own model name, the text, and a clone model's preset
 // voice) asking for an event stream. stream_format is said outright although "sse" is
 // audio.cpp's default, because the measurement reads frames and would not parse the raw
-// PCM the other format answers. response_format stays unset for audio.cpp, whose stream is
-// pcm without being told; sglang-omni refuses a stream whose response_format is not pcm and
-// defaults to wav (ADR-103), so a request to it says pcm, as the relay's does.
+// PCM the other format answers -- and sglang-omni's own default is that raw format.
+// response_format stays unset for audio.cpp, whose stream is pcm without being told;
+// sglang-omni refuses a stream whose response_format is not pcm and defaults to wav
+// (ADR-103), so a request to it says pcm, as the relay's does.
 type audioStreamSpeechRequest struct {
 	speechBenchmarkRequest
 	Stream         bool   `json:"stream"`
@@ -385,7 +397,7 @@ type ttsStreamTiming struct {
 // measureTTSStream's rules, returning what it observed; every rule a stream breaks is the
 // error measureTTSStream documents.
 func (m audioMeasurer) streamSynthesis(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string) (ttsStreamTiming, error) {
-	omni := target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni)
+	omni := isSGLangOmniTarget(target)
 	request := audioStreamSpeechRequest{
 		speechBenchmarkRequest: speechBenchmarkRequest{Model: target.ProviderModel, Input: text, Voice: voice},
 		Stream:                 true,

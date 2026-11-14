@@ -1276,7 +1276,7 @@ func TestNewSpeechStreamScanIsKeyedOnTheContentType(t *testing.T) {
 	} {
 		t.Run(tc.contentType, func(t *testing.T) {
 			for _, kind := range []string{routing.ProviderAudioCpp, string(routing.RuntimeSpecTypeSGLangOmni)} {
-				scan := newSpeechStreamScan(http.Header{"Content-Type": {tc.contentType}}, kind)
+				scan := newSpeechStreamScan(http.Header{"Content-Type": {tc.contentType}}, speechTargetOfKind(kind))
 				if (scan != nil) != tc.wantScan {
 					t.Fatalf("%s: scan = %v, want a scan: %v", kind, scan, tc.wantScan)
 				}
@@ -1288,8 +1288,15 @@ func TestNewSpeechStreamScanIsKeyedOnTheContentType(t *testing.T) {
 	}
 }
 
-// omniKind is the effective kind of an sglang-omni target (routing.Target.EffectiveKind).
-const omniKind = string(routing.RuntimeSpecTypeSGLangOmni)
+// speechTargetOfKind is a target whose effective kind (routing.Target.EffectiveKind) is
+// kind: an agent-launched child whose runtime spec type is kind, or, for "", one whose
+// spec type is not known.
+func speechTargetOfKind(kind string) routing.Target {
+	return routing.Target{Provider: routing.ProviderServerAgent, LiveProgressSpecType: kind}
+}
+
+// omniTarget is an sglang-omni target, as newSpeechStreamScan is handed one.
+var omniTarget = speechTargetOfKind(string(routing.RuntimeSpecTypeSGLangOmni))
 
 // omniFormatHeader is the response header of an sglang-omni stream of the given media
 // type, stating its PCM format as sglang-omni does.
@@ -1309,16 +1316,16 @@ func TestNewSpeechStreamScanReadsTheHeaderRateForSGLangOmniOnly(t *testing.T) {
 		wantRate    uint32
 		wantEnd     bool
 	}{
-		{"sglang-omni event stream", "text/event-stream", omniKind, 48000, true},
-		{"sglang-omni raw pcm", "audio/pcm", omniKind, 48000, false},
-		{"sglang-omni octet stream", "application/octet-stream", omniKind, 48000, false},
+		{"sglang-omni event stream", "text/event-stream", string(routing.RuntimeSpecTypeSGLangOmni), 48000, true},
+		{"sglang-omni raw pcm", "audio/pcm", string(routing.RuntimeSpecTypeSGLangOmni), 48000, false},
+		{"sglang-omni octet stream", "application/octet-stream", string(routing.RuntimeSpecTypeSGLangOmni), 48000, false},
 		{"audio.cpp event stream", "text/event-stream", routing.ProviderAudioCpp, 0, false},
 		{"audio.cpp raw pcm", "application/octet-stream", routing.ProviderAudioCpp, 0, false},
 		{"sglang (not omni)", "text/event-stream", string(routing.RuntimeSpecTypeSGLang), 0, false},
 		{"no kind", "text/event-stream", "", 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			scan := newSpeechStreamScan(omniFormatHeader(tc.contentType, "24000", "1", "16"), tc.kind)
+			scan := newSpeechStreamScan(omniFormatHeader(tc.contentType, "24000", "1", "16"), speechTargetOfKind(tc.kind))
 			if scan == nil {
 				t.Fatal("no scan")
 			}
@@ -1327,7 +1334,7 @@ func TestNewSpeechStreamScanReadsTheHeaderRateForSGLangOmniOnly(t *testing.T) {
 			}
 		})
 	}
-	if got := newSpeechStreamScan(omniFormatHeader("text/event-stream", "44100", "2", "24"), omniKind).headerRate; got != 44100*2*3 {
+	if got := newSpeechStreamScan(omniFormatHeader("text/event-stream", "44100", "2", "24"), omniTarget).headerRate; got != 44100*2*3 {
 		t.Fatalf("headerRate = %d, want 264600 for 44.1 kHz stereo 24-bit", got)
 	}
 }
@@ -1371,7 +1378,7 @@ func TestNewSpeechStreamScanRefusesAnUnusableHeaderRate(t *testing.T) {
 						delete(header, name)
 					}
 				}
-				scan := newSpeechStreamScan(header, omniKind)
+				scan := newSpeechStreamScan(header, omniTarget)
 				if scan == nil || scan.headerRate != 0 {
 					t.Fatalf("%s: scan = %+v, want a scan with no header rate", contentType, scan)
 				}
@@ -1385,24 +1392,24 @@ func TestNewSpeechStreamScanRefusesAnUnusableHeaderRate(t *testing.T) {
 		t.Run(name+" stated twice", func(t *testing.T) {
 			header := omniFormatHeader("text/event-stream", "24000", "1", "16")
 			header.Add(name, header.Get(name))
-			scan := newSpeechStreamScan(header, omniKind)
+			scan := newSpeechStreamScan(header, omniTarget)
 			if scan == nil || scan.headerRate != 0 || scan.headerIssue.header != name {
 				t.Fatalf("scan = %+v, want no header rate and an issue naming %s", scan, name)
 			}
 		})
 	}
-	scan := newSpeechStreamScan(http.Header{"Content-Type": {"text/event-stream"}}, omniKind)
+	scan := newSpeechStreamScan(http.Header{"Content-Type": {"text/event-stream"}}, omniTarget)
 	if scan == nil || scan.headerRate != 0 || !scan.writeEnd || scan.headerIssue != (speechHeaderRateIssue{}) {
 		t.Fatalf("no format headers: scan = %+v, want an event stream the relay ends, with no header rate and no issue", scan)
 	}
-	if scan := newSpeechStreamScan(omniFormatHeader("text/event-stream", "24000", "1", "16"), omniKind); scan.headerIssue != (speechHeaderRateIssue{}) {
+	if scan := newSpeechStreamScan(omniFormatHeader("text/event-stream", "24000", "1", "16"), omniTarget); scan.headerIssue != (speechHeaderRateIssue{}) {
 		t.Fatalf("usable headers: issue = %+v, want none", scan.headerIssue)
 	}
 }
 
 // omniSSEScan is the scan of an sglang-omni event stream with no format headers.
 func omniSSEScan() *speechStreamScan {
-	return newSpeechStreamScan(http.Header{"Content-Type": {"text/event-stream"}}, omniKind)
+	return newSpeechStreamScan(http.Header{"Content-Type": {"text/event-stream"}}, omniTarget)
 }
 
 // The frame the relay ends an sglang-omni event stream with: only for a body the upstream
@@ -1437,7 +1444,7 @@ func TestSpeechStreamScanEndFrame(t *testing.T) {
 		{name: "a lost delta", scan: omniSSEScan, stream: "data: {\"type\": \"speech.audio.delta\", \"audio\": \"***\"}\n\n" + done, closed: true},
 		{name: "an audio.cpp event stream", scan: newTestSpeechScan, stream: delta + done, closed: true},
 		{name: "a raw stream", scan: func() *speechStreamScan {
-			return newSpeechStreamScan(http.Header{"Content-Type": {"audio/pcm"}}, omniKind)
+			return newSpeechStreamScan(http.Header{"Content-Type": {"audio/pcm"}}, omniTarget)
 		}, stream: delta + done, closed: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

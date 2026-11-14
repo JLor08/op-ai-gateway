@@ -807,7 +807,7 @@ PCM, so the request surface of a streamed request is:
 |---|---|
 | `stream` | a JSON boolean; a non-boolean value is 400 `speech.stream_unsupported` |
 | `response_format` | `pcm` or absent; **`wav` is 400 `speech.stream_unsupported`** (audio.cpp 500s a wav stream, so the gateway refuses it up front), any other value 400 `speech.response_format_unsupported` |
-| `stream_format` | `sse` (audio.cpp's default) or `audio`, relayed as written with nothing translated; any other value, and a `stream_format` on a request that does not stream, is 400 `speech.stream_unsupported`; `null` is absent |
+| `stream_format` | `sse` (audio.cpp's default) or `audio`, relayed as written with nothing translated (to an `sglang_omni` target, whose own default is `audio`, an unstated one is sent as `sse`, below); any other value, and a `stream_format` on a request that does not stream, is 400 `speech.stream_unsupported`; `null` is absent |
 
 The streamed answer is `text/event-stream` — `speech.audio.delta` frames (base64 PCM in
 `audio`, signed 16-bit little-endian mono, **headerless: no sample rate and no duration on the
@@ -900,21 +900,27 @@ stripped. A body that is no WAV, or one with no audio bytes, keeps the logged ze
 A **streamed** call to a target of effective kind `sglang_omni` (reachable only when the route's `speech_streaming` verdict is
 a manual yes) is adapted in three places, because sglang-omni's stream differs from audio.cpp's:
 
-- **The request states `pcm`.** sglang-omni refuses `stream=true` with a 400 unless `response_format` is `pcm`, and its own
-  default is `wav`. So `relaySpeech` writes `"response_format":"pcm"` onto the upstream body of a stream whose body has no key
-  named exactly `response_format` holding the string `pcm`: the key absent, `null` or `""`, or spelled in another case
-  (`speechBodyStatesExactPCM`; Go's decoder folds the case of a key, sglang-omni's request model does not, so pcm under
-  `Response_Format` is no pcm to it and the exact key is added). Every other field is relayed as written. The buffered retry
-  (`speechBufferedBody`) is built from the client's body and still drops the field.
+- **The request states `pcm` and `sse`.** sglang-omni refuses `stream=true` with a 400 unless `response_format` is `pcm`, and
+  its own default is `wav`; its `stream_format` defaults to raw `audio`, where the gateway documents `sse` as a stream's default
+  shape. So `relaySpeech` writes `"response_format":"pcm"` onto the upstream body of a stream whose body has no key named
+  exactly `response_format` holding the string `pcm`, and `"stream_format":"sse"` onto one whose body has no key named exactly
+  `stream_format` holding `sse` or `audio`: the key absent, `null` or `""`, or spelled in another case
+  (`sglangOmniSpeechStreamBody`; Go's decoder folds the case of a key, sglang-omni's request model does not, so pcm under
+  `Response_Format` is no pcm to it and the exact key is added beside the client's). Both are one rewrite; every other field is
+  relayed as written, an exact `audio` or `sse` stays as the client sent it, and a body that already states both exactly is
+  relayed byte for byte. The buffered retry (`speechBufferedBody`) is built from the client's body and still drops both fields.
 - **The gateway ends the event stream.** sglang-omni ends a successful `sse` stream after `speech.audio.done` with no `[DONE]`
   (a failure sends an `error` event in place of the done event). When the upstream closes the body cleanly after
-  `speech.audio.done`, with no `error` event, no `[DONE]` of its own anywhere and nothing lost, the copier writes
+  `speech.audio.done`, with no error frame, no `[DONE]` of its own anywhere and nothing lost, the copier writes
   `data: [DONE]` itself (`speechStreamScan.endFrame`), through the path the upstream's chunks take, so it is flushed and fed
   to the scan. It is prefixed only by the newlines the relayed bytes lack of a blank line (two after an unterminated line,
   one after a single newline, none after a whole frame, a CRLF counting as one), so it is always an event of its own and an
   sglang-omni stream ends in exactly the frame audio.cpp's does. The stream is then billed by the rule above, unchanged, and
-  the portal voice-chat TTS leg (`chat_runs_audio_stream.go`), whose reader needs the `[DONE]`, reads it unchanged. A failed
-  write of the sentinel is the copy's error: an error row (`provider.client_disconnected`, or `provider.stream_copy_error` on
+  the portal voice-chat TTS leg (`chat_runs_audio_stream.go`), whose reader needs the `[DONE]`, reads it unchanged. An error
+  frame is judged by the audio benchmark's rule (`isSSEErrorEvent`, shared with `sseStreamError`): an event of type `error`, or
+  an event with no type whose `error` member is stated and not `null`, which is the agent router's `{"error":{...}}` frame when
+  the child fails after the stream was committed and can follow even the done event. A failed write of the sentinel is the
+  copy's error: an error row (`provider.client_disconnected`, or `provider.stream_copy_error` on
   a live request context) that bills zero. An audio.cpp stream, the raw shape and every other kind are relayed byte for byte,
   with no sentinel.
 - **The format headers give a byte rate.** sglang-omni states the PCM format of both shapes in the response headers
@@ -922,12 +928,14 @@ a manual yes) is adapted in three places, because sglang-omni's stream differs f
   rate, else over the header rate (sample rate × channels × bit depth / 8), else `audio_bytes`. Each header must be stated
   exactly once as a plain decimal positive integer, the bit depth a whole number of bytes, and the product a usable rate by
   `routing.ParseOutputByteRate`'s rule (positive, within a uint32); anything else gives no rate, never a guessed one. A format
-  header that is present but unusable or stated twice is logged at Warn, naming it, when the header rate would have been used
-  (no cached rate); an answer with none of the three states no format and logs nothing.
+  header that is present but unusable, stated twice, or missing beside the other two is logged at Warn, naming it, when the
+  header rate would have been used (no cached rate); three usable headers whose product is no usable rate are logged the same
+  way, naming all three. An answer with none of the three states no format and logs nothing. The capture's summary keeps the
+  three headers among the metering headers (`speechMeteringHeaders`), so a bill over the header rate can be audited.
 
-sglang-omni's raw stream counts as the raw shape: its `stream_format` defaults to `audio`, and it labels the headerless PCM
-`audio/pcm` rather than `application/octet-stream`, so `newSpeechStreamScan` takes either as raw PCM, billed from the bytes on a
-body closed cleanly.
+sglang-omni's raw stream counts as the raw shape: a client that asks for `stream_format` `audio` gets it, labelled `audio/pcm`
+rather than `application/octet-stream`, so `newSpeechStreamScan` takes either as raw PCM, billed from the bytes on a body
+closed cleanly.
 
 *Inline voice references for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni reads a bare `ref_audio` path from the model
 host and fetches a URL, and authenticates nothing, so the gateway relays only inline voice references to a target whose

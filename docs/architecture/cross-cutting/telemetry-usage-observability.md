@@ -960,11 +960,15 @@ request is never mislabelled, and only the success path chooses between the two 
 response headers state. Those headers count only when each is stated exactly once as a plain
 decimal positive integer, the bit depth is a whole number of bytes and the product is a usable
 rate by the cached rate's own rule (`routing.ParseOutputByteRate`); a present but unusable or
-repeated one gives no rate, never a guessed one, and is logged at `Warn`, naming the header, when
-the header rate would have been used ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+repeated one, or one missing beside the other two, gives no rate, never a guessed one, and is
+logged at `Warn`, naming the header, when the header rate would have been used, and three usable
+headers whose product is no usable rate are logged the same way, naming all three. The capture
+keeps the three among the speech metering headers, so a bill over the header rate can be audited
+([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
 sglang-omni's event stream ends after `speech.audio.done` with no `[DONE]`; the relay writes
-that sentinel itself on a clean close after the done event with no `error` event and nothing
-lost, so the completion rule above holds for it unchanged, and a failed write of it is an
+that sentinel itself on a clean close after the done event with no error frame (an `error`
+event, or the agent router's untyped `{"error":{...}}` frame, by the audio benchmark's rule) and
+nothing lost, so the completion rule above holds for it unchanged, and a failed write of it is an
 error row that bills zero. The quantity is never a
 partial count: a stream cut short delivered some audio and bills none, and the two shapes that
 would read as a success that billed nothing (a stream that ended without a completion the gateway

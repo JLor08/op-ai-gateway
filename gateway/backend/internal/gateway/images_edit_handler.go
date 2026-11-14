@@ -715,7 +715,7 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 	// (sglangOmniEditPartHeader): such a form is refused here, after the gates and
 	// before anything is sent, and every form it accepts is rebuilt with headers the
 	// gateway wrote.
-	omni := target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni)
+	omni := isSGLangOmniTarget(target)
 	if omni {
 		if refusal := sglangOmniEditSourceRefusal(raw, form.boundary); refusal != nil {
 			s.recordImageSourceRefusal(w, r, token, req, raw, start, refusal)
