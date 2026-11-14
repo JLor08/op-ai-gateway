@@ -211,6 +211,16 @@ than rejecting the request. Two behaviors are specific to Codex continuity:
   the upstream chat history is always the strict
   `assistant(tool_calls…) → tool… → user` shape a Chat Completions upstream
   expects.
+- **Foreign reasoning on the ChatGPT-subscription passthrough.** That
+  passthrough is otherwise byte-for-byte, but a Codex session can start on
+  another model (a local one served by this gateway) and later switch to a
+  subscription model, so its replayed history holds `reasoning` items the
+  ChatGPT backend never produced: `reasoning_text` in `content`, empty
+  `encrypted_content`. The backend rejects them (`array_above_max_length` on
+  `input[n].content`, maximum length 0) and cannot use them.
+  `OpenAIResponsesClient.ProxyNative` therefore drops `reasoning` items without a
+  real `encrypted_content` and strips `content` from the remaining ones; a body
+  that needs neither is forwarded unchanged.
 
 Rendering the non-stream reply (`compat.OpenAIResponsesResponse`) emits, in
 order: a `reasoning` output item (if the model reasoned), then a `message`

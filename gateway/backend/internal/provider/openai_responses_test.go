@@ -476,6 +476,21 @@ func TestOpenAIResponsesClientProxyNativeSanitizesForeignReasoning(t *testing.T)
 	}
 }
 
+func TestSanitizeResponsesReasoningLeavesOtherBodiesUntouched(t *testing.T) {
+	for name, raw := range map[string]string{
+		"string input":    `{"model":"m","input":"hi"}`,
+		"missing input":   `{"model":"m"}`,
+		"null input":      `{"model":"m","input":null}`,
+		"not json":        `not json`,
+		"only real items": `{"model":"m","input":[{"type":"message","role":"user","content":"x"},{"type":"reasoning","id":"rs","summary":[],"encrypted_content":"gAAAA"}]}`,
+		"large int field": `{"model":"m","seed":12345678901234567890,"input":[]}`,
+	} {
+		if got := sanitizeResponsesReasoning([]byte(raw)); string(got) != raw {
+			t.Errorf("%s: body changed to %s", name, got)
+		}
+	}
+}
+
 func TestOpenAIResponsesToolChoiceMapsForms(t *testing.T) {
 	tests := []struct {
 		name   string
