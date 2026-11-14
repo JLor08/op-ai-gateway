@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -1914,6 +1915,176 @@ func TestRealtimeRecheckLookupTimeoutIsWarned(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "realtime: the session's user lookup failed") {
 		t.Fatal("the timed-out lookup was not logged")
+	}
+}
+
+// rtRechecker is a bearer store with auth.BearerRechecker whose re-read a test
+// controls, as the SQL store's is: admission (LookupBearer) and an untouched re-check
+// go to the rig's in-memory store; err, when set, is the answer to every re-check
+// instead; block makes a re-check signal blocked, wait until its context ends and
+// return that context's error, signaling released once it has. Every re-check that
+// answers signals calls.
+type rtRechecker struct {
+	*auth.TokenStore
+	mu       sync.Mutex
+	err      error
+	block    bool
+	calls    chan struct{}
+	blocked  chan struct{}
+	released chan struct{}
+}
+
+func (r *rtRechecker) RecheckBearer(ctx context.Context, header string) (auth.Token, error) {
+	r.mu.Lock()
+	err, block := r.err, r.block
+	r.mu.Unlock()
+	if block {
+		r.blocked <- struct{}{}
+		<-ctx.Done()
+		r.released <- struct{}{}
+		return auth.Token{}, ctx.Err()
+	}
+	defer func() {
+		select {
+		case r.calls <- struct{}{}:
+		default:
+		}
+	}()
+	if err != nil {
+		return auth.Token{}, err
+	}
+	return r.TokenStore.RecheckBearer(ctx, header)
+}
+
+func (r *rtRechecker) edit(f func(*rtRechecker)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f(r)
+}
+
+// useRTRechecker puts an rtRechecker over the rig's token store and sets the short
+// re-check interval.
+func (rig *rtRig) useRTRechecker(t *testing.T) *rtRechecker {
+	t.Helper()
+	r := &rtRechecker{TokenStore: rig.tokenStore(t), calls: make(chan struct{}, 256), blocked: make(chan struct{}, 16), released: make(chan struct{}, 16)}
+	rig.srv.Tokens = r
+	rig.srv.realtimeRecheck = rtRecheck
+	return r
+}
+
+// The bearer re-check through auth.BearerRechecker ends a session only on a definite
+// refusal: a read that fails for any other reason (the SQL store's database hiccup)
+// keeps it open and is logged, and auth.ErrBearerRefused -- or the token gone from the
+// store underneath -- ends it with token_invalid.
+func TestRealtimeRecheckBearerRechecker(t *testing.T) {
+	t.Run("transient read error keeps the session", func(t *testing.T) {
+		logs := captureRTLog(t)
+		rig := newRTRig(t)
+		r := rig.useRTRechecker(t)
+		conn := rig.dial(t, "model="+rtModel)
+		r.edit(func(r *rtRechecker) { r.err = errors.New("database is locked") })
+		waitSignals(t, r.calls, 3)
+		r.edit(func(r *rtRechecker) { r.err = nil })
+		requireStillRelaying(t, rig, conn)
+		if !strings.Contains(logs.String(), "realtime: the session's token re-read failed") {
+			t.Fatal("the transient re-read failure was not logged")
+		}
+	})
+	t.Run("refusal ends the session", func(t *testing.T) {
+		rig := newRTRig(t)
+		r := rig.useRTRechecker(t)
+		conn := rig.dial(t, "model="+rtModel)
+		roundTrip(t, conn)
+		r.edit(func(r *rtRechecker) { r.err = fmt.Errorf("wrapped: %w", auth.ErrBearerRefused) })
+		requireGatewayEnd(t, rig, conn, "token_invalid", "realtime.token_invalid")
+	})
+	t.Run("revoked token ends the session", func(t *testing.T) {
+		rig := newRTRig(t)
+		rig.useRTRechecker(t)
+		conn := rig.dial(t, "model="+rtModel)
+		roundTrip(t, conn)
+		rig.srv.Tokens.(*rtRechecker).RemoveToken("tok_dev")
+		requireGatewayEnd(t, rig, conn, "token_invalid", "realtime.token_invalid")
+	})
+}
+
+// A bearer re-read that hangs is bounded by the session: the lifetime still ends the
+// session on time, the cancel ends the hung read, and the handler returns promptly --
+// the read never holds the session's join or its row -- without logging the canceled
+// read as a failure.
+func TestRealtimeHungBearerRecheckEndsWithTheSession(t *testing.T) {
+	logs := captureRTLog(t)
+	rig := newRTRig(t)
+	r := rig.useRTRechecker(t)
+	rig.srv.realtimeMaxSession = 500 * time.Millisecond
+	conn := rig.dial(t, "model="+rtModel)
+	r.edit(func(r *rtRechecker) { r.block = true })
+	select {
+	case <-r.blocked:
+	case <-time.After(rtWait):
+		t.Fatal("no re-check reached the token store")
+	}
+	if code, reason := rtReadClose(t, conn); code != websocket.StatusPolicyViolation || reason != "max_session_duration" {
+		t.Fatalf("client close = %d %q, want 1008 max_session_duration", code, reason)
+	}
+	if end := recvEnd(t, rig.agent); end.code != websocket.StatusPolicyViolation || end.reason != "max_session_duration" {
+		t.Fatalf("agent end = %+v, want 1008 max_session_duration", end)
+	}
+	rig.waitHandled(t)
+	select {
+	case <-r.released:
+	default:
+		t.Fatal("the session finished before its hung re-read returned")
+	}
+	if rows := rig.srv.Usage.All(); len(rows) != 1 || rows[0].ErrorCode != "realtime.max_session_duration" {
+		t.Fatalf("usage rows = %+v, want one realtime.max_session_duration row", rows)
+	}
+	if strings.Contains(logs.String(), "token re-read failed") {
+		t.Fatalf("the canceled re-read was logged as a failure:\n%s", logs.String())
+	}
+}
+
+// A bearer re-read that runs past the check's timeout keeps the session, like any
+// transient failure, and is warned.
+func TestRealtimeBearerRecheckTimeoutIsWarned(t *testing.T) {
+	logs := captureRTLog(t)
+	r := &rtRechecker{TokenStore: auth.NewTokenStore(), block: true, blocked: make(chan struct{}, 1), released: make(chan struct{}, 1)}
+	srv := &Server{Tokens: r}
+	req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	req.Header.Set("Authorization", "Bearer "+rtSecret)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if !srv.realtimeGrantHolds(ctx, realtimeGrant{authReq: req, token: auth.Token{ID: "tok_dev"}}) {
+		t.Fatal("a timed-out re-read ended the session")
+	}
+	if !strings.Contains(logs.String(), "realtime: the session's token re-read failed") {
+		t.Fatal("the timed-out re-read was not logged")
+	}
+}
+
+// rtLookupOnly hides every method but LookupBearer, as a bearer store without
+// auth.BearerRechecker.
+type rtLookupOnly struct{ auth.BearerStore }
+
+// A bearer store without auth.BearerRechecker falls back to LookupBearer, whose
+// answer is taken as definite: the key holds while it resolves to the same token with
+// an inference scope, and fails once it is revoked.
+func TestRealtimeRecheckFallsBackToLookupBearer(t *testing.T) {
+	tokens := auth.NewTokenStore()
+	tokens.AddPlainToken(auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true, Scopes: []string{"gateway:use"}}, rtSecret)
+	srv := &Server{Tokens: rtLookupOnly{tokens}}
+	if _, ok := srv.Tokens.(auth.BearerRechecker); ok {
+		t.Fatal("rtLookupOnly still implements auth.BearerRechecker")
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	req.Header.Set("Authorization", "Bearer "+rtSecret)
+	grant := realtimeGrant{authReq: req, token: auth.Token{ID: "tok_dev"}}
+	if !srv.realtimeGrantHolds(context.Background(), grant) {
+		t.Fatal("a valid key failed the fallback re-check")
+	}
+	tokens.RemoveToken("tok_dev")
+	if srv.realtimeGrantHolds(context.Background(), grant) {
+		t.Fatal("a revoked key passed the fallback re-check")
 	}
 }
 

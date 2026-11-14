@@ -4,8 +4,10 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +134,23 @@ type BearerStore interface {
 	LookupBearer(header string) (Token, bool)
 }
 
+// ErrBearerRefused is RecheckBearer's definite refusal: the credential does not
+// authenticate (no bearer secret, an unknown secret, an inactive or expired token, a
+// service token whose service is missing or disabled, ...). Any other error from
+// RecheckBearer means the store could not answer, which says nothing about the
+// credential.
+var ErrBearerRefused = errors.New("auth: bearer credential refused")
+
+// BearerRechecker is an optional extension of a BearerStore for re-validating a
+// credential that was already admitted (the realtime session's periodic re-check). It
+// refuses on exactly the conditions LookupBearer refuses on, but it has no side
+// effects (LookupBearer may record the token's use) and it honors ctx, and it tells a
+// refusal (ErrBearerRefused) apart from a failed read (any other error), which
+// LookupBearer's bool folds together.
+type BearerRechecker interface {
+	RecheckBearer(ctx context.Context, header string) (Token, error)
+}
+
 type TokenStore struct {
 	mu     sync.RWMutex
 	tokens map[string]Token
@@ -234,6 +253,16 @@ func (s *TokenStore) LookupBearer(header string) (Token, bool) {
 	token.AllowedModels = cloneStrings(token.AllowedModels)
 	token.VendorAccess = cloneVendorAccess(token.VendorAccess)
 	return token, true
+}
+
+// RecheckBearer is LookupBearer as a BearerRechecker: an in-memory read that cannot
+// fail, so a miss is always ErrBearerRefused and ctx is not consulted.
+func (s *TokenStore) RecheckBearer(_ context.Context, header string) (Token, error) {
+	token, ok := s.LookupBearer(header)
+	if !ok {
+		return Token{}, ErrBearerRefused
+	}
+	return token, nil
 }
 
 func ExtractBearerSecret(header string) (string, bool) {

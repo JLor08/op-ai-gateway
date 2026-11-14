@@ -3,10 +3,38 @@
 
 package auth
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
 
 func TestTokenStoreImplementsBearerStore(t *testing.T) {
 	var _ BearerStore = (*TokenStore)(nil)
+	var _ BearerRechecker = (*TokenStore)(nil)
+}
+
+// RecheckBearer answers as LookupBearer does, with every miss a definite
+// ErrBearerRefused (an in-memory read cannot fail), even on an ended context.
+func TestTokenStoreRecheckBearer(t *testing.T) {
+	store := NewTokenStore()
+	past := time.Now().UTC().Add(-time.Minute)
+	store.AddPlainToken(Token{ID: "tok_ok", Active: true, Scopes: []string{"gateway:use"}}, "ok")
+	store.AddPlainToken(Token{ID: "tok_off", Active: false}, "off")
+	store.AddPlainToken(Token{ID: "tok_exp", Active: true, ExpiresAt: &past}, "exp")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tok, err := store.RecheckBearer(canceled, "Bearer ok")
+	if err != nil || tok.ID != "tok_ok" || !tok.HasScope("gateway:use") {
+		t.Fatalf("RecheckBearer(valid) = %+v, %v", tok, err)
+	}
+	for _, header := range []string{"", "Bearer unknown", "Bearer off", "Bearer exp"} {
+		if _, err := store.RecheckBearer(context.Background(), header); !errors.Is(err, ErrBearerRefused) {
+			t.Fatalf("RecheckBearer(%q) err = %v, want ErrBearerRefused", header, err)
+		}
+	}
 }
 
 func TestTokenStoreFindsActiveToken(t *testing.T) {

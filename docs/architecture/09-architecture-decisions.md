@@ -12840,17 +12840,25 @@ billed by the one row written when it ends, its consumption reached the aggregat
   ends and joins it before writing the row, so it never outlives the session, and it never blocks the relay, which only reads the end of
   a check that failed.
   - **Authentication** re-runs the leg that admitted the session against the same request, so a subprotocol key is re-checked too. The
-    bearer leg is the in-memory token store and its answer is definite: the key must still resolve (not revoked, active, unexpired) to the
-    same token, which must still carry `gateway:use` or `llm:invoke`. The loopback leg needs the internal secret and a user lookup in the
-    store; it ends the session only on a definite answer, a user that is gone (`store.ErrNotFound`) or disabled. Any other lookup error is
-    transient: it is logged and the session is kept until the next tick, so a store hiccup never cuts a live session. A failure closes
-    both hops with 1008 `token_invalid`.
+    bearer leg re-reads the token through the new optional `auth.BearerRechecker` (`RecheckBearer(ctx, header)`), which the SQL store
+    (sqlite and postgres) and the in-memory `auth.TokenStore` implement: it refuses on exactly the conditions `LookupBearer` refuses on
+    (shared code in the SQL store), but writes no `last_used_at`, runs every query under the check's context, so a hung read ends with the
+    check's timeout or the session's cancel, and tells a refusal (`auth.ErrBearerRefused`: an unknown, inactive or expired token, a
+    service token whose service is missing or disabled) from a failed read. The key must still resolve to the same token, which must
+    still carry `gateway:use` or `llm:invoke`. A bearer store without the interface falls back to `LookupBearer`, whose `false` is then
+    taken as definite. The loopback leg needs the internal secret and a user lookup in the store; a user that is gone
+    (`store.ErrNotFound`) or disabled is definite. On either leg only a definite answer ends the session: any other read error is
+    transient, logged (unless the session itself canceled the check) and retried on the next tick, so a store hiccup never cuts a live
+    session. A failure closes both hops with 1008 `token_invalid`.
   - **Token quota and cost budget** through the new `PrincipalLimiter.Check`, which runs only `Admit`'s two spend checks (shared code) over
     the same config and aggregate caches. A breach closes both hops with 1008 `token_quota_exceeded` or `cost_budget_exceeded`. Like
     `Admit`, `Check` fails open on a store error.
   - **The rate limit and the request quota are deliberately not re-checked.** A check would count as a request in the rate bucket and could
     throttle the principal's real requests or deny the session itself; and the request quota governs admitting requests, which the
     session already was.
+  - **Nor are a token's allowed models and model override.** Of the credential, only its validity, identity and scopes are
+    re-checked: a token's allowed-models list (a service's allowlist) or model override changed mid-session does not affect the
+    session, which keeps the model it was admitted for.
 - **The usage row says why.** Every new end goes through the same one deferred row, an `error` row with `http_status` 101 and a code of
   its own rather than the generic `realtime.close_1008`: `realtime.max_session_duration`, `realtime.token_invalid`, and for a spend limit
   that limit's admission code, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, so one limit has one code wherever it stops

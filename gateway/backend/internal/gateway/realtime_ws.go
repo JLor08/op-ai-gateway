@@ -97,8 +97,9 @@ const DefaultRealtimeMaxSession = 60 * time.Minute
 // realtimeRecheckInterval is how often an open session re-checks its principal
 // (recheckRealtime): its credential still authenticates and its spend limits are
 // not exhausted. A minute bounds how long a revoked key or an exhausted budget
-// keeps a session relaying, at the cost of one in-memory lookup and at most a few
-// limit reads from the store per session and minute.
+// keeps a session relaying, at the cost of a few reads per session and minute: the
+// credential's (a token read, for a service token its service's too, or a user
+// lookup) and the limits'.
 const realtimeRecheckInterval = time.Minute
 
 // realtimeRecheckTimeout bounds one re-check, so a store that stops answering
@@ -939,9 +940,10 @@ type realtimeRecheck struct {
 // net/http keeps a hijacked request's context live while the handler runs, but that is
 // not a contract the checks should depend on. The session's end is what stops them
 // instead: the relay cancels that context and then waits on done, so the goroutine
-// never outlives its session. Every store call a check makes (the user lookup, the
-// limiter's store reads) honors its context, and the bearer leg's token lookup is an
-// in-memory read that takes none, so that wait is short.
+// never outlives its session. Every store call a check makes (the token re-read, the
+// user lookup, the limiter's store reads) honors its context, so that wait is short.
+// The one exception is a bearer store without auth.BearerRechecker, whose
+// LookupBearer takes no context (realtimeGrantHolds).
 func (s *Server) startRealtimeRecheck(ctx context.Context, grant realtimeGrant) realtimeRecheck {
 	ends := make(chan realtimeEnd, 1) // one report at most, so it never blocks
 	done := make(chan struct{})
@@ -1004,18 +1006,24 @@ func (s *Server) recheckRealtime(ctx context.Context, grant realtimeGrant) (real
 }
 
 // realtimeGrantHolds re-runs the authentication leg that admitted the session against
-// the request it read.
+// the request it read. Either leg can hit a store that fails for reasons that say
+// nothing about the credential, so only a definite answer ends the session; any other
+// failure is logged and the session is kept until the next tick, so a store hiccup
+// never cuts a live session. A read that failed because the session canceled its check
+// keeps it too, unlogged.
 //
-// The bearer leg is the in-memory token store, so its answer is definite: the key must
-// still resolve (not revoked, active, unexpired), to the same token, which must still
-// carry gateway:use or llm:invoke.
+// The bearer leg re-reads the token through auth.BearerRechecker when the store has it
+// (the SQL store and the in-memory token store both do): side-effect free (no record of
+// the use, which LookupBearer writes) and under the check's context, so a hung read
+// ends with the check's timeout or the session's cancel. Only auth.ErrBearerRefused (an
+// unknown, inactive or expired token, a missing or disabled service, ...) is definite.
+// A store without it falls back to LookupBearer, whose false is then taken as definite
+// and which is not bounded by the check's context. Either way the key must resolve to
+// the same token, which must still carry gateway:use or llm:invoke.
 //
-// The loopback leg is the internal secret plus a user lookup in the store, which can
-// fail for reasons that say nothing about the user. Only a definite answer ends the
-// session: a user that is gone (store.ErrNotFound, which every driver returns for a
-// missing user) or disabled. Any other lookup error is transient: it is logged and the
-// session is kept until the next tick, so a store hiccup never cuts a live session. A
-// lookup that failed because the session canceled its check keeps it too, unlogged.
+// The loopback leg is the internal secret plus a user lookup in the store: a user that
+// is gone (store.ErrNotFound, which every driver returns for a missing user) or
+// disabled is definite.
 func (s *Server) realtimeGrantHolds(ctx context.Context, grant realtimeGrant) bool {
 	if grant.loopback {
 		if s.users == nil || !s.presentsInternalSecret(grant.authReq) {
@@ -1025,23 +1033,46 @@ func (s *Server) realtimeGrantHolds(ctx context.Context, grant realtimeGrant) bo
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return false
-		case err != nil && errors.Is(ctx.Err(), context.Canceled):
-			// The session ended and canceled its check: that says nothing about the
-			// user, so it is neither a refusal nor a lookup failure worth a warning.
-			// A lookup that ran past the check's timeout is still warned below.
-			return true
 		case err != nil:
-			slog.Warn("realtime: the session's user lookup failed; the session stays open until the next re-check",
-				"user", grant.token.UserID, "err", err)
-			return true
+			return realtimeRecheckReadFailed(ctx, "user lookup", "user", grant.token.UserID, err)
 		}
 		return user.Status != store.UserStatusDisabled
 	}
 	if s.Tokens == nil {
 		return false
 	}
-	token, ok := s.Tokens.LookupBearer(grant.authReq.Header.Get("Authorization"))
-	return ok && token.ID == grant.token.ID && hasAnyScope(token, realtimeScopes)
+	header := grant.authReq.Header.Get("Authorization")
+	var token auth.Token
+	if rechecker, ok := s.Tokens.(auth.BearerRechecker); ok {
+		var err error
+		token, err = rechecker.RecheckBearer(ctx, header)
+		switch {
+		case errors.Is(err, auth.ErrBearerRefused):
+			return false
+		case err != nil:
+			return realtimeRecheckReadFailed(ctx, "token re-read", "token", grant.token.ID, err)
+		}
+	} else {
+		var ok bool
+		if token, ok = s.Tokens.LookupBearer(header); !ok {
+			return false
+		}
+	}
+	return token.ID == grant.token.ID && hasAnyScope(token, realtimeScopes)
+}
+
+// realtimeRecheckReadFailed is realtimeGrantHolds' answer to a read that failed
+// without a definite answer: the session holds. The failure is warned about, unless
+// the session ended and canceled its check -- that says nothing about the credential,
+// so it is neither a refusal nor a failure worth a warning. A read that ran past the
+// check's timeout is still warned about.
+func realtimeRecheckReadFailed(ctx context.Context, what, idKey, id string, err error) bool {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return true
+	}
+	slog.Warn("realtime: the session's "+what+" failed; the session stays open until the next re-check",
+		idKey, id, "err", err)
+	return true
 }
 
 // relayRealtime pumps messages between client and upstream until the session ends,

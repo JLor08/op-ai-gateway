@@ -31,8 +31,10 @@ hours. During that time:
    never stalls relaying, and each check gets its own short timeout context.
    - **Authentication:** re-run the leg that admitted the session, against the same request: the clone
      `realtimeAuthRequest(r)` produces, which covers the subprotocol key.
-     - The **bearer leg** is `s.Tokens.LookupBearer`. It is in-memory: deterministic, no I/O errors. The check fails
-       when:
+     - The **bearer leg** was planned as `s.Tokens.LookupBearer`, assumed in-memory. *Corrected after the final
+       review:* production wires the SQL store, whose `LookupBearer` writes `last_used_at`, ignores the context and
+       folds read errors into a miss; the leg now uses `auth.BearerRechecker.RecheckBearer` (no write, under the
+       check's context, `auth.ErrBearerRefused` vs. a transient read error). The check fails when:
        - the key is revoked, inactive or expired;
        - the key now resolves to a different token ID;
        - the token no longer has `gateway:use` or `llm:invoke` (its scopes were edited).

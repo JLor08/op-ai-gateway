@@ -637,13 +637,16 @@ func offeringFlavor(apiFlavor string) string {
 	return routing.NormalizeAPIFlavor(apiFlavor)
 }
 
-// The stable error codes of the two spend limits. writeLimitDenied answers a
-// denied request with them, and a /v1/realtime session that a re-check ends on
-// the same limit records them as its usage row's error code, so one limit has
-// one code wherever it stops consumption.
+// The stable error codes of the principal limits, which writeLimitDenied answers
+// a denied request with. A /v1/realtime session that a re-check ends on one of the
+// two spend limits records its code as the usage row's error code, so one limit
+// has one code wherever it stops consumption; the rate limit and the request quota
+// govern admitting requests only, so only the HTTP path uses theirs.
 const (
-	codeLimitTokenQuotaExceeded = "limit.token_quota_exceeded"
-	codeLimitCostBudgetExceeded = "limit.cost_budget_exceeded"
+	codeLimitRateLimited          = "limit.rate_limited"
+	codeLimitRequestQuotaExceeded = "limit.request_quota_exceeded"
+	codeLimitTokenQuotaExceeded   = "limit.token_quota_exceeded"
+	codeLimitCostBudgetExceeded   = "limit.cost_budget_exceeded"
 )
 
 // writeLimitDenied writes the HTTP response for a PrincipalLimiter.Admit
@@ -658,11 +661,11 @@ const (
 // message per reason, never a store error).
 func writeLimitDenied(w http.ResponseWriter, reason string, retryAfter time.Duration) {
 	status := http.StatusTooManyRequests
-	code := "limit.rate_limited"
+	code := codeLimitRateLimited
 	message := "rate limit exceeded"
 	switch reason {
 	case "request_quota":
-		code, message = "limit.request_quota_exceeded", "request quota exceeded"
+		code, message = codeLimitRequestQuotaExceeded, "request quota exceeded"
 	case "token_quota":
 		code, message = codeLimitTokenQuotaExceeded, "token quota exceeded"
 	case "cost_budget":

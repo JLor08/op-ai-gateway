@@ -2304,12 +2304,19 @@ adapter.
    gate, the same as the other audio endpoints. What can change while the session runs is **re-checked every
    minute** instead, on a goroutine of the session's own that never blocks the relay (each check under a 10 s timeout):
    - **the credential**, by re-running the leg that admitted it against the same request (a subprotocol key too). A
-     bearer key must still resolve, not revoked, active and unexpired, to the same token with `gateway:use` or
-     `llm:invoke`. The loopback leg fails only for a user that is gone or disabled; any other user-lookup error is
-     transient, logged and retried on the next tick, so a store hiccup never cuts a session;
+     bearer key must still resolve, not revoked, active and unexpired (for a service token, its service present and
+     enabled), to the same token with `gateway:use` or `llm:invoke`. The token is re-read through
+     `auth.BearerRechecker.RecheckBearer`, which the SQL and in-memory stores implement: no `last_used_at` write, every
+     query under the check's context (so a hung read ends with the check's timeout or the session's cancel), and a
+     definite refusal (`auth.ErrBearerRefused`) told apart from a failed read; a store without it falls back to
+     `LookupBearer`, whose miss is taken as definite. The loopback leg fails only for a user that is gone or disabled.
+     On either leg any other read error is transient, logged and retried on the next tick, so a store hiccup never
+     cuts a session;
    - **the token quota and the cost budget**, through `PrincipalLimiter.Check`, `Admit`'s two spend checks alone, which
      fails open on a store error. The rate limit and the request quota are not re-checked: a check would spend the
-     rate bucket, and the request quota governs admitting requests, which the session already was.
+     rate bucket, and the request quota governs admitting requests, which the session already was. Nor are a token's
+     allowed models and model override: of the credential, only its validity, identity and scopes are re-checked, so a
+     changed allowlist or override does not affect a session that was admitted for its model.
 
    The session's own running consumption is not in the aggregate the check reads until its row is written when it
    ends, so one session can overrun a limit by what it consumes meanwhile; the maximum lifetime (item 5) bounds that.
