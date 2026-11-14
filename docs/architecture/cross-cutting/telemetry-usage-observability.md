@@ -3193,6 +3193,18 @@ memory/dev mode lives in the non-persistent `usage.Recorder`), so it returns a
 zero aggregate honestly: quota and budget enforcement is a
 persistent-store feature by design.
 
+`PrincipalLimiter.Check` is `Admit`'s spend half alone: the token quota and the
+cost budget, over the same config and aggregate caches and failing open the
+same way, without the rate bucket or the request quota. Its one caller is a
+`/v1/realtime` session, which re-checks its principal with it every minute and
+ends with close code 1008 on a breach; its row then carries the limit's own
+code, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`
+([Compatibility & Inference
+§3.11](compatibility-and-inference.md#311-realtime-the-websocket-relay)). A
+session's own consumption is not in the aggregate it reads until its one row is
+written when it ends, so the session's maximum lifetime
+(`OP_AI_GATEWAY_REALTIME_MAX_SESSION`) is what bounds its overrun.
+
 All of that is the *configured* case. A principal with no limits never reaches
 any of it: `Admit` short-circuits on the zero `routing.LimitConfig` — no
 `principal_limits` row at all, or a row whose every field is zero — and allows

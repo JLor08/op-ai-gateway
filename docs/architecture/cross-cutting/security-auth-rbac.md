@@ -161,7 +161,14 @@ principal, or the internal loopback all eventually resolve into. Key fields:
 <secret>` value and looks it up by hash. There is no reversible encryption
 here because there is nothing to reverse: an active, non-expired match is a
 valid token, a miss is not, and the plaintext secret is shown to the operator
-exactly once, at creation time.
+exactly once, at creation time. The SQL store's `LookupBearer` also records the
+use (`last_used_at`) and folds any read or write failure into a miss, so the
+request path fails closed. Re-validating an already admitted credential (a
+`/v1/realtime` session's periodic re-check) goes through the optional
+`auth.BearerRechecker` instead: `RecheckBearer(ctx, header)` refuses on the same
+conditions with `auth.ErrBearerRefused`, writes nothing, honors its context, and
+reports a failed read as an error of its own, which the re-check treats as
+transient.
 
 A user creates their own tokens with `CreateToken`
 (`internal/portal/service.go`); requested scopes are validated against what
@@ -1057,7 +1064,9 @@ for the rest of the window. No rate bucket is touched and no `UsageAggregateSinc
 issued on that path, so zero-config is a genuine short-circuit rather than
 four checks that each happen to pass — and that is what makes an all-zero PUT
 the supported way to *clear* limits, a stored all-zero row being behaviorally
-identical to no row. What the memory driver can and cannot enforce once limits
+identical to no row. `PrincipalLimiter.Check`, the non-consuming re-check a
+`/v1/realtime` session runs every minute, shares that config resolution and its
+fail-open rule, and on a zero config reads no aggregate either. What the memory driver can and cannot enforce once limits
 *are* set is a separate question, answered in [Telemetry, Usage Analytics &
 Observability §8.4.5](telemetry-usage-observability.md#845-cost-and-currency).
 

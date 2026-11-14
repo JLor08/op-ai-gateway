@@ -2300,8 +2300,26 @@ adapter.
    (`InsecureSkipVerify`) because the endpoint accepts no ambient credential a cross-site page could ride.
 2. **`model` is the query's `model`, required** (`400 realtime.model_required`). A request that is no
    WebSocket handshake the gateway can accept is `426` or `400 realtime.upgrade_required`, before anything is spent.
-3. **Admission runs once per session**, however long it lasts: the model and server override, the allowlist and the
-   rate, quota and budget gate, the same as the other audio endpoints.
+3. **Admission runs once per session**: the model and server override, the allowlist and the rate, quota and budget
+   gate, the same as the other audio endpoints. What can change while the session runs is **re-checked every
+   minute** instead, on a goroutine of the session's own that never blocks the relay (each check under a 10 s timeout):
+   - **the credential**, by re-running the leg that admitted it against the same request (a subprotocol key too). A
+     bearer key must still resolve, not revoked, active and unexpired (for a service token, its service present and
+     enabled), to the same token with `gateway:use` or `llm:invoke`. The token is re-read through
+     `auth.BearerRechecker.RecheckBearer`, which the SQL and in-memory stores implement: no `last_used_at` write, every
+     query under the check's context (so a hung read ends with the check's timeout or the session's cancel), and a
+     definite refusal (`auth.ErrBearerRefused`) told apart from a failed read; a store without it falls back to
+     `LookupBearer`, whose miss is taken as definite. The loopback leg fails only for a user that is gone or disabled.
+     On either leg any other read error is transient, logged and retried on the next tick, so a store hiccup never
+     cuts a session;
+   - **the token quota and the cost budget**, through `PrincipalLimiter.Check`, `Admit`'s two spend checks alone, which
+     fails open on a store error. The rate limit and the request quota are not re-checked: a check would spend the
+     rate bucket, and the request quota governs admitting requests, which the session already was. Nor are a token's
+     allowed models and model override: of the credential, only its validity, identity and scopes are re-checked, so a
+     changed allowlist or override does not affect a session that was admitted for its model.
+
+   The session's own running consumption is not in the aggregate the check reads until its row is written when it
+   ends, so one session can overrun a limit by what it consumes meanwhile; the maximum lifetime (item 5) bounds that.
 4. **The target** needs the `openai_audio` flavor, a **manual `realtime: yes`** verdict (the capability `realtime`,
    which no probe writes; an agent's report of it is dropped at ingest) and a `server_agent` provider whose agent
    reports `realtime_proxy` (fail closed, also for an agent that has not reported since the gateway started). The
@@ -2311,10 +2329,17 @@ adapter.
 5. **The relay.** The session is registered in Active Requests before the agent is dialed, and the client's
    socket is accepted only after the dial succeeded, so a failed dial is a plain `502`/`503`. The dial is
    forced to HTTP/1.1 (the production CA-pool transport offers `http/1.1` alone for it, since HTTP/2 cannot carry
-   an upgrade) and sends no `Origin` and no client subprotocol. The gateway ends a session with no message in
-   either direction for 15 minutes with 1008. During shutdown it waits at most 6 s for open sessions to close
-   (1001) and answers a new handshake `503 realtime.shutting_down`. The close code and reason of either side
-   are mirrored.
+   an upgrade) and sends no `Origin` and no client subprotocol. The session ends at the first of:
+   - a side's close frame, whose code and reason are mirrored to the other side;
+   - 15 minutes with no message in either direction: 1008 `idle_timeout`;
+   - the **maximum lifetime**, however busy the session is (`OP_AI_GATEWAY_REALTIME_MAX_SESSION`, default 60
+     minutes, `0` for no bound, timed from the start of the relay): 1008 `max_session_duration`;
+   - a **failed re-check** (item 3): 1008 `token_invalid`, `token_quota_exceeded` or `cost_budget_exceeded`;
+   - the shutdown, which waits at most 6 s for open sessions to close (1001) and answers a new handshake
+     `503 realtime.shutting_down`.
+
+   An end the gateway decides closes both hops with the same code and reason, so the agent's router releases the
+   spec as on any close.
 6. **Usage: one row per session**, `http_status` 101, in this order of preference:
    - **`audio_second`**, when the client appended any audio, from its `input_audio_buffer.append` frames: the count of base64
      alphabet characters of `audio`, times 3/4, divided by 32000 bytes per second. The frame is read as the
@@ -2327,7 +2352,11 @@ adapter.
    - otherwise **tokens**, for a session that appended no audio, summed from the upstream's `response.done`
      `response.usage` (prompt or input tokens and completion or output tokens);
    - otherwise a **logged zero** (`audio_second` 0 with an `Error` log line).
-   A close code of 1000, 1001 or 1005 is a `success`; any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded. A
+   A session the gateway ended on its lifetime or a re-check is an `error` row with a code of its own:
+   `realtime.max_session_duration`, `realtime.token_invalid`, or the spend limit's admission code,
+   `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`. Otherwise a close code of 1000, 1001 or 1005 is a
+   `success`, and any other code is the error `realtime.close_<code>` (`realtime.close_1008` for the idle limit and a
+   peer's own 1008). However a session ends, it is billed for everything it relayed. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded. A
    request refused before a target is chosen records no row, as the live bearer endpoint's gate does.
 7. **Residuals.** A gone instance `m#k` with k ≥ 1 is not re-selected on the dial. A peer that
    freezes mid-frame during a close handshake is unbounded in `coder/websocket`. `/v1/realtime/` with a trailing
@@ -4932,8 +4961,8 @@ Every inference error response uses the gateway-wide envelope
 |---|---|---|
 | `request.*` (e.g. `request.model_required`, `openai.content_required`, `anthropic.content_unsupported`) | 400 | body failed `compat.Parse*`/`inference.Request.Validate` |
 | `model.not_allowed` | 403 | service-token allowlist (§6 step 2) |
-| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate |
-| `limit.cost_budget_exceeded` | 402 | `PrincipalLimiter` admission gate |
+| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate; `.token_quota_exceeded` is also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
+| `limit.cost_budget_exceeded` | 402 | `PrincipalLimiter` admission gate; also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |

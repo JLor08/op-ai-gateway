@@ -1352,3 +1352,30 @@ func TestLoadMaxDecisionsBodyBytesOverride(t *testing.T) {
 		t.Fatalf("MaxDecisionsBodyBytes = %d, want 1048576", cfg.MaxDecisionsBodyBytes)
 	}
 }
+
+// The /v1/realtime session lifetime is a knob where 0 is a real value (no bound), so an
+// absent variable (-> the 60m default) must stay distinguishable from an explicit 0, and a
+// negative or unparseable value must fall back to the default rather than silently lifting
+// the bound.
+func TestLoadRealtimeMaxSession(t *testing.T) {
+	cases := []struct {
+		value string
+		want  time.Duration
+	}{
+		{"", 60 * time.Minute},        // absent -> the default
+		{"   ", 60 * time.Minute},     // blank -> the default
+		{"30m", 30 * time.Minute},     // an explicit bound
+		{"90s", 90 * time.Second},     // an explicit bound
+		{"0", 0},                      // explicit off, NOT the default
+		{"0s", 0},                     // explicit off, NOT the default
+		{"-5m", 60 * time.Minute},     // negative -> default (not silently off)
+		{"garbage", 60 * time.Minute}, // invalid -> default
+		{"60", 60 * time.Minute},      // a bare number has no unit -> invalid -> default
+	}
+	for _, tc := range cases {
+		t.Setenv("OP_AI_GATEWAY_REALTIME_MAX_SESSION", tc.value)
+		if got := mustLoad(t).RealtimeMaxSession; got != tc.want {
+			t.Fatalf("value %q: got %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}

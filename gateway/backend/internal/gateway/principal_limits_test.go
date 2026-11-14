@@ -641,3 +641,101 @@ func TestPrincipalLimiterConcurrentRace(t *testing.T) {
 		t.Fatalf("allowed = %d, exceeds the per-principal rate caps (%d total)", allowed, len(principals)*1000)
 	}
 }
+
+// setErrors sets the store errors under the lock, for a test that changes them while
+// another goroutine (a realtime session's re-check) reads the store.
+func (f *fakePrincipalStore) setErrors(cfgErr, aggErr error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cfgErr, f.aggErr = cfgErr, aggErr
+}
+
+// Check runs only the spend limits -- the token quota and the cost budget -- and
+// reports the first breach the way Admit names it.
+func TestPrincipalLimiterCheckSpendLimits(t *testing.T) {
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	for _, tc := range []struct {
+		name   string
+		cfg    routing.LimitConfig
+		tokens int64
+		cost   float64
+		allow  bool
+		reason string
+	}{
+		{"no limits", routing.LimitConfig{}, 1 << 40, 1e9, true, ""},
+		{"below the token quota", routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 99, 0, true, ""},
+		{"at the token quota", routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 100, 0, false, "token_quota"},
+		{"below the cost budget", routing.LimitConfig{CostBudget: 5, CostBudgetPeriod: "month"}, 0, 4.99, true, ""},
+		{"at the cost budget", routing.LimitConfig{CostBudget: 5, CostBudgetPeriod: "month"}, 0, 5, false, "cost_budget"},
+		{"both breached: the token quota first", routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day", CostBudget: 5, CostBudgetPeriod: "day"}, 100, 5, false, "token_quota"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakePrincipalStore()
+			store.setConfig(p, tc.cfg)
+			store.setAggregate(p, 0, tc.tokens, tc.cost)
+			allow, reason := NewPrincipalLimiter(store, PrincipalLimiterOptions{}).Check(context.Background(), p)
+			if allow != tc.allow || reason != tc.reason {
+				t.Fatalf("Check() = (%v,%q), want (%v,%q)", allow, reason, tc.allow, tc.reason)
+			}
+		})
+	}
+}
+
+// Check never consults the rate bucket or the request quota: a principal at its rate
+// limit and past its request quota still passes, and any number of checks leaves the
+// rate bucket exactly where the one Admit put it.
+func TestPrincipalLimiterCheckSkipsRateAndRequestQuota(t *testing.T) {
+	store := newFakePrincipalStore()
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	store.setConfig(p, routing.LimitConfig{RateRequests: 1, RateWindowSeconds: 3600, RequestQuota: 1, RequestQuotaPeriod: "day"})
+	now := utc(2026, 3, 15, 12, 0, 0)
+	limiter := NewPrincipalLimiter(store, PrincipalLimiterOptions{Now: clockAt(&now)})
+	if allow, reason, _ := limiter.Admit(context.Background(), p); !allow {
+		t.Fatalf("the first Admit() was denied (%q)", reason)
+	}
+	store.setAggregate(p, 10, 0, 0)
+	for i := 0; i < 5; i++ {
+		now = now.Add(2 * defaultLimiterCacheTTL)
+		if allow, reason := limiter.Check(context.Background(), p); !allow {
+			t.Fatalf("check %d: Check() = (false,%q), want allowed", i, reason)
+		}
+	}
+	limiter.rateMu.Lock()
+	count := limiter.rateBuckets[p].count
+	limiter.rateMu.Unlock()
+	if count != 1 {
+		t.Fatalf("rate bucket count after the checks = %d, want the one Admit's 1", count)
+	}
+	if allow, reason, _ := limiter.Admit(context.Background(), p); allow || reason != "rate" {
+		t.Fatalf("a second Admit() = (%v,%q), want the rate limit to deny it", allow, reason)
+	}
+}
+
+// Check fails open on a store error, as Admit does, and is nil-safe.
+func TestPrincipalLimiterCheckFailsOpen(t *testing.T) {
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	for _, tc := range []struct {
+		name           string
+		cfgErr, aggErr error
+	}{
+		{"config read", errors.New("db unavailable"), nil},
+		{"aggregate read", nil, errors.New("db unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakePrincipalStore()
+			store.setConfig(p, routing.LimitConfig{TokenQuota: 1, TokenQuotaPeriod: "day", CostBudget: 1, CostBudgetPeriod: "day"})
+			store.setAggregate(p, 0, 10, 10)
+			store.setErrors(tc.cfgErr, tc.aggErr)
+			if allow, reason := NewPrincipalLimiter(store, PrincipalLimiterOptions{}).Check(context.Background(), p); !allow || reason != "" {
+				t.Fatalf("Check() = (%v,%q), want fail-open", allow, reason)
+			}
+		})
+	}
+	var nilLimiter *PrincipalLimiter
+	if allow, _ := nilLimiter.Check(context.Background(), p); !allow {
+		t.Fatal("a nil limiter's Check() denied")
+	}
+	if allow, _ := NewPrincipalLimiter(nil, PrincipalLimiterOptions{}).Check(context.Background(), p); !allow {
+		t.Fatal("a nil store's Check() denied")
+	}
+}

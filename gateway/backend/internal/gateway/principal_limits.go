@@ -215,19 +215,58 @@ func (l *PrincipalLimiter) Admit(ctx context.Context, p Principal) (allow bool, 
 			return false, "request_quota", 0
 		}
 	}
+	if reason := l.spendBreach(ctx, p, cfg, now); reason != "" {
+		return false, reason, 0
+	}
+	return true, "", 0
+}
+
+// Check decides whether principal p may go on consuming what it was already
+// admitted for -- a long-lived /v1/realtime session re-checks its principal
+// periodically with it. It runs only the spend limits of Admit, the token quota
+// and the cost budget, because only those measure consumption. It deliberately
+// skips the other two:
+//   - the rate bucket, because each check would count as a request and could
+//     both throttle the principal's real requests and deny the session itself;
+//   - the request quota, because it governs admitting requests, and the session
+//     was admitted already.
+//
+// reason is "" (allowed), "token_quota" or "cost_budget", named as Admit names
+// them. Like Admit it is nil-safe, uses the same caches (so a check costs at most
+// one store read per CacheTTL and period), and fails open on a store error.
+func (l *PrincipalLimiter) Check(ctx context.Context, p Principal) (allow bool, reason string) {
+	if l == nil || l.store == nil {
+		return true, ""
+	}
+	now := l.now()
+	cfg, ok := l.configFor(ctx, p, now)
+	if !ok {
+		return true, "" // a store error: fail open, uncached, exactly as Admit does
+	}
+	if reason := l.spendBreach(ctx, p, cfg, now); reason != "" {
+		return false, reason
+	}
+	return true, ""
+}
+
+// spendBreach is the token-quota and cost-budget half of Admit, shared with
+// Check: the first configured spend limit p has reached in its current period
+// ("token_quota" before "cost_budget"), or "" when none is. An aggregate read
+// that fails counts as zero (aggregate), so a store error never breaches.
+func (l *PrincipalLimiter) spendBreach(ctx context.Context, p Principal, cfg routing.LimitConfig, now time.Time) string {
 	if cfg.TokenQuota > 0 && cfg.TokenQuotaPeriod != "" {
 		_, toks, _ := l.aggregate(ctx, p, cfg.TokenQuotaPeriod, now)
 		if toks >= cfg.TokenQuota {
-			return false, "token_quota", 0
+			return "token_quota"
 		}
 	}
 	if cfg.CostBudget > 0 && cfg.CostBudgetPeriod != "" {
 		_, _, cost := l.aggregate(ctx, p, cfg.CostBudgetPeriod, now)
 		if cost >= cfg.CostBudget {
-			return false, "cost_budget", 0
+			return "cost_budget"
 		}
 	}
-	return true, "", 0
+	return ""
 }
 
 // checkRate applies the tumbling-window rate limit (design spec §6.1). It is

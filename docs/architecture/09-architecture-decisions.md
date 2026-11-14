@@ -12775,7 +12775,8 @@ budget gate, the usage row, and a model that the agent starts and keeps admitted
   pair, or the subprotocols `realtime` and `openai-insecure-api-key.<key>`. A Bearer header wins, the first key offered wins, and only
   `realtime` is ever selected; the key is never logged and never forwarded. The `Origin` check is skipped, because the endpoint accepts no
   ambient credential a cross-site page could use. `model` is required (`400 realtime.model_required`). Admission runs **once per
-  session**. A target must carry the `openai_audio` flavor, a **manual `realtime: yes`** verdict and be a `server_agent` target whose agent
+  session**. (Amended 2026-11-14: what can change while a session runs, its credential, token quota and cost budget, is re-checked every
+  minute, and a session never outlives a maximum lifetime; see the amendment at the end of this ADR.) A target must carry the `openai_audio` flavor, a **manual `realtime: yes`** verdict and be a `server_agent` target whose agent
   reported `realtime_proxy` (fail closed). A rejected target is excluded by its instance key and the resolve runs again, up to 8 tries,
   ending in `404 routing.no_model_route`. The session is registered in Active Requests before the dial; the gateway dials the agent
   through a new `provider.NativeWebSocketDialer`, **forced to HTTP/1.1** (the production CA-pool transport offers `http/1.1` alone for
@@ -12787,7 +12788,7 @@ budget gate, the usage row, and a model that the agent starts and keeps admitted
   legacy session sends `usage: null` for a cancelled turn and runs a transcription pass that is never billed: token precedence would
   under-count and give free transcription after one normal turn. Only a session with no audio is token-metered, from the upstream's
   `response.done` `response.usage` (prompt or input, completion or output). With neither the row is a logged zero. `http_status` is 101; the close
-  codes 1000, 1001 and 1005 are a success and any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded.
+  codes 1000, 1001 and 1005 are a success and any other code is the error `realtime.close_<code>` (amended 2026-11-14: an end the gateway decides on the lifetime or a re-check records its own code instead). A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded.
 - **Capability `realtime`.** Manual verdicts only (`routing.CapabilityRealtime`): no probe states it, and the agent ingest drops it. The
   portal's mapping form labels it "Realtime (WebSocket)", and the `sglang_omni` type note names `--enable-realtime`.
 - **nginx.** Exact-match locations for `/v1/realtime` and `/openai/v1/realtime` in all three deployable configurations (the two compose variants, which share
@@ -12818,5 +12819,57 @@ budget gate, the usage row, and a model that the agent starts and keeps admitted
   - A gone instance k ≥ 1 is not re-selected on the dial.
   - A peer frozen mid-frame during a close handshake is unbounded in coder/websocket.
   - `/v1/realtime/` with a trailing slash is not upgraded by nginx.
+  - (Added 2026-11-14.) A session's own running consumption is not in the aggregate the re-check reads until its one row is written
+    when it ends, so a single session can overrun a token quota or cost budget by what it consumes meanwhile; the maximum lifetime
+    bounds that overrun.
 - **The agent still serves no other WebSocket.** The §13 limitation stands for every other route and server.
 - **Not verified live:** an sglang-omni `/v1/realtime` end to end through the agent. The contracts were read off the pinned source.
+
+**Amended 2026-11-14 — a maximum lifetime and a periodic re-check.** As first shipped, a session was admitted once, before the upgrade,
+and then ran until a close, an error, the idle limit or the shutdown. A key revoked or expired mid-session, a user disabled or deleted,
+or a principal whose token quota or cost budget ran out kept relaying for as long as the session stayed busy, and since the session is
+billed by the one row written when it ends, its consumption reached the aggregate only then.
+
+- **Maximum lifetime.** `OP_AI_GATEWAY_REALTIME_MAX_SESSION` (a Go duration, default `60m`, the cap OpenAI's Realtime API applies;
+  `gateway.DefaultRealtimeMaxSession`) bounds how long a session relays, however busy it is. The timer starts with the relay. Reaching
+  it closes both hops with 1008 `max_session_duration`. An explicit `0` turns the bound off; an absent, empty, unparseable or negative
+  value uses the default, as `OP_AI_GATEWAY_VOICE_MUTE_TEARDOWN` does (`cmd/gateway` carries the explicit `0` as
+  `ServerDeps.RealtimeMaxSessionOff`, since a zero duration in `ServerDeps` reads as the default).
+- **A re-check every minute.** A goroutine of the session's own re-checks the principal on a one-minute ticker, each check under its own
+  10 s timeout and a context detached from the request's cancellation (`context.WithoutCancel`); the relay cancels it when the session
+  ends and joins it before writing the row, so it never outlives the session, and it never blocks the relay, which only reads the end of
+  a check that failed.
+  - **Authentication** re-runs the leg that admitted the session against the same request, so a subprotocol key is re-checked too. The
+    bearer leg re-reads the token through the new optional `auth.BearerRechecker` (`RecheckBearer(ctx, header)`), which the SQL store
+    (sqlite and postgres) and the in-memory `auth.TokenStore` implement: it refuses on exactly the conditions `LookupBearer` refuses on
+    (shared code in the SQL store), but writes no `last_used_at`, runs every query under the check's context, so a hung read ends with the
+    check's timeout or the session's cancel, and tells a refusal (`auth.ErrBearerRefused`: an unknown, inactive or expired token, a
+    service token whose service is missing or disabled) from a failed read. The key must still resolve to the same token, which must
+    still carry `gateway:use` or `llm:invoke`. A bearer store without the interface falls back to `LookupBearer`, whose `false` is then
+    taken as definite. The loopback leg needs the internal secret and a user lookup in the store; a user that is gone
+    (`store.ErrNotFound`) or disabled is definite. On either leg only a definite answer ends the session: any other read error is
+    transient, logged (unless the session itself canceled the check) and retried on the next tick, so a store hiccup never cuts a live
+    session. A store that fails every read therefore keeps the session until the maximum lifetime ends it, and without bound when the
+    lifetime is set to `0`, with a Warn each tick. A failure closes both hops with 1008 `token_invalid`.
+  - **Token quota and cost budget** through the new `PrincipalLimiter.Check`, which runs only `Admit`'s two spend checks (shared code) over
+    the same config and aggregate caches. A breach closes both hops with 1008 `token_quota_exceeded` or `cost_budget_exceeded`. Like
+    `Admit`, `Check` fails open on a store error.
+  - **The rate limit and the request quota are deliberately not re-checked.** A check would count as a request in the rate bucket and could
+    throttle the principal's real requests or deny the session itself; and the request quota governs admitting requests, which the
+    session already was.
+  - **Nor are a token's allowed models and model override.** Of the credential, only its validity, identity and scopes are
+    re-checked: a token's allowed-models list (a service's allowlist) or model override changed mid-session does not affect the
+    session, which keeps the model it was admitted for.
+- **The usage row says why.** Every new end goes through the same one deferred row, an `error` row with `http_status` 101 and a code of
+  its own rather than the generic `realtime.close_1008`: `realtime.max_session_duration`, `realtime.token_invalid`, and for a spend limit
+  that limit's admission code, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, so one limit has one code wherever it stops
+  consumption. `realtime.close_1008` stays for the idle limit and a peer's own 1008. Billing is unchanged: a session the gateway cut
+  bills everything it relayed, exactly like an idle-closed one, so ending a session early never makes it free.
+- **Known gap: loopback admission ignores a user's status.** The loopback leg's admission (`loopbackPrincipal`) resolves the user but
+  does not check whether it is disabled, so a disabled user's loopback session is admitted and ended at the first re-check, within the
+  re-check interval. Tightening the admission is out of scope here: `loopbackPrincipal` serves every internal route, not only this one.
+- **Gateway-only.** Every new end runs through the existing close path, so the agent hop gets the same 1008 and reason, and its router
+  releases the spec as on any close. The agent version and its routes are unchanged.
+
+The session's own running consumption still reaches the aggregate only with its row: the re-check reads what earlier rows recorded,
+and the maximum lifetime is what bounds a single session's overrun (the accepted residual added above).
