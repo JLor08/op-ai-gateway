@@ -937,6 +937,22 @@ dropped for voices, because audio.cpp ignores `?model=`).
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [API Surface](reference/api-surface.md#53-the-agents-own-router-port-not-a-gateway-endpoint).
 
+**Amended: the gateway's probe through the passthrough is narrowed by spec type.** The
+router forwards `/upstream/{model}/props` to whatever child runs, and the gateway's
+resolver used to send it for every loaded mapping. Once [ADR-103](#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)
+added types without `/props`, a running sglang-omni child logged a 404 for it on every
+app-health tick (the application's health-check interval, 30 s by default, plus a retry
+2 s later). The gateway now resolves the default per mapping
+(`routing.EffectiveMappingContextProbePath`) and sends none for a spec whose effective
+type serves no `/props`: `vllm`, `tgi`, `ollama`, `vllm_sr`, `sglang`,
+`stable_diffusion_cpp`, `audio_cpp` and `sglang_omni`. `llama_cpp` and `custom` (which
+may be a llama-server under another name) are still probed, and an operator-set
+`context_probe_path` still wins. Nothing is lost: only a llama.cpp `/props` document
+carries the context size and the verdicts this probe reads, and the skipped types' context
+sizes, where they have one, arrive through the agent's own per-type probe.
+→ [Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation).
+
 ## ADR-038 — Capability detection: one `/props` read, three states, an open vocabulary
 **Context:** #49 sub-project 2 needed a persisted answer for "does this
 upstream take images/video/audio, and does its chat template support tool

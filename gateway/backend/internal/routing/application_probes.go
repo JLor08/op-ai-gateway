@@ -62,9 +62,9 @@ func EffectiveLoadedModelsProbe(app Application) (path, format string) {
 // otherwise "", meaning no probe.
 //
 // The gate is fail-closed: an agent without the route answers 404 for every
-// such probe. There is no spec-type logic either: the router forwards to any
-// running child, and a child that serves no /props answers 404, which a
-// caller treats as "no context size from this probe".
+// such probe. This is the application-level answer and knows no spec type: a
+// caller that probes the router default for one mapping narrows it with
+// EffectiveMappingContextProbePath.
 func EffectiveContextProbePath(app Application, agentHasUpstreamProps bool) string {
 	if p := strings.TrimSpace(app.ContextProbePath); p != "" {
 		return p
@@ -73,4 +73,46 @@ func EffectiveContextProbePath(app Application, agentHasUpstreamProps bool) stri
 		return AgentRouterContextProbePath
 	}
 	return ""
+}
+
+// EffectiveMappingContextProbePath is EffectiveContextProbePath for one
+// mapping whose resolved runtime spec is spec (the zero spec when it has
+// none). It returns the same path, except that the router default
+// (AgentRouterContextProbePath, used only when app.ContextProbePath is blank)
+// becomes "" when the spec's effective type (EffectiveRuntimeSpecType) is one
+// whose server serves no /props (runtimeSpecTypeServesProps).
+//
+// The router forwards /upstream/{model}/props to the running child's /props
+// whatever the child is. A child that serves no /props answers 404, and the
+// app-health pass asked it again after its retry gap on every cadence tick
+// (the application's health-check interval, 30 s by default), which kept a
+// steady stream of 404s in a sglang-omni child's log. Such a child carries
+// no llama.cpp /props document, so the probe never yielded a context size or
+// a capability verdict from it: its context size, where it has one, comes
+// from the agent's own per-type probe (DeriveProbePaths). An operator-set
+// ContextProbePath still wins.
+func EffectiveMappingContextProbePath(app Application, spec RuntimeSpec, agentHasUpstreamProps bool) string {
+	p := EffectiveContextProbePath(app, agentHasUpstreamProps)
+	if strings.TrimSpace(app.ContextProbePath) == "" && !runtimeSpecTypeServesProps(EffectiveRuntimeSpecType(spec)) {
+		return ""
+	}
+	return p
+}
+
+// runtimeSpecTypeServesProps reports whether a server of type t may answer a
+// GET /props. It is false for every type known to serve none: vllm, tgi,
+// ollama, vllm_sr and sglang read their context size from another path
+// (DeriveProbePaths), and stable_diffusion_cpp, audio_cpp and sglang_omni
+// have no context size to read. llama_cpp serves /props; custom stays true
+// because it is the detection fallback and may be a llama-server under
+// another name; an unknown value stays true, as before this check existed.
+func runtimeSpecTypeServesProps(t RuntimeSpecType) bool {
+	switch t {
+	case RuntimeSpecTypeVLLM, RuntimeSpecTypeTGI, RuntimeSpecTypeOllama,
+		RuntimeSpecTypeStableDiffusionCpp, RuntimeSpecTypeAudioCpp,
+		RuntimeSpecTypeVllmSR, RuntimeSpecTypeSGLang, RuntimeSpecTypeSGLangOmni:
+		return false
+	default:
+		return true
+	}
 }

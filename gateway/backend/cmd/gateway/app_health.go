@@ -2443,8 +2443,10 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 			// the router's GET-only /props passthrough per loaded mapping, but
 			// only when its agent declared the route: an agent without it
 			// would 404 every probe. An operator-set ContextProbePath always
-			// wins.
-			probePath := routing.EffectiveContextProbePath(app, hasAgentFeature(r.agents, server.ID, gateway.RuntimeUpstreamPropsFeature))
+			// wins. The per-mapping loop below further skips a mapping whose
+			// spec type serves no /props (routing.EffectiveMappingContextProbePath).
+			upstreamProps := hasAgentFeature(r.agents, server.ID, gateway.RuntimeUpstreamPropsFeature)
+			probePath := routing.EffectiveContextProbePath(app, upstreamProps)
 			if !hasCtxProber || probePath == "" {
 				continue
 			}
@@ -2526,6 +2528,15 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 						}
 						if _, ok := loadedSet[mp.AppModelName]; !ok {
 							continue // only probe genuinely-loaded models
+						}
+						// The router default reaches the child's /props whatever
+						// the child is; a spec type that serves none (sglang_omni,
+						// sglang, vllm_sr, audio_cpp, ...) would answer 404 twice
+						// per tick (probe + retry) and yield nothing, so it is not
+						// asked. A spec read error left specByMapping empty: the
+						// zero spec detects as custom, which still probes.
+						if routing.EffectiveMappingContextProbePath(app, specByMapping[mp.ID], upstreamProps) == "" {
+							continue
 						}
 						// Per-mapping credential (issue #58): SpecUpstreamAuth
 						// resolves mode off/set/random/app against this mapping's

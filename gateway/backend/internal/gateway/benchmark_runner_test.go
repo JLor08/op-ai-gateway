@@ -1227,6 +1227,53 @@ func TestMeasureSpeedTargetContextProbeUsesSpecToken(t *testing.T) {
 	}
 }
 
+// TestBenchmarkProbeContextSizeSkipsRouterPropsForTypesWithoutProps: the
+// speed run's context probe sends the router default only for a spec type that
+// may serve /props (llama_cpp, custom); a type that serves none is not asked
+// and the size comes from the telemetry fallback. An operator-set path is
+// still probed for every type.
+func TestBenchmarkProbeContextSizeSkipsRouterPropsForTypesWithoutProps(t *testing.T) {
+	cases := []struct {
+		specType  string
+		wantProbe bool
+	}{
+		{"llama_cpp", true},
+		{"custom", true},
+		{"", true},
+		{"sglang_omni", false},
+		{"sglang", false},
+		{"vllm_sr", false},
+		{"vllm", false},
+		{"tgi", false},
+		{"ollama", false},
+		{"audio_cpp", false},
+		{"stable_diffusion_cpp", false},
+	}
+	for _, tc := range cases {
+		t.Run("type "+tc.specType, func(t *testing.T) {
+			for _, override := range []string{"", "/custom/{model}/info"} {
+				fake := &benchProbingProvider{probeName: "up-model", probeContext: 8192}
+				srv := &Server{Provider: fake, AgentFeatures: NewAgentFeaturesRegistry()}
+				srv.AgentFeatures.Set("srv1", []string{RuntimeUpstreamPropsFeature})
+				tgt := benchServerAgentTarget()
+				tgt.spec.Type = tc.specType
+				tgt.app.ContextProbePath = override
+				size := srv.benchmarkProbeContextSize(context.Background(), tgt, contextDirect)
+				want := tc.wantProbe || override != ""
+				if got := fake.probedPath != ""; got != want {
+					t.Fatalf("override %q: probed = %v (path %q), want %v", override, got, fake.probedPath, want)
+				}
+				if want && size != 8192 {
+					t.Fatalf("override %q: size = %d, want 8192", override, size)
+				}
+				if !want && size != 0 {
+					t.Fatalf("override %q: size = %d, want 0", override, size)
+				}
+			}
+		})
+	}
+}
+
 // TestBenchmarkSpecForServerAgentWithSpec: benchmarkSpecFor (the model
 // warmer's spec read; every other construction site hands benchmarkTargetFor
 // the spec it read) loads the stored spec for a server_agent mapping.

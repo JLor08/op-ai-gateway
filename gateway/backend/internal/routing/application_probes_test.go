@@ -110,3 +110,52 @@ func TestEffectiveProbes(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveMappingContextProbePath pins which effective spec types keep
+// the router's /props default: llama_cpp and custom (the detection fallback,
+// which may be a llama-server under another name) still probe, every type
+// known to serve no /props does not, and an operator-set path wins for all.
+func TestEffectiveMappingContextProbePath(t *testing.T) {
+	agent := Application{Type: ProviderServerAgent}
+	overridden := Application{Type: ProviderServerAgent, ContextProbePath: " /custom/{model} "}
+	cases := []struct {
+		name string
+		spec RuntimeSpec
+		want string
+	}{
+		{"explicit llama_cpp", RuntimeSpec{Type: "llama_cpp"}, "/upstream/{model}/props"},
+		{"detected llama_cpp", RuntimeSpec{Binary: "/opt/llama.cpp/llama-server"}, "/upstream/{model}/props"},
+		{"explicit custom", RuntimeSpec{Type: "custom", Binary: "/opt/sglang/bin/python"}, "/upstream/{model}/props"},
+		{"detected custom", RuntimeSpec{Binary: "/usr/local/bin/my-server"}, "/upstream/{model}/props"},
+		{"zero spec detects custom", RuntimeSpec{}, "/upstream/{model}/props"},
+		{"unknown type", RuntimeSpec{Type: "future_kind"}, "/upstream/{model}/props"},
+		{"explicit sglang_omni", RuntimeSpec{Type: "sglang_omni"}, ""},
+		{"detected sglang_omni", RuntimeSpec{Binary: "/opt/sglang-omni/bin/sgl-omni"}, ""},
+		{"sglang with --model-type omni", RuntimeSpec{Binary: "/opt/sglang/bin/sglang", Args: `["serve","--model-type","omni"]`}, ""},
+		{"explicit sglang", RuntimeSpec{Type: "sglang"}, ""},
+		{"detected sglang", RuntimeSpec{Binary: "/opt/sglang/bin/sglang"}, ""},
+		{"explicit vllm_sr", RuntimeSpec{Type: "vllm_sr"}, ""},
+		{"detected vllm_sr", RuntimeSpec{Binary: "/opt/sr/vllm-srun"}, ""},
+		{"explicit vllm", RuntimeSpec{Type: "vllm"}, ""},
+		{"explicit tgi", RuntimeSpec{Type: "tgi"}, ""},
+		{"explicit ollama", RuntimeSpec{Type: "ollama"}, ""},
+		{"detected ollama", RuntimeSpec{Binary: "/usr/bin/ollama"}, ""},
+		{"explicit stable_diffusion_cpp", RuntimeSpec{Type: "stable_diffusion_cpp"}, ""},
+		{"detected stable_diffusion_cpp", RuntimeSpec{Binary: "/opt/sd/sd-server"}, ""},
+		{"explicit audio_cpp", RuntimeSpec{Type: "audio_cpp"}, ""},
+		{"detected audio_cpp", RuntimeSpec{Binary: "/opt/audio/audiocpp_server"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffectiveMappingContextProbePath(agent, tc.spec, true); got != tc.want {
+				t.Fatalf("router default: got %q, want %q", got, tc.want)
+			}
+			if got := EffectiveMappingContextProbePath(agent, tc.spec, false); got != "" {
+				t.Fatalf("agent without runtime_upstream_props: got %q, want \"\"", got)
+			}
+			if got := EffectiveMappingContextProbePath(overridden, tc.spec, true); got != "/custom/{model}" {
+				t.Fatalf("operator-set path: got %q, want %q", got, "/custom/{model}")
+			}
+		})
+	}
+}
