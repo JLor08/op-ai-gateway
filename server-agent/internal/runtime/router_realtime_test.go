@@ -905,6 +905,36 @@ func TestRouterRealtimeDialFailureIs502BeforeUpgrade(t *testing.T) {
 	rig.assertReleasedOnce(t)
 }
 
+// TestRouterRealtimeDialErrorNamesNoQuery: a child that cannot be reached at all
+// (the transport fails before any handshake) is a 502 whose message names the
+// endpoint and path but never the client's query, which the transport's own
+// *url.Error would carry.
+func TestRouterRealtimeDialErrorNamesNoQuery(t *testing.T) {
+	gone := httptest.NewServer(http.NotFoundHandler())
+	endpoint := gone.URL
+	gone.Close() // nothing listens any more: connection refused
+	rig := newRealtimeRig(t, map[string]string{"m": endpoint}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), realtimeWait)
+	defer cancel()
+	c, resp, err := websocket.Dial(ctx, wsURL(rig.srv, "/realtime/m")+"?api_key=s3cr3t-query", nil)
+	if err == nil {
+		_ = c.CloseNow()
+		t.Fatal("the upgrade succeeded against an unreachable child")
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("response = %v, want an HTTP 502 (err %v)", resp, err)
+	}
+	got := decodeRouterError(t, resp.Body)
+	if strings.Contains(got.Message, "s3cr3t-query") || strings.Contains(got.Message, "?") {
+		t.Errorf("error message %q names the query", got.Message)
+	}
+	if !strings.Contains(got.Message, endpoint+realtimeChildPath) {
+		t.Errorf("error message %q does not name the endpoint and path", got.Message)
+	}
+	rig.assertReleasedOnce(t)
+}
+
 // TestRouterRealtimeRefusals: a request that is not a WebSocket handshake is
 // 400 runtime.realtime_upgrade_required before anything is admitted, and an
 // unknown model is the 404 runtime.model_not_managed /live answers.

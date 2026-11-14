@@ -337,7 +337,15 @@ func (rt *router) dialRealtimeChild(ctx context.Context, endpoint string, r *htt
 		if resp != nil {
 			return nil, fmt.Errorf("runtime: the child answered the realtime handshake with %d: %w", resp.StatusCode, err)
 		}
-		return nil, fmt.Errorf("runtime: dial the child's realtime endpoint: %w", err)
+		// The transport's own error names the URL it dialed, query included, and
+		// the query is the client's: only the endpoint and path are named, so the
+		// message (the 502 body, and the gateway's Warn log of it) stays free of
+		// it and under coder/websocket's readable error-body limit.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return nil, fmt.Errorf("runtime: dial the child's realtime endpoint %s: %v", endpoint+realtimeChildPath, err)
 	}
 	conn.SetReadLimit(realtimeMessageLimit)
 	return conn, nil
