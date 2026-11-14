@@ -404,7 +404,7 @@ func (s *Server) serveRealtimeSession(w http.ResponseWriter, r *http.Request, to
 	// Until the session says otherwise, it failed; a panic below is recorded so.
 	out := realtimeOutcome{httpStatus: http.StatusBadGateway, status: "error", errorCode: provider.ErrUnavailable.Error()}
 	defer func() {
-		s.recordRealtimeUsage(start, id, r, token, req, target, out, &meter)
+		s.recordRealtimeUsage(start, id, r, token, req, target, realtimeSessionEnd{outcome: out, meter: &meter})
 		s.Active.Remove(id)
 	}()
 
@@ -488,9 +488,10 @@ func (rs *realtimeSessionSet) wait(bound time.Duration) bool {
 // http.Server.Shutdown does not track a hijacked connection, so without it the
 // process could exit before a session has sent its 1001 close and written its usage
 // row. It refuses new sessions (503 realtime.shutting_down), waits at most bound,
-// and reports whether every session finished in time. A session whose peer does not
-// answer its close handshake can outlast a short bound (coder/websocket allows the
-// handshake 5 s each way); that session's row is then lost with the process.
+// and reports whether every session finished in time. The bound (6 s) exceeds
+// coder/websocket's 5 s close wait, so only a peer frozen in the middle of a frame
+// during the close handshake can outlast it; that session's row is then lost with
+// the process.
 func (s *Server) WaitRealtimeSessions(bound time.Duration) bool {
 	return s.realtimeSessions.wait(bound)
 }
@@ -520,6 +521,13 @@ func realtimeOutcomeOf(end realtimeEnd) realtimeOutcome {
 	return out
 }
 
+// realtimeSessionEnd is what a finished session hands recordRealtimeUsage: how it
+// ended and what it metered.
+type realtimeSessionEnd struct {
+	outcome realtimeOutcome
+	meter   *realtimeMeter
+}
+
 // recordRealtimeUsage records a session's one usage row. Its measure, by the billing
 // XOR (usage.ValidateBillingXOR), is exactly one of:
 //   - audio seconds, when the client appended any audio: its decoded bytes over
@@ -535,7 +543,8 @@ func realtimeOutcomeOf(end realtimeEnd) realtimeOutcome {
 // transcription pass that is never billed, so token precedence would let a key holder
 // get free ASR after one normal turn. Every sglang-omni flavor takes audio input, so a
 // session with appends is an audio session.
-func (s *Server) recordRealtimeUsage(start time.Time, id string, r *http.Request, token auth.Token, req inference.Request, target routing.Target, out realtimeOutcome, meter *realtimeMeter) {
+func (s *Server) recordRealtimeUsage(start time.Time, id string, r *http.Request, token auth.Token, req inference.Request, target routing.Target, end realtimeSessionEnd) {
+	out, meter := end.outcome, end.meter
 	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: out.httpStatus, Endpoint: endpointRealtime}
 	if !out.upgraded {
 		meta.ContentType = jsonContentType
