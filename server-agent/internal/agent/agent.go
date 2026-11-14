@@ -434,7 +434,14 @@ import (
 // series of each dp_rank group, summed over the groups) feed queue_depth and
 // active, its context size is read from /v1/models data[].max_model_len (else the
 // best-effort scan), and the /props capability probe is skipped for both types.
-const Version = "0.19.2"
+//
+// 0.19.2 -> 0.20.0 is the single bump for the /v1/realtime WebSocket relay
+// (#395 Phase 3). MINOR: agent.Features gains the realtime_proxy entry, and the
+// runtime router serves a new route, GET /realtime/{model}, which relays a
+// WebSocket to a managed child's /v1/realtime and holds the spec admitted for
+// the session. This is the ONE bump for the whole branch; later commits on it
+// do not bump again.
+const Version = "0.20.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

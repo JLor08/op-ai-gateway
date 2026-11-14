@@ -615,8 +615,8 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.19.2" {
-		t.Fatalf("Version = %q, want 0.19.2 (the sglang PATCH bump; runtime_stop keeps Since 0.17.0)", Version)
+	if Version != "0.20.0" {
+		t.Fatalf("Version = %q, want 0.20.0 (the realtime_proxy MINOR bump; runtime_stop keeps Since 0.17.0)", Version)
 	}
 }
 
@@ -639,8 +639,8 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.19.2" {
-		t.Fatalf("Version = %q, want 0.19.2 (the sglang PATCH bump: rpc_cluster keeps Since 0.18.0)", Version)
+	if Version != "0.20.0" {
+		t.Fatalf("Version = %q, want 0.20.0 (the realtime_proxy MINOR bump: rpc_cluster keeps Since 0.18.0)", Version)
 	}
 }
 
@@ -662,5 +662,41 @@ func TestFeaturesDeclareRuntimeExecWSL(t *testing.T) {
 	}
 	if !slices.Contains(FeatureNames(), "runtime_exec_wsl") {
 		t.Fatal("FeatureNames() does not carry runtime_exec_wsl")
+	}
+}
+
+// TestFeaturesDeclareRealtimeProxy pins the realtime relay capability and the
+// version bump it brought. This agent's runtime router serves GET
+// /realtime/{model}, a WebSocket relay to a managed child's /v1/realtime that
+// holds the spec admitted for the whole session. The GATEWAY dials it only on
+// an agent that declares this exact name, fail-closed: a router without the
+// route hands the bodiless upgrade to the model-routed proxy, which answers 404
+// runtime.model_not_managed -- the same answer as an unmanaged model -- so only
+// the declaration tells the two apart. The gateway spells the same string in its
+// own constant; this module cannot import it.
+//
+// 0.20.0 is MINOR because agent.Features gained realtime_proxy -- the one bump
+// for the realtime branch (#395 Phase 3), whatever its commit count.
+func TestFeaturesDeclareRealtimeProxy(t *testing.T) {
+	if FeatureRealtimeProxy != "realtime_proxy" {
+		t.Fatalf("FeatureRealtimeProxy = %q, want the wire literal realtime_proxy", FeatureRealtimeProxy)
+	}
+	found := false
+	for _, f := range Features {
+		if f.Name == "realtime_proxy" {
+			found = true
+			if f.Since != "0.20.0" {
+				t.Fatalf("realtime_proxy Since = %q, want 0.20.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare realtime_proxy")
+	}
+	if !slices.Contains(FeatureNames(), "realtime_proxy") {
+		t.Fatal("FeatureNames() does not carry realtime_proxy, so it never reaches the gateway in capabilities.features")
+	}
+	if Version != "0.20.0" {
+		t.Fatalf("Version = %q, want 0.20.0 (MINOR: agent.Features gained realtime_proxy)", Version)
 	}
 }

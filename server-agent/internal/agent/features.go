@@ -378,6 +378,22 @@ var Features = []Feature{
 	//
 	// Since is 0.19.0: agent.Features gains an entry, so the rule is a MINOR bump.
 	{Name: FeatureRuntimeExecWSL, Since: "0.19.0"},
+
+	// realtime_proxy: the runtime router serves GET /realtime/{model}, a
+	// WebSocket relay to a managed child's /v1/realtime (sglang-omni with
+	// --enable-realtime) that holds the spec admitted for the whole session and
+	// ends it on an idle timeout, a message over 4 MiB, or the router closing.
+	//
+	// Like fullduplex_proxy, this flag gates nothing on the agent -- the route
+	// is simply there or not -- and is declared for the GATEWAY's benefit, which
+	// dials the route only on an agent that declares this name, fail-closed. A
+	// router without the route hands the bodiless upgrade to the model-routed
+	// proxy, which answers 404 runtime.model_not_managed, the same answer as an
+	// unmanaged model, so only the declaration tells the two apart. The gateway
+	// spells the same string in its own constant; this module cannot import it.
+	//
+	// Since is 0.20.0: agent.Features gains an entry, so the rule is a MINOR bump.
+	{Name: FeatureRealtimeProxy, Since: "0.20.0"},
 }
 
 // FeatureRuntimeInstances names the runtime_instances feature (see its registry
@@ -395,6 +411,10 @@ const FeatureRPCCluster = "rpc_cluster"
 // FeatureRuntimeExecWSL names the runtime_exec_wsl feature (see its registry
 // entry above): specs that run inside a WSL2 distribution.
 const FeatureRuntimeExecWSL = "runtime_exec_wsl"
+
+// FeatureRealtimeProxy names the realtime_proxy feature (see its registry entry
+// above): the router serves GET /realtime/{model}, a WebSocket relay.
+const FeatureRealtimeProxy = "realtime_proxy"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {
