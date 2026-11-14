@@ -2284,7 +2284,7 @@ adapter.
      bare literals `NaN`, `Infinity` and `-Infinity` are tolerated as Python's `json` does. The count can only
      over-count, never under-count;
    - otherwise a **logged zero** (`audio_second` 0 with an `Error` log line).
-   A close code of 1000, 1001 or 1005 is a `success`; any other code is the error `realtime.close_<code>`. A
+   A close code of 1000, 1001 or 1005 is a `success`; any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded. A
    request refused before a target is chosen records no row, as the live bearer endpoint's gate does.
 7. **Residuals.** A gone instance `m#k` with k ≥ 1 is not re-selected on the dial. A peer that never answers a
    1001 can hold its session about 5 s past the 2 s shutdown bound, so its row may be lost at exit. A peer that

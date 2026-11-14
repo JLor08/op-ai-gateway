@@ -12733,7 +12733,7 @@ budget gate, the usage row, and a model that the agent starts and keeps admitted
   Without any usage object the row is `audio_second`, computed from the client's `input_audio_buffer.append` frames as base64 alphabet
   characters × 3/4 ÷ 32000, read as the upstream reads a frame: keys matched exactly, the last duplicate wins, `NaN` and `Infinity`
   tolerated as Python's `json` does. The count can only over-count. Without audio the row is a logged zero. `http_status` is 101; the close
-  codes 1000, 1001 and 1005 are a success and any other code is the error `realtime.close_<code>`.
+  codes 1000, 1001 and 1005 are a success and any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded.
 - **Capability `realtime`.** Manual verdicts only (`routing.CapabilityRealtime`): no probe states it, and the agent ingest drops it. The
   portal's mapping form labels it "Realtime (WebSocket)", and the `sglang_omni` type note names `--enable-realtime`.
 - **nginx.** Exact-match locations for `/v1/realtime` and `/openai/v1/realtime` in all three deployable configurations (the two compose variants, which share
