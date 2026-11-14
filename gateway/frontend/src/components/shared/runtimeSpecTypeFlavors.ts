@@ -62,9 +62,11 @@ export const sglangOmniSpecFlavorDefaults: RuntimeSpecFlavorValues = {
 };
 
 /**
- * The spec kinds whose Type switch defaults the API-variant block: each serves
- * one non-text API only, so the stock text flavors would make it a text
- * candidate. Every other kind has no entry and defaults nothing.
+ * The spec kinds whose Type switch defaults the API-variant block: kinds the
+ * stock flavors and modes misdescribe. sd-server, audio.cpp and vllm-srun each
+ * serve one non-text API only, so the stock text flavors would make them a text
+ * candidate; sglang-omni serves chat and audio but neither coding-agent route.
+ * Every other kind has no entry and defaults nothing.
  */
 const specTypeFlavorDefaults: Partial<Record<RuntimeSpec['type'], RuntimeSpecFlavorValues>> = {
   stable_diffusion_cpp: stableDiffusionSpecFlavorDefaults,
@@ -201,14 +203,15 @@ export type RuntimeSpecTypeSwitchResult = {
 /**
  * The API-variant block after the Type select changes, or null when the
  * values stay as they are. Only values the operator has not changed move,
- * judged against the parent template and the kinds' defaults (the sd and the
- * audio one, specTypeFlavorDefaults) rather than against a touched flag, so
- * the rule holds on Create and on Edit alike.
+ * judged against the parent template and the kinds' defaults
+ * (specTypeFlavorDefaults: stable_diffusion_cpp, audio_cpp, vllm_sr and
+ * sglang_omni) rather than against a touched flag, so the rule holds on Create
+ * and on Edit alike.
  *
- * - To a defaulting kind (stable_diffusion_cpp, audio_cpp) from the kind's
- *   own default values (the hop between the two kinds): the new default
- *   replaces them, and the remembered values stay what they were, since the
- *   operator's own are the ones before the first default.
+ * - To a defaulting kind from another defaulting kind's own default values (a
+ *   hop between two such kinds): the new default replaces them, and the
+ *   remembered values stay what they were, since the operator's own are the
+ *   ones before the first default.
  * - To a defaulting kind otherwise, with the flavors equal to the template's
  *   (order-insensitive): the kind's default replaces the values, and the
  *   current values are remembered.
@@ -216,8 +219,9 @@ export type RuntimeSpecTypeSwitchResult = {
  *   values still exactly that kind's default: the remembered values come
  *   back, or the template when nothing is remembered (a spec loaded as that
  *   kind).
- * - To Auto nothing moves: an Auto spec whose binary is an sd-server or an
- *   audiocpp_server is still that kind, the same rule as the health path's.
+ * - To Auto nothing moves: an Auto spec whose binary is one of these kinds
+ *   (an sd-server, an audiocpp_server, a vllm-srun, an sglang-omni) is still
+ *   that kind, the same rule as the health path's.
  */
 export function specFlavorsAfterTypeSwitch(
   change: RuntimeSpecTypeSwitch,

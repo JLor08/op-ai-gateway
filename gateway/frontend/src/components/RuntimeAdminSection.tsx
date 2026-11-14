@@ -754,9 +754,9 @@ function runtimeSpecHealthPathDefault(type: RuntimeSpec['type']): string {
   return type === 'stable_diffusion_cpp' ? '/v1/models' : '/health';
 }
 
-// The Type select's helper text: the note of a kind whose defaults diverge
-// from the stock text server's (sd-server and audio.cpp each serve one non-text
-// API), nothing for every other kind, Auto included.
+// The Type select's helper text: the note of a kind with something the operator
+// must know to launch or route it (sd-server, audio.cpp, vllm-srun, SGLang and
+// sglang-omni), nothing for every other kind, Auto included.
 function runtimeSpecTypeNote(type: RuntimeSpec['type'], t: Translation): string | undefined {
   if (type === 'stable_diffusion_cpp') return t.runtimeSpecTypeStableDiffusionCppNote;
   if (type === 'audio_cpp') return t.runtimeSpecTypeAudioCppNote;

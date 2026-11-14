@@ -4757,6 +4757,18 @@ describe('sglang i18n keys', () => {
       expect(messages[locale].runtimeSpecTypeSglangNote).toContain('--mem-fraction-static');
       expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('--model-path ${MODEL}');
       expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('data:');
+      // The sglang note names the --api-key cost to the context probe, the image
+      // references the gateway accepts, and the passthrough residual.
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('/v1/models');
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('https://');
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('/v1/messages');
+      // The sglang_omni note names the parent's audio flavor and the chat audio the
+      // gateway does not relay.
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('openai_audio');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('server_agent');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('input_audio');
     }
+    expect(messages.de.runtimeSpecTypeSglangNote).toContain('„Umwandlung“');
+    expect(messages.en.runtimeSpecTypeSglangNote).toContain('Translate');
   });
 });

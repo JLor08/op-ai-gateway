@@ -313,9 +313,11 @@ export interface RuntimeSpec {
   // and that is load-bearing -- see PutRuntimeSpecRequest.
   responses_live_timings_enabled: boolean;
   // Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
-  // "tgi" | "ollama" | "stable_diffusion_cpp" | "audio_cpp" | "vllm_sr" | "sglang" | "sglang_omni" | "custom"); "" means
-  // auto-detect from `binary` -- `effective_type` below is what that
-  // resolves to. Mirrors the Go RuntimeSpecDTO.Type / routing.RuntimeSpec.Type.
+  // "tgi" | "ollama" | "stable_diffusion_cpp" | "audio_cpp" | "vllm_sr" |
+  // "sglang" | "sglang_omni" | "custom"); "" means auto-detect from `binary`
+  // (and, for an sglang binary, its args) -- `effective_type` below is what
+  // that resolves to. Mirrors the Go RuntimeSpecDTO.Type /
+  // routing.RuntimeSpec.Type.
   type:
     | ''
     | 'vllm'
