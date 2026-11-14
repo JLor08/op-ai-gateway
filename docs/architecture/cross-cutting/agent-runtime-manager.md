@@ -2460,10 +2460,17 @@ host index 1 and not on index 2. Secrets in `env` travel through `WSLENV` and st
 out of the argv, which `ps` inside the VM would show.
 
 **Port, health and config files.** `${PORT}` is chosen on the Windows side, as
-always, and the workload binds `127.0.0.1:${PORT}` inside the VM; WSL's localhost
-forwarding (NAT mode, the default) or mirrored networking makes it reachable from
-Windows, so the router and the 500 ms health poll work unchanged (the forwarder
-scans for new listeners about once a second). Config files are written on the
+always, and the workload binds `127.0.0.1:${PORT}` inside the VM. The router and
+the 500 ms health poll reach it from Windows at `127.0.0.1:${PORT}`, which needs
+**mirrored networking** (`[wsl2]` `networkingMode=mirrored` in the Windows user's
+`%UserProfile%\.wslconfig`, then `wsl --shutdown`); the operator setup requires it.
+WSL's localhost forwarding in NAT mode (the default) was not reliable for a
+`127.0.0.1` listener in a live test (WSL 3.0.5, Windows build 26300): Windows got
+"connection refused" while the same request inside the distro got 200, so the
+health poll timed out and the instance never left `starting`. With mirrored
+networking the same setup answered from Windows. **A WSL spec that stays in
+`starting` until `startup_timeout_seconds` elapses (`runtime.start_timeout`) while
+its runtime log shows the server listening is this symptom.** Config files are written on the
 Windows side as always (§3.5), and `${CONFIG_DIR}` expands to that directory's
 `/mnt/<drive>/…` path inside the distro; a UNC base directory, or one whose `..`
 climbs above its drive's root, is a placeholder error and so `not_permitted`. Its
