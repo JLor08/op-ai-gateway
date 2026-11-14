@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/portal"
+	"op-ai-gateway/internal/routing"
 )
 
 // gatewayAgentFeatures is the gateway's declared feature set for agents
@@ -283,6 +284,41 @@ const multipartProxyFeature = "multipart_proxy"
 // string in its own registry (server-agent/internal/agent/features.go). The two
 // spellings must stay equal; TestFullduplexProxyFeatureName pins this side.
 const fullduplexProxyFeature = "fullduplex_proxy"
+
+// realtimeProxyFeature is the agent-declared capability meaning: this agent's
+// runtime router relays a WebSocket upgrade to the child it keys on the model in
+// the path -- its GET /realtime/{model} route, the native route behind the
+// gateway's /v1/realtime. Like fullduplexProxyFeature it is on the agent's list
+// only, not on gatewayAgentFeatures, and the GATEWAY gates real behavior on it,
+// fail-closed (realtimeTargetServed). Trying the route instead cannot work: a
+// router without it answers 404 for /realtime/{model}, the same status it
+// answers an unmanaged model with, so the failure could not be told from an
+// unknown model.
+//
+// The agent module cannot import this package, so the agent names the identical
+// string in its own registry (server-agent/internal/agent/features.go). The two
+// spellings must stay equal; TestRealtimeProxyFeatureName pins this side.
+const realtimeProxyFeature = "realtime_proxy"
+
+// realtimeTargetServed reports whether target may serve a realtime session. Only
+// an agent-launched (server_agent) target can: the WebSocket is relayed through
+// the agent's runtime router, whose /realtime/{model} route exists only in an
+// agent that has DECLARED realtime_proxy. AgentFeatures.Has is false for a server
+// that has never reported (a gateway restart empties the registry until the next
+// telemetry sample), for one whose last sample lacked the name, and for a nil
+// registry, so the answer fails closed.
+//
+// Unlike transcriptionTargetServed and liveTranscriptionTargetServed, every other
+// provider is NOT served: there is no direct realtime dial, so a target that is
+// not behind an agent has no way to reach the model. The /v1/realtime handler
+// calls this once the resolver has returned a target (the resolver already
+// enforced openai_audio and the realtime:yes row).
+func (s *Server) realtimeTargetServed(target routing.Target) bool {
+	if target.Provider != routing.ProviderServerAgent {
+		return false
+	}
+	return s.AgentFeatures.Has(target.ServerID, realtimeProxyFeature)
+}
 
 // agentFeaturesDTO is the GET /api/agent/v1/features response body. Unlike
 // AgentProxyRoutesDTO/AgentRuntimeConfigDTO, the etag is carried ONLY in the

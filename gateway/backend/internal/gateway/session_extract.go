@@ -34,6 +34,7 @@ const (
 	endpointTranscriptionDetails                        // /v1/audio/transcriptions/details (OpenAI speech-to-text with speaker turns, multipart, one-shot)
 	endpointSystemOne                                   // /v1/systemone (System One decisions)
 	endpointDecisions                                   // /v1/decisions (OpenAI Decisions)
+	endpointRealtime                                    // /v1/realtime (OpenAI Realtime WebSocket; openai_audio flavor family)
 )
 
 // sessionInfo is the extractor result. ExplicitHeader is the raw
@@ -97,6 +98,9 @@ func extractClientSession(h http.Header, raw []byte, endpoint sessionEndpoint) s
 		// /v1/systemone and /v1/decisions have no per-endpoint header signal
 		// either; see the fuller comment on sessionFromBody's decisions case
 		// below.
+	case endpointRealtime:
+		// /v1/realtime is a WebSocket upgrade: no body to read and no per-endpoint
+		// header signal; the explicit session header (step 1) still applies.
 	case endpointTranscription, endpointTranscriptionDetails:
 		// /v1/audio/transcriptions and its one-shot diarized twin
 		// /v1/audio/transcriptions/details have no per-endpoint header signal
@@ -176,6 +180,9 @@ func sessionFromBody(raw []byte, endpoint sessionEndpoint) (id, source string) {
 		// translate route drops it, ADR-098), not a conversation: a decision is
 		// a one-shot verdict like a System One one. The explicit session header
 		// (step 1 of extractClientSession) still applies.
+	case endpointRealtime:
+		// /v1/realtime has no request body at all (a WebSocket upgrade), so there
+		// is no body signal to read.
 	case endpointTranscription, endpointTranscriptionDetails:
 		// /v1/audio/transcriptions (and its /details twin, which takes the same
 		// form) carries no session signal: OpenAI's
