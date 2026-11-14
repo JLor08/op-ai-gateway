@@ -15,6 +15,8 @@ import (
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 	"strings"
+
+	"github.com/coder/websocket"
 )
 
 // maxToolArgumentsBytes bounds the per-tool-call streamed argument accumulation.
@@ -502,6 +504,14 @@ var _ NativeDuplexProxyClient = (*OpenAICompatibleClient)(nil)
 // NativeDuplexProxyClient for the body-ownership and timeout contract.
 func (c *OpenAICompatibleClient) ProxyNativeDuplex(ctx context.Context, target routing.Target, path string, body io.Reader, contentType string) (*ProxyResponse, error) {
 	return doNativeDuplexProxy(ctx, c.http, target, path, body, contentType)
+}
+
+var _ NativeWebSocketDialer = (*OpenAICompatibleClient)(nil)
+
+// DialWebSocket dials a WebSocket on the upstream through this client's transport. See
+// NativeWebSocketDialer.
+func (c *OpenAICompatibleClient) DialWebSocket(ctx context.Context, target routing.Target, path, rawQuery string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	return dialNativeWebSocket(ctx, c.http, target, path, rawQuery, header)
 }
 
 var _ StreamingClient = (*OpenAICompatibleClient)(nil)

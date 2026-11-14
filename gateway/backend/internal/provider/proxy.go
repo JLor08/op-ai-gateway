@@ -10,7 +10,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"op-ai-gateway/internal/routing"
+	"strings"
+
+	"github.com/coder/websocket"
 )
 
 // ProxyResponse is the upstream's raw HTTP response for a native-passthrough
@@ -64,6 +68,46 @@ type NativeProxyClient interface {
 // contract, not something this client can force.
 type NativeDuplexProxyClient interface {
 	ProxyNativeDuplex(ctx context.Context, target routing.Target, path string, body io.Reader, contentType string) (*ProxyResponse, error)
+}
+
+// NativeWebSocketDialer is the optional capability of dialing a WebSocket on the
+// upstream's own endpoint path: the gateway's /v1/realtime relay dials the agent
+// router's GET /realtime/{model} through it and pumps messages between that socket and
+// the client's.
+//
+// Like NativeDuplexProxyClient it is a separate interface, reached by type assertion:
+// only the client that talks to an OpenAI-compatible upstream (here the server agent's
+// runtime router) dials one, and a client without it is "WebSocket not supported".
+//
+// DialWebSocket dials endpointURL(target.Endpoint, path), with "?"+rawQuery when
+// rawQuery is not empty, and returns the open socket with the handshake response.
+//
+//   - It applies no timeout of its own (the session outlives any): ctx bounds the
+//     handshake only, and canceling it once the socket is open does not close it.
+//   - It follows no redirect.
+//   - header is sent with the handshake minus Origin, every Sec-WebSocket-* field and
+//     the client credentials (Authorization, Cookie): the gateway, not a browser, is
+//     the upstream's client (an Origin naming another host fails the agent's origin
+//     check), coder/websocket writes the handshake's own fields, and neither a
+//     client's subprotocol offer -- which may carry its API key -- nor its bearer is
+//     ever forwarded. The per-app upstream credential and its static extra headers
+//     are then applied from ctx exactly as on every other upstream call
+//     (applyUpstreamAuth).
+//   - The upgrade stays on HTTP/1.1 over any transport, HTTP/2-capable ones included:
+//     net/http never sends a request carrying "Connection: Upgrade" and
+//     "Upgrade: websocket" over HTTP/2 (the request requires HTTP/1).
+//   - A refused handshake is an error built as a chat completion's refusal is
+//     (chatStatusError): an agent router's answer becomes a RouterError carrying its
+//     status and code, any other upstream's non-101 answer ErrUnavailable (or its
+//     ErrUpstreamStarting / ErrAuthRejected subset) with the status; the response is
+//     returned too, its body bounded. A transport failure is ErrUnavailable with no
+//     response, or ErrTimeout when ctx's deadline ended the handshake. No error names
+//     the query, which is the client's.
+//
+// The returned socket's read limit is coder/websocket's default; the caller sets its
+// own.
+type NativeWebSocketDialer interface {
+	DialWebSocket(ctx context.Context, target routing.Target, path, rawQuery string, header http.Header) (*websocket.Conn, *http.Response, error)
 }
 
 // doNativeProxy POSTs body to endpointURL(target.Endpoint, path) with the given
@@ -146,4 +190,76 @@ func sendNativeProxy(ctx context.Context, httpClient *http.Client, httpReq *http
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	return &ProxyResponse{StatusCode: httpResp.StatusCode, Header: httpResp.Header, Body: httpResp.Body}, nil
+}
+
+// dialNativeWebSocket is DialWebSocket over httpClient's transport (the default
+// transport for a nil client or a nil Transport). The handshake runs on a client of its
+// own that shares only the transport: no Timeout, no cookie jar, and no redirects.
+func dialNativeWebSocket(ctx context.Context, httpClient *http.Client, target routing.Target, path, rawQuery string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	u := endpointURL(target.Endpoint, path)
+	if rawQuery != "" {
+		u += "?" + rawQuery
+	}
+	var transport http.RoundTripper
+	if httpClient != nil {
+		transport = httpClient.Transport
+	}
+	dialClient := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	conn, resp, err := websocket.Dial(ctx, u, &websocket.DialOptions{
+		HTTPClient: dialClient,
+		HTTPHeader: webSocketDialHeader(ctx, header),
+	})
+	if err == nil {
+		return conn, resp, nil
+	}
+	if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, resp, webSocketRefusal(target, resp)
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, resp, ErrTimeout
+	}
+	// The transport's own error names the URL it dialed, query included, and the
+	// query is the client's: only the endpoint and path are named here, so nothing
+	// a client put in its query reaches a log through this error.
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+	}
+	return nil, resp, fmt.Errorf("%w: websocket dial %s: %v", ErrUnavailable, endpointURL(target.Endpoint, path), err)
+}
+
+// webSocketDialHeader is the handshake header DialWebSocket sends: header without
+// Origin, the client credentials and the Sec-WebSocket-* fields, then the upstream
+// credential from ctx.
+func webSocketDialHeader(ctx context.Context, header http.Header) http.Header {
+	h := header.Clone()
+	if h == nil {
+		h = http.Header{}
+	}
+	for _, name := range []string{"Origin", "Authorization", "Cookie"} {
+		h.Del(name)
+	}
+	for name := range h {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "Sec-Websocket-") {
+			delete(h, name)
+		}
+	}
+	setUpstreamAuth(ctx, h)
+	return h
+}
+
+// webSocketRefusal is the error of a handshake the upstream answered with resp, not
+// 101. coder/websocket leaves at most the first KiB of the body readable, which holds
+// an agent router's one-line envelope.
+func webSocketRefusal(target routing.Target, resp *http.Response) error {
+	if target.Provider != routing.ProviderServerAgent || resp.Body == nil {
+		return unavailableStatus(resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, routerErrorBodyLimit))
+	return RouterStatusError(resp.StatusCode, body)
 }

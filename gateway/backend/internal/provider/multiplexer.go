@@ -7,12 +7,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/tracing"
 	"strings"
 	"time"
 
+	"github.com/coder/websocket"
 	"go.opentelemetry.io/otel/codes"
 )
 
@@ -186,6 +188,38 @@ func (m *Multiplexer) dispatchProxyNativeDuplex(ctx context.Context, target rout
 		return nil, fmt.Errorf("%w: duplex native proxy not supported for provider %q", ErrUnavailable, target.Provider)
 	}
 	return proxy.ProxyNativeDuplex(ctx, target, path, body, contentType)
+}
+
+var _ NativeWebSocketDialer = (*Multiplexer)(nil)
+
+// DialWebSocket routes a WebSocket dial to the provider's client. The capability is
+// OPTIONAL (NativeWebSocketDialer) and, like ProxyNativeDuplex, a miss is an error and
+// is never cross-routed to the fallback: the socket must reach the provider routing
+// resolved to. The span covers the handshake only; the session outlives it.
+func (m *Multiplexer) DialWebSocket(ctx context.Context, target routing.Target, path, rawQuery string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	ctx, span := tracing.Start(ctx, "provider.DialWebSocket")
+	defer span.End()
+	conn, resp, err := m.dispatchDialWebSocket(ctx, target, path, rawQuery, header)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return conn, resp, err
+}
+
+func (m *Multiplexer) dispatchDialWebSocket(ctx context.Context, target routing.Target, path, rawQuery string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	if m == nil {
+		return nil, nil, ErrUnavailable
+	}
+	client := m.clients[strings.TrimSpace(target.Provider)]
+	if client == nil {
+		client = m.fallback
+	}
+	dialer, ok := client.(NativeWebSocketDialer)
+	if !ok {
+		return nil, nil, fmt.Errorf("%w: websocket dial not supported for provider %q", ErrUnavailable, target.Provider)
+	}
+	return dialer.DialWebSocket(ctx, target, path, rawQuery, header)
 }
 
 func (m *Multiplexer) dispatchProxyNative(ctx context.Context, target routing.Target, path string, body []byte, contentType string) (*ProxyResponse, error) {
