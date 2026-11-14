@@ -454,6 +454,24 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         label: t.mappingTranscriptionCapable,
         hint: t.mappingTranscriptionCapableUnknownHint,
       },
+      // The refinements follow the same rules: audio.cpp's probe states them from
+      // its /v1/models mode and task, (x, no) is reserved for it, and a manual yes
+      // is the only enablement on an engine it does not reach (sglang_omni).
+      {
+        capability: 'speech_streaming',
+        label: t.mappingSpeechStreaming,
+        hint: t.mappingSpeechStreamingUnknownHint,
+      },
+      {
+        capability: 'transcription_streaming',
+        label: t.mappingTranscriptionStreaming,
+        hint: t.mappingTranscriptionStreamingUnknownHint,
+      },
+      {
+        capability: 'speech_clone',
+        label: t.mappingSpeechClone,
+        hint: t.mappingSpeechCloneHint,
+      },
     ] as const) {
       const { capability, label, hint } = control;
 
@@ -529,8 +547,45 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         expect(t.mappingSpeechCapableUnknownHint).not.toBe(
           t.mappingTranscriptionCapableUnknownHint,
         );
+        expect(t.mappingSpeechStreamingUnknownHint).not.toBe(
+          t.mappingTranscriptionStreamingUnknownHint,
+        );
+      });
+
+      it(`resets a manual ${capability} yes to unknown by sending the empty verdict`, async () => {
+        const { submitted } = renderForm({
+          row: makeMapping({ capabilities: [capRow(capability, 'yes')] }),
+        });
+        await pickOption(label, t.mappingCapabilityUnknown);
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ [capability]: '' });
+      });
+
+      it(`never sends a reserved ${capability} no, even after moving away from a stored one`, async () => {
+        // The probe's no is the only way the control can hold "no", and it is
+        // disabled; moving to yes overrides it, moving back to the disabled no is
+        // impossible, and an untouched no is never re-sent.
+        const { submitted } = renderForm({
+          row: makeMapping({ capabilities: [capRow(capability, 'no')] }),
+        });
+        await pickOption(label, t.mappingCapabilityYes);
+        await save();
+
+        await waitFor(() => expect(submitted).toHaveLength(1));
+        expect(submitted[0].capability_verdicts).toEqual({ [capability]: 'yes' });
       });
     }
+
+    it('keeps the speech_clone hint visible on a yes, because a yes hides the model from the chat', () => {
+      // speech_clone does NOT enable cloning: a yes marks a model that NEEDS a
+      // reference voice and the chat speech picker hides it (#252). That is the
+      // state the operator most needs explained, so the hint is not an unknown hint.
+      renderForm({ row: makeMapping({ capabilities: [capRow('speech_clone', 'yes')] }) });
+      expect(screen.getByText(t.mappingSpeechCloneHint)).toBeInTheDocument();
+      expect(t.mappingSpeechCloneHint).not.toBe(t.mappingSpeechCapableUnknownHint);
+    });
 
     // realtime gates GET /v1/realtime. Nothing probes it, so the operator's verdict is the
     // only source and all three states are offered, like embedding and rerank.
