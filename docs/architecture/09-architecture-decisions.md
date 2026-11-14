@@ -12596,37 +12596,55 @@ the change.
 - **sglang-omni sends none of audio.cpp's duration signals.** Billing audio seconds read `X-AudioCPP-Audio-Duration-Ms` (speech) and
   `timing.audio_duration_ms` (transcription), so every call to it would have billed the logged zero of ADR-041.
 - **sglang-omni trusts its caller.** It authenticates nothing on its inference routes and listens on `0.0.0.0` by default. Its speech
-  `ref_audio` and `references[]` read a bare path from the host and fetch a URL, and its chat image connector fetches private
-  addresses. A gateway key holder could therefore read a file on the model host or make it fetch an internal URL.
+  `ref_audio` and `references[]` read a bare path from the host and fetch a URL, its chat image connector fetches private
+  addresses, and its image edit resolves a source that is no uploaded file (`url`, or a text `image`) the same way. A gateway key
+  holder could therefore read a file on the model host or make it fetch an internal URL. SGLang reads an image reference that
+  starts with `/` or `file://` from its host too.
 - **A server may host any model.** One sglang-omni server can host a text, speech or ASR model.
 
 **Decision.**
 
 - **Two spec types, `sglang` and `sglang_omni`** (`routing.RuntimeSpecType`; the agent keeps literal copies of the strings). Detection
   checks `sgl-omni`, `sgl_omni`, `sglang-omni` and `sglang_omni` first, then `sglang`, both before `vllm`; the base name `sglang` (the
-  console script) detects as `sglang`. `python -m sglang.launch_server` and `sglang serve --model-type omni` need an explicit type. An
-  explicit type still wins; only a binary whose name contains `sglang` or one of the omni names changes type.
+  console script) detects as `sglang`, unless its args hold `--model-type omni` or `--model-type=omni` (SGLang's serve CLI hands
+  either to the sglang-omni serve backend, which nothing else selects): that spec is `sglang_omni`. `python -m
+  sglang.launch_server` needs an explicit type. An explicit type still wins; only a binary whose name contains `sglang` or one of
+  the omni names changes type.
 - **Probes follow the server.** `sglang`: `/metrics` and the context probe `/v1/models` (`data[].max_model_len`). `sglang_omni`: neither.
-  The `/props` probe is skipped for both, as for `vllm_sr`. `sglang:num_queue_reqs` and `sglang:num_running_reqs` count only series
-  with `tp_rank="0"` or no `tp_rank` label, summed over the rest, so tensor parallelism does not multiply the figure; other families
-  keep their aggregation.
+  A body without a positive `max_model_len` falls back to the best-effort scan. The `/props` probe is skipped for both, as for
+  `vllm_sr`. The series of `sglang:num_queue_reqs` and `sglang:num_running_reqs` are grouped by `dp_rank` (a series without the
+  label is one group), each group counts its largest value and the groups add up, so neither tensor parallelism nor pipeline
+  stages multiply the figure while data-parallel groups add; other families keep their aggregation.
 - **Role and warning.** `sglang` falls back to chat. `sglang_omni` has no fallback, so capabilities decide and an ASR-only server stays
   ASR. A `sglang_omni` spec without `openai_audio` raises the advisory `api_flavors_no_audio_on_sglang_omni`. Live timings and live
   progress stay off for both.
 - **Portal defaults for `sglang_omni`.** Flavors `openai` and `openai_audio`; `responses_mode` and `messages_mode` both `disabled`,
   because v0.2.0 serves neither route and a passthrough would bypass the media guard. The type notes give the launch templates, keep
   `--host 127.0.0.1` and say that speech and transcription verdicts are manual.
+- **A passthrough mode on an `sglang_omni` target is served as translate.** The portal default does not reach an Auto-typed spec, a
+  spec written through the API or a row stored before the type existed, so the gateway's `endpointModeFor` answers `passthrough` as
+  `translate` for such a target: `/v1/responses` and `/v1/messages` go through the media guard like chat, and the usage row's
+  provider path is `/v1/chat/completions`.
 - **Duration fallbacks, only when audio.cpp's signal is absent.** Speech: no or an empty `X-AudioCPP-Audio-Duration-Ms` on a successful
   one-shot relay makes the duration the audio data bytes actually relayed divided by the byte rate of the WAV `fmt ` chunk; the header's
   size field is not trusted, and pcm derived from the WAV is tallied the same way. Transcription: a body with no `timing` object or no
-  `timing.audio_duration_ms` key makes the duration that of the uploaded WAV part, measured with `wavDurationFromReader`. A present but
-  unusable audio.cpp value stays an Error log and quantity 0 (ADR-041), and streamed speech is unchanged. A fallback that cannot
-  measure (a non-WAV upload, a body that is no WAV) keeps the logged zero.
+  `timing.audio_duration_ms` key makes the duration that of the uploaded WAV part, measured with `wavDurationFromReader`, and when
+  that cannot be measured (a non-WAV upload, a WAV with a streaming writer's `0xFFFFFFFF` size) the duration sglang-omni states,
+  `usage` `{"type":"duration","seconds":N}` with `N` a positive finite number. A present but unusable audio.cpp value stays an Error
+  log and quantity 0 (ADR-041). Streamed speech keeps its rule (PCM bytes over the cached byte rate, else `audio_bytes`), and
+  sglang-omni's raw stream, labelled `audio/pcm` (its `stream_format` defaults to `audio`), is counted as the raw shape
+  `application/octet-stream` is. A fallback that cannot measure (a body that is no WAV, a transcription with neither a measurable
+  WAV nor that usage statement) keeps the logged zero.
 - **Inline media only, for a resolved target of effective type `sglang_omni`.** Speech `ref_audio` and every `references[]`
-  `audio_path`, `ref_audio` and `audio` must be `data:` URLs, matched case-insensitively, with a malformed `references` refused
-  (400 `speech.reference_audio_unsupported`). Chat `image_url.url`, translated Anthropic images included, must be `data:` (400
-  `chat.media_url_unsupported`). Both are logged at Warn with a usage row. The top-level chat fields `audios`, `images` and `videos`
-  never reach the provider.
+  `audio_path`, `ref_audio` and `audio` must be `data:` URLs, matched case-insensitively, with a malformed `references` and a body
+  that is not one JSON object refused (400 `speech.reference_audio_unsupported`). Chat `image_url.url`, translated Anthropic images
+  included, must be `data:` (400 `chat.media_url_unsupported`). An image edit's source must be an uploaded file: `url` and `url[]`
+  are refused, `image` and `image[]` need a filename, a part needs exactly one parseable `form-data` Content-Disposition (Starlette
+  reads the last, Go the first), and every relayed part is rebuilt with gateway-written headers (400 `images.source_unsupported`).
+  All are logged at Warn with a usage row. The top-level chat fields `audios`, `images` and `videos` never reach the provider.
+- **No host paths, for a resolved target of effective type `sglang`.** Chat `image_url.url` must be a `data:`, `http://` or
+  `https://` URL (the scheme case-insensitive); anything else, a bare path or `file://` included, is refused with the same 400
+  `chat.media_url_unsupported`. http(s) stays allowed, as for vLLM, because blocking it breaks the ordinary use of a vision model.
 - **Agent `0.19.1` → `0.19.2`, PATCH.** No feature flag changes; there is no upgrade order.
 - **Realtime is out of this change.** `/v1/realtime` is a later phase; the WebSocket limitation stands.
 
@@ -12647,11 +12665,18 @@ the change.
 **Consequence:**
 
 - **A client that sends a path or a URL to an sglang-omni model gets a 400.** It must inline the image or voice reference as a `data:`
-  URL. Other targets are unchanged.
+  URL, and upload an edit's source as a file. A chat image path (or `file://`) sent to an SGLang model gets the same 400. Other
+  targets are unchanged.
 - **Accepted residuals.** A misdeclared type (an explicit `custom` on an sglang-omni binary) and a static application fronting an
-  sglang-omni server are not guarded; sglang-omni still authenticates nothing, so it stays on loopback behind the agent router.
-- **Other billing shapes stay logged zeros.** A non-WAV transcription upload to a target with no reported duration, and a speech body
-  that is no WAV, bill quantity 0 with an Error log.
+  sglang-omni server are not guarded; sglang-omni still authenticates nothing, so it stays on loopback behind the agent router. A raw
+  `/v1/responses` or `/v1/messages` passthrough to an `sglang` target is not guarded either, because parsing every passthrough
+  dialect is out of proportion; switching those modes to translate closes it, and the portal's `sglang` note says so. An `sglang`
+  target still fetches any http(s) URL it is given.
+- **Chat audio is not relayed to sglang-omni.** The gateway's chat model carries text and images only: an `input_audio` part is
+  refused at parse and `modalities`/`audio` are dropped, so only text and inline images reach sglang-omni chat. The sglang_omni
+  type note says so.
+- **Other billing shapes stay logged zeros.** A transcription to a target with no reported duration whose upload measures no WAV and
+  whose body states no usable `usage` duration, and a one-shot speech body that is no WAV, bill quantity 0 with an Error log.
 - **Speech and transcription verdicts are manual** for `sglang_omni`, and the model is not offered for audio until they are set under the
   `openai_audio` flavor.
 - **Not verified live:** an sglang-omni server end to end through the agent. The contracts were read off the pinned commits.

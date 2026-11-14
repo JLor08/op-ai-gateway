@@ -988,16 +988,23 @@ wav, mp3, flac and pcm, with voice cloning through `ref_audio`. Their facts, eac
 
 - **Detection** checks `sgl-omni`, `sgl_omni`, `sglang-omni` and `sglang_omni` first, so an omni name never detects as
   `sglang`, then `sglang`, and both before `vllm`. The binary base name `sglang` (SGLang's console script, `sglang serve`)
-  detects as `sglang`. `python -m sglang.launch_server` and `sglang serve --model-type omni` have a base name that says
-  nothing, so they need an explicit `type`. An explicit `type` always wins.
+  detects as `sglang`, unless the spec's args hold `--model-type omni` or `--model-type=omni`: SGLang's serve CLI hands
+  either spelling to the sglang-omni serve backend (its `omni` entry point, which nothing else selects), so that spec is
+  `sglang_omni`, and its probe paths, role, warning and media guards follow (`routing.EffectiveRuntimeSpecType`). Any
+  occurrence counts, which errs on the stricter guards. `python -m sglang.launch_server` has a base name that says nothing, so it
+  needs an explicit `type`. An explicit `type` always wins.
 - **Probe paths.** `sglang` uses `/metrics` (SGLang serves it only with `--enable-metrics`) and the context probe `/v1/models`
-  (`data[].max_model_len`, read by the same extractor as vLLM's). `sglang_omni` has neither a metrics path nor a context probe.
-  The health path stays the stock `/health` for both.
+  (`data[].max_model_len`, read by the same extractor as vLLM's; a body without a positive one falls back to the best-effort
+  key scan, as `vllm_sr`'s does). `sglang_omni` has neither a metrics path nor a context probe. The health path stays the stock
+  `/health` for both.
 - **Metrics.** The scrape reads `sglang:num_queue_reqs` as the queue depth and `sglang:num_running_reqs` as the running count,
   after the existing names. SGLang emits one series per scheduler rank, labelled `tp_rank`, `dp_rank`, `pp_rank` and
-  `moe_ep_rank`, so a tensor-parallel server emits one series per tensor-parallel rank. For these two names only a series
-  with `tp_rank="0"` or with no `tp_rank` label counts, and those are summed over the rest (the data-parallel replicas), so
-  `--tp-size 2` does not double the figure. Every other metric family is aggregated as before.
+  `moe_ep_rank`. For these two names the series are grouped by `dp_rank` (a series without the label is one group), each group
+  counts its largest value, and the groups are summed: the tensor-parallel ranks of a group repeat its numbers and its
+  pipeline stages share one queue, so neither `--tp-size 2` nor `--pp-size 2` doubles the figure, while data-parallel groups
+  (DP attention included) hold disjoint requests and add up. The `dp_rank` value is read by a label-block parser, so a
+  `my_dp_rank` label or a quoted value that contains `dp_rank=` is not taken for it. If pipeline stages ever held disjoint
+  queues the figure would undercount (unverified upstream). Every other metric family is aggregated as before.
 - **No `/props` probe:** neither type serves `/props` or a capability document, so the capability probe (§10) returns before
   sending a request, as for `vllm_sr`. An `sglang_omni` server's speech and transcription verdicts are manual.
 - **Role.** `routing.DeriveRole` falls back to chat for `sglang`, like `vllm`. `sglang_omni` has no type fallback, because one
@@ -1014,11 +1021,23 @@ wav, mp3, flac and pcm, with voice cloning through `ref_audio`. Their facts, eac
 - **Inline media only.** For a resolved target of effective type `sglang_omni`, the gateway relays only inline media, because
   sglang-omni reads a bare path from the model host, fetches any URL (its chat image connector allows private addresses) and
   authenticates nothing. Speech `ref_audio` and every `references[]` `audio_path`, `ref_audio` and `audio` must be `data:`
-  URLs (keys are matched case-insensitively, and a malformed `references` value is refused); chat `image_url.url`, including
-  images translated from Anthropic Messages, must be `data:` too. The refusals are 400 `speech.reference_audio_unsupported`
-  and 400 `chat.media_url_unsupported`, logged at Warn and recorded as a usage row. The top-level chat fields `audios`,
-  `images` and `videos` never reach the provider, which rebuilds the body from known fields. Two residuals stay: a misdeclared
-  type (an explicit `custom` on an sglang-omni binary) and a static application fronting an sglang-omni server are not guarded.
+  URLs (keys are matched case-insensitively, and a malformed `references` value or a body that is not one JSON object is
+  refused); chat `image_url.url`, including images translated from Anthropic Messages, must be `data:` too; an image edit's
+  source must be an uploaded file (no `url`/`url[]`, a filename on `image`/`image[]`, exactly one parseable `form-data`
+  Content-Disposition per part, every part relayed with gateway-written headers). The refusals are 400
+  `speech.reference_audio_unsupported`, 400 `chat.media_url_unsupported` and 400 `images.source_unsupported`, logged at Warn
+  and recorded as a usage row. A `responses_mode` or `messages_mode` of `passthrough` is served as translate for such a target,
+  so neither coding-agent body reaches it raw. The top-level chat fields `audios`, `images` and `videos` never reach the
+  provider, which rebuilds the body from known fields. Chat audio is not relayed either: the gateway's chat model carries text
+  and images only (an `input_audio` part is refused at parse, `modalities` and `audio` are dropped), so only text and inline
+  images reach sglang-omni chat. Two residuals stay: a misdeclared type (an explicit `custom` on an sglang-omni binary) and a
+  static application fronting an sglang-omni server are not guarded.
+- **No host paths for `sglang`.** For a resolved target of effective type `sglang`, a chat `image_url.url` must be a `data:`,
+  `http://` or `https://` URL (the scheme case-insensitive), because SGLang reads a `/` or `file://` reference from its host;
+  anything else is refused with the same 400 `chat.media_url_unsupported`. http(s) stays allowed, as for vLLM. A raw
+  `/v1/responses` or `/v1/messages` passthrough to an `sglang` target is not checked; switching those modes to translate closes
+  that, and the portal's type note says so. With `--api-key`, `/v1/models` needs the key, so the context probe (which sends
+  none) reads nothing.
 - **Audio billing.** sglang-omni sends none of audio.cpp's duration signals, so the gateway measures the audio itself, but only
   where audio.cpp's signal is absent ([Compatibility & Inference §3.6 item 6](compatibility-and-inference.md#36-openai-audio-speech)).
 - **Realtime.** `/v1/realtime` is not served by this change (it is a later phase); the WebSocket limitation in §13 stands.
@@ -1356,7 +1375,7 @@ fact about this runtime is, and why:
   `api_flavors_text_on_stable_diffusion` for an `sd-server` spec whose flavors
   are not images-only, and `api_flavors_not_on_application` for a spec that
   lists `openai_images` alone under a parent that lacks it, which leaves the
-  child served, and listed, under no API at all. A third, advisory one,
+  child served, and listed, under no API at all. An advisory one,
   `api_flavors_no_audio_on_sglang_omni`, is the audio counterpart for an
   sglang-omni spec (below).
   Both forms offer `openai_images` as a third flavor checkbox, in the shared
@@ -5900,7 +5919,7 @@ agent before switching its config to `wsl://` entries.
 
 **`0.19.1` → `0.19.2` (the SGLang and sglang-omni spec types, #395) is PATCH.** No feature flag
 changes: the `sglang` type adds a context extractor (`data[].max_model_len`, shared with `vllm`), the two queue and running
-gauge names (`tp_rank="0"` or unlabelled series only), and both types skip the `/props` probe (§3.4). An older agent keeps
+gauge names (the largest series of each `dp_rank` group, summed over the groups), and both types skip the `/props` probe (§3.4). An older agent keeps
 working against a newer gateway and the reverse; there is **no upgrade order**
 ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
 
@@ -8086,7 +8105,8 @@ offered for audio requests. It is advisory, like the `vllm_sr` warning, and coun
 specs. Its helper is `anySGLangOmniSpecLacksAudioFlavor`
 ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
 
-Both of the two warnings above count disabled specs, like `binary_path_os_mismatch` and unlike the
+The `api_flavors_not_on_application` and `api_flavors_text_on_stable_diffusion`
+warnings count disabled specs, like `binary_path_os_mismatch` and unlike the
 timeout warning, because dispatch reads a spec's flavors whether it is enabled
 or not (`targetFrom` ignores `Enabled`). Each check is a pure helper beside
 `anySpecBinaryContradictsReportedOS` (`anySpecListsFlavorNotOnApplication`,

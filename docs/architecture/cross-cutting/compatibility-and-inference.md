@@ -176,14 +176,21 @@ followed by a `role:"tool"` result message keyed by `tool_call_id`. Content is
 required on every message *except* such a tool-call turn or a tool-result
 message (`parseChatMessageContent`'s `contentOptional`).
 
-**Inline images only for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).** When the resolved target's effective runtime spec type is
+**Inline images only for `sglang_omni`, no host paths for `sglang` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).** When the resolved target's effective runtime spec type is
 `sglang_omni`, every `image_url.url` must be a `data:` URL, whether the request arrived as chat completions or was
-translated from Responses or Anthropic Messages. Otherwise the request is refused after routing as **400
-`chat.media_url_unsupported`**, logged at Warn and recorded as a usage row without an upstream call. sglang-omni v0.2.0 reads
-a bare path from the model host and fetches any URL, and its chat image connector allows private addresses. The top-level
-chat fields `audios`, `images` and `videos` never reach the provider, which rebuilds the body from the fields it knows.
-Not guarded: a spec whose type is misdeclared (an explicit `custom`) and a static application fronting an sglang-omni
-server. Every other target is unchanged.
+translated from Responses or Anthropic Messages. When it is `sglang`, it must be a `data:`, `http://` or `https://` URL
+(the scheme case-insensitive). Otherwise the request is refused after routing as **400 `chat.media_url_unsupported`**
+(`mediaURLsRefused`; the message says what the target accepts), logged at Warn and recorded as a usage row without an
+upstream call. sglang-omni v0.2.0 reads a bare path from the model host and fetches any URL, and its chat image connector
+allows private addresses; SGLang v0.5.23 reads a reference that starts with `/` or `file://` from its host
+(`get_image_bytes`), and http(s) stays allowed for it, as for vLLM. A `passthrough` Responses or Messages mode is served as
+translate for an `sglang_omni` target (§6), so neither body reaches it raw; the Responses translation keeps text only, so
+no image reaches sglang-omni from `/v1/responses`. The top-level chat fields `audios`, `images` and `videos` never reach
+the provider, which rebuilds the body from the fields it knows, and no chat audio reaches it either: an `input_audio` part
+is refused at parse (`openai.content_unsupported`) and `modalities`/`audio` are dropped, so sglang-omni chat receives text
+and inline images only. Not guarded: a spec whose type is misdeclared (an explicit `custom`), a static application fronting
+an sglang-omni server, and a raw Responses or Messages passthrough to an `sglang` target (switching those modes to translate
+closes it). Every other target is unchanged.
 
 ### 3.2 OpenAI Responses — Codex continuity
 
@@ -616,19 +623,31 @@ takes the request's `Content-Type` as a parameter (§8) and `nativeRelay` gains 
 optional `upstreamBody`, so the relay can send the **client's bytes verbatim**
 (boundary included) or a body built for the upstream. It is **rebuilt once**
 (`rebuildImageEditBody`: every part copied with its headers, bytes and position,
-a fresh boundary) when either holds: the **`model` field must carry the mapping's
+a fresh boundary) when one of these holds: the **`model` field must carry the mapping's
 own model name** (`Target.ProviderModel`) and the form's differs — for **every**
 target, since the JSON generations relay rewrites it for every provider too, an
 agent's router keys the child on that name, and a model-routing upstream would
 otherwise route on the gateway's name; the comparison is against the *form's*
 value, because a token override or a redirect can land on a mapping whose two
-names are equal — or the form carries a **mask**, which is always a rebuild. A
-no-mask edit whose model needs no rewrite is relayed verbatim. `nativeRelay.raw`
+names are equal — the form carries a **mask**, which is always a rebuild — or the
+target is `sglang_omni` (below). A no-mask edit whose model needs no rewrite is
+relayed verbatim to every other target. `nativeRelay.raw`
 stays the client's bytes either way, which is what capture records. The usage row
 records `/v1/images/edits` as its `provider_path`. A body bound for
 an agent-launched target is checked against **the agent's own 32 MiB** *after*
 the rebuild (§10); one over it is refused `413 request.body_too_large` and
 recorded rather than sent.
+
+*An uploaded source only, for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni v0.2.0 takes the source from
+`image`, `image[]`, `url` or `url[]` and resolves a source that is no uploaded file as a model-host path or a URL it
+fetches. For a target of effective type `sglang_omni` the form is checked after routing (`sglangOmniEditSourceRefusal`)
+and refused **400 `images.source_unsupported`**, logged at Warn and recorded as a usage row, when a part does not carry
+exactly one `Content-Disposition` that parses and is `form-data` (Starlette keeps a part's last one, Go reads the first, and
+a duplicated parameter fails the parse), when it carries a `url` or `url[]` part, or when an `image` or `image[]` part has
+no filename (Starlette makes a part an uploaded file only by its filename). The message names the field, never a value.
+Every form it accepts is rebuilt, each part with headers the gateway wrote (`sglangOmniEditPartHeader`: a `form-data`
+Content-Disposition with the name and filename it read, plus the part's Content-Type), so the upstream reads what the
+gateway checked.
 
 **5. The mask: alpha in, luminance out.** An OpenAI edit marks the region to
 regenerate by **transparency** (an RGBA PNG whose transparent pixels are the
@@ -857,7 +876,7 @@ whole, a stream with no audio) is `(audio_second, 0)`: the quantity is never a p
 stores the request JSON as usual, since it carries the `input` text the opt-in exists
 for, and stores a **metadata summary instead of the audio bytes** (content type, size,
 the metering headers), gated on the response's own `Content-Type`; a streamed response is
-`text/event-stream` or `application/octet-stream` and is still that redacted summary, because
+`text/event-stream`, `application/octet-stream` or `audio/pcm` and is still that redacted summary, because
 the capture's endpoint is stamped speech
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
 
@@ -870,15 +889,19 @@ actually forwarded, divided by the byte rate of the WAV's `fmt ` chunk (`speechW
 is not trusted, because a streaming WAV writer leaves `0` or `0xFFFFFFFF` there: a declared size is used only when it is
 smaller than what followed (trailing metadata chunks are not audio). A `pcm` answer, which the gateway derives from the
 upstream WAV, is tallied the same way, from the bytes of the stripped stream and the byte rate of the header it
-stripped. A body that is no WAV, or one with no audio bytes, keeps the logged zero. A **streamed** call keeps the rule
-above unchanged.
+stripped. A body that is no WAV, or one with no audio bytes, keeps the logged zero. A **streamed** call is billed by the
+rule above, and sglang-omni's raw stream counts as its raw shape: its `stream_format` defaults to `audio`, and it labels
+the headerless PCM `audio/pcm` rather than `application/octet-stream`, so `newSpeechStreamScan` takes either as raw PCM,
+billed from the bytes on a body closed cleanly. Its event stream ends on `speech.audio.done` without a `[DONE]`, which the
+scan does not count as a completion, so a streamed sglang-omni call in `sse` shape stays the logged zero.
 
 *Inline voice references for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni reads a bare `ref_audio` path from the model
 host and fetches a URL, and authenticates nothing, so the gateway relays only inline voice references to a target whose
 effective runtime spec type is `sglang_omni`: `ref_audio` and every `references[]` `audio_path`, `ref_audio` and `audio`
 must be `data:` URLs (the scheme is case-insensitive). Keys are matched case-insensitively, because the JSON decoder
 in Go and the Python upstream disagree on duplicate and differently cased keys, and a `references` value that cannot be
-read as objects is refused. The refusal is **400 `speech.reference_audio_unsupported`**, decided after the route is
+read as objects is refused, as is a body that does not decode as one JSON object (named `body`; `validateSpeechRequest`
+refuses such a body first, and the guard does not rely on it). The refusal is **400 `speech.reference_audio_unsupported`**, decided after the route is
 resolved, answered before any upstream call, logged at Warn (the field name, never the value) and recorded as one
 `error` usage row of quantity `0`. Every other target is relayed unchanged.
 
@@ -1227,9 +1250,13 @@ response under the opt-in and clipped, like any, at the capture cap
 *Targets that are not audio.cpp ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni returns no `timing` block. When the response body states no duration
 at all, that is, has no `timing` object or none with an `audio_duration_ms` key (any value under the key, a `null` or a
 `0` included, is a statement), the quantity falls back to the duration of the **uploaded** WAV file part, measured with
-`wavDurationFromReader`, the measurement a streamed transcription is billed by (item 11). audio.cpp's statement always
-wins. A present but unusable value stays the Error log and quantity `0`, and an upload that is no WAV whose header can be
-believed (an mp3, say) also stays the logged zero: a duration is never guessed (ADR-041).
+`wavDurationFromReader`, the measurement a streamed transcription is billed by (item 11). When that measures nothing — an
+upload that is no WAV (an mp3, say), or a WAV whose header cannot be believed (the `0xFFFFFFFF` data size a streaming writer
+leaves) — the quantity is sglang-omni's own statement, `usage` `{"type":"duration","seconds":N}`
+(`transcriptionUsageSeconds`), read only when the type is exactly `duration` and `N` a positive finite number; sglang-omni
+measures the audio it decoded and rounds up to whole seconds. audio.cpp's statement always wins, and a present but unusable
+value stays the Error log and quantity `0`. Anything else (no measurable WAV and no such statement) also stays the logged
+zero: a duration is never guessed (ADR-041).
 
 **10. Resolving a transcription writes the token's last-used-model marker, and the
 redirect takes a transcription candidate.** `relayTranscription` resolves through
@@ -2293,6 +2320,15 @@ service, on an application's create and on every runtime-spec write
 (`writeRuntimeSpec`) — for every application type, because every supported
 upstream now serves both native endpoints (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
+
+**One exception at dispatch: `sglang_omni`.** For a target whose effective kind
+(`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
+`passthrough` mode as `translate`, so the relay decision and the usage row's
+`provider_path` both read translate: sglang-omni v0.2.0 serves neither native
+route, and a raw body would bypass the media guard (§3.1). The portal's
+`sglang_omni` defaults disable both modes, but an Auto-typed spec, a spec written
+through the API and a row stored before the type existed keep the stock
+passthrough ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
 
 **Where the effective mode lives.** An ordinary application carries
 `ResponsesMode`/`MessagesMode` directly on `routing.Application`

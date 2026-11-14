@@ -873,8 +873,10 @@ since the usage scanner is nil for the flavor), and its `provider_path` is
 an image edit, because `recordUsage` recomputes the path from the flavor and the flavor
 would say speech). The quantity is audio.cpp's own measurement of the **input** audio,
 `timing.audio_duration_ms` of the JSON response divided by 1000; when the body has no `timing.audio_duration_ms` key at
-all (a target that is not audio.cpp, [ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)) it is the duration of the uploaded WAV part instead, and a present but
-unusable value or a non-WAV upload stays the logged `0`. The `timing` block is
+all (a target that is not audio.cpp, [ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)) it is the duration of the uploaded WAV part instead,
+and when that measures nothing (a non-WAV upload, a WAV whose header cannot be believed) the seconds sglang-omni states,
+`usage` `{"type":"duration","seconds":N}` with `N` a positive finite number. A present but unusable value, or neither a
+measurable WAV nor such a statement, stays the logged `0`. The `timing` block is
 the **trailing** field of `{"text": ..., "timing": {...}}`, so the relay buffers the
 whole body, up to the transcription body cap, before it writes (a response over the cap or
 one that breaks off is a 502 `transcription.upstream_error` with quantity `0`; [API

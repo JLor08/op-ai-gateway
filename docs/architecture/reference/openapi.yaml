@@ -64,7 +64,9 @@ paths:
         inference path that also accepts the portal session (portal chat runs
         use it over the internal loopback path). Alias: /openai/v1/chat/completions.
         Against an agent-launched `sglang_omni` target every `image_url.url`
-        must be an inline `data:` URL, else 400 `chat.media_url_unsupported`.
+        must be an inline `data:` URL, and against an `sglang` target a
+        `data:`, `http://` or `https://` URL, else 400
+        `chat.media_url_unsupported`.
       security: [{ bearerAuth: [] }, { sessionCookie: [], csrfHeader: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -196,7 +198,12 @@ paths:
         `yes`, unless an operator set an `image_edit: no` verdict on the
         mapping. An agent-launched model's runtime spec must declare the flavor
         too, and its agent must declare the `multipart_proxy` feature, else
-        404 `images.edit_unavailable`. Non-streaming only (a `stream` of
+        404 `images.edit_unavailable`. Against an agent-launched `sglang_omni`
+        target the source must be an uploaded file: a `url` or `url[]` part,
+        an `image` or `image[]` part without a filename, and a part without
+        exactly one parseable `form-data` Content-Disposition are 400
+        `images.source_unsupported`, and every part is relayed with headers
+        the gateway wrote. Non-streaming only (a `stream` of
         `true` is 400 `images.stream_unsupported`), and `response_format` must
         be `b64_json` or absent (400 `images.response_format_unsupported`).
         An OpenAI-style `mask` (an RGBA PNG whose TRANSPARENT pixels mark the
@@ -283,7 +290,8 @@ paths:
         `stream_format` on a request that does not stream are 400
         `speech.stream_unsupported`. Against an agent-launched `sglang_omni`
         target a `ref_audio`, or a `references[]` element's `audio_path`,
-        `ref_audio` or `audio`, that is not an inline `data:` URL is 400
+        `ref_audio` or `audio`, that is not an inline `data:` URL, and a body
+        that is not one JSON object, is 400
         `speech.reference_audio_unsupported`. A one-shot 200 is the synthesized clip as
         one binary `audio/wav` body, relayed without buffering and with the
         upstream's own `Content-Length`. A non-2xx upstream answer keeps the
@@ -298,7 +306,8 @@ paths:
         byte rate), not in tokens; a `speech.pcm_unavailable` row is
         `audio_second` with quantity 0. A streamed call
         has no such header: on a clean completion (`speech.audio.done` then
-        `[DONE]`, or a raw body closed cleanly) it is billed from the PCM bytes
+        `[DONE]`, or a raw body closed cleanly, sglang-omni's `audio/pcm`
+        included) it is billed from the PCM bytes
         the relay counted, as `audio_second` equal to the bytes divided by the
         mapping's cached output byte rate, or, while no rate is cached, as
         `audio_bytes` with the byte count; every other streamed outcome is
@@ -489,7 +498,9 @@ paths:
         it, with the same refusal. Metered in seconds of audio
         (`billing_unit: audio_second`), not in tokens: a buffered call reads the
         duration from the response body's `timing.audio_duration_ms` (not a
-        header); a streamed call, which carries no such field, reads it from the
+        header), or, when the body has no such key (a target that is not
+        audio.cpp), from the uploaded WAV part and then from sglang-omni's
+        `usage` `{"type":"duration","seconds":N}`; a streamed call, which carries no such field, reads it from the
         uploaded WAV header and bills only on a clean completion. Beyond those
         it answers the same statuses as every other inference path (429/402
         from the principal limiter, 503 from the capacity queue or no healthy
@@ -4854,7 +4865,8 @@ components:
         is absent or empty (a target that is not audio.cpp), measures the audio
         bytes relayed against the WAV `fmt ` byte rate. A STREAMED answer (a
         `mode=streaming` model asked with `stream: true`) is instead
-        `text/event-stream` or `application/octet-stream`, chunked and without a
+        `text/event-stream` or raw PCM (`application/octet-stream`, or
+        `audio/pcm` from sglang-omni), chunked and without a
         `Content-Length`, relayed byte for byte and billed from the PCM bytes
         counted on a clean completion.
       content:
