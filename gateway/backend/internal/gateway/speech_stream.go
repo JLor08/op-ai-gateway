@@ -10,21 +10,43 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"net/http"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
+	"strconv"
 	"strings"
 )
 
-// The frames of the event stream audio.cpp answers a streamed speech request with
-// (OpenAI-style SSE): a speech.audio.delta per chunk, its PCM base64-encoded in the
-// `audio` field, a speech.audio.done that states a time to first token and NO
-// duration, then the [DONE] sentinel (sseDoneSentinel). With stream_format=audio the
-// body is instead headerless raw PCM under application/octet-stream (audio/pcm from
-// sglang-omni).
+// The frames of the event stream a streamed speech request is answered with (OpenAI-style
+// SSE): a speech.audio.delta per chunk, its PCM base64-encoded in the `audio` field, then
+// a speech.audio.done that states NO duration. audio.cpp's done event states a time to
+// first token and is followed by the [DONE] sentinel (sseDoneSentinel). sglang-omni's
+// (v0.2.0) states token usage, and its body then simply ends: it writes no [DONE], and on
+// a failure it writes an `error` event in the done event's place (an error frame by
+// isSSEErrorEvent's rule). The relay writes the sentinel for it once the body has closed
+// cleanly after the done event (speechStreamScan.endFrame, ADR-103), so every speech event
+// stream the gateway relays ends the same way. With stream_format=audio the body is
+// instead headerless raw PCM under application/octet-stream (audio/pcm from sglang-omni).
 const (
 	speechEventDelta = "speech.audio.delta"
 	speechEventDone  = "speech.audio.done"
+)
+
+// speechStreamEndFrame is the [DONE] frame the relay ends an sglang-omni event stream
+// with. endFrame puts as many newlines ahead of it as the relayed bytes lack of a blank
+// line (none, one or two), so it is always an event of its own.
+const speechStreamEndFrame = "data: " + sseDoneSentinel + "\n\n"
+
+// The response headers sglang-omni (v0.2.0) states the PCM format of a streamed synthesis
+// in, on both shapes: the sample rate, the channel count and the bits a sample. Together
+// they are the stream's byte rate (speechHeaderByteRate), which the billing of a stream
+// falls back to when the mapping has no cached rate.
+const (
+	speechSampleRateHeader = "X-Sample-Rate"
+	speechChannelsHeader   = "X-Channels"
+	speechBitDepthHeader   = "X-Bit-Depth"
 )
 
 // The media types a streamed speech request is answered in: the event stream
@@ -65,6 +87,16 @@ const speechStreamMaxLine = 16 << 20
 //     only evidence that the audio was delivered whole is that its end arrived.
 //     Billing is decided on that (setStreamedSpeechBillingQuantity).
 //
+// sglang-omni's event stream has no [DONE] of its own: its body ends after the done event.
+// For it the scan also answers the one thing the relay WRITES rather than relays -- the
+// sentinel that stream lacks (endFrame), which the copier sends the client at a clean EOF
+// after the done event and feeds back through the scan like any chunk. The completion rule
+// above is unchanged by it: what completes the stream is still the done event and then
+// [DONE], and the gateway writes that [DONE] only for a stream that is done. And because
+// sglang-omni states its PCM format in response headers, the scan keeps the byte rate they
+// add up to (headerRate), which the billing falls back to when the mapping has no cached
+// rate. Every other upstream gets neither: audio.cpp's stream is relayed exactly as it was.
+//
 // A count the scan could not make whole is never offered as one: an event it could not
 // decode, a delta whose audio is not base64, a line dropped for its length each mark
 // the scan lost, and a lost scan is not complete -- the bytes the client was sent are
@@ -72,8 +104,8 @@ const speechStreamMaxLine = 16 << 20
 //
 // A nil *speechStreamScan is a scan that sees nothing: a relay that is not a streamed
 // speech call carries none. Every method nativeCopier and proxyNative call on it -- feed,
-// finish, cleanClose, complete, pcmBytes and stampCapture -- is nil-safe; the helpers
-// behind them are reached only through those and are not.
+// finish, cleanClose, endFrame, complete, pcmBytes and stampCapture -- is nil-safe; the
+// helpers behind them are reached only through those and are not.
 //
 // Frames are read line by line, as usageScanner and transcriptionStreamScan read them:
 // a frame can straddle two chunks, so the unterminated tail of a chunk is carried to the
@@ -83,33 +115,142 @@ type speechStreamScan struct {
 	raw bool
 	// maxLine bounds one line held between chunks (event stream only).
 	maxLine int
+	// writeEnd marks an event stream from sglang-omni, which ends a completed synthesis at
+	// its done event with no [DONE]: the relay writes the sentinel itself (endFrame). False
+	// for every other upstream, and for the raw shape, which has no terminal frame to write.
+	writeEnd bool
+	// headerRate is the byte rate the answer's format headers state (speechHeaderByteRate),
+	// read for sglang-omni only, on either shape; 0 is none. The billing falls back to it
+	// when the mapping has no cached rate.
+	headerRate uint32
+	// headerIssue names the format header that made headerRate unusable, when sglang-omni
+	// stated its format and a header of it could not be read; zero when it stated none or
+	// all three were usable. The billing warns of it when it would have used the rate.
+	headerIssue speechHeaderRateIssue
 
 	carry    []byte // the unterminated tail of the chunks so far
 	skipping bool   // inside a line dropped for its length: discard up to its newline
+	// trailingLF is how many newlines the bytes fed so far end with, held at 2 (event stream
+	// only). A carriage return is passed over, so a CRLF counts as one newline.
+	trailingLF int
 
-	n       int64 // PCM bytes counted
-	lost    bool  // audio relayed that n does not account for
-	sawDone bool  // a speech.audio.done event was seen
-	sawEnd  bool  // [DONE] was seen AFTER it
-	closed  bool  // raw: the upstream closed the body cleanly
+	n           int64 // PCM bytes counted
+	lost        bool  // audio relayed that n does not account for
+	sawDone     bool  // a speech.audio.done event was seen
+	sawEnd      bool  // [DONE] was seen AFTER it
+	sawSentinel bool  // [DONE] was seen at all, wherever it came
+	sawError    bool  // an error frame was seen (isSSEErrorEvent)
+	closed      bool  // the upstream closed the body cleanly
 }
 
 // newSpeechStreamScan returns the scan for a 2xx answer to a streamed speech request,
 // keyed on the answer's own Content-Type: an event stream or raw PCM. Any other answer
 // -- the one-shot audio/wav of an upstream that did not stream, a JSON document -- is no
 // stream and gets no scan (nil), and is relayed and billed as the document it is.
-func newSpeechStreamScan(header http.Header) *speechStreamScan {
+//
+// target is the relay's target. For an sglang-omni one (isSGLangOmniTarget) the scan reads
+// the byte rate its format headers state (headerRate), on either shape, and an event
+// stream from it is one the relay ends itself (writeEnd); every other target gets neither.
+func newSpeechStreamScan(header http.Header, target routing.Target) *speechStreamScan {
 	mediaType, _, err := mime.ParseMediaType(header.Get(contentTypeHeader))
 	if err != nil {
 		return nil
 	}
+	omni := isSGLangOmniTarget(target)
+	var scan *speechStreamScan
 	switch mediaType {
 	case speechStreamSSEType:
-		return &speechStreamScan{maxLine: speechStreamMaxLine}
+		scan = &speechStreamScan{maxLine: speechStreamMaxLine, writeEnd: omni}
 	case speechStreamRawType, speechStreamRawPCMType:
-		return &speechStreamScan{raw: true}
+		scan = &speechStreamScan{raw: true}
+	default:
+		return nil
 	}
-	return nil
+	if omni {
+		scan.headerRate, scan.headerIssue = speechHeaderByteRate(header)
+	}
+	return scan
+}
+
+// speechHeaderRateIssue says why an sglang-omni answer's format headers gave no byte rate:
+// the header (or, for a product out of range, the three) and what was wrong with it. The
+// zero value is no issue.
+type speechHeaderRateIssue struct {
+	header string
+	reason string
+}
+
+// speechFormatHeaders are the three format headers, in the order a rate is read from them.
+var speechFormatHeaders = [...]string{speechSampleRateHeader, speechChannelsHeader, speechBitDepthHeader}
+
+// speechHeaderByteRate returns the bytes a second of the PCM a stream carries, as its
+// format headers state it: sample rate times channels times bytes a sample. Each header
+// must be stated exactly once and be a plain decimal positive integer (strconv.ParseUint's
+// base 10: no sign, no space, no fraction, no unit), the bit depth a whole number of bytes,
+// and the product a usable rate by the one definition a cached rate is held to
+// (routing.ParseOutputByteRate: positive and within a uint32). Anything else -- a header
+// missing, stated twice, a zero, a 12-bit depth, a product past the range -- is 0, no rate:
+// a rate is never guessed, because a guessed one would bill a wrong duration under a
+// plausible unit. A header stated twice is refused rather than one of its values picked,
+// for the same reason: two statements of the format are no single rate.
+//
+// Alongside no rate it returns which header was unusable, so the billing can say why it
+// fell back. An answer that states none of the three is no such case -- that is a stream
+// without a stated format, not one whose statement is broken -- and returns no issue.
+func speechHeaderByteRate(header http.Header) (uint32, speechHeaderRateIssue) {
+	stated := false
+	for _, name := range speechFormatHeaders {
+		stated = stated || len(header.Values(name)) > 0
+	}
+	if !stated {
+		return 0, speechHeaderRateIssue{}
+	}
+	var factors [len(speechFormatHeaders)]uint64
+	for i, name := range speechFormatHeaders {
+		n, issue := speechFormatHeader(header, name)
+		if issue != "" {
+			return 0, speechHeaderRateIssue{header: name, reason: issue}
+		}
+		factors[i] = n
+	}
+	sampleRate, channels, bitDepth := factors[0], factors[1], factors[2]
+	if bitDepth%8 != 0 {
+		return 0, speechHeaderRateIssue{header: speechBitDepthHeader, reason: "not a whole number of bytes"}
+	}
+	outOfRange := speechHeaderRateIssue{
+		header: strings.Join(speechFormatHeaders[:], ", "),
+		reason: "their product is no byte rate within a uint32",
+	}
+	// Each factor is below 2^32, so the bytes a frame fit a uint64. A frame past a uint32
+	// makes a product past it too (the sample rate is at least 1), so it is refused before
+	// the multiplication that could overflow.
+	frameBytes := channels * (bitDepth / 8)
+	if frameBytes > math.MaxUint32 {
+		return 0, outOfRange
+	}
+	rate, ok := routing.ParseOutputByteRate(strconv.FormatUint(sampleRate*frameBytes, 10))
+	if !ok {
+		return 0, outOfRange
+	}
+	return rate, speechHeaderRateIssue{}
+}
+
+// speechFormatHeader reads one format header, stated exactly once, as a plain decimal
+// positive integer within a uint32. For anything else it returns what is wrong with it.
+func speechFormatHeader(header http.Header, name string) (uint64, string) {
+	values := header.Values(name)
+	switch len(values) {
+	case 0:
+		return 0, "missing beside the other format headers"
+	case 1:
+	default:
+		return 0, "stated more than once"
+	}
+	n, err := strconv.ParseUint(values[0], 10, 32)
+	if err != nil || n == 0 {
+		return 0, "not a plain decimal positive integer within a uint32"
+	}
+	return n, ""
 }
 
 // feed takes one chunk of the stream, as it came off the upstream.
@@ -121,6 +262,7 @@ func (s *speechStreamScan) feed(chunk []byte) {
 		s.n += int64(len(chunk))
 		return
 	}
+	s.trailingLF = trailingNewlines(chunk, s.trailingLF)
 	for {
 		i := bytes.IndexByte(chunk, '\n')
 		if i < 0 {
@@ -130,6 +272,24 @@ func (s *speechStreamScan) feed(chunk []byte) {
 		s.endLine(chunk[:i])
 		chunk = chunk[i+1:]
 	}
+}
+
+// trailingNewlines returns how many newlines the stream ends with once chunk is fed, given
+// prev, the count before it; held at 2, the most endFrame asks about. A carriage return is
+// passed over, so a CRLF ending counts as one newline a line ("\r\n\r\n" is two), and a
+// chunk of nothing but line breaks adds to what came before it.
+func trailingNewlines(chunk []byte, prev int) int {
+	n := 0
+	for i := len(chunk) - 1; i >= 0; i-- {
+		switch chunk[i] {
+		case '\n':
+			n++
+		case '\r':
+		default:
+			return min(n, 2)
+		}
+	}
+	return min(prev+n, 2)
 }
 
 // finish takes the end of the stream: a last line the upstream never terminated is
@@ -144,14 +304,42 @@ func (s *speechStreamScan) finish() {
 	s.carry = nil
 }
 
-// cleanClose records that the upstream closed the body cleanly (the copier read io.EOF).
-// It is the raw shape's only terminal signal; an event stream's completion is its own
-// terminal frames, which a clean close does not stand in for.
+// cleanClose records that the upstream closed the body cleanly (the copier read io.EOF),
+// and reads the line the body may have left unterminated as its last (finish), so the
+// scan has judged the whole of what the upstream sent before endFrame is asked. A clean
+// close is the raw shape's only terminal signal; an event stream's completion is its own
+// terminal frames, which a clean close does not stand in for -- for sglang-omni it is only
+// what lets the relay write the [DONE] its stream lacks (endFrame).
 func (s *speechStreamScan) cleanClose() {
 	if s == nil {
 		return
 	}
+	s.finish()
 	s.closed = true
+}
+
+// endFrame returns the frame the relay writes to end an sglang-omni event stream, or nil
+// when it writes none. It is the [DONE] that stream lacks, and it is written only for a
+// stream that is done: the upstream closed the body cleanly (cleanClose) after a
+// speech.audio.done event, sent no [DONE] of its own, anywhere, sent no error frame
+// (isSSEErrorEvent: sglang-omni's error event, or the agent router's untyped error frame
+// that may follow even the done event when the child dies mid-body), and nothing of it was
+// lost. Every other stream -- one that ended in an error frame, one cut or ended before its
+// done event, one whose audio could not be counted, any stream from another upstream, and
+// the raw shape -- gets nothing, and stays the incomplete stream it is. sglang-omni (v0.2.0) writes either the done event or an error event, never both; a
+// stream that carries both is refused the sentinel all the same, because an upstream that
+// reported a failure has not plainly delivered a whole synthesis.
+//
+// The frame is always an event of its own, and adds no more line breaks than that takes:
+// after bytes that end mid-line two newlines end the line and the event, after a single
+// newline one more ends the event, and after a whole frame (two newlines or more, a CRLF
+// counting as one) the sentinel follows directly -- sglang-omni ends every frame so, which
+// makes its streams end in exactly the `data: [DONE]` frame audio.cpp's do.
+func (s *speechStreamScan) endFrame() []byte {
+	if s == nil || !s.writeEnd || !s.closed || !s.sawDone || s.sawSentinel || s.sawError || s.lost {
+		return nil
+	}
+	return []byte(strings.Repeat("\n", 2-s.trailingLF) + speechStreamEndFrame)
 }
 
 // hold carries the unterminated tail of a chunk to the next one, or -- when the line
@@ -186,7 +374,9 @@ func (s *speechStreamScan) endLine(tail []byte) {
 
 // scanLine reads one line: only a `data:` line carries anything, and what it carries is
 // either the [DONE] sentinel or a JSON event; every other line (a comment, an `event:`
-// field, a blank separator) and every event of another type is ignored.
+// field, a blank separator) and every event of another type is ignored -- except an error
+// frame (isSSEErrorEvent), which is noted so the relay never ends that stream with a
+// [DONE] (endFrame).
 func (s *speechStreamScan) scanLine(line []byte) {
 	line = bytes.TrimSuffix(line, []byte("\r"))
 	payload, ok := bytes.CutPrefix(line, []byte("data:"))
@@ -196,16 +386,19 @@ func (s *speechStreamScan) scanLine(line []byte) {
 	payload = bytes.TrimSpace(payload)
 	if string(payload) == sseDoneSentinel {
 		// [DONE] ends a stream that completed; one that arrives without (or ahead of) the
-		// done event is not a completion.
+		// done event is not a completion. Either way the stream has its sentinel, and the
+		// relay writes no second one (endFrame).
 		s.sawEnd = s.sawEnd || s.sawDone
+		s.sawSentinel = true
 		return
 	}
 	if len(payload) == 0 || payload[0] != '{' {
 		return
 	}
 	var event struct {
-		Type  string `json:"type"`
-		Audio string `json:"audio"`
+		Type  string          `json:"type"`
+		Audio string          `json:"audio"`
+		Error json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &event); err != nil {
 		// A frame that is JSON in shape and cannot be read -- cut mid-frame, or malformed --
@@ -213,11 +406,17 @@ func (s *speechStreamScan) scanLine(line []byte) {
 		s.lost = true
 		return
 	}
-	switch event.Type {
-	case speechEventDelta:
+	switch {
+	case event.Type == speechEventDelta:
 		s.addDelta(event.Audio)
-	case speechEventDone:
+	case event.Type == speechEventDone:
 		s.sawDone = true
+	case isSSEErrorEvent(event.Type, event.Error):
+		// The upstream's own error event, or the agent's runtime router's untyped
+		// {"error":{...}} frame, which it writes when the child fails after the stream was
+		// committed -- possibly after the done event. Either says the synthesis was not
+		// plainly delivered whole, by the same rule the benchmark refuses a stream on.
+		s.sawError = true
 	}
 }
 
@@ -282,14 +481,17 @@ func (s *speechStreamScan) stampCapture(in *captureInput) {
 // the mapping's output byte rate is cached (cachedOutputByteRate: what its speech
 // benchmark measured) that is a duration, the PCM bytes over the bytes a second, in the
 // endpoint's own unit, audio_second -- the unit a one-shot call bills in too. When it is
-// not, it is the PCM bytes themselves, in audio_bytes (usage.BillingUnitAudioBytes): the
-// rate is never guessed, because a guessed one would bill a wrong duration under a
-// plausible unit. Every other outcome is a zero in the endpoint's own unit, audio_second
-// -- the unit every refusal and failed relay of this endpoint carries (ADR-041(c)), so a
-// failed streamed request is never mislabelled -- and the quantity is never a partial
-// count: a stream cut short, torn down, or ended without its terminal events delivered
-// some audio and billed none, which is a loud zero and never an over- or under-bill of
-// what a failed relay may or may not have produced.
+// not, but the stream itself stated its PCM format in usable headers (scan.headerRate,
+// sglang-omni's X-Sample-Rate, X-Channels and X-Bit-Depth), that rate makes it a duration
+// the same way; the cached rate goes first because it is this mapping's measured figure.
+// When neither is known, it is the PCM bytes themselves, in audio_bytes
+// (usage.BillingUnitAudioBytes): the rate is never guessed, because a guessed one would
+// bill a wrong duration under a plausible unit. Every other outcome is a zero in the
+// endpoint's own unit, audio_second -- the unit every refusal and failed relay of this
+// endpoint carries (ADR-041(c)), so a failed streamed request is never mislabelled -- and
+// the quantity is never a partial count: a stream cut short, torn down, or ended without
+// its terminal events delivered some audio and billed none, which is a loud zero and
+// never an over- or under-bill of what a failed relay may or may not have produced.
 //
 // The loud part (ADR-041) is said once at Error, with enough to find the request, for the
 // two cases whose row would otherwise look like a success that billed nothing: a stream
@@ -304,15 +506,27 @@ func (s *speechStreamScan) stampCapture(in *captureInput) {
 // whether its rate is known, rather than from the endpoint alone; that is ADR-068's one
 // amendment of ADR-041(c), confined to the success path.
 //
+// When sglang-omni stated its format but a header of it could not be read or was missing
+// beside the others, or the three gave no usable rate (scan.headerIssue), the bytes
+// fallback is said once at Warn, naming the header, or all three for the product -- here,
+// where the request's id is known, and only when the header rate would have been used (no
+// cached rate), so a mapping whose benchmark measured its rate is not warned about headers
+// nothing reads. A stream that stated no format headers is not warned about.
+//
 // This runs once the stream has ended. A client that went away is not a case this billing
 // ever sees as a success: a disconnect seen when the stream terminates, mid-stream or
 // right after the final frame, has already made the status provider.client_disconnected
 // (nativeTerminalStatus decides it as soon as the copy returns, before this setter reads
 // the rate), and the status != "success" return below turns it into the error row
-// (audio_second, 0), never a billed stream. The rate read is on a context that survives a
-// cancelled ctx (context.WithoutCancel) purely defensively: it covers only the window
-// after that status decision, so a request context cancelled between the decision and the
-// store read cannot make the read fail and drop a stream already judged a success to bytes.
+// (audio_second, 0), never a billed stream. For sglang-omni the final frame is the [DONE]
+// the relay writes itself (speechStreamScan.endFrame), and a failed write of it is the
+// copy's error: the status is provider.client_disconnected when the request context is
+// already cancelled by then, and provider.stream_copy_error when the write failed on a live
+// one (a write deadline, say) -- either way an error row that bills zero. The rate read is
+// on a context that survives a cancelled ctx (context.WithoutCancel) purely defensively: it
+// covers only the window after that status decision, so a request context cancelled
+// between the decision and the store read cannot make the read fail and drop a stream
+// already judged a success to bytes.
 func (s *Server) setStreamedSpeechBillingQuantity(ctx context.Context, meta *usageMeta, ex nativeExchange, scan *speechStreamScan, status string) {
 	if scan == nil {
 		return
@@ -331,11 +545,18 @@ func (s *Server) setStreamedSpeechBillingQuantity(ctx context.Context, meta *usa
 		return
 	}
 	// A clean completion: what was relayed is what is billed. The measure is stated here
-	// and nowhere else -- a duration when the rate that turns bytes into one is cached,
-	// the bytes themselves when it is not.
+	// and nowhere else -- a duration when the rate that turns bytes into one is cached or
+	// stated by the stream's headers, the bytes themselves when neither is known.
 	if rate, ok := s.cachedOutputByteRate(context.WithoutCancel(ctx), ex.target.RouteID); ok {
 		meta.BillingUnit, meta.BillingQuantity = usage.BillingUnitAudioSecond, float64(bytesRelayed)/float64(rate)
 		return
+	}
+	if scan.headerRate > 0 {
+		meta.BillingUnit, meta.BillingQuantity = usage.BillingUnitAudioSecond, float64(bytesRelayed)/float64(scan.headerRate)
+		return
+	}
+	if issue := scan.headerIssue; issue.header != "" {
+		slog.Warn("streamed speech call stated its PCM format in format headers the gateway cannot use: billed in audio_bytes", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "header", issue.header, "reason", issue.reason)
 	}
 	meta.BillingUnit, meta.BillingQuantity = usage.BillingUnitAudioBytes, float64(bytesRelayed)
 }

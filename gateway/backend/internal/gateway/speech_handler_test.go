@@ -1074,8 +1074,10 @@ func TestSpeechRelayDoesNotTreatASuccessfulWAVAsAnError(t *testing.T) {
 }
 
 // The metering headers a skipped speech body's capture keeps are the audio.cpp
-// ones (the X-AudioCPP- family: duration, wall time, real-time factor), and only
-// those: the upstream's other headers are not metering.
+// ones (the X-AudioCPP- family: duration, wall time, real-time factor) and the PCM
+// format headers sglang-omni states a stream's rate in (X-Sample-Rate, X-Channels,
+// X-Bit-Depth), which a stream billed from that rate is audited by -- and only those:
+// the upstream's other headers are not metering.
 func TestSpeechMeteringHeaders(t *testing.T) {
 	if !strings.HasPrefix(strings.ToLower(speechDurationHeader), speechMeteringHeaderPrefix) {
 		t.Fatalf("the billing duration header %q is not in the metering family %q", speechDurationHeader, speechMeteringHeaderPrefix)
@@ -1087,6 +1089,11 @@ func TestSpeechMeteringHeaders(t *testing.T) {
 	upstream.Set("X-AudioCPP-Wall-Ms", "120.5")
 	upstream.Set("x-audiocpp-rtf", "0.08")
 	upstream.Set("X-Unrelated", "keep-out")
+	upstream.Set("X-Sample-Rate-Hint", "keep-out")
+	upstream.Set("X-Sample-Rate", "24000")
+	upstream.Set("X-Channels", "1")
+	upstream.Add("X-Bit-Depth", "16")
+	upstream.Add("X-Bit-Depth", "24") // a header stated twice is kept as the upstream stated it
 
 	got := speechMeteringHeaders(upstream)
 
@@ -1094,6 +1101,9 @@ func TestSpeechMeteringHeaders(t *testing.T) {
 	want.Set("X-AudioCPP-Audio-Duration-Ms", "1500.000000")
 	want.Set("X-AudioCPP-Wall-Ms", "120.5")
 	want.Set("X-AudioCPP-RTF", "0.08")
+	want.Set("X-Sample-Rate", "24000")
+	want.Set("X-Channels", "1")
+	want.Set("X-Bit-Depth", "16")
 	if len(got) != len(want) {
 		t.Fatalf("metering headers = %v, want exactly %v", got, want)
 	}
@@ -1101,6 +1111,9 @@ func TestSpeechMeteringHeaders(t *testing.T) {
 		if got.Get(name) != want.Get(name) {
 			t.Errorf("%s = %q, want %q", name, got.Get(name), want.Get(name))
 		}
+	}
+	if bits := got.Values("X-Bit-Depth"); len(bits) != 2 || bits[1] != "24" {
+		t.Errorf("X-Bit-Depth = %q, want both values the upstream stated", bits)
 	}
 	if speechMeteringHeaders(http.Header{"Content-Type": {"audio/wav"}}) != nil {
 		t.Error("an upstream with no metering headers must yield nil, not an empty header")

@@ -1294,8 +1294,11 @@ parameters), `captureResponseBody` stores a small JSON summary in place of the b
 its `content_type`, its `size` (the number of bytes the relay actually wrote, counted by
 the copier, not the length of the bounded tee buffer, which stops at the cap and would
 record any longer clip as the cap), `"redacted": true` (so a reader does not take the
-summary for the body), and the upstream's `X-AudioCPP-*` metering headers. Those
-headers are the upstream's: the relay does not forward them to the client, so the
+summary for the body), and the upstream's metering headers: audio.cpp's `X-AudioCPP-*`
+family and the PCM format headers `X-Sample-Rate`, `X-Channels` and `X-Bit-Depth`,
+which an `sglang_omni` stream states and may be billed by
+([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)), so
+such a bill can be audited from the capture. Those headers are the upstream's: the relay does not forward them to the client, so the
 client headers the capture holds carry none of them, and they reach the summary
 through their own field at the relay's terminal step. `truncated` is not set, since
 nothing was cut off. The gate is the response's type, **not the request flavor** (bar the 2xx backstop below): a

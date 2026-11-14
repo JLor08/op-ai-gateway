@@ -281,7 +281,17 @@ paths:
         the raw PCM as `application/octet-stream`. A streamed request must ask
         `response_format` `pcm` or omit it: `wav` beside a stream is 400
         `speech.stream_unsupported` (audio.cpp serves streaming only as `pcm`)
-        and any other value is 400 `speech.response_format_unsupported`. Against
+        and any other value is 400 `speech.response_format_unsupported`. To an
+        `sglang_omni` target, which refuses a stream in its default `wav` and
+        defaults `stream_format` to raw `audio`, the gateway states
+        `"response_format":"pcm"` upstream when the body has no key named
+        exactly `response_format` holding `pcm`, and `"stream_format":"sse"`
+        when it has no key named exactly `stream_format` holding `sse` or
+        `audio` (one rewrite; a body stating both exactly is relayed byte for
+        byte), and ends its event stream (closed by sglang-omni after
+        `speech.audio.done` with no `[DONE]`) with a gateway-written
+        `data: [DONE]`, only after a clean close with no error frame and
+        nothing lost (ADR-103). Against
         an offline, unprobed or not-yet-reported model the same `stream: true`
         is answered buffered, as one complete `audio/wav` clip whatever
         `response_format` was named, never as an error, and on a stale-`yes`
@@ -309,8 +319,9 @@ paths:
         `[DONE]`, or a raw body closed cleanly, sglang-omni's `audio/pcm`
         included) it is billed from the PCM bytes
         the relay counted, as `audio_second` equal to the bytes divided by the
-        mapping's cached output byte rate, or, while no rate is cached, as
-        `audio_bytes` with the byte count; every other streamed outcome is
+        mapping's cached output byte rate, else, for an `sglang_omni` target,
+        by the rate its `X-Sample-Rate`, `X-Channels` and `X-Bit-Depth`
+        headers state, else as `audio_bytes` with the byte count; every other streamed outcome is
         `audio_second` with quantity 0. A requested
         `voice` is a fail-open routing preference: when at least one candidate
         mapping's cached voice list (see GET /v1/audio/voices) offers it,
@@ -501,7 +512,9 @@ paths:
         header), or, when the body has no such key (a target that is not
         audio.cpp), from the uploaded WAV part and then from sglang-omni's
         `usage` `{"type":"duration","seconds":N}`; a streamed call, which carries no such field, reads it from the
-        uploaded WAV header and bills only on a clean completion. Beyond those
+        uploaded WAV header, else from that `usage` on its last
+        `transcript.text.done` (sglang-omni's), and bills only on a clean
+        completion. Beyond those
         it answers the same statuses as every other inference path (429/402
         from the principal limiter, 503 from the capacity queue or no healthy
         host), which this path-level spec does not enumerate. Alias:
@@ -5018,8 +5031,9 @@ components:
         `mode=streaming` model asked with `stream: true`) is instead
         `text/event-stream` or raw PCM (`application/octet-stream`, or
         `audio/pcm` from sglang-omni), chunked and without a
-        `Content-Length`, relayed byte for byte and billed from the PCM bytes
-        counted on a clean completion.
+        `Content-Length`, relayed byte for byte (an `sglang_omni` event stream
+        ended with a gateway-written `[DONE]`, which it lacks) and billed from
+        the PCM bytes counted on a clean completion.
       content:
         audio/wav:
           schema: { type: string, format: binary }
@@ -5070,7 +5084,9 @@ components:
         asked with `stream: true`) is instead `text/event-stream`: audio.cpp's
         own SSE, `transcript.text.delta` (incremental) -> `transcript.text.done`
         (the full `text` plus `timing.ttft_ms`, no `audio_duration_ms`) ->
-        `[DONE]`, relayed unbuffered and billed from the uploaded WAV header.
+        `[DONE]`, relayed unbuffered and billed from the uploaded WAV header
+        (or, when that measures nothing, from the `usage` duration the done
+        event states, as sglang-omni's does).
       content:
         application/json:
           schema:

@@ -899,14 +899,19 @@ text is skipped, not copied ([ADR-062](../09-architecture-decisions.md#adr-062--
 clean completion only.** When the gateway relays audio.cpp's SSE (a `mode=streaming` model,
 [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
 issue #262) there is no response `timing.audio_duration_ms` to read — the streamed
-`transcript.text.done` of audio.cpp carries only `ttft_ms`; sglang-omni's carries `usage{seconds}`, which the relay does not read — so the quantity comes from the **uploaded
+`transcript.text.done` of audio.cpp carries only `ttft_ms` — so the quantity comes from the **uploaded
 WAV header**: the `data` chunk's byte count over the format's byte-rate gives the duration,
-and `audio_second = duration / 1000`. The unit is unchanged (endpoint identity, token
+and `audio_second = duration / 1000`. Where the upload measures nothing (no WAV, or a WAV whose
+header cannot be believed) the quantity is the `usage` `{"type":"duration","seconds":N}` the
+**last** `transcript.text.done` states, sglang-omni's, held to the one-shot rule above (`type`
+exactly `duration`, `N` positive finite; a done event after `[DONE]` is not read), [ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni).
+That fallback is keyed on the stream, not the target type; audio.cpp's done event states no usage. The unit is unchanged (endpoint identity, token
 counts and both rates zero), and the rule is the same **loud-zero** rule, tightened to a
 clean completion: the quantity is set **only** when the stream ended with both the terminal
 `transcript.text.done` **and** `[DONE]` seen, and a stream that ends without both while the
 relay otherwise ended `success` (an error-status cut is already an error row) — or an upload
-that is not a parseable PCM WAV — records `0` and is logged once at `Error`. A
+that is not a parseable PCM WAV beside a done event whose usage is absent or unusable (the log's
+`usage` field says which) — records `0` and is logged once at `Error`. A
 **forged-header guard** bounds under-billing from both directions: the uploaded bytes may not
 exceed the header's declared `data` size by more than about 16 KiB — audio **hidden behind a
 small or zero `data` chunk**, which would under-report the duration, is a loud zero — and the
@@ -944,13 +949,27 @@ scan lost, because billing a short count would be a silent under-bill):
 | Outcome | `billing_unit` | `billing_quantity` |
 |---|---|---|
 | Clean completion, the mapping's output byte rate cached (`model_mapping_cache`, `output_byte_rate`, learned by the speech benchmark, which names one cached preset voice for a configured clone model, [ADR-076](../09-architecture-decisions.md#adr-076--a-configured-preset-clone-streams-in-the-portal-the-speech-benchmark-names-a-cached-preset-voice-both-exclusion-layers-relax-for-a-clone-model-with-presets-only-and-the-output-byte-rate-is-assumed-voice-independent)) | `audio_second` | PCM bytes ÷ byte rate — exactly what the one-shot header would have stated |
-| Clean completion, no rate cached (not benchmarked yet, not mono 16-bit PCM, or a reference-only clone model, which is never benchmarked) | `audio_bytes` | the PCM byte count |
+| Clean completion, no rate cached, an `sglang_omni` target whose `X-Sample-Rate`, `X-Channels` and `X-Bit-Depth` give a usable rate | `audio_second` | PCM bytes ÷ (sample rate × channels × bit depth / 8) |
+| Clean completion, no rate cached (not benchmarked yet, not mono 16-bit PCM, or a reference-only clone model, which is never benchmarked) and no header rate | `audio_bytes` | the PCM byte count |
 | Any other outcome (error status, copy error, idle timeout, client gone, no terminal events, a lost count, no audio) | `audio_second` | `0` |
 
 The rule of the unit above is **preserved in the form that protects it**: every failure,
 refusal and aborted-stream row keeps the endpoint-identity unit `audio_second`, so a failed
 request is never mislabelled, and only the success path chooses between the two audio units, from
-**mapping state** (is the rate cached?) and never from the response. The quantity is never a
+**mapping state** (is the rate cached?) and, for an `sglang_omni` target only, the format the
+response headers state. Those headers count only when each is stated exactly once as a plain
+decimal positive integer, the bit depth is a whole number of bytes and the product is a usable
+rate by the cached rate's own rule (`routing.ParseOutputByteRate`); a present but unusable or
+repeated one, or one missing beside the other two, gives no rate, never a guessed one, and is
+logged at `Warn`, naming the header, when the header rate would have been used, and three usable
+headers whose product is no usable rate are logged the same way, naming all three. The capture
+keeps the three among the speech metering headers, so a bill over the header rate can be audited
+([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+sglang-omni's event stream ends after `speech.audio.done` with no `[DONE]`; the relay writes
+that sentinel itself on a clean close after the done event with no error frame (an `error`
+event, or the agent router's untyped `{"error":{...}}` frame, by the audio benchmark's rule) and
+nothing lost, so the completion rule above holds for it unchanged, and a failed write of it is an
+error row that bills zero. The quantity is never a
 partial count: a stream cut short delivered some audio and bills none, and the two shapes that
 would read as a success that billed nothing (a stream that ended without a completion the gateway
 can count, and one that completed with no audio) are logged once at `Error`, the loud-zero rule
@@ -3341,7 +3360,10 @@ server's reservation, which keeps routed requests away.
 | ASR, `transcription_streaming` yes, live route served | The bundled clip sent **unpaced** over the live endpoint | audio ÷ wall time | first frame carrying transcript text (a delta or a partial) before the final one |
 | ASR, otherwise | One buffered transcription of the bundled clip | audio ÷ wall time | the whole answer (its text is usable only whole) |
 
-A streamed synthesis needs the mapping's output byte rate; when none is cached the
+A streamed synthesis counts only as a whole stream: `speech.audio.done` then `[DONE]`, or, for
+an `sglang_omni` target (which writes no `[DONE]`, and is asked for `response_format: pcm`
+because it refuses a stream in its default `wav`), a body that closes cleanly after
+`speech.audio.done`. It needs the mapping's output byte rate; when none is cached the
 speech benchmark measures and caches it (writing its own `speech` history row) — in a
 speed part before the stop-all when the run stops the server's models, else after the
 cold pass (**speed**, below).

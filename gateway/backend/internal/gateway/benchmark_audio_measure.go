@@ -229,8 +229,7 @@ func sseStreamError(line []byte, messageOf func(payload []byte) string) (code, m
 	}
 	// A member of another type is a member not stated; json decodes the others regardless.
 	_ = json.Unmarshal(payload, &frame)
-	hasError := len(frame.Error) > 0 && string(frame.Error) != "null"
-	if frame.Type != liveEventError && (frame.Type != "" || !hasError) {
+	if !isSSEErrorEvent(frame.Type, frame.Error) {
 		return "", "", false
 	}
 	code = liveErrorCode(payload)
@@ -238,6 +237,18 @@ func sseStreamError(line []byte, messageOf func(payload []byte) string) (code, m
 		code = own
 	}
 	return code, truncateRunes(messageOf(payload), speechBenchmarkErrorRunes), true
+}
+
+// isSSEErrorEvent is the one rule for which decoded SSE event is an error frame
+// (sseStreamError's two shapes): an event of type "error", or an event with no type whose
+// error member is stated and not null. The benchmark's measurements and the speech relay's
+// scan (speechStreamScan) both judge a frame by it, so a frame one of them takes for the
+// upstream's failure is never a frame the other lets pass.
+func isSSEErrorEvent(eventType string, errorMember json.RawMessage) bool {
+	if eventType == liveEventError {
+		return true
+	}
+	return eventType == "" && len(errorMember) > 0 && string(errorMember) != "null"
 }
 
 // speechStreamErrorMessage is what an error frame of a streamed synthesis says: the event's
@@ -295,11 +306,15 @@ func measureASRLive(ctx context.Context, client provider.NativeDuplexProxyClient
 // benchmark's request (the target's own model name, the text, and a clone model's preset
 // voice) asking for an event stream. stream_format is said outright although "sse" is
 // audio.cpp's default, because the measurement reads frames and would not parse the raw
-// PCM the other format answers; response_format stays unset, a stream is pcm.
+// PCM the other format answers -- and sglang-omni's own default is that raw format.
+// response_format stays unset for audio.cpp, whose stream is pcm without being told;
+// sglang-omni refuses a stream whose response_format is not pcm and defaults to wav
+// (ADR-103), so a request to it says pcm, as the relay's does.
 type audioStreamSpeechRequest struct {
 	speechBenchmarkRequest
-	Stream       bool   `json:"stream"`
-	StreamFormat string `json:"stream_format"`
+	Stream         bool   `json:"stream"`
+	StreamFormat   string `json:"stream_format"`
+	ResponseFormat string `json:"response_format,omitempty"`
 }
 
 // measureTTSStream synthesizes text as an event stream on target and times it:
@@ -316,11 +331,15 @@ type audioStreamSpeechRequest struct {
 // and a moment is the arrival of the read that completed its line. The synthesis ends at
 // speech.audio.done: a delta after it is not part of what was timed and is not counted.
 // The stream must end the way a whole synthesis does, speech.audio.done and then [DONE],
-// with every delta before done counted. Reading stops at any [DONE], so an upstream that
-// keeps the connection open after it cannot hold the measurement until its deadline; one
-// that comes before speech.audio.done ends a stream that has no done, and so no
-// measurement. An error frame anywhere before [DONE] -- audio.cpp's, or the terminal frame
-// of the agent's router after its keepalives (sseStreamError) -- is the upstream's refusal
+// with every delta before done counted. sglang-omni's stream has no [DONE]: its body ends
+// after the done event (ADR-103), so for a target of that kind the body closing cleanly
+// after speech.audio.done ends the stream too -- for that kind only, because for audio.cpp
+// a body that stops without [DONE] is a stream cut short. Reading stops at any [DONE], so
+// an upstream that keeps the connection open after it cannot hold the measurement until
+// its deadline; one that comes before speech.audio.done ends a stream that has no done,
+// and so no measurement. An error frame anywhere before [DONE] -- audio.cpp's,
+// sglang-omni's in place of its done event, or the terminal frame of the agent's router
+// after its keepalives (sseStreamError) -- is the upstream's refusal
 // (audioMeasureUpstreamRefused, with its code and message), and nothing after it is read.
 // voice is a clone model's preset voice, "" for a model that needs none.
 func (m audioMeasurer) measureTTSStream(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string, byteRate int) (audioMeasurement, error) {
@@ -378,11 +397,16 @@ type ttsStreamTiming struct {
 // measureTTSStream's rules, returning what it observed; every rule a stream breaks is the
 // error measureTTSStream documents.
 func (m audioMeasurer) streamSynthesis(ctx context.Context, client provider.NativeProxyClient, target routing.Target, text, voice string) (ttsStreamTiming, error) {
-	body, err := json.Marshal(audioStreamSpeechRequest{
+	omni := isSGLangOmniTarget(target)
+	request := audioStreamSpeechRequest{
 		speechBenchmarkRequest: speechBenchmarkRequest{Model: target.ProviderModel, Input: text, Voice: voice},
 		Stream:                 true,
 		StreamFormat:           speechStreamFormatSSE,
-	})
+	}
+	if omni {
+		request.ResponseFormat = speechFormatPCM
+	}
+	body, err := json.Marshal(request)
 	if err != nil {
 		return ttsStreamTiming{}, &audioMeasureError{Kind: audioMeasureInvalidInput, Message: "build the synthesis request", Err: err}
 	}
@@ -400,7 +424,7 @@ func (m audioMeasurer) streamSynthesis(ctx context.Context, client provider.Nati
 		return ttsStreamTiming{}, err
 	}
 
-	read, err := m.readSynthesisStream(resp.Body)
+	read, err := m.readSynthesisStream(resp.Body, omni)
 	if err != nil {
 		return ttsStreamTiming{}, err
 	}
@@ -412,7 +436,8 @@ func (m audioMeasurer) streamSynthesis(ctx context.Context, client provider.Nati
 
 // synthesisStreamRead is what reading one synthesis stream (readSynthesisStream) observed:
 // its counted audio, when its first audio delta and its speech.audio.done arrived, and
-// whether it ended with [DONE].
+// whether it ended the way a whole synthesis does (ended): with [DONE], or -- for a stream
+// whose end is the body's clean close -- by closing cleanly after speech.audio.done.
 type synthesisStreamRead struct {
 	scan        *speechStreamScan
 	first, done time.Time
@@ -423,7 +448,12 @@ type synthesisStreamRead struct {
 // can no longer be counted from, or its end. An error frame before [DONE] is the upstream's
 // refusal, and a read that fails is the stream's error; whether what was read is a whole
 // synthesis is complete's to judge.
-func (m audioMeasurer) readSynthesisStream(body io.Reader) (synthesisStreamRead, error) {
+//
+// endsAtClose says the stream is sglang-omni's, which has no [DONE] (ADR-103): for it a body
+// that closes cleanly -- the reader's io.EOF, never a read error -- after speech.audio.done,
+// with every frame before it counted, has ended. Any other stream that stops without [DONE]
+// stays unended, and complete refuses it as it always has.
+func (m audioMeasurer) readSynthesisStream(body io.Reader, endsAtClose bool) (synthesisStreamRead, error) {
 	read := synthesisStreamRead{scan: &speechStreamScan{maxLine: speechStreamMaxLine}}
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 0, audioStreamReadBytes), speechStreamMaxLine)
@@ -450,6 +480,11 @@ func (m audioMeasurer) readSynthesisStream(body io.Reader) (synthesisStreamRead,
 		// A frame past the relay's own bound is one the relay could not count either.
 		return synthesisStreamRead{}, audioStreamReadError("the synthesis stream", err, speechStreamMaxLine)
 	}
+	// With no read error the loop stopped at [DONE], at a lost count, or at the body's clean
+	// end; only the last, after the done event, is the end of a stream that has no [DONE].
+	if endsAtClose && !read.ended && !read.scan.lost && !read.done.IsZero() {
+		read.ended = true
+	}
 	return read, nil
 }
 
@@ -465,7 +500,8 @@ func (read *synthesisStreamRead) mark(at time.Time) {
 }
 
 // complete reports whether the stream read was a whole synthesis: every frame counted, ended
-// by speech.audio.done and then [DONE], with audio in it.
+// by speech.audio.done and then its end (ended: [DONE], or for sglang-omni the body's clean
+// close), with audio in it.
 func (read synthesisStreamRead) complete() error {
 	switch {
 	case read.scan.lost:
