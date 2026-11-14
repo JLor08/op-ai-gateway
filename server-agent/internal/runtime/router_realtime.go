@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,9 +47,17 @@ const realtimeIdleTimeout = 15 * time.Minute
 // the one case it does not bound).
 const realtimeCloseBound = 2 * time.Second
 
+// realtimeCauseGrace is how long a session that ended on a failed write waits
+// for the read that names the cause (relayRealtime, settleEnd).
+const realtimeCauseGrace = time.Second
+
 // codeRealtimeUpgradeRequired answers a GET /realtime/{model} that is not a
-// WebSocket handshake.
+// WebSocket handshake websocket.Accept would take (realtimeHandshakeRefusal).
 const codeRealtimeUpgradeRequired = "runtime.realtime_upgrade_required"
+
+// codeRealtimeOriginForbidden answers a realtime handshake whose Origin names
+// another host than the one it was sent to.
+const codeRealtimeOriginForbidden = "runtime.realtime_origin_forbidden"
 
 // The close reasons the router itself sends. Reasons a peer sent are relayed
 // as they are.
@@ -90,11 +99,14 @@ func (s realtimeSide) other() realtimeSide {
 // are closed with, and the side whose socket caused it (realtimeSideNone when
 // the router ended the session itself). The cause's socket is already closed,
 // or has had its close frame sent by coder/websocket, so it is closed without a
-// handshake.
+// handshake. write marks an end a failed write reported: it names the cause's
+// socket as lost, though that socket's own read usually reports why a moment
+// later (settleEnd).
 type realtimeEnd struct {
 	code   websocket.StatusCode
 	reason string
 	cause  realtimeSide
+	write  bool
 }
 
 // realtimeSessions tracks the open realtime sessions of one router, so Close can
@@ -167,6 +179,54 @@ func (rt *router) Close() {
 	}
 }
 
+// handshakeRefusal is the answer to a realtime request that is not a handshake
+// websocket.Accept would take.
+type handshakeRefusal struct {
+	status  int
+	code    string
+	message string
+}
+
+// realtimeHandshakeRefusal checks r the way websocket.Accept will, before
+// anything is admitted, so a malformed or cross-origin handshake never starts
+// or evicts a model only to be refused by Accept after the child was dialed:
+// HTTP/1.1 or later, Connection: upgrade, Upgrade: websocket,
+// Sec-WebSocket-Version 13 and exactly one Sec-WebSocket-Key that decodes to
+// 16 bytes are 400 runtime.realtime_upgrade_required when missing; an Origin
+// that names another host than r.Host is 403 runtime.realtime_origin_forbidden
+// (Accept's default rule, which this route keeps: the router authenticates
+// nothing, so it must not let a browser page on another site open a session).
+// An absent Origin -- the gateway's dial sends none -- passes. It returns nil
+// for a handshake Accept takes.
+func realtimeHandshakeRefusal(r *http.Request) *handshakeRefusal {
+	upgrade := func(message string) *handshakeRefusal {
+		return &handshakeRefusal{status: http.StatusBadRequest, code: codeRealtimeUpgradeRequired, message: message}
+	}
+	if !r.ProtoAtLeast(1, 1) || !headerHasToken(r.Header, "Connection", "upgrade") || !headerHasToken(r.Header, "Upgrade", "websocket") {
+		return upgrade("GET /realtime/{model} must be a WebSocket handshake")
+	}
+	if r.Header.Get("Sec-WebSocket-Version") != "13" {
+		return upgrade("the WebSocket handshake must carry Sec-WebSocket-Version 13")
+	}
+	keys := r.Header.Values("Sec-WebSocket-Key")
+	if len(keys) != 1 {
+		return upgrade("the WebSocket handshake must carry exactly one Sec-WebSocket-Key")
+	}
+	if key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(keys[0])); err != nil || len(key) != 16 {
+		return upgrade("the WebSocket handshake's Sec-WebSocket-Key must be 16 bytes, base64-encoded")
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return &handshakeRefusal{
+				status:  http.StatusForbidden,
+				code:    codeRealtimeOriginForbidden,
+				message: "the WebSocket handshake's Origin does not name the host it was sent to",
+			}
+		}
+	}
+	return nil
+}
+
 // serveRealtime handles GET /realtime/{model}: a WebSocket relay to a managed
 // child's /v1/realtime (sglang-omni with --enable-realtime), held for the whole
 // session. It is the router's one route that upgrades a connection, so it is
@@ -176,9 +236,10 @@ func (rt *router) Close() {
 // from ever running.
 //
 // Deliberate properties:
-//   - A request that is not a WebSocket handshake (Connection: upgrade plus
-//     Upgrade: websocket) is 400 runtime.realtime_upgrade_required before
-//     anything is admitted. The model is the decoded PATH after "/realtime/",
+//   - A request that is not a handshake websocket.Accept would take is refused
+//     before anything is admitted: 400 runtime.realtime_upgrade_required, or
+//     403 runtime.realtime_origin_forbidden for a foreign Origin
+//     (realtimeHandshakeRefusal). The model is the decoded PATH after "/realtime/",
 //     exactly as /live reads it; an empty model or a nil manager is 404
 //     runtime.model_not_managed, and so is an unknown model (EnsureServing).
 //   - The model is admitted with EnsureServing and its address read again once
@@ -202,8 +263,8 @@ func (rt *router) Close() {
 //     router's stop). From then on the session ends only as relayRealtime
 //     describes.
 func (rt *router) serveRealtime(w http.ResponseWriter, r *http.Request) {
-	if !isWebSocketUpgrade(r) {
-		writeError(w, http.StatusBadRequest, codeRealtimeUpgradeRequired, "GET /realtime/{model} must be a WebSocket handshake")
+	if refusal := realtimeHandshakeRefusal(r); refusal != nil {
+		writeError(w, refusal.status, refusal.code, refusal.message)
 		return
 	}
 	model := strings.TrimPrefix(r.URL.Path, realtimePathPrefix)
@@ -241,9 +302,11 @@ func (rt *router) serveRealtime(w http.ResponseWriter, r *http.Request) {
 	}
 	client, err := websocket.Accept(w, r, nil)
 	if err != nil {
-		// Accept has answered the client itself. Nothing was relayed, and
-		// nothing reads the child's socket, so it is dropped rather than closed
-		// with a handshake (closeRealtime explains why that matters).
+		// Accept has answered the client itself: the handshake was checked
+		// above, so what is left is a writer that cannot be hijacked or a
+		// hijack that failed. Nothing was relayed, and nothing reads the
+		// child's socket, so it is dropped rather than closed with a handshake
+		// (closeRealtime explains why that matters).
 		_ = child.CloseNow()
 		return
 	}
@@ -313,13 +376,6 @@ func realtimeChildHeader(in http.Header) http.Header {
 	return h
 }
 
-// isWebSocketUpgrade reports whether r asks for a WebSocket upgrade. The
-// remaining handshake checks (Sec-WebSocket-Version, Sec-WebSocket-Key) are
-// websocket.Accept's, which answers a malformed handshake itself.
-func isWebSocketUpgrade(r *http.Request) bool {
-	return headerHasToken(r.Header, "Connection", "upgrade") && headerHasToken(r.Header, "Upgrade", "websocket")
-}
-
 // headerHasToken reports whether one of key's comma-separated values is token,
 // in any letter case.
 func headerHasToken(h http.Header, key, token string) bool {
@@ -343,7 +399,10 @@ func headerHasToken(h http.Header, key, token string) bool {
 //     reason. A status that may not be sent on becomes 1011
 //     (sendableCloseCode); a close frame without a status is relayed as one.
 //   - a side lost without a close frame (a read or write error): the other side
-//     is closed with 1011.
+//     is closed with 1011. A failed write is not taken as the cause on its own:
+//     a write fails as soon as the peer it goes to has closed, which that
+//     peer's own read reports a moment later with the real status, so the
+//     session waits briefly for that read (settleEnd).
 //   - a message over realtimeMessageLimit: coder/websocket has already sent the
 //     offending side 1009, and the other side is closed with 1009 too.
 //   - realtimeIdle without a message in either direction (pings do not count):
@@ -376,6 +435,7 @@ wait:
 		case <-activity:
 			idle.Reset(rt.realtimeIdle)
 		case end = <-ends:
+			end = settleEnd(end, ends, rt.realtimeCauseWait)
 			break wait
 		case <-idle.C:
 			end = realtimeEnd{code: websocket.StatusPolicyViolation, reason: realtimeReasonIdle, cause: realtimeSideNone}
@@ -389,6 +449,32 @@ wait:
 	closeRealtime(client, child, end)
 	pumps.Wait() // both sockets are closed now, so both pumps' reads fail at once
 	return end
+}
+
+// settleEnd returns the end a session closes with, given the first end a pump
+// reported. A read's end is final. A failed write's end is not: when side X
+// closes, the pump writing to X fails at once with X "lost" -- and races X's
+// own pump, which reads X's close frame and reports its real status and reason.
+// Taken as it came, the first end would relay 1011 "X connection lost" instead
+// of what X sent whenever traffic was flowing towards X. So a write's end waits
+// up to wait for the other pump's end and prefers it when a read reported it;
+// it stands only when no read names a cause in time, or the other end is a
+// failed write as well. Each pump reports exactly once, so the next end on
+// ends is the other pump's.
+func settleEnd(first realtimeEnd, ends <-chan realtimeEnd, wait time.Duration) realtimeEnd {
+	if !first.write {
+		return first
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case next := <-ends:
+		if !next.write {
+			return next
+		}
+	case <-timer.C:
+	}
+	return first
 }
 
 // pumpRealtime relays messages from src to dst until either fails, reports why
@@ -414,7 +500,7 @@ func pumpRealtime(src, dst *websocket.Conn, from realtimeSide, activity chan<- s
 		}
 		if err := dst.Write(ctx, typ, data); err != nil {
 			to := from.other()
-			ends <- realtimeEnd{code: websocket.StatusInternalError, reason: to.lostReason(), cause: to}
+			ends <- realtimeEnd{code: websocket.StatusInternalError, reason: to.lostReason(), cause: to, write: true}
 			for {
 				if _, _, err := src.Read(ctx); err != nil {
 					return
@@ -478,6 +564,9 @@ func closeRealtime(client, child *websocket.Conn, end realtimeEnd) {
 			_ = conn.CloseNow()
 			return
 		}
+		// A peer that closed without a status leaves end.code at 1005, and
+		// coder/websocket sends Close(1005, ...) as a close frame without a
+		// status: the other side gets exactly what the peer sent, not a 1011.
 		_ = conn.Close(end.code, end.reason)
 	}
 	wg.Add(2)

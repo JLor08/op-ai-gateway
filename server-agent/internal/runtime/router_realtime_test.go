@@ -92,10 +92,11 @@ type childEnd struct {
 
 // realtimeChild is a fake realtime child: a WebSocket server at /v1/realtime
 // that greets each session with one text and one binary message, echoes every
-// message with its type, and obeys three text commands -- "child:close" closes
+// message with its type, and obeys four text commands -- "child:close" closes
 // with 4001 "child says bye", "child:drop" drops the connection without a close
-// frame, and "child:big" sends one binary message a byte over the router's
-// limit. seen receives each handshake's URL and headers its header, ended how
+// frame, "child:big" sends one binary message a byte over the router's limit,
+// and "child:flood" starts sending text messages back to back until a write
+// fails. seen receives each handshake's URL and headers its header, ended how
 // each session ended, and oversize the length of any message over the router's
 // limit that reached it (which it does not echo: the router must never have let
 // it through).
@@ -153,6 +154,14 @@ func newRealtimeChild(t *testing.T) *realtimeChild {
 				return
 			case typ == websocket.MessageText && string(data) == "child:big":
 				_ = conn.Write(ctx, websocket.MessageBinary, make([]byte, realtimeMessageLimit+1))
+			case typ == websocket.MessageText && string(data) == "child:flood":
+				go func() {
+					for {
+						if err := conn.Write(ctx, websocket.MessageText, []byte("flood")); err != nil {
+							return
+						}
+					}
+				}()
 			default:
 				_ = conn.Write(ctx, typ, data)
 			}
@@ -167,6 +176,7 @@ func newRealtimeChild(t *testing.T) *realtimeChild {
 // value each time a /realtime handler has returned -- release() included, since
 // it is deferred inside the handler -- which is when "release ran exactly once"
 // can be asserted without waiting for a second release that might still come.
+// m is nil for a rig over another managerPort (newRealtimeRigOver).
 type realtimeRig struct {
 	rt   *router
 	m    *realtimeManager
@@ -177,11 +187,19 @@ type realtimeRig struct {
 func newRealtimeRig(t *testing.T, endpoints map[string]string, tune func(*router)) *realtimeRig {
 	t.Helper()
 	m := newRealtimeManager(endpoints)
-	rt := newRouter(m)
+	rig := newRealtimeRigOver(t, m, tune)
+	rig.m = m
+	return rig
+}
+
+// newRealtimeRigOver is newRealtimeRig over any managerPort.
+func newRealtimeRigOver(t *testing.T, mp managerPort, tune func(*router)) *realtimeRig {
+	t.Helper()
+	rt := newRouter(mp)
 	if tune != nil {
 		tune(rt)
 	}
-	rig := &realtimeRig{rt: rt, m: m, done: make(chan struct{}, 8)}
+	rig := &realtimeRig{rt: rt, done: make(chan struct{}, 8)}
 	rig.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rt.ServeHTTP(w, r)
 		if strings.HasPrefix(r.URL.Path, realtimePathPrefix) {
@@ -464,16 +482,16 @@ func TestRouterRealtimeEveryEndReleasesOnce(t *testing.T) {
 }
 
 // TestRouterRealtimeBusySessionIsNotIdle: the idle timeout counts silence, not
-// session age -- a session that keeps relaying messages outlives several idle
-// windows. Each round trip is real relay work, so the loop never sleeps; it
-// stops after three idle windows have passed.
+// session age -- a session that keeps relaying messages outlives its idle
+// window twice over. Each round trip is real relay work, so the loop never
+// sleeps; it stops after two idle windows have passed.
 func TestRouterRealtimeBusySessionIsNotIdle(t *testing.T) {
-	const idle = 500 * time.Millisecond
+	const idle = time.Second
 	child := newRealtimeChild(t)
 	rig := newRealtimeRig(t, map[string]string{"m": child.srv.URL}, func(rt *router) { rt.realtimeIdle = idle })
 	c := dialRealtime(t, rig.srv, "/realtime/m")
 	readGreeting(t, c)
-	for start := time.Now(); time.Since(start) < 3*idle; {
+	for start := time.Now(); time.Since(start) < 2*idle; {
 		writeMessage(t, c, websocket.MessageText, []byte("tick"))
 		if _, data := readMessage(t, c); string(data) != "tick" {
 			t.Fatalf("echo = %q, want tick", data)
@@ -596,6 +614,260 @@ func TestRouterRealtimeOversizedFrameFromAStalledPeer(t *testing.T) {
 		t.Errorf("child end = %+v, want 1009", end)
 	}
 	rig.assertReleasedOnce(t)
+}
+
+// TestRouterRealtimeCloseUnderTrafficRelaysTheClosersStatus: a close is
+// relayed with the closer's own status and reason even while messages flow
+// towards the closer. Without settleEnd, the pump writing to the closer fails
+// the moment the closer's socket closes and races the closer's own pump, and
+// the far side got 1011 "<closer> connection lost" in most runs. Each direction
+// runs 50 sessions, so a race left open fails it all but certainly.
+func TestRouterRealtimeCloseUnderTrafficRelaysTheClosersStatus(t *testing.T) {
+	const runs = 50
+	t.Run("the client closes while the child floods it", func(t *testing.T) {
+		for i := range runs {
+			child := newRealtimeChild(t)
+			rig := newRealtimeRig(t, map[string]string{"m": child.srv.URL}, nil)
+			c := dialRealtime(t, rig.srv, "/realtime/m")
+			readGreeting(t, c)
+			writeMessage(t, c, websocket.MessageText, []byte("child:flood"))
+			for range 20 { // the flood is flowing towards the client
+				if _, data := readMessage(t, c); string(data) != "flood" {
+					t.Fatalf("run %d: message = %q, want flood", i, data)
+				}
+			}
+			_ = c.Close(4002, "client says bye")
+			if end := recv(t, child.ended, "the child's end"); end.code != 4002 || end.reason != "client says bye" {
+				t.Fatalf("run %d: child end = %+v, want the client's own 4002 \"client says bye\"", i, end)
+			}
+			rig.assertReleasedOnce(t)
+		}
+	})
+	t.Run("the child closes while the client floods it", func(t *testing.T) {
+		for i := range runs {
+			child := newRealtimeChild(t)
+			rig := newRealtimeRig(t, map[string]string{"m": child.srv.URL}, nil)
+			c := dialRealtime(t, rig.srv, "/realtime/m")
+			readGreeting(t, c)
+			flooding := make(chan struct{})
+			go func() {
+				defer close(flooding)
+				for {
+					if err := c.Write(context.Background(), websocket.MessageText, []byte("flood")); err != nil {
+						return
+					}
+				}
+			}()
+			for range 20 { // the flood is flowing towards the child, which echoes it
+				if _, data := readMessage(t, c); string(data) != "flood" {
+					t.Fatalf("run %d: message = %q, want the echoed flood", i, data)
+				}
+			}
+			writeMessage(t, c, websocket.MessageText, []byte("child:close"))
+			if code, reason := readClose(t, c); code != 4001 || reason != "child says bye" {
+				t.Fatalf("run %d: client close = %d %q, want the child's own 4001 \"child says bye\"", i, code, reason)
+			}
+			recv(t, flooding, "the client's flood to stop")
+			rig.assertReleasedOnce(t)
+		}
+	})
+}
+
+// TestRealtimeSettleEnd: a read's end stands; a failed write's end gives way to
+// the other pump's read end, but not to another failed write, and stands alone
+// once the wait is over.
+func TestRealtimeSettleEnd(t *testing.T) {
+	read := realtimeEnd{code: 4002, reason: "client says bye", cause: realtimeSideClient}
+	write := realtimeEnd{code: websocket.StatusInternalError, reason: "client connection lost", cause: realtimeSideClient, write: true}
+	otherWrite := realtimeEnd{code: websocket.StatusInternalError, reason: "child connection lost", cause: realtimeSideChild, write: true}
+	cases := []struct {
+		name  string
+		first realtimeEnd
+		next  []realtimeEnd // queued on ends before settleEnd runs
+		wait  time.Duration
+		want  realtimeEnd
+	}{
+		{"a read stands", read, []realtimeEnd{write}, realtimeWait, read},
+		{"a write gives way to a read", write, []realtimeEnd{read}, realtimeWait, read},
+		{"a write does not give way to a write", write, []realtimeEnd{otherWrite}, realtimeWait, write},
+		{"a write stands once the wait is over", write, nil, time.Millisecond, write},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ends := make(chan realtimeEnd, 2)
+			for _, e := range tc.next {
+				ends <- e
+			}
+			if got := settleEnd(tc.first, ends, tc.wait); got != tc.want {
+				t.Errorf("settleEnd = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// realtimeHandshake is a valid WebSocket handshake request for target, built
+// for a direct ServeHTTP call.
+func realtimeHandshake(target string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, target, nil)
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("Sec-WebSocket-Version", "13")
+	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	return r
+}
+
+// TestRouterRealtimeRefusesABadHandshakeBeforeAdmission: a handshake
+// websocket.Accept would refuse is refused before anything is admitted, so a
+// malformed or cross-origin request never starts or evicts a model: 400
+// runtime.realtime_upgrade_required for a malformed one, 403
+// runtime.realtime_origin_forbidden for a foreign Origin.
+func TestRouterRealtimeRefusesABadHandshakeBeforeAdmission(t *testing.T) {
+	cases := []struct {
+		name   string
+		edit   func(r *http.Request)
+		status int
+		code   string
+	}{
+		{"HTTP/1.0", func(r *http.Request) { r.Proto, r.ProtoMajor, r.ProtoMinor = "HTTP/1.0", 1, 0 }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"no Upgrade", func(r *http.Request) { r.Header.Del("Upgrade") }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"no version", func(r *http.Request) { r.Header.Del("Sec-WebSocket-Version") }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"version 8", func(r *http.Request) { r.Header.Set("Sec-WebSocket-Version", "8") }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"no key", func(r *http.Request) { r.Header.Del("Sec-WebSocket-Key") }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"two keys", func(r *http.Request) { r.Header.Add("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==") }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"key not base64", func(r *http.Request) { r.Header.Set("Sec-WebSocket-Key", "not base64!") }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"key of 15 bytes", func(r *http.Request) { r.Header.Set("Sec-WebSocket-Key", "MDEyMzQ1Njc4OWFiY2Rl") }, http.StatusBadRequest, codeRealtimeUpgradeRequired},
+		{"foreign Origin", func(r *http.Request) { r.Header.Set("Origin", "http://elsewhere.example") }, http.StatusForbidden, codeRealtimeOriginForbidden},
+		{"opaque Origin", func(r *http.Request) { r.Header.Set("Origin", "null") }, http.StatusForbidden, codeRealtimeOriginForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newRealtimeManager(map[string]string{"m": "http://127.0.0.1:1"})
+			r := realtimeHandshake("/realtime/m")
+			tc.edit(r)
+			rec := httptest.NewRecorder()
+			newRouter(m).ServeHTTP(rec, r)
+			if rec.Code != tc.status {
+				t.Fatalf("status = %d, want %d (%s)", rec.Code, tc.status, rec.Body.String())
+			}
+			if got := decodeRouterError(t, rec.Body); got.Code != tc.code {
+				t.Errorf("code = %q, want %q", got.Code, tc.code)
+			}
+			select {
+			case model := <-m.ensured:
+				t.Errorf("admitted %q; a refused handshake must start nothing", model)
+			default:
+			}
+		})
+	}
+	t.Run("an Origin naming the request's host passes", func(t *testing.T) {
+		r := realtimeHandshake("/realtime/m")
+		r.Header.Set("Origin", "http://"+r.Host)
+		if refusal := realtimeHandshakeRefusal(r); refusal != nil {
+			t.Errorf("refused %+v, want the handshake taken", *refusal)
+		}
+	})
+}
+
+// TestRouterRealtimeAcceptFailureDropsTheChild: when websocket.Accept fails
+// after the child was dialed -- here a writer that cannot be hijacked -- the
+// child sees its connection dropped, and the admission is released once.
+func TestRouterRealtimeAcceptFailureDropsTheChild(t *testing.T) {
+	child := newRealtimeChild(t)
+	m := newRealtimeManager(map[string]string{"m": child.srv.URL})
+	rec := httptest.NewRecorder() // no http.Hijacker
+	newRouter(m).ServeHTTP(rec, realtimeHandshake("/realtime/m"))
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("status = %d, want Accept's own 501 for a writer it cannot hijack", rec.Code)
+	}
+	recv(t, child.seen, "the child's handshake")
+	if end := recv(t, child.ended, "the child's end"); end.code != -1 {
+		t.Errorf("child end = %+v, want a drop without a close frame", end)
+	}
+	if held, releases := m.held.Load(), m.releases.Load(); held != 0 || releases != 1 {
+		t.Fatalf("held = %d, releases = %d; want nothing held and exactly one release", held, releases)
+	}
+}
+
+// blockingAdmission is a managerPort whose admission blocks until its context
+// ends: entered receives a value when an admission starts, left the context's
+// error when it gives up.
+type blockingAdmission struct {
+	entered chan struct{}
+	left    chan error
+}
+
+func newBlockingAdmission() *blockingAdmission {
+	return &blockingAdmission{entered: make(chan struct{}, 1), left: make(chan error, 1)}
+}
+
+func (b *blockingAdmission) EnsureRunning(ctx context.Context, model string) (string, func(), error) {
+	return b.EnsureServing(ctx, model)
+}
+
+func (b *blockingAdmission) EnsureServing(ctx context.Context, model string) (string, func(), error) {
+	b.entered <- struct{}{}
+	<-ctx.Done()
+	b.left <- ctx.Err()
+	return "", nil, fmt.Errorf("runtime: admission of %q abandoned: %w", model, ctx.Err())
+}
+func (b *blockingAdmission) ResolveAddress(string) (string, int, bool) { return "", 0, false }
+func (b *blockingAdmission) LoadedModels() []string                    { return nil }
+func (b *blockingAdmission) Status() []Status                          { return nil }
+
+// TestRouterRealtimeAdmissionIsAbandoned: an admission still waiting -- a cold
+// start, say -- is abandoned when the client leaves, and when the router is
+// closed: the session cannot be opened any more, so nothing may be started for
+// it. The second case is the router's stop reaching the admission's context.
+func TestRouterRealtimeAdmissionIsAbandoned(t *testing.T) {
+	t.Run("the client leaves", func(t *testing.T) {
+		b := newBlockingAdmission()
+		rig := newRealtimeRigOver(t, b, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		dialed := make(chan error, 1)
+		go func() {
+			c, _, err := websocket.Dial(ctx, wsURL(rig.srv, "/realtime/m"), nil)
+			if err == nil {
+				_ = c.CloseNow()
+			}
+			dialed <- err
+		}()
+		recv(t, b.entered, "the admission to start")
+		cancel()
+		if err := recv(t, b.left, "the admission to be abandoned"); !errors.Is(err, context.Canceled) {
+			t.Errorf("admission ended with %v, want context.Canceled", err)
+		}
+		recv(t, rig.done, "the realtime handler to return")
+		if err := recv(t, dialed, "the client's dial"); err == nil {
+			t.Error("the client's dial succeeded")
+		}
+	})
+	t.Run("the router closes", func(t *testing.T) {
+		b := newBlockingAdmission()
+		rig := newRealtimeRigOver(t, b, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), realtimeWait)
+		defer cancel()
+		dialed := make(chan *http.Response, 1)
+		go func() {
+			c, resp, err := websocket.Dial(ctx, wsURL(rig.srv, "/realtime/m"), nil)
+			if err == nil {
+				_ = c.CloseNow()
+			}
+			dialed <- resp
+		}()
+		recv(t, b.entered, "the admission to start")
+		closed := make(chan struct{})
+		go func() {
+			rig.rt.Close()
+			close(closed)
+		}()
+		if err := recv(t, b.left, "the admission to be abandoned"); !errors.Is(err, context.Canceled) {
+			t.Errorf("admission ended with %v, want context.Canceled", err)
+		}
+		if resp := recv(t, dialed, "the client's answer"); resp == nil || resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("client answer = %v, want 502 before any upgrade", resp)
+		}
+		recv(t, closed, "the router's Close to return")
+	})
 }
 
 // decodeRouterError reads the router's JSON error envelope from body.

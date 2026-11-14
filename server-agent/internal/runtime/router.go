@@ -357,12 +357,15 @@ type router struct {
 	// realtime tracks the open GET /realtime/{model} sessions, so Close can
 	// end them (router_realtime.go).
 	realtime *realtimeSessions
-	// realtimeIdle is a realtime session's idle timeout (realtimeIdleTimeout)
-	// and realtimeCloseWait how long Close waits for the sessions it ends
-	// (realtimeCloseBound). Fields rather than constants so a test can shrink
+	// realtimeIdle is a realtime session's idle timeout (realtimeIdleTimeout),
+	// realtimeCloseWait how long Close waits for the sessions it ends
+	// (realtimeCloseBound), and realtimeCauseWait how long a session that
+	// ended on a failed write waits for the read naming the cause
+	// (realtimeCauseGrace). Fields rather than constants so a test can set
 	// them on its own router.
 	realtimeIdle      time.Duration
 	realtimeCloseWait time.Duration
+	realtimeCauseWait time.Duration
 }
 
 func newRouter(m managerPort) *router {
@@ -372,6 +375,7 @@ func newRouter(m managerPort) *router {
 		realtime:          newRealtimeSessions(),
 		realtimeIdle:      realtimeIdleTimeout,
 		realtimeCloseWait: realtimeCloseBound,
+		realtimeCauseWait: realtimeCauseGrace,
 	}
 }
 
