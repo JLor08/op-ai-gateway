@@ -899,7 +899,7 @@ text is skipped, not copied ([ADR-062](../09-architecture-decisions.md#adr-062--
 clean completion only.** When the gateway relays audio.cpp's SSE (a `mode=streaming` model,
 [ADR-065](../09-architecture-decisions.md#adr-065--streaming-transcription-the-gateway-relays-the-sse-for-a-streaming-model-gated-by-a-transcription_streaming-verdict-with-a-retry-buffered-on-500-safety-net-bills-the-streamed-call-from-the-wav-header-and-the-portal-chat-run-streams-the-transcript),
 issue #262) there is no response `timing.audio_duration_ms` to read — the streamed
-`transcript.text.done` carries only `ttft_ms` — so the quantity comes from the **uploaded
+`transcript.text.done` of audio.cpp carries only `ttft_ms`; sglang-omni's carries `usage{seconds}`, which the relay does not read — so the quantity comes from the **uploaded
 WAV header**: the `data` chunk's byte count over the format's byte-rate gives the duration,
 and `audio_second = duration / 1000`. The unit is unchanged (endpoint identity, token
 counts and both rates zero), and the rule is the same **loud-zero** rule, tightened to a

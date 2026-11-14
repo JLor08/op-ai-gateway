@@ -157,3 +157,63 @@ func TestImagesEditToOtherTargetsKeepsTheClientsParts(t *testing.T) {
 		})
 	}
 }
+
+// python-multipart splits a Content-Disposition with a copy of CPython's
+// email.message._parseparam, which counts quotes as count('"') - count('\\"'), so a
+// quoted value ending in a backslash misparses and a smuggled parameter becomes a
+// field the gateway never saw. The relayed names and filenames therefore stay inside a
+// charset that has no such shape: a refused part is a 400 naming the header, never the
+// value, and a plain filename with a space still passes.
+func TestImagesEditToSGLangOmniRefusesUnsafePartNames(t *testing.T) {
+	cases := map[string]string{
+		"backslash name smuggling a url field":    "Content-Disposition: form-data; name=\"a\\\\\"; filename=\";name=url;\"\r\n\r\n/etc/passwd",
+		"filename with quote semicolon backslash": "Content-Disposition: form-data; name=\"image\"; filename=\"x\\\"; name=\\\"url;\\\\\"\r\n\r\n/etc/passwd",
+		"filename with a plain quote":             "Content-Disposition: form-data; name=\"image\"; filename=\"a\\\"b.png\"\r\n\r\nPNGDATA",
+		"filename with a semicolon":               "Content-Disposition: form-data; name=\"image\"; filename=\"a;b.png\"\r\n\r\nPNGDATA",
+		"filename with a backslash":               "Content-Disposition: form-data; name=\"image\"; filename=\"a\\\\b.png\"\r\n\r\nPNGDATA",
+		"name with a space":                       "Content-Disposition: form-data; name=\"zz yy\"\r\n\r\nx",
+		"name with a semicolon":                   "Content-Disposition: form-data; name=\"a;b\"\r\n\r\nx",
+		"empty name":                              "Content-Disposition: form-data; name=\"\"\r\n\r\nx",
+	}
+	for name, part := range cases {
+		t.Run(name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: editsOKBody}
+			srv := newSGLangOmniEditTestServer(t, prov, routing.RuntimeSpecTypeSGLangOmni)
+			body := rawEditBody(omniEditBoundary, omniModelPart, omniPromptPart, omniImagePart, part)
+			rec := postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, "multipart/form-data; boundary="+omniEditBoundary, map[string]string{"Authorization": "Bearer dev-secret"})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "images.source_unsupported")
+			if prov.proxyCalls != 0 {
+				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+			}
+			if !strings.Contains(rec.Body.String(), "Content-Disposition") {
+				t.Fatalf("refusal does not name the Content-Disposition header: %s", rec.Body.String())
+			}
+			for _, leak := range []string{"passwd", "name=url", "zz yy", "b.png"} {
+				if strings.Contains(rec.Body.String(), leak) {
+					t.Fatalf("refusal echoes the value (%q): %s", leak, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+// The charset rule leaves ordinary uploads alone: a filename with a space, and the
+// bracketed, dotted and dashed names OpenAI clients send, are relayed.
+func TestImagesEditToSGLangOmniRelaysSafePartNames(t *testing.T) {
+	prov := &recordingProxyProvider{respBody: editsOKBody}
+	srv := newSGLangOmniEditTestServer(t, prov, routing.RuntimeSpecTypeSGLangOmni)
+	body := rawEditBody(omniEditBoundary, omniModelPart, omniPromptPart,
+		"Content-Disposition: form-data; name=\"image\"; filename=\"photo 1.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA",
+		"Content-Disposition: form-data; name=\"image[]\"; filename=\"photo-2_b.v1.png\"\r\nContent-Type: image/png\r\n\r\nPNGDATA",
+	)
+	rec := postEditRaw(t, srv, http.MethodPost, "/v1/images/edits", body, "multipart/form-data; boundary="+omniEditBoundary, map[string]string{"Authorization": "Bearer dev-secret"})
+	if rec.Code != http.StatusOK || prov.proxyCalls != 1 {
+		t.Fatalf("status = %d, calls = %d, want a relayed 200; body = %s", rec.Code, prov.proxyCalls, rec.Body.String())
+	}
+	if !strings.Contains(string(prov.gotBody), `filename="photo 1.png"`) {
+		t.Fatalf("relayed body lost the filename: %q", prov.gotBody)
+	}
+}

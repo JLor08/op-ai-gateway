@@ -646,8 +646,13 @@ exactly one `Content-Disposition` that parses and is `form-data` (Starlette keep
 a duplicated parameter fails the parse), when it carries a `url` or `url[]` part, or when an `image` or `image[]` part has
 no filename (Starlette makes a part an uploaded file only by its filename). The message names the field, never a value.
 Every form it accepts is rebuilt, each part with headers the gateway wrote (`sglangOmniEditPartHeader`: a `form-data`
-Content-Disposition with the name and filename it read, plus the part's Content-Type), so the upstream reads what the
-gateway checked.
+Content-Disposition with the name and filename it read, plus the part's Content-Type). python-multipart splits a
+disposition's parameters with a copy of CPython's `email.message._parseparam`, which counts quotes as
+`count('"') - count('\\"')`, so a quoted value ending in a backslash misparses and can smuggle a parameter (a part Go saw as
+an unknown file field becomes the text field `url` upstream). The rebuild is therefore only trusted inside a charset: every
+relayed part's name must match `^[A-Za-z0-9_.\[\]-]+$` and its filename, when present, must hold no `\`, `"`, `;`, CR, LF
+or other control character, else the same 400 (the message names the Content-Disposition header, never the value). Inside it
+the quoting the gateway writes reads back identically, so the upstream reads what the gateway checked.
 
 **5. The mask: alpha in, luminance out.** An OpenAI edit marks the region to
 regenerate by **transparency** (an RGBA PNG whose transparent pixels are the
@@ -893,7 +898,10 @@ stripped. A body that is no WAV, or one with no audio bytes, keeps the logged ze
 rule above, and sglang-omni's raw stream counts as its raw shape: its `stream_format` defaults to `audio`, and it labels
 the headerless PCM `audio/pcm` rather than `application/octet-stream`, so `newSpeechStreamScan` takes either as raw PCM,
 billed from the bytes on a body closed cleanly. Its event stream ends on `speech.audio.done` without a `[DONE]`, which the
-scan does not count as a completion, so a streamed sglang-omni call in `sse` shape stays the logged zero.
+scan does not count as a completion, so a streamed sglang-omni call in `sse` shape stays the logged zero. The same missing
+`[DONE]` is a **known residual** for the portal voice-chat TTS leg (`chat_runs_audio_stream.go`): its reader treats a stream
+without `[DONE]` as incomplete and drops the tail part. Both are reachable only when the route's `speech_streaming`
+verdict is a manual yes.
 
 *Inline voice references for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni reads a bare `ref_audio` path from the model
 host and fetches a URL, and authenticates nothing, so the gateway relays only inline voice references to a target whose
@@ -1256,7 +1264,9 @@ leaves) — the quantity is sglang-omni's own statement, `usage` `{"type":"durat
 (`transcriptionUsageSeconds`), read only when the type is exactly `duration` and `N` a positive finite number; sglang-omni
 measures the audio it decoded and rounds up to whole seconds. audio.cpp's statement always wins, and a present but unusable
 value stays the Error log and quantity `0`. Anything else (no measurable WAV and no such statement) also stays the logged
-zero: a duration is never guessed (ADR-041).
+zero: a duration is never guessed (ADR-041). A **streamed** transcription to sglang-omni is billed only from the uploaded WAV:
+the final `transcript.text.done` event's `usage{seconds}` is not read, so a streamed non-WAV upload is a logged zero (a
+known residual).
 
 **10. Resolving a transcription writes the token's last-used-model marker, and the
 redirect takes a transcription candidate.** `relayTranscription` resolves through

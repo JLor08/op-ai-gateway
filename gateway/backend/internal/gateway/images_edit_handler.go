@@ -19,9 +19,11 @@ import (
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // defaultMaxImageEditBodyBytes is the default bound on the multipart read of POST
@@ -489,22 +491,32 @@ func sglangOmniEditSourceRefusal(raw []byte, boundary string) *imageSourceRefusa
 //     Starlette keeps the LAST Content-Disposition of a part while Go's FormName and
 //     FileName read the first, and a duplicated parameter (two names) is one more way
 //     for the two to disagree; mime.ParseMediaType refuses that one.
+//
 //   - url and url[] are refused: the upstream resolves their value whatever its shape.
+//
 //   - image and image[] must be file parts (a non-empty filename): Starlette makes a
 //     part an uploaded file only when its Content-Disposition names a filename.
 //
+//   - the name matches sglangOmniPartNamePattern and the filename holds no backslash,
+//     double quote, semicolon or control character. python-multipart splits the
+//     parameters with a copy of CPython's email.message._parseparam, which counts
+//     quotes as count('"') - count('\\"'), so a quoted value ending in a backslash
+//     misparses and can turn the rest of the line into a smuggled parameter (a part the
+//     gateway saw as an unknown file field becomes the text field url). Inside the
+//     charset the quoting the gateway writes is read back identically.
+//
 // The header returned carries a Content-Disposition the gateway built from what it
 // read (form-data, the name and, when there is one, the filename) and the part's
-// Content-Type, and nothing else the client sent, so what the upstream reads is what
-// the gateway checked. The refusal names the field and never echoes a value.
+// Content-Type, and nothing else the client sent. The refusal names the field and
+// never echoes a value.
 func sglangOmniEditPartHeader(part *multipart.Part) (textproto.MIMEHeader, *imageSourceRefusal) {
-	dispositions := part.Header.Values("Content-Disposition")
+	dispositions := part.Header.Values(contentDispositionHeader)
 	if len(dispositions) != 1 {
-		return nil, &imageSourceRefusal{field: "Content-Disposition", message: "every form part must carry exactly one Content-Disposition header for this model server"}
+		return nil, &imageSourceRefusal{field: contentDispositionHeader, message: "every form part must carry exactly one Content-Disposition header for this model server"}
 	}
 	disposition, params, err := mime.ParseMediaType(dispositions[0])
 	if err != nil || disposition != "form-data" {
-		return nil, &imageSourceRefusal{field: "Content-Disposition", message: "every form part's Content-Disposition must be a well-formed form-data disposition for this model server"}
+		return nil, &imageSourceRefusal{field: contentDispositionHeader, message: "every form part's Content-Disposition must be a well-formed form-data disposition for this model server"}
 	}
 	name, filename := params["name"], part.FileName()
 	switch name {
@@ -515,16 +527,41 @@ func sglangOmniEditPartHeader(part *multipart.Part) (textproto.MIMEHeader, *imag
 			return nil, &imageSourceRefusal{field: name, message: fmt.Sprintf("form field %q must be an uploaded file with a filename; this model server would read a text value as a server-side path or fetch it as a URL", name)}
 		}
 	}
+	if refusal := sglangOmniEditPartNameRefusal(name, params["filename"]); refusal != nil {
+		return nil, refusal
+	}
 	h := textproto.MIMEHeader{}
 	value := fmt.Sprintf("form-data; name=%q", name)
 	if filename != "" {
 		value += fmt.Sprintf("; filename=%q", filename)
 	}
-	h.Set("Content-Disposition", value)
+	h.Set(contentDispositionHeader, value)
 	if ct := part.Header.Get(contentTypeHeader); ct != "" {
 		h.Set(contentTypeHeader, ct)
 	}
 	return h, nil
+}
+
+// contentDispositionHeader is the multipart part header that names a part and its file.
+const contentDispositionHeader = "Content-Disposition"
+
+// sglangOmniPartNamePattern is the charset of a part name relayed to an sglang_omni
+// target: what the form fields of /v1/images/edits (image, image[], model, n, ...) use.
+var sglangOmniPartNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.\[\]-]+$`)
+
+// sglangOmniEditPartNameRefusal refuses a part whose name or filename is outside the
+// charset sglang-omni's parameter parser reads the same way the gateway does (see
+// sglangOmniEditPartHeader). It names the header and never echoes the value.
+func sglangOmniEditPartNameRefusal(name, filename string) *imageSourceRefusal {
+	if !sglangOmniPartNamePattern.MatchString(name) {
+		return &imageSourceRefusal{field: contentDispositionHeader, message: "every form part's Content-Disposition name must consist only of letters, digits and _ . [ ] - for this model server"}
+	}
+	if strings.ContainsFunc(filename, func(r rune) bool {
+		return r == '\\' || r == '"' || r == ';' || unicode.IsControl(r)
+	}) {
+		return &imageSourceRefusal{field: contentDispositionHeader, message: "a form part's Content-Disposition filename must not contain a backslash, double quote, semicolon or control character for this model server"}
+	}
+	return nil
 }
 
 // imageSourceRefusal is an images.source_unsupported refusal: the field it names (a
@@ -537,8 +574,9 @@ type imageSourceRefusal struct {
 
 // rebuildImageEditBody returns raw with the changes of rb applied, as a new
 // multipart body and its Content-Type (a fresh boundary). Every part the changes
-// do not touch -- its headers, its bytes, and its position -- is copied exactly
-// as the client sent it. The model change replaces the value of the model field,
+// do not touch keeps its bytes and its position; its headers are copied as the
+// client sent them, except under rb.canonical, where the gateway rebuilds them
+// (sglangOmniEditPartHeader). The model change replaces the value of the model field,
 // the one the agent's router (and, now, any model-routing upstream) reads; the
 // mask change replaces the content of the mask part IN PLACE with the converted
 // mask, as a PNG file part (imageEditMaskFilename). A mask edit is therefore
@@ -577,8 +615,9 @@ func rebuildImageEditBody(raw []byte, boundary string, rb imageEditRebuild) ([]b
 
 // writeRebuiltPart writes one part of the client's form into the rebuilt body: the
 // model field with rb.model for its value when that is set, the mask part with the
-// converted rb.mask for its content when that is set, and every other part -- its
-// headers and its bytes -- as the client sent it.
+// converted rb.mask for its content when that is set, and every other part with its
+// bytes as the client sent them and its headers as the client sent them -- or, under
+// rb.canonical, rebuilt by sglangOmniEditPartHeader.
 func writeRebuiltPart(mw *multipart.Writer, part *multipart.Part, rb imageEditRebuild) error {
 	if rb.model != "" && part.FormName() == "model" {
 		if err := mw.WriteField("model", rb.model); err != nil {
@@ -612,7 +651,7 @@ func writeRebuiltPart(mw *multipart.Writer, part *multipart.Part, rb imageEditRe
 // file part named imageEditMaskFilename.
 func writeConvertedMaskPart(mw *multipart.Writer, mask []byte) error {
 	h := textproto.MIMEHeader{}
-	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="mask"; filename=%q`, imageEditMaskFilename))
+	h.Set(contentDispositionHeader, fmt.Sprintf(`form-data; name="mask"; filename=%q`, imageEditMaskFilename))
 	h.Set(contentTypeHeader, mediaTypePNG)
 	pw, err := mw.CreatePart(h)
 	if err != nil {

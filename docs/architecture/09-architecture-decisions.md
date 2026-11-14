@@ -12640,7 +12640,10 @@ the change.
   that is not one JSON object refused (400 `speech.reference_audio_unsupported`). Chat `image_url.url`, translated Anthropic images
   included, must be `data:` (400 `chat.media_url_unsupported`). An image edit's source must be an uploaded file: `url` and `url[]`
   are refused, `image` and `image[]` need a filename, a part needs exactly one parseable `form-data` Content-Disposition (Starlette
-  reads the last, Go the first), and every relayed part is rebuilt with gateway-written headers (400 `images.source_unsupported`).
+  reads the last, Go the first), and every relayed part is rebuilt with gateway-written headers (400 `images.source_unsupported`). The
+  rebuild is trusted only inside a charset, because python-multipart's parameter splitter (a copy of CPython's `_parseparam`) counts
+  quotes as `count('"') - count('\\"')` and a value ending in a backslash lets a client smuggle a parameter: a part name must
+  match `^[A-Za-z0-9_.\[\]-]+$` and a filename must hold no `\`, `"`, `;` or control character, else the same 400.
   All are logged at Warn with a usage row. The top-level chat fields `audios`, `images` and `videos` never reach the provider.
 - **No host paths, for a resolved target of effective type `sglang`.** Chat `image_url.url` must be a `data:`, `http://` or
   `https://` URL (the scheme case-insensitive); anything else, a bare path or `file://` included, is refused with the same 400
@@ -12679,5 +12682,9 @@ the change.
   whose body states no usable `usage` duration, and a one-shot speech body that is no WAV, bill quantity 0 with an Error log.
 - **Speech and transcription verdicts are manual** for `sglang_omni`, and the model is not offered for audio until they are set under the
   `openai_audio` flavor.
+- **Streaming residuals for sglang-omni, both behind a manual `speech_streaming`/`transcription_streaming` yes.** A streamed
+  transcription is billed only from the uploaded WAV: the final `transcript.text.done` event's `usage{seconds}` is not read, so a
+  streamed non-WAV upload is a logged zero. Its SSE speech stream ends on `speech.audio.done` without `[DONE]`, so the portal
+  voice-chat TTS leg treats the stream as incomplete and drops the tail, and the call's billing is a logged zero.
 - **Not verified live:** an sglang-omni server end to end through the agent. The contracts were read off the pinned commits.
 - **Older agents** ignore the type strings: the gateway sees a best-effort context and no SGLang queue gauge.
