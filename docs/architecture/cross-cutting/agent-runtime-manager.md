@@ -10217,7 +10217,14 @@ operator meets first:
   502); a peer that freezes
   mid-frame during a close handshake is unbounded in coder/websocket; and nginx does
   not upgrade `/v1/realtime/` with a trailing slash. Nothing is written for a request
-  refused before a target is chosen.
+  refused before a target is chosen. A session is admitted once; the gateway then
+  re-checks its credential, token quota and cost budget every minute and ends it at a
+  maximum lifetime (`OP_AI_GATEWAY_REALTIME_MAX_SESSION`, default 60 minutes), but the
+  session's own running consumption reaches the aggregate those checks read only with
+  the one row written when it ends, so a single session can overrun a token quota or
+  cost budget by up to what it consumes within that lifetime (unbounded when the
+  operator sets `0`). The agent route itself has no lifetime bound, only its 15-minute
+  idle limit: the bound is the gateway's.
 - **Device names follow the backend's enumeration, not the host index**
   (§3.2, §3.6). A `${DEVICES}`-style token renders the declared GPU indices under
   the backend prefix, but the number the backend gives a card is its own:

@@ -885,8 +885,16 @@ paths:
         dial of the agent is the mapped provider error (502 or 503), before the
         upgrade.
         The session ends after 15 minutes without a message in either direction
-        (close code 1008), and on shutdown the gateway waits at most 6 s for open
-        sessions (close code 1001). The session shows in Active Requests.
+        (close code 1008, reason `idle_timeout`), at its maximum lifetime however
+        busy it is (OP_AI_GATEWAY_REALTIME_MAX_SESSION, default 60 minutes, 0 for
+        none; close code 1008, reason `max_session_duration`), and on shutdown the
+        gateway waits at most 6 s for open sessions (close code 1001). Every
+        minute the gateway re-checks the principal: the credential through the
+        leg that admitted it (close code 1008, reason `token_invalid`, for a
+        revoked, expired or re-scoped key or a gone or disabled loopback user),
+        and the token quota and cost budget (close code 1008, reason
+        `token_quota_exceeded` or `cost_budget_exceeded`); the rate limit and
+        request quota are not re-checked. The session shows in Active Requests.
         Metered with ONE usage row per session, `http_status` 101. The row is in
         `audio_second` when the client appended any audio, from its
         `input_audio_buffer.append` frames (base64 alphabet characters of `audio`
@@ -894,8 +902,12 @@ paths:
         upstream's usage is ignored then, because sglang-omni sends a null usage
         for cancelled turns and runs an unbilled transcription pass. A session
         without audio is in tokens (the sum of the upstream's `response.done`
-        `response.usage`); otherwise a logged zero. Close codes 1000, 1001 and 1005 are a success,
-        any other code is the error `realtime.close_<code>`. A session whose dial of the
+        `response.usage`); otherwise a logged zero. An end on the lifetime or a
+        re-check is the error `realtime.max_session_duration`,
+        `realtime.token_invalid`, `limit.token_quota_exceeded` or
+        `limit.cost_budget_exceeded`; otherwise close codes 1000, 1001 and 1005 are a success,
+        any other code is the error `realtime.close_<code>`. Every row bills what
+        the session relayed, however it ended. A session whose dial of the
         agent fails records its one row with the refusal's error status (502 or 503),
         and one whose client handshake cannot be accepted after a successful dial
         records 500 with the error code `realtime.accept_failed`; 101 is a session

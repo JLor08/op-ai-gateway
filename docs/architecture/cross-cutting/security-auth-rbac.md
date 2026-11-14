@@ -1057,7 +1057,9 @@ for the rest of the window. No rate bucket is touched and no `UsageAggregateSinc
 issued on that path, so zero-config is a genuine short-circuit rather than
 four checks that each happen to pass — and that is what makes an all-zero PUT
 the supported way to *clear* limits, a stored all-zero row being behaviorally
-identical to no row. What the memory driver can and cannot enforce once limits
+identical to no row. `PrincipalLimiter.Check`, the non-consuming re-check a
+`/v1/realtime` session runs every minute, shares that config resolution and its
+fail-open rule, and on a zero config reads no aggregate either. What the memory driver can and cannot enforce once limits
 *are* set is a separate question, answered in [Telemetry, Usage Analytics &
 Observability §8.4.5](telemetry-usage-observability.md#845-cost-and-currency).
 
