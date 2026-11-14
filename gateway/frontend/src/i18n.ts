@@ -1186,6 +1186,19 @@ const de = {
   mappingSpeechCapable: 'Sprachsynthese',
   mappingSpeechCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es Sprache synthetisiert. Das wird automatisch aus dem Feld „task“ in /v1/models des audio.cpp-Servers erkannt: durch das Gateway mit dem nächsten Health-Check bei einem statischen Server, den es direkt erreicht, und durch den Server-Agent (ab Version 0.9.1) bei einem Modell, das er startet. Wo das noch kein Ergebnis geliefert hat, etwa bei einem älteren Agent oder einem Modell, das die Auflistung nicht nennt, setze es auf Ja, um die Sprachsynthese freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
+  // Die Verfeinerungen der Sprachsynthese und Transkription: audio.cpp setzt
+  // sie selbst aus Modus und Task in /v1/models; ein „Nein“ ist dem Probe
+  // vorbehalten. Jede andere Engine (sglang_omni hat keine Abfrage) braucht das
+  // manuelle Ja.
+  mappingSpeechStreaming: 'Sprachsynthese gestreamt',
+  mappingSpeechStreamingUnknownHint:
+    'Unbekannt: Eine Sprachanfrage mit stream=true wird als einmalige, gepufferte Antwort beantwortet. Bei audio.cpp setzt das Gateway bzw. der Server-Agent dies selbst aus dem Feld „mode“ in /v1/models („streaming“). Andere Engines wie sglang_omni werden nicht abgefragt: Setze es dort auf Ja, damit das Gateway die Sprachausgabe als Stream weiterreicht.',
+  mappingSpeechClone: 'Benötigt Referenzstimme (Klon)',
+  mappingSpeechCloneHint:
+    'Ja kennzeichnet ein Modell, das Sprache nur in einer mitgeschickten Referenzstimme erzeugt. Es schaltet KEIN Stimmklonen frei: Das Modell wird aus der Sprachmodell-Auswahl des Portal-Chats ausgeblendet, weil eine Chat-Anfrage keine Referenzstimme mitschicken kann (außer das Gateway hat für das Modell vorkonfigurierte Stimmen gefunden). Bei audio.cpp wird es automatisch aus dem Feld „task“ in /v1/models („clon“) gesetzt; setze es nur für das Modell einer anderen Engine auf Ja, das eine Referenzstimme verlangt.',
+  mappingTranscriptionStreaming: 'Transkription gestreamt',
+  mappingTranscriptionStreamingUnknownHint:
+    'Unbekannt: Eine Transkription mit stream=true wird als einmalige, gepufferte Antwort beantwortet. Bei audio.cpp setzt das Gateway bzw. der Server-Agent dies selbst aus dem Feld „mode“ in /v1/models („streaming“). Andere Engines wie sglang_omni werden nicht abgefragt: Setze es dort auf Ja, damit das Gateway das Transkript als Stream weiterreicht.',
   mappingDecisionCapable: 'Entscheidungen (System One)',
   mappingDecisionCapableUnknownHint:
     'Unbekannt: für dieses Mapping ist nicht festgelegt, ob es System-One-Entscheidungen liefert. Das ermittelt die Prüfung der Entscheidungsmodelle automatisch. Wo sie noch kein Ergebnis geliefert hat, setze es auf Ja, um POST /v1/systemone für dieses Modell freizugeben. Ein hier gesetztes Ja hat Vorrang vor der automatischen Erkennung.',
@@ -5235,6 +5248,18 @@ const en: PortalMessages = {
   mappingSpeechCapable: 'Speech synthesis',
   mappingSpeechCapableUnknownHint:
     'Unknown: whether this mapping synthesises speech is not on file. It is detected automatically from the "task" field of the audio.cpp server\'s /v1/models: by the gateway on the next health check for a static server it reaches directly, and by the server agent (version 0.9.1 or later) for a model it launches. Where that has not produced a verdict yet, for example with an older agent or a model the listing does not name, set it to Yes to enable speech synthesis. A Yes set here takes precedence over the automatic detection.',
+  // The speech and transcription refinements: audio.cpp sets them itself from
+  // the mode and task of /v1/models, and a No is reserved for that probe. Any
+  // other engine (sglang_omni has no probe) needs the manual Yes.
+  mappingSpeechStreaming: 'Streamed speech',
+  mappingSpeechStreamingUnknownHint:
+    'Unknown: a speech request with stream=true is answered with one buffered response. For audio.cpp the gateway or the server agent sets this itself from the "mode" field of /v1/models ("streaming"). Other engines such as sglang_omni are not probed: set it to Yes there so the gateway relays the speech as a stream.',
+  mappingSpeechClone: 'Requires a reference voice (clone)',
+  mappingSpeechCloneHint:
+    'Yes marks a model that synthesises speech only in a reference voice sent with the request. It does NOT enable voice cloning: it hides the model from the portal chat\'s speech model picker, because a chat request cannot send a reference voice (unless the gateway has found preset voices for the model). For audio.cpp it is set automatically from the "task" field of /v1/models ("clon"); set it to Yes only for another engine\'s model that requires a reference voice.',
+  mappingTranscriptionStreaming: 'Streamed transcription',
+  mappingTranscriptionStreamingUnknownHint:
+    'Unknown: a transcription request with stream=true is answered with one buffered response. For audio.cpp the gateway or the server agent sets this itself from the "mode" field of /v1/models ("streaming"). Other engines such as sglang_omni are not probed: set it to Yes there so the gateway relays the transcript as a stream.',
   mappingDecisionCapable: 'Decisions (System One)',
   mappingDecisionCapableUnknownHint:
     'Unknown: whether this mapping serves System One decisions is not on file. The decision-model probe detects it automatically. Where it has not produced a verdict yet, set it to Yes to enable POST /v1/systemone for this model. A Yes set here takes precedence over the automatic detection.',

@@ -343,6 +343,18 @@ export function MappingForm({
   );
   const [transcriptionCapable, setTranscriptionCapable] =
     useState<CapabilityChoice>(transcriptionCapableSeed);
+  const [speechStreamingSeed] = useState<CapabilityChoice>(() =>
+    capabilitySeed(row, 'speech_streaming'),
+  );
+  const [speechStreaming, setSpeechStreaming] = useState<CapabilityChoice>(speechStreamingSeed);
+  const [speechCloneSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'speech_clone'));
+  const [speechClone, setSpeechClone] = useState<CapabilityChoice>(speechCloneSeed);
+  const [transcriptionStreamingSeed] = useState<CapabilityChoice>(() =>
+    capabilitySeed(row, 'transcription_streaming'),
+  );
+  const [transcriptionStreaming, setTranscriptionStreaming] = useState<CapabilityChoice>(
+    transcriptionStreamingSeed,
+  );
   const [realtimeCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'realtime'));
   const [realtimeCapable, setRealtimeCapable] = useState<CapabilityChoice>(realtimeCapableSeed);
   const [decisionCapableSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'decision'));
@@ -487,7 +499,14 @@ export function MappingForm({
       { capability: 'image', value: imageCapable, seed: imageCapableSeed },
       { capability: 'image_edit', value: imageEdit, seed: imageEditSeed },
       { capability: 'speech', value: speechCapable, seed: speechCapableSeed },
+      { capability: 'speech_streaming', value: speechStreaming, seed: speechStreamingSeed },
+      { capability: 'speech_clone', value: speechClone, seed: speechCloneSeed },
       { capability: 'transcription', value: transcriptionCapable, seed: transcriptionCapableSeed },
+      {
+        capability: 'transcription_streaming',
+        value: transcriptionStreaming,
+        seed: transcriptionStreamingSeed,
+      },
       { capability: 'realtime', value: realtimeCapable, seed: realtimeCapableSeed },
       { capability: 'decision', value: decisionCapable, seed: decisionCapableSeed },
       {
@@ -835,6 +854,50 @@ export function MappingForm({
             </option>
           )}
         </SelectField>
+        {/* speech_streaming and speech_clone refine speech, and follow it exactly:
+            unknown and yes are the picks, (speech_streaming, no) and
+            (speech_clone, no) are reserved for the audio.cpp /v1/models probe
+            (its per-model mode and task), and a stored no is shown disabled.
+            The seed diff in submit() sends a control only when it MOVED, and no
+            "no" option is ever pickable, so the reserved no is unreachable: the
+            disabled option can only be the value the control opened with.
+            Their manual yes is the ONLY enablement on an engine audio.cpp's
+            probe does not reach -- sglang_omni has no capability probe at all
+            (ADR-103). speech_streaming lets the speech handler relay
+            stream=true as a stream. speech_clone does NOT enable cloning: it
+            marks a model that NEEDS a reference voice, and the portal chat's
+            speech picker hides such a model (#252), so its hint is shown in
+            every state, not only while unknown. */}
+        <SelectField
+          id="mapping-speech-streaming"
+          label={t.mappingSpeechStreaming}
+          value={speechStreaming}
+          onChange={(e) => setSpeechStreaming(e.target.value as CapabilityChoice)}
+          {...unknownHint(speechStreaming, t.mappingSpeechStreamingUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {speechStreamingSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
+        </SelectField>
+        <SelectField
+          id="mapping-speech-clone"
+          label={t.mappingSpeechClone}
+          value={speechClone}
+          onChange={(e) => setSpeechClone(e.target.value as CapabilityChoice)}
+          helperText={t.mappingSpeechCloneHint}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {speechCloneSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
+        </SelectField>
         <SelectField
           id="mapping-transcription-capable"
           label={t.mappingTranscriptionCapable}
@@ -845,6 +908,23 @@ export function MappingForm({
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>
           {transcriptionCapableSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
+        </SelectField>
+        {/* transcription_streaming is speech_streaming's transcriber twin: same
+            rules, (transcription_streaming, no) reserved for the probe. */}
+        <SelectField
+          id="mapping-transcription-streaming"
+          label={t.mappingTranscriptionStreaming}
+          value={transcriptionStreaming}
+          onChange={(e) => setTranscriptionStreaming(e.target.value as CapabilityChoice)}
+          {...unknownHint(transcriptionStreaming, t.mappingTranscriptionStreamingUnknownHint)}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {transcriptionStreamingSeed === 'no' && (
             <option value="no" disabled>
               {t.mappingCapabilityNo}
             </option>

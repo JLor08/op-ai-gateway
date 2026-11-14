@@ -12624,7 +12624,9 @@ version accepted are closed. Everything else below stands.)**
   progress stay off for both.
 - **Portal defaults for `sglang_omni`.** Flavors `openai` and `openai_audio`; `responses_mode` and `messages_mode` both `disabled`,
   because v0.2.0 serves neither route and a passthrough would bypass the media guard. The type notes give the launch templates, keep
-  `--host 127.0.0.1` and say that speech and transcription verdicts are manual.
+  `--host 127.0.0.1` and say that speech and transcription verdicts are manual. The mapping form offers a manual `yes` for
+  `speech`, `transcription` and their refinements `speech_streaming`, `transcription_streaming` and `speech_clone` (the `no` of
+  each is reserved for the audio.cpp probe), so a streamed sglang-omni call is enabled there.
 - **A passthrough mode on an `sglang_omni` target is served as translate.** The portal default does not reach an Auto-typed spec, a
   spec written through the API or a row stored before the type existed, so the gateway's `endpointModeFor` answers `passthrough` as
   `translate` for such a target: `/v1/responses` and `/v1/messages` go through the media guard like chat, and the usage row's
