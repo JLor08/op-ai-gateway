@@ -2272,22 +2272,24 @@ adapter.
    socket is accepted only after the dial succeeded, so a failed dial is a plain `502`/`503`. The dial is
    forced to HTTP/1.1 (the production CA-pool transport offers `http/1.1` alone for it, since HTTP/2 cannot carry
    an upgrade) and sends no `Origin` and no client subprotocol. The gateway ends a session with no message in
-   either direction for 15 minutes with 1008. During shutdown it waits at most 2 s for open sessions to close
+   either direction for 15 minutes with 1008. During shutdown it waits at most 6 s for open sessions to close
    (1001) and answers a new handshake `503 realtime.shutting_down`. The close code and reason of either side
    are mirrored.
 6. **Usage: one row per session**, `http_status` 101, in this order of preference:
-   - **tokens**, summed from the upstream's `response.done` `response.usage` (prompt or input tokens and
-     completion or output tokens);
-   - otherwise **`audio_second`**, from the client's `input_audio_buffer.append` frames: the count of base64
+   - **`audio_second`**, when the client appended any audio, from its `input_audio_buffer.append` frames: the count of base64
      alphabet characters of `audio`, times 3/4, divided by 32000 bytes per second. The frame is read as the
      upstream reads it: `type` and `audio` are matched exactly (case-sensitive, the last duplicate wins), and the
      bare literals `NaN`, `Infinity` and `-Infinity` are tolerated as Python's `json` does. The count can only
-     over-count, never under-count;
+     over-count, never under-count. Audio comes first, whatever usage the upstream reports: sglang-omni's
+     legacy session sends `usage: null` for a cancelled turn and runs a transcription pass that is never billed,
+     so token precedence would under-count an audio session and let a key holder get free transcription after
+     one normal turn. Every sglang-omni flavor takes audio input;
+   - otherwise **tokens**, for a session that appended no audio, summed from the upstream's `response.done`
+     `response.usage` (prompt or input tokens and completion or output tokens);
    - otherwise a **logged zero** (`audio_second` 0 with an `Error` log line).
    A close code of 1000, 1001 or 1005 is a `success`; any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded. A
    request refused before a target is chosen records no row, as the live bearer endpoint's gate does.
-7. **Residuals.** A gone instance `m#k` with k ≥ 1 is not re-selected on the dial. A peer that never answers a
-   1001 can hold its session about 5 s past the 2 s shutdown bound, so its row may be lost at exit. A peer that
+7. **Residuals.** A gone instance `m#k` with k ≥ 1 is not re-selected on the dial. A peer that
    freezes mid-frame during a close handshake is unbounded in `coder/websocket`. `/v1/realtime/` with a trailing
    slash is not upgraded by nginx. A reverse proxy must carry the upgrade on both exact paths with long
    timeouts ([Deployment View §7](../07-deployment-view.md)).

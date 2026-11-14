@@ -872,14 +872,16 @@ paths:
         dial of the agent is the mapped provider error (502 or 503), before the
         upgrade.
         The session ends after 15 minutes without a message in either direction
-        (close code 1008), and on shutdown the gateway waits at most 2 s for open
+        (close code 1008), and on shutdown the gateway waits at most 6 s for open
         sessions (close code 1001). The session shows in Active Requests.
         Metered with ONE usage row per session, `http_status` 101. The row is in
-        tokens (the sum of the upstream's `response.done` `response.usage`) when
-        any carried usage; otherwise in `audio_second`, from the client's
+        `audio_second` when the client appended any audio, from its
         `input_audio_buffer.append` frames (base64 alphabet characters of `audio`
-        times 3/4 over 32000 bytes per second, which can only over-count);
-        otherwise a logged zero. Close codes 1000, 1001 and 1005 are a success,
+        times 3/4 over 32000 bytes per second, which can only over-count); the
+        upstream's usage is ignored then, because sglang-omni sends a null usage
+        for cancelled turns and runs an unbilled transcription pass. A session
+        without audio is in tokens (the sum of the upstream's `response.done`
+        `response.usage`); otherwise a logged zero. Close codes 1000, 1001 and 1005 are a success,
         any other code is the error `realtime.close_<code>`. A session whose dial of the
         agent fails records its one row with the refusal's error status (502 or 503),
         and one whose client handshake cannot be accepted after a successful dial

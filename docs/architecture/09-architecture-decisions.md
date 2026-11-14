@@ -12727,12 +12727,14 @@ budget gate, the usage row, and a model that the agent starts and keeps admitted
   reported `realtime_proxy` (fail closed). A rejected target is excluded by its instance key and the resolve runs again, up to 8 tries,
   ending in `404 routing.no_model_route`. The session is registered in Active Requests before the dial; the gateway dials the agent
   through a new `provider.NativeWebSocketDialer`, **forced to HTTP/1.1** (the production CA-pool transport offers `http/1.1` alone for
-  such a handshake), with no `Origin` and no client subprotocol. It has its own 15-minute idle limit; during shutdown it waits at most 2 s
-  for sessions and answers a new handshake `503 realtime.shutting_down`.
-- **One usage row per session.** Tokens come from the upstream's `response.done` `response.usage` (prompt or input, completion or output).
-  Without any usage object the row is `audio_second`, computed from the client's `input_audio_buffer.append` frames as base64 alphabet
-  characters × 3/4 ÷ 32000, read as the upstream reads a frame: keys matched exactly, the last duplicate wins, `NaN` and `Infinity`
-  tolerated as Python's `json` does. The count can only over-count. Without audio the row is a logged zero. `http_status` is 101; the close
+  such a handshake), with no `Origin` and no client subprotocol. It has its own 15-minute idle limit; during shutdown it waits at most 6 s
+  for sessions (more than coder/websocket's 5 s close wait, and inside Docker's 10 s stop grace; the agent router keeps its own 2 s bound) and answers a new handshake `503 realtime.shutting_down`.
+- **One usage row per session.** A session that appended any audio is billed `audio_second`, computed from the client's `input_audio_buffer.append` frames as base64
+  alphabet characters × 3/4 ÷ 32000, read as the upstream reads a frame: keys matched exactly, the last duplicate wins, `NaN` and `Infinity`
+  tolerated as Python's `json` does. The count can only over-count. Audio takes precedence over the upstream's usage because sglang-omni's
+  legacy session sends `usage: null` for a cancelled turn and runs a transcription pass that is never billed: token precedence would
+  under-count and give free transcription after one normal turn. Only a session with no audio is token-metered, from the upstream's
+  `response.done` `response.usage` (prompt or input, completion or output). With neither the row is a logged zero. `http_status` is 101; the close
   codes 1000, 1001 and 1005 are a success and any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded.
 - **Capability `realtime`.** Manual verdicts only (`routing.CapabilityRealtime`): no probe states it, and the agent ingest drops it. The
   portal's mapping form labels it "Realtime (WebSocket)", and the `sglang_omni` type note names `--enable-realtime`.
@@ -12762,8 +12764,6 @@ budget gate, the usage row, and a model that the agent starts and keeps admitted
 - **Accepted residuals.**
   - A refusal before a target is chosen writes no usage row, as the bearer live gate does.
   - A gone instance k ≥ 1 is not re-selected on the dial.
-  - A peer that never answers a 1001 can hold its session about 5 s past the 2 s shutdown bound (coder/websocket's close handshake), so
-    its row may be lost at exit.
   - A peer frozen mid-frame during a close handshake is unbounded in coder/websocket.
   - `/v1/realtime/` with a trailing slash is not upgraded by nginx.
 - **The agent still serves no other WebSocket.** The §13 limitation stands for every other route and server.

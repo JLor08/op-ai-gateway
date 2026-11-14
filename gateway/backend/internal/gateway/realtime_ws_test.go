@@ -853,8 +853,8 @@ func TestRealtimeTargetLoopIsBounded(t *testing.T) {
 	})
 }
 
-// Token usage: the usage of every response.done whose response.usage is an object is
-// summed -- prompt_tokens/completion_tokens (sglang-omni's conversation flavor) and
+// Token usage, for a session that appended no audio (a text-only session): the usage of
+// every response.done whose response.usage is an object is summed -- prompt_tokens/completion_tokens (sglang-omni's conversation flavor) and
 // input_tokens/output_tokens alike -- and a null usage adds nothing. The row is
 // token-metered (no billing quantity, per the billing XOR), status success with the
 // handshake's 101.
@@ -872,8 +872,6 @@ func TestRealtimeUsageSumsTokensFromResponseDone(t *testing.T) {
 			t.Fatalf("relayed %q, want %q", data, ev)
 		}
 	}
-	rtWrite(t, conn, websocket.MessageText, appendEvent(32000)) // tokens win over audio
-	rtRead(t, conn)
 	_ = conn.Close(websocket.StatusNormalClosure, "")
 	ev := rig.oneRow(t)
 	if ev.InputTokens != 17 || ev.OutputTokens != 8 || ev.TotalTokens != 25 {
@@ -893,9 +891,9 @@ func TestRealtimeUsageSumsTokensFromResponseDone(t *testing.T) {
 	}
 }
 
-// Without any usage, the session bills audio seconds: the decoded bytes of the
+// A session that appended audio bills audio seconds: the decoded bytes of the
 // client's input_audio_buffer.append audio over 32000 (PCM16 mono at 16 kHz).
-func TestRealtimeUsageFallsBackToAppendedAudio(t *testing.T) {
+func TestRealtimeUsageBillsAppendedAudio(t *testing.T) {
 	rig := newRTRig(t)
 	conn := rig.dial(t, "model="+rtModel)
 	for _, n := range []int{32000, 16000} {
@@ -911,6 +909,47 @@ func TestRealtimeUsageFallsBackToAppendedAudio(t *testing.T) {
 	}
 	if err := usage.ValidateBillingXOR(ev); err != nil {
 		t.Fatalf("billing XOR: %v", err)
+	}
+}
+
+// Audio takes precedence over tokens: sglang-omni sends usage null for cancelled turns
+// and runs an unbilled transcription pass, so a session with appends bills the appended
+// audio even when a response.done carries a usage object.
+func TestRealtimeAudioSessionIgnoresResponseUsage(t *testing.T) {
+	rig := newRTRig(t)
+	conn := rig.dial(t, "model="+rtModel)
+	rtWrite(t, conn, websocket.MessageText, appendEvent(32000))
+	rtRead(t, conn)
+	ev := `{"type":"response.done","response":{"id":"r1","status":"completed","usage":{"prompt_tokens":10,"completion_tokens":5}}}`
+	rtWrite(t, conn, websocket.MessageText, []byte("agent:send "+ev))
+	rtRead(t, conn)
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+	row := rig.oneRow(t)
+	if row.BillingUnit != usage.BillingUnitAudioSecond || row.BillingQuantity != 1 || row.TotalTokens != 0 || row.InputTokens != 0 {
+		t.Fatalf("billing = %v %q tokens %d, want 1 audio_second and no tokens", row.BillingQuantity, row.BillingUnit, row.TotalTokens)
+	}
+	if err := usage.ValidateBillingXOR(row); err != nil {
+		t.Fatalf("billing XOR: %v", err)
+	}
+}
+
+// Appends followed only by null-usage responses bill every appended second.
+func TestRealtimeAudioSessionWithNullUsageBillsAllAudio(t *testing.T) {
+	rig := newRTRig(t)
+	conn := rig.dial(t, "model="+rtModel)
+	for _, n := range []int{32000, 32000, 16000} {
+		rtWrite(t, conn, websocket.MessageText, appendEvent(n))
+		rtRead(t, conn)
+	}
+	for i := 0; i < 2; i++ {
+		ev := `{"type":"response.done","response":{"status":"cancelled","usage":null}}`
+		rtWrite(t, conn, websocket.MessageText, []byte("agent:send "+ev))
+		rtRead(t, conn)
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+	row := rig.oneRow(t)
+	if row.BillingUnit != usage.BillingUnitAudioSecond || row.BillingQuantity != 2.5 {
+		t.Fatalf("billing = %v %q, want 2.5 audio_second", row.BillingQuantity, row.BillingUnit)
 	}
 }
 

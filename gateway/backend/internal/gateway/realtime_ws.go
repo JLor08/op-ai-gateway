@@ -522,13 +522,19 @@ func realtimeOutcomeOf(end realtimeEnd) realtimeOutcome {
 
 // recordRealtimeUsage records a session's one usage row. Its measure, by the billing
 // XOR (usage.ValidateBillingXOR), is exactly one of:
-//   - tokens, when any response.done carried a usage object: the sum over all of them
-//     (realtimeMeter.observeUpstream), token-metered;
-//   - otherwise audio seconds, when the client appended audio: its decoded bytes over
+//   - audio seconds, when the client appended any audio: its decoded bytes over
 //     realtimeInputBytesPerSecond;
+//   - otherwise tokens, when any response.done carried a usage object: the sum over all
+//     of them (realtimeMeter.observeUpstream), token-metered;
 //   - otherwise a zero in audio seconds, which a session that upgraded logs as an
 //     error (a relayed session nothing can be billed for); a session refused before
 //     the upgrade logged its refusal already.
+//
+// Audio comes first because the upstream's token usage under-counts an audio session:
+// sglang-omni's legacy session sends usage null for a cancelled turn and runs a
+// transcription pass that is never billed, so token precedence would let a key holder
+// get free ASR after one normal turn. Every sglang-omni flavor takes audio input, so a
+// session with appends is an audio session.
 func (s *Server) recordRealtimeUsage(start time.Time, id string, r *http.Request, token auth.Token, req inference.Request, target routing.Target, out realtimeOutcome, meter *realtimeMeter) {
 	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: out.httpStatus, Endpoint: endpointRealtime}
 	if !out.upgraded {
@@ -536,15 +542,15 @@ func (s *Server) recordRealtimeUsage(start time.Time, id string, r *http.Request
 	}
 	var resp provider.Response
 	switch {
+	case meter.appendBytes > 0:
+		meta.BillingUnit = usage.BillingUnitAudioSecond
+		meta.BillingQuantity = float64(meter.appendBytes) / realtimeInputBytesPerSecond
 	case meter.usageSeen:
 		resp.Usage = inference.Usage{
 			InputTokens:  int(meter.inputTokens),
 			OutputTokens: int(meter.outputTokens),
 			TotalTokens:  int(meter.inputTokens + meter.outputTokens),
 		}
-	case meter.appendBytes > 0:
-		meta.BillingUnit = usage.BillingUnitAudioSecond
-		meta.BillingQuantity = float64(meter.appendBytes) / realtimeInputBytesPerSecond
 	default:
 		meta.BillingUnit = usage.BillingUnitAudioSecond
 		if out.upgraded {
