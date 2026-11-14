@@ -1083,7 +1083,11 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '422':
-          description: The Error envelope with code `systemone.refused` and error `type` `refusal` (the other decision errors keep `upstream_error`): on the translate route the upstream refused one or more questions; the message names the refused keys.
+          description: >
+            The Error envelope with code `systemone.refused` and error `type`
+            `refusal` (the other decision errors keep `upstream_error`): on the
+            translate route the upstream refused one or more questions; the
+            message names the refused keys.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

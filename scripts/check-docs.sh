@@ -367,7 +367,9 @@ read -r -d '' OPENAPI_AWK <<'AWK' || true
 # complaints" means the document really was understood end to end. What it
 # reports: tabs in indentation, indentation that lands between levels,
 # duplicate keys in one mapping, unparsable lines, multi-line flow collections,
-# and $ref pointers with no node behind them.
+# a plain (unquoted) scalar that contains ": " -- YAML reads that as a nested
+# mapping and a conforming parser rejects the document -- and $ref pointers
+# with no node behind them.
 function problem(msg) {
   printf "%s:%d: %s\n", FILENAME, FNR, msg
   problems++
@@ -427,7 +429,7 @@ function collect_refs(s,   rest, tok, c, i, q) {
   }
 }
 
-BEGIN { problems = 0; nrefs = 0; ndocs = 0 }
+BEGIN { problems = 0; nrefs = 0; ndocs = 0; skipplain = 0 }
 
 FNR == 1 {
   ndocs++
@@ -447,8 +449,12 @@ FNR == 1 {
 
   if (content == "") next                       # blank line: no state change
   if (skip >= 0) {                              # inside a block scalar or a
-    if (ind > skip) next                        # multi-line plain scalar
+    if (ind > skip) {                           # multi-line plain scalar
+      if (skipplain) plain_colon(content)       # a plain continuation line
+      next                                      # keeps the plain-scalar rules
+    }
     skip = -1
+    skipplain = 0
   }
   if (index(lead, "\t") > 0) { problem("tab in indentation (YAML forbids it)"); next }
   if (substr(content, 1, 1) == "#") next        # whole-line comment
@@ -516,13 +522,30 @@ FNR == 1 {
   if (substr(rest, 1, 1) == "|" || substr(rest, 1, 1) == ">") {
     if (rest !~ /^[|>][-+0-9]*([ \t]+#.*)?$/) problem("unsupported block scalar header: " rest)
     skip = ind
+    skipplain = 0
     next
   }
   if ((substr(rest, 1, 1) == "[" || substr(rest, 1, 1) == "{") && !flow_balanced(rest)) {
     problem("multi-line flow collections are not supported by this checker")
     next
   }
+  c = substr(rest, 1, 1)
+  if (c != "\047" && c != "\"" && c != "[" && c != "{") {
+    plain_colon(rest)                                   # a plain scalar
+    skipplain = 1
+  } else {
+    skipplain = 0
+  }
   skip = ind                                            # scalar; continuations skipped
+}
+
+function plain_colon(s) {
+  # A plain scalar may not contain ": " (or end in ":"): YAML reads it as a
+  # mapping indicator, and a conforming parser rejects the whole document
+  # ("bad indentation of a mapping entry"). A " #" starts a comment, so only
+  # the text before it counts. Quote the value or make it a block scalar.
+  sub(/[ \t]+#.*$/, "", s)
+  if (index(s, ": ") > 0 || s ~ /:$/) problem("plain scalar contains \": \" -- quote it or use a block scalar (>)")
 }
 
 function check_indent(ind,   d) {
