@@ -12602,6 +12602,10 @@ the change.
   starts with `/` or `file://` from its host too.
 - **A server may host any model.** One sglang-omni server can host a text, speech or ASR model.
 
+**(Amended 2026-11-14 — streamed speech and transcription to sglang-omni are served and billed: the decision bullet "Streams to an
+`sglang_omni` target" is added, the "Duration fallbacks" bullet hands streamed calls to it, and the streaming residuals the first
+version accepted are closed. Everything else below stands.)**
+
 **Decision.**
 
 - **Two spec types, `sglang` and `sglang_omni`** (`routing.RuntimeSpecType`; the agent keeps literal copies of the strings). Detection
@@ -12631,10 +12635,40 @@ the change.
   `timing.audio_duration_ms` key makes the duration that of the uploaded WAV part, measured with `wavDurationFromReader`, and when
   that cannot be measured (a non-WAV upload, a WAV with a streaming writer's `0xFFFFFFFF` size) the duration sglang-omni states,
   `usage` `{"type":"duration","seconds":N}` with `N` a positive finite number. A present but unusable audio.cpp value stays an Error
-  log and quantity 0 (ADR-041). Streamed speech keeps its rule (PCM bytes over the cached byte rate, else `audio_bytes`), and
-  sglang-omni's raw stream, labelled `audio/pcm` (its `stream_format` defaults to `audio`), is counted as the raw shape
-  `application/octet-stream` is. A fallback that cannot measure (a body that is no WAV, a transcription with neither a measurable
-  WAV nor that usage statement) keeps the logged zero.
+  log and quantity 0 (ADR-041). Streamed calls follow the next bullet. A fallback that cannot measure (a body that is no WAV, a
+  transcription with neither a measurable WAV nor that usage statement) keeps the logged zero.
+- **Streams to an `sglang_omni` target are completed, told `pcm` and billed from what the stream states.** sglang-omni v0.2.0 ends
+  a successful speech event stream after `speech.audio.done` with no `[DONE]` (a failure sends an `error` event in place of the
+  done event), refuses `stream=true` with a 400 unless `response_format` is `pcm` while its own default is `wav`, states the PCM
+  format of either stream shape only in the response headers `X-Sample-Rate`, `X-Channels` and `X-Bit-Depth`, and ends a streamed
+  transcription with a `transcript.text.done` event that carries `usage` `{"type":"duration","seconds":N}`, then `[DONE]`. So,
+  for a resolved target of effective kind `sglang_omni`:
+  - *The gateway writes the `[DONE]`.* When the upstream closes an `sse` speech stream cleanly after `speech.audio.done`, with no
+    `error` event, no `[DONE]` of its own anywhere and nothing lost, the relay writes `data: [DONE]` through the same copy path
+    as the upstream's bytes (flushed, and fed to the scan), prefixed only by the newlines the relayed bytes lack of a blank line
+    (none after a normal `\n\n`-terminated frame), so it is always an event of its own. The relay then bills the stream by its
+    unchanged rule (`speech.audio.done` then `[DONE]`), and the portal voice-chat TTS leg reads it unchanged. A failed write of
+    the sentinel is the copy's error, an error row that bills zero. audio.cpp streams, the raw shape and every other kind are
+    relayed as before, with no sentinel.
+  - *A stream states `pcm`.* A streamed speech request whose body has no key named exactly `response_format` holding the string
+    `pcm` (the key absent, `null`, `""`, or spelled in another case, which Go's decoder folds and sglang-omni does not) gets
+    `"response_format":"pcm"` on its upstream body; every other field is relayed as written. The buffered retry is built from the
+    client's body and still drops the field. The audio benchmark's streamed synthesis states it too.
+  - *The format headers give the second byte rate.* Streamed speech, raw (`audio/pcm`, counted as `application/octet-stream`
+    is) and `sse` alike, bills `audio_second` over the mapping's cached output byte rate, else over `X-Sample-Rate` ×
+    `X-Channels` × `X-Bit-Depth`/8, else `audio_bytes`. Each header must be stated exactly once as a plain decimal positive
+    integer, the bit depth a whole number of bytes, and the product a usable rate by the cached rate's own rule
+    (`routing.ParseOutputByteRate`: positive, within a uint32). A format header that is present but unusable or stated twice gives
+    no rate and, when that rate would have been used, a Warn log naming it; an answer with none of the three states no format and
+    logs nothing.
+  - *A streamed transcription's done event is the second measure.* On a completed stream (done, then `[DONE]`) the quantity is
+    the uploaded WAV's duration, else the `usage` of the last `transcript.text.done` under the one-shot rule (`type` exactly
+    `duration`, `N` positive finite; a done event after `[DONE]` is not read), else the logged zero, whose log says whether the
+    statement was absent or unusable. This is not keyed on the target type: audio.cpp's done event states no usage, so its
+    billing is unchanged.
+  - *The benchmark takes the clean close as the end.* The audio benchmark counts a body that closes cleanly (EOF, never a read
+    error) after `speech.audio.done` as the end of an `sglang_omni` synthesis stream; every other target, audio.cpp included,
+    still needs `[DONE]`.
 - **Inline media only, for a resolved target of effective type `sglang_omni`.** Speech `ref_audio` and every `references[]`
   `audio_path`, `ref_audio` and `audio` must be `data:` URLs, matched case-insensitively, with a malformed `references` and a body
   that is not one JSON object refused (400 `speech.reference_audio_unsupported`). Chat `image_url.url`, translated Anthropic images
@@ -12664,6 +12698,12 @@ the change.
 - **Allowlisting paths instead of requiring inline media.** A path allowlist needs a directory on the model host the gateway cannot
   see, and says nothing about a fetched URL. A `data:` URL is the one form the upstream resolves without touching the host or the
   network.
+- **Counting a clean close after `speech.audio.done` as the relay's completion, without writing `[DONE]`.** It would bill the
+  stream, but a client and the portal voice-chat TTS leg would still read an event stream without its sentinel as cut short.
+  Writing the sentinel gives every relayed speech event stream one ending and leaves the billing rule as it was.
+- **Guessing a byte rate from a partial format statement.** A missing, repeated or odd header (a 12-bit depth, a zero) yields no
+  rate, never an assumed 16-bit mono one, because a guessed rate bills a wrong duration under a plausible unit; `audio_bytes`
+  stays the honest fallback.
 
 **Consequence:**
 
@@ -12679,13 +12719,16 @@ the change.
   refused at parse and `modalities`/`audio` are dropped, so only text and inline images reach sglang-omni chat. The sglang_omni
   type note says so.
 - **Other billing shapes stay logged zeros.** A transcription to a target with no reported duration whose upload measures no WAV and
-  whose body states no usable `usage` duration, and a one-shot speech body that is no WAV, bill quantity 0 with an Error log.
+  whose body (or, streamed, whose last done event) states no usable `usage` duration, and a one-shot speech body that is no WAV,
+  bill quantity 0 with an Error log.
 - **Speech and transcription verdicts are manual** for `sglang_omni`, and the model is not offered for audio until they are set under the
-  `openai_audio` flavor.
-- **Streaming residuals for sglang-omni, both behind a manual `speech_streaming`/`transcription_streaming` yes.** A streamed
-  transcription is billed only from the uploaded WAV: the final `transcript.text.done` event's `usage{seconds}` is not read, so a
-  streamed non-WAV upload is a logged zero. Its SSE speech stream ends on `speech.audio.done` without `[DONE]`, so the portal
-  voice-chat TTS leg treats the stream as incomplete and drops the tail, and the call's billing is a logged zero.
+  `openai_audio` flavor. Streaming likewise needs a manual `speech_streaming`/`transcription_streaming` yes.
+- **Streamed sglang-omni calls work and bill.** A streamed synthesis is no longer refused for want of `pcm`, its event stream
+  reaches the client, the portal voice-chat TTS leg and the benchmark as a complete stream, and it bills `audio_second` from the
+  format headers before the mapping is benchmarked. A streamed transcription of a non-WAV upload bills the seconds its done event
+  states. A client of an sglang-omni event stream sees one frame more than the upstream wrote, the gateway's `[DONE]`. Two
+  limits are accepted: the format headers are the trusted upstream's own statement, read as the cached rate is, and a stream the
+  upstream ends after its done event, closing cleanly, is complete by definition, as a raw stream's clean close is (ADR-068).
 - **Not verified live:** an sglang-omni server end to end through the agent. The contracts were read off the pinned commits.
 - **Older agents** ignore the type strings: the gateway sees a best-effort context and no SGLang queue gauge.
 
