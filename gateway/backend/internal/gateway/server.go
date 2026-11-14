@@ -498,6 +498,10 @@ type Server struct {
 	// nil, which acquire treats as fail-closed (every session rejected busy), so
 	// the handler must be wired with a constructed registry.
 	liveSessions *liveSessionRegistry
+	// realtimeIdle overrides a /v1/realtime session's idle bound
+	// (realtime_ws.go: realtimeIdleTimeout) when positive. Zero, the default and
+	// every production value, keeps the constant; only tests set it.
+	realtimeIdle time.Duration
 	// instanceScaler starts another instance of a replicable spec when requests
 	// park because every instance of their model is busy (instance_scaler.go).
 	// New builds it whenever it builds the resolver's instance source and installs
@@ -1708,6 +1712,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/audio/transcriptions/details", s.handleOpenAITranscriptionDetails)
 	s.mux.HandleFunc("/openai/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
 	s.mux.HandleFunc("/v1/audio/transcriptions/live", s.handleBearerLiveTranscription)
+	s.mux.HandleFunc("/openai/v1/realtime", s.handleRealtime)
+	s.mux.HandleFunc("/v1/realtime", s.handleRealtime)
 	s.mux.HandleFunc("/openai/v1/audio/voices", s.handleAudioVoices)
 	s.mux.HandleFunc("/v1/audio/voices", s.handleAudioVoices)
 	s.mux.HandleFunc("/openai/v1/models", s.handleOpenAIModels)

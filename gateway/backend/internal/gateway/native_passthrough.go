@@ -254,6 +254,12 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 	if endpoint == endpointTranscriptionDetails {
 		return "/v1/audio/transcriptions/details"
 	}
+	// A realtime session shares the openai_audio flavor too and is told apart by its
+	// endpoint alone. Its row names the endpoint the agent relays it to, the child's
+	// /v1/realtime (the agent route it is dialed at is the active request's path).
+	if endpoint == endpointRealtime {
+		return realtimeUsagePath
+	}
 	if endpoint == endpointTranscription {
 		return "/v1/audio/transcriptions"
 	}
