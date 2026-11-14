@@ -939,9 +939,9 @@ type realtimeRecheck struct {
 // net/http keeps a hijacked request's context live while the handler runs, but that is
 // not a contract the checks should depend on. The session's end is what stops them
 // instead: the relay cancels that context and then waits on done, so the goroutine
-// never outlives its session. Every call a check makes (the in-memory token store,
-// the user lookup, the limiter's store reads) honors its context, so that wait is
-// short.
+// never outlives its session. Every store call a check makes (the user lookup, the
+// limiter's store reads) honors its context, and the bearer leg's token lookup is an
+// in-memory read that takes none, so that wait is short.
 func (s *Server) startRealtimeRecheck(ctx context.Context, grant realtimeGrant) realtimeRecheck {
 	ends := make(chan realtimeEnd, 1) // one report at most, so it never blocks
 	done := make(chan struct{})
@@ -956,6 +956,11 @@ func (s *Server) startRealtimeRecheck(ctx context.Context, grant realtimeGrant) 
 			case <-checkCtx.Done():
 				return
 			case <-ticker.C:
+			}
+			// A tick and the cancel can be ready together, and select picks either:
+			// never start a check on a context that has already ended.
+			if checkCtx.Err() != nil {
+				return
 			}
 			onceCtx, cancelOnce := context.WithTimeout(checkCtx, realtimeRecheckTimeout)
 			end, failed := s.recheckRealtime(onceCtx, grant)
@@ -1009,7 +1014,8 @@ func (s *Server) recheckRealtime(ctx context.Context, grant realtimeGrant) (real
 // fail for reasons that say nothing about the user. Only a definite answer ends the
 // session: a user that is gone (store.ErrNotFound, which every driver returns for a
 // missing user) or disabled. Any other lookup error is transient: it is logged and the
-// session is kept until the next tick, so a store hiccup never cuts a live session.
+// session is kept until the next tick, so a store hiccup never cuts a live session. A
+// lookup that failed because the session canceled its check keeps it too, unlogged.
 func (s *Server) realtimeGrantHolds(ctx context.Context, grant realtimeGrant) bool {
 	if grant.loopback {
 		if s.users == nil || !s.presentsInternalSecret(grant.authReq) {
@@ -1019,6 +1025,11 @@ func (s *Server) realtimeGrantHolds(ctx context.Context, grant realtimeGrant) bo
 		switch {
 		case errors.Is(err, store.ErrNotFound):
 			return false
+		case err != nil && errors.Is(ctx.Err(), context.Canceled):
+			// The session ended and canceled its check: that says nothing about the
+			// user, so it is neither a refusal nor a lookup failure worth a warning.
+			// A lookup that ran past the check's timeout is still warned below.
+			return true
 		case err != nil:
 			slog.Warn("realtime: the session's user lookup failed; the session stays open until the next re-check",
 				"user", grant.token.UserID, "err", err)

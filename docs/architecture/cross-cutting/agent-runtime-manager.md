@@ -10224,7 +10224,10 @@ operator meets first:
   the one row written when it ends, so a single session can overrun a token quota or
   cost budget by up to what it consumes within that lifetime (unbounded when the
   operator sets `0`). The agent route itself has no lifetime bound, only its 15-minute
-  idle limit: the bound is the gateway's.
+  idle limit: the bound is the gateway's. The loopback leg's admission
+  (`loopbackPrincipal`, shared by every internal route) does not check a user's
+  status, so a disabled user's loopback session is admitted and ended only at the
+  first re-check, within one re-check interval.
 - **Device names follow the backend's enumeration, not the host index**
   (§3.2, §3.6). A `${DEVICES}`-style token renders the declared GPU indices under
   the backend prefix, but the number the backend gives a card is its own:

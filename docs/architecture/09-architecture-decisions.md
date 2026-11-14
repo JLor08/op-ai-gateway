@@ -12856,6 +12856,9 @@ billed by the one row written when it ends, its consumption reached the aggregat
   that limit's admission code, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, so one limit has one code wherever it stops
   consumption. `realtime.close_1008` stays for the idle limit and a peer's own 1008. Billing is unchanged: a session the gateway cut
   bills everything it relayed, exactly like an idle-closed one, so ending a session early never makes it free.
+- **Known gap: loopback admission ignores a user's status.** The loopback leg's admission (`loopbackPrincipal`) resolves the user but
+  does not check whether it is disabled, so a disabled user's loopback session is admitted and ended at the first re-check, within the
+  re-check interval. Tightening the admission is out of scope here: `loopbackPrincipal` serves every internal route, not only this one.
 - **Gateway-only.** Every new end runs through the existing close path, so the agent hop gets the same 1008 and reason, and its router
   releases the spec as on any close. The agent version and its routes are unchanged.
 

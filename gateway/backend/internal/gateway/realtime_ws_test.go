@@ -1606,7 +1606,8 @@ func TestRealtimeGatewayEndsCloseBothHopsAndBillLikeIdle(t *testing.T) {
 		code    string
 	}{
 		{name: "idle bound", setup: func(rig *rtRig) { rig.srv.realtimeIdle = 300 * time.Millisecond }, reason: "idle_timeout", code: "realtime.close_1008"},
-		{name: "maximum lifetime", setup: func(rig *rtRig) { rig.srv.realtimeMaxSession = 500 * time.Millisecond }, reason: "max_session_duration", code: "realtime.max_session_duration"},
+		// The lifetime leaves the append and its echo ample time under -race load.
+		{name: "maximum lifetime", setup: func(rig *rtRig) { rig.srv.realtimeMaxSession = 2 * time.Second }, reason: "max_session_duration", code: "realtime.max_session_duration"},
 		{name: "key revoked", trigger: func(t *testing.T, rig *rtRig, _ *rtLimitStore) {
 			rig.tokenStore(t).RemoveToken("tok_dev")
 		}, reason: "token_invalid", code: "realtime.token_invalid"},
@@ -1688,7 +1689,9 @@ func TestRealtimeBlockedRecheckDoesNotStallTheRelay(t *testing.T) {
 	rig := newRTRig(t)
 	limits := newRTLimitStore()
 	rig.useRTLimits(limits)
-	rig.srv.realtimeMaxSession = time.Second
+	// Long enough that the blocked check and three round trips fit well inside it
+	// under -race load, so the frames are proven to cross while the check blocks.
+	rig.srv.realtimeMaxSession = 2 * time.Second
 	conn := rig.dial(t, "model="+rtModel)
 	limits.hold = make(chan struct{})
 	limits.blocking.Store(true)
@@ -1840,6 +1843,80 @@ func TestRealtimeRecheckLoopbackUser(t *testing.T) {
 	})
 }
 
+// rtBlockingUsers is a user lookup that signals blocked and then waits until its
+// context ends, returning that context's error, as a real store call does when the
+// session cancels it. calls counts every lookup.
+type rtBlockingUsers struct {
+	calls   atomic.Int32
+	blocked chan struct{}
+}
+
+func (u *rtBlockingUsers) UserByID(ctx context.Context, _ string) (store.User, error) {
+	u.calls.Add(1)
+	u.blocked <- struct{}{}
+	<-ctx.Done()
+	return store.User{}, ctx.Err()
+}
+
+// Canceling the re-check ends it quietly: the check in flight fails with the
+// canceled context, which is no lookup failure worth a Warn, and the goroutine starts
+// no further check on that canceled context -- not even when a tick is already
+// waiting as the cancel lands (both select cases ready, which the loop repeats to
+// hit).
+func TestRealtimeRecheckCancelIsQuiet(t *testing.T) {
+	logs := captureRTLog(t)
+	for i := 0; i < 20; i++ {
+		users := &rtBlockingUsers{blocked: make(chan struct{}, 16)}
+		srv := &Server{internalAuthSecret: rtInternalSecret, users: users, realtimeRecheck: time.Millisecond}
+		req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+		req.Header.Set(internalAuthHeaderName, rtInternalSecret)
+		req.Header.Set(internalUserHeaderName, "usr_dev")
+		rc := srv.startRealtimeRecheck(context.Background(), realtimeGrant{authReq: req, loopback: true})
+		select {
+		case <-users.blocked:
+		case <-time.After(rtWait):
+			t.Fatal("no re-check reached the user lookup")
+		}
+		time.Sleep(5 * time.Millisecond) // the next tick is now buffered on the ticker
+		rc.cancel()
+		select {
+		case <-rc.done:
+		case <-time.After(rtWait):
+			t.Fatal("the re-check did not stop after its cancel")
+		}
+		select {
+		case end := <-rc.ends:
+			t.Fatalf("a canceled re-check reported %+v", end)
+		default:
+		}
+		if n := users.calls.Load(); n != 1 {
+			t.Fatalf("round %d: user lookups = %d, want 1: a check ran on the canceled context", i, n)
+		}
+	}
+	if strings.Contains(logs.String(), "user lookup failed") {
+		t.Fatalf("a canceled check was logged as a lookup failure:\n%s", logs.String())
+	}
+}
+
+// A lookup that runs past the check's timeout is a slow store, not a session that
+// ended: it keeps the session, like any transient lookup error, and is still warned.
+func TestRealtimeRecheckLookupTimeoutIsWarned(t *testing.T) {
+	logs := captureRTLog(t)
+	users := &rtBlockingUsers{blocked: make(chan struct{}, 1)}
+	srv := &Server{internalAuthSecret: rtInternalSecret, users: users}
+	req := httptest.NewRequest(http.MethodGet, "/v1/realtime", nil)
+	req.Header.Set(internalAuthHeaderName, rtInternalSecret)
+	req.Header.Set(internalUserHeaderName, "usr_dev")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if !srv.realtimeGrantHolds(ctx, realtimeGrant{authReq: req, loopback: true}) {
+		t.Fatal("a timed-out lookup ended the session")
+	}
+	if !strings.Contains(logs.String(), "realtime: the session's user lookup failed") {
+		t.Fatal("the timed-out lookup was not logged")
+	}
+}
+
 // The limits re-check fails open: a store error reading the config or an aggregate
 // keeps the session open, as it admits a request.
 func TestRealtimeRecheckStoreErrorKeepsTheSession(t *testing.T) {
@@ -1872,6 +1949,11 @@ func TestRealtimeRecheckStoreErrorKeepsTheSession(t *testing.T) {
 // The re-check never applies the rate limit or the request quota, which govern
 // admitting requests: a principal at its rate limit and past its request quota keeps
 // the session it was admitted for.
+//
+// End to end, this test cannot see a Check that applies the rate limit: recheckRealtime
+// acts only on a "token_quota" or "cost_budget" reason, so a rate refusal would be
+// ignored here either way. TestPrincipalLimiterCheckSkipsRateAndRequestQuota pins
+// that Check itself neither consumes nor applies the rate bucket or request quota.
 func TestRealtimeRecheckIgnoresRateAndRequestQuota(t *testing.T) {
 	rig := newRTRig(t)
 	limits := newRTLimitStore()
