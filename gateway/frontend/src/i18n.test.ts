@@ -4774,7 +4774,7 @@ describe('sglang i18n keys', () => {
 });
 
 describe('realtime capability i18n keys', () => {
-  it('has the form control, hint and chip keys in de and en, and they differ', () => {
+  it('has the form control, hint and chip keys in de and en; the labels match and the hint differs', () => {
     for (const key of [
       'mappingRealtimeCapable',
       'mappingRealtimeCapableUnknownHint',
@@ -4789,6 +4789,11 @@ describe('realtime capability i18n keys', () => {
     expect(messages.en.mappingRealtimeCapableUnknownHint).toContain('/v1/realtime');
     expect(messages.en.mappingRealtimeCapableUnknownHint).toContain('0.20.0');
     expect(messages.de.mappingRealtimeCapableUnknownHint).toContain('0.20.0');
+    for (const locale of ['de', 'en'] as const) {
+      const hint = messages[locale].mappingRealtimeCapableUnknownHint;
+      expect(hint, locale).toContain('--enable-realtime');
+      expect(hint, locale).toContain('sglang_omni');
+    }
     expect(messages.de.mappingRealtimeCapableUnknownHint).not.toBe(
       messages.en.mappingRealtimeCapableUnknownHint,
     );

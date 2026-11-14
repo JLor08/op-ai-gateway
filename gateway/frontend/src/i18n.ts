@@ -1207,7 +1207,8 @@ const de = {
   mappingRerankCapableUnknownHint:
     'Unbekannt = keine Festlegung. Das Gateway erkennt Reranker-Modelle nicht; sie werden ausschließlich vom Betreiber gekennzeichnet. Setze es auf Ja, um das Modell als Reranker (bewertet Anfrage-Dokument-Paare, kein Textgenerator) zu kennzeichnen. Das Gateway leitet daraus die Rolle des Modells ab.',
   mappingRealtimeCapable: 'Realtime (WebSocket)',
-  mappingRealtimeCapableUnknownHint: 'Erlaubt /v1/realtime; erfordert Agent 0.20.0 oder neuer',
+  mappingRealtimeCapableUnknownHint:
+    'Unbekannt = kein Urteil hinterlegt. Das Gateway erkennt Realtime-Modelle nicht selbst. /v1/realtime leitet ein Modell nur weiter, wenn hier Ja steht, auf einem sglang_omni-Server, der mit --enable-realtime gestartet wurde und dessen Agent mindestens 0.20.0 ist.',
   mappingMetricsLocked: 'Metriken gesperrt',
   mappingMaxConcurrency: 'Max. Parallelität',
   mappingRecommendedConcurrency: 'Empfohlene Parallelität',
@@ -5255,7 +5256,8 @@ const en: PortalMessages = {
   mappingRerankCapableUnknownHint:
     "Unknown = no verdict on file. The gateway does not detect reranker models; only an operator marks them. Set it to Yes to mark the model as a reranker (it scores query/document pairs, it does not generate text). The gateway derives the model's role from it.",
   mappingRealtimeCapable: 'Realtime (WebSocket)',
-  mappingRealtimeCapableUnknownHint: 'Allows /v1/realtime; requires agent 0.20.0 or later',
+  mappingRealtimeCapableUnknownHint:
+    'Unknown = no verdict on file. Nothing detects realtime models; /v1/realtime routes a model only when this is Yes, on an sglang_omni server started with --enable-realtime whose agent is 0.20.0 or later.',
   mappingMetricsLocked: 'Metrics locked',
   mappingMaxConcurrency: 'Max concurrency',
   mappingRecommendedConcurrency: 'Recommended concurrency',

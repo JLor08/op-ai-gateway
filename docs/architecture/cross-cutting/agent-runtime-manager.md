@@ -10214,9 +10214,7 @@ operator meets first:
   server's HTTP/JSON endpoints work, its socket endpoints do not.
 - **Realtime residuals** ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)):
   a gone instance k≥1 is not re-selected on the dial (the session fails with the dial's
-  502); a peer that never answers the router's or the gateway's 1001 can hold its
-  session about 5 s past the 2 s shutdown bound (coder/websocket's own close handshake
-  bound), so the usage row of such a session may be lost at exit; a peer that freezes
+  502); a peer that freezes
   mid-frame during a close handshake is unbounded in coder/websocket; and nginx does
   not upgrade `/v1/realtime/` with a trailing slash. Nothing is written for a request
   refused before a target is chosen.

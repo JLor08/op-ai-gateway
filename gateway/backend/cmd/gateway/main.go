@@ -116,7 +116,9 @@ func main() {
 
 // realtimeShutdownBound is how long the shutdown waits for the open /v1/realtime
 // sessions to close and record their usage (gateway.Server.WaitRealtimeSessions).
-const realtimeShutdownBound = 2 * time.Second
+// It must exceed coder/websocket's 5 s close wait and still fit Docker's 10 s default
+// stop grace.
+const realtimeShutdownBound = 6 * time.Second
 
 // certEdgeGateTestRemoteAddrEnv, when set, makes the main listener report a
 // FIXED, caller-supplied address as the RemoteAddr of every accepted
