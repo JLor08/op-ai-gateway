@@ -12649,7 +12649,7 @@ the change.
   `https://` URL (the scheme case-insensitive); anything else, a bare path or `file://` included, is refused with the same 400
   `chat.media_url_unsupported`. http(s) stays allowed, as for vLLM, because blocking it breaks the ordinary use of a vision model.
 - **Agent `0.19.1` → `0.19.2`, PATCH.** No feature flag changes; there is no upgrade order.
-- **Realtime is out of this change.** `/v1/realtime` is a later phase; the WebSocket limitation stands.
+- **Realtime is out of this change.** `/v1/realtime` is a later phase ([ADR-104](#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)).
 
 **Rejected:**
 
@@ -12688,3 +12688,83 @@ the change.
   voice-chat TTS leg treats the stream as incomplete and drops the tail, and the call's billing is a logged zero.
 - **Not verified live:** an sglang-omni server end to end through the agent. The contracts were read off the pinned commits.
 - **Older agents** ignore the type strings: the gateway sees a best-effort context and no SGLang queue gauge.
+
+## ADR-104 — `/v1/realtime`: a WebSocket relayed through a new agent `/realtime/{model}` route that holds the spec admitted for the session, meters one usage row and is served only by an agent that declared `realtime_proxy`
+
+**Context.** sglang-omni serves an OpenAI Realtime-style WebSocket at `/v1/realtime` when it is started with `--enable-realtime`
+(#395, Phase 3). A client wants it through the gateway like every other model endpoint: one key, the allowlist and the rate, quota and
+budget gate, the usage row, and a model that the agent starts and keeps admitted. Four facts shaped the change.
+
+- **The agent router could not carry a WebSocket.** Its model-routed proxy buffers a JSON body to find the model, a WebSocket handshake
+  is a bodiless GET that answers `404 runtime.model_not_managed`, and `deadlineWriter.Hijack` returns `http.ErrNotSupported` on purpose:
+  a hijacked connection has no write deadline, no request-context cancellation and no rescue from `Server.Close`, so a spec whose
+  `release()` never ran would be un-evictable for the agent's lifetime (agent-runtime-manager §4.5).
+- **The live transcription path is not a template.** ADR-072 relays a chunked HTTP body full-duplex, because audio.cpp's `/live` is HTTP
+  and the browser's WebSocket ends at the gateway. sglang-omni's endpoint is a WebSocket with its own message protocol, which a client
+  speaks end to end.
+- **A router without the route cannot say so.** The agent answers `GET /realtime/{model}` on an older router with the same 404 as an
+  unmanaged model, so trying the route cannot tell the two apart.
+- **The credential problem of a browser.** A browser WebSocket cannot set an `Authorization` header. OpenAI's clients offer the key as a
+  subprotocol, `openai-insecure-api-key.<key>`, next to `realtime`.
+
+**Decision.**
+
+- **Agent `0.19.2` → `0.20.0`, MINOR, feature `realtime_proxy`.** A new router route `GET /realtime/{model}`, with the model in the path and
+  `m#k` instance addresses as for `/live`. The handshake is validated **before** admission: version 13, exactly one 16-byte key, and an
+  `Origin` that is absent or equal to `Host` (`400 runtime.realtime_upgrade_required`, `403 runtime.realtime_origin_forbidden`). The route
+  ensures the spec and **holds it admitted for the whole session**, dials the child's `ws://…/v1/realtime` with `model` rewritten, and
+  answers a failed dial `502 runtime.upstream_gone` before the upgrade. Frames are relayed both ways with their message type, bounded at
+  4 MiB per message (close code 1009) and ended by a 15-minute idle limit (1008 `idle_timeout`). The close code and reason are mirrored;
+  when the first end is a write failure, the router waits up to 1 s for the closer's own read, so the real code wins, and a 1005 is
+  relayed as an empty close frame. `router.Close`, an unbind and a rebind end every session with 1001, waiting at most 2 s. The route
+  hands `coder/websocket` the server's own writer, so the `deadlineWriter` Hijack ban and the `Connection`/`Upgrade` strip stay in force
+  for every other route.
+- **Gateway `GET /v1/realtime` and `/openai/v1/realtime`.** Auth runs **before** the upgrade, bearer-only: a Bearer token or the loopback
+  pair, or the subprotocols `realtime` and `openai-insecure-api-key.<key>`. A Bearer header wins, the first key offered wins, and only
+  `realtime` is ever selected; the key is never logged and never forwarded. The `Origin` check is skipped, because the endpoint accepts no
+  ambient credential a cross-site page could use. `model` is required (`400 realtime.model_required`). Admission runs **once per
+  session**. A target must carry the `openai_audio` flavor, a **manual `realtime: yes`** verdict and be a `server_agent` target whose agent
+  reported `realtime_proxy` (fail closed). A rejected target is excluded by its instance key and the resolve runs again, up to 8 tries,
+  ending in `404 routing.no_model_route`. The session is registered in Active Requests before the dial; the gateway dials the agent
+  through a new `provider.NativeWebSocketDialer`, **forced to HTTP/1.1** (the production CA-pool transport offers `http/1.1` alone for
+  such a handshake), with no `Origin` and no client subprotocol. It has its own 15-minute idle limit; during shutdown it waits at most 2 s
+  for sessions and answers a new handshake `503 realtime.shutting_down`.
+- **One usage row per session.** Tokens come from the upstream's `response.done` `response.usage` (prompt or input, completion or output).
+  Without any usage object the row is `audio_second`, computed from the client's `input_audio_buffer.append` frames as base64 alphabet
+  characters × 3/4 ÷ 32000, read as the upstream reads a frame: keys matched exactly, the last duplicate wins, `NaN` and `Infinity`
+  tolerated as Python's `json` does. The count can only over-count. Without audio the row is a logged zero. `http_status` is 101; the close
+  codes 1000, 1001 and 1005 are a success and any other code is the error `realtime.close_<code>`.
+- **Capability `realtime`.** Manual verdicts only (`routing.CapabilityRealtime`): no probe states it, and the agent ingest drops it. The
+  portal's mapping form labels it "Realtime (WebSocket)", and the `sglang_omni` type note names `--enable-realtime`.
+- **nginx.** Exact-match locations for `/v1/realtime` and `/openai/v1/realtime` in all three deployable configurations (the two compose variants, which share
+  `locations.conf`, and the Kubernetes ConfigMap), with `Upgrade`/`Connection`, 3600 s timeouts and the full re-declared header set, the
+  `X-OP-*` blankings included.
+
+**Rejected:**
+
+- **Translating the WebSocket to HTTP, like the live path.** The client and sglang-omni speak one message protocol. A translation layer
+  would have to model it (session, response, audio buffer events), and any event it did not know would be lost or invented.
+- **A generic upgrade passthrough in `serveProxy`.** It would lift the Hijack ban for every route to serve one, and the ban exists because a
+  hijacked connection frees nothing on its own. A generic path would also need the model from a body that a handshake does not have, and
+  would leave a `101` from any child, solicited or not, holding a spec admitted. One route with its own session bounds, idle limit and
+  close is smaller and its failure modes are all named.
+- **A resolver-side feature filter.** The resolver chooses among mappings and cannot see agent features; teaching it a per-endpoint feature
+  would couple the routing package to the agent registry. The gateway filters after the resolve and re-resolves with an exclusion, as
+  re-selection already does.
+- **Trying the route and reading the 404.** It cannot be told from an unmanaged model.
+
+**Consequence:**
+
+- **Upgrade order.** A new gateway with an older agent answers `404 routing.no_model_route`: it never dials an agent that did not declare
+  `realtime_proxy`, including right after a gateway restart, until the agent has reported. An older gateway has no `/v1/realtime`.
+- **A realtime model must be told by an operator** (`realtime: yes`, manual) under the `openai_audio` flavor, on an agent-launched
+  `sglang_omni` server started with `--enable-realtime`. No other provider is served.
+- **Accepted residuals.**
+  - A refusal before a target is chosen writes no usage row, as the bearer live gate does.
+  - A gone instance k ≥ 1 is not re-selected on the dial.
+  - A peer that never answers a 1001 can hold its session about 5 s past the 2 s shutdown bound (coder/websocket's close handshake), so
+    its row may be lost at exit.
+  - A peer frozen mid-frame during a close handshake is unbounded in coder/websocket.
+  - `/v1/realtime/` with a trailing slash is not upgraded by nginx.
+- **The agent still serves no other WebSocket.** The §13 limitation stands for every other route and server.
+- **Not verified live:** an sglang-omni `/v1/realtime` end to end through the agent. The contracts were read off the pinned source.

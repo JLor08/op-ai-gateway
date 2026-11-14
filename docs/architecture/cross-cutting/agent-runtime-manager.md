@@ -1040,7 +1040,7 @@ wav, mp3, flac and pcm, with voice cloning through `ref_audio`. Their facts, eac
   none) reads nothing.
 - **Audio billing.** sglang-omni sends none of audio.cpp's duration signals, so the gateway measures the audio itself, but only
   where audio.cpp's signal is absent ([Compatibility & Inference §3.6 item 6](compatibility-and-inference.md#36-openai-audio-speech)).
-- **Realtime.** `/v1/realtime` is not served by this change (it is a later phase); the WebSocket limitation in §13 stands.
+- **Realtime.** `/v1/realtime` is served by a later change ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)): a `realtime: yes` verdict (manual) on a model of an `sglang_omni` server started with `--enable-realtime`, relayed through §4.5's route.
 - **Agent `0.19.1` → `0.19.2` is PATCH** (§7.1): no `agent.Features` entry changed. Against an older agent the types are
   harmless: it ignores the type string, so the gateway sees a best-effort context and no `sglang:` queue gauge, and the agent
   still sends the `/props` probe.
@@ -2816,7 +2816,7 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Seven fixed GET-only routes, three POST routes and the member routes `POST /rpc/{action}/{specID}` (since 0.18.0, [§3.6](#holds-reservations-and-the-member-routes)) (the `/upstream` passthrough counts
+Eight fixed GET-only routes (the eighth, `GET /realtime/{model}`, since 0.20.0, is the one that upgrades), three POST routes and the member routes `POST /rpc/{action}/{specID}` (since 0.18.0, [§3.6](#holds-reservations-and-the-member-routes)) (the `/upstream` passthrough counts
 once per allowlisted endpoint: `/props`, since 0.11.0 `/v1/audio/voices` and since 0.13.0
 `/v1/models`; the second POST route, `/live/{model}`, since 0.12.0, is the one that streams a
 request body rather than controlling anything; the third, `/stop/{model}`, since 0.17.0, drains
@@ -2834,6 +2834,7 @@ one instance); any other method on those paths falls through to model routing.
 | `POST /stop/{model}` | Begins a graceful drain of **one** instance — `m` for instance 0, `m#k` for instance k, resolved by `ResolveAddress` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) — and persists nothing (the `runtime_stop` feature, `Since: "0.17.0"`): `200 {"state":"stopping"}` when the drain began or was already running, `200 {"state":"stopped"}` when the instance has no process (so a repeat is idempotent, and an allowed instance that does not exist is not created), `404 runtime.model_not_managed` for an address that is not managed (also an empty model, or a spec the last push removed), `409 runtime.instance_protected` for an instance inside the protected floor, `409 runtime.instance_not_highest` while a higher instance of the spec has a process (an instance already draining is answered `stopping` regardless), or `502 runtime.upstream_gone` for any other failure (the manager shutting down, the request's context ending). The checks run in that order, so a refusal wins over the idempotent answers: a protected instance is refused even with no process. An instance of a `force_stopped` spec is answered from its process alone (`stopping` while the push's drain runs, `stopped` after), with neither refusal. A stop that is not refused also answers every request queued on the instance at that moment, a starting instance's ensure included: `409 runtime.instance_no_capacity` for a burst instance, `503 runtime.admission_blocked` for instance 0. `?if_evictable=1` makes it the gateway's conditional cluster-head stop: `409 runtime.instance_busy` when the agent's own eviction rule would not evict the head ([§3.6](#the-head-guard)). Bodiless like `/ensure`: any body is read and discarded, one over the 32 MiB bound gets `413 runtime.request_too_large`, and `model` is the decoded path after `/stop/` (the `#` percent-encoded). | Never: it answers as soon as the drain has begun; `Status()` and telemetry report the exit. |
 | `POST /rpc/{action}/{specID}` | The RPC cluster member routes (the `rpc_cluster` feature, `Since: "0.18.0"`); `action` is `ensure`, `release`, `stop` or `purge-cache`: start a member and arm a reservation, end it, stop a member, purge its cache. Addressed by **spec id** and never by model, answering `404 runtime.model_not_managed` for anything but an `rpc_server` spec. Answers and codes are in [§3.6](#holds-reservations-and-the-member-routes). | `ensure` for the start it asked for (held until the member is TCP-ready, and until the relay listens for a relay member); the others never. |
 | `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureServing`, so a burst instance that is not up answers `409 runtime.instance_no_capacity`, §4.8, and the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
+| `GET /realtime/{model}` | The **WebSocket relay** (the `realtime_proxy` feature, `Since: "0.20.0"`, [ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy), [§4.5](#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)): validates the handshake first (`400 runtime.realtime_upgrade_required`, `403 runtime.realtime_origin_forbidden`), then ensures the spec like an inference request (the §4.3 codes apply), dials the child's `/v1/realtime` with `model` rewritten (`502 runtime.upstream_gone` for a failed dial, before the upgrade), upgrades the client and relays frames both ways with their message type. 4 MiB per message (close code 1009 beyond it), a 15-minute idle limit (1008 `idle_timeout`), close codes mirrored, and 1001 when the router closes, unbinds or rebinds. `model` is the decoded path after `/realtime/`; an `m#k` instance address works. | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the session ends). |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
 "the router accepts requests", never "a model is warm". Making the health check
@@ -2996,7 +2997,7 @@ had streamed seconds of audio into the void. With the call first, a `404 runtime
 request with **no declared length**, so the transport sends it chunked in a background goroutine and
 returns the response as soon as the child's headers arrive; the inbound `Accept-Encoding` is stripped as on
 every proxy path, so the relayed SSE is the decoded body. The existing buffering `serveProxy` is
-unchanged; `/live` is the new, non-buffering path beside it. No protocol upgrade is involved (§4.5): the
+unchanged; `/live` is the new, non-buffering path beside it. No protocol upgrade is involved on this route (§4.5): the
 browser's WebSocket ends at the gateway (whose handler loops it back to the gateway's own bearer endpoint, [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)),
 and this leg, from that endpoint to the router, is a plain chunked POST.
 
@@ -3197,10 +3198,14 @@ or a pinned model process:
    goroutine and its `release()` indefinitely. The tests prove the wiring, not
    that a genuinely stalled TCP peer is freed end to end.
 
-### 4.5 No protocol upgrades — and what that costs
+### 4.5 One protocol upgrade, the realtime WebSocket — and what the rest costs
 
-**The router never proxies a protocol upgrade, and two independent mechanisms
-keep it that way.** Both must stay; each looks redundant beside the other.
+**The router proxies exactly one protocol upgrade, `GET /realtime/{model}`
+(below). Every other route still refuses one, and two independent mechanisms
+keep it that way.** Both must stay; each looks redundant beside the other. The
+realtime route is not an exception to either: it never runs through a
+`deadlineWriter` and never through `httputil.ReverseProxy`, it hands
+`coder/websocket` the server's own writer and carries its own bounds.
 
 - `deadlineWriter.Hijack` returns `http.ErrNotSupported`. This is *required*
   because `deadlineWriter` declares `Unwrap() http.ResponseWriter` (so
@@ -3225,16 +3230,55 @@ with it the per-write deadline refresh that is the wrapper's whole purpose. Note
 the asymmetry — for `io.ReaderFrom`, not declaring the method suffices; for
 `http.Hijacker` it does not, because `Unwrap` promotes it.
 
-**The operator-visible consequence: a WebSocket-first model server cannot be
-driven through a `server_agent` application.** A WebSocket handshake is a
-bodiless GET, so it is rejected at the front door with
-`404 runtime.model_not_managed` — the HTTP/JSON endpoints of such a server work,
-its socket endpoints do not (text-generation-webui's and koboldcpp's streaming
-sockets are the concrete cases). This is a design boundary, not a missing
-feature: adding upgrade support would need an in-flight model for long-lived
-connections, an idle-based deadline on the raw connection, and a drain that
-closes hijacked connections. It is not a re-added `Hijack`. The limitation is
-recorded in §13 of this document.
+**`GET /realtime/{model}` (the `realtime_proxy` feature, `Since: "0.20.0"`,
+[ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)).** A WebSocket relay to a managed
+child's `/v1/realtime` (sglang-omni started with `--enable-realtime`). The gateway's
+`/v1/realtime` is its only client. The rules:
+
+- **The handshake is validated before anything is admitted:** HTTP/1.1 or later with
+  `Connection: upgrade` and `Upgrade: websocket`, `Sec-WebSocket-Version` 13, exactly
+  one `Sec-WebSocket-Key` that decodes to 16 bytes, and an `Origin` that is absent or
+  equal to `Host`. A malformed handshake is `400 runtime.realtime_upgrade_required`, a
+  foreign `Origin` is `403 runtime.realtime_origin_forbidden`. The gateway sends no
+  `Origin`, so the check stops a browser page from reaching an agent router directly.
+- **The model is in the path**, as for `/live`, and `m#k` instance addresses work the
+  same way (§4.8): the route ensures the spec like an inference request
+  (`EnsureServing`, so the §4.3 codes apply) and **holds it admitted for the whole
+  session**; `release()` runs exactly once, when the session ends.
+- **The child is dialed at `ws://…/v1/realtime`** with `model` rewritten to the child's
+  own model name (the inbound query is carried, its `model` replaced). A failed dial is
+  `502 runtime.upstream_gone` **before** the client's upgrade, so a refusal is still a
+  plain HTTP answer.
+- **Frames are relayed both ways and keep their message type.** One message is bounded
+  at **4 MiB**: a larger one ends the session with close code 1009 on both sides, and
+  nothing larger is buffered. A session with no message in either direction for **15
+  minutes** ends with 1008 and the reason `idle_timeout` (pings do not count); the
+  child normally times a silent session out first, and the bound exists so a peer gone
+  without a FIN cannot hold the admission for good.
+- **Close codes and reasons are mirrored.** When the first thing the router sees is a
+  failed write, it waits up to 1 s for the other end's own read, so the code the closer
+  really sent wins over a synthesized one. A close with no status (1005) is relayed as
+  an empty close frame.
+- **The router's own end of a session is 1001.** `router.Close`, an unbind and a rebind
+  to another port (which retires the old router) close every open session with 1001,
+  waiting at most 2 s for the close handshakes, after `routerMu` is released and before
+  the manager closes. A hijacked connection is invisible to `http.Server.Close`, which
+  is why the router tracks its sessions itself. A router that is closing answers a new
+  handshake `502 runtime.upstream_gone`.
+- **The `deadlineWriter.Hijack` ban stays in force for every other route**, and so does
+  the `Connection`/`Upgrade` strip of `servePlainProxy`.
+
+**The operator-visible consequence for every other server stays: a WebSocket-first
+model server is not served through a `server_agent` application, except for
+`/v1/realtime` as above.** A WebSocket handshake to any other path is a bodiless
+GET, so it is rejected at the front door with `404 runtime.model_not_managed` —
+the HTTP/JSON endpoints of such a server work, its socket endpoints do not
+(text-generation-webui's and koboldcpp's streaming sockets are the concrete
+cases). This is a design boundary, not a missing feature: a generic upgrade would
+need what the realtime route builds for itself — an in-flight model for long-lived
+connections, an idle-based bound on the raw connection and a drain that closes
+hijacked connections — for every route, and it is not a re-added `Hijack`. Recorded
+in §13, which also lists the realtime route's residuals.
 
 One residual risk is accepted rather than fixed: **a child that answers `101`
 unsolicited leaks its raw connection.** Verified against the Go 1.26.5 source,
@@ -5131,7 +5175,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 [§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), `Since: "0.16.0"`, and
 `runtime_stop` ([§4.1](#41-control-routes)), `Since: "0.17.0"`, and
 `rpc_cluster` ([§3.6](#36-rpc-cluster-members-and-heads)), `Since: "0.18.0"`, and
-`runtime_exec_wsl` ([§3.8](#38-execution-modes-wsl2)), `Since: "0.19.0"`
+`runtime_exec_wsl` ([§3.8](#38-execution-modes-wsl2)), `Since: "0.19.0"`, and
+`realtime_proxy` ([§4.5](#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)), `Since: "0.20.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -5139,6 +5184,14 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_manager`, `runtime_logs`, `runtime_config_ack`, `capability_source_sdcpp`,
 `capability_source_audiocpp`, `runtime_instances` and `rpc_cluster`
 (`gatewayAgentFeatures`, `internal/gateway/agent_features.go`).
+
+`realtime_proxy` ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)) is, like `fullduplex_proxy`, on the **agent's list
+only**: the agent gates nothing on it (the route is there or not), and the gateway reads it as positive
+evidence, fail-closed, before it dials `GET /realtime/{model}` (`realtimeTargetServed`). Trying the route
+instead cannot work: a router without it hands the bodiless GET to the model-routed proxy, which answers
+`404 runtime.model_not_managed`, the answer an unmanaged model gets too. The gateway also needs the
+agent's telemetry to have arrived since it started, so right after a gateway restart a session is refused
+until the agent has reported (the target is excluded and resolution runs again, ADR-104).
 
 `runtime_instances` (#340, [ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
 is the one name **both sides declare, each stating a different fact, and each
@@ -5922,6 +5975,15 @@ changes: the `sglang` type adds a context extractor (`data[].max_model_len`, sha
 gauge names (the largest series of each `dp_rank` group, summed over the groups), and both types skip the `/props` probe (§3.4). An older agent keeps
 working against a newer gateway and the reverse; there is **no upgrade order**
 ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+
+**`0.19.2` → `0.20.0` (the realtime WebSocket relay, #395 Phase 3) is MINOR, and one bump for
+the whole branch.** `agent.Features` gained `realtime_proxy` (§7) and the router gained
+`GET /realtime/{model}` (§4.5). `TestFeaturesDeclareRealtimeProxy` pins the name and its
+`Since`. The upgrade order matters for one thing only: the gateway dials the route only on
+an agent that declared the name, so a new gateway with an older agent answers a realtime
+request as if the model had no route (`404 routing.no_model_route`), never with a
+connection to an agent that cannot serve it, and an older gateway has no `/v1/realtime`
+at all. Upgrade the agent before relying on a realtime model ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -10147,7 +10209,17 @@ operator meets first:
 - **A portal admin with server-management rights effectively chooses what runs on
   the AI servers**, bounded solely by the agent-local binary allowlist (§3.1).
 - **WebSocket-serving model servers are not supported** through a `server_agent`
-  application (§4.5). Their HTTP/JSON endpoints work.
+  application (§4.5), with one exception: `/v1/realtime` (agent 0.20.0, the
+  `realtime_proxy` feature, [ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)). Every other
+  server's HTTP/JSON endpoints work, its socket endpoints do not.
+- **Realtime residuals** ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)):
+  a gone instance k≥1 is not re-selected on the dial (the session fails with the dial's
+  502); a peer that never answers the router's or the gateway's 1001 can hold its
+  session about 5 s past the 2 s shutdown bound (coder/websocket's own close handshake
+  bound), so the usage row of such a session may be lost at exit; a peer that freezes
+  mid-frame during a close handshake is unbounded in coder/websocket; and nginx does
+  not upgrade `/v1/realtime/` with a trailing slash. Nothing is written for a request
+  refused before a target is chosen.
 - **Device names follow the backend's enumeration, not the host index**
   (§3.2, §3.6). A `${DEVICES}`-style token renders the declared GPU indices under
   the backend prefix, but the number the backend gives a card is its own:

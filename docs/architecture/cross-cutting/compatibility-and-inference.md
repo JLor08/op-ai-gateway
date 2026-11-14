@@ -2242,6 +2242,56 @@ official OpenAI SDK against either route; those remain operator steps. The vllm-
 `/v1/systemone` relay and a `/v1/decisions` translate) and an agent-launched `vllm-srun`
 through both endpoints.
 
+### 3.11 Realtime: the WebSocket relay
+
+`GET /v1/realtime` (and `/openai/v1/realtime`) is an OpenAI Realtime-style **WebSocket** to an sglang-omni
+model started with `--enable-realtime`, relayed through the agent's router
+([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy), [Agent-Managed Model Runtime §4.5](agent-runtime-manager.md#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)).
+The gateway translates nothing: messages cross byte for byte with their type kept, and are read only to count
+what the session is billed for. Unlike the live transcription of §3.8 it has no HTTP form and no portal
+adapter.
+
+1. **Auth runs before the upgrade, and is bearer-only.** A Bearer token with `gateway:use` or `llm:invoke` (or
+   the internal loopback pair), never the session cookie. A client that cannot set a header, a browser
+   WebSocket, may offer the subprotocols `realtime` and `openai-insecure-api-key.<key>` (OpenAI's convention):
+   the key then authenticates as a bearer would. A Bearer header wins over a subprotocol key, the **first** key
+   offered wins, and only `realtime` is ever selected as the subprotocol. The key is never logged and never
+   forwarded: the agent is dialed with a header of the gateway's own. The `Origin` check is skipped
+   (`InsecureSkipVerify`) because the endpoint accepts no ambient credential a cross-site page could ride.
+2. **`model` is the query's `model`, required** (`400 realtime.model_required`). A request that is no
+   WebSocket handshake the gateway can accept is `426` or `400 realtime.upgrade_required`, before anything is spent.
+3. **Admission runs once per session**, however long it lasts: the model and server override, the allowlist and the
+   rate, quota and budget gate, the same as the other audio endpoints.
+4. **The target** needs the `openai_audio` flavor, a **manual `realtime: yes`** verdict (the capability `realtime`,
+   which no probe writes; an agent's report of it is dropped at ingest) and a `server_agent` provider whose agent
+   reports `realtime_proxy` (fail closed, also for an agent that has not reported since the gateway started). The
+   resolver cannot see agent features, so a target that fails the agent test is excluded by its instance key and
+   the resolve runs again, up to 8 tries; a model with no serving target is `404 routing.no_model_route`. Every
+   other provider is refused the same way, since there is no direct realtime dial.
+5. **The relay.** The session is registered in Active Requests before the agent is dialed, and the client's
+   socket is accepted only after the dial succeeded, so a failed dial is a plain `502`/`503`. The dial is
+   forced to HTTP/1.1 (the production CA-pool transport offers `http/1.1` alone for it, since HTTP/2 cannot carry
+   an upgrade) and sends no `Origin` and no client subprotocol. The gateway ends a session with no message in
+   either direction for 15 minutes with 1008. During shutdown it waits at most 2 s for open sessions to close
+   (1001) and answers a new handshake `503 realtime.shutting_down`. The close code and reason of either side
+   are mirrored.
+6. **Usage: one row per session**, `http_status` 101, in this order of preference:
+   - **tokens**, summed from the upstream's `response.done` `response.usage` (prompt or input tokens and
+     completion or output tokens);
+   - otherwise **`audio_second`**, from the client's `input_audio_buffer.append` frames: the count of base64
+     alphabet characters of `audio`, times 3/4, divided by 32000 bytes per second. The frame is read as the
+     upstream reads it: `type` and `audio` are matched exactly (case-sensitive, the last duplicate wins), and the
+     bare literals `NaN`, `Infinity` and `-Infinity` are tolerated as Python's `json` does. The count can only
+     over-count, never under-count;
+   - otherwise a **logged zero** (`audio_second` 0 with an `Error` log line).
+   A close code of 1000, 1001 or 1005 is a `success`; any other code is the error `realtime.close_<code>`. A
+   request refused before a target is chosen records no row, as the live bearer endpoint's gate does.
+7. **Residuals.** A gone instance `m#k` with k ≥ 1 is not re-selected on the dial. A peer that never answers a
+   1001 can hold its session about 5 s past the 2 s shutdown bound, so its row may be lost at exit. A peer that
+   freezes mid-frame during a close handshake is unbounded in `coder/websocket`. `/v1/realtime/` with a trailing
+   slash is not upgraded by nginx. A reverse proxy must carry the upgrade on both exact paths with long
+   timeouts ([Deployment View §7](../07-deployment-view.md)).
+
 ## 4. Session / continuity signals
 
 `extractClientSession` (`internal/gateway/session_extract.go`) derives a
