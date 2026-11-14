@@ -837,14 +837,15 @@ have emitted).
 ### 3.4 Runtime-server kind and per-kind probe-path derivation
 
 A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` |
-`stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `custom`; migration 75, `text not null default ''`)
+`stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `sglang` | `sglang_omni` | `custom`; migration 75, `text not null default ''`)
 is what tells the gateway — and, through it, the agent — which conventions govern
 *this* child's metrics and context-window endpoints (design 2026-09-07), and,
 for `stable_diffusion_cpp`, its health path. `""` (every pre-feature row) is
 not "unknown", it is **auto-detect**: `DetectRuntimeSpecType`
 (`routing/runtime_spec_type.go`) matches case-insensitive substrings of the
 launched binary's basename, first match wins — `vllm-srun`/`vllm_srun`
-(before `vllm`, whose substring they contain), then `vllm`, then
+(before `vllm`, whose substring they contain), then `sgl-omni`/`sgl_omni`/`sglang-omni`/`sglang_omni`
+(`sglang_omni`, before `sglang`, whose substring they contain), then `sglang`, then `vllm`, then
 `llama-server`/`llama_cpp`/`llama.cpp`, then
 `text-generation-launcher`/`tgi`, then `sd-server`/`stable-diffusion`, then
 `audiocpp_server`/`audio.cpp`, then `ollama` — and falls back to `custom` when nothing
@@ -865,6 +866,8 @@ winning **per field** over the type's own default:
 | `stable_diffusion_cpp` | *(none)* — measured: `sd-server` serves no metrics endpoint of any kind | *(none)* — no `/props`, no context-length field in its capability document, and an image model has no context window | — |
 | `audio_cpp` | *(none)* — an audio server's design relies on no Prometheus-style scrape | *(none)* — `/v1/models` entries carry `family`, `task`, `mode`, `loaded` and `path`, not a context length, and a speech or transcription model has no context window | — |
 | `vllm_sr` | `/metrics` (Prometheus; `vllm_srun_queue_depth`=queue, **no** running gauge, so active stays 0) | `/v1/models` | `data[].limits.max_input_tokens` (the first entry that carries it; the best-effort scan is the fallback) |
+| `sglang` | `/metrics` (Prometheus, needs `--enable-metrics`; `sglang:num_queue_reqs`=queue, `sglang:num_running_reqs`=active) | `/v1/models` | `data[].max_model_len` |
+| `sglang_omni` | *(none)* — sglang-omni has no `/metrics` | *(none)* — its `/v1/models` carries no context length | — |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -976,6 +979,71 @@ the code:
   Against an older agent the type is harmless: it ignores the type string, so
   the gateway sees a best-effort context, no queue gauge and no `runtime_api_version`
   (unknown, never a warning).
+
+**`sglang` and `sglang_omni` are two spec types for two different servers, both launched as an agent child ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).**
+`sglang` is SGLang (`routing.RuntimeSpecTypeSGLang`, read off `v0.5.23`), a text server. `sglang_omni` is sglang-omni
+(`routing.RuntimeSpecTypeSGLangOmni`, read off `v0.2.0`), a multimodal server that serves chat, speech and transcription;
+Ming-3.0-TTS (`inclusionAI/Ming-3.0-tts-tiny` and `-0.5B`), a model family it serves, offers `/v1/audio/speech` at 44.1 kHz in
+wav, mp3, flac and pcm, with voice cloning through `ref_audio`. Their facts, each from the code:
+
+- **Detection** checks `sgl-omni`, `sgl_omni`, `sglang-omni` and `sglang_omni` first, so an omni name never detects as
+  `sglang`, then `sglang`, and both before `vllm`. The binary base name `sglang` (SGLang's console script, `sglang serve`)
+  detects as `sglang`, unless the spec's args hold `--model-type omni` or `--model-type=omni`: SGLang's serve CLI hands
+  either spelling to the sglang-omni serve backend (its `omni` entry point, which nothing else selects), so that spec is
+  `sglang_omni`, and its probe paths, role, warning and media guards follow (`routing.EffectiveRuntimeSpecType`). Any
+  occurrence counts, which errs on the stricter guards. `python -m sglang.launch_server` has a base name that says nothing, so it
+  needs an explicit `type`. An explicit `type` always wins.
+- **Probe paths.** `sglang` uses `/metrics` (SGLang serves it only with `--enable-metrics`) and the context probe `/v1/models`
+  (`data[].max_model_len`, read by the same extractor as vLLM's; a body without a positive one falls back to the best-effort
+  key scan, as `vllm_sr`'s does). `sglang_omni` has neither a metrics path nor a context probe. The health path stays the stock
+  `/health` for both.
+- **Metrics.** The scrape reads `sglang:num_queue_reqs` as the queue depth and `sglang:num_running_reqs` as the running count,
+  after the existing names. SGLang emits one series per scheduler rank, labelled `tp_rank`, `dp_rank`, `pp_rank` and
+  `moe_ep_rank`. For these two names the series are grouped by `dp_rank` (a series without the label is one group), each group
+  counts its largest value, and the groups are summed: the tensor-parallel ranks of a group repeat its numbers and its
+  pipeline stages share one queue, so neither `--tp-size 2` nor `--pp-size 2` doubles the figure, while data-parallel groups
+  (DP attention included) hold disjoint requests and add up. The `dp_rank` value is read by a label-block parser, so a
+  `my_dp_rank` label or a quoted value that contains `dp_rank=` is not taken for it. If pipeline stages ever held disjoint
+  queues the figure would undercount (unverified upstream). Every other metric family is aggregated as before.
+- **No `/props` probe:** neither type serves `/props` or a capability document, so the capability probe (§10) returns before
+  sending a request, as for `vllm_sr`. An `sglang_omni` server's speech and transcription verdicts are manual.
+- **Role.** `routing.DeriveRole` falls back to chat for `sglang`, like `vllm`. `sglang_omni` has no type fallback, because one
+  server may host a text, speech or ASR model: its capabilities decide, and a bare mapping is `other`.
+- **Launch shape** (the portal form's type notes). `sglang`: `serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics`;
+  set `--mem-fraction-static` when the card is shared, because the automatic default takes most of it; `--api-key` leaves
+  `/health` and `/metrics` open. `sglang_omni`: `serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}`.
+  Keep `--host 127.0.0.1`: sglang-omni authenticates nothing and listens on `0.0.0.0` by default. On Windows both run in the
+  WSL execution mode (§3.8).
+- **Portal defaults.** Switching an untouched spec to `sglang_omni` ticks the flavors `openai` and `openai_audio` and sets
+  `responses_mode` and `messages_mode` to `disabled`: v0.2.0 serves neither route, and a passthrough would bypass the media
+  guard below. `sglang` keeps the stock defaults. A `sglang_omni` spec without `openai_audio` raises the advisory warning
+  `api_flavors_no_audio_on_sglang_omni`, because speech and transcription are routed only under that flavor.
+- **Inline media only.** For a resolved target of effective type `sglang_omni`, the gateway relays only inline media, because
+  sglang-omni reads a bare path from the model host, fetches any URL (its chat image connector allows private addresses) and
+  authenticates nothing. Speech `ref_audio` and every `references[]` `audio_path`, `ref_audio` and `audio` must be `data:`
+  URLs (keys are matched case-insensitively, and a malformed `references` value or a body that is not one JSON object is
+  refused); chat `image_url.url`, including images translated from Anthropic Messages, must be `data:` too; an image edit's
+  source must be an uploaded file (no `url`/`url[]`, a filename on `image`/`image[]`, exactly one parseable `form-data`
+  Content-Disposition per part, every part relayed with gateway-written headers). The refusals are 400
+  `speech.reference_audio_unsupported`, 400 `chat.media_url_unsupported` and 400 `images.source_unsupported`, logged at Warn
+  and recorded as a usage row. A `responses_mode` or `messages_mode` of `passthrough` is served as translate for such a target,
+  so neither coding-agent body reaches it raw. The top-level chat fields `audios`, `images` and `videos` never reach the
+  provider, which rebuilds the body from known fields. Chat audio is not relayed either: the gateway's chat model carries text
+  and images only (an `input_audio` part is refused at parse, `modalities` and `audio` are dropped), so only text and inline
+  images reach sglang-omni chat. Two residuals stay: a misdeclared type (an explicit `custom` on an sglang-omni binary) and a
+  static application fronting an sglang-omni server are not guarded.
+- **No host paths for `sglang`.** For a resolved target of effective type `sglang`, a chat `image_url.url` must be a `data:`,
+  `http://` or `https://` URL (the scheme case-insensitive), because SGLang reads a `/` or `file://` reference from its host;
+  anything else is refused with the same 400 `chat.media_url_unsupported`. http(s) stays allowed, as for vLLM. A raw
+  `/v1/responses` or `/v1/messages` passthrough to an `sglang` target is not checked; switching those modes to translate closes
+  that, and the portal's type note says so. With `--api-key`, `/v1/models` needs the key, so the context probe (which sends
+  none) reads nothing.
+- **Audio billing.** sglang-omni sends none of audio.cpp's duration signals, so the gateway measures the audio itself, but only
+  where audio.cpp's signal is absent ([Compatibility & Inference §3.6 item 6](compatibility-and-inference.md#36-openai-audio-speech)).
+- **Realtime.** `/v1/realtime` is served by a later change ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)): a `realtime: yes` verdict (manual) on a model of an `sglang_omni` server started with `--enable-realtime`, relayed through §4.5's route.
+- **Agent `0.19.1` → `0.19.2` is PATCH** (§7.1): no `agent.Features` entry changed. Against an older agent the types are
+  harmless: it ignores the type string, so the gateway sees a best-effort context and no `sglang:` queue gauge, and the agent
+  still sends the `/props` probe.
 
 **`ollama` is the one row whose verb is not `GET`, and having it wrong made
 that probe unsatisfiable for as long as it existed (issue #54, fixed).**
@@ -1307,7 +1375,9 @@ fact about this runtime is, and why:
   `api_flavors_text_on_stable_diffusion` for an `sd-server` spec whose flavors
   are not images-only, and `api_flavors_not_on_application` for a spec that
   lists `openai_images` alone under a parent that lacks it, which leaves the
-  child served, and listed, under no API at all.
+  child served, and listed, under no API at all. An advisory one,
+  `api_flavors_no_audio_on_sglang_omni`, is the audio counterpart for an
+  sglang-omni spec (below).
   Both forms offer `openai_images` as a third flavor checkbox, in the shared
   `ApiVariantControls`: tick it on the
   `server_agent` application for candidacy and on each image spec for the
@@ -2746,7 +2816,7 @@ and mesh surface per model.
 
 ### 4.1 Control routes
 
-Seven fixed GET-only routes, three POST routes and the member routes `POST /rpc/{action}/{specID}` (since 0.18.0, [§3.6](#holds-reservations-and-the-member-routes)) (the `/upstream` passthrough counts
+Eight fixed GET-only routes (the eighth, `GET /realtime/{model}`, since 0.20.0, is the one that upgrades), three POST routes and the member routes `POST /rpc/{action}/{specID}` (since 0.18.0, [§3.6](#holds-reservations-and-the-member-routes)) (the `/upstream` passthrough counts
 once per allowlisted endpoint: `/props`, since 0.11.0 `/v1/audio/voices` and since 0.13.0
 `/v1/models`; the second POST route, `/live/{model}`, since 0.12.0, is the one that streams a
 request body rather than controlling anything; the third, `/stop/{model}`, since 0.17.0, drains
@@ -2764,6 +2834,7 @@ one instance); any other method on those paths falls through to model routing.
 | `POST /stop/{model}` | Begins a graceful drain of **one** instance — `m` for instance 0, `m#k` for instance k, resolved by `ResolveAddress` ([§4.8](#48-instance-addresses-and-the-in-place-model-rewrite)) — and persists nothing (the `runtime_stop` feature, `Since: "0.17.0"`): `200 {"state":"stopping"}` when the drain began or was already running, `200 {"state":"stopped"}` when the instance has no process (so a repeat is idempotent, and an allowed instance that does not exist is not created), `404 runtime.model_not_managed` for an address that is not managed (also an empty model, or a spec the last push removed), `409 runtime.instance_protected` for an instance inside the protected floor, `409 runtime.instance_not_highest` while a higher instance of the spec has a process (an instance already draining is answered `stopping` regardless), or `502 runtime.upstream_gone` for any other failure (the manager shutting down, the request's context ending). The checks run in that order, so a refusal wins over the idempotent answers: a protected instance is refused even with no process. An instance of a `force_stopped` spec is answered from its process alone (`stopping` while the push's drain runs, `stopped` after), with neither refusal. A stop that is not refused also answers every request queued on the instance at that moment, a starting instance's ensure included: `409 runtime.instance_no_capacity` for a burst instance, `503 runtime.admission_blocked` for instance 0. `?if_evictable=1` makes it the gateway's conditional cluster-head stop: `409 runtime.instance_busy` when the agent's own eviction rule would not evict the head ([§3.6](#the-head-guard)). Bodiless like `/ensure`: any body is read and discarded, one over the 32 MiB bound gets `413 runtime.request_too_large`, and `model` is the decoded path after `/stop/` (the `#` percent-encoded). | Never: it answers as soon as the drain has begun; `Status()` and telemetry report the exit. |
 | `POST /rpc/{action}/{specID}` | The RPC cluster member routes (the `rpc_cluster` feature, `Since: "0.18.0"`); `action` is `ensure`, `release`, `stop` or `purge-cache`: start a member and arm a reservation, end it, stop a member, purge its cache. Addressed by **spec id** and never by model, answering `404 runtime.model_not_managed` for anything but an `rpc_server` spec. Answers and codes are in [§3.6](#holds-reservations-and-the-member-routes). | `ensure` for the start it asked for (held until the member is TCP-ready, and until the relay listens for a relay member); the others never. |
 | `POST /live/{model}` | Relays a **full-duplex, chunked** request body to the managed child's streaming transcription endpoint (issue #266, the `fullduplex_proxy` feature, `Since: "0.12.0"`, [ADR-072](../09-architecture-decisions.md#adr-072--live-transcription-a-ticket-gated-websocket-carries-the-browsers-pcm-to-the-gateway-which-relays-it-full-duplex-through-a-new-agent-livemodel-route-and-bills-the-input-audio-it-counted-on-a-clean-end-of-input)): starts the child like an inference request (`EnsureServing`, so a burst instance that is not up answers `409 runtime.instance_no_capacity`, §4.8, and the §4.3 codes apply: `runtime.model_not_managed` 404 for an unmanaged or empty model, `runtime.admission_blocked` 503, `runtime.start_timeout` 504, `runtime.start_failed`/`runtime.not_permitted` 502), then streams the inbound body to `{child}/v1/audio/transcriptions/live` and relays the child's SSE back, flushed per write. `model` is the decoded path after `/live/`, so an id containing `/` works and the router **never reads the body to route it**. The child's query is the inbound `sample_rate`/`channels`/`sample_format`/`language` plus `model=<path model>`, which is authoritative (a stray inbound `model=` is overwritten). `502 runtime.upstream_gone` for an unreachable child. No heartbeat and no lazy 200: the child's own status and headers are the response (§4.4). | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the relay ends). |
+| `GET /realtime/{model}` | The **WebSocket relay** (the `realtime_proxy` feature, `Since: "0.20.0"`, [ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy), [§4.5](#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)): validates the handshake first (`400 runtime.realtime_upgrade_required`, `403 runtime.realtime_origin_forbidden`), then ensures the spec like an inference request (the §4.3 codes apply), dials the child's `/v1/realtime` with `model` rewritten (`502 runtime.upstream_gone` for a failed dial, before the upgrade), upgrades the client and relays frames both ways with their message type. 4 MiB per message (close code 1009 beyond it), a 15-minute idle limit (1008 `idle_timeout`), close codes mirrored, and 1001 when the router closes, unbinds or rebinds. `model` is the decoded path after `/realtime/`; an `m#k` instance address works. | Yes for the start, then it **holds the child admitted for the whole session** (`release()` runs exactly once, when the session ends). |
 
 **The health endpoints are load-bearing, not a formality.** Reachability means
 "the router accepts requests", never "a model is warm". Making the health check
@@ -2926,7 +2997,7 @@ had streamed seconds of audio into the void. With the call first, a `404 runtime
 request with **no declared length**, so the transport sends it chunked in a background goroutine and
 returns the response as soon as the child's headers arrive; the inbound `Accept-Encoding` is stripped as on
 every proxy path, so the relayed SSE is the decoded body. The existing buffering `serveProxy` is
-unchanged; `/live` is the new, non-buffering path beside it. No protocol upgrade is involved (§4.5): the
+unchanged; `/live` is the new, non-buffering path beside it. No protocol upgrade is involved on this route (§4.5): the
 browser's WebSocket ends at the gateway (whose handler loops it back to the gateway's own bearer endpoint, [ADR-073](../09-architecture-decisions.md#adr-073--portal-live-transcription-loops-back-through-the-public-v1audiotranscriptionslive-one-canonical-relay-that-resolves-admits-guards-and-bills-once)),
 and this leg, from that endpoint to the router, is a plain chunked POST.
 
@@ -3127,10 +3198,14 @@ or a pinned model process:
    goroutine and its `release()` indefinitely. The tests prove the wiring, not
    that a genuinely stalled TCP peer is freed end to end.
 
-### 4.5 No protocol upgrades — and what that costs
+### 4.5 One protocol upgrade, the realtime WebSocket — and what the rest costs
 
-**The router never proxies a protocol upgrade, and two independent mechanisms
-keep it that way.** Both must stay; each looks redundant beside the other.
+**The router proxies exactly one protocol upgrade, `GET /realtime/{model}`
+(below). Every other route still refuses one, and two independent mechanisms
+keep it that way.** Both must stay; each looks redundant beside the other. The
+realtime route is not an exception to either: it never runs through a
+`deadlineWriter` and never through `httputil.ReverseProxy`, it hands
+`coder/websocket` the server's own writer and carries its own bounds.
 
 - `deadlineWriter.Hijack` returns `http.ErrNotSupported`. This is *required*
   because `deadlineWriter` declares `Unwrap() http.ResponseWriter` (so
@@ -3155,16 +3230,55 @@ with it the per-write deadline refresh that is the wrapper's whole purpose. Note
 the asymmetry — for `io.ReaderFrom`, not declaring the method suffices; for
 `http.Hijacker` it does not, because `Unwrap` promotes it.
 
-**The operator-visible consequence: a WebSocket-first model server cannot be
-driven through a `server_agent` application.** A WebSocket handshake is a
-bodiless GET, so it is rejected at the front door with
-`404 runtime.model_not_managed` — the HTTP/JSON endpoints of such a server work,
-its socket endpoints do not (text-generation-webui's and koboldcpp's streaming
-sockets are the concrete cases). This is a design boundary, not a missing
-feature: adding upgrade support would need an in-flight model for long-lived
-connections, an idle-based deadline on the raw connection, and a drain that
-closes hijacked connections. It is not a re-added `Hijack`. The limitation is
-recorded in §13 of this document.
+**`GET /realtime/{model}` (the `realtime_proxy` feature, `Since: "0.20.0"`,
+[ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)).** A WebSocket relay to a managed
+child's `/v1/realtime` (sglang-omni started with `--enable-realtime`). The gateway's
+`/v1/realtime` is its only client. The rules:
+
+- **The handshake is validated before anything is admitted:** HTTP/1.1 or later with
+  `Connection: upgrade` and `Upgrade: websocket`, `Sec-WebSocket-Version` 13, exactly
+  one `Sec-WebSocket-Key` that decodes to 16 bytes, and an `Origin` that is absent or
+  equal to `Host`. A malformed handshake is `400 runtime.realtime_upgrade_required`, a
+  foreign `Origin` is `403 runtime.realtime_origin_forbidden`. The gateway sends no
+  `Origin`, so the check stops a browser page from reaching an agent router directly.
+- **The model is in the path**, as for `/live`, and `m#k` instance addresses work the
+  same way (§4.8): the route ensures the spec like an inference request
+  (`EnsureServing`, so the §4.3 codes apply) and **holds it admitted for the whole
+  session**; `release()` runs exactly once, when the session ends.
+- **The child is dialed at `ws://…/v1/realtime`** with `model` rewritten to the child's
+  own model name (the inbound query is carried, its `model` replaced). A failed dial is
+  `502 runtime.upstream_gone` **before** the client's upgrade, so a refusal is still a
+  plain HTTP answer.
+- **Frames are relayed both ways and keep their message type.** One message is bounded
+  at **4 MiB**: a larger one ends the session with close code 1009 on both sides, and
+  nothing larger is buffered. A session with no message in either direction for **15
+  minutes** ends with 1008 and the reason `idle_timeout` (pings do not count); the
+  child normally times a silent session out first, and the bound exists so a peer gone
+  without a FIN cannot hold the admission for good.
+- **Close codes and reasons are mirrored.** When the first thing the router sees is a
+  failed write, it waits up to 1 s for the other end's own read, so the code the closer
+  really sent wins over a synthesized one. A close with no status (1005) is relayed as
+  an empty close frame.
+- **The router's own end of a session is 1001.** `router.Close`, an unbind and a rebind
+  to another port (which retires the old router) close every open session with 1001,
+  waiting at most 2 s for the close handshakes, after `routerMu` is released and before
+  the manager closes. A hijacked connection is invisible to `http.Server.Close`, which
+  is why the router tracks its sessions itself. A router that is closing answers a new
+  handshake `502 runtime.upstream_gone`.
+- **The `deadlineWriter.Hijack` ban stays in force for every other route**, and so does
+  the `Connection`/`Upgrade` strip of `servePlainProxy`.
+
+**The operator-visible consequence for every other server stays: a WebSocket-first
+model server is not served through a `server_agent` application, except for
+`/v1/realtime` as above.** A WebSocket handshake to any other path is a bodiless
+GET, so it is rejected at the front door with `404 runtime.model_not_managed` —
+the HTTP/JSON endpoints of such a server work, its socket endpoints do not
+(text-generation-webui's and koboldcpp's streaming sockets are the concrete
+cases). This is a design boundary, not a missing feature: a generic upgrade would
+need what the realtime route builds for itself — an in-flight model for long-lived
+connections, an idle-based bound on the raw connection and a drain that closes
+hijacked connections — for every route, and it is not a re-added `Hijack`. Recorded
+in §13, which also lists the realtime route's residuals.
 
 One residual risk is accepted rather than fixed: **a child that answers `101`
 unsolicited leaks its raw connection.** Verified against the Go 1.26.5 source,
@@ -4601,14 +4715,14 @@ capability verdicts and its effective runtime type, **first match wins**:
 | 4 | `embedding` is yes | `embedding` |
 | 5 | `rerank` is yes | `reranker` |
 | 6a | none of the above, and the type is `stable_diffusion_cpp` | `image` |
-| 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi` or `ollama` | `chat` |
+| 6b | none of the above, and the type is `vllm`, `llama_cpp`, `tgi`, `ollama` or `sglang` | `chat` |
 | 7 | any chat-only capability (`vision`, `video`, `audio`, `tools`, `mtp`) is yes | `chat` |
-| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` server, a `vllm_sr` worker, to which the gateway routes decisions only) | `other` |
+| 8 | otherwise (a `custom` launcher with no verdicts, a bare `audio_cpp` or `sglang_omni` server, a `vllm_sr` worker, to which the gateway routes decisions only) | `other` |
 
 Capabilities outrank the type because they are specific and the type is not (an
 operator's `embedding` verdict on a `vllm` server is how that model becomes an
 embedding model); a model that both transcribes and synthesises is `asr`;
-`audio_cpp` is deliberately no type fallback, because one server hosts asr or tts
+`audio_cpp` and `sglang_omni` are deliberately no type fallback, because one server hosts asr, tts or chat
 and the type cannot say which, and `vllm_sr` is none because the gateway routes no chat to it. `embedding` and `rerank` are capabilities of their
 own, **operator-stated** on the mapping form (no probe; no reserved verdict, so a
 manual `no` is selectable), and gate no route, since the gateway serves no
@@ -5061,7 +5175,8 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 [§5.8](#58-instances-of-one-spec-siblings-burst-capacity-and-the-protected-floor)), `Since: "0.16.0"`, and
 `runtime_stop` ([§4.1](#41-control-routes)), `Since: "0.17.0"`, and
 `rpc_cluster` ([§3.6](#36-rpc-cluster-members-and-heads)), `Since: "0.18.0"`, and
-`runtime_exec_wsl` ([§3.8](#38-execution-modes-wsl2)), `Since: "0.19.0"`
+`runtime_exec_wsl` ([§3.8](#38-execution-modes-wsl2)), `Since: "0.19.0"`, and
+`realtime_proxy` ([§4.5](#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)), `Since: "0.20.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -5069,6 +5184,14 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_manager`, `runtime_logs`, `runtime_config_ack`, `capability_source_sdcpp`,
 `capability_source_audiocpp`, `runtime_instances` and `rpc_cluster`
 (`gatewayAgentFeatures`, `internal/gateway/agent_features.go`).
+
+`realtime_proxy` ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)) is, like `fullduplex_proxy`, on the **agent's list
+only**: the agent gates nothing on it (the route is there or not), and the gateway reads it as positive
+evidence, fail-closed, before it dials `GET /realtime/{model}` (`realtimeTargetServed`). Trying the route
+instead cannot work: a router without it hands the bodiless GET to the model-routed proxy, which answers
+`404 runtime.model_not_managed`, the answer an unmanaged model gets too. The gateway also needs the
+agent's telemetry to have arrived since it started, so right after a gateway restart a session is refused
+until the agent has reported (the target is excluded and resolution runs again, ADR-104).
 
 `runtime_instances` (#340, [ADR-090](../09-architecture-decisions.md#adr-090--model-instances-are-gateway-named-addresses-m-for-instance-0-mk-for-instance-k-and-the-agent-rewrites-the-child-model-in-place))
 is the one name **both sides declare, each stating a different fact, and each
@@ -5847,6 +5970,21 @@ containment on (a native spec with an explicit `work_dir` outside it is
 refused). It still needs the old `runtime_wsl_allowed_*` settings, so upgrade the
 agent before switching its config to `wsl://` entries.
 
+**`0.19.1` → `0.19.2` (the SGLang and sglang-omni spec types, #395) is PATCH.** No feature flag
+changes: the `sglang` type adds a context extractor (`data[].max_model_len`, shared with `vllm`), the two queue and running
+gauge names (the largest series of each `dp_rank` group, summed over the groups), and both types skip the `/props` probe (§3.4). An older agent keeps
+working against a newer gateway and the reverse; there is **no upgrade order**
+([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+
+**`0.19.2` → `0.20.0` (the realtime WebSocket relay, #395 Phase 3) is MINOR, and one bump for
+the whole branch.** `agent.Features` gained `realtime_proxy` (§7) and the router gained
+`GET /realtime/{model}` (§4.5). `TestFeaturesDeclareRealtimeProxy` pins the name and its
+`Since`. The upgrade order matters for one thing only: the gateway dials the route only on
+an agent that declared the name, so a new gateway with an older agent answers a realtime
+request as if the model had no route (`404 routing.no_model_route`), never with a
+connection to an agent that cannot serve it, and an older gateway has no `/v1/realtime`
+at all. Upgrade the agent before relying on a realtime model ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)).
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
@@ -6622,6 +6760,8 @@ mirror). Three different cadences share the one collect cycle:
     worker serves no `/props` and no capability document, so nothing is requested and
     nothing is sent. The skip sits in the caller, `probeRuntimeChild`, so a `vllm_sr`
     child never reaches `probeRuntimeChildProps` at all.
+  - `sglang`, `sglang_omni` — **no probe at all** (agent 0.19.2, ADR-103): neither server serves `/props`, so the skip
+    sits in the same caller, `probeRuntimeChild`, beside `vllm_sr`'s.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.
@@ -6634,7 +6774,7 @@ mirror). Three different cadences share the one collect cycle:
   either capability, which is exactly the case this probe exists to recover.
   A type may be claimed by name only when its binary serves no `/props` at
   all, so that claiming it loses nothing a `/props` probe could have found —
-  true of `ollama`, of `stable_diffusion_cpp`, of `audio_cpp` and of `vllm_sr`, and of nothing else; `custom`
+  true of `ollama`, of `stable_diffusion_cpp`, of `audio_cpp`, of `vllm_sr`, of `sglang` and of `sglang_omni`, and of nothing else; `custom`
   can never be claimed, whatever binary it turns out to run, or that fallback
   loses its probe. Either way it is one extra loopback request per child
   lifetime once a verdict set is cached, on a path that is a package
@@ -6952,6 +7092,8 @@ Nothing found is recorded as 0, which the history shows as "—". Per spec type:
 | `stable_diffusion_cpp` | not applicable | not applicable | none | always: an images-only mapping gets no speed row, and the standalone context probe is refused and disabled for it |
 | `audio_cpp` | not applicable | not applicable | none | always: an audio-only mapping gets no speed row, and the standalone context probe is refused (`benchmark.audio_only`) and disabled for it |
 | `vllm_sr` | not applicable | not applicable | none from a benchmark | always: a `vllm_sr` mapping is decisions-only, so it gets no speed row and the standalone context probe is refused (`benchmark.decisions_only`). The context the agent reads (`data[].limits.max_input_tokens` of `/v1/models`, best effort) reaches the mapping through the ingest write-back, not through a benchmark |
+| `sglang` | none (the `/props` probe is skipped), so telemetry decides | `/v1/models` | `data[].max_model_len` | a child started with `--api-key`, which protects `/v1/models` (`/health` and `/metrics` stay open) |
+| `sglang_omni` | not applicable | not applicable | none | always: its `/v1/models` carries no context length, and the standalone context probe has no path to read |
 | `custom` | yes, if the child serves a llama.cpp-shaped `/props` | only when the spec sets `context_probe_path`, and only for a child without a key | a best-effort scan for `n_ctx`, `max_model_len` or `context_length` | otherwise |
 | Auto (`""`) | follows the type `EffectiveRuntimeSpecType` resolves | | | |
 
@@ -7793,7 +7935,8 @@ Auto, its `binary` is unchanged since the form loaded, and the loaded spec was
 Auto and resolved to `stable_diffusion_cpp`. The form does not mirror the
 backend's binary-name detection, so under Auto a changed binary, or a spec
 loaded with an explicit Type, shows no hint; once the spec is saved, the
-warning judges its binary.
+warning judges its binary. The advisory `api_flavors_no_audio_on_sglang_omni`
+has no inline hint: it appears only in the warnings banner of the specs tab.
 
 **A type switch moves untouched flavors and modes, as it moves an untouched
 health path** ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
@@ -7809,8 +7952,9 @@ sd. Switching to Auto moves nothing, for the health path's reason: an Auto spec
 with an `sd-server` binary is still sd. In every other case the values are the
 operator's and stay as they are. Switching Type to `audio_cpp` does the same with
 `["openai_audio"]` and both modes `disabled`, the application form's default for that
-type (`specTypeFlavorDefaults`, one entry per defaulting kind), and a switch between
-the two defaulting kinds moves from one default to the other. "Untouched" is judged
+type (`specTypeFlavorDefaults`, one entry per defaulting kind: `stable_diffusion_cpp`,
+`audio_cpp`, `vllm_sr` and `sglang_omni`; `sglang_omni`'s is `["openai", "openai_audio"]` with both modes
+`disabled`), and a switch between two defaulting kinds moves from one default to the other. "Untouched" is judged
 against the template, not by the form's flavor-touched flag, which resets on every
 open. The hint
 and switch rules live in `runtimeSpecTypeFlavors.ts`
@@ -8016,7 +8160,15 @@ audio.cpp twin** of this warning or of the form's matching inline hint: a spec o
 `audio_cpp` that keeps a text flavor is not flagged, because the agent-managed audio
 path is deferred ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
 
-Both count disabled specs, like `binary_path_os_mismatch` and unlike the
+**`api_flavors_no_audio_on_sglang_omni`** — a spec of a `server_agent` application whose
+effective type is `sglang_omni` lists no `openai_audio` flavor. sglang-omni's speech and
+transcription endpoints are routed only under that flavor, so the model would never be
+offered for audio requests. It is advisory, like the `vllm_sr` warning, and counts disabled
+specs. Its helper is `anySGLangOmniSpecLacksAudioFlavor`
+([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+
+The `api_flavors_not_on_application` and `api_flavors_text_on_stable_diffusion`
+warnings count disabled specs, like `binary_path_os_mismatch` and unlike the
 timeout warning, because dispatch reads a spec's flavors whether it is enabled
 or not (`targetFrom` ignores `Enabled`). Each check is a pure helper beside
 `anySpecBinaryContradictsReportedOS` (`anySpecListsFlavorNotOnApplication`,
@@ -10057,7 +10209,15 @@ operator meets first:
 - **A portal admin with server-management rights effectively chooses what runs on
   the AI servers**, bounded solely by the agent-local binary allowlist (§3.1).
 - **WebSocket-serving model servers are not supported** through a `server_agent`
-  application (§4.5). Their HTTP/JSON endpoints work.
+  application (§4.5), with one exception: `/v1/realtime` (agent 0.20.0, the
+  `realtime_proxy` feature, [ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)). Every other
+  server's HTTP/JSON endpoints work, its socket endpoints do not.
+- **Realtime residuals** ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)):
+  a gone instance k≥1 is not re-selected on the dial (the session fails with the dial's
+  502); a peer that freezes
+  mid-frame during a close handshake is unbounded in coder/websocket; and nginx does
+  not upgrade `/v1/realtime/` with a trailing slash. Nothing is written for a request
+  refused before a target is chosen.
 - **Device names follow the backend's enumeration, not the host index**
   (§3.2, §3.6). A `${DEVICES}`-style token renders the declared GPU indices under
   the backend prefix, but the number the backend gives a card is its own:

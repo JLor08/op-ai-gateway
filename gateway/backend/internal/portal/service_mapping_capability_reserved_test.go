@@ -279,3 +279,26 @@ func TestManualLiveProgressYesStaysAllowed(t *testing.T) {
 		t.Fatal("live_progress row survived its reset")
 	}
 }
+
+// TestMappingAcceptsAManualRealtimeVerdict pins that realtime takes manual
+// verdicts, both directions: it has no probe writer, so a manual row is the only
+// way it is ever stated and there is nothing to outrank (not a reserved pair).
+func TestMappingAcceptsAManualRealtimeVerdict(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	for _, verdict := range []string{routing.CapabilityYes, routing.CapabilityNo} {
+		t.Run(verdict, func(t *testing.T) {
+			recorder := &capabilityResetRecorder{MemoryStore: routing.NewMemoryStore()}
+			fx := newCapabilityTestFixture(t, now, recorder)
+			if _, err := fx.svc.UpdateMapping(ctx, ownerToken(), fx.mappingID, UpdateMappingRequest{
+				CapabilityVerdicts: map[string]string{routing.CapabilityRealtime: verdict},
+			}); err != nil {
+				t.Fatalf("UpdateMapping: %v", err)
+			}
+			rows := routing.CapabilityRowsByName(mustMappingCapabilities(t, recorder.MemoryStore, fx.mappingID))
+			if got := rows[routing.CapabilityRealtime]; got.Verdict != verdict || got.Source != routing.CapabilitySourceManual {
+				t.Fatalf("realtime row = %+v, want a manual %s", got, verdict)
+			}
+		})
+	}
+}

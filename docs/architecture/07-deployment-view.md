@@ -78,6 +78,13 @@ flowchart TB
   section re-synthesis `POST /api/portal/voice-chat-synth` (issue #324), whose first synthesis can wait on a model's cold start. ingress-nginx's own
   header buffer is a controller-global ConfigMap key, not an annotation (`gateway/deploy/k8s/README.md`).
   `gateway/deploy/nginx-config.test.sh` pins all three ([ADR-078](09-architecture-decisions.md#adr-078--voice-chat-one-orchestration-websocket-composes-the-three-v1-cores-as-a-server-side-state-machine-with-a-pause-tolerant-continuation-window-a-deferred-commit-and-a-playout-aware-half-duplex-gate), [Networking & Mesh §10](cross-cutting/networking-mesh.md#10-agentgateway-websocket-transport)).
+- **The realtime WebSocket needs two exact-match nginx locations.** `/v1/realtime` and its `/openai/v1/realtime` alias
+  (`locations.conf`, mirrored in the k8s `nginx-configmap.yaml`) forward `Upgrade` and `Connection` to the gateway over
+  HTTP/1.1, set `proxy_read_timeout` and `proxy_send_timeout` to 3600 s so the gateway's own 15-minute idle limit is the
+  fuse, and re-declare the full header set, the `X-OP-*` blankings included, because a `proxy_set_header` in a location
+  discards the inherited ones. `/v1/realtime/` with a trailing slash is not upgraded. `ingress.yaml` carries the 3600 s
+  timeouts for the Kubernetes path, and a custom proxy must upgrade WebSockets on both paths
+  ([ADR-104](09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy), `gateway/deploy/nginx-config.test.sh` pins the locations).
 
 ## 7.4 Listeners
 

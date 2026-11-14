@@ -5,11 +5,14 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"strings"
 )
 
 // resolveTarget is the single seam through which every inference path
@@ -105,5 +108,82 @@ func (s *Server) resolveTranslateTarget(r *http.Request, token *auth.Token, req 
 			"server", s.serverName(target.ServerID), "route_id", target.RouteID)
 		return routing.Target{}, routing.ErrNoModelRoute
 	}
+	if refusal := mediaURLsRefused(target, req); refusal != nil {
+		slog.Warn("inference request rejected: image_url is a reference this target would resolve on the model host",
+			"path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model,
+			"server", s.serverName(target.ServerID), "route_id", target.RouteID,
+			"spec_type", target.LiveProgressSpecType, "field", "image_url.url")
+		return routing.Target{}, refusal
+	}
 	return target, nil
+}
+
+// errMediaURLUnsupported is the refusal of a request whose image reference an
+// sglang_omni target cannot be given safely (anything but an inline data: URL);
+// completionHTTPStatus answers it 400 with codeMediaURLUnsupported. Like the other
+// resolve sentinels it is recorded as a row without an upstream call.
+var errMediaURLUnsupported = errors.New(codeMediaURLUnsupported)
+
+// errMediaPathUnsupported is errMediaURLUnsupported's sglang twin: the refusal of an
+// image reference that is neither a data: nor an http(s) URL. It wraps
+// errMediaURLUnsupported, so it shares its status and code; only the message
+// (completionErrorResponse) differs, saying what an sglang target accepts.
+var errMediaPathUnsupported = fmt.Errorf("%w: not a data: or http(s) URL", errMediaURLUnsupported)
+
+// codeMediaURLUnsupported is API surface: clients branch on it.
+const codeMediaURLUnsupported = "chat.media_url_unsupported"
+
+// mediaURLsRefused returns the refusal of the first image of req whose reference
+// target's effective runtime spec type would resolve on the model host, nil when
+// there is none. It runs in resolveTranslateTarget, the one place every request that
+// reaches a provider as inference messages (chat, and the translated Responses and
+// Messages) passes after routing. Every other target is unchanged.
+//
+//   - sglang_omni (v0.2.0): only an inline data: URL is relayed
+//     (errMediaURLUnsupported). sglang-omni reads a bare image_url path from the model
+//     host, fetches any URL (private and metadata addresses included) and
+//     authenticates nothing. The upstream's top-level audios, images and videos
+//     fields never reach it: the chat body is parsed into a typed request
+//     (compat.openAIChatRequest) and rebuilt from known fields only
+//     (provider.OpenAICompatibleClient.Complete and streamRequestBody).
+//   - sglang (v0.5.23): a data:, http:// or https:// URL is relayed, the scheme
+//     matched case-insensitively, and everything else is refused
+//     (errMediaPathUnsupported). SGLang reads a reference that starts with "/" or
+//     "file://" from the model host (python/sglang/srt/utils/common.py,
+//     get_image_bytes); no gateway client has a reason to name a model-host path. An
+//     http(s) URL stays allowed, as it is for vLLM: blocking it would break the
+//     ordinary vision-model use.
+func mediaURLsRefused(target routing.Target, req inference.Request) error {
+	var allowed func(string) bool
+	var refusal error
+	switch target.LiveProgressSpecType {
+	case string(routing.RuntimeSpecTypeSGLangOmni):
+		allowed, refusal = isDataURL, errMediaURLUnsupported
+	case string(routing.RuntimeSpecTypeSGLang):
+		allowed, refusal = isDataOrHTTPURL, errMediaPathUnsupported
+	default:
+		return nil
+	}
+	for _, m := range req.Messages {
+		for _, p := range m.Content {
+			if p.Type == inference.ContentImage && !allowed(p.ImageURL) {
+				return refusal
+			}
+		}
+	}
+	return nil
+}
+
+// isDataOrHTTPURL reports whether s is a data:, http:// or https:// URL (the scheme is
+// case-insensitive).
+func isDataOrHTTPURL(s string) bool {
+	if isDataURL(s) {
+		return true
+	}
+	for _, scheme := range []string{"http://", "https://"} {
+		if len(s) >= len(scheme) && strings.EqualFold(s[:len(scheme)], scheme) {
+			return true
+		}
+	}
+	return false
 }

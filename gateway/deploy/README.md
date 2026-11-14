@@ -98,6 +98,10 @@ regardless. See [Persistence](../../docs/architecture/cross-cutting/persistence.
   body cap, a long body timeout). A custom proxy in front must not buffer that request body either. On Kubernetes
   the ingress-nginx buffering is per Ingress, so a dedicated Ingress for those two paths is the follow-up (see
   `k8s/README.md`).
+- The realtime relay adds two exact-match WebSocket locations to the same file: `/v1/realtime` and its
+  `/openai/v1/realtime` alias (HTTP/1.1 upstream, `Upgrade`/`Connection` forwarded, `proxy_read_timeout` and
+  `proxy_send_timeout` of 3600 s, the full X-OP-* header set re-declared). A custom proxy in front must upgrade
+  WebSockets on those paths and not shorten the idle limits below the gateway's 15-minute bound.
 - Voice Chat adds one location to the same file: a WebSocket upgrade for `/api/portal/voice-chat`, the
   live-transcription one again (`Host $http_host`, a 3600 s idle limit), plus two requirements that are not
   location-level. Both server blocks set `large_client_header_buffers 4 16k`: the single-use ticket rides one

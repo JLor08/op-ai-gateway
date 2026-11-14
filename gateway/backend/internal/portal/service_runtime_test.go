@@ -2951,6 +2951,8 @@ func TestPutRuntimeSpecTypeValidation(t *testing.T) {
 		string(routing.RuntimeSpecTypeOllama),
 		string(routing.RuntimeSpecTypeStableDiffusionCpp),
 		string(routing.RuntimeSpecTypeAudioCpp),
+		string(routing.RuntimeSpecTypeSGLang),
+		string(routing.RuntimeSpecTypeSGLangOmni),
 		string(routing.RuntimeSpecTypeCustom),
 	}
 	for _, typ := range validTypes {

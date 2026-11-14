@@ -4,6 +4,7 @@
 package routing
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -28,7 +29,16 @@ const (
 	// RuntimeSpecTypeVllmSR is the agent-launched vLLM Semantic Router worker
 	// (vllm-srun): the gateway routes only the decision endpoints to it.
 	RuntimeSpecTypeVllmSR RuntimeSpecType = "vllm_sr"
-	RuntimeSpecTypeCustom RuntimeSpecType = "custom"
+	// RuntimeSpecTypeSGLang is the agent-launched SGLang server (v0.5.23,
+	// sgl-project/sglang@297e54fd105e974cdf401e5b4d20253a22c16f90): a text
+	// server with /metrics and a /v1/models listing that carries max_model_len.
+	RuntimeSpecTypeSGLang RuntimeSpecType = "sglang"
+	// RuntimeSpecTypeSGLangOmni is the agent-launched sglang-omni server
+	// (v0.2.0, sgl-project/sglang-omni@e8c635ecb9c68bcf2fbc32ceb3c40f85f3590657):
+	// a multimodal server without /metrics, whose /v1/models carries no context
+	// length, so it has no probe path and no type-based role fallback.
+	RuntimeSpecTypeSGLangOmni RuntimeSpecType = "sglang_omni"
+	RuntimeSpecTypeCustom     RuntimeSpecType = "custom"
 )
 
 // VllmSRSupportedAPIMajor is the major version of the vllm-srun runtime API
@@ -68,7 +78,9 @@ const defaultPrometheusMetricsPath = "/metrics"
 // binary's basename when no explicit RuntimeSpec.Type is set. It matches on
 // case-insensitive substrings -- vllm-srun/vllm_srun (checked before vllm;
 // the bare vllm-sr is deliberately not one: the vllm-sr CLI is no spec binary,
-// ADR-099, and the substring would catch names like vllm-srv), vllm,
+// ADR-099, and the substring would catch names like vllm-srv),
+// sgl-omni/sgl_omni/sglang-omni/sglang_omni (sglang_omni, checked before sglang
+// so an omni name never detects as sglang), sglang, vllm,
 // llama-server/llama_cpp/llama.cpp,
 // text-generation-launcher/tgi, sd-server/stable-diffusion,
 // audiocpp_server/audio.cpp, ollama -- in the order below (first match wins),
@@ -80,6 +92,12 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 	case strings.Contains(name, "vllm-srun"), strings.Contains(name, "vllm_srun"):
 		// Before the vllm case: the router worker's name contains "vllm".
 		return RuntimeSpecTypeVllmSR
+	case strings.Contains(name, "sgl-omni"), strings.Contains(name, "sgl_omni"),
+		strings.Contains(name, "sglang-omni"), strings.Contains(name, "sglang_omni"):
+		// Before the sglang case: an omni name contains "sglang".
+		return RuntimeSpecTypeSGLangOmni
+	case strings.Contains(name, "sglang"):
+		return RuntimeSpecTypeSGLang
 	case strings.Contains(name, "vllm"):
 		return RuntimeSpecTypeVLLM
 	case strings.Contains(name, "llama-server"), strings.Contains(name, "llama_cpp"), strings.Contains(name, "llama.cpp"):
@@ -99,12 +117,40 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 
 // EffectiveRuntimeSpecType resolves the RuntimeSpecType that governs a given
 // spec: the explicit spec.Type when set, else the type detected from
-// spec.Binary.
+// spec.Binary -- except that a binary detected as sglang whose args select the
+// omni serve backend (sglangArgsSelectOmni) is sglang_omni.
 func EffectiveRuntimeSpecType(spec RuntimeSpec) RuntimeSpecType {
 	if spec.Type != "" {
 		return RuntimeSpecType(spec.Type)
 	}
-	return DetectRuntimeSpecType(spec.Binary)
+	detected := DetectRuntimeSpecType(spec.Binary)
+	if detected == RuntimeSpecTypeSGLang && sglangArgsSelectOmni(spec.Args) {
+		return RuntimeSpecTypeSGLangOmni
+	}
+	return detected
+}
+
+// sglangArgsSelectOmni reports whether args (a spec's Args, an opaque JSON array of
+// strings) hold `--model-type omni` or `--model-type=omni`. That is the upstream
+// `sglang serve --model-type omni` form: SGLang v0.5.23's serve CLI
+// (python/sglang/cli/serve.py, _extract_model_type_override) hands the value of either
+// spelling to the serve backend registry, and sglang-omni v0.2.0 registers its server
+// as the "omni" backend (pyproject.toml, sglang.serve_backends), which is selected by
+// that flag alone -- its auto-detection never picks it. Any occurrence counts, even
+// one a later --model-type overrides upstream: reading the spec as sglang_omni turns
+// on the stricter media guards, which is the safe side to err on. Args that are no
+// JSON array select nothing.
+func sglangArgsSelectOmni(args string) bool {
+	var list []string
+	if json.Unmarshal([]byte(args), &list) != nil {
+		return false
+	}
+	for i, arg := range list {
+		if arg == "--model-type=omni" || (arg == "--model-type" && i+1 < len(list) && list[i+1] == "omni") {
+			return true
+		}
+	}
+	return false
 }
 
 // DeriveProbePaths resolves the metrics and context-probe paths to use for a
@@ -153,6 +199,15 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 		// vllm-srun serves Prometheus metrics at /metrics and lists its models,
 		// with their limits and the runtime api_version, at /v1/models.
 		defaultMetrics, defaultContext = defaultPrometheusMetricsPath, "/v1/models"
+	case RuntimeSpecTypeSGLang:
+		// SGLang v0.5.23 serves Prometheus metrics at /metrics (started with
+		// --enable-metrics) and lists its model, with max_model_len, at
+		// /v1/models.
+		defaultMetrics, defaultContext = defaultPrometheusMetricsPath, "/v1/models"
+	case RuntimeSpecTypeSGLangOmni:
+		// sglang-omni v0.2.0 has no /metrics, and its /v1/models carries no
+		// context length, so there is nothing honest to default either path to.
+		defaultMetrics, defaultContext = "", ""
 	case RuntimeSpecTypeCustom:
 		defaultMetrics, defaultContext = "", ""
 	default:

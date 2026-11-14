@@ -12581,3 +12581,190 @@ Configs generated since #390 carry the removed keys, so removing them must not s
 - **Accepted residual.** The running-list snapshot is taken once per scan, so a distro that idles out during a long scan (a `vllm --version` can take
   up to 60 s) can be started again by a later `stat` in the same scan.
 - **Running things needs no upgrade order; display does.** The agent's policy decides what runs. An older gateway stores and lists a `wsl://` row verbatim, without `execution`, `distro` or `exec_path`: its Binaries tab shows the raw `wsl://…` path, its picker would offer that string as a native binary path, and a `vllm` is stored as `other`. Upgrade the gateway (and its portal) together with, or before, agents that list `wsl://` entries. An agent before 0.19.1 has no `wsl://` concept: such a string in `runtime_allowed_binaries` is a useless native entry, and in `runtime_allowed_dirs` a native dir entry that turns native `work_dir` containment on. It still needs the old `runtime_wsl_allowed_*` settings: upgrade the agent before switching its config.
+
+## ADR-103 — SGLang and sglang-omni runtime spec types; duration fallbacks for non-audio.cpp audio and inline-only media for sglang-omni
+
+**Context.** Operators run SGLang and sglang-omni (a multimodal server for chat, speech and transcription; Ming-3.0-TTS is one of its
+model families) behind the agent, and had to register them as `custom` or `vllm`, which gave them no metrics, no context size and the
+wrong probes. Five facts, read off `sgl-project/sglang` `v0.5.23` (`297e54fd`) and `sgl-project/sglang-omni` `v0.2.0` (`e8c635ec`), shaped
+the change.
+
+- **The two servers differ.** SGLang serves Prometheus metrics at `/metrics` (only with `--enable-metrics`), one series per scheduler
+  rank, and a `/v1/models` listing with `max_model_len`. sglang-omni has no `/metrics`, and its `/v1/models` carries no context length.
+  Neither serves `/props`.
+- **One name contains the other.** An omni binary name contains `sglang`, so detection order decides the type.
+- **sglang-omni sends none of audio.cpp's duration signals.** Billing audio seconds read `X-AudioCPP-Audio-Duration-Ms` (speech) and
+  `timing.audio_duration_ms` (transcription), so every call to it would have billed the logged zero of ADR-041.
+- **sglang-omni trusts its caller.** It authenticates nothing on its inference routes and listens on `0.0.0.0` by default. Its speech
+  `ref_audio` and `references[]` read a bare path from the host and fetch a URL, its chat image connector fetches private
+  addresses, and its image edit resolves a source that is no uploaded file (`url`, or a text `image`) the same way. A gateway key
+  holder could therefore read a file on the model host or make it fetch an internal URL. SGLang reads an image reference that
+  starts with `/` or `file://` from its host too.
+- **A server may host any model.** One sglang-omni server can host a text, speech or ASR model.
+
+**Decision.**
+
+- **Two spec types, `sglang` and `sglang_omni`** (`routing.RuntimeSpecType`; the agent keeps literal copies of the strings). Detection
+  checks `sgl-omni`, `sgl_omni`, `sglang-omni` and `sglang_omni` first, then `sglang`, both before `vllm`; the base name `sglang` (the
+  console script) detects as `sglang`, unless its args hold `--model-type omni` or `--model-type=omni` (SGLang's serve CLI hands
+  either to the sglang-omni serve backend, which nothing else selects): that spec is `sglang_omni`. `python -m
+  sglang.launch_server` needs an explicit type. An explicit type still wins; only a binary whose name contains `sglang` or one of
+  the omni names changes type.
+- **Probes follow the server.** `sglang`: `/metrics` and the context probe `/v1/models` (`data[].max_model_len`). `sglang_omni`: neither.
+  A body without a positive `max_model_len` falls back to the best-effort scan. The `/props` probe is skipped for both, as for
+  `vllm_sr`. The series of `sglang:num_queue_reqs` and `sglang:num_running_reqs` are grouped by `dp_rank` (a series without the
+  label is one group), each group counts its largest value and the groups add up, so neither tensor parallelism nor pipeline
+  stages multiply the figure while data-parallel groups add; other families keep their aggregation.
+- **Role and warning.** `sglang` falls back to chat. `sglang_omni` has no fallback, so capabilities decide and an ASR-only server stays
+  ASR. A `sglang_omni` spec without `openai_audio` raises the advisory `api_flavors_no_audio_on_sglang_omni`. Live timings and live
+  progress stay off for both.
+- **Portal defaults for `sglang_omni`.** Flavors `openai` and `openai_audio`; `responses_mode` and `messages_mode` both `disabled`,
+  because v0.2.0 serves neither route and a passthrough would bypass the media guard. The type notes give the launch templates, keep
+  `--host 127.0.0.1` and say that speech and transcription verdicts are manual.
+- **A passthrough mode on an `sglang_omni` target is served as translate.** The portal default does not reach an Auto-typed spec, a
+  spec written through the API or a row stored before the type existed, so the gateway's `endpointModeFor` answers `passthrough` as
+  `translate` for such a target: `/v1/responses` and `/v1/messages` go through the media guard like chat, and the usage row's
+  provider path is `/v1/chat/completions`.
+- **Duration fallbacks, only when audio.cpp's signal is absent.** Speech: no or an empty `X-AudioCPP-Audio-Duration-Ms` on a successful
+  one-shot relay makes the duration the audio data bytes actually relayed divided by the byte rate of the WAV `fmt ` chunk; the header's
+  size field is not trusted, and pcm derived from the WAV is tallied the same way. Transcription: a body with no `timing` object or no
+  `timing.audio_duration_ms` key makes the duration that of the uploaded WAV part, measured with `wavDurationFromReader`, and when
+  that cannot be measured (a non-WAV upload, a WAV with a streaming writer's `0xFFFFFFFF` size) the duration sglang-omni states,
+  `usage` `{"type":"duration","seconds":N}` with `N` a positive finite number. A present but unusable audio.cpp value stays an Error
+  log and quantity 0 (ADR-041). Streamed speech keeps its rule (PCM bytes over the cached byte rate, else `audio_bytes`), and
+  sglang-omni's raw stream, labelled `audio/pcm` (its `stream_format` defaults to `audio`), is counted as the raw shape
+  `application/octet-stream` is. A fallback that cannot measure (a body that is no WAV, a transcription with neither a measurable
+  WAV nor that usage statement) keeps the logged zero.
+- **Inline media only, for a resolved target of effective type `sglang_omni`.** Speech `ref_audio` and every `references[]`
+  `audio_path`, `ref_audio` and `audio` must be `data:` URLs, matched case-insensitively, with a malformed `references` and a body
+  that is not one JSON object refused (400 `speech.reference_audio_unsupported`). Chat `image_url.url`, translated Anthropic images
+  included, must be `data:` (400 `chat.media_url_unsupported`). An image edit's source must be an uploaded file: `url` and `url[]`
+  are refused, `image` and `image[]` need a filename, a part needs exactly one parseable `form-data` Content-Disposition (Starlette
+  reads the last, Go the first), and every relayed part is rebuilt with gateway-written headers (400 `images.source_unsupported`). The
+  rebuild is trusted only inside a charset, because python-multipart's parameter splitter (a copy of CPython's `_parseparam`) counts
+  quotes as `count('"') - count('\\"')` and a value ending in a backslash lets a client smuggle a parameter: a part name must
+  match `^[A-Za-z0-9_.\[\]-]+$` and a filename must hold no `\`, `"`, `;` or control character, else the same 400.
+  All are logged at Warn with a usage row. The top-level chat fields `audios`, `images` and `videos` never reach the provider.
+- **No host paths, for a resolved target of effective type `sglang`.** Chat `image_url.url` must be a `data:`, `http://` or
+  `https://` URL (the scheme case-insensitive); anything else, a bare path or `file://` included, is refused with the same 400
+  `chat.media_url_unsupported`. http(s) stays allowed, as for vLLM, because blocking it breaks the ordinary use of a vision model.
+- **Agent `0.19.1` → `0.19.2`, PATCH.** No feature flag changes; there is no upgrade order.
+- **Realtime is out of this change.** `/v1/realtime` is a later phase ([ADR-104](#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)).
+
+**Rejected:**
+
+- **A capability probe now.** Neither server was found to state what a model does in a form the agent can read, so a probe would
+  guess, and a wrong verdict gates a route. The verdicts stay manual.
+- **Relaxing the response formats.** Speech stays `wav` and `pcm`. Relaying mp3 or flac would need a second relay path and a
+  duration measurement the WAV byte-rate logic cannot make. Ming-3.0-TTS also offers wav and pcm, which the relay serves.
+- **Trusting the WAV header's size field.** Streaming writers leave `0` or `0xFFFFFFFF` there, so the relayed bytes are counted
+  instead, and a declared size counts only when it is smaller than what followed.
+- **Falling back on a garbage audio.cpp header.** A present but unusable header is audio.cpp's own failure. Billing a guess for it would
+  hide the failure ADR-041 makes loud, and would change audio.cpp's behaviour. The fallback fires only on absence.
+- **Allowlisting paths instead of requiring inline media.** A path allowlist needs a directory on the model host the gateway cannot
+  see, and says nothing about a fetched URL. A `data:` URL is the one form the upstream resolves without touching the host or the
+  network.
+
+**Consequence:**
+
+- **A client that sends a path or a URL to an sglang-omni model gets a 400.** It must inline the image or voice reference as a `data:`
+  URL, and upload an edit's source as a file. A chat image path (or `file://`) sent to an SGLang model gets the same 400. Other
+  targets are unchanged.
+- **Accepted residuals.** A misdeclared type (an explicit `custom` on an sglang-omni binary) and a static application fronting an
+  sglang-omni server are not guarded; sglang-omni still authenticates nothing, so it stays on loopback behind the agent router. A raw
+  `/v1/responses` or `/v1/messages` passthrough to an `sglang` target is not guarded either, because parsing every passthrough
+  dialect is out of proportion; switching those modes to translate closes it, and the portal's `sglang` note says so. An `sglang`
+  target still fetches any http(s) URL it is given.
+- **Chat audio is not relayed to sglang-omni.** The gateway's chat model carries text and images only: an `input_audio` part is
+  refused at parse and `modalities`/`audio` are dropped, so only text and inline images reach sglang-omni chat. The sglang_omni
+  type note says so.
+- **Other billing shapes stay logged zeros.** A transcription to a target with no reported duration whose upload measures no WAV and
+  whose body states no usable `usage` duration, and a one-shot speech body that is no WAV, bill quantity 0 with an Error log.
+- **Speech and transcription verdicts are manual** for `sglang_omni`, and the model is not offered for audio until they are set under the
+  `openai_audio` flavor.
+- **Streaming residuals for sglang-omni, both behind a manual `speech_streaming`/`transcription_streaming` yes.** A streamed
+  transcription is billed only from the uploaded WAV: the final `transcript.text.done` event's `usage{seconds}` is not read, so a
+  streamed non-WAV upload is a logged zero. Its SSE speech stream ends on `speech.audio.done` without `[DONE]`, so the portal
+  voice-chat TTS leg treats the stream as incomplete and drops the tail, and the call's billing is a logged zero.
+- **Not verified live:** an sglang-omni server end to end through the agent. The contracts were read off the pinned commits.
+- **Older agents** ignore the type strings: the gateway sees a best-effort context and no SGLang queue gauge.
+
+## ADR-104 — `/v1/realtime`: a WebSocket relayed through a new agent `/realtime/{model}` route that holds the spec admitted for the session, meters one usage row and is served only by an agent that declared `realtime_proxy`
+
+**Context.** sglang-omni serves an OpenAI Realtime-style WebSocket at `/v1/realtime` when it is started with `--enable-realtime`
+(#395, Phase 3). A client wants it through the gateway like every other model endpoint: one key, the allowlist and the rate, quota and
+budget gate, the usage row, and a model that the agent starts and keeps admitted. Four facts shaped the change.
+
+- **The agent router could not carry a WebSocket.** Its model-routed proxy buffers a JSON body to find the model, a WebSocket handshake
+  is a bodiless GET that answers `404 runtime.model_not_managed`, and `deadlineWriter.Hijack` returns `http.ErrNotSupported` on purpose:
+  a hijacked connection has no write deadline, no request-context cancellation and no rescue from `Server.Close`, so a spec whose
+  `release()` never ran would be un-evictable for the agent's lifetime (agent-runtime-manager §4.5).
+- **The live transcription path is not a template.** ADR-072 relays a chunked HTTP body full-duplex, because audio.cpp's `/live` is HTTP
+  and the browser's WebSocket ends at the gateway. sglang-omni's endpoint is a WebSocket with its own message protocol, which a client
+  speaks end to end.
+- **A router without the route cannot say so.** The agent answers `GET /realtime/{model}` on an older router with the same 404 as an
+  unmanaged model, so trying the route cannot tell the two apart.
+- **The credential problem of a browser.** A browser WebSocket cannot set an `Authorization` header. OpenAI's clients offer the key as a
+  subprotocol, `openai-insecure-api-key.<key>`, next to `realtime`.
+
+**Decision.**
+
+- **Agent `0.19.2` → `0.20.0`, MINOR, feature `realtime_proxy`.** A new router route `GET /realtime/{model}`, with the model in the path and
+  `m#k` instance addresses as for `/live`. The handshake is validated **before** admission: version 13, exactly one 16-byte key, and an
+  `Origin` that is absent or equal to `Host` (`400 runtime.realtime_upgrade_required`, `403 runtime.realtime_origin_forbidden`). The route
+  ensures the spec and **holds it admitted for the whole session**, dials the child's `ws://…/v1/realtime` with `model` rewritten, and
+  answers a failed dial `502 runtime.upstream_gone` before the upgrade. Frames are relayed both ways with their message type, bounded at
+  4 MiB per message (close code 1009) and ended by a 15-minute idle limit (1008 `idle_timeout`). The close code and reason are mirrored;
+  when the first end is a write failure, the router waits up to 1 s for the closer's own read, so the real code wins, and a 1005 is
+  relayed as an empty close frame. `router.Close`, an unbind and a rebind end every session with 1001, waiting at most 2 s. The route
+  hands `coder/websocket` the server's own writer, so the `deadlineWriter` Hijack ban and the `Connection`/`Upgrade` strip stay in force
+  for every other route.
+- **Gateway `GET /v1/realtime` and `/openai/v1/realtime`.** Auth runs **before** the upgrade, bearer-only: a Bearer token or the loopback
+  pair, or the subprotocols `realtime` and `openai-insecure-api-key.<key>`. A Bearer header wins, the first key offered wins, and only
+  `realtime` is ever selected; the key is never logged and never forwarded. The `Origin` check is skipped, because the endpoint accepts no
+  ambient credential a cross-site page could use. `model` is required (`400 realtime.model_required`). Admission runs **once per
+  session**. A target must carry the `openai_audio` flavor, a **manual `realtime: yes`** verdict and be a `server_agent` target whose agent
+  reported `realtime_proxy` (fail closed). A rejected target is excluded by its instance key and the resolve runs again, up to 8 tries,
+  ending in `404 routing.no_model_route`. The session is registered in Active Requests before the dial; the gateway dials the agent
+  through a new `provider.NativeWebSocketDialer`, **forced to HTTP/1.1** (the production CA-pool transport offers `http/1.1` alone for
+  such a handshake), with no `Origin` and no client subprotocol. It has its own 15-minute idle limit; during shutdown it waits at most 6 s
+  for sessions (more than coder/websocket's 5 s close wait, and inside Docker's 10 s stop grace; the agent router keeps its own 2 s bound) and answers a new handshake `503 realtime.shutting_down`.
+- **One usage row per session.** A session that appended any audio is billed `audio_second`, computed from the client's `input_audio_buffer.append` frames as base64
+  alphabet characters × 3/4 ÷ 32000, read as the upstream reads a frame: keys matched exactly, the last duplicate wins, `NaN` and `Infinity`
+  tolerated as Python's `json` does. The count can only over-count. Audio takes precedence over the upstream's usage because sglang-omni's
+  legacy session sends `usage: null` for a cancelled turn and runs a transcription pass that is never billed: token precedence would
+  under-count and give free transcription after one normal turn. Only a session with no audio is token-metered, from the upstream's
+  `response.done` `response.usage` (prompt or input, completion or output). With neither the row is a logged zero. `http_status` is 101; the close
+  codes 1000, 1001 and 1005 are a success and any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded.
+- **Capability `realtime`.** Manual verdicts only (`routing.CapabilityRealtime`): no probe states it, and the agent ingest drops it. The
+  portal's mapping form labels it "Realtime (WebSocket)", and the `sglang_omni` type note names `--enable-realtime`.
+- **nginx.** Exact-match locations for `/v1/realtime` and `/openai/v1/realtime` in all three deployable configurations (the two compose variants, which share
+  `locations.conf`, and the Kubernetes ConfigMap), with `Upgrade`/`Connection`, 3600 s timeouts and the full re-declared header set, the
+  `X-OP-*` blankings included.
+
+**Rejected:**
+
+- **Translating the WebSocket to HTTP, like the live path.** The client and sglang-omni speak one message protocol. A translation layer
+  would have to model it (session, response, audio buffer events), and any event it did not know would be lost or invented.
+- **A generic upgrade passthrough in `serveProxy`.** It would lift the Hijack ban for every route to serve one, and the ban exists because a
+  hijacked connection frees nothing on its own. A generic path would also need the model from a body that a handshake does not have, and
+  would leave a `101` from any child, solicited or not, holding a spec admitted. One route with its own session bounds, idle limit and
+  close is smaller and its failure modes are all named.
+- **A resolver-side feature filter.** The resolver chooses among mappings and cannot see agent features; teaching it a per-endpoint feature
+  would couple the routing package to the agent registry. The gateway filters after the resolve and re-resolves with an exclusion, as
+  re-selection already does.
+- **Trying the route and reading the 404.** It cannot be told from an unmanaged model.
+
+**Consequence:**
+
+- **Upgrade order.** A new gateway with an older agent answers `404 routing.no_model_route`: it never dials an agent that did not declare
+  `realtime_proxy`, including right after a gateway restart, until the agent has reported. An older gateway has no `/v1/realtime`.
+- **A realtime model must be told by an operator** (`realtime: yes`, manual) under the `openai_audio` flavor, on an agent-launched
+  `sglang_omni` server started with `--enable-realtime`. No other provider is served.
+- **Accepted residuals.**
+  - A refusal before a target is chosen writes no usage row, as the bearer live gate does.
+  - A gone instance k ≥ 1 is not re-selected on the dial.
+  - A peer frozen mid-frame during a close handshake is unbounded in coder/websocket.
+  - `/v1/realtime/` with a trailing slash is not upgraded by nginx.
+- **The agent still serves no other WebSocket.** The §13 limitation stands for every other route and server.
+- **Not verified live:** an sglang-omni `/v1/realtime` end to end through the agent. The contracts were read off the pinned source.

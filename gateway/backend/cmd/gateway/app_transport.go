@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"op-ai-gateway/internal/provider"
 	"strings"
 	"sync/atomic"
 )
@@ -111,6 +112,11 @@ func (p *appCAPool) current() *x509.CertPool {
 // be reconstructed. InsecureSkipVerify is never set (explicit false).
 // ForceAttemptHTTP2 is set because installing a custom DialTLSContext
 // otherwise disables net/http's automatic HTTP/2 opt-in for this transport.
+//
+// The ALPN offer is h2 and http/1.1, except for a connection dialed for a request
+// provider.RequiresHTTP1 marks (the /v1/realtime WebSocket handshake), which offers
+// http/1.1 alone: HTTP/2 cannot carry an upgrade, and net/http leaves h2 out on its
+// own only for the TLS handshakes it performs itself, never for this dialer's.
 func (p *appCAPool) transport() *http.Transport {
 	base := http.DefaultTransport.(*http.Transport).Clone()
 	dial := base.DialContext
@@ -125,10 +131,14 @@ func (p *appCAPool) transport() *http.Transport {
 		if h, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
 			host = h
 		}
+		nextProtos := []string{"h2", "http/1.1"}
+		if provider.RequiresHTTP1(ctx) {
+			nextProtos = []string{"http/1.1"}
+		}
 		cfg := &tls.Config{
 			RootCAs:            p.current(),
 			ServerName:         host,
-			NextProtos:         []string{"h2", "http/1.1"},
+			NextProtos:         nextProtos,
 			InsecureSkipVerify: false,
 		}
 		tlsConn := tls.Client(rawConn, cfg)

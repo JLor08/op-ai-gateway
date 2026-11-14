@@ -69,7 +69,36 @@ func endpointDisabledError(apiFlavor string) (string, int) {
 // never reaches this function; its own upstream path is decided directly in
 // upstreamPath, before the mode lookup this function answers. Speech
 // (apiFlavorSpeech) is absent for the identical reason.
+//
+// A passthrough mode on a target whose effective kind is sglang_omni is answered
+// as translate (sglangOmniPassthroughAsTranslate), so the relay decision
+// (relayPassthroughTarget, and reselectPassthrough through it) and the usage
+// row's provider_path (upstreamPath) both see the mode the request is served by.
 func endpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
+	path, mode := storedEndpointModeFor(target, apiFlavor)
+	return path, sglangOmniPassthroughAsTranslate(target, mode)
+}
+
+// sglangOmniPassthroughAsTranslate returns translate for a passthrough mode on a
+// target whose effective kind (routing.Target.EffectiveKind) is sglang_omni, and mode
+// unchanged otherwise. A raw /v1/responses or /v1/messages body would reach
+// sglang-omni unexamined, and sglang-omni reads a bare image path from the model host,
+// fetches any URL and authenticates nothing; served as translate, the request passes
+// the media guard (resolveTranslateTarget, mediaURLsRefused) like a chat one. The
+// portal's sglang_omni defaults disable both modes, but an Auto-typed spec, a spec
+// written through the API and a row stored before the type existed keep the stock
+// passthrough, so the rule is the gateway's own (sglang-omni v0.2.0 serves neither
+// route either).
+func sglangOmniPassthroughAsTranslate(target routing.Target, mode routing.EndpointMode) routing.EndpointMode {
+	if mode == routing.EndpointModePassthrough && target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni) {
+		return routing.EndpointModeTranslate
+	}
+	return mode
+}
+
+// storedEndpointModeFor is endpointModeFor before the sglang_omni rule: the path and
+// the mode exactly as the Target carries them.
+func storedEndpointModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
 	switch apiFlavor {
 	case inference.APIFlavorOpenAIResponses:
 		// An OpenAI SUBSCRIPTION target (Milestone 5b) forwards to the ChatGPT
@@ -224,6 +253,12 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 	// too, and is told from the plain transcription by the endpoint alone.
 	if endpoint == endpointTranscriptionDetails {
 		return "/v1/audio/transcriptions/details"
+	}
+	// A realtime session shares the openai_audio flavor too and is told apart by its
+	// endpoint alone. Its row names the endpoint the agent relays it to, the child's
+	// /v1/realtime (the agent route it is dialed at is the active request's path).
+	if endpoint == endpointRealtime {
+		return realtimeUsagePath
 	}
 	if endpoint == endpointTranscription {
 		return "/v1/audio/transcriptions"
@@ -448,11 +483,13 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 		return true
 	default:
 		// translate (or an unpopulated "" mode — treated as translate, the safe
-		// fall-back): hand off to the compat translate path exactly as a non-native
-		// app did before. The rich-body reject happens at that path's parse.
+		// fall-back; or a passthrough mode on an sglang_omni target, which
+		// endpointModeFor answers as translate): hand off to the compat translate path
+		// exactly as a non-native app did before. The rich-body reject happens at that
+		// path's parse.
 		slog.Debug("native passthrough not applied: endpoint mode is translate",
 			"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
-			"server", s.serverName(target.ServerID),
+			"server", s.serverName(target.ServerID), "mode", string(mode),
 			"responses_mode", string(target.ResponsesMode), "messages_mode", string(target.MessagesMode))
 		return false
 	}
@@ -970,8 +1007,17 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// becomes application/octet-stream and its Content-Length the data size, and only the
 	// data chunk (io.LimitReader) reaches the copier. Metering is untouched:
 	// setSpeechBillingQuantity below still reads the upstream WAV's duration header, which the
-	// strip leaves in resp.Header.
+	// strip leaves in resp.Header; a target with no such header is measured from the PCM
+	// relayed and the stripped WAV's byte rate (speechTally).
 	relayBody := io.Reader(resp.Body)
+	// A one-shot speech body is also measured as it is relayed (speechWavTally), only when
+	// the upstream sent no duration header (not audio.cpp): setSpeechBillingQuantity falls
+	// back to it. An audio.cpp response is not tallied at all.
+	var speechTally *speechWavTally
+	noSpeechHeader := speechDurationHeaderAbsent(resp.Header)
+	if speechRelay && speechScan == nil && noSpeechHeader {
+		speechTally = newSpeechWavTally()
+	}
 	if rel.speechPCMStrip {
 		counting := &wavCountingReader{r: resp.Body}
 		format, dataSize, ok := wavStripToData(counting)
@@ -983,6 +1029,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		contentType = "application/octet-stream"
 		w.Header().Set(contentLengthHeader, strconv.FormatInt(dataSize, 10))
 		relayBody = io.LimitReader(resp.Body, dataSize)
+		if noSpeechHeader {
+			speechTally = newSpeechPCMTally(format.ByteRate)
+		}
 	}
 
 	markServedInstance(w, rel.pfReq, rel.target)
@@ -1061,7 +1110,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	if transcriptScan != nil || speechScan != nil {
 		teeBuf = nil
 	}
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan}
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan, speechWav: speechTally}
 	// relayBody is resp.Body for every relay but the pcm strip, which already consumed the
 	// WAV header above and hands the copier only the data chunk (io.LimitReader).
 	copyErr := copier.run(relayBody)
@@ -1078,14 +1127,15 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// The speech measure, likewise for a speech request that finished cleanly and
 	// for nothing else. Its quantity is the upstream's own duration header, so
 	// resp.Header is passed alongside the exchange -- see
-	// setSpeechBillingQuantity (speech_handler.go). A STREAMED speech call has no such
+	// setSpeechBillingQuantity (speech_handler.go), or, with no header at all, the
+	// WAV measured as it was relayed (speechTally). A STREAMED speech call has no such
 	// header: what it bills is what the scan counted on a completed stream, and
 	// setSpeechBillingQuantity -- which would log every streamed success as one that
 	// reported no duration -- is not asked. See setStreamedSpeechBillingQuantity.
 	if speechScan != nil {
 		s.setStreamedSpeechBillingQuantity(ctx, &meta, ex, speechScan, status)
 	} else {
-		setSpeechBillingQuantity(&meta, ex, resp.Header, status)
+		setSpeechBillingQuantity(&meta, ex, resp.Header, speechTally, status)
 	}
 	// The transcription measure, for the one transcription that gets this far: a
 	// streamed one, which states no duration -- it is read off the upload's WAV
@@ -1321,6 +1371,9 @@ type nativeCopier struct {
 	// Fed like transcript, and told at a clean EOF that the upstream closed the body
 	// (the raw shape's completion).
 	speech *speechStreamScan
+	// speechWav measures a one-shot speech body for billing when the upstream sends no
+	// duration header (nil for every other relay).
+	speechWav *speechWavTally
 	// written counts every body byte the client's writer took, past the capture
 	// cap too (respBuf stops growing there), so a capture that does not store the
 	// body can still say how large it was.
@@ -1382,6 +1435,7 @@ func (c *nativeCopier) writeChunk(chunk []byte) error {
 	c.imgCounter.feed(chunk)
 	c.transcript.feed(chunk)
 	c.speech.feed(chunk)
+	c.speechWav.feed(chunk)
 	if c.respBuf != nil && c.respBuf.Len() <= c.capBytes {
 		c.respBuf.Write(chunk)
 	}

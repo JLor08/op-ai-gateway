@@ -4734,3 +4734,77 @@ describe('vllm_sr i18n keys', () => {
     expect(messages.en.applicationTypeVllmSrNote).toContain('clear the verdict in the portal');
   });
 });
+
+describe('sglang i18n keys', () => {
+  it('defines the type labels, notes and the warning in de and en', () => {
+    const keys = [
+      'runtimeSpecTypeSglang',
+      'runtimeSpecTypeSglangNote',
+      'runtimeSpecTypeSglangOmni',
+      'runtimeSpecTypeSglangOmniNote',
+      'runtimeNoAudioOnSglangOmniWarning',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      // The product names are the same in both locales; everything else is text.
+      if (k !== 'runtimeSpecTypeSglang' && k !== 'runtimeSpecTypeSglangOmni') {
+        expect(messages.en[k]).not.toBe(messages.de[k]);
+      }
+    }
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('--mem-fraction-static');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('--model-path ${MODEL}');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('data:');
+      // The sglang note names the --api-key cost to the context probe, the image
+      // references the gateway accepts, and the passthrough residual.
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('/v1/models');
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('https://');
+      expect(messages[locale].runtimeSpecTypeSglangNote).toContain('/v1/messages');
+      // The sglang_omni note names the parent's audio flavor and the chat audio the
+      // gateway does not relay.
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('openai_audio');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('server_agent');
+      expect(messages[locale].runtimeSpecTypeSglangOmniNote).toContain('input_audio');
+    }
+    expect(messages.de.runtimeSpecTypeSglangNote).toContain('„Umwandlung“');
+    expect(messages.en.runtimeSpecTypeSglangNote).toContain('Translate');
+  });
+});
+
+describe('realtime capability i18n keys', () => {
+  it('has the form control, hint and chip keys in de and en; the labels match and the hint differs', () => {
+    for (const key of [
+      'mappingRealtimeCapable',
+      'mappingRealtimeCapableUnknownHint',
+      'capabilityRealtime',
+    ] as const) {
+      expect(messages.de[key], key).toBeTruthy();
+      expect(messages.en[key], key).toBeTruthy();
+    }
+    expect(messages.en.mappingRealtimeCapable).toBe('Realtime (WebSocket)');
+    expect(messages.de.mappingRealtimeCapable).toBe('Realtime (WebSocket)');
+    expect(messages.en.capabilityRealtime).toBe('Realtime (WebSocket)');
+    expect(messages.en.mappingRealtimeCapableUnknownHint).toContain('/v1/realtime');
+    expect(messages.en.mappingRealtimeCapableUnknownHint).toContain('0.20.0');
+    expect(messages.de.mappingRealtimeCapableUnknownHint).toContain('0.20.0');
+    for (const locale of ['de', 'en'] as const) {
+      const hint = messages[locale].mappingRealtimeCapableUnknownHint;
+      expect(hint, locale).toContain('--enable-realtime');
+      expect(hint, locale).toContain('sglang_omni');
+    }
+    expect(messages.de.mappingRealtimeCapableUnknownHint).not.toBe(
+      messages.en.mappingRealtimeCapableUnknownHint,
+    );
+  });
+
+  it('names --enable-realtime and the realtime verdict in the sglang_omni type note', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].runtimeSpecTypeSglangOmniNote;
+      expect(note).toContain('--enable-realtime');
+      expect(note).toContain('/v1/realtime');
+      expect(note).toContain('realtime');
+    }
+  });
+});

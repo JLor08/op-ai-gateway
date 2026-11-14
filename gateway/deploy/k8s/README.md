@@ -456,6 +456,14 @@ locations, and the Ingress caveat below is the only thing left to you.
   clients of the live endpoint need it. The reasoning is `docs/architecture/09-architecture-decisions.md` ADR-073
   and `docs/architecture/07-deployment-view.md` §7.3.
 
+## Realtime WebSocket
+
+`GET /v1/realtime` (and `/openai/v1/realtime`) is a long-lived WebSocket. The `op-gateway-web` nginx carries an
+exact-match upgrade location for each path (`nginx-configmap.yaml`, mirroring `../nginx/locations.conf`), and the
+Ingress upgrades WebSockets already; `ingress.yaml` sets `proxy-read-timeout` and `proxy-send-timeout` to 3600 s so
+the gateway's own 15-minute idle bound is the fuse. A proxy in front of the Ingress must upgrade WebSockets on those
+paths too. Not exercised against a cluster here.
+
 ## Voice Chat (portal WebSocket and ticket)
 
 Voice Chat (the portal's hands-free spoken conversation, issue #312, ADR-078) is two routes: the ticket mint

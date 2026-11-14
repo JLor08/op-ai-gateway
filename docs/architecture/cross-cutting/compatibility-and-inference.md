@@ -176,6 +176,22 @@ followed by a `role:"tool"` result message keyed by `tool_call_id`. Content is
 required on every message *except* such a tool-call turn or a tool-result
 message (`parseChatMessageContent`'s `contentOptional`).
 
+**Inline images only for `sglang_omni`, no host paths for `sglang` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).** When the resolved target's effective runtime spec type is
+`sglang_omni`, every `image_url.url` must be a `data:` URL, whether the request arrived as chat completions or was
+translated from Responses or Anthropic Messages. When it is `sglang`, it must be a `data:`, `http://` or `https://` URL
+(the scheme case-insensitive). Otherwise the request is refused after routing as **400 `chat.media_url_unsupported`**
+(`mediaURLsRefused`; the message says what the target accepts), logged at Warn and recorded as a usage row without an
+upstream call. sglang-omni v0.2.0 reads a bare path from the model host and fetches any URL, and its chat image connector
+allows private addresses; SGLang v0.5.23 reads a reference that starts with `/` or `file://` from its host
+(`get_image_bytes`), and http(s) stays allowed for it, as for vLLM. A `passthrough` Responses or Messages mode is served as
+translate for an `sglang_omni` target (§6), so neither body reaches it raw; the Responses translation keeps text only, so
+no image reaches sglang-omni from `/v1/responses`. The top-level chat fields `audios`, `images` and `videos` never reach
+the provider, which rebuilds the body from the fields it knows, and no chat audio reaches it either: an `input_audio` part
+is refused at parse (`openai.content_unsupported`) and `modalities`/`audio` are dropped, so sglang-omni chat receives text
+and inline images only. Not guarded: a spec whose type is misdeclared (an explicit `custom`), a static application fronting
+an sglang-omni server, and a raw Responses or Messages passthrough to an `sglang` target (switching those modes to translate
+closes it). Every other target is unchanged.
+
 ### 3.2 OpenAI Responses — Codex continuity
 
 `compat.ParseOpenAIResponses` accepts both the simple string `input` and the
@@ -607,19 +623,36 @@ takes the request's `Content-Type` as a parameter (§8) and `nativeRelay` gains 
 optional `upstreamBody`, so the relay can send the **client's bytes verbatim**
 (boundary included) or a body built for the upstream. It is **rebuilt once**
 (`rebuildImageEditBody`: every part copied with its headers, bytes and position,
-a fresh boundary) when either holds: the **`model` field must carry the mapping's
+a fresh boundary) when one of these holds: the **`model` field must carry the mapping's
 own model name** (`Target.ProviderModel`) and the form's differs — for **every**
 target, since the JSON generations relay rewrites it for every provider too, an
 agent's router keys the child on that name, and a model-routing upstream would
 otherwise route on the gateway's name; the comparison is against the *form's*
 value, because a token override or a redirect can land on a mapping whose two
-names are equal — or the form carries a **mask**, which is always a rebuild. A
-no-mask edit whose model needs no rewrite is relayed verbatim. `nativeRelay.raw`
+names are equal — the form carries a **mask**, which is always a rebuild — or the
+target is `sglang_omni` (below). A no-mask edit whose model needs no rewrite is
+relayed verbatim to every other target. `nativeRelay.raw`
 stays the client's bytes either way, which is what capture records. The usage row
 records `/v1/images/edits` as its `provider_path`. A body bound for
 an agent-launched target is checked against **the agent's own 32 MiB** *after*
 the rebuild (§10); one over it is refused `413 request.body_too_large` and
 recorded rather than sent.
+
+*An uploaded source only, for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni v0.2.0 takes the source from
+`image`, `image[]`, `url` or `url[]` and resolves a source that is no uploaded file as a model-host path or a URL it
+fetches. For a target of effective type `sglang_omni` the form is checked after routing (`sglangOmniEditSourceRefusal`)
+and refused **400 `images.source_unsupported`**, logged at Warn and recorded as a usage row, when a part does not carry
+exactly one `Content-Disposition` that parses and is `form-data` (Starlette keeps a part's last one, Go reads the first, and
+a duplicated parameter fails the parse), when it carries a `url` or `url[]` part, or when an `image` or `image[]` part has
+no filename (Starlette makes a part an uploaded file only by its filename). The message names the field, never a value.
+Every form it accepts is rebuilt, each part with headers the gateway wrote (`sglangOmniEditPartHeader`: a `form-data`
+Content-Disposition with the name and filename it read, plus the part's Content-Type). python-multipart splits a
+disposition's parameters with a copy of CPython's `email.message._parseparam`, which counts quotes as
+`count('"') - count('\\"')`, so a quoted value ending in a backslash misparses and can smuggle a parameter (a part Go saw as
+an unknown file field becomes the text field `url` upstream). The rebuild is therefore only trusted inside a charset: every
+relayed part's name must match `^[A-Za-z0-9_.\[\]-]+$` and its filename, when present, must hold no `\`, `"`, `;`, CR, LF
+or other control character, else the same 400 (the message names the Content-Disposition header, never the value). Inside it
+the quoting the gateway writes reads back identically, so the upstream reads what the gateway checked.
 
 **5. The mask: alpha in, luminance out.** An OpenAI edit marks the region to
 regenerate by **transparency** (an RGBA PNG whose transparent pixels are the
@@ -848,9 +881,37 @@ whole, a stream with no audio) is `(audio_second, 0)`: the quantity is never a p
 stores the request JSON as usual, since it carries the `input` text the opt-in exists
 for, and stores a **metadata summary instead of the audio bytes** (content type, size,
 the metering headers), gated on the response's own `Content-Type`; a streamed response is
-`text/event-stream` or `application/octet-stream` and is still that redacted summary, because
+`text/event-stream`, `application/octet-stream` or `audio/pcm` and is still that redacted summary, because
 the capture's endpoint is stamped speech
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+
+*Targets that are not audio.cpp ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* An `sglang_omni` target (sglang-omni v0.2.0) sends no
+`X-AudioCPP-Audio-Duration-Ms` header, so a one-shot call falls back to measuring the audio it relayed, and **only when
+audio.cpp's signal is absent**: no header, or an empty one. A header that is present but unusable (zero, negative, not a
+number) is audio.cpp's own broken statement and stays the Error log and quantity `0` of ADR-041, and a present
+header always wins, so audio.cpp's billing and logging are unchanged. The duration is the audio data bytes the relay
+actually forwarded, divided by the byte rate of the WAV's `fmt ` chunk (`speechWavTally`). The header's `data` size field
+is not trusted, because a streaming WAV writer leaves `0` or `0xFFFFFFFF` there: a declared size is used only when it is
+smaller than what followed (trailing metadata chunks are not audio). A `pcm` answer, which the gateway derives from the
+upstream WAV, is tallied the same way, from the bytes of the stripped stream and the byte rate of the header it
+stripped. A body that is no WAV, or one with no audio bytes, keeps the logged zero. A **streamed** call is billed by the
+rule above, and sglang-omni's raw stream counts as its raw shape: its `stream_format` defaults to `audio`, and it labels
+the headerless PCM `audio/pcm` rather than `application/octet-stream`, so `newSpeechStreamScan` takes either as raw PCM,
+billed from the bytes on a body closed cleanly. Its event stream ends on `speech.audio.done` without a `[DONE]`, which the
+scan does not count as a completion, so a streamed sglang-omni call in `sse` shape stays the logged zero. The same missing
+`[DONE]` is a **known residual** for the portal voice-chat TTS leg (`chat_runs_audio_stream.go`): its reader treats a stream
+without `[DONE]` as incomplete and drops the tail part. Both are reachable only when the route's `speech_streaming`
+verdict is a manual yes.
+
+*Inline voice references for `sglang_omni` ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni reads a bare `ref_audio` path from the model
+host and fetches a URL, and authenticates nothing, so the gateway relays only inline voice references to a target whose
+effective runtime spec type is `sglang_omni`: `ref_audio` and every `references[]` `audio_path`, `ref_audio` and `audio`
+must be `data:` URLs (the scheme is case-insensitive). Keys are matched case-insensitively, because the JSON decoder
+in Go and the Python upstream disagree on duplicate and differently cased keys, and a `references` value that cannot be
+read as objects is refused, as is a body that does not decode as one JSON object (named `body`; `validateSpeechRequest`
+refuses such a body first, and the guard does not rely on it). The refusal is **400 `speech.reference_audio_unsupported`**, decided after the route is
+resolved, answered before any upstream call, logged at Warn (the field name, never the value) and recorded as one
+`error` usage row of quantity `0`. Every other target is relayed unchanged.
 
 **7. Resolving a speech request writes the token's last-used-model marker, and the
 redirect only takes a speech-capable model.** Like the image relays, `relaySpeech`
@@ -1193,6 +1254,19 @@ capture stores the multipart **request** as a JSON summary, the text fields kept
 the transcript is the user's spoken content, **output-sensitive**, captured like any
 response under the opt-in and clipped, like any, at the capture cap
 ([Security §14](security-auth-rbac.md#14-capture-redaction-of-sensitive-headers)).
+
+*Targets that are not audio.cpp ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).* sglang-omni returns no `timing` block. When the response body states no duration
+at all, that is, has no `timing` object or none with an `audio_duration_ms` key (any value under the key, a `null` or a
+`0` included, is a statement), the quantity falls back to the duration of the **uploaded** WAV file part, measured with
+`wavDurationFromReader`, the measurement a streamed transcription is billed by (item 11). When that measures nothing — an
+upload that is no WAV (an mp3, say), or a WAV whose header cannot be believed (the `0xFFFFFFFF` data size a streaming writer
+leaves) — the quantity is sglang-omni's own statement, `usage` `{"type":"duration","seconds":N}`
+(`transcriptionUsageSeconds`), read only when the type is exactly `duration` and `N` a positive finite number; sglang-omni
+measures the audio it decoded and rounds up to whole seconds. audio.cpp's statement always wins, and a present but unusable
+value stays the Error log and quantity `0`. Anything else (no measurable WAV and no such statement) also stays the logged
+zero: a duration is never guessed (ADR-041). A **streamed** transcription to sglang-omni is billed only from the uploaded WAV:
+the final `transcript.text.done` event's `usage{seconds}` is not read, so a streamed non-WAV upload is a logged zero (a
+known residual).
 
 **10. Resolving a transcription writes the token's last-used-model marker, and the
 redirect takes a transcription candidate.** `relayTranscription` resolves through
@@ -2168,6 +2242,58 @@ official OpenAI SDK against either route; those remain operator steps. The vllm-
 `/v1/systemone` relay and a `/v1/decisions` translate) and an agent-launched `vllm-srun`
 through both endpoints.
 
+### 3.11 Realtime: the WebSocket relay
+
+`GET /v1/realtime` (and `/openai/v1/realtime`) is an OpenAI Realtime-style **WebSocket** to an sglang-omni
+model started with `--enable-realtime`, relayed through the agent's router
+([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy), [Agent-Managed Model Runtime §4.5](agent-runtime-manager.md#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)).
+The gateway translates nothing: messages cross byte for byte with their type kept, and are read only to count
+what the session is billed for. Unlike the live transcription of §3.8 it has no HTTP form and no portal
+adapter.
+
+1. **Auth runs before the upgrade, and is bearer-only.** A Bearer token with `gateway:use` or `llm:invoke` (or
+   the internal loopback pair), never the session cookie. A client that cannot set a header, a browser
+   WebSocket, may offer the subprotocols `realtime` and `openai-insecure-api-key.<key>` (OpenAI's convention):
+   the key then authenticates as a bearer would. A Bearer header wins over a subprotocol key, the **first** key
+   offered wins, and only `realtime` is ever selected as the subprotocol. The key is never logged and never
+   forwarded: the agent is dialed with a header of the gateway's own. The `Origin` check is skipped
+   (`InsecureSkipVerify`) because the endpoint accepts no ambient credential a cross-site page could ride.
+2. **`model` is the query's `model`, required** (`400 realtime.model_required`). A request that is no
+   WebSocket handshake the gateway can accept is `426` or `400 realtime.upgrade_required`, before anything is spent.
+3. **Admission runs once per session**, however long it lasts: the model and server override, the allowlist and the
+   rate, quota and budget gate, the same as the other audio endpoints.
+4. **The target** needs the `openai_audio` flavor, a **manual `realtime: yes`** verdict (the capability `realtime`,
+   which no probe writes; an agent's report of it is dropped at ingest) and a `server_agent` provider whose agent
+   reports `realtime_proxy` (fail closed, also for an agent that has not reported since the gateway started). The
+   resolver cannot see agent features, so a target that fails the agent test is excluded by its instance key and
+   the resolve runs again, up to 8 tries; a model with no serving target is `404 routing.no_model_route`. Every
+   other provider is refused the same way, since there is no direct realtime dial.
+5. **The relay.** The session is registered in Active Requests before the agent is dialed, and the client's
+   socket is accepted only after the dial succeeded, so a failed dial is a plain `502`/`503`. The dial is
+   forced to HTTP/1.1 (the production CA-pool transport offers `http/1.1` alone for it, since HTTP/2 cannot carry
+   an upgrade) and sends no `Origin` and no client subprotocol. The gateway ends a session with no message in
+   either direction for 15 minutes with 1008. During shutdown it waits at most 6 s for open sessions to close
+   (1001) and answers a new handshake `503 realtime.shutting_down`. The close code and reason of either side
+   are mirrored.
+6. **Usage: one row per session**, `http_status` 101, in this order of preference:
+   - **`audio_second`**, when the client appended any audio, from its `input_audio_buffer.append` frames: the count of base64
+     alphabet characters of `audio`, times 3/4, divided by 32000 bytes per second. The frame is read as the
+     upstream reads it: `type` and `audio` are matched exactly (case-sensitive, the last duplicate wins), and the
+     bare literals `NaN`, `Infinity` and `-Infinity` are tolerated as Python's `json` does. The count can only
+     over-count, never under-count. Audio comes first, whatever usage the upstream reports: sglang-omni's
+     legacy session sends `usage: null` for a cancelled turn and runs a transcription pass that is never billed,
+     so token precedence would under-count an audio session and let a key holder get free transcription after
+     one normal turn. Every sglang-omni flavor takes audio input;
+   - otherwise **tokens**, for a session that appended no audio, summed from the upstream's `response.done`
+     `response.usage` (prompt or input tokens and completion or output tokens);
+   - otherwise a **logged zero** (`audio_second` 0 with an `Error` log line).
+   A close code of 1000, 1001 or 1005 is a `success`; any other code is the error `realtime.close_<code>`. A session whose upstream dial fails records its one row with the error status of the refusal (`502` or `503`), and one whose client handshake cannot be accepted after a successful dial records `500` with the error code `realtime.accept_failed`; `http_status` 101 is a session that upgraded. A
+   request refused before a target is chosen records no row, as the live bearer endpoint's gate does.
+7. **Residuals.** A gone instance `m#k` with k ≥ 1 is not re-selected on the dial. A peer that
+   freezes mid-frame during a close handshake is unbounded in `coder/websocket`. `/v1/realtime/` with a trailing
+   slash is not upgraded by nginx. A reverse proxy must carry the upgrade on both exact paths with long
+   timeouts ([Deployment View §7](../07-deployment-view.md)).
+
 ## 4. Session / continuity signals
 
 `extractClientSession` (`internal/gateway/session_extract.go`) derives a
@@ -2256,6 +2382,15 @@ service, on an application's create and on every runtime-spec write
 (`writeRuntimeSpec`) — for every application type, because every supported
 upstream now serves both native endpoints (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
+
+**One exception at dispatch: `sglang_omni`.** For a target whose effective kind
+(`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
+`passthrough` mode as `translate`, so the relay decision and the usage row's
+`provider_path` both read translate: sglang-omni v0.2.0 serves neither native
+route, and a raw body would bypass the media guard (§3.1). The portal's
+`sglang_omni` defaults disable both modes, but an Auto-typed spec, a spec written
+through the API and a row stored before the type existed keep the stock
+passthrough ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
 
 **Where the effective mode lives.** An ordinary application carries
 `ResponsesMode`/`MessagesMode` directly on `routing.Application`

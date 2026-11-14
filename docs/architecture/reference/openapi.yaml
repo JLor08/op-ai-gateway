@@ -63,6 +63,10 @@ paths:
         Session-or-bearer, scope `gateway:use` or `llm:invoke`. The only
         inference path that also accepts the portal session (portal chat runs
         use it over the internal loopback path). Alias: /openai/v1/chat/completions.
+        Against an agent-launched `sglang_omni` target every `image_url.url`
+        must be an inline `data:` URL, and against an `sglang` target a
+        `data:`, `http://` or `https://` URL, else 400
+        `chat.media_url_unsupported`.
       security: [{ bearerAuth: [] }, { sessionCookie: [], csrfHeader: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -194,7 +198,12 @@ paths:
         `yes`, unless an operator set an `image_edit: no` verdict on the
         mapping. An agent-launched model's runtime spec must declare the flavor
         too, and its agent must declare the `multipart_proxy` feature, else
-        404 `images.edit_unavailable`. Non-streaming only (a `stream` of
+        404 `images.edit_unavailable`. Against an agent-launched `sglang_omni`
+        target the source must be an uploaded file: a `url` or `url[]` part,
+        an `image` or `image[]` part without a filename, and a part without
+        exactly one parseable `form-data` Content-Disposition are 400
+        `images.source_unsupported`, and every part is relayed with headers
+        the gateway wrote. Non-streaming only (a `stream` of
         `true` is 400 `images.stream_unsupported`), and `response_format` must
         be `b64_json` or absent (400 `images.response_format_unsupported`).
         An OpenAI-style `mask` (an RGBA PNG whose TRANSPARENT pixels mark the
@@ -279,7 +288,11 @@ paths:
         mode-mismatch 500 the gateway retries buffered once. A non-boolean
         `stream`, a `stream_format` other than `sse` or `audio`, and a
         `stream_format` on a request that does not stream are 400
-        `speech.stream_unsupported`. A one-shot 200 is the synthesized clip as
+        `speech.stream_unsupported`. Against an agent-launched `sglang_omni`
+        target a `ref_audio`, or a `references[]` element's `audio_path`,
+        `ref_audio` or `audio`, that is not an inline `data:` URL, and a body
+        that is not one JSON object, is 400
+        `speech.reference_audio_unsupported`. A one-shot 200 is the synthesized clip as
         one binary `audio/wav` body, relayed without buffering and with the
         upstream's own `Content-Length`. A non-2xx upstream answer keeps the
         upstream's status and is normalised to the OpenAI error shape: an OpenAI
@@ -288,10 +301,13 @@ paths:
         and any other body is relayed as it came. Metered in seconds of audio
         (`billing_unit: audio_second`, read from the upstream's
         `X-AudioCPP-Audio-Duration-Ms` header, a one-shot `pcm` answer
-        included), not in tokens; a `speech.pcm_unavailable` row is
+        included; where that header is absent or empty, as from an
+        sglang-omni target, the audio bytes relayed divided by the WAV `fmt `
+        byte rate), not in tokens; a `speech.pcm_unavailable` row is
         `audio_second` with quantity 0. A streamed call
         has no such header: on a clean completion (`speech.audio.done` then
-        `[DONE]`, or a raw body closed cleanly) it is billed from the PCM bytes
+        `[DONE]`, or a raw body closed cleanly, sglang-omni's `audio/pcm`
+        included) it is billed from the PCM bytes
         the relay counted, as `audio_second` equal to the bytes divided by the
         mapping's cached output byte rate, or, while no rate is cached, as
         `audio_bytes` with the byte count; every other streamed outcome is
@@ -482,7 +498,9 @@ paths:
         it, with the same refusal. Metered in seconds of audio
         (`billing_unit: audio_second`), not in tokens: a buffered call reads the
         duration from the response body's `timing.audio_duration_ms` (not a
-        header); a streamed call, which carries no such field, reads it from the
+        header), or, when the body has no such key (a target that is not
+        audio.cpp), from the uploaded WAV part and then from sglang-omni's
+        `usage` `{"type":"duration","seconds":N}`; a streamed call, which carries no such field, reads it from the
         uploaded WAV header and bills only on a clean completion. Beyond those
         it answers the same statuses as every other inference path (429/402
         from the principal limiter, 503 from the capacity queue or no healthy
@@ -816,6 +834,153 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /v1/realtime:
+    get:
+      tags: [inference]
+      summary: Realtime WebSocket, relayed to a model server through the agent (OpenAI Realtime style)
+      description: >
+        An OpenAI Realtime-style WebSocket (ADR-104, issue #395) relayed to an
+        sglang-omni model started with --enable-realtime, through the agent's
+        GET /realtime/{model} route. The gateway translates nothing: messages
+        cross in both directions byte for byte with their type kept, and are read
+        only to count what the session is billed for.
+        Auth runs before the upgrade and is bearer-only: scope `gateway:use` or
+        `llm:invoke`, a bearer token OR the internal trusted-loopback header pair,
+        never a portal session cookie. A client that cannot set a header (a
+        browser WebSocket) may instead offer the subprotocols `realtime` and
+        `openai-insecure-api-key.<key>` in Sec-WebSocket-Protocol; the key then
+        authenticates as a bearer would. A Bearer header wins over a subprotocol
+        key, the first key offered wins, only `realtime` is ever selected as the
+        subprotocol, and the key is never logged or forwarded. The Origin check
+        is skipped on purpose, since the endpoint accepts no ambient credential.
+        In order, each a plain HTTP refusal before any upgrade: a method other
+        than GET is 405; no or an invalid key is 401; a missing scope 403
+        `auth.insufficient_scope`; a request that is no acceptable WebSocket
+        handshake (no upgrade, a version other than 13, a missing or malformed
+        key) is 426 or 400 `realtime.upgrade_required`; a blank `model` 400
+        `realtime.model_required`; then the principal's ONE admission per session
+        (403 `model.not_allowed` or `server_override.forbidden`, 429
+        `limit.rate_limited` (with Retry-After), `limit.request_quota_exceeded`
+        or `limit.token_quota_exceeded`, 402 `limit.cost_budget_exceeded`), the
+        resolve (404 `routing.no_model_route` or `routing.model_not_capable`, 503
+        `routing.no_healthy_host` or `routing.admission_queue_timeout`/`_full`)
+        and 503 `realtime.shutting_down` once the gateway's shutdown has begun.
+        The target needs the `openai_audio` flavor, a manual `realtime` yes
+        verdict and a `server_agent` agent that reports `realtime_proxy` (fail
+        closed). A target that fails the last two is excluded and the resolve runs
+        again, up to 8 tries, ending in 404 `routing.no_model_route`. A failed
+        dial of the agent is the mapped provider error (502 or 503), before the
+        upgrade.
+        The session ends after 15 minutes without a message in either direction
+        (close code 1008), and on shutdown the gateway waits at most 6 s for open
+        sessions (close code 1001). The session shows in Active Requests.
+        Metered with ONE usage row per session, `http_status` 101. The row is in
+        `audio_second` when the client appended any audio, from its
+        `input_audio_buffer.append` frames (base64 alphabet characters of `audio`
+        times 3/4 over 32000 bytes per second, which can only over-count); the
+        upstream's usage is ignored then, because sglang-omni sends a null usage
+        for cancelled turns and runs an unbilled transcription pass. A session
+        without audio is in tokens (the sum of the upstream's `response.done`
+        `response.usage`); otherwise a logged zero. Close codes 1000, 1001 and 1005 are a success,
+        any other code is the error `realtime.close_<code>`. A session whose dial of the
+        agent fails records its one row with the refusal's error status (502 or 503),
+        and one whose client handshake cannot be accepted after a successful dial
+        records 500 with the error code `realtime.accept_failed`; 101 is a session
+        that upgraded. A request refused
+        before a target is chosen writes no usage row. A reverse proxy in front
+        must upgrade WebSockets on this exact path with long timeouts (the
+        bundled nginx does; `/v1/realtime/` with a trailing slash is not
+        upgraded). Alias: /openai/v1/realtime. See api-surface.md and
+        compatibility-and-inference.md section 3.11.
+      parameters:
+        - name: model
+          in: query
+          required: true
+          description: The gateway model name (trimmed, non-empty; blank is 400 `realtime.model_required`).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }]
+      responses:
+        '101':
+          description: >
+            The WebSocket is upgraded (Sec-WebSocket-Protocol `realtime` when the
+            client offered it) and relayed to the model.
+        '400':
+          description: >
+            The Error envelope with code `realtime.model_required` or
+            `realtime.upgrade_required` (a version other than 13, or a missing or
+            malformed key).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402':
+          description: The Error envelope with code `limit.cost_budget_exceeded` (the principal's cost budget).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: >
+            The Error envelope with code `auth.insufficient_scope`,
+            `model.not_allowed` or `server_override.forbidden`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '405': { description: 'Any method other than GET (Allow: GET).' }
+        '426':
+          description: >
+            The Error envelope with code `realtime.upgrade_required` (the request
+            is no WebSocket handshake), with Upgrade and Sec-WebSocket-Version
+            headers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: >
+            The Error envelope with code `limit.rate_limited` (with a Retry-After
+            header), `limit.request_quota_exceeded` or `limit.token_quota_exceeded`:
+            the one admission a session spends.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: The Error envelope with the mapped provider error of a failed dial of the agent, before any upgrade.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: >
+            The Error envelope with code `realtime.shutting_down`,
+            `routing.no_healthy_host`, `routing.admission_queue_timeout` or
+            `routing.admission_queue_full`, or the mapped provider error of a
+            dial the agent could not serve.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /openai/v1/realtime:
+    get:
+      tags: [inference]
+      summary: Alias of /v1/realtime
+      parameters:
+        - name: model
+          in: query
+          required: true
+          description: The gateway model name (trimmed, non-empty; blank is 400 `realtime.model_required`).
+          schema: { type: string, minLength: 1 }
+      security: [{ bearerAuth: [] }]
+      responses:
+        '101':
+          description: The WebSocket is upgraded and relayed to the model, as at /v1/realtime.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426':
+          description: The Error envelope with code `realtime.upgrade_required`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
   /v1/messages/count_tokens:
     post:
       tags: [inference]
@@ -4843,9 +5008,12 @@ components:
         `application/octet-stream` (the `Content-Length` is the data size);
         the upstream's metering
         headers (`X-AudioCPP-*`) are not forwarded, and the gateway reads
-        `X-AudioCPP-Audio-Duration-Ms` for the usage row. A STREAMED answer (a
+        `X-AudioCPP-Audio-Duration-Ms` for the usage row, or, when that header
+        is absent or empty (a target that is not audio.cpp), measures the audio
+        bytes relayed against the WAV `fmt ` byte rate. A STREAMED answer (a
         `mode=streaming` model asked with `stream: true`) is instead
-        `text/event-stream` or `application/octet-stream`, chunked and without a
+        `text/event-stream` or raw PCM (`application/octet-stream`, or
+        `audio/pcm` from sglang-omni), chunked and without a
         `Content-Length`, relayed byte for byte and billed from the PCM bytes
         counted on a clean completion.
       content:

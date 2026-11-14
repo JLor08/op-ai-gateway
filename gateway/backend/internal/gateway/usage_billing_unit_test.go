@@ -177,6 +177,12 @@ func TestBillingUnitForNamesEachNonTokenFlavorsUnit(t *testing.T) {
 // whether X-AudioCPP-Audio-Duration-Ms is present and what it says.
 func speechBillingUpstream(t *testing.T, status int, headers map[string]string) *httptest.Server {
 	t.Helper()
+	return speechBillingUpstreamBody(t, status, headers, speechTestWAV())
+}
+
+// speechBillingUpstreamBody is speechBillingUpstream with the body the stub answers with.
+func speechBillingUpstreamBody(t *testing.T, status int, headers map[string]string, body []byte) *httptest.Server {
+	t.Helper()
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.Header().Set("Content-Type", "audio/wav")
@@ -184,7 +190,7 @@ func speechBillingUpstream(t *testing.T, status int, headers map[string]string) 
 			w.Header().Set(k, v)
 		}
 		w.WriteHeader(status)
-		_, _ = w.Write(speechTestWAV())
+		_, _ = w.Write(body)
 	}))
 	t.Cleanup(up.Close)
 	return up
@@ -297,7 +303,15 @@ func TestSpeechUsageWithoutAUsableDurationRecordsZeroAndLogsOnce(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf, restore := withCapturedSlog(t)
 			t.Cleanup(restore)
-			up := speechBillingUpstream(t, http.StatusOK, tc.headers)
+			// A present-but-unusable header is audio.cpp's own broken statement: the loud zero
+			// holds even for a body that is a valid WAV. Only an absent or empty header
+			// (a target that is not audio.cpp) falls back to measuring the body, so those two
+			// cases answer a non-WAV one.
+			body := speechTestWAV()
+			if tc.headers["X-AudioCPP-Audio-Duration-Ms"] == "" {
+				body = []byte("not a wav")
+			}
+			up := speechBillingUpstreamBody(t, http.StatusOK, tc.headers, body)
 			srv, _ := newSpeechCapableTestServer(t, up.URL)
 
 			rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there."}`)
@@ -607,7 +621,7 @@ func TestSetTranscriptionBillingQuantity(t *testing.T) {
 		buf, restore := withCapturedSlog(t)
 		t.Cleanup(restore)
 		meta := usageMeta{ReqPath: "/v1/audio/transcriptions"}
-		setTranscriptionBillingQuantity(&meta, exchange(endpointTranscription), body, "success")
+		setTranscriptionBillingQuantity(&meta, exchange(endpointTranscription), body, "", "success")
 		if meta.BillingQuantity != 3 {
 			t.Fatalf("BillingQuantity = %v, want 3", meta.BillingQuantity)
 		}
@@ -619,7 +633,7 @@ func TestSetTranscriptionBillingQuantity(t *testing.T) {
 		buf, restore := withCapturedSlog(t)
 		t.Cleanup(restore)
 		meta := usageMeta{ReqPath: "/v1/audio/transcriptions/details"}
-		setTranscriptionBillingQuantity(&meta, exchange(endpointTranscriptionDetails), body, "success")
+		setTranscriptionBillingQuantity(&meta, exchange(endpointTranscriptionDetails), body, "", "success")
 		if meta.BillingQuantity != 3 {
 			t.Fatalf("BillingQuantity = %v, want 3", meta.BillingQuantity)
 		}
@@ -640,7 +654,7 @@ func TestSetTranscriptionBillingQuantity(t *testing.T) {
 			buf, restore := withCapturedSlog(t)
 			t.Cleanup(restore)
 			meta := usageMeta{ReqPath: "/v1/audio/transcriptions"}
-			setTranscriptionBillingQuantity(&meta, exchange(tc.endpoint), body, tc.status)
+			setTranscriptionBillingQuantity(&meta, exchange(tc.endpoint), body, "", tc.status)
 			if meta.BillingQuantity != 0 {
 				t.Fatalf("BillingQuantity = %v, want 0", meta.BillingQuantity)
 			}
@@ -666,8 +680,8 @@ func TestSetSpeechBillingQuantityIgnoresATranscriptionExchange(t *testing.T) {
 		buf, restore := withCapturedSlog(t)
 		t.Cleanup(restore)
 		meta := usageMeta{ReqPath: "/v1/audio/transcriptions"}
-		setSpeechBillingQuantity(&meta, exchange(endpointTranscription), http.Header{}, "success")
-		setSpeechBillingQuantity(&meta, exchange(endpointTranscription), header, "success")
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscription), http.Header{}, nil, "success")
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscription), header, nil, "success")
 		if meta.BillingQuantity != 0 {
 			t.Fatalf("BillingQuantity = %v, want 0", meta.BillingQuantity)
 		}
@@ -679,8 +693,8 @@ func TestSetSpeechBillingQuantityIgnoresATranscriptionExchange(t *testing.T) {
 		buf, restore := withCapturedSlog(t)
 		t.Cleanup(restore)
 		meta := usageMeta{ReqPath: "/v1/audio/transcriptions/details"}
-		setSpeechBillingQuantity(&meta, exchange(endpointTranscriptionDetails), http.Header{}, "success")
-		setSpeechBillingQuantity(&meta, exchange(endpointTranscriptionDetails), header, "success")
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscriptionDetails), http.Header{}, nil, "success")
+		setSpeechBillingQuantity(&meta, exchange(endpointTranscriptionDetails), header, nil, "success")
 		if meta.BillingQuantity != 0 {
 			t.Fatalf("BillingQuantity = %v, want 0", meta.BillingQuantity)
 		}
@@ -690,7 +704,7 @@ func TestSetSpeechBillingQuantityIgnoresATranscriptionExchange(t *testing.T) {
 	})
 	for _, endpoint := range []sessionEndpoint{endpointSpeech, endpointChat} {
 		meta := usageMeta{ReqPath: "/v1/audio/speech"}
-		setSpeechBillingQuantity(&meta, exchange(endpoint), header, "success")
+		setSpeechBillingQuantity(&meta, exchange(endpoint), header, nil, "success")
 		if meta.BillingQuantity != 2 {
 			t.Fatalf("endpoint %v: BillingQuantity = %v, want 2 from the header", endpoint, meta.BillingQuantity)
 		}

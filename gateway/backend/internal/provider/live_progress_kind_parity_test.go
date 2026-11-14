@@ -101,7 +101,8 @@ func TestLiveProgressUpstreamsCoverEveryRoutingCapableKind(t *testing.T) {
 		string(routing.RuntimeSpecTypeVLLM), string(routing.RuntimeSpecTypeLlamaCpp),
 		string(routing.RuntimeSpecTypeTGI), string(routing.RuntimeSpecTypeOllama),
 		string(routing.RuntimeSpecTypeStableDiffusionCpp), string(routing.RuntimeSpecTypeAudioCpp),
-		string(routing.RuntimeSpecTypeVllmSR), string(routing.RuntimeSpecTypeCustom), "",
+		string(routing.RuntimeSpecTypeVllmSR), string(routing.RuntimeSpecTypeSGLang),
+		string(routing.RuntimeSpecTypeSGLangOmni), string(routing.RuntimeSpecTypeCustom), "",
 	}
 	listed := make(map[string]struct{}, len(kinds))
 	for _, kind := range kinds {

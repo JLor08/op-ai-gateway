@@ -49,6 +49,17 @@ func (d *Driver) LocalRouter(port int) http.Handler {
 	return ref.handler
 }
 
+// publishedRouter is the router currently published, whatever its port, or nil
+// when none is. Callers hold routerMu.
+func (d *Driver) publishedRouter() *router {
+	ref := d.localRouter.Load()
+	if ref == nil {
+		return nil
+	}
+	rt, _ := ref.handler.(*router)
+	return rt
+}
+
 // publishLocalRouter makes h the handler LocalRouter resolves for listen, or
 // clears the reference entirely when listen is non-positive or h is nil.
 // Callers hold routerMu, which serialises publishes against each other and

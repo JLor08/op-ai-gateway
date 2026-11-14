@@ -160,6 +160,23 @@ func TestHandlePortalMappingRuntimeSpecPutBadTypeReturns400(t *testing.T) {
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutSGLangTypesAccepted pins that a PUT with
+// type sglang or sglang_omni is not refused as runtime_spec.type_invalid.
+func TestHandlePortalMappingRuntimeSpecPutSGLangTypesAccepted(t *testing.T) {
+	for _, typ := range []string{"sglang", "sglang_omni"} {
+		t.Run(typ, func(t *testing.T) {
+			srv := NewTestServer()
+			mappingID := seedRuntimeSpecMapping(t, srv)
+			body := `{"binary":"/home/ai/sglang-env/bin/sglang","type":"` + typ + `"}`
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400 pins the WIRE
 // contract of portal.ErrRuntimeSpecConfigFilesInvalid (#257): 400 with its own
 // code, a message that names the offending file and rule, and no echo of the

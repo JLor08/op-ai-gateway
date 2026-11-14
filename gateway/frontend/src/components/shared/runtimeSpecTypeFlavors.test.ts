@@ -9,6 +9,7 @@ import {
   formSpecIsLlamaCpp,
   formSpecIsStableDiffusion,
   specFlavorsAfterTypeSwitch,
+  sglangOmniSpecFlavorDefaults,
   stableDiffusionSpecFlavorDefaults,
   textFlavorsOnStableDiffusion,
   tickedFlavorMissingOnApplication,
@@ -511,5 +512,40 @@ describe('specFlavorsAfterTypeSwitch for vllm_sr', () => {
         remembered: template,
       }),
     ).toEqual({ values: template, remembered: null });
+  });
+});
+
+describe('specFlavorsAfterTypeSwitch for sglang and sglang_omni', () => {
+  const template: RuntimeSpecFlavorValues = {
+    apiFlavors: ['openai', 'anthropic'],
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
+  };
+
+  it('defaults sglang_omni to the openai and openai_audio flavors', () => {
+    expect(sglangOmniSpecFlavorDefaults.apiFlavors).toEqual(['openai', 'openai_audio']);
+    expect(sglangOmniSpecFlavorDefaults.responsesMode).toBe('disabled');
+    expect(sglangOmniSpecFlavorDefaults.messagesMode).toBe('disabled');
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'llama_cpp',
+        to: 'sglang_omni',
+        current: template,
+        template,
+        remembered: null,
+      }),
+    ).toEqual({ values: sglangOmniSpecFlavorDefaults, remembered: template });
+  });
+
+  it('defaults nothing for sglang', () => {
+    expect(
+      specFlavorsAfterTypeSwitch({
+        from: 'llama_cpp',
+        to: 'sglang',
+        current: template,
+        template,
+        remembered: null,
+      }),
+    ).toBeNull();
   });
 });

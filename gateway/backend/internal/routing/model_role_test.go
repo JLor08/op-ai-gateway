@@ -73,6 +73,9 @@ func TestDeriveRole(t *testing.T) {
 		{"bare llama_cpp is chat", RuntimeSpecTypeLlamaCpp, nil, RoleChat},
 		{"bare tgi is chat", RuntimeSpecTypeTGI, nil, RoleChat},
 		{"bare ollama is chat", RuntimeSpecTypeOllama, nil, RoleChat},
+		{"bare sglang is chat", RuntimeSpecTypeSGLang, nil, RoleChat},
+		{"bare sglang_omni is not chat", RuntimeSpecTypeSGLangOmni, nil, RoleOther},
+		{"sglang_omni with a transcription verdict is asr", RuntimeSpecTypeSGLangOmni, map[string]bool{CapabilityTranscription: true}, RoleASR},
 		{"bare vllm with an empty map is chat", RuntimeSpecTypeVLLM, map[string]bool{}, RoleChat},
 		// An LLM server whose only verdicts are unrelated or negative is still chat.
 		{"vllm with a no verdict is chat", RuntimeSpecTypeVLLM, map[string]bool{CapabilityTranscription: false}, RoleChat},

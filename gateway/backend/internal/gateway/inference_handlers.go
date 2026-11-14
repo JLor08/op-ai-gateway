@@ -581,18 +581,18 @@ func (s *Server) inferenceGate(w http.ResponseWriter, r *http.Request, token aut
 	// native endpoints that carry any set them from their own identity:
 	// /v1/images/generations ["image"], /v1/images/edits ["image_edit"],
 	// /v1/audio/speech ["speech"], /v1/audio/transcriptions and its /details twin
-	// ["transcription"], /v1/systemone ["decision"] and /v1/decisions
-	// ["any_decision"]; the translate-capable text endpoints require none. The
-	// capability gate refuses a model without them, so a candidate is taken
-	// only when it carries every one (ModelOffering.Capable): a
-	// LastUsedModel or fallback that lacks the capability is skipped rather than
-	// turned into a 404 model_not_capable about a model the client never named.
-	// Every required capability a native endpoint sets has a portal fold
-	// (image, image_edit, speech, transcription, decision and any_decision), so
-	// Capable is never empty for want of one. A capability added to
-	// RequiredCapabilities without a fold in hasCapabilityFold/
-	// capabilityFlagsByName would leave Capable empty, and no candidate would
-	// ever be taken for it.
+	// ["transcription"], /v1/systemone ["decision"], /v1/decisions
+	// ["any_decision"] and /v1/realtime ["realtime"]; the translate-capable text
+	// endpoints require none. The capability gate refuses a model without them,
+	// so a candidate is taken only when it carries every one
+	// (ModelOffering.Capable): a LastUsedModel or fallback that lacks the
+	// capability is skipped rather than turned into a 404 model_not_capable about
+	// a model the client never named. A capability without a fold in
+	// hasCapabilityFold/capabilityFlagsByName leaves Capable empty, so no
+	// candidate is ever taken for it. image, image_edit, speech, transcription,
+	// decision and any_decision have one; realtime has none, so the redirect
+	// never fires for a /v1/realtime handshake, which keeps the model it named
+	// and is gated as named.
 	//
 	//
 	// The offering is asked by offeringFlavor: the two decision endpoints share

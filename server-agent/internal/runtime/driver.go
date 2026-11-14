@@ -793,7 +793,14 @@ func (d *Driver) Transitions() <-chan struct{} {
 // is the unauthenticated, most-exposed choice: this router authenticates
 // nothing, so anyone who can reach it can enumerate/run/evict managed
 // models.
+//
+// A router that stops being published -- an unbind, or a rebind to another
+// port, which builds a new router -- is retired: its realtime sessions are
+// closed (router.Close). That runs after routerMu is released, since Close
+// may wait up to realtimeCloseBound for the sessions' close handshakes.
 func (d *Driver) StartRouter(listen int) error {
+	var retired *router
+	defer func() { retired.Close() }() // registered first, so it runs after the unlock below
 	d.routerMu.Lock()
 	defer d.routerMu.Unlock()
 
@@ -809,6 +816,7 @@ func (d *Driver) StartRouter(listen int) error {
 		// No server_agent application on this server: the router is not
 		// served at all, so the in-process path must stop resolving too and
 		// let a loopback-upstream route fall back to its dialled semantics.
+		retired = d.publishedRouter()
 		d.publishLocalRouter(0, nil)
 		return nil
 	}
@@ -836,6 +844,7 @@ func (d *Driver) StartRouter(listen int) error {
 	// would blink the reference for as long as the bind keeps failing.
 	rt := d.LocalRouter(listen)
 	if rt == nil {
+		retired = d.publishedRouter() // the previous port's router, if any
 		rt = newRouter(d.mgr)
 		d.publishLocalRouter(listen, rt)
 	}
@@ -890,10 +899,17 @@ func (d *Driver) stopRouterLocked() {
 // The clear lives HERE, under routerMu, and deliberately NOT inside
 // stopRouterLocked: StartRouter calls that on every 60s retry, where clearing
 // would open a nil window on a path that has no reason to blink.
+//
+// The unpublished router is retired: its realtime sessions, which run on
+// hijacked connections that stopRouterLocked's http.Server.Close neither sees
+// nor closes, are closed with 1001 (router.Close, at most realtimeCloseBound),
+// after routerMu is released -- before main.go closes the Manager.
 func (d *Driver) Close() {
 	d.routerMu.Lock()
 	d.closed = true
+	retired := d.publishedRouter()
 	d.publishLocalRouter(0, nil)
 	d.stopRouterLocked()
 	d.routerMu.Unlock()
+	retired.Close()
 }

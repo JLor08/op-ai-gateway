@@ -301,8 +301,10 @@ type Request struct {
 	// telemetry that reported them running and the dispatch. An instance
 	// that is only busy is never listed: a live slot another session took
 	// first is held, routing passes over a held slot by itself, and the
-	// session may still take that slot once it frees. Internal only: set by
-	// the gateway when it re-selects, never parsed from a client body.
+	// session may still take that slot once it frees. The one other use is
+	// the gateway's realtime target selection, which lists an instance whose
+	// agent cannot serve a realtime session at all. Internal only: set by the
+	// gateway when it re-selects, never parsed from a client body.
 	ExcludeInstanceKeys []string `json:"-"`
 	// AdmissionStart, when set, is when this request's admission began (wall
 	// clock): a bounded admission-queue timeout counts from it instead of from

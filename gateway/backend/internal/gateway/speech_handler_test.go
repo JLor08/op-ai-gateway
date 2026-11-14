@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -149,6 +151,7 @@ func TestSpeechErrorCodesAreStable(t *testing.T) {
 		speechInputRequired:             "speech.input_required",
 		speechResponseFormatUnsupported: "speech.response_format_unsupported",
 		speechStreamUnsupported:         "speech.stream_unsupported",
+		speechReferenceAudioUnsupported: "speech.reference_audio_unsupported",
 		speechPcmUnavailable:            "speech.pcm_unavailable",
 	} {
 		if got != want {
@@ -598,6 +601,13 @@ func TestSpeechRunAsWithoutPortalIsRefused(t *testing.T) {
 // request is served.
 func newServerAgentSpeechSpecTestServer(t *testing.T, prov provider.Client, specFlavors []string) *Server {
 	t.Helper()
+	return newTypedServerAgentSpeechSpecTestServer(t, prov, specFlavors, "")
+}
+
+// newTypedServerAgentSpeechSpecTestServer is newServerAgentSpeechSpecTestServer with
+// the spec's explicit Type set.
+func newTypedServerAgentSpeechSpecTestServer(t *testing.T, prov provider.Client, specFlavors []string, specType routing.RuntimeSpecType) *Server {
+	t.Helper()
 	tokens := auth.NewTokenStore()
 	directory := portal.NewMemoryDirectory(tokens)
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
@@ -620,7 +630,7 @@ func newServerAgentSpeechSpecTestServer(t *testing.T, prov provider.Client, spec
 	if err := routeStore.UpsertMappingCapabilities(ctx, "route-agent-audio", []routing.CapabilityRow{{Capability: routing.CapabilitySpeech, Verdict: routing.CapabilityYes, Source: routing.CapabilitySourceManual, CheckedAt: now}}); err != nil {
 		t.Fatalf("UpsertMappingCapabilities: %v", err)
 	}
-	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-agent-audio", MappingID: "route-agent-audio", APIFlavors: specFlavors, ResponsesMode: routing.EndpointModeDisabled, MessagesMode: routing.EndpointModeDisabled, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{ID: "spec-agent-audio", MappingID: "route-agent-audio", Type: string(specType), APIFlavors: specFlavors, ResponsesMode: routing.EndpointModeDisabled, MessagesMode: routing.EndpointModeDisabled, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("UpsertRuntimeSpec: %v", err)
 	}
 	if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: "srv-agent-audio", ReportedAt: now, LatencyMS: 100, ProviderHealth: `{}`, Capabilities: `{}`, RawSummary: `{}`, UpdatedAt: now}); err != nil {
@@ -1390,5 +1400,225 @@ func TestSpeechPCMRefusesAWAVWithoutAContentLength(t *testing.T) {
 	got := lastUsageEvent(t, srv)
 	if got.Status != "error" || got.BillingUnit != usage.BillingUnitAudioSecond || got.BillingQuantity != 0 {
 		t.Fatalf("usage=%q/%q/%v, want error/audio_second/0", got.Status, got.BillingUnit, got.BillingQuantity)
+	}
+}
+
+// A speech request routed to an sglang_omni target may carry a voice reference only
+// inline: sglang-omni reads a bare ref_audio path from ITS OWN working directory and
+// fetches a URL, so relaying one would let a gateway key holder read a file on the
+// model host or make it request an arbitrary URL.
+func TestSpeechToSGLangOmniAcceptsOnlyInlineVoiceReferences(t *testing.T) {
+	const inline = "data:audio/wav;base64,UklGRg=="
+	cases := []struct {
+		name    string
+		body    string
+		refused bool
+	}{
+		{"inline ref_audio", `{"model":"agent-voice","input":"hi","ref_audio":"` + inline + `"}`, false},
+		{"inline references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"` + inline + `","text":"x"}]}`, false},
+		{"no reference", `{"model":"agent-voice","input":"hi"}`, false},
+		{"null ref_audio", `{"model":"agent-voice","input":"hi","ref_audio":null}`, false},
+		{"relative path", `{"model":"agent-voice","input":"hi","ref_audio":"tests/data/x.wav"}`, true},
+		{"absolute path", `{"model":"agent-voice","input":"hi","ref_audio":"/etc/passwd"}`, true},
+		{"file url", `{"model":"agent-voice","input":"hi","ref_audio":"file:///x.wav"}`, true},
+		{"https url", `{"model":"agent-voice","input":"hi","ref_audio":"https://host/x.wav"}`, true},
+		{"empty string", `{"model":"agent-voice","input":"hi","ref_audio":""}`, true},
+		{"non-string", `{"model":"agent-voice","input":"hi","ref_audio":["` + inline + `"]}`, true},
+		{"path in references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd"}]}`, true},
+		{"ref_audio in references", `{"model":"agent-voice","input":"hi","references":[{"ref_audio":"/etc/passwd"}]}`, true},
+		{"audio in references", `{"model":"agent-voice","input":"hi","references":[{"audio":"https://example.com/x.wav"}]}`, true},
+		{"null audio_path then ref_audio", `{"model":"agent-voice","input":"hi","references":[{"audio_path":null,"ref_audio":"/x"}]}`, true},
+		{"inline audio_path with a path audio", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"` + inline + `","audio":"/x"}]}`, true},
+		{"case-variant duplicate ref_audio", `{"model":"agent-voice","input":"hi","ref_audio":"/etc/passwd","Ref_Audio":"` + inline + `"}`, true},
+		{"case-variant duplicate references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd"}],"References":[{"audio_path":"` + inline + `"}]}`, true},
+		{"case-variant audio_path in an element", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd","AUDIO_PATH":"` + inline + `"}]}`, true},
+		{"mixed array", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/etc/passwd"},1]}`, true},
+		{"undecodable references", `{"model":"agent-voice","input":"hi","references":"/etc/passwd"}`, true},
+		{"single object references", `{"model":"agent-voice","input":"hi","references":{"audio_path":"/etc/passwd"}}`, true},
+		{"upper-case DATA scheme", `{"model":"agent-voice","input":"hi","ref_audio":"DATA:audio/wav;base64,UklGRg=="}`, false},
+		{"file url in references", `{"model":"agent-voice","input":"hi","references":[{"audio_path":"` + inline + `"},{"audio_path":"file:///x.wav"}]}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: "RIFF"}
+			srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIAudio}, routing.RuntimeSpecTypeSGLangOmni)
+
+			rec := postSpeech(t, srv, tc.body)
+
+			if !tc.refused {
+				if rec.Code != http.StatusOK || prov.proxyCalls != 1 {
+					t.Fatalf("status = %d, ProxyNative calls = %d, want a relayed 200; body = %s", rec.Code, prov.proxyCalls, rec.Body.String())
+				}
+				return
+			}
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			requireErrorCode(t, rec.Body.String(), "speech.reference_audio_unsupported")
+			if prov.proxyCalls != 0 {
+				t.Fatalf("ProxyNative calls = %d, want 0", prov.proxyCalls)
+			}
+			events := srv.Usage.All()
+			if len(events) != 1 || events[0].ErrorCode != "speech.reference_audio_unsupported" || events[0].HTTPStatus != http.StatusBadRequest {
+				t.Fatalf("usage events = %+v, want one 400 speech.reference_audio_unsupported row", events)
+			}
+			for _, leak := range []string{"passwd", "x.wav", "tests/data", "host", "example.com"} {
+				if strings.Contains(rec.Body.String(), leak) {
+					t.Fatalf("refusal echoes the value (%q): %s", leak, rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+// Every other target is relayed unchanged: the rule belongs to sglang_omni, not to
+// the speech endpoint.
+func TestSpeechToOtherTargetsRelaysReferencesUnchanged(t *testing.T) {
+	body := `{"model":"agent-voice","input":"hi","ref_audio":"/etc/passwd","references":[{"audio_path":"file:///x.wav"}]}`
+	for _, specType := range []routing.RuntimeSpecType{"", routing.RuntimeSpecTypeSGLang, routing.RuntimeSpecTypeLlamaCpp, routing.RuntimeSpecTypeAudioCpp} {
+		t.Run("agent "+string(specType), func(t *testing.T) {
+			prov := &recordingProxyProvider{respBody: "RIFF"}
+			srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIAudio}, specType)
+			rec := postSpeech(t, srv, body)
+			if rec.Code != http.StatusOK || prov.proxyCalls != 1 || string(prov.gotBody) != body {
+				t.Fatalf("status = %d, calls = %d, body %q, want a verbatim relay", rec.Code, prov.proxyCalls, prov.gotBody)
+			}
+		})
+	}
+	t.Run("static application", func(t *testing.T) {
+		up, calls := newSpeechUpstream(t, speechTestWAV())
+		srv, _ := newSpeechCapableTestServer(t, up.URL)
+		rec := postSpeech(t, srv, `{"model":"tts-voice","input":"hi","ref_audio":"/etc/passwd"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		}
+		if got := <-calls; !strings.Contains(string(got.body), "/etc/passwd") {
+			t.Fatalf("upstream body = %q, want the field relayed", got.body)
+		}
+	})
+}
+
+// The refusal names the offending field, and each guarded field of a reference is
+// named as itself.
+func TestSpeechReferenceRefusalNamesTheField(t *testing.T) {
+	for field, body := range map[string]string{
+		"ref_audio":               `{"model":"agent-voice","input":"hi","ref_audio":"/a"}`,
+		"references[].audio_path": `{"model":"agent-voice","input":"hi","references":[{"audio_path":"/a"}]}`,
+		"references[].ref_audio":  `{"model":"agent-voice","input":"hi","references":[{"ref_audio":"/a"}]}`,
+		"references[].audio":      `{"model":"agent-voice","input":"hi","references":[{"audio":"/a"}]}`,
+	} {
+		prov := &recordingProxyProvider{respBody: "RIFF"}
+		srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAIAudio}, routing.RuntimeSpecTypeSGLangOmni)
+		rec := postSpeech(t, srv, body)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), field+" must be") {
+			t.Errorf("%s: status %d body %s, want 400 naming the field", field, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// captureCompleteProvider counts the chat requests that reach the provider and keeps the
+// last one.
+type captureCompleteProvider struct {
+	recordingProxyProvider
+	completes int
+	last      inference.Request
+}
+
+func (p *captureCompleteProvider) Complete(ctx context.Context, t routing.Target, req inference.Request) (provider.Response, error) {
+	p.completes++
+	p.last = req
+	return p.recordingProxyProvider.Complete(ctx, t, req)
+}
+
+func (p *captureCompleteProvider) CompleteStream(ctx context.Context, t routing.Target, req inference.Request, emit provider.StreamEmit) error {
+	p.completes++
+	p.last = req
+	return p.recordingProxyProvider.CompleteStream(ctx, t, req, emit)
+}
+
+// A chat request routed to an sglang_omni target carries images only inline: the
+// upstream reads a bare image_url path from the model host and fetches any URL.
+func TestChatToSGLangOmniAcceptsOnlyInlineImages(t *testing.T) {
+	chat := func(url string) string {
+		return `{"model":"agent-voice","messages":[{"role":"user","content":[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"` + url + `"}}]}]}`
+	}
+	cases := []struct {
+		name, url string
+		specType  routing.RuntimeSpecType
+		refused   bool
+	}{
+		{"data url", "data:image/png;base64,iVBORw0=", routing.RuntimeSpecTypeSGLangOmni, false},
+		{"upper-case DATA", "DATA:image/png;base64,iVBORw0=", routing.RuntimeSpecTypeSGLangOmni, false},
+		{"bare path", "/etc/passwd", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"relative path", "tests/secret.png", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"file url", "file:///etc/passwd", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"https url", "https://169.254.169.254/x.png", routing.RuntimeSpecTypeSGLangOmni, true},
+		{"path to a vllm target", "/etc/passwd", routing.RuntimeSpecTypeVLLM, false},
+		{"url to an untyped agent", "https://host/x.png", "", false},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("%s stream=%v", tc.name, stream), func(t *testing.T) {
+				prov := &captureCompleteProvider{recordingProxyProvider: recordingProxyProvider{respBody: "x"}}
+				srv := newTypedServerAgentSpeechSpecTestServer(t, prov, []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}, tc.specType)
+				body := chat(tc.url)
+				if stream {
+					body = strings.Replace(body, `"model"`, `"stream":true,"model"`, 1)
+				}
+				rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"})
+				if !tc.refused {
+					if rec.Code != http.StatusOK || prov.completes != 1 {
+						t.Fatalf("status = %d, provider calls = %d, want a relayed 200; body = %s", rec.Code, prov.completes, rec.Body.String())
+					}
+					return
+				}
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+				}
+				requireErrorCode(t, rec.Body.String(), "chat.media_url_unsupported")
+				if prov.completes != 0 {
+					t.Fatalf("provider calls = %d, want 0", prov.completes)
+				}
+				if !strings.Contains(rec.Body.String(), "image_url.url") {
+					t.Fatalf("refusal does not name the field: %s", rec.Body.String())
+				}
+				for _, leak := range []string{"passwd", "secret.png", "169.254", "host"} {
+					if strings.Contains(rec.Body.String(), leak) {
+						t.Fatalf("refusal echoes the value (%q): %s", leak, rec.Body.String())
+					}
+				}
+			})
+		}
+	}
+}
+
+// The upstream's top-level audios, images and videos fields (local paths or URLs) never
+// reach the upstream: the chat body is parsed into a typed request and rebuilt from known
+// fields only. The assertion is on the bytes the real provider client puts on the wire,
+// streamed and not.
+func TestChatToSGLangOmniDropsTopLevelMediaFields(t *testing.T) {
+	for _, stream := range []string{"", `"stream":true,`} {
+		up, calls := newWireUpstream(t)
+		srv := newWireSpecTestServer(t, up.URL, routing.RuntimeSpec{Type: string(routing.RuntimeSpecTypeSGLangOmni), APIFlavors: []string{routing.APIFlavorOpenAI, routing.APIFlavorOpenAIAudio}})
+		body := `{"model":"agent-omni",` + stream + `"audios":["/etc/passwd"],"images":["https://x/y.png"],"videos":["/v.mp4"],"messages":[{"role":"user","content":"hi"}]}`
+		rec := postImagesWithHeaders(t, srv, "/v1/chat/completions", body, map[string]string{"Authorization": "Bearer dev-secret"})
+		got := calls.all()
+		if rec.Code != http.StatusOK || len(got) != 1 || got[0].path != "/v1/chat/completions" {
+			t.Fatalf("status = %d, upstream calls = %+v; body %s", rec.Code, got, rec.Body.String())
+		}
+		var wire map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(got[0].body), &wire); err != nil {
+			t.Fatalf("upstream body is no JSON object: %v (%s)", err, got[0].body)
+		}
+		for _, field := range []string{"audios", "images", "videos"} {
+			if _, ok := wire[field]; ok {
+				t.Fatalf("the upstream body carries the top-level %q field: %s", field, got[0].body)
+			}
+		}
+		for _, leak := range []string{"passwd", "y.png", "v.mp4"} {
+			if strings.Contains(got[0].body, leak) {
+				t.Fatalf("the upstream body carries %q: %s", leak, got[0].body)
+			}
+		}
 	}
 }

@@ -125,7 +125,7 @@ var (
 	// checkHeaderName's shape check. HTTP 400.
 	ErrRuntimeSpecAPITokenHeaderInvalid = errors.New("runtime_spec.api_token_header_invalid")
 	// ErrRuntimeSpecTypeInvalid rejects a type that is not one of
-	// ""/vllm/llama_cpp/tgi/ollama/stable_diffusion_cpp/audio_cpp/custom
+	// ""/vllm/llama_cpp/tgi/ollama/stable_diffusion_cpp/audio_cpp/vllm_sr/sglang/sglang_omni/custom
 	// (design 2026-09-07; see validRuntimeSpecType). "" is valid --
 	// it means auto-detect from Binary (routing.EffectiveRuntimeSpecType) --
 	// so this is the same "empty is fine, everything else must be a known
@@ -1343,6 +1343,9 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	// here for the application side's 409 sentinel to answer. The stored row
 	// is read later (priorRuntimeSpec), for the default-versus-preserve
 	// decision only, never here.
+	// The args are not encoded yet, so an `sglang serve --model-type omni` spec reads as
+	// sglang here (routing.EffectiveRuntimeSpecType): harmless, because sglang and
+	// sglang_omni answer every check that reads this kind alike.
 	effectiveSpecKind := routing.EffectiveRuntimeSpecType(routing.RuntimeSpec{Type: f.specType, Binary: f.binary})
 	f.liveTimingsCapable = routing.LiveTimingsCapableKind(string(effectiveSpecKind))
 	if req.ResponsesLiveTimingsEnabled != nil && *req.ResponsesLiveTimingsEnabled && !f.liveTimingsCapable {
@@ -1987,19 +1990,20 @@ func validRuntimeAPITokenMode(s string) bool {
 }
 
 // validRuntimeSpecType reports whether s is "" (auto-detect from Binary, the
-// default and every pre-feature row's stored value) or one of the eight
+// default and every pre-feature row's stored value) or one of the ten
 // routing.RuntimeSpecType values (vllm, llama_cpp, tgi, ollama,
-// stable_diffusion_cpp, audio_cpp, vllm_sr, custom). Unlike validRuntimeAPITokenMode,
+// stable_diffusion_cpp, audio_cpp, vllm_sr, sglang, sglang_omni, custom). Unlike validRuntimeAPITokenMode,
 // empty IS accepted directly here (mirrors validVisibleDevicesMode) -- callers
 // pass req.Type through untouched, they don't normalize "" to a concrete value
 // first, because "" is itself a legitimate stored/wire value (auto), not a
-// default that collapses into one of the eight kinds.
+// default that collapses into one of the ten kinds.
 func validRuntimeSpecType(s string) bool {
 	switch routing.RuntimeSpecType(s) {
 	case "", routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeLlamaCpp,
 		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama,
 		routing.RuntimeSpecTypeStableDiffusionCpp, routing.RuntimeSpecTypeAudioCpp,
-		routing.RuntimeSpecTypeVllmSR, routing.RuntimeSpecTypeCustom:
+		routing.RuntimeSpecTypeVllmSR, routing.RuntimeSpecTypeSGLang,
+		routing.RuntimeSpecTypeSGLangOmni, routing.RuntimeSpecTypeCustom:
 		return true
 	}
 	return false
@@ -2713,6 +2717,13 @@ const runtimeTextOnStableDiffusionWarning = "api_flavors_text_on_stable_diffusio
 // dispatched to it fail.
 const runtimeTextOnVllmSRWarning = "api_flavors_text_on_vllm_sr"
 
+// runtimeNoAudioOnSGLangOmniWarning: a runtime spec whose effective type is
+// sglang_omni lists no openai_audio flavor. sglang-omni (v0.2.0) is a
+// multimodal server whose speech and transcription endpoints are served only
+// under that flavor, so the model would never be offered for audio requests.
+// Advisory, like the vllm_sr warning.
+const runtimeNoAudioOnSGLangOmniWarning = "api_flavors_no_audio_on_sglang_omni"
+
 // RuntimeWarnings is a pure derivation (no store write) of operator-facing
 // warnings about appID's current runtime configuration. authorizeApplication
 // gates it (404-no-leak). Always a non-nil slice, even when empty.
@@ -2753,6 +2764,9 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 	}
 	if anyVllmSRSpecListsTextFlavor(app, specs) {
 		warnings = append(warnings, runtimeTextOnVllmSRWarning)
+	}
+	if anySGLangOmniSpecLacksAudioFlavor(app, specs) {
+		warnings = append(warnings, runtimeNoAudioOnSGLangOmniWarning)
 	}
 	return warnings, nil
 }
@@ -2875,6 +2889,26 @@ func anyVllmSRSpecListsTextFlavor(app routing.Application, specs []routing.Runti
 			continue
 		}
 		if slices.Contains(spec.APIFlavors, routing.APIFlavorOpenAI) || slices.Contains(spec.APIFlavors, routing.APIFlavorAnthropic) {
+			return true
+		}
+	}
+	return false
+}
+
+// anySGLangOmniSpecLacksAudioFlavor backs runtimeNoAudioOnSGLangOmniWarning: a
+// spec whose effective type is sglang_omni (explicit, or detected from an
+// omni-named binary) that does not list openai_audio. Same scope as
+// anyVllmSRSpecListsTextFlavor: a server_agent application only, disabled
+// specs included.
+func anySGLangOmniSpecLacksAudioFlavor(app routing.Application, specs []routing.RuntimeSpec) bool {
+	if app.Type != routing.ProviderServerAgent {
+		return false
+	}
+	for _, spec := range specs {
+		if routing.EffectiveRuntimeSpecType(spec) != routing.RuntimeSpecTypeSGLangOmni {
+			continue
+		}
+		if !slices.Contains(spec.APIFlavors, routing.APIFlavorOpenAIAudio) {
 			return true
 		}
 	}

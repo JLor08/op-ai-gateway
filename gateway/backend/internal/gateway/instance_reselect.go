@@ -91,7 +91,9 @@ func reselectsLostInstance(target routing.Target, req inference.Request, err err
 
 // withLostInstance returns req with lost's instance, found gone, added to the instances
 // its selections must not pick. The slice is copied, so the caller's request is
-// untouched.
+// untouched. The /v1/realtime target selection (selectRealtimeTarget) excludes with it
+// too: there the instance is one that cannot serve the session (its agent has not
+// declared realtime_proxy), not one found gone.
 func withLostInstance(req inference.Request, lost routing.Target) inference.Request {
 	req.ExcludeInstanceKeys = append(slices.Clone(req.ExcludeInstanceKeys), lost.InstanceKey)
 	return req

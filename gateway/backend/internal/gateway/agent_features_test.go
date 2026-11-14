@@ -361,3 +361,18 @@ func TestRuntimeExecWSLFeatureName(t *testing.T) {
 		t.Fatalf("a server that declared %q must read as having it", RuntimeExecWSLFeature)
 	}
 }
+
+// TestRealtimeProxyFeatureName pins the literal an agent that serves the
+// realtime WebSocket route declares in its own registry (server-agent/internal/
+// agent/features.go; the agent module cannot import this one), and that the name
+// stays off the gateway's own list: it states a fact about the agent's router
+// alone, and the gateway reads it off the agent's declared set before it dials
+// the route (realtimeTargetServed).
+func TestRealtimeProxyFeatureName(t *testing.T) {
+	if realtimeProxyFeature != "realtime_proxy" {
+		t.Fatalf("realtimeProxyFeature = %q, want the agent's literal %q", realtimeProxyFeature, "realtime_proxy")
+	}
+	if slices.Contains(gatewayAgentFeatures, realtimeProxyFeature) {
+		t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, realtimeProxyFeature)
+	}
+}

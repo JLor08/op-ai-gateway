@@ -1554,3 +1554,42 @@ func TestProbeContextInfo_VLLMSRAPIVersionWithoutLimit(t *testing.T) {
 		t.Errorf("info = %+v, want api_version 5.0.0 and size 0", info)
 	}
 }
+
+func TestExtractContext_SGLangReadsMaxModelLen(t *testing.T) {
+	var v any
+	// A LoRA adapter card carries max_model_len null; the first positive wins.
+	if err := json.Unmarshal([]byte(`{"data":[{"id":"m","max_model_len":32768},{"id":"lora","max_model_len":null}]}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := extractContext("sglang", v); !ok || n != 32768 {
+		t.Errorf("extractContext(sglang) = %d, %v; want 32768, true", n, ok)
+	}
+	if _, ok := extractContext("sglang", map[string]any{"data": []any{}}); ok {
+		t.Error("extractContext(sglang) on empty data = ok, want false")
+	}
+}
+
+// When no data[] entry carries a positive max_model_len, an sglang body falls back to
+// the best-effort key scan, as vllm_sr does: a context probe override may point at a
+// document of another shape.
+func TestExtractContext_SGLangFallsBackToTheBestEffortScan(t *testing.T) {
+	for body, want := range map[string]int{
+		`{"context_length":16384}`: 16384,
+		`{"data":[{"id":"lora","max_model_len":null}],"server":{"context_length":8192}}`: 8192,
+		`{"internal_states":[{"n_ctx":4096}]}`:                                           4096,
+	} {
+		var v any
+		if err := json.Unmarshal([]byte(body), &v); err != nil {
+			t.Fatal(err)
+		}
+		if n, ok := extractContext("sglang", v); !ok || n != want {
+			t.Errorf("extractContext(sglang, %s) = %d, %v; want %d, true", body, n, ok, want)
+		}
+	}
+	// vllm keeps its strict reading.
+	var v any
+	_ = json.Unmarshal([]byte(`{"context_length":16384}`), &v)
+	if _, ok := extractContext("vllm", v); ok {
+		t.Error("extractContext(vllm) fell back to the scan, want its strict reading")
+	}
+}

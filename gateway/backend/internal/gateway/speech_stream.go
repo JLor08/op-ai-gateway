@@ -20,18 +20,22 @@ import (
 // (OpenAI-style SSE): a speech.audio.delta per chunk, its PCM base64-encoded in the
 // `audio` field, a speech.audio.done that states a time to first token and NO
 // duration, then the [DONE] sentinel (sseDoneSentinel). With stream_format=audio the
-// body is instead headerless raw PCM under application/octet-stream.
+// body is instead headerless raw PCM under application/octet-stream (audio/pcm from
+// sglang-omni).
 const (
 	speechEventDelta = "speech.audio.delta"
 	speechEventDone  = "speech.audio.done"
 )
 
-// The two media types audio.cpp answers a streamed speech request in: the event stream
-// (stream_format=sse, its default) and raw PCM (stream_format=audio). They, and nothing
-// else, make an answer a stream (newSpeechStreamScan).
+// The media types a streamed speech request is answered in: the event stream
+// (audio.cpp's stream_format=sse, its default) and raw PCM, which audio.cpp labels
+// application/octet-stream (stream_format=audio) and sglang-omni audio/pcm (v0.2.0
+// sglang_omni/serve/openai_api.py; its stream_format defaults to "audio"). They, and
+// nothing else, make an answer a stream (newSpeechStreamScan).
 const (
-	speechStreamSSEType = "text/event-stream"
-	speechStreamRawType = "application/octet-stream"
+	speechStreamSSEType    = "text/event-stream"
+	speechStreamRawType    = "application/octet-stream"
+	speechStreamRawPCMType = "audio/pcm"
 )
 
 // speechStreamMaxLine bounds one SSE line the scan holds between chunks. A delta line
@@ -102,7 +106,7 @@ func newSpeechStreamScan(header http.Header) *speechStreamScan {
 	switch mediaType {
 	case speechStreamSSEType:
 		return &speechStreamScan{maxLine: speechStreamMaxLine}
-	case speechStreamRawType:
+	case speechStreamRawType, speechStreamRawPCMType:
 		return &speechStreamScan{raw: true}
 	}
 	return nil

@@ -73,6 +73,8 @@ const specTypeKeys: Record<RuntimeSpec['type'], true> = {
   stable_diffusion_cpp: true,
   audio_cpp: true,
   vllm_sr: true,
+  sglang: true,
+  sglang_omni: true,
   custom: true,
 };
 const allSpecTypes = Object.keys(specTypeKeys) as RuntimeSpec['type'][];

@@ -13,12 +13,17 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/usage"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // defaultMaxImageEditBodyBytes is the default bound on the multipart read of POST
@@ -445,16 +450,133 @@ func imageEditNeedsModelRewrite(target routing.Target, formModel string) bool {
 
 // imageEditRebuild says what rebuildImageEditBody changes in a form: the value of
 // its model field when model is set, the content of its mask part when mask is
-// set. Whatever it leaves unset is copied as the client sent it.
+// set, and -- when canonical is set (an sglang_omni target) -- the headers of every
+// other part, rebuilt by sglangOmniEditPartHeader. Whatever it leaves unset is
+// copied as the client sent it.
 type imageEditRebuild struct {
-	model string
-	mask  []byte
+	model     string
+	mask      []byte
+	canonical bool
+}
+
+// sglangOmniEditSourceRefusal walks an edit form bound for an sglang_omni target and
+// returns the refusal of its first part sglangOmniEditPartHeader refuses, nil when
+// every part may be relayed. raw is a body parseImageEditForm accepted under boundary.
+func sglangOmniEditSourceRefusal(raw []byte, boundary string) *imageSourceRefusal {
+	mr := multipart.NewReader(bytes.NewReader(raw), boundary)
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			// Not expected: parseImageEditForm walked this body to its end.
+			return &imageSourceRefusal{field: "body", message: malformedMultipartBodyMessage}
+		}
+		if _, refusal := sglangOmniEditPartHeader(part); refusal != nil {
+			return refusal
+		}
+	}
+}
+
+// sglangOmniEditPartHeader returns the header a part of an edit bound for an
+// sglang_omni target is relayed with, or the refusal of the part. sglang-omni v0.2.0
+// (sglang_omni/serve/openai_api.py, edits) takes the source image from the form fields
+// image, image[], url and url[], and a source that is no uploaded file is a string it
+// resolves itself: a bare path read from the model host, a file:// path or a URL it
+// fetches. sglang-omni authenticates nothing, so the gateway relays a source only as an
+// uploaded file:
+//
+//   - a part must carry exactly one Content-Disposition, which parses and is form-data.
+//     Starlette keeps the LAST Content-Disposition of a part while Go's FormName and
+//     FileName read the first, and a duplicated parameter (two names) is one more way
+//     for the two to disagree; mime.ParseMediaType refuses that one.
+//
+//   - url and url[] are refused: the upstream resolves their value whatever its shape.
+//
+//   - image and image[] must be file parts (a non-empty filename): Starlette makes a
+//     part an uploaded file only when its Content-Disposition names a filename.
+//
+//   - the name matches sglangOmniPartNamePattern and the filename holds no backslash,
+//     double quote, semicolon or control character. python-multipart splits the
+//     parameters with a copy of CPython's email.message._parseparam, which counts
+//     quotes as count('"') - count('\\"'), so a quoted value ending in a backslash
+//     misparses and can turn the rest of the line into a smuggled parameter (a part the
+//     gateway saw as an unknown file field becomes the text field url). Inside the
+//     charset the quoting the gateway writes is read back identically.
+//
+// The header returned carries a Content-Disposition the gateway built from what it
+// read (form-data, the name and, when there is one, the filename) and the part's
+// Content-Type, and nothing else the client sent. The refusal names the field and
+// never echoes a value.
+func sglangOmniEditPartHeader(part *multipart.Part) (textproto.MIMEHeader, *imageSourceRefusal) {
+	dispositions := part.Header.Values(contentDispositionHeader)
+	if len(dispositions) != 1 {
+		return nil, &imageSourceRefusal{field: contentDispositionHeader, message: "every form part must carry exactly one Content-Disposition header for this model server"}
+	}
+	disposition, params, err := mime.ParseMediaType(dispositions[0])
+	if err != nil || disposition != "form-data" {
+		return nil, &imageSourceRefusal{field: contentDispositionHeader, message: "every form part's Content-Disposition must be a well-formed form-data disposition for this model server"}
+	}
+	name, filename := params["name"], part.FileName()
+	switch name {
+	case "url", "url[]":
+		return nil, &imageSourceRefusal{field: name, message: fmt.Sprintf("form field %q is not accepted by this model server, which would read its value as a server-side path or fetch it as a URL; send the source image as an uploaded file under \"image\"", name)}
+	case "image", "image[]":
+		if filename == "" {
+			return nil, &imageSourceRefusal{field: name, message: fmt.Sprintf("form field %q must be an uploaded file with a filename; this model server would read a text value as a server-side path or fetch it as a URL", name)}
+		}
+	}
+	if refusal := sglangOmniEditPartNameRefusal(name, params["filename"]); refusal != nil {
+		return nil, refusal
+	}
+	h := textproto.MIMEHeader{}
+	value := fmt.Sprintf("form-data; name=%q", name)
+	if filename != "" {
+		value += fmt.Sprintf("; filename=%q", filename)
+	}
+	h.Set(contentDispositionHeader, value)
+	if ct := part.Header.Get(contentTypeHeader); ct != "" {
+		h.Set(contentTypeHeader, ct)
+	}
+	return h, nil
+}
+
+// contentDispositionHeader is the multipart part header that names a part and its file.
+const contentDispositionHeader = "Content-Disposition"
+
+// sglangOmniPartNamePattern is the charset of a part name relayed to an sglang_omni
+// target: what the form fields of /v1/images/edits (image, image[], model, n, ...) use.
+var sglangOmniPartNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.\[\]-]+$`)
+
+// sglangOmniEditPartNameRefusal refuses a part whose name or filename is outside the
+// charset sglang-omni's parameter parser reads the same way the gateway does (see
+// sglangOmniEditPartHeader). It names the header and never echoes the value.
+func sglangOmniEditPartNameRefusal(name, filename string) *imageSourceRefusal {
+	if !sglangOmniPartNamePattern.MatchString(name) {
+		return &imageSourceRefusal{field: contentDispositionHeader, message: "every form part's Content-Disposition name must consist only of letters, digits and _ . [ ] - for this model server"}
+	}
+	if strings.ContainsFunc(filename, func(r rune) bool {
+		return r == '\\' || r == '"' || r == ';' || unicode.IsControl(r)
+	}) {
+		return &imageSourceRefusal{field: contentDispositionHeader, message: "a form part's Content-Disposition filename must not contain a backslash, double quote, semicolon or control character for this model server"}
+	}
+	return nil
+}
+
+// imageSourceRefusal is an images.source_unsupported refusal: the field it names (a
+// form field, or the Content-Disposition header) and its message, which never
+// carries a value from the form.
+type imageSourceRefusal struct {
+	field   string
+	message string
 }
 
 // rebuildImageEditBody returns raw with the changes of rb applied, as a new
 // multipart body and its Content-Type (a fresh boundary). Every part the changes
-// do not touch -- its headers, its bytes, and its position -- is copied exactly
-// as the client sent it. The model change replaces the value of the model field,
+// do not touch keeps its bytes and its position; its headers are copied as the
+// client sent them, except under rb.canonical, where the gateway rebuilds them
+// (sglangOmniEditPartHeader). The model change replaces the value of the model field,
 // the one the agent's router (and, now, any model-routing upstream) reads; the
 // mask change replaces the content of the mask part IN PLACE with the converted
 // mask, as a PNG file part (imageEditMaskFilename). A mask edit is therefore
@@ -493,8 +615,9 @@ func rebuildImageEditBody(raw []byte, boundary string, rb imageEditRebuild) ([]b
 
 // writeRebuiltPart writes one part of the client's form into the rebuilt body: the
 // model field with rb.model for its value when that is set, the mask part with the
-// converted rb.mask for its content when that is set, and every other part -- its
-// headers and its bytes -- as the client sent it.
+// converted rb.mask for its content when that is set, and every other part with its
+// bytes as the client sent them and its headers as the client sent them -- or, under
+// rb.canonical, rebuilt by sglangOmniEditPartHeader.
 func writeRebuiltPart(mw *multipart.Writer, part *multipart.Part, rb imageEditRebuild) error {
 	if rb.model != "" && part.FormName() == "model" {
 		if err := mw.WriteField("model", rb.model); err != nil {
@@ -505,7 +628,16 @@ func writeRebuiltPart(mw *multipart.Writer, part *multipart.Part, rb imageEditRe
 	if rb.mask != nil && part.FormName() == "mask" {
 		return writeConvertedMaskPart(mw, rb.mask)
 	}
-	pw, err := mw.CreatePart(part.Header)
+	header := part.Header
+	if rb.canonical {
+		h, refusal := sglangOmniEditPartHeader(part)
+		if refusal != nil {
+			// Not expected: relayImageEdit refused such a form before the rebuild.
+			return fmt.Errorf("part %q: %s", part.FormName(), refusal.message)
+		}
+		header = h
+	}
+	pw, err := mw.CreatePart(header)
 	if err != nil {
 		return fmt.Errorf("create part %q: %w", part.FormName(), err)
 	}
@@ -519,7 +651,7 @@ func writeRebuiltPart(mw *multipart.Writer, part *multipart.Part, rb imageEditRe
 // file part named imageEditMaskFilename.
 func writeConvertedMaskPart(mw *multipart.Writer, mask []byte) error {
 	h := textproto.MIMEHeader{}
-	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="mask"; filename=%q`, imageEditMaskFilename))
+	h.Set(contentDispositionHeader, fmt.Sprintf(`form-data; name="mask"; filename=%q`, imageEditMaskFilename))
 	h.Set(contentTypeHeader, mediaTypePNG)
 	pw, err := mw.CreatePart(h)
 	if err != nil {
@@ -548,7 +680,10 @@ func writeConvertedMaskPart(mw *multipart.Writer, mask []byte) error {
 // maskPNG is its sd luminance conversion (convertImageEditMask). Either makes the
 // body be rebuilt ONCE with all of its changes (rebuildImageEditBody), sent with
 // its own Content-Type; a no-mask edit whose model needs no rewrite stays
-// verbatim. nativeRelay.raw stays the client's bytes either way: that is what
+// verbatim. An sglang_omni target is the exception: its form is checked for a
+// source the upstream would resolve itself (sglangOmniEditSourceRefusal, 400
+// images.source_unsupported) and always rebuilt, every part's headers written by
+// the gateway (sglangOmniEditPartHeader). nativeRelay.raw stays the client's bytes either way: that is what
 // capture records. The relay names the edits endpoint, so the upstream path AND
 // the usage row's provider_path are /v1/images/edits -- left unset, the endpoint
 // defaults to the generations one in both places.
@@ -576,6 +711,17 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 		s.recordImagesRoutingFailure(w, r, token, req, raw, start, errImageEditUnavailable)
 		return
 	}
+	// An sglang_omni target resolves a source that is no uploaded file on its own
+	// (sglangOmniEditPartHeader): such a form is refused here, after the gates and
+	// before anything is sent, and every form it accepts is rebuilt with headers the
+	// gateway wrote.
+	omni := target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni)
+	if omni {
+		if refusal := sglangOmniEditSourceRefusal(raw, form.boundary); refusal != nil {
+			s.recordImageSourceRefusal(w, r, token, req, raw, start, refusal)
+			return
+		}
+	}
 	rel := nativeRelay{
 		token:       token,
 		target:      target,
@@ -587,11 +733,11 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 		reselect:    relayAgain(req, func(again inference.Request) { s.relayImageEdit(w, r, token, again, form, raw, maskPNG) }),
 	}
 	sent := len(raw)
-	rebuild := imageEditRebuild{mask: maskPNG}
+	rebuild := imageEditRebuild{mask: maskPNG, canonical: omni}
 	if imageEditNeedsModelRewrite(target, form.model) {
 		rebuild.model = target.ProviderModel
 	}
-	if rebuild.model != "" || rebuild.mask != nil {
+	if rebuild.model != "" || rebuild.mask != nil || rebuild.canonical {
 		body, contentType, err := rebuildImageEditBody(raw, form.boundary, rebuild)
 		if err != nil {
 			// Not expected for a body parseImageEditForm accepted: it walked every
@@ -614,4 +760,17 @@ func (s *Server) relayImageEdit(w http.ResponseWriter, r *http.Request, token au
 		return
 	}
 	s.proxyNative(w, r, rel)
+}
+
+// recordImageSourceRefusal answers an edit whose source an sglang_omni target cannot be
+// given safely (sglangOmniEditSourceRefusal) with 400 and the refusal, and records the
+// usage row recordImagesRoutingFailure records (no upstream call, billed as image, 0).
+// It logs at Warn: a path or URL aimed at an sglang_omni target is probing.
+func (s *Server) recordImageSourceRefusal(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, start time.Time, refusal *imageSourceRefusal) {
+	slog.Warn("image edit rejected: the source is not an uploaded file for an sglang_omni target",
+		"path", r.URL.Path, "model", req.Model, "field", refusal.field)
+	id := nextRequestID()
+	capturing := s.capturingEnabled(token)
+	body := writeJSONCaptured(w, http.StatusBadRequest, apierror.Response(imagesSourceUnsupported, refusal.message, ""))
+	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, imagesSourceUnsupported, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadRequest, ContentType: jsonContentType, BillingUnit: usage.BillingUnitImage}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadRequest, req.APIFlavor), nil)
 }

@@ -4,7 +4,7 @@
 // This file is the router port (design doc §6.1): the single HTTP port the
 // gateway talks to for a server_agent application, which routes every
 // inference request to the right managed model process, starting it first
-// if necessary. Six route classes:
+// if necessary. Seven route classes:
 //
 //   - GET /health, GET /v1/health -- always 200 while the router is up.
 //     "Reachability means the router accepts, not that a model is warm" --
@@ -48,6 +48,12 @@
 //     refusal. Bodiless, so a router without this route answers it from
 //     serveProxy with 404 runtime.model_not_managed and stops nothing; the
 //     gateway calls it only on an agent that declares "runtime_stop".
+//   - GET /realtime/{model} -- the one route that upgrades a connection: a
+//     WebSocket relay to a managed child's /v1/realtime (the "realtime_proxy"
+//     feature), model from the PATH like /live, the admission held for the
+//     whole session, which the router bounds itself -- an idle timeout, a
+//     message limit, and Close ending every session (router_realtime.go).
+//     Every other route still refuses an upgrade (deadlineWriter.Hijack).
 //   - everything else -- the model-routed reverse proxy. The model comes from
 //     the JSON body or, when the request is multipart/form-data (an image
 //     edit or an audio transcription, "multipart_proxy" in the agent's
@@ -278,6 +284,10 @@ func (dw deadlineWriter) Unwrap() http.ResponseWriter {
 // (errors.Is(hijackErr, http.ErrNotSupported)) and answers the client
 // through ErrorHandler -- the pre-Unwrap 502, with a prompt release() --
 // instead of failing some other way.
+//
+// GET /realtime/{model} is the one route that upgrades, and it never runs
+// through a deadlineWriter: it hands coder/websocket the server's own writer
+// and solves the three problems above itself (serveRealtime).
 func (dw deadlineWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, http.ErrNotSupported
 }
@@ -344,18 +354,35 @@ type router struct {
 	// framing of this feature as a component that must never add a new
 	// timer to that chain.
 	transport http.RoundTripper
+	// realtime tracks the open GET /realtime/{model} sessions, so Close can
+	// end them (router_realtime.go).
+	realtime *realtimeSessions
+	// realtimeIdle is a realtime session's idle timeout (realtimeIdleTimeout),
+	// realtimeCloseWait how long Close waits for the sessions it ends
+	// (realtimeCloseBound), and realtimeCauseWait how long a session that
+	// ended on a failed write waits for the read naming the cause
+	// (realtimeCauseGrace). Fields rather than constants so a test can set
+	// them on its own router.
+	realtimeIdle      time.Duration
+	realtimeCloseWait time.Duration
+	realtimeCauseWait time.Duration
 }
 
 func newRouter(m managerPort) *router {
 	return &router{
-		m:         m,
-		transport: &http.Transport{},
+		m:                 m,
+		transport:         &http.Transport{},
+		realtime:          newRealtimeSessions(),
+		realtimeIdle:      realtimeIdleTimeout,
+		realtimeCloseWait: realtimeCloseBound,
+		realtimeCauseWait: realtimeCauseGrace,
 	}
 }
 
 func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// M9: every control path answers one method -- GET, or POST for
-	// /ensure/{model}, /stop/{model}, /live/{model} and /rpc/...; a different method on one of these paths falls
+	// M9: every control path answers one method -- GET (GET /realtime/{model}
+	// included), or POST for /ensure/{model}, /stop/{model}, /live/{model} and
+	// /rpc/...; a different method on one of these paths falls
 	// through to the model-routed proxy instead (the ordinary "everything
 	// else" case), rather than getting the control treatment regardless
 	// of method.
@@ -369,6 +396,8 @@ func (rt *router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rt.serveModels(w, r)
 	case isGet && strings.HasPrefix(r.URL.Path, "/upstream/"):
 		rt.serveUpstream(w, r)
+	case isGet && strings.HasPrefix(r.URL.Path, realtimePathPrefix):
+		rt.serveRealtime(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, ensurePathPrefix):
 		rt.serveEnsure(w, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, stopPathPrefix):

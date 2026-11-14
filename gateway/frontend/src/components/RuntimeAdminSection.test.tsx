@@ -1436,6 +1436,54 @@ describe('RuntimeAdminSection vllm_sr launch-spec kind', { timeout: 15_000 }, ()
   });
 });
 
+describe('RuntimeAdminSection sglang launch-spec kinds', { timeout: 15_000 }, () => {
+  it('offers both types and shows each note only for its own type', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    const field = () => screen.getByRole('combobox', { name: t.runtimeSpecType });
+    await pickFlavorFormType(t.runtimeSpecTypeSglang);
+    expect(field()).toHaveAccessibleDescription(t.runtimeSpecTypeSglangNote);
+    await pickFlavorFormType(t.runtimeSpecTypeSglangOmni);
+    expect(field()).toHaveAccessibleDescription(t.runtimeSpecTypeSglangOmniNote);
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+    expect(screen.queryByText(t.runtimeSpecTypeSglangNote)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeSpecTypeSglangOmniNote)).not.toBeInTheDocument();
+  });
+
+  it('sets openai and openai_audio for sglang_omni and keeps the stock flavors for sglang', async () => {
+    const { putSpecs } = renderSection({
+      application: { ...application, api_flavors: ['openai', 'anthropic', 'openai_audio'] },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/sglang/bin/sglang' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeSglang);
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    await pickFlavorFormType(t.runtimeSpecTypeSglangOmni);
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).not.toBeChecked();
+    expect(flavorBoxes().audio).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('sglang_omni');
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai', 'openai_audio']);
+    expect(putSpecs[0].body.responses_mode).toBe('disabled');
+    expect(putSpecs[0].body.messages_mode).toBe('disabled');
+  });
+
+  it('renders the api_flavors_no_audio_on_sglang_omni warning by its label', async () => {
+    renderSection({ warnings: ['api_flavors_no_audio_on_sglang_omni'] });
+    expect(await screen.findByText(t.runtimeNoAudioOnSglangOmniWarning)).toBeInTheDocument();
+    expect(screen.queryByText('api_flavors_no_audio_on_sglang_omni')).not.toBeInTheDocument();
+    expect(messages.en.runtimeNoAudioOnSglangOmniWarning).not.toBe(
+      messages.de.runtimeNoAudioOnSglangOmniWarning,
+    );
+  });
+});
+
 describe('RuntimeAdminSection decisions modes in the spec form', () => {
   const decisionsField = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
   const systemOneField = () => screen.getByRole('combobox', { name: t.applicationSystemOneMode });

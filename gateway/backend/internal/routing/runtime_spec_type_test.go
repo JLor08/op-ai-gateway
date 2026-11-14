@@ -263,3 +263,95 @@ func TestVllmSRAPIVersionUnsupported(t *testing.T) {
 		}
 	}
 }
+
+// TestDetectRuntimeSpecTypeSGLang pins SGLang (v0.5.23) and sglang-omni
+// (v0.2.0) detection: an omni-named binary must never detect as sglang, both
+// cases sit ahead of the vllm substring, and every name that detected before
+// keeps its type.
+func TestDetectRuntimeSpecTypeSGLang(t *testing.T) {
+	cases := []struct {
+		binary string
+		want   RuntimeSpecType
+	}{
+		{"/home/ai/sglang-env/bin/sglang", RuntimeSpecTypeSGLang},
+		{"SGLANG", RuntimeSpecTypeSGLang},
+		{"python -m sglang.launch_server", RuntimeSpecTypeSGLang},
+		{"sgl-omni", RuntimeSpecTypeSGLangOmni},
+		{"/x/sglang-omni", RuntimeSpecTypeSGLangOmni},
+		{"/x/sglang_omni", RuntimeSpecTypeSGLangOmni},
+		{"sgl_omni", RuntimeSpecTypeSGLangOmni},
+		{"SGL_OMNI", RuntimeSpecTypeSGLangOmni},
+		{"/opt/sglang-omni/bin/sglang", RuntimeSpecTypeSGLang},
+		{"vllm", RuntimeSpecTypeVLLM},
+		{"vllm-srun", RuntimeSpecTypeVllmSR},
+		{"llama-server", RuntimeSpecTypeLlamaCpp},
+		{"ollama", RuntimeSpecTypeOllama},
+		{"text-generation-launcher", RuntimeSpecTypeTGI},
+		{"sd-server", RuntimeSpecTypeStableDiffusionCpp},
+		{"audiocpp_server", RuntimeSpecTypeAudioCpp},
+		{"python3", RuntimeSpecTypeCustom},
+	}
+	for _, tc := range cases {
+		if got := DetectRuntimeSpecType(tc.binary); got != tc.want {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", tc.binary, got, tc.want)
+		}
+	}
+}
+
+func TestDeriveProbePathsSGLang(t *testing.T) {
+	metrics, context := DeriveProbePaths(RuntimeSpecTypeSGLang, "", "")
+	if metrics != "/metrics" || context != "/v1/models" {
+		t.Fatalf("sglang probe paths = (%q, %q), want (/metrics, /v1/models)", metrics, context)
+	}
+	metrics, context = DeriveProbePaths(RuntimeSpecTypeSGLangOmni, "", "")
+	if metrics != "" || context != "" {
+		t.Fatalf("sglang_omni probe paths = (%q, %q), want both empty", metrics, context)
+	}
+	for _, typ := range []RuntimeSpecType{RuntimeSpecTypeSGLang, RuntimeSpecTypeSGLangOmni} {
+		if m, c := DeriveProbePaths(typ, "/m", "/c"); m != "/m" || c != "/c" {
+			t.Fatalf("%s overrides = (%q, %q), want (/m, /c)", typ, m, c)
+		}
+	}
+}
+
+// TestEffectiveRuntimeSpecTypeSGLangServeModelTypeOmni pins the `sglang serve
+// --model-type omni` form: SGLang v0.5.23's serve CLI hands that flag (either
+// spelling) to the sglang-omni serve backend, which is selected by it alone, so an
+// Auto-typed spec whose binary detects as sglang is sglang_omni when its args name
+// it. An explicit type still wins, and only an sglang binary is read this way.
+func TestEffectiveRuntimeSpecTypeSGLangServeModelTypeOmni(t *testing.T) {
+	const sglang = "/home/ai/sglang-env/bin/sglang"
+	cases := []struct {
+		name string
+		spec RuntimeSpec
+		want RuntimeSpecType
+	}{
+		{"separate value", RuntimeSpec{Binary: sglang, Args: `["serve","--model-type","omni","--model-path","inclusionAI/Ming-3.0-tts-tiny"]`}, RuntimeSpecTypeSGLangOmni},
+		{"equals form", RuntimeSpec{Binary: sglang, Args: `["serve","--model-path","x","--model-type=omni"]`}, RuntimeSpecTypeSGLangOmni},
+		{"another backend", RuntimeSpec{Binary: sglang, Args: `["serve","--model-type","llm","--model-path","x"]`}, RuntimeSpecTypeSGLang},
+		{"omni as another flag's value", RuntimeSpec{Binary: sglang, Args: `["serve","--model-path","omni"]`}, RuntimeSpecTypeSGLang},
+		{"flag without a value", RuntimeSpec{Binary: sglang, Args: `["serve","--model-type"]`}, RuntimeSpecTypeSGLang},
+		{"no args", RuntimeSpec{Binary: sglang}, RuntimeSpecTypeSGLang},
+		{"args that are no JSON array", RuntimeSpec{Binary: sglang, Args: `not json`}, RuntimeSpecTypeSGLang},
+		{"explicit sglang wins", RuntimeSpec{Binary: sglang, Type: "sglang", Args: `["serve","--model-type","omni"]`}, RuntimeSpecTypeSGLang},
+		{"explicit custom wins", RuntimeSpec{Binary: sglang, Type: "custom", Args: `["serve","--model-type=omni"]`}, RuntimeSpecTypeCustom},
+		{"not an sglang binary", RuntimeSpec{Binary: "/opt/vllm/bin/vllm", Args: `["serve","--model-type","omni"]`}, RuntimeSpecTypeVLLM},
+		{"omni binary unchanged", RuntimeSpec{Binary: "sgl-omni", Args: `["serve","--model-type","llm"]`}, RuntimeSpecTypeSGLangOmni},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffectiveRuntimeSpecType(tc.spec); got != tc.want {
+				t.Errorf("EffectiveRuntimeSpecType(binary %q, type %q, args %s) = %q, want %q", tc.spec.Binary, tc.spec.Type, tc.spec.Args, got, tc.want)
+			}
+		})
+	}
+	// The effective type is what everything downstream reads: the probe paths and the
+	// role of an `sglang serve --model-type omni` spec are sglang_omni's.
+	spec := RuntimeSpec{Binary: sglang, Args: `["serve","--model-type","omni"]`}
+	if m, c := DeriveProbePaths(EffectiveRuntimeSpecType(spec), "", ""); m != "" || c != "" {
+		t.Errorf("probe paths = (%q, %q), want both empty", m, c)
+	}
+	if role := DeriveRole(EffectiveRuntimeSpecType(spec), nil); role != RoleOther {
+		t.Errorf("role = %q, want other (no chat fallback for sglang_omni)", role)
+	}
+}

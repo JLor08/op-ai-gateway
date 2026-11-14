@@ -947,6 +947,15 @@ func extractContext(specType string, v any) (int, bool) {
 	switch specType {
 	case "vllm":
 		return extractVLLMContext(v)
+	case "sglang":
+		// sglang (v0.5.23, protocol.py ModelCard) serves the same
+		// data[].max_model_len shape as vLLM; a body without a positive one (a
+		// LoRA-only listing, or a context probe override pointing at a document of
+		// another shape) falls back to the best-effort scan, as vllm_sr does.
+		if n, ok := extractVLLMContext(v); ok {
+			return n, true
+		}
+		return extractBestEffortContext(v)
 	case "llama_cpp":
 		return extractLlamaCppContext(v)
 	case "tgi":

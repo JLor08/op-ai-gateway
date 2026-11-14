@@ -225,6 +225,8 @@ const KNOWN_CAPABILITY_ORDER: { capability: string; label: (t: Translation) => s
   // of the observed "speculation_observed".
   { capability: 'embedding', label: (t) => t.capabilityEmbedding },
   { capability: 'rerank', label: (t) => t.capabilityRerank },
+  // "realtime" gates GET /v1/realtime; operator-stated like embedding and rerank.
+  { capability: 'realtime', label: (t) => t.capabilityRealtime },
   { capability: 'speculation_observed', label: (t) => t.capabilitySpeculationObserved },
 ];
 const KNOWN_CAPABILITY_NAMES = new Set(KNOWN_CAPABILITY_ORDER.map((k) => k.capability));

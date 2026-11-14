@@ -169,6 +169,14 @@ func TestExtractClientSession(t *testing.T) {
 			wantID: "", wantSource: "",
 		},
 		{
+			// /v1/realtime is a WebSocket upgrade: no body, and none of the other
+			// endpoints' signals is read; an explicit session header still is.
+			name: "realtime: no other endpoint's signal is read", endpoint: endpointRealtime,
+			h:      hdr("session_id", "would-be-codex", "x-claude-code-session-id", "would-be-claude-code"),
+			raw:    `{"prompt_cache_key":"would-be-pck","user":"would-be-user"}`,
+			wantID: "", wantSource: "",
+		},
+		{
 			// The agent id is read only on endpointMessages; a transcription
 			// request that carries the header must not pick it up.
 			name: "transcription: claude-code agent id is not read", endpoint: endpointTranscription,

@@ -51,21 +51,28 @@ func UpstreamAuthFrom(ctx context.Context) (UpstreamAuth, bool) {
 // raw token value. The extra headers are set FIRST so the credential header is never shadowed by an
 // ExtraHeaders entry of the same name. NEVER logs the token.
 func applyUpstreamAuth(ctx context.Context, req *http.Request) {
+	setUpstreamAuth(ctx, req.Header)
+}
+
+// setUpstreamAuth is applyUpstreamAuth on a bare header set: the one place the
+// credential and extra headers are written, shared with the WebSocket dial, whose
+// handshake header is handed to coder/websocket rather than built on a request.
+func setUpstreamAuth(ctx context.Context, h http.Header) {
 	a, ok := UpstreamAuthFrom(ctx)
 	if !ok {
 		return
 	}
 	for name, value := range a.ExtraHeaders {
 		if name != "" {
-			req.Header.Set(name, value)
+			h.Set(name, value)
 		}
 	}
 	if strings.TrimSpace(a.Token) == "" {
 		return // extra-headers-only target: no credential to attach
 	}
 	if a.Header == "" {
-		req.Header.Set("Authorization", "Bearer "+a.Token)
+		h.Set("Authorization", "Bearer "+a.Token)
 		return
 	}
-	req.Header.Set(a.Header, a.Token)
+	h.Set(a.Header, a.Token)
 }

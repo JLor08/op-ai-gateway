@@ -1540,6 +1540,8 @@ var reservedAgentCapabilityNames = map[string]bool{
 	routing.CapabilityImageEdit:           true,
 	routing.CapabilityDecision:            true,
 	routing.CapabilityDecisionOpenAI:      true,
+	// realtime is manual-only: no probe source states it (see routing.CapabilityRealtime).
+	routing.CapabilityRealtime: true,
 	// The derived any_decision requirement is never a stored row name.
 	routing.CapabilityAnyDecision: true,
 }

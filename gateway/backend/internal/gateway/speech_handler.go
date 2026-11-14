@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -48,6 +49,11 @@ const (
 	// no stream or outside the two audio.cpp emits, or a stream asking for wav; see
 	// validateSpeechRequest.
 	speechStreamUnsupported = "speech.stream_unsupported"
+	// speechReferenceAudioUnsupported is the code for a voice reference an sglang_omni
+	// target cannot be given safely: anything but an inline data: URL; see
+	// nonInlineVoiceReferenceField. Unlike the codes above it is decided after the
+	// route is resolved, because it depends on the target.
+	speechReferenceAudioUnsupported = "speech.reference_audio_unsupported"
 	// speechPcmUnavailable is the code for a one-shot request that asked for
 	// response_format "pcm" whose synthesized clip cannot be served as such: the mapped
 	// model's native format is not 16-bit mono PCM. Unlike the codes above it is a
@@ -378,7 +384,145 @@ func (s *Server) resolveSpeechTarget(w http.ResponseWriter, r *http.Request, tok
 		s.recordSpeechRoutingFailure(w, r, *token, req, raw, start, routing.ErrNoModelRoute)
 		return routing.Target{}, false
 	}
+	if field := nonInlineVoiceReferenceField(raw, target); field != "" {
+		s.recordSpeechReferenceRefusal(w, r, *token, req, raw, start, field)
+		return routing.Target{}, false
+	}
 	return target, true
+}
+
+// recordSpeechReferenceRefusal answers a refused voice reference and records the
+// usage row the neighbouring flavor refusal records (a row that claims no upstream
+// call). It logs at Warn: a path or URL aimed at an sglang_omni target is probing.
+func (s *Server) recordSpeechReferenceRefusal(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, start time.Time, field string) {
+	refusal := speechReferenceError(field)
+	slog.Warn("speech request rejected: voice reference is not inline",
+		"path", r.URL.Path, "model", req.Model, "field", field)
+	id := nextRequestID()
+	capturing := s.capturingEnabled(token)
+	body := writeJSONCaptured(w, http.StatusBadRequest, apierror.Response(refusal.Code, refusal.Message, ""))
+	s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, refusal.Code, "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: http.StatusBadRequest, ContentType: jsonContentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: endpointSpeech}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, http.StatusBadRequest, req.APIFlavor), nil)
+}
+
+// nonInlineVoiceReferenceField returns the name of the first voice reference field that must be refused, "" for none. It refuses a voice reference an sglang_omni target
+// would resolve on its own: ref_audio and each reference's audio_path, ref_audio and
+// audio take a bare path (read from the model host), a file:// path or a URL, and
+// sglang-omni authenticates nothing, so relaying one lets any gateway key holder read
+// a file on that host or make it fetch an arbitrary URL. Only an inline data: URL is
+// accepted. The rule applies to a target whose EFFECTIVE runtime spec type is
+// sglang_omni (target.LiveProgressSpecType, filled for an agent-launched child); every
+// other target is relayed unchanged.
+//
+// Objects are decoded into maps, not structs: encoding/json matches struct fields
+// case-insensitively and lets the last key win, while sglang-omni (Python) reads the
+// exact key, so {"ref_audio":"/etc/passwd","Ref_Audio":"data:..."} would pass a struct
+// check and be read from disk upstream. Every key that EqualFolds a guarded name is
+// checked. A body that is not one JSON object is refused as "body". The refusal names
+// the field and never the value (the returned name is what the log carries).
+func nonInlineVoiceReferenceField(raw []byte, target routing.Target) string {
+	if target.LiveProgressSpecType != string(routing.RuntimeSpecTypeSGLangOmni) {
+		return ""
+	}
+	var body map[string]json.RawMessage
+	if json.Unmarshal(raw, &body) != nil || body == nil {
+		// Not one JSON object (a null decodes to a nil map): nothing can be said about
+		// what the upstream would read from it, so it fails closed. validateSpeechRequest
+		// refuses every such body first today; this guard does not rely on that.
+		return "body"
+	}
+	for key, v := range body {
+		switch {
+		case strings.EqualFold(key, "ref_audio"):
+			if !inlineVoiceReference(v) {
+				return "ref_audio"
+			}
+		case strings.EqualFold(key, "references"):
+			if field := nonInlineReferenceField(v); field != "" {
+				return "references[]." + field
+			}
+		}
+	}
+	return ""
+}
+
+// nonInlineReferenceField checks a references value (an array of objects, or one
+// object) and returns the name of the first element field that is not inline, "" when
+// all are. A present, non-null value that cannot be read as objects counts as a
+// failure under the name "audio_path", since nothing can be said about what the
+// upstream would read from it.
+func nonInlineReferenceField(v json.RawMessage) string {
+	v = bytes.TrimSpace(v)
+	if len(v) == 0 || string(v) == "null" {
+		return ""
+	}
+	var elems []json.RawMessage
+	if v[0] == '{' {
+		elems = []json.RawMessage{v}
+	} else if json.Unmarshal(v, &elems) != nil {
+		return "audio_path"
+	}
+	for _, e := range elems {
+		if field := nonInlineElementField(e); field != "" {
+			return field
+		}
+	}
+	return ""
+}
+
+// nonInlineElementField checks one element of a references value and returns the
+// guarded field of it that is not inline, "" when none is (a null element is nothing
+// to read). An element that is no object counts as "audio_path", like in
+// nonInlineReferenceField.
+func nonInlineElementField(e json.RawMessage) string {
+	if string(bytes.TrimSpace(e)) == "null" {
+		return ""
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(e, &obj) != nil {
+		return "audio_path"
+	}
+	for key, val := range obj {
+		if guarded := guardedReferenceField(key); guarded != "" && !inlineVoiceReference(val) {
+			return guarded
+		}
+	}
+	return ""
+}
+
+// guardedReferenceField returns the canonical name of the reference field key names
+// (case-insensitively) when the upstream would read a path or URL from it, else "".
+func guardedReferenceField(key string) string {
+	for _, guarded := range []string{"audio_path", "ref_audio", "audio"} {
+		if strings.EqualFold(key, guarded) {
+			return guarded
+		}
+	}
+	return ""
+}
+
+// inlineVoiceReference reports whether a reference field is null or a string holding
+// a data: URL (the scheme is case-insensitive).
+func inlineVoiceReference(v json.RawMessage) bool {
+	if string(bytes.TrimSpace(v)) == "null" {
+		return true
+	}
+	var s string
+	if json.Unmarshal(v, &s) != nil {
+		return false
+	}
+	return isDataURL(s)
+}
+
+// isDataURL reports whether s is an inline data: URL (the scheme is case-insensitive).
+func isDataURL(s string) bool {
+	return len(s) >= len("data:") && strings.EqualFold(s[:len("data:")], "data:")
+}
+
+func speechReferenceError(field string) *inference.Error {
+	if field == "body" {
+		return &inference.Error{Code: speechReferenceAudioUnsupported, Message: "body must be one JSON object for this model server, whose voice references must be inline data: URLs"}
+	}
+	return &inference.Error{Code: speechReferenceAudioUnsupported, Message: field + " must be an inline data: URL; this model server cannot read a server-side path or fetch a URL"}
 }
 
 // relaySpeech relays an already-gated speech request via proxyNative, following
@@ -617,17 +761,105 @@ func speechDurationSeconds(header string) (float64, bool) {
 // setTranscriptionBillingQuantity is its setter. Without that endpoint test a
 // flavor-only guard would log an Error for every successful transcription (no
 // duration header, by design) and still leave its quantity at 0.
-func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.Header, status string) {
+//
+// A target that is not audio.cpp (sglang-omni for one, v0.2.0) sends no duration header.
+// With no header at all (absent or empty, never a present-but-unusable one) the quantity falls back to the audio itself: tally, which the
+// copier fed with the relayed body, reads the byte rate off the WAV's `fmt ` chunk and
+// counts the data bytes that were really relayed (speechWavTally.seconds). audio.cpp's
+// header always wins, so its behaviour and logging are unchanged; a body that is no
+// WAV, or a fallback that finds no duration, keeps the logged zero below (ADR-041).
+func setSpeechBillingQuantity(meta *usageMeta, ex nativeExchange, upstream http.Header, tally *speechWavTally, status string) {
 	if ex.req.APIFlavor != apiFlavorSpeech || isTranscriptionEndpoint(ex.endpoint) || status != "success" {
 		return
 	}
 	value := upstream.Get(speechDurationHeader)
 	seconds, ok := speechDurationSeconds(value)
 	if !ok {
+		// Only an ABSENT header is a target that is not audio.cpp. A header that is there
+		// but unusable is audio.cpp's own broken statement: it stays the loud zero below.
+		if speechDurationHeaderAbsent(upstream) {
+			if seconds, ok = tally.seconds(); ok {
+				meta.BillingQuantity = seconds
+				return
+			}
+		}
 		slog.Error("speech relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "header", speechDurationHeader, "value", value)
 		return
 	}
 	meta.BillingQuantity = seconds
+}
+
+// speechDurationHeaderAbsent reports whether the upstream sent no duration header at all
+// (absent or empty): the sign of a target that is not audio.cpp, and the only case the WAV
+// fallback applies to.
+func speechDurationHeaderAbsent(h http.Header) bool {
+	return strings.TrimSpace(h.Get(speechDurationHeader)) == ""
+}
+
+// speechWavHeadCap bounds how much of a one-shot speech body speechWavTally keeps to find
+// the `fmt ` and `data` chunk headers in: far more than a WAV header plus a metadata chunk.
+const speechWavHeadCap = 64 << 10
+
+// speechWavTally measures a one-shot speech body that carries no duration header, from the
+// audio itself. The copier feeds it every chunk the client's writer took. It keeps the head
+// of the body (bounded by speechWavHeadCap) and counts all bytes, so the data bytes are
+// what was RELAYED, not what the header's size field claims: a streaming WAV writer leaves
+// 0 or 0xFFFFFFFF there. A tally with a preset byte rate (newSpeechPCMTally) is for the pcm
+// relay, whose WAV header proxyNative already stripped, so every byte it sees is audio.
+//
+// A nil *speechWavTally sees nothing and measures nothing, so a relay without one (a
+// stream, which has its own rule, or a test) needs no guard.
+type speechWavTally struct {
+	presetRate uint32
+	head       []byte
+	total      int64
+}
+
+func newSpeechWavTally() *speechWavTally { return &speechWavTally{} }
+
+// newSpeechPCMTally is the tally of a relay whose bytes are raw PCM at byteRate.
+func newSpeechPCMTally(byteRate uint32) *speechWavTally {
+	return &speechWavTally{presetRate: byteRate}
+}
+
+func (t *speechWavTally) feed(chunk []byte) {
+	if t == nil {
+		return
+	}
+	t.total += int64(len(chunk))
+	if t.presetRate == 0 && len(t.head) < speechWavHeadCap {
+		room := speechWavHeadCap - len(t.head)
+		t.head = append(t.head, chunk[:min(room, len(chunk))]...)
+	}
+}
+
+// seconds returns the duration of the audio fed so far: data bytes / byte rate. It is false
+// when no rate can be read (not a RIFF/WAVE body, no consistent `fmt ` chunk before `data`)
+// or when no audio bytes were relayed, since neither states how much audio was produced.
+// When the `data` chunk declares a size smaller than what follows it, only the declared
+// size counts (trailing metadata chunks are not audio); any other declaration (0, or one
+// at least as large as what was relayed: the streaming writers' placeholders) is not
+// believed, and the relayed bytes count.
+func (t *speechWavTally) seconds() (float64, bool) {
+	if t == nil {
+		return 0, false
+	}
+	rate, data := int64(t.presetRate), t.total
+	if rate == 0 {
+		counting := &wavCountingReader{r: bytes.NewReader(t.head)}
+		format, declared, ok := wavStripToData(counting)
+		if !ok {
+			return 0, false
+		}
+		rate, data = int64(format.ByteRate), t.total-counting.n
+		if declared > 0 && declared < data {
+			data = declared
+		}
+	}
+	if rate <= 0 || data <= 0 {
+		return 0, false
+	}
+	return float64(data) / float64(rate), true
 }
 
 // cachedOutputByteRate returns the PCM byte rate cached for the mapping routeID

@@ -1791,6 +1791,22 @@ const (
 	// a model can do, the unit names what a served request is metered in.
 	CapabilityTranscription = "transcription"
 
+	// CapabilityRealtime means the model may be the target of GET /v1/realtime,
+	// the OpenAI Realtime WebSocket. It is orthogonal to CapabilityAudio,
+	// CapabilitySpeech and CapabilityTranscription above: a realtime session
+	// is a long-lived duplex conversation, not one synthesis or recognition,
+	// and a model may do any of the four. Never map one onto another.
+	//
+	// The row is MANUAL ONLY. No upstream document says which models speak the
+	// realtime protocol, so no probe source writes it; an operator states it
+	// (realtime:yes), and the request routes only on that literal yes. It is
+	// on the agent ingest's reserved list for that reason (a verdict an agent
+	// reports under the name is dropped). The request also needs the
+	// coarse openai_audio flavor on the application or spec, and the gateway
+	// serves a session only through a server_agent whose agent declared
+	// realtime_proxy.
+	CapabilityRealtime = "realtime"
+
 	// CapabilityTranscriptionStreaming means the model can answer a STREAMED
 	// transcription: POST /v1/audio/transcriptions with stream=true. It refines
 	// CapabilityTranscription rather than standing beside it, and it is the one

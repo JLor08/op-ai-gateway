@@ -1163,6 +1163,44 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 	return ms / 1000, true
 }
 
+// transcriptionUsageSeconds reads sglang-omni's usage statement out of a transcription
+// body (v0.2.0: sglang_omni/serve/protocol.py TranscriptionUsage, a usage object of type
+// "duration"; speech_to_text.py and transcriptions.py set its seconds to
+// math.ceil of the decoded audio's length), and reports whether it is one: the type
+// exactly "duration" and the seconds a positive finite number. Any other shape -- no
+// usage, another type, a zero, a string -- states nothing.
+func transcriptionUsageSeconds(body []byte) (float64, bool) {
+	var doc struct {
+		Usage *struct {
+			Type    string   `json:"type"`
+			Seconds *float64 `json:"seconds"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil || doc.Usage == nil || doc.Usage.Type != "duration" || doc.Usage.Seconds == nil {
+		return 0, false
+	}
+	seconds := *doc.Usage.Seconds
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+		return 0, false
+	}
+	return seconds, true
+}
+
+// transcriptionDurationAbsent reports whether body states no audio duration at all: no
+// timing object, or one without an audio_duration_ms key (any value there, a null or a
+// zero included, is a statement). A body that is no JSON object states nothing either.
+func transcriptionDurationAbsent(body []byte) bool {
+	var doc struct {
+		Timing struct {
+			AudioDurationMs json.RawMessage `json:"audio_duration_ms"`
+		} `json:"timing"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return true
+	}
+	return doc.Timing.AudioDurationMs == nil
+}
+
 // setTranscriptionBillingQuantity records, on meta, how many seconds of audio a
 // finished transcription relay transcribed (the plain endpoint's and the details
 // endpoint's alike: both answer with the same timing block) -- and does nothing at all
@@ -1183,12 +1221,41 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 // enough to find the request, instead of silently recording a bare zero (ADR-041).
 // Only the body's size is logged: the body is the transcript, which is the user's
 // content and has no business in a log line.
-func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []byte, status string) {
+//
+// When the body states no duration (a target that is not audio.cpp, sglang-omni for one,
+// sends no timing block) the quantity falls back, in this order, to:
+//
+//  1. the duration of the WAV that was UPLOADED (uploadWavDurationMillis, over ex.raw
+//     and the client's contentType): the same measurement a streamed transcription is
+//     billed by, exact to the millisecond;
+//  2. the upstream's own usage statement, when it is sglang-omni's
+//     {"type":"duration","seconds":N} with N a positive finite number
+//     (transcriptionUsageSeconds). sglang-omni measures the audio it decoded and
+//     rounds up to whole seconds, which closes the gaps step 1 leaves: an upload that
+//     is no WAV (an mp3, say) and a WAV whose header cannot be believed (the
+//     0xFFFFFFFF data size a streaming writer leaves).
+//
+// audio.cpp's own statement always wins, a present but unusable one included, so its
+// behaviour and logging are unchanged. Anything else stays the logged zero above: the
+// duration is never guessed (ADR-041).
+func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []byte, contentType, status string) {
 	if !isTranscriptionEndpoint(ex.endpoint) || status != "success" {
 		return
 	}
 	seconds, ok := transcriptionDurationSeconds(body)
 	if !ok {
+		// Only an ABSENT statement is a target that is not audio.cpp; a present but
+		// unusable one (0, negative, null, not a number) stays the loud zero below.
+		if transcriptionDurationAbsent(body) {
+			if ms, measured := uploadWavDurationMillis(ex.raw, contentType); measured {
+				meta.BillingQuantity = float64(ms) / 1000
+				return
+			}
+			if stated, ok := transcriptionUsageSeconds(body); ok {
+				meta.BillingQuantity = stated
+				return
+			}
+		}
 		slog.Error("transcription relay succeeded but the upstream reported no usable audio duration", "id", ex.id, "path", meta.ReqPath, "model", ex.req.Model, "server", ex.serverName, "field", "timing.audio_duration_ms", "body_bytes", len(body))
 		return
 	}
@@ -1354,7 +1421,7 @@ func (s *Server) relayTranscriptionResponse(w http.ResponseWriter, r *http.Reque
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, ex.req, ex.serverName, false, writeErr, ex.start)
 	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: usage.BillingUnitAudioSecond, Endpoint: ex.endpoint}
-	setTranscriptionBillingQuantity(&meta, ex, body, status)
+	setTranscriptionBillingQuantity(&meta, ex, body, r.Header.Get(contentTypeHeader), status)
 	capIn := buildCaptureInput(ex.capturing, ex.token.UserID, ex.token.Secret, r, ex.raw, w.Header(), body, resp.StatusCode, ex.req.APIFlavor)
 	if capIn != nil {
 		capIn.RespBytes = int64(written)
