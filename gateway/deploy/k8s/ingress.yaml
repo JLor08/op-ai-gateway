@@ -25,6 +25,10 @@ metadata:
     # SSE streaming: disable proxy buffering so tokens flush immediately.
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # The realtime WebSocket (GET /v1/realtime, also under /openai/) is long-lived and idle for
+    # stretches: ingress-nginx upgrades it as it does the other WebSockets, and both idle limits
+    # must stay at 3600 s so the gateway's own 15-minute bound is the fuse.
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     # Not set on purpose: nginx.ingress.kubernetes.io/proxy-request-buffering. The BEARER
     # live-transcription endpoint (POST /v1/audio/transcriptions/live, also under
     # /openai/) is a chunked full-duplex request, and ingress-nginx buffers request bodies

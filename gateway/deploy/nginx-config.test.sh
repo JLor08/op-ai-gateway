@@ -18,11 +18,12 @@
 #  could keep an armed plaintext gate extinguished against the attacker) -- and
 #  X-OP-Edge-Scheme. The sixth is SET from $scheme and never blanked -- it is the
 #  gateway's only unforgeable statement about the last hop, and a "" would make it
-#  useless. Fifteen blocks: server-80, server-443 and the three WebSocket locations (the
-#  agent stream, the live-transcription stream and the voice-chat stream), in each of the
-#  three deployable configurations (the two compose variants share locations.conf, so the
-#  fifteen live in twelve physical text blocks: six server blocks, plus the three WebSocket
-#  locations in each of locations.conf and the ConfigMap).
+#  useless. Twenty-one blocks: server-80, server-443 and the five WebSocket locations (the
+#  agent stream, the live-transcription stream, the voice-chat stream and the two realtime
+#  locations, /v1/realtime and its /openai/ alias), in each of the three deployable
+#  configurations (the two compose variants share locations.conf, so the twenty-one live in
+#  sixteen physical text blocks: six server blocks, plus the five WebSocket locations in
+#  each of locations.conf and the ConfigMap).
 #  It also pins the structural invariants: `listen 80` and the ACME challenge location
 #  survive, `listen 443 ssl` exists, and the shared include is NOT a *.conf under
 #  conf.d/ (nginx auto-includes those at HTTP level, where `location` is illegal).
@@ -178,15 +179,15 @@ for entry in $CONFIGURATIONS; do
     done < "$work/hb.txt"
   done
   note "$name: $blocks header-setting block(s), all six directives present"
-  [ "$blocks" -eq 5 ] \
-    || bad "$name: expected 5 header-setting blocks (server-80, server-443, the agent, live-transcription and voice-chat WebSocket locations), found $blocks"
+  [ "$blocks" -eq 7 ] \
+    || bad "$name: expected 7 header-setting blocks (server-80, server-443, the agent, live-transcription, voice-chat and the two realtime WebSocket locations), found $blocks"
   total_blocks=$((total_blocks + blocks))
   IFS='
 '
 done
 IFS=$old_ifs
-note "total across the three configurations: $total_blocks (expected 15)"
-[ "$total_blocks" -eq 15 ] || bad "expected 15 header-setting blocks in total, found $total_blocks"
+note "total across the three configurations: $total_blocks (expected 21)"
+[ "$total_blocks" -eq 21 ] || bad "expected 21 header-setting blocks in total, found $total_blocks"
 
 # A blanked X-OP-Edge-Scheme anywhere is fatal, however it is written.
 for f in nginx/default.conf nginx/default.no-netbird.conf nginx/locations.conf "$CONFIGMAP"; do
@@ -255,6 +256,41 @@ for f in nginx/locations.conf "$work/k8s-locations.conf"; do
        inb && /^[ \t]*}/ { inb = 0 }
        END { exit (up && conn) ? 0 : 1 }' "$f" \
     || bad "$f: the voice-chat WebSocket location does not send 'Upgrade \$http_upgrade' and 'Connection \"upgrade\"' -- the upgrade would never reach the gateway"
+  # The realtime relay (GET /v1/realtime and the /openai/ alias) is a WebSocket upgrade
+  # like the voice-chat one, but long-lived and silent for stretches: each location must
+  # upgrade the connection, keep HTTP/1.1 to the upstream, and set both idle limits to
+  # 3600 s (the gateway's own 15-minute bound is the intended fuse). Its X-OP-* blankings
+  # are covered by the header-block count above; they are re-asserted here per location so
+  # a dropped Internal-Auth/Internal-User line names the location that lost it.
+  for rt in '/v1/realtime' '/openai/v1/realtime'; do
+    grep -q "^[[:space:]]*location = $rt {" "$f" \
+      || bad "$f: the exact-match WebSocket location '$rt' is gone -- the /v1/realtime relay depends on it"
+    awk -v loc="$rt" '
+         BEGIN { want = "location = " loc " {" }
+         { line = $0; sub(/#.*/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line) }
+         line == want { inb = 1; next }
+         inb && line ~ /^proxy_http_version[ \t]+1\.1;$/ { v11 = 1 }
+         inb && line ~ /^proxy_set_header[ \t]+Upgrade[ \t]+\$http_upgrade;$/ { up = 1 }
+         inb && line ~ /^proxy_set_header[ \t]+Connection[ \t]+"upgrade";$/ { conn = 1 }
+         inb && line ~ /^proxy_set_header[ \t]+X-OP-Internal-Auth[ \t]+"";$/ { ia = 1 }
+         inb && line ~ /^proxy_set_header[ \t]+X-OP-Internal-User[ \t]+"";$/ { iu = 1 }
+         inb && line ~ /^proxy_read_timeout[ \t]+3600s;$/ { rd = 1 }
+         inb && line ~ /^proxy_send_timeout[ \t]+3600s;$/ { sd = 1 }
+         inb && line == "}" { inb = 0 }
+         END {
+           if (!v11) print "proxy_http_version 1.1 missing"
+           if (!up) print "Upgrade $http_upgrade missing"
+           if (!conn) print "Connection \"upgrade\" missing"
+           if (!ia) print "X-OP-Internal-Auth not blanked"
+           if (!iu) print "X-OP-Internal-User not blanked"
+           if (!rd) print "proxy_read_timeout 3600s missing"
+           if (!sd) print "proxy_send_timeout 3600s missing"
+         }' "$f" > "$work/rt.txt"
+    if [ -s "$work/rt.txt" ]; then
+      bad "$f: realtime location '$rt' is incomplete:"
+      sed 's/^/      /' "$work/rt.txt"
+    fi
+  done
   # The bearer live endpoint is a chunked FULL-DUPLEX POST: without an unbuffered request
   # body nginx holds the PCM until the speaker stops and no transcript ever comes back.
   awk '/^[ \t]*location[ \t]+~[ \t]+\^\/\(\?:openai\/\)\?v1\/audio\/transcriptions\/live\$/ { inb = 1 }
