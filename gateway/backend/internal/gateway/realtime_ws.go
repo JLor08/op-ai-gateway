@@ -577,11 +577,12 @@ type realtimeMeter struct {
 //     regard to case (an "AUDIO":"" after the real "audio" would win there);
 //   - there is no byte-level pre-filter: a type spelled with JSON escapes is the same
 //     type once decoded;
-//   - the audio is counted leniently, as Python's default base64 decode reads it:
-//     every character of the standard alphabet counts 3/4 of a byte, and anything
-//     else (padding, a stray character) is skipped, so a malformed character or a
-//     missing pad cannot zero the whole frame. No base64 decoder runs: the count is
-//     one pass over the audio string.
+//   - Python's json also takes the bare literals NaN, Infinity and -Infinity, which
+//     encoding/json refuses with the whole frame, so a frame with one is decoded once
+//     more with each of them read as 0 (realtimeClientFields);
+//   - the audio is counted leniently (base64AlphabetBytes): at least what the
+//     upstream decodes, so no malformed character can zero the frame. No base64
+//     decoder runs: the count is one pass over the audio string.
 //
 // A binary frame, a frame that is not a JSON object, another type, or an audio that is
 // not a string counts nothing. Billing never alters or refuses a frame.
@@ -589,8 +590,8 @@ func (m *realtimeMeter) observeClient(typ websocket.MessageType, data []byte) {
 	if typ != websocket.MessageText {
 		return
 	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(data, &fields) != nil {
+	fields, ok := realtimeClientFields(data)
+	if !ok {
 		return
 	}
 	var eventType, audio string
@@ -603,9 +604,108 @@ func (m *realtimeMeter) observeClient(typ websocket.MessageType, data []byte) {
 	m.appendBytes += base64AlphabetBytes(audio)
 }
 
-// base64AlphabetBytes is the byte count a lenient base64 decode yields for s: the
-// number of standard-alphabet characters ([A-Za-z0-9+/]) times 3/4, rounded down.
-// For well-formed base64 it is exactly the decoded length, padded or not.
+// realtimeClientFields decodes a client frame into its top-level fields as raw values,
+// the way the upstream's Python json reads it. A frame encoding/json refuses with a
+// syntax error is tried once more as realtimeFiniteJSON rewrites it -- the bare
+// NaN, Infinity and -Infinity Python accepts read as 0 -- and only a copy that then
+// parses counts. The frame itself is relayed as it came: the rewrite is a copy.
+func realtimeClientFields(data []byte) (map[string]json.RawMessage, bool) {
+	var fields map[string]json.RawMessage
+	err := json.Unmarshal(data, &fields)
+	if err == nil {
+		return fields, true
+	}
+	var syntax *json.SyntaxError
+	if !errors.As(err, &syntax) {
+		return nil, false
+	}
+	finite, rewritten := realtimeFiniteJSON(data)
+	if !rewritten || json.Unmarshal(finite, &fields) != nil {
+		return nil, false
+	}
+	return fields, true
+}
+
+// realtimeNonFinite are the literals Python's json reads as numbers and JSON has no
+// spelling for.
+var realtimeNonFinite = []string{"-Infinity", "Infinity", "NaN"}
+
+// realtimeFiniteJSON returns a copy of data in which every NaN, Infinity and -Infinity
+// token outside a string is 0, and whether there was one. A literal is a token only
+// in a value's place -- right after ':', '[' or ',' (or at the start), whitespace
+// aside -- and only when a delimiter or the end follows it, so "-NaN", "NaNa" or
+// "1Infinity", which Python refuses too, stay as they are and the copy does not
+// parse. A string is copied whole, its escapes included, so its content is never
+// touched.
+func realtimeFiniteJSON(data []byte) ([]byte, bool) {
+	out := make([]byte, 0, len(data))
+	rewritten := false
+	inString, escaped := false, false
+	valueStart := true // the next significant byte would start a value
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		if valueStart {
+			if n := realtimeNonFiniteAt(data, i); n > 0 {
+				out = append(out, '0')
+				i += n - 1
+				rewritten, valueStart = true, false
+				continue
+			}
+		}
+		out = append(out, c)
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			// Whitespace keeps whatever came before it.
+		case ':', '[', ',':
+			valueStart = true
+		case '"':
+			inString, valueStart = true, false
+		default:
+			valueStart = false
+		}
+	}
+	return out, rewritten
+}
+
+// realtimeNonFiniteAt is the length of the non-finite literal at data[i], 0 when there
+// is none or it runs on into more of a token.
+func realtimeNonFiniteAt(data []byte, i int) int {
+	for _, literal := range realtimeNonFinite {
+		end := i + len(literal)
+		if end > len(data) || string(data[i:end]) != literal {
+			continue
+		}
+		if end == len(data) {
+			return len(literal)
+		}
+		switch data[end] {
+		case ' ', '\t', '\n', '\r', ',', ']', '}':
+			return len(literal)
+		}
+		return 0
+	}
+	return 0
+}
+
+// base64AlphabetBytes counts s as audio bytes: the number of standard-alphabet
+// characters ([A-Za-z0-9+/]) times 3/4, rounded down, every other character skipped.
+// For well-formed base64 it is exactly the decoded length. It is never less than what
+// the upstream decodes: Python's default decode skips characters outside the alphabet
+// as this count does, and refuses some inputs this count still takes (a missing pad,
+// say), so where the two differ the count can only over-bill the client's own audio,
+// never under-bill it.
 func base64AlphabetBytes(s string) int64 {
 	var n int64
 	for i := 0; i < len(s); i++ {

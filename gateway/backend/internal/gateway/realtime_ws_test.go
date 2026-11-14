@@ -1191,6 +1191,8 @@ func TestRealtimeMeterCountsAppendsAsTheUpstreamReadsThem(t *testing.T) {
 		{"the last duplicate audio wins, empty", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + audio + `","audio":""}`, 0},
 		{"the last duplicate type wins", websocket.MessageText, `{"type":"session.update","type":"input_audio_buffer.append","audio":"` + audio + `"}`, 32000},
 		{"a stray character in the base64", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + audio[:100] + ` ` + audio[100:] + `"}`, 32000},
+		// Python's decode refuses a missing pad, where the meter counts it: a difference
+		// can only over-count the client's own audio, never under-count it.
 		{"unpadded base64", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + base64.RawStdEncoding.EncodeToString(make([]byte, 31999)) + `"}`, 31999},
 		{"escaped slashes", websocket.MessageText, `{"type":"input_audio_buffer.append","audio":"` + escapedSlashes + `"}`, 30},
 		{"another type", websocket.MessageText, `{"type":"Input_Audio_Buffer.Append","audio":"` + audio + `"}`, 0},
@@ -1313,4 +1315,68 @@ func TestRealtimeWaitSessionsOnShutdown(t *testing.T) {
 			t.Fatal("begin admitted a session after the wait")
 		}
 	})
+}
+
+// Python's json accepts the bare literals NaN, Infinity and -Infinity, and the upstream
+// reads a frame with it, so a frame carrying one is still an append there. Go's
+// encoding/json refuses the whole frame, so the meter retries once on a copy where
+// each such literal outside a string is 0 -- never one inside a string, whose content
+// is counted as sent -- and counts only if that copy parses.
+func TestRealtimeMeterCountsAppendsWithNonFiniteLiterals(t *testing.T) {
+	audio := base64.StdEncoding.EncodeToString(make([]byte, 32000))
+	appendWith := func(extra string) string {
+		return `{"type":"input_audio_buffer.append","audio":"` + audio + `",` + extra + `}`
+	}
+	for _, tc := range []struct {
+		name  string
+		frame string
+		want  int64
+	}{
+		{"NaN at the top level", appendWith(`"x":NaN`), 32000},
+		{"Infinity at the top level", appendWith(`"x":Infinity`), 32000},
+		{"-Infinity at the top level", appendWith(`"x":-Infinity`), 32000},
+		{"each literal nested", appendWith(`"x":{"y":[1, NaN ,{"z":-Infinity}],"w":[Infinity]}`), 32000},
+		{"a literal before the audio", `{"x":NaN,"type":"input_audio_buffer.append","audio":"` + audio + `"}`, 32000},
+		// The audio's own text "NaN" is three alphabet characters more (42670 x 3/4):
+		// rewritten to 0 it would be two fewer.
+		{"NaN inside the audio string is left alone", `{"type":"input_audio_buffer.append","audio":"` + audio + `NaN","x":NaN}`, 32002},
+		{"an escaped quote keeps the string open", `{"note":"say \"NaN\" here","type":"input_audio_buffer.append","audio":"` + audio + `NaN","x":Infinity}`, 32002},
+		// ",NaN," inside the audio sits where a value would outside a string: the
+		// string state alone keeps it from becoming ",0,".
+		{"a value-shaped NaN inside the audio string is left alone", `{"type":"input_audio_buffer.append","audio":"` + audio + `,NaN,","x":NaN}`, 32002},
+		{"an escaped quote inside the audio keeps it open", `{"type":"input_audio_buffer.append","audio":"` + audio + `\",NaN,","x":NaN}`, 32002},
+		{"an escaped backslash closes the string", `{"note":"dir\\","x":NaN,"type":"input_audio_buffer.append","audio":"` + audio + `"}`, 32000},
+		{"still invalid after the retry", appendWith(`"x":NaN,`), 0},
+		{"-NaN is no literal", appendWith(`"x":-NaN`), 0},
+		{"a literal glued to more text", appendWith(`"x":NaNa`), 0},
+		{"a literal glued to a number", appendWith(`"x":1Infinity`), 0},
+		// Read as 0 these would be the valid numbers 0.5 and 0e5; Python refuses both.
+		{"a literal glued to a fraction", appendWith(`"x":NaN.5`), 0},
+		{"a literal glued to an exponent", appendWith(`"x":-Infinitye5`), 0},
+		{"the audio itself NaN", `{"type":"input_audio_buffer.append","audio":NaN}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var m realtimeMeter
+			m.observeClient(websocket.MessageText, []byte(tc.frame))
+			if m.appendBytes != tc.want {
+				t.Fatalf("appendBytes = %d, want %d", m.appendBytes, tc.want)
+			}
+		})
+	}
+}
+
+// An append carrying a NaN crosses byte for byte -- the rewrite is only the meter's
+// copy -- and bills its audio.
+func TestRealtimeRelaysANonFiniteAppendUnchangedAndBillsIt(t *testing.T) {
+	rig := newRTRig(t)
+	conn := rig.dial(t, "model="+rtModel)
+	frame := `{"type":"input_audio_buffer.append","audio":"` + base64.StdEncoding.EncodeToString(make([]byte, 32000)) + `","x":NaN}`
+	rtWrite(t, conn, websocket.MessageText, []byte(frame))
+	if _, data := rtRead(t, conn); string(data) != frame {
+		t.Fatal("the frame was not relayed byte for byte")
+	}
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+	if ev := rig.oneRow(t); ev.BillingUnit != usage.BillingUnitAudioSecond || ev.BillingQuantity != 1 {
+		t.Fatalf("billing = %v %q, want 1 audio_second", ev.BillingQuantity, ev.BillingUnit)
+	}
 }
