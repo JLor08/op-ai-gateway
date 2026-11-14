@@ -1164,10 +1164,11 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 }
 
 // transcriptionUsageSeconds reads sglang-omni's usage statement out of a transcription
-// body (v0.2.0 sglang_omni/serve/protocol.py, TranscriptionUsage: a usage object of type
-// "duration" whose seconds is the decoded audio's length, rounded up), and reports
-// whether it is one: the type exactly "duration" and the seconds a positive finite
-// number. Any other shape -- no usage, another type, a zero, a string -- states nothing.
+// body (v0.2.0: sglang_omni/serve/protocol.py TranscriptionUsage, a usage object of type
+// "duration"; speech_to_text.py and transcriptions.py set its seconds to
+// math.ceil of the decoded audio's length), and reports whether it is one: the type
+// exactly "duration" and the seconds a positive finite number. Any other shape -- no
+// usage, another type, a zero, a string -- states nothing.
 func transcriptionUsageSeconds(body []byte) (float64, bool) {
 	var doc struct {
 		Usage *struct {
