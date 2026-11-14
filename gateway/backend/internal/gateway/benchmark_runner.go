@@ -1131,12 +1131,15 @@ func benchmarkContextInBounds(size int) bool {
 // server_agent application without a stored path, on an agent that declares
 // runtime_upstream_props, that is the router's /upstream/{model}/props: it
 // forwards to the running child's /props with the credential intact, so a
-// key-protected llama.cpp child answers too. It returns 0 when there is no
-// path, the probe fails, or the answer is out of bounds. A 401 or 403 is the
+// key-protected llama.cpp child answers too. The path is resolved per mapping
+// (routing.EffectiveMappingContextProbePath): a spec type that serves no
+// /props gets no router default, and its size comes from the telemetry
+// fallback instead. It returns 0 when there is no path, the probe fails, or
+// the answer is out of bounds. A 401 or 403 is the
 // one failure it logs: the gateway holds that credential, so the spec's token
 // is wrong.
 func (s *Server) benchmarkProbeContextSize(ctx context.Context, tgt benchmarkTarget, attr benchmarkContextAttribution) int {
-	path := routing.EffectiveContextProbePath(tgt.app, s.AgentFeatures.Has(tgt.server.ID, RuntimeUpstreamPropsFeature))
+	path := routing.EffectiveMappingContextProbePath(tgt.app, tgt.spec, s.AgentFeatures.Has(tgt.server.ID, RuntimeUpstreamPropsFeature))
 	prober, ok := s.Provider.(provider.ModelInfoProber)
 	if !ok || path == "" {
 		return 0

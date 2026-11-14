@@ -2232,6 +2232,97 @@ func TestRunAppHealthOnceServerAgentOperatorPathWins(t *testing.T) {
 	}
 }
 
+// TestRunAppHealthOnceServerAgentContextProbeSkipsTypesWithoutProps proves the
+// {model} pass asks the router's /props passthrough only for a mapping whose
+// effective spec type may serve /props: llama_cpp (explicit or detected) and
+// custom (explicit, detected, or a mapping without a spec) are probed, while
+// every type known to serve none is never asked -- such a child answered 404
+// on every cadence tick, twice with the retry. An operator-set path still
+// reaches every mapping, whatever its type.
+func TestRunAppHealthOnceServerAgentContextProbeSkipsTypesWithoutProps(t *testing.T) {
+	probed := map[string]routing.RuntimeSpec{
+		"llama":         {Type: "llama_cpp"},
+		"llama-binary":  {Binary: "/opt/llama.cpp/llama-server"},
+		"custom":        {Type: "custom"},
+		"custom-binary": {Binary: "/usr/local/bin/my-server"},
+	}
+	skipped := map[string]routing.RuntimeSpec{
+		"omni":        {Type: "sglang_omni"},
+		"omni-args":   {Binary: "/opt/sglang/bin/sglang", Args: `["serve","--model-type","omni"]`},
+		"sglang":      {Type: "sglang"},
+		"router":      {Type: "vllm_sr"},
+		"vllm":        {Type: "vllm"},
+		"tgi":         {Type: "tgi"},
+		"ollama":      {Type: "ollama"},
+		"sd":          {Binary: "/opt/sd/sd-server"},
+		"audio":       {Type: "audio_cpp"},
+		"audio-bin":   {Binary: "/opt/audio/audiocpp_server"},
+		"stable-diff": {Type: "stable_diffusion_cpp"},
+	}
+	setup := func(contextProbePath string) *fakeProber {
+		app := serverAgentApp("a1", "s1", 8001)
+		app.ContextProbePath = contextProbePath
+		st := newHealthTestStore(app)
+		var mappings []routing.ModelMapping
+		var specs []routing.RuntimeSpec
+		var names []string
+		add := func(name string, spec routing.RuntimeSpec, withSpec bool) {
+			id := "m-" + name
+			mappings = append(mappings, routing.ModelMapping{ID: id, ApplicationID: "a1", GatewayModelName: "g-" + name, AppModelName: name, Status: routing.ServerStatusActive})
+			if withSpec {
+				spec.MappingID = id
+				specs = append(specs, spec)
+			}
+			names = append(names, name)
+		}
+		for name, spec := range probed {
+			add(name, spec, true)
+		}
+		for name, spec := range skipped {
+			add(name, spec, true)
+		}
+		add("no-spec", routing.RuntimeSpec{}, false)
+		st.mappings = map[string][]routing.ModelMapping{"a1": mappings}
+		st.runtimeSpecs = specs
+		prober := newFakeProber()
+		loaded := gateway.NewLoadedModelRegistry()
+		loaded.SetGatewayProbe("a1", names)
+		bundle := fakeAgentBundle{features: map[string][]string{"s1": {gateway.RuntimeUpstreamPropsFeature}}}
+		(&appHealthRunner{store: st, prober: prober, registry: gateway.NewAppHealthRegistry(nil), loaded: loaded, agents: bundle, settings: st, probeTimeout: time.Second, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+		return prober
+	}
+
+	t.Run("router default", func(t *testing.T) {
+		shrinkRetryGap(t)
+		prober := setup("")
+		for name := range probed {
+			if !prober.probedPath("/upstream/" + name + "/props") {
+				t.Errorf("mapping %q (a type that may serve /props) was not probed", name)
+			}
+		}
+		if !prober.probedPath("/upstream/no-spec/props") {
+			t.Errorf("a mapping without a spec (zero spec, detected custom) was not probed")
+		}
+		for name := range skipped {
+			if prober.probedPath("/upstream/" + name + "/props") {
+				t.Errorf("mapping %q (a type that serves no /props) was probed", name)
+			}
+		}
+	})
+
+	t.Run("operator-set path wins", func(t *testing.T) {
+		shrinkRetryGap(t)
+		prober := setup("/custom/{model}/info")
+		for _, set := range []map[string]routing.RuntimeSpec{probed, skipped} {
+			for name := range set {
+				if !prober.probedPath("/custom/" + name + "/info") {
+					t.Errorf("mapping %q was not probed on the operator-set path", name)
+				}
+			}
+		}
+	})
+}
+
 // TestRunAppHealthOnceServerAgentProbeCarriesSpecToken is the wire-level
 // credential test (issue #58): the per-mapping context carried into the
 // {model} branch's ProbeModelInfo calls is unexported, so this proves it on
