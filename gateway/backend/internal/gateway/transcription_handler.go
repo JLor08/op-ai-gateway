@@ -1163,6 +1163,28 @@ func transcriptionDurationSeconds(body []byte) (float64, bool) {
 	return ms / 1000, true
 }
 
+// transcriptionUsageSeconds reads sglang-omni's usage statement out of a transcription
+// body (v0.2.0 sglang_omni/serve/protocol.py, TranscriptionUsage: a usage object of type
+// "duration" whose seconds is the decoded audio's length, rounded up), and reports
+// whether it is one: the type exactly "duration" and the seconds a positive finite
+// number. Any other shape -- no usage, another type, a zero, a string -- states nothing.
+func transcriptionUsageSeconds(body []byte) (float64, bool) {
+	var doc struct {
+		Usage *struct {
+			Type    string   `json:"type"`
+			Seconds *float64 `json:"seconds"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil || doc.Usage == nil || doc.Usage.Type != "duration" || doc.Usage.Seconds == nil {
+		return 0, false
+	}
+	seconds := *doc.Usage.Seconds
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+		return 0, false
+	}
+	return seconds, true
+}
+
 // transcriptionDurationAbsent reports whether body states no audio duration at all: no
 // timing object, or one without an audio_duration_ms key (any value there, a null or a
 // zero included, is a statement). A body that is no JSON object states nothing either.
@@ -1200,11 +1222,20 @@ func transcriptionDurationAbsent(body []byte) bool {
 // content and has no business in a log line.
 //
 // When the body states no duration (a target that is not audio.cpp, sglang-omni for one,
-// sends no timing block) the quantity falls back to the duration of the WAV that was
-// UPLOADED (uploadWavDurationMillis, over ex.raw and the client's contentType): the
-// same measurement a streamed transcription is billed by. audio.cpp's own statement
-// always wins, so its behaviour and logging are unchanged. An upload that is no WAV
-// whose header can be believed (an mp3, say) stays the logged zero above: the
+// sends no timing block) the quantity falls back, in this order, to:
+//
+//  1. the duration of the WAV that was UPLOADED (uploadWavDurationMillis, over ex.raw
+//     and the client's contentType): the same measurement a streamed transcription is
+//     billed by, exact to the millisecond;
+//  2. the upstream's own usage statement, when it is sglang-omni's
+//     {"type":"duration","seconds":N} with N a positive finite number
+//     (transcriptionUsageSeconds). sglang-omni measures the audio it decoded and
+//     rounds up to whole seconds, which closes the gaps step 1 leaves: an upload that
+//     is no WAV (an mp3, say) and a WAV whose header cannot be believed (the
+//     0xFFFFFFFF data size a streaming writer leaves).
+//
+// audio.cpp's own statement always wins, a present but unusable one included, so its
+// behaviour and logging are unchanged. Anything else stays the logged zero above: the
 // duration is never guessed (ADR-041).
 func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []byte, contentType, status string) {
 	if !isTranscriptionEndpoint(ex.endpoint) || status != "success" {
@@ -1217,6 +1248,10 @@ func setTranscriptionBillingQuantity(meta *usageMeta, ex nativeExchange, body []
 		if transcriptionDurationAbsent(body) {
 			if ms, measured := uploadWavDurationMillis(ex.raw, contentType); measured {
 				meta.BillingQuantity = float64(ms) / 1000
+				return
+			}
+			if stated, ok := transcriptionUsageSeconds(body); ok {
+				meta.BillingQuantity = stated
 				return
 			}
 		}

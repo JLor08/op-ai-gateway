@@ -1675,3 +1675,56 @@ func TestMappingStreamsSpeechAndTranscriptionAreIndependent(t *testing.T) {
 		t.Fatal("a speech_streaming yes made the mapping stream transcriptions")
 	}
 }
+
+// sglang-omni (v0.2.0) answers a streamed speech request in its own raw shape: its
+// stream_format defaults to "audio", and the headerless PCM comes as audio/pcm
+// (sglang_omni/serve/openai_api.py, StreamingResponse media_type="audio/pcm"). That is
+// the raw shape application/octet-stream is, billed the same way: the cached byte rate
+// makes it seconds, and without one it is the bytes, on a body closed cleanly.
+func TestSpeechStreamAudioPCMIsTheRawShape(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		rate        string
+		unit        string
+		quantity    float64
+	}{
+		{"no cached rate", "audio/pcm", "", usage.BillingUnitAudioBytes, 176400},
+		{"a cached rate", "audio/pcm", "88200", usage.BillingUnitAudioSecond, 2},
+		{"a parameter and upper case", "Audio/PCM; rate=44100", "", usage.BillingUnitAudioBytes, 176400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			chunks := [][]byte{speechPCM(100000, 1), speechPCM(76400, 2)}
+			up, _ := newScriptedSpeechUpstream(t, func(_ int, w http.ResponseWriter, _ speechUpstreamCall) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.Header().Set("X-Sample-Rate", "44100")
+				w.WriteHeader(http.StatusOK)
+				for _, chunk := range chunks {
+					_, _ = w.Write(chunk)
+					w.(http.Flusher).Flush()
+				}
+			})
+			srv := newSpeechStreamingTestServer(t, up.URL)
+			if tc.rate != "" {
+				seedSpeechOutputByteRate(t, srv, "route-tts", tc.rate)
+			}
+
+			rec := postSpeech(t, srv, `{"model":"tts-voice","input":"Hello there.","stream":true}`)
+
+			want := bytes.Join(chunks, nil)
+			if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), want) {
+				t.Fatalf("response = %d (%d bytes), want the upstream's %d raw bytes verbatim", rec.Code, rec.Body.Len(), len(want))
+			}
+			ev := onlyUsageEvent(t, srv)
+			if ev.Status != "success" || !ev.Stream {
+				t.Fatalf("usage row = %q stream=%v, want a streamed success", ev.Status, ev.Stream)
+			}
+			requireStreamedSpeechRow(t, ev, tc.unit, tc.quantity)
+			if errs := errorLogs(buf); len(errs) != 0 {
+				t.Fatalf("a clean audio/pcm stream logged at Error: %+v", errs)
+			}
+		})
+	}
+}

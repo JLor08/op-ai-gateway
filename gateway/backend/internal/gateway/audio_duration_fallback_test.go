@@ -257,3 +257,75 @@ func TestTranscriptionBillsFromTheUploadedWAVWithoutTiming(t *testing.T) {
 		})
 	}
 }
+
+// When neither audio.cpp's timing nor the uploaded WAV gives a duration, a
+// transcription is billed from sglang-omni's own usage statement (v0.2.0
+// sglang_omni/serve/protocol.py TranscriptionUsage: {"type":"duration","seconds":N}),
+// read only when its type is "duration" and its seconds a positive finite number.
+// audio.cpp's timing, present, still wins -- a present but unusable one is audio.cpp's
+// loud zero -- and a WAV that measures beats the statement.
+func TestTranscriptionBillsFromTheSGLangOmniUsageStatement(t *testing.T) {
+	// 8 kHz mono 16-bit: 16000 B/s, so 40000 bytes are 2.5 s.
+	var wav bytes.Buffer
+	wav.WriteString("RIFF")
+	wavPut(t, &wav, uint32(36+40000))
+	wav.WriteString("WAVE")
+	wav.Write(wavFmtChunk(t, 8000, 1, 16))
+	wav.Write(wavChunk(t, "data", 40000, make([]byte, 40000)))
+	parts := func(filename, ctype string, audio []byte) []editPart {
+		return []editPart{
+			{name: "model", body: []byte(transcriptionGatewayModel)},
+			{name: "file", filename: filename, contentType: ctype, body: audio},
+		}
+	}
+	mp3 := parts("clip.mp3", "audio/mpeg", append([]byte("ID3\x04\x00"), bytes.Repeat([]byte{0xFF, 0xFB}, 100)...))
+	streamedWAV := parts("clip.wav", "audio/wav", fallbackWAV(t, 0xFFFFFFFF, 0xFFFFFFFF, 48000))
+	measuredWAV := parts("clip.wav", "audio/wav", wav.Bytes())
+
+	cases := []struct {
+		name      string
+		response  string
+		parts     []editPart
+		want      float64
+		wantError bool
+	}{
+		{"mp3 upload, usage seconds 3", `{"text":"hi","usage":{"type":"duration","seconds":3}}`, mp3, 3, false},
+		{"verbose_json, usage seconds 3", `{"task":"transcribe","duration":2.9,"text":"hi","segments":[],"usage":{"type":"duration","seconds":3}}`, mp3, 3, false},
+		{"WAV with a 0xFFFFFFFF data size, usage seconds 2", `{"text":"hi","usage":{"type":"duration","seconds":2}}`, streamedWAV, 2, false},
+		{"usage type tokens", `{"text":"hi","usage":{"type":"tokens","seconds":3}}`, mp3, 0, true},
+		{"usage seconds 0", `{"text":"hi","usage":{"type":"duration","seconds":0}}`, mp3, 0, true},
+		{"usage seconds negative", `{"text":"hi","usage":{"type":"duration","seconds":-3}}`, mp3, 0, true},
+		{"usage seconds a string", `{"text":"hi","usage":{"type":"duration","seconds":"3"}}`, mp3, 0, true},
+		{"usage without a type", `{"text":"hi","usage":{"seconds":3}}`, mp3, 0, true},
+		{"usage null", `{"text":"hi","usage":null}`, mp3, 0, true},
+		{"timing present beats usage", `{"text":"hi","timing":{"audio_duration_ms":1000},"usage":{"type":"duration","seconds":5}}`, mp3, 1, false},
+		{"timing present 0 beats usage (loud zero)", `{"text":"hi","timing":{"audio_duration_ms":0},"usage":{"type":"duration","seconds":5}}`, mp3, 0, true},
+		{"a measured WAV beats usage", `{"text":"hi","usage":{"type":"duration","seconds":3}}`, measuredWAV, 2.5, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf, restore := withCapturedSlog(t)
+			t.Cleanup(restore)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			t.Cleanup(up.Close)
+			srv, _ := newTranscriptionCapableTestServer(t, up.URL)
+
+			rec := postTranscriptionParts(t, srv, tc.parts)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %q", rec.Code, rec.Body.Bytes())
+			}
+			if got := lastUsageEvent(t, srv); math.Abs(got.BillingQuantity-tc.want) > 1e-9 {
+				t.Errorf("BillingQuantity = %v, want %v", got.BillingQuantity, tc.want)
+			}
+			errs := errorLogs(buf)
+			if tc.wantError != (len(errs) == 1 && strings.Contains(errs[0].Msg, "no usable audio duration")) || (!tc.wantError && len(errs) != 0) {
+				t.Errorf("Error logs = %+v, wantError = %v", errs, tc.wantError)
+			}
+		})
+	}
+}
