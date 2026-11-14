@@ -545,7 +545,9 @@ func speechReferenceError(field string) *inference.Error {
 // is sent without the stream-only fields (speechBufferedBody), so the upstream is never
 // asked for what it would refuse and the client's answer, a one-shot WAV, costs one
 // upstream call. The preflight request is not marked a stream, so the gate and the
-// resolve judged the same request a one-shot call would be.
+// resolve judged the same request a one-shot call would be. A stream relayed to an
+// sglang-omni target states response_format pcm on its upstream body when the client
+// stated none, because that upstream refuses a stream in its own default, wav (ADR-103).
 //
 // proxyNative then finishes the exchange: a 2xx event stream (or raw PCM) of a streamed
 // request is relayed unbuffered by the native copier, read on its way by
@@ -576,6 +578,26 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 				body, err := speechBufferedBody(raw)
 				return body, jsonContentType, err
 			}
+			// sglang-omni refuses a stream whose response_format is not pcm, and its own
+			// default is wav (ADR-103), so a stream that states none -- the portal's, and any
+			// client relying on the documented default -- would be refused. The upstream is
+			// told pcm, the one format a stream carries (validateSpeechRequest admits nothing
+			// else on one), and every other field is relayed as the client wrote it. A client
+			// that already said pcm is relayed untouched; the buffered retry above is built
+			// from the client's body and still leaves the field out.
+			if target.EffectiveKind() == string(routing.RuntimeSpecTypeSGLangOmni) && sniffSpeechResponseFormat(raw) != speechFormatPCM {
+				body, err := speechBodyWithResponseFormat(raw, speechFormatPCM)
+				if err != nil {
+					// Not expected for a body validateSpeechRequest accepted (it found a string
+					// input, so the body is a JSON object); answered as a failed relay, as the
+					// two body builders below are.
+					slog.Error("speech: building the sglang-omni stream body failed",
+						"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID), "err", err)
+					s.recordSpeechRoutingFailure(w, r, token, req, raw, start, fmt.Errorf("build sglang-omni speech stream body: %w", err))
+					return
+				}
+				rel.upstreamBody = body
+			}
 		} else {
 			slog.Debug("speech asked to stream but the route is not known to: answering buffered",
 				"path", r.URL.Path, "model", req.Model, "server", s.serverName(target.ServerID),
@@ -601,7 +623,7 @@ func (s *Server) relaySpeech(w http.ResponseWriter, r *http.Request, token auth.
 	// to a one-shot WAV (the route is not known to stream) is NOT stripped: it kept
 	// response_format off the upstream body (speechBufferedBody) and is relayed as the WAV
 	// it asked to become.
-	if !wantsStream && sniffSpeechResponseFormat(raw) == "pcm" {
+	if !wantsStream && sniffSpeechResponseFormat(raw) == speechFormatPCM {
 		body, err := speechPCMUpstreamBody(raw)
 		if err != nil {
 			// Not expected for a body validateSpeechRequest accepted (it found a string input,
@@ -678,6 +700,23 @@ func speechBufferedBody(raw []byte) ([]byte, error) {
 // It is an error only for a body that is no JSON object, which validateSpeechRequest has
 // already ruled out (it found a string input), mirroring speechBufferedBody.
 func speechPCMUpstreamBody(raw []byte) ([]byte, error) {
+	return speechBodyWithResponseFormat(raw, speechFormatWAV)
+}
+
+// The two response_format values a speech relay ever writes onto an upstream body: wav,
+// forced on a one-shot pcm request (speechPCMUpstreamBody), and pcm, stated on a stream to
+// sglang-omni (relaySpeech).
+const (
+	speechFormatWAV = "wav"
+	speechFormatPCM = "pcm"
+)
+
+// speechBodyWithResponseFormat returns the client's JSON with response_format set to
+// format, every other field kept exactly as it was written (values travel as raw JSON, so
+// a number keeps its full precision). The model name is not touched here: proxyNative
+// rewrites it to the mapped one, as for any speech body. It is an error only for a body
+// that is no JSON object.
+func speechBodyWithResponseFormat(raw []byte, format string) ([]byte, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return nil, fmt.Errorf("speech body is not valid JSON: %w", err)
@@ -685,7 +724,8 @@ func speechPCMUpstreamBody(raw []byte) ([]byte, error) {
 	if fields == nil {
 		return nil, errors.New("speech body is not a JSON object")
 	}
-	fields["response_format"] = json.RawMessage(`"wav"`)
+	value, _ := json.Marshal(format) // a string always encodes
+	fields["response_format"] = value
 	return json.Marshal(fields)
 }
 

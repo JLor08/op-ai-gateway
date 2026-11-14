@@ -1275,15 +1275,209 @@ func TestNewSpeechStreamScanIsKeyedOnTheContentType(t *testing.T) {
 		{"not a media type", false, false},
 	} {
 		t.Run(tc.contentType, func(t *testing.T) {
-			scan := newSpeechStreamScan(http.Header{"Content-Type": {tc.contentType}})
-			if (scan != nil) != tc.wantScan {
-				t.Fatalf("scan = %v, want a scan: %v", scan, tc.wantScan)
-			}
-			if scan != nil && scan.raw != tc.wantRaw {
-				t.Fatalf("raw = %v, want %v", scan.raw, tc.wantRaw)
+			for _, kind := range []string{routing.ProviderAudioCpp, string(routing.RuntimeSpecTypeSGLangOmni)} {
+				scan := newSpeechStreamScan(http.Header{"Content-Type": {tc.contentType}}, kind)
+				if (scan != nil) != tc.wantScan {
+					t.Fatalf("%s: scan = %v, want a scan: %v", kind, scan, tc.wantScan)
+				}
+				if scan != nil && scan.raw != tc.wantRaw {
+					t.Fatalf("%s: raw = %v, want %v", kind, scan.raw, tc.wantRaw)
+				}
 			}
 		})
 	}
+}
+
+// omniKind is the effective kind of an sglang-omni target (routing.Target.EffectiveKind).
+const omniKind = string(routing.RuntimeSpecTypeSGLangOmni)
+
+// omniFormatHeader is the response header of an sglang-omni stream of the given media
+// type, stating its PCM format as sglang-omni does.
+func omniFormatHeader(contentType, sampleRate, channels, bitDepth string) http.Header {
+	return http.Header{"Content-Type": {contentType}, "X-Sample-Rate": {sampleRate}, "X-Channels": {channels}, "X-Bit-Depth": {bitDepth}}
+}
+
+// The rate an sglang-omni stream's format headers state is read for that kind only, on
+// either shape -- sample rate times channels times bytes a sample -- and only an event
+// stream from it is one the relay ends itself. No other upstream gets either: audio.cpp
+// sending the same headers is not taken at its word.
+func TestNewSpeechStreamScanReadsTheHeaderRateForSGLangOmniOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		kind        string
+		wantRate    uint32
+		wantEnd     bool
+	}{
+		{"sglang-omni event stream", "text/event-stream", omniKind, 48000, true},
+		{"sglang-omni raw pcm", "audio/pcm", omniKind, 48000, false},
+		{"sglang-omni octet stream", "application/octet-stream", omniKind, 48000, false},
+		{"audio.cpp event stream", "text/event-stream", routing.ProviderAudioCpp, 0, false},
+		{"audio.cpp raw pcm", "application/octet-stream", routing.ProviderAudioCpp, 0, false},
+		{"sglang (not omni)", "text/event-stream", string(routing.RuntimeSpecTypeSGLang), 0, false},
+		{"no kind", "text/event-stream", "", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := newSpeechStreamScan(omniFormatHeader(tc.contentType, "24000", "1", "16"), tc.kind)
+			if scan == nil {
+				t.Fatal("no scan")
+			}
+			if scan.headerRate != tc.wantRate || scan.writeEnd != tc.wantEnd {
+				t.Fatalf("headerRate = %d, writeEnd = %v, want %d and %v", scan.headerRate, scan.writeEnd, tc.wantRate, tc.wantEnd)
+			}
+		})
+	}
+	if got := newSpeechStreamScan(omniFormatHeader("text/event-stream", "44100", "2", "24"), omniKind).headerRate; got != 44100*2*3 {
+		t.Fatalf("headerRate = %d, want 264600 for 44.1 kHz stereo 24-bit", got)
+	}
+}
+
+// A format header that is not a plain decimal positive integer, a bit depth that is no
+// whole number of bytes, and a product that is no usable rate (routing.ParseOutputByteRate's
+// rule: positive, within a uint32) all mean no header rate: it is never guessed.
+func TestNewSpeechStreamScanRefusesAnUnusableHeaderRate(t *testing.T) {
+	for _, tc := range []struct {
+		name                           string
+		sampleRate, channels, bitDepth string
+	}{
+		{"a zero sample rate", "0", "1", "16"},
+		{"zero channels", "24000", "0", "16"},
+		{"a zero bit depth", "24000", "1", "0"},
+		{"a negative sample rate", "-24000", "1", "16"},
+		{"a signed sample rate", "+24000", "1", "16"},
+		{"a fractional sample rate", "24000.0", "1", "16"},
+		{"a unit suffix", "24kHz", "1", "16"},
+		{"a hexadecimal sample rate", "0x5dc0", "1", "16"},
+		{"surrounding space", " 24000", "1", "16"},
+		{"a 12-bit depth", "24000", "1", "12"},
+		{"a 4-bit depth", "24000", "1", "4"},
+		{"a missing sample rate", "", "1", "16"},
+		{"missing channels", "24000", "", "16"},
+		{"a missing bit depth", "24000", "1", ""},
+		{"a sample rate past a uint32", "4294967296", "1", "16"},
+		{"a product past a uint32", "4294967295", "1", "16"},
+		{"a product past a uint64", "4294967295", "4294967295", "4294967288"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, contentType := range []string{"text/event-stream", "audio/pcm"} {
+				scan := newSpeechStreamScan(omniFormatHeader(contentType, tc.sampleRate, tc.channels, tc.bitDepth), omniKind)
+				if scan == nil || scan.headerRate != 0 {
+					t.Fatalf("%s: scan = %+v, want a scan with no header rate", contentType, scan)
+				}
+			}
+		})
+	}
+	scan := newSpeechStreamScan(http.Header{"Content-Type": {"text/event-stream"}}, omniKind)
+	if scan == nil || scan.headerRate != 0 || !scan.writeEnd {
+		t.Fatalf("no format headers: scan = %+v, want an event stream the relay ends, with no header rate", scan)
+	}
+}
+
+// omniSSEScan is the scan of an sglang-omni event stream with no format headers.
+func omniSSEScan() *speechStreamScan {
+	return newSpeechStreamScan(http.Header{"Content-Type": {"text/event-stream"}}, omniKind)
+}
+
+// The frame the relay ends an sglang-omni event stream with: only for a body the upstream
+// closed cleanly after a done event, with no [DONE] of its own and nothing lost -- and
+// always an event of its own, so after a frame left unterminated it starts with \n\n.
+func TestSpeechStreamScanEndFrame(t *testing.T) {
+	delta := omniFrameDelta(speechPCM(10, 1))
+	done := omniSSEDone
+	for _, tc := range []struct {
+		name   string
+		scan   func() *speechStreamScan
+		stream string
+		closed bool
+		want   string // "" is no frame
+	}{
+		{name: "done, closed after a whole frame", scan: omniSSEScan, stream: delta + done, closed: true, want: "\ndata: [DONE]\n\n"},
+		{name: "done, closed after one newline", scan: omniSSEScan, stream: delta + strings.TrimSuffix(done, "\n"), closed: true, want: "\ndata: [DONE]\n\n"},
+		{name: "done, closed mid-line", scan: omniSSEScan, stream: delta + strings.TrimRight(done, "\n"), closed: true, want: "\n\ndata: [DONE]\n\n"},
+		{name: "done, not closed", scan: omniSSEScan, stream: delta + done},
+		{name: "no done event", scan: omniSSEScan, stream: delta, closed: true},
+		{name: "an error event", scan: omniSSEScan, stream: delta + omniSSEError, closed: true},
+		{name: "its own [DONE]", scan: omniSSEScan, stream: delta + done + speechSSEEnd, closed: true},
+		{name: "[DONE] ahead of the done event", scan: omniSSEScan, stream: delta + speechSSEEnd + done, closed: true},
+		{name: "a lost delta", scan: omniSSEScan, stream: "data: {\"type\": \"speech.audio.delta\", \"audio\": \"***\"}\n\n" + done, closed: true},
+		{name: "an audio.cpp event stream", scan: newTestSpeechScan, stream: delta + done, closed: true},
+		{name: "a raw stream", scan: func() *speechStreamScan {
+			return newSpeechStreamScan(http.Header{"Content-Type": {"audio/pcm"}}, omniKind)
+		}, stream: delta + done, closed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, size := range []int{1, 0} {
+				scan := tc.scan()
+				for rest := []byte(tc.stream); len(rest) > 0; {
+					n := len(rest)
+					if size > 0 {
+						n = min(size, n)
+					}
+					scan.feed(rest[:n])
+					rest = rest[n:]
+				}
+				if tc.closed {
+					scan.cleanClose()
+				}
+				if got := string(scan.endFrame()); got != tc.want {
+					t.Fatalf("chunks of %d: endFrame = %q, want %q", size, got, tc.want)
+				}
+			}
+		})
+	}
+	var none *speechStreamScan
+	if none.endFrame() != nil {
+		t.Fatal("a nil scan asked for an end frame")
+	}
+}
+
+// The copier writes the end frame an sglang-omni event stream asks for through its own
+// write path, once the upstream closed the body cleanly: the client receives it, and the
+// scan, fed it like any chunk, sees the stream complete. A failed write of it is the
+// copy's error, and the scan is not fed what the client never got.
+func TestNativeCopierEndsAnSGLangOmniEventStream(t *testing.T) {
+	stream := omniFrameDelta(speechPCM(600, 1)) + strings.TrimRight(omniSSEDone, "\n")
+	t.Run("written", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		scan := omniSSEScan()
+		copier := &nativeCopier{w: rec, flusher: rec, capBytes: 4, speech: scan}
+
+		if err := copier.run(strings.NewReader(stream)); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+
+		want := stream + "\n\ndata: [DONE]\n\n"
+		if rec.Body.String() != want || copier.written != int64(len(want)) {
+			t.Fatalf("client got %q (%d written), want the stream and then the end frame", rec.Body.String(), copier.written)
+		}
+		if !scan.complete() || scan.pcmBytes() != 600 {
+			t.Fatalf("scan complete = %v, pcmBytes = %d, want a completed stream of 600 bytes", scan.complete(), scan.pcmBytes())
+		}
+	})
+	t.Run("the write fails", func(t *testing.T) {
+		rec := &sentinelRefusingWriter{ResponseRecorder: httptest.NewRecorder(), cancel: func() {}}
+		scan := omniSSEScan()
+		copier := &nativeCopier{w: rec, capBytes: 4, speech: scan}
+
+		if err := copier.run(strings.NewReader(stream)); err == nil {
+			t.Fatal("run returned nil, want the failed write of the end frame")
+		}
+		if rec.Body.String() != stream || scan.complete() {
+			t.Fatalf("client got %q, scan complete = %v, want the stream alone and no completion", rec.Body.String(), scan.complete())
+		}
+	})
+	t.Run("an audio.cpp stream is left as it ended", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		scan := newTestSpeechScan()
+		copier := &nativeCopier{w: rec, flusher: rec, capBytes: 4, speech: scan}
+
+		if err := copier.run(strings.NewReader(stream)); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		if rec.Body.String() != stream || scan.complete() {
+			t.Fatalf("client got %q, scan complete = %v, want the stream verbatim and no completion", rec.Body.String(), scan.complete())
+		}
+	})
 }
 
 // The capture of a streamed synthesis is stamped as speech's, which is what keeps the
@@ -1311,10 +1505,11 @@ func mustCaptureBody(t *testing.T, in *captureInput) string {
 }
 
 // The billing of a streamed call, decided in one place: a clean completion bills a
-// duration in audio_second when the mapping's output byte rate is cached and the bytes
-// that were relayed in audio_bytes when it is not; anything else bills zero in the
-// endpoint's own audio_second unit -- a cached rate changing none of that -- and says so
-// at Error exactly when the row would otherwise look like a success that billed nothing.
+// duration in audio_second when the mapping's output byte rate is cached, or else when the
+// stream's own format headers stated one (sglang-omni's), and the bytes that were relayed
+// in audio_bytes when neither is known; anything else bills zero in the endpoint's own
+// audio_second unit -- a known rate changing none of that -- and says so at Error exactly
+// when the row would otherwise look like a success that billed nothing.
 func TestSetStreamedSpeechBillingQuantity(t *testing.T) {
 	const mappingID = "route_mock_qwen" // seeded by seedGatewayTestRoutes
 	ex := nativeExchange{id: "req_1", serverName: "audio-1", req: inference.Request{Model: "tts-voice"}, target: routing.Target{RouteID: mappingID}}
@@ -1331,6 +1526,10 @@ func TestSetStreamedSpeechBillingQuantity(t *testing.T) {
 		scan := newTestRawSpeechScan()
 		scan.feed(speechPCM(n, 1))
 		scan.cleanClose()
+		return scan
+	}
+	withHeaderRate := func(scan *speechStreamScan, rate uint32) *speechStreamScan {
+		scan.headerRate = rate
 		return scan
 	}
 	for _, tc := range []struct {
@@ -1365,6 +1564,12 @@ func TestSetStreamedSpeechBillingQuantity(t *testing.T) {
 			scan.cleanClose()
 			return scan
 		}(), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
+		{name: "a clean completion with a header rate", scan: withHeaderRate(complete(), 48000), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantQuantity: 700.0 / 48000},
+		{name: "a clean completion with a header rate and a cached rate: the cached one", scan: withHeaderRate(complete(), 48000), status: "success", rate: "88200", wantUnit: usage.BillingUnitAudioSecond, wantQuantity: 700.0 / 88200},
+		{name: "a clean completion with a header rate and a cached rate that is no rate", scan: withHeaderRate(complete(), 48000), status: "success", rate: "0", wantUnit: usage.BillingUnitAudioSecond, wantQuantity: 700.0 / 48000},
+		{name: "a raw stream closed cleanly, header rate", scan: withHeaderRate(rawClean(900), 48000), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantQuantity: 900.0 / 48000},
+		{name: "a stream with no terminal events, header rate", scan: withHeaderRate(incomplete(), 48000), status: "success", wantUnit: usage.BillingUnitAudioSecond, wantErrorLog: true},
+		{name: "a complete stream that failed on the way, header rate", scan: withHeaderRate(complete(), 48000), status: "error", wantUnit: usage.BillingUnitAudioSecond},
 		{name: "no scan: not a streamed speech call", scan: nil, status: "success", untouched: true},
 		{name: "no scan, rate cached: still not a streamed speech call", scan: nil, status: "success", rate: "88200", untouched: true},
 	} {

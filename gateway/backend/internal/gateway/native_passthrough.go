@@ -987,11 +987,12 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// The speech scan exists only for a speech request that asked for a stream AND was
 	// answered with one (newSpeechStreamScan reads the answer's Content-Type): a stream
 	// request answered with a plain audio/wav is no stream, and is relayed and billed like
-	// any one-shot synthesis.
+	// any one-shot synthesis. The target's effective kind tells it an sglang-omni stream,
+	// whose format headers state a byte rate and whose event stream the relay ends itself.
 	speechRelay := rel.pfReq.APIFlavor == apiFlavorSpeech && !isTranscriptionEndpoint(rel.endpoint)
 	var speechScan *speechStreamScan
 	if speechRelay && rel.pfReq.Stream {
-		speechScan = newSpeechStreamScan(resp.Header)
+		speechScan = newSpeechStreamScan(resp.Header, rel.target.EffectiveKind())
 	}
 
 	// A one-shot pcm request (rel.speechPCMStrip, set only by relaySpeech, never on a stream
@@ -1369,7 +1370,8 @@ type nativeCopier struct {
 	transcript *transcriptionStreamScan
 	// speech is the scan of a streamed speech call's body (nil for every other relay).
 	// Fed like transcript, and told at a clean EOF that the upstream closed the body
-	// (the raw shape's completion).
+	// (the raw shape's completion); an sglang-omni event stream is then ended with the
+	// frame the scan asks for (endFrame).
 	speech *speechStreamScan
 	// speechWav measures a one-shot speech body for billing when the upstream sends no
 	// duration header (nil for every other relay).
@@ -1381,7 +1383,8 @@ type nativeCopier struct {
 }
 
 // run streams the upstream body to the client chunk by chunk and returns the
-// terminal copy error (nil on a clean EOF). Extracted from proxyNative —
+// terminal copy error (nil on a clean EOF, unless the [DONE] it then writes to end
+// an sglang-omni speech stream fails to reach the client). Extracted from proxyNative —
 // behavior-identical: same read/write order, same error precedence (a write
 // error terminates before the read error is inspected). The deferred
 // scanner.finish call runs exactly once no matter how run() returns, so the
@@ -1405,7 +1408,15 @@ func (c *nativeCopier) run(body io.Reader) error {
 			if readErr != io.EOF {
 				return readErr
 			}
+			// A clean close is the raw speech shape's completion, and the moment an
+			// sglang-omni event stream, which ends at its done event, gets the [DONE] it
+			// lacks (speechStreamScan.endFrame, ADR-103). The frame goes out through
+			// writeChunk, so it is flushed and fed to the scan like any upstream byte;
+			// a write that fails is the client going away, returned as the copy error.
 			c.speech.cleanClose()
+			if end := c.speech.endFrame(); end != nil {
+				return c.writeChunk(end)
+			}
 			return nil
 		}
 	}
