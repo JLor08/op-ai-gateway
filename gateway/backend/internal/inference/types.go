@@ -182,6 +182,10 @@ func (e *Error) Error() string {
 // against.
 const APIFlavorOpenAIResponses = "openai_responses"
 
+// APIFlavorAnthropicMessages is the FINE api-flavor of an inbound Anthropic
+// Messages request (/v1/messages), the counterpart of APIFlavorOpenAIResponses.
+const APIFlavorAnthropicMessages = "anthropic_messages"
+
 // PromptCacheDirective asks a provider that supports prompt caching (Anthropic
 // translate) to place cache_control breakpoints on this request. nil or
 // Enabled=false means no caching (today's behavior). Providers without caching
