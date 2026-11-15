@@ -310,3 +310,42 @@ func TestSanitizeSwitchHistoryGateToleratesWhitespace(t *testing.T) {
 		t.Fatalf("null signature must be dropped: %d %s", dropped, out)
 	}
 }
+
+// The byte gate trips but the body cannot be rewritten: the same slice comes back.
+func TestSanitizeSwitchHistoryGateHitButUnrewritableIsNoOp(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		flavor string
+		class  switchTargetClass
+	}{
+		{"string input with trigger", `{"input":"a reasoning_text b"}`, flavorResp, switchClassOpenAIVendor},
+		{"non-json with trigger", `oops "reasoning_text"`, flavorResp, switchClassOpenAIVendor},
+		{"null input, trigger elsewhere", `{"input":null,"note":"reasoning_text"}`, flavorResp, switchClassOpenAIVendor},
+		{"local string input with trigger", `{"input":"x","note":"encrypted_content"}`, flavorResp, switchClassLocal},
+		{"messages as string", `{"messages":"x","signature":""}`, flavorMsgs, switchClassAnthropicVendor},
+		{"string content, signature elsewhere", `{"messages":[{"role":"assistant","content":"hi"}],"signature":""}`, flavorMsgs, switchClassAnthropicVendor},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(tc.body)
+			out, dropped, stripped := sanitizeSwitchHistory(raw, tc.flavor, tc.class)
+			if dropped+stripped != 0 || len(out) != len(raw) || &out[0] != &raw[0] {
+				t.Fatalf("expected same slice and zero counts, got %d/%d", dropped, stripped)
+			}
+		})
+	}
+}
+
+func TestSanitizeSwitchHistoryLocalCodexBodyWithReasoningConfigNotParsed(t *testing.T) {
+	raw := []byte(`{"model":"qwen","reasoning":{"effort":"low"},"input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	before := switchHistoryParses.Load()
+	out, dropped, stripped := sanitizeSwitchHistory(raw, flavorResp, switchClassLocal)
+	if dropped+stripped != 0 || &out[0] != &raw[0] {
+		t.Fatalf("want same slice, got %d/%d", dropped, stripped)
+	}
+	if n := switchHistoryParses.Load() - before; n != 0 {
+		t.Fatalf("parses = %d, want 0", n)
+	}
+}

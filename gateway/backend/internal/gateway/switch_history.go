@@ -57,7 +57,10 @@ func sanitizeSwitchHistory(raw []byte, flavor string, class switchTargetClass) (
 			return sanitizeResponsesItems(items, class)
 		})
 	case flavor == inference.APIFlavorOpenAIResponses && class == switchClassLocal:
-		if !bytes.Contains(raw, []byte(`"encrypted_content"`)) && !bytes.Contains(raw, []byte(`"reasoning"`)) {
+		// The bare word "reasoning" is not a trigger: every Codex body carries
+		// the top-level reasoning config.
+		if !bytes.Contains(raw, []byte(`"encrypted_content"`)) &&
+			!hasKeyWithValue(raw, `"type"`, `"reasoning"`) {
 			return raw, 0, 0
 		}
 		return rewriteHistory(raw, "input", func(items []json.RawMessage) ([]json.RawMessage, int, int, bool) {
