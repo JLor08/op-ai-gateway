@@ -661,10 +661,13 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
 `ProxyNative`, the account's opened sealed key sent as `x-api-key`
 (`upstreamAuthCtx`), and the usual usage attribution to the serving account (§5).
 
-- **Only `model` is rewritten.** It is set to the account's bare upstream id, which
+- **Only `model` is rewritten, plus one removal.** It is set to the account's bare upstream id, which
   equals the requested name when the account has no prefix. `system`, `tools`,
   `thinking`, `cache_control`, `metadata` and everything else reach Anthropic as the
-  client wrote it. The relay is value-lossless rather than byte-identical when a
+  client wrote it, with one exception: assistant `thinking` blocks Anthropic cannot
+  verify (an empty `signature`, or after a 400 ``Invalid `signature` in `thinking`
+  block`` the blocks of another account or vendor) are removed from the replayed
+  history and the request is retried once, see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo)). The relay is value-lossless rather than byte-identical when a
   rewrite happens (key order may change). The response and its SSE are relayed
   unchanged and are not rewritten back (§6.5).
 - **The headers are the gateway's, bar one.** Besides `Content-Type`, the
@@ -782,9 +785,11 @@ account (§5).
   deduplicated (*Client `anthropic-beta`*, above). No other inbound header is
   forwarded. The response and its SSE are relayed unchanged and are not rewritten
   back (§6.5); redirects are not followed, as for the api-key relay.
-- **The body is verbatim except two edits.** The gateway layer rewrites `model` to
+- **The body is verbatim except three edits.** The gateway layer rewrites `model` to
   the account's bare upstream id (equal to the requested name when the account has
-  no prefix). `AnthropicClient.ProxyNative` then **injects the Claude-Code block**
+  no prefix) and removes the replayed `thinking` blocks Anthropic cannot verify
+  (an empty `signature`; after a 400 ``Invalid `signature` in `thinking` block``,
+  every thinking block of the history, with one retry), see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo)). `AnthropicClient.ProxyNative` then **injects the Claude-Code block**
   the OAuth Messages path requires: the exact
   `{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}`
   becomes the **first** `system` block (the same block the translate path renders,
@@ -973,8 +978,11 @@ The subscription path splits by the inbound request shape:
 - An inbound **Codex `/v1/responses`** request has `ResponsesMode = passthrough`
   set by the resolver (from the **fine** `openai_responses` flavor), so it is
   relayed **verbatim** to the ChatGPT backend's `/responses` (lossless; the one
-  edit is the request's `model` field, set to the bare vendor id when the account
-  has a prefix, and the response is not rewritten back, §6.5). It is
+  edits are the request's `model` field, set to the bare vendor id when the account
+  has a prefix, and the removal of replayed `reasoning` items the backend cannot
+  read (an empty `encrypted_content`, a non-empty `content`; after a 400
+  `invalid_encrypted_content`, every encrypted blob of the history, with one
+  retry; see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo))), and the response is not rewritten back, §6.5). It is
   `Target.Subscription` that makes `endpointModeFor` select the **bare** `/responses`
   path (not `/v1/responses`); an api-key OpenAI target, whose `Subscription` is
   false, is unaffected and keeps the platform `/v1/responses` (*Api-key Responses
@@ -1015,9 +1023,12 @@ standard `/v1/responses` (a non-subscription OpenAI vendor target), the account'
 opened sealed key as the `Authorization: Bearer`, and the usual usage attribution
 to the serving account (§5).
 
-- **Only `model` is rewritten.** It is set to the account's bare upstream id,
+- **Only `model` is rewritten, plus one removal.** It is set to the account's bare upstream id,
   which equals the requested name when the account has no prefix. The rest of the
-  body reaches OpenAI as the client wrote it, **including `store`, `include` and
+  body reaches OpenAI as the client wrote it, except that replayed `reasoning`
+  items the platform cannot read are removed and the request retried once after
+  a 400 `invalid_encrypted_content` (the same rules as the subscription relay,
+  [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo)); the api-key behavior is VERIFY-LIVE, not probed), **including `store`, `include` and
   `previous_response_id`**: `store: false` is **not** forced here, because that
   is a requirement of the subscription backend, imposed by the subscription
   *translate* client only (above). The relay is value-lossless rather than

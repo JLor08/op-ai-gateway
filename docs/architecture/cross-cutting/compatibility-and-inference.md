@@ -82,10 +82,10 @@ flowchart TD
     CapGateD -->|refused| Reject7["404 routing.model_not_capable /<br/>routing.no_model_route"]
     CapGateD -->|target| Native7["relaySystemOne -> proxyNative:<br/>JSON body, model rewritten,<br/>to upstream /v1/systemone,<br/>answer relayed verbatim, metered in tokens"]
 
-    NativeGate -->|passthrough| Native["proxyNative:<br/>forward raw body byte-for-byte<br/>to upstream /v1/responses"]
+    NativeGate -->|passthrough| Native["proxyNative:<br/>forward raw body (model rewritten,<br/>unreadable reasoning removed, §6)<br/>to upstream /v1/responses"]
     NativeGate -->|translate| ParseResp["compat.ParseOpenAIResponses"]
     NativeGate -->|disabled| Reject1["404 responses.endpoint_disabled"]
-    NativeGate2 -->|passthrough| Native2["proxyNative:<br/>forward raw body byte-for-byte<br/>to upstream /v1/messages"]
+    NativeGate2 -->|passthrough| Native2["proxyNative:<br/>forward raw body (model rewritten,<br/>unreadable thinking removed, §6)<br/>to upstream /v1/messages"]
     NativeGate2 -->|translate| ParseMsg["compat.ParseAnthropicMessages"]
     NativeGate2 -->|disabled| Reject2["404 messages.endpoint_disabled"]
 
@@ -211,16 +211,23 @@ than rejecting the request. Two behaviors are specific to Codex continuity:
   the upstream chat history is always the strict
   `assistant(tool_calls…) → tool… → user` shape a Chat Completions upstream
   expects.
-- **Foreign reasoning on the ChatGPT-subscription passthrough.** That
-  passthrough is otherwise byte-for-byte, but a Codex session can start on
-  another model (a local one served by this gateway) and later switch to a
-  subscription model, so its replayed history holds `reasoning` items the
-  ChatGPT backend never produced: `reasoning_text` in `content`, empty
-  `encrypted_content`. The backend rejects them (`array_above_max_length` on
-  `input[n].content`, maximum length 0) and cannot use them.
-  `OpenAIResponsesClient.ProxyNative` therefore drops `reasoning` items without a
-  real `encrypted_content` and strips `content` from the remaining ones; a body
-  that needs neither is forwarded unchanged.
+- **Foreign reasoning on the native passthrough.** The client replays its whole
+  history on every request, so after a change of target in the middle of a session
+  (local model to vendor, vendor to local model, vendor to vendor) the history
+  holds `reasoning` items the new target did not produce and cannot read. The
+  passthrough is otherwise verbatim, so `proxyNative` removes them in one central
+  place, three steps, **dropping and never converting** them (a target cannot use
+  another target's reasoning, and a text conversion would change the
+  conversation). The mechanism is shared with the Anthropic Messages flavor and
+  specified in §6 (*Provider-switch history sanitizing*); for this flavor:
+  step 1 (stateless shape rules) drops, for an OpenAI vendor target
+  (`vendor_openai_subscription`, `vendor_openai`), a `reasoning` item whose
+  `encrypted_content` is empty, missing or not a string (a gateway-minted item
+  carries `reasoning_text` and an empty blob) and strips a non-empty `content`
+  array from the remaining ones (the backend allows length 0); for a local target
+  it drops a `reasoning` item with no non-empty `text` in `content` or `summary`
+  and strips `encrypted_content` from the rest. Step 2 retries once without every
+  opaque blob after a 400 with error `code` `invalid_encrypted_content`.
 
 Rendering the non-stream reply (`compat.OpenAIResponsesResponse`) emits, in
 order: a `reasoning` output item (if the model reasoned), then a `message`
@@ -246,6 +253,19 @@ passed through for a `url` source).
 Responses reasoning path. `thinking.signature` is read but never validated on
 this path (the gateway never mints a real signature; only `api.anthropic.com`
 does, and it is never reached here).
+
+**Thinking on the native passthrough.** The translate path above never forwards a
+signature. On the passthrough (`vendor_anthropic`, api-key or subscription) a
+client replays `thinking` blocks signed by another target or minted by the
+gateway (empty `signature`), which Anthropic refuses (``Invalid `signature` in
+`thinking` block``). `proxyNative` drops an assistant `thinking` block with an
+empty or missing `signature` before the first send (step 1), and after a 400 with
+that message it records the `signature` of every `thinking` block and the `data`
+of every `redacted_thinking` block of the history and retries once without them
+(steps 2 and 3, §6). An assistant turn left without a content block is removed and
+the two user turns that then meet are merged, so strict alternation holds. A
+local target needs nothing: it accepts a signed `thinking` and a
+`redacted_thinking` block.
 
 **stop_reason.** `compat.AnthropicStopReason` maps the upstream OpenAI
 `finish_reason`: any tool call present (or `finish_reason:"tool_calls"`) →
@@ -2403,8 +2423,8 @@ same `ClientSessionID`.
 | Edge | Non-stream | Stream | Native passthrough |
 |---|---|---|---|
 | Chat Completions | `tool_calls` array on the assistant message | incremental `tool_calls` deltas (opening id/name delta, then a full-arguments delta) per OpenAI SDK accumulation shape | n/a (never native) |
-| Responses (Codex) | `function_call` output item(s) | `response.output_item.added` → `response.function_call_arguments.delta`/`.done` → `response.output_item.done` per call | raw upstream `/v1/responses` body forwarded byte-for-byte |
-| Anthropic Messages (Claude Code) | `tool_use` content block(s), `input` as a JSON object | `content_block_start` (type `tool_use`) → one `input_json_delta` (whole-argument fragment) → `content_block_stop` | raw upstream `/v1/messages` body forwarded byte-for-byte |
+| Responses (Codex) | `function_call` output item(s) | `response.output_item.added` → `response.function_call_arguments.delta`/`.done` → `response.output_item.done` per call | raw upstream `/v1/responses` body forwarded as the upstream sent it (the response is never rewritten) |
+| Anthropic Messages (Claude Code) | `tool_use` content block(s), `input` as a JSON object | `content_block_start` (type `tool_use`) → one `input_json_delta` (whole-argument fragment) → `content_block_stop` | raw upstream `/v1/messages` body forwarded as the upstream sent it (the response is never rewritten) |
 
 **Replay** (turn 2+ of a multi-turn tool loop) is handled per-edge: Chat
 Completions replays the OpenAI shape (§3.1); Responses replays
@@ -2651,9 +2671,11 @@ dispatch-time decision:
    translate path would re-queue and wait a second time).
 4. Read `endpointModeFor(target, apiFlavor)` — the resolved `Target`'s
    effective mode for this flavor — and switch three ways:
-   - `passthrough` → `proxyNative` forwards the body (with only its `model`
+   - `passthrough` → `proxyNative` forwards the body (with its `model`
      field rewritten to the upstream's mapped name — `rewriteModelField`,
-     value-lossless but not byte-identical JSON) and `tryProxyNative` returns
+     value-lossless but not byte-identical JSON — and, for the two coding-agent
+     flavors, the replayed reasoning the target cannot read removed, see
+     *Provider-switch history sanitizing* below) and `tryProxyNative` returns
      `true` (handled).
    - `disabled` → reject immediately: a stable error code + HTTP 404
      (`responses.endpoint_disabled` / `messages.endpoint_disabled`, written
@@ -2688,6 +2710,125 @@ interior newlines, with or without a trailing newline; splitting such a body at
 an interior newline previously handed the parser a truncated fragment and lost
 **all** of its usage, zeroing both the persisted row and the token budget the
 request consumed while the request itself still succeeded.
+
+**Provider-switch history sanitizing.** A Codex or Claude Code session must
+survive a change of target in the middle of the session, but the client replays
+its whole history on every request and the passthrough relays it, so reasoning
+items the previous target produced reach a new target that cannot read them and
+it answers 400 (the trigger: Codex started on a local Qwen model, then switched
+to a ChatGPT-subscription model, and every further request failed with
+`array_above_max_length` on `input[n].content`). `proxyNative`
+(`internal/gateway/native_passthrough.go`, helpers in `switch_history.go` and
+`switch_history_memo.go`) therefore edits the **JSON** body of a relay whose fine
+flavor is `openai_responses` (the `input` array) or `anthropic_messages` (the
+assistant turns' `content` arrays), after `rewriteModelField`
+([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo)).
+It **drops, never converts**: another target's reasoning (encrypted, signed or
+model-specific) is not usable, and a text conversion would change the
+conversation. The target class comes from `Target.Provider`: OpenAI vendor
+(`vendor_openai_subscription`, `vendor_openai`), Anthropic vendor
+(`vendor_anthropic`, api-key or subscription), local (every other provider);
+Gemini has no passthrough. A body that needs nothing is forwarded as before,
+unparsed and unchanged, because every parse is gated by a byte scan.
+
+1. **Shape rules (stateless, every request).** Items the target provably cannot
+   read are removed before the first send:
+
+   | Endpoint | Target class | Drop | Strip | Byte-scan gate (any hit parses) |
+   |---|---|---|---|---|
+   | `/v1/responses` | OpenAI vendor | `reasoning` items whose `encrypted_content` is empty, missing or not a string | `content` of the remaining `reasoning` items when it is a non-empty array | `"reasoning_text"`, or `"encrypted_content"` with value `""`/`null` |
+   | `/v1/responses` | local | `reasoning` items with no non-empty `text` in `content` or `summary` | `encrypted_content` of the remaining ones | `"encrypted_content"`, or `"type":"reasoning"` |
+   | `/v1/messages` | Anthropic vendor | assistant `thinking` blocks with an empty or missing `signature` | nothing | `"signature"` with value `""`/`null` |
+   | `/v1/messages` | local | nothing | nothing | none (no scan, no parse) |
+
+   The scan tolerates whitespace around the colon; the bare word `reasoning` is
+   not a trigger (every Codex body carries the top-level reasoning config). Two
+   gaps are accepted and fall to step 2: an OpenAI reasoning item that lacks
+   `encrypted_content` entirely and has no `reasoning_text`, and an Anthropic
+   `thinking` block with no `signature` key at all. A false positive costs one
+   parse, never a wrong result. An assistant turn left with no content block is
+   removed as a whole, and the user turns that then meet are merged (content
+   arrays concatenated in order, a string content becoming one text block), so a
+   local chat template that needs strict alternation still gets it. Edited
+   bodies keep every untouched value as raw JSON (numbers and unknown fields
+   survive).
+2. **One optimistic retry on a recognised refusal.** What step 1 cannot see (a
+   well-formed `encrypted_content` or `signature` that belongs to another
+   account) is sent unchanged. If the upstream answers **before any byte reached
+   the client** with a 400 whose JSON `error.code` is `invalid_encrypted_content`
+   (OpenAI) or whose `error.message` contains ``Invalid `signature` in `thinking`
+   block`` (Anthropic), `proxyNative` records the SHA-256 hashes of **all**
+   opaque blobs of the history (`encrypted_content` of `reasoning` items;
+   `signature` of `thinking` and `data` of `redacted_thinking` blocks of
+   assistant turns) in the session memo, removes those items (with the
+   empty-turn rule above) and runs the relay once more. Only a 400 is peeked (the
+   first 8 KiB, put back, so any other answer reaches the client whole); a
+   429, a 5xx, any other 400 and a second refusal are relayed as they came. The
+   refused attempt records nothing, its resources are released first, and the
+   retry runs through `proxyNative` again, so the request gets **one usage row**
+   (`nativeRelay.foreignRetried` keeps it to one retry). A body with nothing to
+   remove is not retried. The recorded set is safe because the first refused
+   request after a switch only carries blobs from before it.
+3. **Per-session memo for follow-ups.** `Server.switchMemo`
+   (`rejectedBlobMemo`) maps (client session id, target account, flavor) to the
+   set of rejected blob hashes. The account is `Target.VendorAccountID`, else
+   `ServerID/InstanceKey`; the session id is the one §4 derives. On every
+   passthrough request the gateway does one map lookup (`Has`); only when the
+   session has a live entry for this target is the body parsed and the items
+   whose blob hash is in the set removed, so the new target's own blocks (other
+   hashes) stay and a follow-up is filtered **without a failed attempt**. A
+   request without a session id gets steps 1 and 2 but no memo (it retries per
+   request). The set only grows, so concurrent requests of one session are
+   harmless, and A to B to A needs nothing special (A never rejected its own
+   blobs). A hash is dropped after **1 h** without a match (context compaction
+   makes old blobs vanish for good; a request that merely lacks them, such as a
+   Claude Code subagent sharing the session id with its own history, must not drop
+   them, so only elapsed time does) and an entry with its last hash; an entry
+   lives at most **24 h** from its first record; at most **10 000** entries are
+   kept, least recently used first. Only hashes are stored, never blob contents.
+   Losing the memo (restart, another instance) costs at most one more retry.
+
+Removals and retries are logged at debug level with counts (`removed unreadable
+reasoning from replayed history`, `removed reasoning the target rejected earlier
+in this session`, `target refused replayed reasoning; retrying once without it`),
+never blob contents. The payload capture keeps recording the client's bytes. The
+translate path needs none of this: its renderers already drop assistant
+reasoning. Item types other than reasoning/thinking (`additional_tools`,
+`web_search_call`, `item_reference`) are not touched.
+
+*Live probes (2026-11-15, verbatim passthrough, through a running gateway).*
+They are the evidence for the rules above.
+
+| # | Target | Replayed history | Result |
+|---|---|---|---|
+| O1 | ChatGPT subscription (`gpt-5.6-luna`) | baseline | 200; reasoning item with `encrypted_content` (1976 B), `content: []` |
+| O2 | ChatGPT subscription | gateway-minted reasoning (`reasoning_text`, `encrypted_content: ""`) | 400 `array_above_max_length` on `input[n].content` |
+| O3 | ChatGPT subscription | its own reasoning item | 200 |
+| O3b | ChatGPT subscription | its own item + non-empty `content` | 400 `array_above_max_length` |
+| O4 | ChatGPT subscription | own item, tampered / garbage `encrypted_content` | 400 `invalid_encrypted_content` ("The encrypted content for item rs_… could not be verified") |
+| O5 | ChatGPT subscription, `gpt-6-astra` | blob issued for `gpt-5.6-luna` (same account) | 200 |
+| A1 | Anthropic subscription (`claude-haiku-4-5`) | baseline tool call, thinking on | 200; signed `thinking` + `tool_use` |
+| A2 | Anthropic subscription | thinking with `signature: ""` (gateway-minted), tool loop | 400 ``messages.1.content.0: Invalid `signature` in `thinking` block`` |
+| A3 | Anthropic subscription | tampered signature, tool loop | 400, same message |
+| A4 | Anthropic subscription | thinking block removed, tool loop, thinking **on** | 200 |
+| A5 | Anthropic subscription | thinking block removed, tool loop, thinking off | 200 |
+| A6 | Anthropic subscription, `claude-haiku-5-5` | block signed for `claude-haiku-4-5` (same account) | 200 |
+| L1 | local Qwen (vLLM-served), `/v1/messages` | signed Anthropic thinking | 200 |
+| L2 | local Qwen, `/v1/messages` | `redacted_thinking` | 200 |
+| L3 | local Qwen, `/v1/responses` | ChatGPT reasoning (encrypted only) | 400 `Encrypted content is not supported. (parameter=input)` |
+| L3g | local Gemma (llama.cpp-served), `/v1/responses` | ChatGPT reasoning (encrypted only) | 400 `item['content'] is empty` |
+| L4 | local Qwen, `/v1/responses` | reasoning with `reasoning_text`, no encryption | 200 |
+| V1 | OpenAI **api-key** target | any of the above | VERIFY-LIVE: not probed (expected to behave like O2-O4) |
+| V2 | Anthropic **api-key** target | any of the above | VERIFY-LIVE: not probed (expected to behave like A2-A4) |
+| V3 | switch between **two accounts of one vendor** | the other account's blob | VERIFY-LIVE: not probed (expected like O4/A3: a foreign account's blob cannot be decrypted or verified, so step 2 recovers) |
+
+Consequences: a model change within one account needs nothing (O5, A6); dropping
+a thinking block in a tool loop is accepted even with thinking on (A4), so
+`thinking` is never switched off; vendor to local breaks without the rules on the
+Responses endpoint (L3, L3g) and not on Messages (L1, L2). The step 1 and step 2
+rows for the api-key targets follow the same code path as the subscription ones
+and are covered by the unit and integration tests; only the vendor's live
+behavior is unverified.
 
 **The panel's live figures are no longer part of the trade-off — except where
 the wire cannot honestly supply them.** Choosing `passthrough` used to cost the

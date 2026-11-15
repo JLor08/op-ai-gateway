@@ -12875,3 +12875,58 @@ billed by the one row written when it ends, its consumption reached the aggregat
 
 The session's own running consumption still reaches the aggregate only with its row: the re-check reads what earlier rows recorded,
 and the maximum lifetime is what bounds a single session's overrun (the accepted residual added above).
+
+## ADR-105 — A provider switch drops foreign reasoning from the replayed history: shape rules, then one optimistic retry and a per-session memo
+
+**Context.** A Codex or Claude Code session must survive a change of target in the middle of the session (local model to vendor, vendor
+to local model, vendor to vendor). The client replays its whole history on every request and the native passthrough relays it, so
+reasoning items the previous target produced reach a target that cannot read them. The trigger (2026-11-14): Codex started on a local
+Qwen model, then switched to a ChatGPT-subscription model, and the backend answered 400 `array_above_max_length` on `input[n].content`
+for every further request of the session. Live probes on 2026-11-15 (the table in
+[Compatibility and Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)) showed the rest:
+a vendor refuses another target's blobs (`invalid_encrypted_content`, ``Invalid `signature` in `thinking` block``), a local Responses
+server refuses encrypted-only reasoning (400), a model change inside one account needs nothing, and Anthropic accepts a tool loop whose
+thinking block was removed even with thinking on. A first fix inside `OpenAIResponsesClient.ProxyNative` covered one direction of one
+flavor and spread rules over the provider clients, one of which (`OpenAICompatibleClient`) serves many target kinds.
+
+**Decision.**
+
+- **Drop, never convert.** A target cannot use another target's reasoning, and converting it to text would change the conversation and is
+  not representable everywhere. Only reasoning/thinking items are touched; other item types are out of scope until a switch is shown to
+  break on them. The translate path needs nothing: its renderers already drop assistant reasoning.
+- **One central place.** `proxyNative`, after `rewriteModelField`, for JSON relays of the `openai_responses` and `anthropic_messages`
+  flavors (`internal/gateway/switch_history.go`, `switch_history_memo.go`); the first fix was removed from the provider client.
+- **Step 1, shape rules, stateless.** What a target provably cannot read is removed before the first send, per target class (OpenAI
+  vendor, Anthropic vendor, local) and endpoint, each rule gated by a byte scan so a request that needs nothing is never parsed. An
+  assistant turn left empty is removed and the user turns that meet are merged.
+- **Step 2, one optimistic retry.** What shape cannot tell (a well-formed blob of another account) is sent unchanged. A 400 recognised by
+  OpenAI `error.code` `invalid_encrypted_content` or Anthropic's invalid-`thinking`-signature message, before any byte reached the client,
+  removes all opaque blobs of the body and retries once; one usage row; no retry on anything else.
+- **Step 3, per-session memo of rejected blob hashes.** Keyed by client session id, target account (`VendorAccountID`, else
+  `ServerID/InstanceKey`) and flavor; SHA-256 hashes only; grace 1 h without a match, TTL 24 h, at most 10 000 entries with LRU eviction;
+  no memo for a request without a session id. Follow-ups are filtered before the first send and the new target's own blocks (other
+  hashes) survive.
+- **Observability.** Removals and retries are logged at debug level with counts, never blob contents; the payload capture keeps the
+  client's bytes.
+
+**Rejected:**
+
+- **Per provider client.** Rules spread over three clients; `OpenAICompatibleClient` serves many target kinds.
+- **Mark gateway-minted items and remove only marked ones.** Covers local to vendor only and changes what clients receive.
+- **Track the last target per session and set a session-wide "filter" flag after a filtered retry.** Tracking fails after a restart, across
+  gateway instances, for sessions started elsewhere, for Claude Code subagents that share one session id and on A to B to A, whereas the
+  refusal itself is a reliable signal. The memo keeps the idea of per-session memory but stores the hashes of the rejected blobs instead of
+  a flag, so the new target's own reasoning is kept (a session-wide filter would degrade OpenAI quality).
+- **Filter all reasoning after a switch, and switch thinking off.** The new target's blocks must survive, and dropping a thinking block is
+  accepted with thinking on (probe A4).
+
+**Consequences and limits.**
+
+- A body that needs nothing is forwarded as before; a switch costs a byte scan, a map lookup and, until the memo knows the blobs, at most
+  one extra upstream attempt per request.
+- Two shapes are not caught by step 1 and fall to step 2: an OpenAI reasoning item with no `encrypted_content` key and no
+  `reasoning_text`, and an Anthropic `thinking` block with no `signature` key.
+- The memo is per gateway instance and in memory; a restart or another instance costs one more retry.
+- **VERIFY-LIVE (not probed, no account available):** an OpenAI api-key target, an Anthropic api-key target, and a switch between two
+  accounts of one vendor (expected to behave like probes O4/A3). The rules are shared code and covered by unit and integration tests; only
+  the vendor's live answer is unverified.
