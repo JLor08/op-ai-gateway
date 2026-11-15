@@ -5,9 +5,12 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
+	"net/http"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"sync/atomic"
 )
 
@@ -339,4 +342,192 @@ func contentBlocks(c json.RawMessage) ([]json.RawMessage, bool) {
 		return nil, false
 	}
 	return []json.RawMessage{tb}, true
+}
+
+// blobHash identifies an opaque reasoning blob (encrypted_content, signature,
+// redacted data) by the SHA-256 of its string value; the blob itself is never
+// kept or logged.
+type blobHash [32]byte
+
+func hashBlob(raw json.RawMessage) (blobHash, bool) {
+	var s string
+	if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &s) != nil || s == "" {
+		return blobHash{}, false
+	}
+	return sha256.Sum256([]byte(s)), true
+}
+
+// blobOf returns the opaque blob of a history item or content block, or false
+// when the item carries none.
+func blobOf(flavor string, m map[string]json.RawMessage) (blobHash, bool) {
+	typ := string(m["type"])
+	switch {
+	case flavor == inference.APIFlavorOpenAIResponses && typ == `"reasoning"`:
+		return hashBlob(m["encrypted_content"])
+	case flavor == inference.APIFlavorAnthropicMessages && typ == `"thinking"`:
+		return hashBlob(m["signature"])
+	case flavor == inference.APIFlavorAnthropicMessages && typ == `"redacted_thinking"`:
+		return hashBlob(m["data"])
+	}
+	return blobHash{}, false
+}
+
+func historyKey(flavor string) string {
+	if flavor == inference.APIFlavorOpenAIResponses {
+		return "input"
+	}
+	return "messages"
+}
+
+// opaqueBlobHashes returns the hashes of every opaque reasoning blob in the
+// replayed history of raw (responses: encrypted_content of reasoning items;
+// messages: signature of thinking and data of redacted_thinking blocks in
+// assistant turns). An unparseable body or an unknown flavor yields nil.
+func opaqueBlobHashes(raw []byte, flavor string) []blobHash {
+	if flavor != inference.APIFlavorOpenAIResponses && flavor != inference.APIFlavorAnthropicMessages {
+		return nil
+	}
+	var top map[string]json.RawMessage
+	if json.Unmarshal(raw, &top) != nil {
+		return nil
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(top[historyKey(flavor)], &items) != nil {
+		return nil
+	}
+	var out []blobHash
+	for _, it := range items {
+		var m map[string]json.RawMessage
+		if json.Unmarshal(it, &m) != nil {
+			continue
+		}
+		if flavor == inference.APIFlavorOpenAIResponses {
+			if h, ok := blobOf(flavor, m); ok {
+				out = append(out, h)
+			}
+			continue
+		}
+		if string(m["role"]) != `"assistant"` {
+			continue
+		}
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(m["content"], &blocks) != nil {
+			continue
+		}
+		for _, b := range blocks {
+			if h, ok := blobOf(flavor, b); ok {
+				out = append(out, h)
+			}
+		}
+	}
+	return out
+}
+
+// removeBlobs removes the reasoning items/blocks whose blob hash is in drop and
+// applies the empty-assistant-turn merge for the messages flavor. Nothing
+// matching returns the SAME slice; raw is never written to.
+func removeBlobs(raw []byte, flavor string, drop map[blobHash]struct{}) (out []byte, removed int) {
+	if len(drop) == 0 {
+		return raw, 0
+	}
+	switch flavor {
+	case inference.APIFlavorOpenAIResponses:
+		out, removed, _ = rewriteHistory(raw, "input", func(items []json.RawMessage) ([]json.RawMessage, int, int, bool) {
+			kept := make([]json.RawMessage, 0, len(items))
+			n := 0
+			for _, it := range items {
+				var m map[string]json.RawMessage
+				if json.Unmarshal(it, &m) == nil {
+					if h, ok := blobOf(flavor, m); ok {
+						if _, hit := drop[h]; hit {
+							n++
+							continue
+						}
+					}
+				}
+				kept = append(kept, it)
+			}
+			return kept, n, 0, n > 0
+		})
+	case inference.APIFlavorAnthropicMessages:
+		out, removed, _ = rewriteHistory(raw, "messages", func(msgs []json.RawMessage) ([]json.RawMessage, int, int, bool) {
+			return removeAnthropicBlobs(msgs, drop)
+		})
+	default:
+		return raw, 0
+	}
+	return out, removed
+}
+
+func removeAnthropicBlobs(msgs []json.RawMessage, drop map[blobHash]struct{}) ([]json.RawMessage, int, int, bool) {
+	removed := 0
+	out := make([]json.RawMessage, 0, len(msgs))
+	for _, msg := range msgs {
+		var m map[string]json.RawMessage
+		if json.Unmarshal(msg, &m) != nil || string(m["role"]) != `"assistant"` {
+			out = append(out, msg)
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(m["content"], &blocks) != nil {
+			out = append(out, msg)
+			continue
+		}
+		kept := make([]json.RawMessage, 0, len(blocks))
+		for _, b := range blocks {
+			var bm map[string]json.RawMessage
+			if json.Unmarshal(b, &bm) == nil {
+				if h, ok := blobOf(inference.APIFlavorAnthropicMessages, bm); ok {
+					if _, hit := drop[h]; hit {
+						removed++
+						continue
+					}
+				}
+			}
+			kept = append(kept, b)
+		}
+		if len(kept) == len(blocks) {
+			out = append(out, msg)
+			continue
+		}
+		nc, err := marshalNoEscape(kept)
+		if err != nil {
+			out = append(out, msg)
+			continue
+		}
+		m["content"] = nc
+		nb, err := marshalNoEscape(m)
+		if err != nil {
+			out = append(out, msg)
+			continue
+		}
+		out = append(out, nb)
+	}
+	if removed == 0 {
+		return msgs, 0, 0, false
+	}
+	return dropEmptyAssistantTurnsAndMergeUsers(out), removed, 0, true
+}
+
+// isForeignReasoningRefusal reports whether an upstream answer is the 400 a
+// target gives for a reasoning blob it cannot verify: OpenAI error code
+// invalid_encrypted_content, or Anthropic's "Invalid `signature` in `thinking`
+// block" message. Only a 400 with a parseable JSON error object matches.
+func isForeignReasoningRefusal(status int, body []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	var env struct {
+		Error struct {
+			Code    any    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &env) != nil {
+		return false
+	}
+	if code, ok := env.Error.Code.(string); ok && code == "invalid_encrypted_content" {
+		return true
+	}
+	return strings.Contains(env.Error.Message, "Invalid `signature` in `thinking` block")
 }
