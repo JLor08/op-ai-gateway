@@ -75,12 +75,12 @@ func TestSanitizeSwitchHistoryRules(t *testing.T) {
 		},
 		{
 			name: "openai drops missing enc", flavor: flavorResp, class: switchClassOpenAIVendor, key: "input",
-			body:      `{"input":[{"type":"reasoning","summary":[]},` + msg + `]}`,
+			body:      `{"input":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"x"}]},` + msg + `]}`,
 			wantTypes: []string{"message"}, wantDropped: 1,
 		},
 		{
 			name: "openai drops non-string enc", flavor: flavorResp, class: switchClassOpenAIVendor, key: "input",
-			body:      `{"input":[{"type":"reasoning","encrypted_content":42},` + msg + `]}`,
+			body:      `{"input":[{"type":"reasoning","encrypted_content":42,"content":[{"type":"reasoning_text","text":"x"}]},` + msg + `]}`,
 			wantTypes: []string{"message"}, wantDropped: 1,
 		},
 		{
@@ -269,5 +269,44 @@ func TestSwitchTargetClassOf(t *testing.T) {
 		if got := switchTargetClassOf(routing.Target{Provider: provider}); got != want {
 			t.Errorf("%s: class %d, want %d", provider, got, want)
 		}
+	}
+}
+
+func TestSanitizeSwitchHistoryGateSkipsParseForOwnSession(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-luna","reasoning":{"effort":"high"},"input":[` +
+		`{"type":"reasoning","id":"rs_1","summary":[],"content":[],"encrypted_content":"gAAAAABpZ3x9Qk1"},` +
+		`{"type":"function_call","call_id":"c1","name":"sh","arguments":"{}"},` +
+		`{"type":"reasoning","id":"rs_2","summary":[],"content":[],"encrypted_content":"gAAAAABpZ3yTT0Q"},` +
+		`{"type":"reasoning","id":"rs_3","summary":[],"content":[],"encrypted_content":"gAAAAABpZ3zZZ9w"}]}`)
+	before := switchHistoryParses.Load()
+	out, dropped, stripped := sanitizeSwitchHistory(raw, flavorResp, switchClassOpenAIVendor)
+	if dropped+stripped != 0 || &out[0] != &raw[0] {
+		t.Fatalf("want same slice, got %d/%d", dropped, stripped)
+	}
+	if n := switchHistoryParses.Load() - before; n != 0 {
+		t.Fatalf("own session must not be parsed, parses = %d", n)
+	}
+	// Local messages: no rules, no scan.
+	msgs := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","signature":""}]}]}`)
+	if out, _, _ := sanitizeSwitchHistory(msgs, flavorMsgs, switchClassLocal); &out[0] != &msgs[0] {
+		t.Fatal("local messages must return raw")
+	}
+	if n := switchHistoryParses.Load() - before; n != 0 {
+		t.Fatalf("parses = %d", n)
+	}
+}
+
+func TestSanitizeSwitchHistoryGateToleratesWhitespace(t *testing.T) {
+	out, dropped, _ := sanitizeSwitchHistory(
+		[]byte("{\"input\": [{\"type\": \"reasoning\", \"encrypted_content\" \n: \t\"\"}, {\"type\":\"message\"}]}"),
+		flavorResp, switchClassOpenAIVendor)
+	if dropped != 1 || len(decodeList(t, out, "input")) != 1 {
+		t.Fatalf("whitespace-formatted minted item must be dropped: %d %s", dropped, out)
+	}
+	out, dropped, _ = sanitizeSwitchHistory(
+		[]byte(`{"messages": [{"role":"assistant","content":[{"type":"thinking","signature" : null}]}]}`),
+		flavorMsgs, switchClassAnthropicVendor)
+	if dropped != 1 || len(decodeList(t, out, "messages")) != 0 {
+		t.Fatalf("null signature must be dropped: %d %s", dropped, out)
 	}
 }

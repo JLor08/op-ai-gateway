@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"sync/atomic"
 )
 
 // switchTargetClass groups the targets by what they can read of a replayed
@@ -45,18 +46,26 @@ func switchTargetClassOf(t routing.Target) switchTargetClass {
 // untouched value as json.RawMessage, so numbers and unknown fields survive.
 func sanitizeSwitchHistory(raw []byte, flavor string, class switchTargetClass) (out []byte, dropped, stripped int) {
 	switch {
-	case flavor == inference.APIFlavorOpenAIResponses &&
-		(class == switchClassOpenAIVendor || class == switchClassLocal):
-		// "reasoning" also matches the request-level reasoning settings; the
-		// parse that follows is the exact test, this is only the cheap gate.
-		if !bytes.Contains(raw, []byte(`"reasoning"`)) {
+	case flavor == inference.APIFlavorOpenAIResponses && class == switchClassOpenAIVendor:
+		// Ungated gap, accepted: a reasoning item that lacks encrypted_content
+		// entirely and has no reasoning_text is not found by this gate.
+		if !bytes.Contains(raw, []byte(`"reasoning_text"`)) &&
+			!hasKeyWithValue(raw, `"encrypted_content"`, `""`, `null`) {
+			return raw, 0, 0
+		}
+		return rewriteHistory(raw, "input", func(items []json.RawMessage) ([]json.RawMessage, int, int, bool) {
+			return sanitizeResponsesItems(items, class)
+		})
+	case flavor == inference.APIFlavorOpenAIResponses && class == switchClassLocal:
+		if !bytes.Contains(raw, []byte(`"encrypted_content"`)) && !bytes.Contains(raw, []byte(`"reasoning"`)) {
 			return raw, 0, 0
 		}
 		return rewriteHistory(raw, "input", func(items []json.RawMessage) ([]json.RawMessage, int, int, bool) {
 			return sanitizeResponsesItems(items, class)
 		})
 	case flavor == inference.APIFlavorAnthropicMessages && class == switchClassAnthropicVendor:
-		if !bytes.Contains(raw, []byte(`"thinking"`)) {
+		// Ungated gap, accepted: a thinking block with no signature key at all.
+		if !hasKeyWithValue(raw, `"signature"`, `""`, `null`) {
 			return raw, 0, 0
 		}
 		return rewriteHistory(raw, "messages", sanitizeAnthropicThinking)
@@ -64,10 +73,38 @@ func sanitizeSwitchHistory(raw []byte, flavor string, class switchTargetClass) (
 	return raw, 0, 0
 }
 
+// switchHistoryParses counts body parses, so a test can prove the byte gate
+// keeps requests that need nothing from being parsed at all.
+var switchHistoryParses atomic.Int64
+
+// hasKeyWithValue reports whether raw contains key, then optional whitespace,
+// ':', optional whitespace and one of the literal values.
+func hasKeyWithValue(raw []byte, key string, values ...string) bool {
+	for off := 0; ; {
+		i := bytes.Index(raw[off:], []byte(key))
+		if i < 0 {
+			return false
+		}
+		rest := raw[off+i+len(key):]
+		off += i + len(key)
+		rest = bytes.TrimLeft(rest, " \t\r\n")
+		if len(rest) == 0 || rest[0] != ':' {
+			continue
+		}
+		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+		for _, v := range values {
+			if bytes.HasPrefix(rest, []byte(v)) {
+				return true
+			}
+		}
+	}
+}
+
 // rewriteHistory decodes the top level of raw, applies edit to the array under
 // key and re-marshals only when edit reports a change. Anything that does not
 // parse as expected leaves the body alone.
 func rewriteHistory(raw []byte, key string, edit func([]json.RawMessage) ([]json.RawMessage, int, int, bool)) ([]byte, int, int) {
+	switchHistoryParses.Add(1)
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return raw, 0, 0
