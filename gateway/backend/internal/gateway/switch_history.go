@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"io"
 	"net/http"
 	"op-ai-gateway/internal/inference"
+	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"strings"
 	"sync/atomic"
@@ -26,6 +28,20 @@ const (
 	// switchClassLocal: every non-vendor provider (on-prem inference servers).
 	switchClassLocal
 )
+
+// String names the class for log lines.
+func (c switchTargetClass) String() string {
+	switch c {
+	case switchClassOpenAIVendor:
+		return "openai_vendor"
+	case switchClassAnthropicVendor:
+		return "anthropic_vendor"
+	case switchClassLocal:
+		return "local"
+	default:
+		return "none"
+	}
+}
 
 // switchTargetClassOf maps a target's provider kind to its switchTargetClass.
 func switchTargetClassOf(t routing.Target) switchTargetClass {
@@ -530,4 +546,48 @@ func isForeignReasoningRefusal(status int, body []byte) bool {
 		return true
 	}
 	return strings.Contains(env.Error.Message, "Invalid `signature` in `thinking` block")
+}
+
+// foreignReasoningRefusalPeekBytes bounds the peek at an upstream error: the two
+// recognised refusals are small JSON envelopes, and a longer body is not one of
+// them (its truncated head does not parse, so it is never mistaken for one).
+const foreignReasoningRefusalPeekBytes = 8 << 10
+
+// peekForeignReasoningRefusal reports whether resp is a target's refusal of a
+// replayed reasoning blob (isForeignReasoningRefusal). Like peekStreamingRefusal
+// it is a peek: the head it reads is put back, so an answer that is not the
+// refusal reaches the client whole. Only a 400 is read at all.
+func peekForeignReasoningRefusal(resp *provider.ProxyResponse) bool {
+	if resp.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	head, err := io.ReadAll(io.LimitReader(resp.Body, foreignReasoningRefusalPeekBytes))
+	resp.Body = replayedBody{Reader: io.MultiReader(bytes.NewReader(head), resp.Body), Closer: resp.Body}
+	return err == nil && isForeignReasoningRefusal(resp.StatusCode, head)
+}
+
+// isSwitchHistoryFlavor reports whether flavor is one of the two native
+// passthrough flavors whose replayed history the switch sanitizing reads.
+func isSwitchHistoryFlavor(flavor string) bool {
+	return flavor == inference.APIFlavorOpenAIResponses || flavor == inference.APIFlavorAnthropicMessages
+}
+
+// switchMemoKey is the rejected-blob memo key of a request: the client session,
+// the target account (the vendor account, else the serving server instance) and
+// the flavor.
+func switchMemoKey(session string, target routing.Target, flavor string) rejectedBlobKey {
+	account := target.VendorAccountID
+	if account == "" {
+		account = target.ServerID + "/" + target.InstanceKey
+	}
+	return rejectedBlobKey{Session: session, Target: account, Flavor: flavor}
+}
+
+// blobSet turns hashes into the drop set removeBlobs takes.
+func blobSet(hashes []blobHash) map[blobHash]struct{} {
+	set := make(map[blobHash]struct{}, len(hashes))
+	for _, h := range hashes {
+		set[h] = struct{}{}
+	}
+	return set
 }
