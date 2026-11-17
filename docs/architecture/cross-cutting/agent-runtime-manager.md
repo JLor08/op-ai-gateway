@@ -4006,6 +4006,17 @@ capability is deliberately *not* a negotiated feature flag — flags negotiate
 protocol, not hardware — an agent with no measurement path simply omits the
 field.
 
+On **native Linux**, compute-app rows are attributed to the process group
+created for each managed runtime, whose group ID is the root PID (§3.1).
+The collector resolves each GPU-owning PID's group before checking the UUID
+cache, then sums all group members per GPU under that root PID. This includes
+vLLM's EngineCore workers even when the API process holds no GPU memory, and
+keeps separately managed runtimes isolated. Exited or inaccessible PIDs are
+omitted rather than assigned a guessed owner. Processes that detach into a
+different group remain outside this boundary, matching native group termination;
+other platforms retain their existing PID attribution. No gateway setting or
+additional feature flag is involved.
+
 The **compute-apps** measurer (every non-Windows host) resolves GPU UUID →
 index from a cached `--query-gpu=index,uuid` mapping, re-fetched only on the
 first call or when a *wanted* PID's UUID is missing from the cache (a card

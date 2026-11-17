@@ -238,7 +238,7 @@ func (m *nvidiaComputeAppsMeasurer) measure(pids []int) map[int]map[int]int {
 	if err != nil {
 		return nil
 	}
-	rows := parseNvidiaComputeAppsCSV(appsOut)
+	rows := groupNvidiaComputeApps(parseNvidiaComputeAppsCSV(appsOut))
 
 	wanted := make(map[int]bool, len(pids))
 	for _, p := range pids {
@@ -311,7 +311,7 @@ func attributeComputeApps(rows []nvidiaComputeAppRow, uuidToIndex map[string]int
 		if out[row.PID] == nil {
 			out[row.PID] = make(map[int]int)
 		}
-		out[row.PID][idx] = row.UsedMemoryMB
+		out[row.PID][idx] += row.UsedMemoryMB
 	}
 	return out
 }
