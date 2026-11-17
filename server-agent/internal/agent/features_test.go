@@ -615,8 +615,8 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.20.0" {
-		t.Fatalf("Version = %q, want 0.20.0 (the realtime_proxy MINOR bump; runtime_stop keeps Since 0.17.0)", Version)
+	if Version != "0.20.1" {
+		t.Fatalf("Version = %q, want 0.20.1 (the Linux VRAM PATCH fix; runtime_stop keeps Since 0.17.0)", Version)
 	}
 }
 
@@ -639,8 +639,8 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.20.0" {
-		t.Fatalf("Version = %q, want 0.20.0 (the realtime_proxy MINOR bump: rpc_cluster keeps Since 0.18.0)", Version)
+	if Version != "0.20.1" {
+		t.Fatalf("Version = %q, want 0.20.1 (the Linux VRAM PATCH fix; rpc_cluster keeps Since 0.18.0)", Version)
 	}
 }
 
@@ -696,7 +696,7 @@ func TestFeaturesDeclareRealtimeProxy(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "realtime_proxy") {
 		t.Fatal("FeatureNames() does not carry realtime_proxy, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.20.0" {
-		t.Fatalf("Version = %q, want 0.20.0 (MINOR: agent.Features gained realtime_proxy)", Version)
+	if Version != "0.20.1" {
+		t.Fatalf("Version = %q, want 0.20.1 (the Linux VRAM PATCH fix; realtime_proxy keeps Since 0.20.0)", Version)
 	}
 }
