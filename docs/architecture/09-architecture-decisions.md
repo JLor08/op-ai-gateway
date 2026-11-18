@@ -12924,9 +12924,10 @@ flavor and spread rules over the provider clients, one of which (`OpenAICompatib
 
 - A body that needs nothing is forwarded as before; a switch costs a byte scan, a map lookup and, until the memo knows the blobs, at most
   one extra upstream attempt per request.
-- Two shapes are not caught by step 1 and fall to step 2: an OpenAI reasoning item with no `encrypted_content` key and no
-  `reasoning_text`, and an Anthropic `thinking` block with no `signature` key.
-- The memo is per gateway instance and in memory; a restart or another instance costs one more retry.
+- Two shapes are not caught by step 1 and not handled at all (step 2 finds no blob to hash; the upstream's answer is relayed as today):
+  an OpenAI reasoning item with no `encrypted_content` key and no `reasoning_text`, and an Anthropic `thinking` block with no
+  `signature` key.
+- The memo is per gateway instance and in memory; a restart, another instance or TTL expiry costs one more retry, and the new target's earlier reasoning blocks are filtered for the grace period (the next refusal records them too).
 - **VERIFY-LIVE (not probed, no account available):** an OpenAI api-key target, an Anthropic api-key target, and a switch between two
   accounts of one vendor (expected to behave like probes O4/A3). The rules are shared code and covered by unit and integration tests; only
   the vendor's live answer is unverified.

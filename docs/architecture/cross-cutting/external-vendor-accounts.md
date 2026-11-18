@@ -2107,7 +2107,7 @@ Two behaviours to know:
   account's `/v1/messages`, §4.1) the gateway rewrites the request's `model`
   field to the bare slug (the Anthropic subscription's relay additionally
   injects the Claude-Code system block, which does not touch `model`, and all
-  four relays (`vendor_openai_subscription`, `vendor_openai`, `vendor_anthropic`)
+  four relays (`vendor_openai_subscription`, `vendor_openai`, and `vendor_anthropic`, which serves both the Anthropic api-key and subscription relays)
   remove replayed reasoning/thinking the vendor cannot read and may retry
   once, which touch neither `model` nor the echo: [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). The vendor's response is relayed verbatim and there is
   no response-side rewrite, so its `model` field echoes the **bare** slug, not

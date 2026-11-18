@@ -188,7 +188,7 @@ carries blobs from before the switch.
 
 - Step 1 is gated by one byte scan for the trigger patterns (e.g.
   `"reasoning_text"`, `"encrypted_content":""`/`null`, an empty `"signature"`,
-  and for local targets `"encrypted_content"`). Measured on a 1 MB Codex-like body:
+  and for local targets `"encrypted_content"` with a non-empty string value). Measured on a 1 MB Codex-like body:
   ~0.8 ms for a three-pattern scan without a hit vs. ~2.4 ms for a full parse;
   one combined pass is cheaper still. `rewriteModelField` already parses every
   passthrough body today. A false positive costs one parse, never a wrong result.

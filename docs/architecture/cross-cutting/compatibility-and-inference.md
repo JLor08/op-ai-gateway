@@ -225,8 +225,10 @@ than rejecting the request. Two behaviors are specific to Codex continuity:
   `encrypted_content` is empty, missing or not a string (a gateway-minted item
   carries `reasoning_text` and an empty blob) and strips a non-empty `content`
   array from the remaining ones (the backend allows length 0); for a local target
-  it drops a `reasoning` item with no non-empty `text` in `content` or `summary`
-  and strips `encrypted_content` from the rest. Step 2 retries once without every
+  it acts only on a body with a non-empty `encrypted_content` string (a vendor
+  blob; the target's own items carry `""` or `null` and are never parsed), then
+  drops a `reasoning` item with no non-empty `text` in `content` or `summary` and
+  strips a non-empty `encrypted_content` from the rest. Step 2 retries once without every
   opaque blob after a 400 with error `code` `invalid_encrypted_content`.
 
 Rendering the non-stream reply (`compat.OpenAIResponsesResponse`) emits, in
@@ -2737,13 +2739,14 @@ unparsed and unchanged, because every parse is gated by a byte scan.
    | Endpoint | Target class | Drop | Strip | Byte-scan gate (any hit parses) |
    |---|---|---|---|---|
    | `/v1/responses` | OpenAI vendor | `reasoning` items whose `encrypted_content` is empty, missing or not a string | `content` of the remaining `reasoning` items when it is a non-empty array | `"reasoning_text"`, or `"encrypted_content"` with value `""`/`null` |
-   | `/v1/responses` | local | `reasoning` items with no non-empty `text` in `content` or `summary` | `encrypted_content` of the remaining ones | `"encrypted_content"`, or `"type":"reasoning"` |
+   | `/v1/responses` | local | `reasoning` items with no non-empty `text` in `content` or `summary` | `encrypted_content` of the remaining ones | `"encrypted_content"` with a non-empty string value |
    | `/v1/messages` | Anthropic vendor | assistant `thinking` blocks with an empty or missing `signature` | nothing | `"signature"` with value `""`/`null` |
    | `/v1/messages` | local | nothing | nothing | none (no scan, no parse) |
 
    The scan tolerates whitespace around the colon; the bare word `reasoning` is
    not a trigger (every Codex body carries the top-level reasoning config). Two
-   gaps are accepted and fall to step 2: an OpenAI reasoning item that lacks
+   gaps are accepted and not handled (the upstream's answer is relayed as today;
+   step 2 finds no blob to hash): an OpenAI reasoning item that lacks
    `encrypted_content` entirely and has no `reasoning_text`, and an Anthropic
    `thinking` block with no `signature` key at all. A false positive costs one
    parse, never a wrong result. An assistant turn left with no content block is
@@ -2786,7 +2789,9 @@ unparsed and unchanged, because every parse is gated by a byte scan.
    them, so only elapsed time does) and an entry with its last hash; an entry
    lives at most **24 h** from its first record; at most **10 000** entries are
    kept, least recently used first. Only hashes are stored, never blob contents.
-   Losing the memo (restart, another instance) costs at most one more retry.
+   Losing the memo (restart, another instance, TTL expiry) costs one more retry,
+   and the new target's earlier reasoning blocks are filtered for the grace
+   period: the next refusal records them too.
 
 Removals and retries are logged at debug level with counts (`removed unreadable
 reasoning from replayed history`, `removed reasoning the target rejected earlier
