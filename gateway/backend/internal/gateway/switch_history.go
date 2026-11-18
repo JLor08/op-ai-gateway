@@ -76,10 +76,11 @@ func sanitizeSwitchHistory(raw []byte, flavor string, class switchTargetClass) (
 			return sanitizeResponsesItems(items, class)
 		})
 	case flavor == inference.APIFlavorOpenAIResponses && class == switchClassLocal:
-		// The bare word "reasoning" is not a trigger: every Codex body carries
-		// the top-level reasoning config.
-		if !bytes.Contains(raw, []byte(`"encrypted_content"`)) &&
-			!hasKeyWithValue(raw, `"type"`, `"reasoning"`) {
+		// Only a non-empty encrypted_content blob is a trigger: llama.cpp emits
+		// "encrypted_content":"" (vLLM likely null) on its own reasoning items,
+		// so an unswitched local session must not be parsed. The bare word
+		// "reasoning" is no trigger either (every Codex body carries it).
+		if !hasNonEmptyStringValue(raw, `"encrypted_content"`) {
 			return raw, 0, 0
 		}
 		return rewriteHistory(raw, "input", func(items []json.RawMessage) ([]json.RawMessage, int, int, bool) {
@@ -118,6 +119,27 @@ func hasKeyWithValue(raw []byte, key string, values ...string) bool {
 			if bytes.HasPrefix(rest, []byte(v)) {
 				return true
 			}
+		}
+	}
+}
+
+// hasNonEmptyStringValue reports whether raw contains key, then optional
+// whitespace, ':', optional whitespace and a JSON string that is not empty
+// (a '"' followed by a character other than '"').
+func hasNonEmptyStringValue(raw []byte, key string) bool {
+	for off := 0; ; {
+		i := bytes.Index(raw[off:], []byte(key))
+		if i < 0 {
+			return false
+		}
+		off += i + len(key)
+		rest := bytes.TrimLeft(raw[off:], " \t\r\n")
+		if len(rest) == 0 || rest[0] != ':' {
+			continue
+		}
+		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+		if len(rest) >= 2 && rest[0] == '"' && rest[1] != '"' {
+			return true
 		}
 	}
 }
@@ -214,7 +236,7 @@ func sanitizeResponsesItems(items []json.RawMessage, class switchTargetClass) ([
 				dropped++
 				continue
 			}
-			if _, ok := m["encrypted_content"]; ok {
+			if isNonEmptyJSONString(m["encrypted_content"]) {
 				strip = "encrypted_content"
 			}
 		}

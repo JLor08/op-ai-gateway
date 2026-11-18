@@ -70,8 +70,9 @@ func (p *scriptedProxyProvider) calls() [][]byte {
 }
 
 var (
-	switchOpenAITarget = routing.Target{Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acc_oai_b", ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}
-	switchLocalTarget  = routing.Target{Provider: routing.ProviderVLLM, ServerID: "srv-native", InstanceKey: "0", Model: "gw-model", ProviderModel: "upstream-model"}
+	switchOpenAITarget    = routing.Target{Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acc_oai_b", ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}
+	switchAnthropicTarget = routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: "acc_anth_b", ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}
+	switchLocalTarget     = routing.Target{Provider: routing.ProviderVLLM, ServerID: "srv-native", InstanceKey: "0", Model: "gw-model", ProviderModel: "upstream-model"}
 )
 
 // relaySwitch runs one native passthrough through proxyNative for target and
@@ -114,8 +115,8 @@ func TestProxyNativeStripsMintedReasoningBeforeSend(t *testing.T) {
 	}
 	srv.Captures, srv.Cipher = cs, cipher
 
-	// A gateway-minted reasoning item: no readable text, empty encrypted_content.
-	client := `{"model":"gw-model","stream":true,"input":[{"role":"user","content":"hi"},{"type":"reasoning","summary":[],"encrypted_content":""},{"role":"user","content":"next"}]}`
+	// A vendor-shaped reasoning item: no readable text, non-empty blob.
+	client := `{"model":"gw-model","stream":true,"input":[{"role":"user","content":"hi"},{"type":"reasoning","summary":[],"encrypted_content":"gAAAA-vendor"},{"role":"user","content":"next"}]}`
 	raw := []byte(client)
 	rec := relaySwitch(t, srv, switchLocalTarget, inference.APIFlavorOpenAIResponses, endpointResponses, raw, nil)
 
@@ -127,7 +128,7 @@ func TestProxyNativeStripsMintedReasoningBeforeSend(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 1", len(calls))
 	}
 	if bytes.Contains(calls[0], []byte(`"reasoning"`)) {
-		t.Fatalf("upstream body still carries the minted reasoning item: %s", calls[0])
+		t.Fatalf("upstream body still carries the vendor reasoning item: %s", calls[0])
 	}
 	if !bytes.Contains(calls[0], []byte(`"next"`)) || !bytes.Contains(calls[0], []byte(`"upstream-model"`)) {
 		t.Fatalf("upstream body lost the rest of the request: %s", calls[0])
@@ -183,7 +184,7 @@ func TestProxyNativeRetriesAnthropicSignatureRefusal(t *testing.T) {
 	srv := newNativeProxyTestServer(prov, false, true)
 	body := `{"model":"gw-model","stream":true,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"sig-from-a"}]},{"role":"user","content":"next"}]}`
 
-	rec := relaySwitch(t, srv, switchLocalTarget, inference.APIFlavorAnthropicMessages, endpointMessages, []byte(body), http.Header{"x-claude-code-session-id": []string{"cc-1"}})
+	rec := relaySwitch(t, srv, switchAnthropicTarget, inference.APIFlavorAnthropicMessages, endpointMessages, []byte(body), http.Header{"x-claude-code-session-id": []string{"cc-1"}})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())

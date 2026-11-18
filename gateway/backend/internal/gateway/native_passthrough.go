@@ -905,7 +905,7 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// through this whole function again so it gets one usage row. The blobs are
 	// recorded in the session memo first, so a follow-up request of the session is
 	// filtered before its first send (the recorded set is safe: the first refused
-	// request after a switch only carries blobs from before it). foreignRetried
+	// request after a switch only carries blobs from before it; after a restart, another instance or TTL expiry the next refusal records the new target's own earlier blobs too, so they are filtered for the grace window). foreignRetried
 	// keeps it to one retry; a body with nothing to remove is not sent again, and
 	// any other answer -- every 429, 5xx and other 400 -- is relayed as it came.
 	if switchApplies && !rel.foreignRetried && peekForeignReasoningRefusal(resp) {

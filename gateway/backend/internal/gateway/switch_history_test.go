@@ -444,3 +444,47 @@ func TestIsForeignReasoningRefusal(t *testing.T) {
 		}
 	}
 }
+
+// An unswitched local session replays its own reasoning items (llama.cpp:
+// reasoning_text plus "encrypted_content":"", vLLM likely null). Neither shape
+// may be parsed or rewritten.
+func TestSanitizeSwitchHistoryLocalOwnReasoningShapesNotParsed(t *testing.T) {
+	const tail = `{"type":"message","role":"user","content":"next"}]}`
+	shapes := map[string]string{
+		"llama.cpp empty":   `{"input":[{"type":"reasoning","id":"rs_1","content":[{"type":"reasoning_text","text":"x"}],"summary":[],"encrypted_content":""},` + tail,
+		"vllm null":         `{"input":[{"type":"reasoning","id":"rs_1","content":[{"type":"reasoning_text","text":"x"}],"summary":[],"encrypted_content":null},` + tail,
+		"spaced empty":      "{\"input\":[{\"type\":\"reasoning\",\"encrypted_content\" : \"\",\"summary\":[]}," + tail,
+		"text only, no key": `{"input":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"x"}]},` + tail,
+	}
+	for name, body := range shapes {
+		t.Run(name, func(t *testing.T) {
+			raw := []byte(body)
+			before := switchHistoryParses.Load()
+			out, dropped, stripped := sanitizeSwitchHistory(raw, flavorResp, switchClassLocal)
+			if dropped+stripped != 0 || &out[0] != &raw[0] || len(out) != len(raw) {
+				t.Fatalf("want same slice, got %d/%d", dropped, stripped)
+			}
+			if n := switchHistoryParses.Load() - before; n != 0 {
+				t.Fatalf("parses = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// A vendor-shaped item (non-empty blob) next to an own item is still handled.
+func TestSanitizeSwitchHistoryLocalVendorBlobStillHandled(t *testing.T) {
+	raw := []byte(`{"input":[{"type":"reasoning","encrypted_content":"gAAA","summary":[]},` +
+		`{"type":"reasoning","encrypted_content":"gAAB","summary":[{"type":"summary_text","text":"t"}]},` +
+		`{"type":"reasoning","encrypted_content":"","content":[{"type":"reasoning_text","text":"own"}]}]}`)
+	out, dropped, stripped := sanitizeSwitchHistory(raw, flavorResp, switchClassLocal)
+	if dropped != 1 || stripped != 1 {
+		t.Fatalf("dropped/stripped = %d/%d, want 1/1", dropped, stripped)
+	}
+	items := decodeList(t, out, "input")
+	if len(items) != 2 {
+		t.Fatalf("unexpected items: %v", items)
+	}
+	if _, ok := items[0]["encrypted_content"]; ok {
+		t.Fatalf("blob must be stripped: %v", items[0])
+	}
+}
