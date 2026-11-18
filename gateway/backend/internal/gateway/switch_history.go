@@ -100,48 +100,50 @@ func sanitizeSwitchHistory(raw []byte, flavor string, class switchTargetClass) (
 // keeps requests that need nothing from being parsed at all.
 var switchHistoryParses atomic.Int64
 
-// hasKeyWithValue reports whether raw contains key, then optional whitespace,
-// ':', optional whitespace and one of the literal values.
-func hasKeyWithValue(raw []byte, key string, values ...string) bool {
+// jsonWhitespace is the insignificant whitespace JSON allows between tokens.
+const jsonWhitespace = " \t\r\n"
+
+// anyValueAfterKey reports whether raw contains key, then optional whitespace,
+// ':', optional whitespace and a value for which match returns true; match
+// sees the bytes from the value's first byte to the end of raw.
+func anyValueAfterKey(raw []byte, key string, match func(value []byte) bool) bool {
+	k := []byte(key)
 	for off := 0; ; {
-		i := bytes.Index(raw[off:], []byte(key))
+		i := bytes.Index(raw[off:], k)
 		if i < 0 {
 			return false
 		}
-		rest := raw[off+i+len(key):]
-		off += i + len(key)
-		rest = bytes.TrimLeft(rest, " \t\r\n")
+		off += i + len(k)
+		rest := bytes.TrimLeft(raw[off:], jsonWhitespace)
 		if len(rest) == 0 || rest[0] != ':' {
 			continue
 		}
-		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+		if match(bytes.TrimLeft(rest[1:], jsonWhitespace)) {
+			return true
+		}
+	}
+}
+
+// hasKeyWithValue reports whether raw contains key, then optional whitespace,
+// ':', optional whitespace and one of the literal values.
+func hasKeyWithValue(raw []byte, key string, values ...string) bool {
+	return anyValueAfterKey(raw, key, func(rest []byte) bool {
 		for _, v := range values {
 			if bytes.HasPrefix(rest, []byte(v)) {
 				return true
 			}
 		}
-	}
+		return false
+	})
 }
 
 // hasNonEmptyStringValue reports whether raw contains key, then optional
 // whitespace, ':', optional whitespace and a JSON string that is not empty
 // (a '"' followed by a character other than '"').
 func hasNonEmptyStringValue(raw []byte, key string) bool {
-	for off := 0; ; {
-		i := bytes.Index(raw[off:], []byte(key))
-		if i < 0 {
-			return false
-		}
-		off += i + len(key)
-		rest := bytes.TrimLeft(raw[off:], " \t\r\n")
-		if len(rest) == 0 || rest[0] != ':' {
-			continue
-		}
-		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
-		if len(rest) >= 2 && rest[0] == '"' && rest[1] != '"' {
-			return true
-		}
-	}
+	return anyValueAfterKey(raw, key, func(rest []byte) bool {
+		return len(rest) >= 2 && rest[0] == '"' && rest[1] != '"'
+	})
 }
 
 // rewriteHistory decodes the top level of raw, applies edit to the array under
@@ -213,6 +215,27 @@ func hasReadableReasoningText(item map[string]json.RawMessage) bool {
 	return false
 }
 
+// reasoningEdit decides what one reasoning item becomes for class: dropped
+// whole, or stripped of the named field (strip == "" keeps it unchanged).
+func reasoningEdit(m map[string]json.RawMessage, class switchTargetClass) (drop bool, strip string) {
+	if class == switchClassOpenAIVendor {
+		if !isNonEmptyJSONString(m["encrypted_content"]) {
+			return true, ""
+		}
+		if isNonEmptyJSONArray(m["content"]) {
+			return false, "content"
+		}
+		return false, ""
+	}
+	if !hasReadableReasoningText(m) {
+		return true, ""
+	}
+	if isNonEmptyJSONString(m["encrypted_content"]) {
+		return false, "encrypted_content"
+	}
+	return false, ""
+}
+
 func sanitizeResponsesItems(items []json.RawMessage, class switchTargetClass) ([]json.RawMessage, int, int, bool) {
 	var dropped, stripped int
 	out := make([]json.RawMessage, 0, len(items))
@@ -222,36 +245,19 @@ func sanitizeResponsesItems(items []json.RawMessage, class switchTargetClass) ([
 			out = append(out, it)
 			continue
 		}
-		strip := ""
-		if class == switchClassOpenAIVendor {
-			if !isNonEmptyJSONString(m["encrypted_content"]) {
-				dropped++
-				continue
-			}
-			if isNonEmptyJSONArray(m["content"]) {
-				strip = "content"
-			}
-		} else {
-			if !hasReadableReasoningText(m) {
-				dropped++
-				continue
-			}
-			if isNonEmptyJSONString(m["encrypted_content"]) {
-				strip = "encrypted_content"
-			}
-		}
-		if strip == "" {
-			out = append(out, it)
+		drop, strip := reasoningEdit(m, class)
+		if drop {
+			dropped++
 			continue
 		}
-		delete(m, strip)
-		nb, err := marshalNoEscape(m)
-		if err != nil {
-			out = append(out, it)
-			continue
+		if strip != "" {
+			delete(m, strip)
+			if nb, err := marshalNoEscape(m); err == nil {
+				stripped++
+				it = nb
+			}
 		}
-		stripped++
-		out = append(out, nb)
+		out = append(out, it)
 	}
 	return out, dropped, stripped, dropped+stripped > 0
 }
@@ -259,50 +265,61 @@ func sanitizeResponsesItems(items []json.RawMessage, class switchTargetClass) ([
 // sanitizeAnthropicThinking removes unsigned thinking blocks from assistant
 // turns, then removes turns left empty and merges the user turns that meet.
 func sanitizeAnthropicThinking(msgs []json.RawMessage) ([]json.RawMessage, int, int, bool) {
-	var dropped int
+	return filterAssistantBlocks(msgs, func(b map[string]json.RawMessage) bool {
+		return string(b["type"]) == `"thinking"` && !isNonEmptyJSONString(b["signature"])
+	})
+}
+
+// filterAssistantBlocks removes from every assistant turn the content blocks
+// for which drop returns true, then removes turns left empty and merges the user
+// turns that meet. Nothing removed returns msgs unchanged.
+func filterAssistantBlocks(msgs []json.RawMessage, drop func(map[string]json.RawMessage) bool) ([]json.RawMessage, int, int, bool) {
+	removed := 0
 	out := make([]json.RawMessage, 0, len(msgs))
 	for _, msg := range msgs {
-		var m map[string]json.RawMessage
-		if json.Unmarshal(msg, &m) != nil || string(m["role"]) != `"assistant"` {
-			out = append(out, msg)
-			continue
-		}
-		var blocks []json.RawMessage
-		if json.Unmarshal(m["content"], &blocks) != nil {
-			out = append(out, msg)
-			continue
-		}
-		kept := make([]json.RawMessage, 0, len(blocks))
-		for _, b := range blocks {
-			var bm map[string]json.RawMessage
-			if json.Unmarshal(b, &bm) == nil && string(bm["type"]) == `"thinking"` &&
-				!isNonEmptyJSONString(bm["signature"]) {
-				dropped++
-				continue
-			}
-			kept = append(kept, b)
-		}
-		if len(kept) == len(blocks) {
-			out = append(out, msg)
-			continue
-		}
-		nc, err := marshalNoEscape(kept)
-		if err != nil {
-			out = append(out, msg)
-			continue
-		}
-		m["content"] = nc
-		nb, err := marshalNoEscape(m)
-		if err != nil {
-			out = append(out, msg)
-			continue
-		}
+		nb, n := filterAssistantTurn(msg, drop)
+		removed += n
 		out = append(out, nb)
 	}
-	if dropped == 0 {
+	if removed == 0 {
 		return msgs, 0, 0, false
 	}
-	return dropEmptyAssistantTurnsAndMergeUsers(out), dropped, 0, true
+	return dropEmptyAssistantTurnsAndMergeUsers(out), removed, 0, true
+}
+
+// filterAssistantTurn applies drop to the content blocks of one assistant
+// message; any other or unparseable message comes back unchanged with n == 0.
+func filterAssistantTurn(msg json.RawMessage, drop func(map[string]json.RawMessage) bool) (json.RawMessage, int) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(msg, &m) != nil || string(m["role"]) != `"assistant"` {
+		return msg, 0
+	}
+	var blocks []json.RawMessage
+	if json.Unmarshal(m["content"], &blocks) != nil {
+		return msg, 0
+	}
+	kept := make([]json.RawMessage, 0, len(blocks))
+	for _, b := range blocks {
+		var bm map[string]json.RawMessage
+		if json.Unmarshal(b, &bm) == nil && drop(bm) {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	n := len(blocks) - len(kept)
+	if n == 0 {
+		return msg, 0
+	}
+	nc, err := marshalNoEscape(kept)
+	if err != nil {
+		return msg, 0
+	}
+	m["content"] = nc
+	nb, err := marshalNoEscape(m)
+	if err != nil {
+		return msg, 0
+	}
+	return nb, n
 }
 
 // dropEmptyAssistantTurnsAndMergeUsers removes every assistant message whose
@@ -436,29 +453,48 @@ func opaqueBlobHashes(raw []byte, flavor string) []blobHash {
 	var out []blobHash
 	for _, it := range items {
 		var m map[string]json.RawMessage
-		if json.Unmarshal(it, &m) != nil {
-			continue
-		}
-		if flavor == inference.APIFlavorOpenAIResponses {
-			if h, ok := blobOf(flavor, m); ok {
-				out = append(out, h)
-			}
-			continue
-		}
-		if string(m["role"]) != `"assistant"` {
-			continue
-		}
-		var blocks []map[string]json.RawMessage
-		if json.Unmarshal(m["content"], &blocks) != nil {
-			continue
-		}
-		for _, b := range blocks {
-			if h, ok := blobOf(flavor, b); ok {
-				out = append(out, h)
-			}
+		if json.Unmarshal(it, &m) == nil {
+			out = append(out, itemBlobHashes(flavor, m)...)
 		}
 	}
 	return out
+}
+
+// itemBlobHashes returns the blob hashes one history entry carries: its own
+// blob for a responses item, the blobs of its content blocks for an assistant
+// message.
+func itemBlobHashes(flavor string, m map[string]json.RawMessage) []blobHash {
+	if flavor == inference.APIFlavorOpenAIResponses {
+		if h, ok := blobOf(flavor, m); ok {
+			return []blobHash{h}
+		}
+		return nil
+	}
+	if string(m["role"]) != `"assistant"` {
+		return nil
+	}
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(m["content"], &blocks) != nil {
+		return nil
+	}
+	var out []blobHash
+	for _, b := range blocks {
+		if h, ok := blobOf(flavor, b); ok {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// blobInSet reports whether the item or block m carries a blob whose hash is
+// in drop.
+func blobInSet(flavor string, m map[string]json.RawMessage, drop map[blobHash]struct{}) bool {
+	h, ok := blobOf(flavor, m)
+	if !ok {
+		return false
+	}
+	_, hit := drop[h]
+	return hit
 }
 
 // removeBlobs removes the reasoning items/blocks whose blob hash is in drop and
@@ -471,25 +507,13 @@ func removeBlobs(raw []byte, flavor string, drop map[blobHash]struct{}) (out []b
 	switch flavor {
 	case inference.APIFlavorOpenAIResponses:
 		out, removed, _ = rewriteHistory(raw, "input", func(items []json.RawMessage) ([]json.RawMessage, int, int, bool) {
-			kept := make([]json.RawMessage, 0, len(items))
-			n := 0
-			for _, it := range items {
-				var m map[string]json.RawMessage
-				if json.Unmarshal(it, &m) == nil {
-					if h, ok := blobOf(flavor, m); ok {
-						if _, hit := drop[h]; hit {
-							n++
-							continue
-						}
-					}
-				}
-				kept = append(kept, it)
-			}
-			return kept, n, 0, n > 0
+			return removeResponsesBlobs(items, drop)
 		})
 	case inference.APIFlavorAnthropicMessages:
 		out, removed, _ = rewriteHistory(raw, "messages", func(msgs []json.RawMessage) ([]json.RawMessage, int, int, bool) {
-			return removeAnthropicBlobs(msgs, drop)
+			return filterAssistantBlocks(msgs, func(b map[string]json.RawMessage) bool {
+				return blobInSet(inference.APIFlavorAnthropicMessages, b, drop)
+			})
 		})
 	default:
 		return raw, 0
@@ -497,54 +521,17 @@ func removeBlobs(raw []byte, flavor string, drop map[blobHash]struct{}) (out []b
 	return out, removed
 }
 
-func removeAnthropicBlobs(msgs []json.RawMessage, drop map[blobHash]struct{}) ([]json.RawMessage, int, int, bool) {
-	removed := 0
-	out := make([]json.RawMessage, 0, len(msgs))
-	for _, msg := range msgs {
+func removeResponsesBlobs(items []json.RawMessage, drop map[blobHash]struct{}) ([]json.RawMessage, int, int, bool) {
+	kept := make([]json.RawMessage, 0, len(items))
+	for _, it := range items {
 		var m map[string]json.RawMessage
-		if json.Unmarshal(msg, &m) != nil || string(m["role"]) != `"assistant"` {
-			out = append(out, msg)
+		if json.Unmarshal(it, &m) == nil && blobInSet(inference.APIFlavorOpenAIResponses, m, drop) {
 			continue
 		}
-		var blocks []json.RawMessage
-		if json.Unmarshal(m["content"], &blocks) != nil {
-			out = append(out, msg)
-			continue
-		}
-		kept := make([]json.RawMessage, 0, len(blocks))
-		for _, b := range blocks {
-			var bm map[string]json.RawMessage
-			if json.Unmarshal(b, &bm) == nil {
-				if h, ok := blobOf(inference.APIFlavorAnthropicMessages, bm); ok {
-					if _, hit := drop[h]; hit {
-						removed++
-						continue
-					}
-				}
-			}
-			kept = append(kept, b)
-		}
-		if len(kept) == len(blocks) {
-			out = append(out, msg)
-			continue
-		}
-		nc, err := marshalNoEscape(kept)
-		if err != nil {
-			out = append(out, msg)
-			continue
-		}
-		m["content"] = nc
-		nb, err := marshalNoEscape(m)
-		if err != nil {
-			out = append(out, msg)
-			continue
-		}
-		out = append(out, nb)
+		kept = append(kept, it)
 	}
-	if removed == 0 {
-		return msgs, 0, 0, false
-	}
-	return dropEmptyAssistantTurnsAndMergeUsers(out), removed, 0, true
+	n := len(items) - len(kept)
+	return kept, n, 0, n > 0
 }
 
 // isForeignReasoningRefusal reports whether an upstream answer is the 400 a
