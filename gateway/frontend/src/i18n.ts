@@ -393,6 +393,13 @@ const de = {
   chatSpeechLanguageDefault: 'Standard (Modell)',
   chatSpeechLanguageHint:
     'ISO-639-1-Code der Sprache, in der gesprochen wird, zum Beispiel de oder en. Leer lassen für den Standard des Modells.',
+  // The voice-design field of the speech settings, shown ONLY for a model the operator marked
+  // speech_voice_design: a natural-language description of the voice, sent upstream as the
+  // OpenAI-style `instructions`. Blank sends nothing.
+  chatSpeechVoiceDescription: 'Stimmbeschreibung',
+  chatSpeechVoiceDescriptionPlaceholder: 'z. B. eine ruhige, tiefe Männerstimme, leicht heiser',
+  chatSpeechVoiceDescriptionHint:
+    'Beschreibe die Stimme in eigenen Worten; das Modell gestaltet die Stimme danach. Leer lassen für die gewählte Stimme bzw. den Standard des Modells.',
   chatSpeechFormatHint: 'Das Audio wird immer als WAV zurückgegeben.',
   // The streaming toggle of the speech settings (ADR-068), shown ONLY for a model the gateway
   // says it can stream (it streams and its output rate is known). On by default: the audio
@@ -1196,6 +1203,9 @@ const de = {
   mappingSpeechClone: 'Benötigt Referenzstimme (Klon)',
   mappingSpeechCloneHint:
     'Ja kennzeichnet ein Modell, das Sprache nur in einer mitgeschickten Referenzstimme erzeugt. Es schaltet KEIN Stimmklonen frei: Das Modell wird aus der Sprachmodell-Auswahl des Portal-Chats ausgeblendet, weil eine Chat-Anfrage keine Referenzstimme mitschicken kann (außer das Gateway hat für das Modell vorkonfigurierte Stimmen gefunden). Bei audio.cpp wird es automatisch aus dem Feld „task“ in /v1/models („clon“) gesetzt; setze es nur für das Modell einer anderen Engine auf Ja, das eine Referenzstimme verlangt.',
+  mappingSpeechVoiceDesign: 'Stimmdesign (Stimmbeschreibung)',
+  mappingSpeechVoiceDesignHint:
+    'Ja kennzeichnet ein Modell, das eine Stimmbeschreibung in natürlicher Sprache annimmt (Voice Design): Der Sprach-Composer des Portal-Chats bietet dann ein Feld „Stimmbeschreibung“ an und schickt den Text als „instructions“ an das Modell. Keine Engine-Abfrage setzt dies; nötig ist es für Engines ohne Capability-Abfrage wie sglang_omni, etwa für Ming-3.0-tts-0.5B mit Voice-Design-Unterstützung.',
   mappingTranscriptionStreaming: 'Transkription gestreamt',
   mappingTranscriptionStreamingUnknownHint:
     'Unbekannt: Eine Transkription mit stream=true wird als einmalige, gepufferte Antwort beantwortet. Bei audio.cpp setzt das Gateway bzw. der Server-Agent dies selbst aus dem Feld „mode“ in /v1/models („streaming“). Andere Engines wie sglang_omni werden nicht abgefragt: Setze es dort auf Ja, damit das Gateway das Transkript als Stream weiterreicht.',
@@ -4640,6 +4650,11 @@ const en: PortalMessages = {
   chatSpeechLanguageDefault: 'Default (model)',
   chatSpeechLanguageHint:
     'ISO-639-1 code of the language to speak in, for example de or en. Leave blank for the model default.',
+  // See the German block: shown only for a model marked speech_voice_design.
+  chatSpeechVoiceDescription: 'Voice description',
+  chatSpeechVoiceDescriptionPlaceholder: 'e.g. a calm, deep male voice, slightly hoarse',
+  chatSpeechVoiceDescriptionHint:
+    'Describe the voice in your own words; the model designs the voice from it. Leave blank for the selected voice or the model default.',
   chatSpeechFormatHint: 'The audio is always returned as WAV.',
   // See the German block: shown only for a model the gateway can stream.
   chatSpeechStream: 'Play while generating (streaming)',
@@ -5257,6 +5272,9 @@ const en: PortalMessages = {
   mappingSpeechClone: 'Requires a reference voice (clone)',
   mappingSpeechCloneHint:
     'Yes marks a model that synthesises speech only in a reference voice sent with the request. It does NOT enable voice cloning: it hides the model from the portal chat\'s speech model picker, because a chat request cannot send a reference voice (unless the gateway has found preset voices for the model). For audio.cpp it is set automatically from the "task" field of /v1/models ("clon"); set it to Yes only for another engine\'s model that requires a reference voice.',
+  mappingSpeechVoiceDesign: 'Voice design (voice description)',
+  mappingSpeechVoiceDesignHint:
+    'Yes marks a model that accepts a natural-language voice description (voice design): the portal chat\'s speech composer then offers a "Voice description" field and sends its text to the model as "instructions". No engine probe sets this; it is needed for engines without a capability probe such as sglang_omni, for example Ming-3.0-tts-0.5B with voice-design support.',
   mappingTranscriptionStreaming: 'Streamed transcription',
   mappingTranscriptionStreamingUnknownHint:
     'Unknown: a transcription request with stream=true is answered with one buffered response. For audio.cpp the gateway or the server agent sets this itself from the "mode" field of /v1/models ("streaming"). Other engines such as sglang_omni are not probed: set it to Yes there so the gateway relays the transcript as a stream.',

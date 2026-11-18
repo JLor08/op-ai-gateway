@@ -326,6 +326,61 @@ func TestChatAudioSettingsLanguageWireShape(t *testing.T) {
 	}
 }
 
+// The voice-design description is declared LAST, after Language: a chat stored before the
+// field existed decodes with Instructions "" and re-encodes to the very same bytes, and a
+// set description is emitted after every earlier knob, so no stored document's bytes move.
+func TestChatAudioSettingsInstructionsWireShape(t *testing.T) {
+	const stored = `{"voice":"af_bella","speed":1.25,"passthrough":{"n":3},"stream":false,"keep_last_audio":3,"language":"de"}`
+	var back ChatAudioSettings
+	if err := json.Unmarshal([]byte(stored), &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Instructions != "" {
+		t.Fatalf("a document without instructions must read as unset, got %q", back.Instructions)
+	}
+	if again, _ := json.Marshal(back); string(again) != stored {
+		t.Fatalf("re-marshal = %s, want the stored bytes %s", again, stored)
+	}
+
+	back.Instructions = "a calm, deep male voice"
+	withDesign, err := json.Marshal(back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := strings.TrimSuffix(stored, "}") + `,"instructions":"a calm, deep male voice"}`; string(withDesign) != want {
+		t.Fatalf("marshal = %s, want instructions appended last: %s", withDesign, want)
+	}
+	if b, _ := json.Marshal(ChatAudioSettings{Instructions: "x"}); string(b) != `{"instructions":"x"}` {
+		t.Fatalf("a lone instructions must marshal as {\"instructions\":\"x\"}, got %s", b)
+	}
+}
+
+// A speech thread's voice-design description is persisted with its audio settings and
+// handed back to the run, like every other first-class knob.
+func TestPrepareChatRunPersistsTheSpeechInstructions(t *testing.T) {
+	ctx := context.Background()
+	svc := NewService(ServiceDeps{Chats: store.NewMemoryChatStore(0)})
+	owner := chatToken("usr_a")
+	created, _ := svc.CreateChat(ctx, owner, CreateChatRequest{
+		Content: json.RawMessage(`{"settings":{},"messages":[]}`),
+	})
+
+	_, settings, err := svc.PrepareChatRun(ctx, owner, created.ID, PrepareRunRequest{
+		UserMessage: json.RawMessage(`{"id":"u1","role":"user","content":"read this aloud"}`),
+		Settings:    ChatRunSettings{Model: "ming", Kind: chatKindSpeech, Audio: &ChatAudioSettings{Instructions: "a calm, deep male voice"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.Audio == nil || settings.Audio.Instructions != "a calm, deep male voice" {
+		t.Fatalf("instructions not returned: %+v", settings.Audio)
+	}
+	got, _ := svc.GetChat(ctx, owner, created.ID)
+	if !strings.Contains(storedSettings(t, got.Content), `"audio":{"instructions":"a calm, deep male voice"}`) {
+		t.Fatalf("instructions not persisted: %s", got.Content)
+	}
+}
+
 // The speech-streaming choice (ADR-068): unset stays off the wire so an existing thread's
 // persisted settings are byte-identical, while an explicit false -- the opt-out -- is
 // emitted and survives the round trip (a plain bool with omitempty would lose it).

@@ -349,6 +349,11 @@ export function MappingForm({
   const [speechStreaming, setSpeechStreaming] = useState<CapabilityChoice>(speechStreamingSeed);
   const [speechCloneSeed] = useState<CapabilityChoice>(() => capabilitySeed(row, 'speech_clone'));
   const [speechClone, setSpeechClone] = useState<CapabilityChoice>(speechCloneSeed);
+  const [speechVoiceDesignSeed] = useState<CapabilityChoice>(() =>
+    capabilitySeed(row, 'speech_voice_design'),
+  );
+  const [speechVoiceDesign, setSpeechVoiceDesign] =
+    useState<CapabilityChoice>(speechVoiceDesignSeed);
   const [transcriptionStreamingSeed] = useState<CapabilityChoice>(() =>
     capabilitySeed(row, 'transcription_streaming'),
   );
@@ -501,6 +506,11 @@ export function MappingForm({
       { capability: 'speech', value: speechCapable, seed: speechCapableSeed },
       { capability: 'speech_streaming', value: speechStreaming, seed: speechStreamingSeed },
       { capability: 'speech_clone', value: speechClone, seed: speechCloneSeed },
+      {
+        capability: 'speech_voice_design',
+        value: speechVoiceDesign,
+        seed: speechVoiceDesignSeed,
+      },
       { capability: 'transcription', value: transcriptionCapable, seed: transcriptionCapableSeed },
       {
         capability: 'transcription_streaming',
@@ -893,6 +903,31 @@ export function MappingForm({
           <option value="">{t.mappingCapabilityUnknown}</option>
           <option value="yes">{t.mappingCapabilityYes}</option>
           {speechCloneSeed === 'no' && (
+            <option value="no" disabled>
+              {t.mappingCapabilityNo}
+            </option>
+          )}
+        </SelectField>
+        {/* speech_voice_design marks a model that accepts a natural-language
+            voice description (voice design): the portal chat's speech composer
+            then offers a description field and sends it upstream as the
+            OpenAI-style `instructions`. No probe states it -- sglang_omni has no
+            capability probe (ADR-103), and that is where a voice-design model
+            such as Ming-3.0-tts-0.5B runs -- so the operator's manual yes is the
+            only enablement. Like its siblings it offers unknown and yes only,
+            sends only when moved from the seed, and renders a stored no (none is
+            expected) disabled instead of blank. Its hint is shown in every
+            state, because it says what the yes turns on. */}
+        <SelectField
+          id="mapping-speech-voice-design"
+          label={t.mappingSpeechVoiceDesign}
+          value={speechVoiceDesign}
+          onChange={(e) => setSpeechVoiceDesign(e.target.value as CapabilityChoice)}
+          helperText={t.mappingSpeechVoiceDesignHint}
+        >
+          <option value="">{t.mappingCapabilityUnknown}</option>
+          <option value="yes">{t.mappingCapabilityYes}</option>
+          {speechVoiceDesignSeed === 'no' && (
             <option value="no" disabled>
               {t.mappingCapabilityNo}
             </option>

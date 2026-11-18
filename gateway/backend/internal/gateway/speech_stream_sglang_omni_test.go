@@ -512,7 +512,7 @@ func TestSpeechStreamToSGLangOmniStatesPCMAndSSE(t *testing.T) {
 		body  string
 		added map[string]any // the exact keys the relay adds or sets; nil: the client's body, byte for byte
 	}{
-		{name: "neither field", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"voice":"alba","speed":1.25}`, added: map[string]any{"response_format": "pcm", "stream_format": "sse"}},
+		{name: "neither field", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"voice":"alba","speed":1.25,"instructions":"a calm, deep male voice"}`, added: map[string]any{"response_format": "pcm", "stream_format": "sse"}},
 		{name: "a null response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":null,"stream_format":"sse"}`, added: map[string]any{"response_format": "pcm"}},
 		{name: "an empty response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"response_format":"","stream_format":"sse"}`, added: map[string]any{"response_format": "pcm"}},
 		{name: "the raw shape, no response_format", body: `{"model":"omni-voice","input":"Hello there.","stream":true,"stream_format":"audio"}`, added: map[string]any{"response_format": "pcm"}},

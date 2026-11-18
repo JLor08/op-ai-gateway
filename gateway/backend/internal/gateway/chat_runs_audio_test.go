@@ -56,7 +56,7 @@ func decodeSpeechBody(t *testing.T, raw []byte) map[string]any {
 // defaults (voice, speed, ...). response_format is deliberately absent too -- the
 // endpoint answers WAV by default and refuses everything else.
 func TestBuildSpeechBodyWithoutSettingsIsModelAndInput(t *testing.T) {
-	raw, err := buildSpeechBody(speechRunPrep())
+	raw, err := buildSpeechBody(speechRunPrep(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestBuildSpeechBodyWithoutSettingsIsModelAndInput(t *testing.T) {
 func TestBuildSpeechBodyWithEmptySettingsIsModelAndInput(t *testing.T) {
 	prep := speechRunPrep()
 	prep.Settings.Audio = &portal.ChatAudioSettings{}
-	raw, err := buildSpeechBody(prep)
+	raw, err := buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestBuildSpeechBodyForwardsOnlyTheSetSettings(t *testing.T) {
 	prep := speechRunPrep()
 	speed := 1.25
 	prep.Settings.Audio = &portal.ChatAudioSettings{Voice: "alloy", Speed: &speed}
-	raw, err := buildSpeechBody(prep)
+	raw, err := buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestBuildSpeechBodyForwardsOnlyTheSetSettings(t *testing.T) {
 
 	// Only a voice: speed is omitted.
 	prep.Settings.Audio = &portal.ChatAudioSettings{Voice: "alloy"}
-	raw, err = buildSpeechBody(prep)
+	raw, err = buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestBuildSpeechBodyForwardsOnlyTheSetSettings(t *testing.T) {
 
 	// Only a speed: the empty voice is omitted.
 	prep.Settings.Audio = &portal.ChatAudioSettings{Speed: &speed}
-	raw, err = buildSpeechBody(prep)
+	raw, err = buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestBuildSpeechBodyForwardsOnlyTheSetSettings(t *testing.T) {
 	// so it is forwarded and left to the model's own range check.
 	zero := 0.0
 	prep.Settings.Audio = &portal.ChatAudioSettings{Speed: &zero}
-	raw, err = buildSpeechBody(prep)
+	raw, err = buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestBuildSpeechBodyMergesThePassthrough(t *testing.T) {
 			"extra":        json.RawMessage(`{"temperature":0.7}`),
 		},
 	}
-	raw, err := buildSpeechBody(prep)
+	raw, err := buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestBuildSpeechBodyRejectsAReservedPassthroughKey(t *testing.T) {
 					key:            json.RawMessage(`"evil"`),
 				},
 			}
-			raw, err := buildSpeechBody(prep)
+			raw, err := buildSpeechBody(prep, false)
 			if !errors.Is(err, errSpeechPassthroughReserved) {
 				t.Fatalf("buildSpeechBody = (%s, %v), want errSpeechPassthroughReserved", raw, err)
 			}
@@ -217,7 +217,7 @@ func TestBuildSpeechBodyFirstClassSettingWinsOverAPassthroughTwin(t *testing.T) 
 			"Speed": json.RawMessage(`9`),
 		},
 	}
-	raw, err := buildSpeechBody(prep)
+	raw, err := buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestBuildSpeechBodyFirstClassSettingWinsOverAPassthroughTwin(t *testing.T) 
 	prep.Settings.Audio = &portal.ChatAudioSettings{
 		Passthrough: map[string]json.RawMessage{"voice": json.RawMessage(`"echo"`)},
 	}
-	raw, err = buildSpeechBody(prep)
+	raw, err = buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,7 @@ func TestBuildSpeechBodyLanguage(t *testing.T) {
 		t.Helper()
 		prep := speechRunPrep()
 		prep.Settings.Audio = audio
-		raw, err := buildSpeechBody(prep)
+		raw, err := buildSpeechBody(prep, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -300,6 +300,99 @@ func TestBuildSpeechBodyLanguage(t *testing.T) {
 	})
 }
 
+// The thread's voice description (voice design) is a first-class top-level "instructions"
+// field, the OpenAI speech request's own: forwarded when set, omitted when not, and -- like
+// voice, speed and language -- the visible control that wins over a passthrough twin, which
+// is not sent a second time (not even under another case). `instructions` is not a
+// reserved field, so with the control unset a passthrough instructions is still the only
+// statement of it, the way a thread stored before the field existed carries it. All of this
+// is with the run's voice-design gate open; TestBuildSpeechBodyInstructionsGateClosed pins
+// the closed gate.
+func TestBuildSpeechBodyInstructions(t *testing.T) {
+	const design = "a calm, deep male voice"
+	build := func(audio *portal.ChatAudioSettings) (map[string]any, []byte) {
+		t.Helper()
+		prep := speechRunPrep()
+		prep.Settings.Audio = audio
+		raw, err := buildSpeechBody(prep, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decodeSpeechBody(t, raw), raw
+	}
+
+	t.Run("set is forwarded top-level", func(t *testing.T) {
+		body, raw := build(&portal.ChatAudioSettings{Instructions: design})
+		if body["instructions"] != design || len(body) != 3 {
+			t.Fatalf("want model/input/instructions, got: %s", raw)
+		}
+	})
+
+	t.Run("unset is omitted", func(t *testing.T) {
+		body, raw := build(&portal.ChatAudioSettings{Voice: "alloy", Language: "de"})
+		if _, ok := body["instructions"]; ok {
+			t.Fatalf("an unset instructions must be omitted, not sent: %s", raw)
+		}
+	})
+
+	t.Run("first-class wins over a passthrough twin and is sent once", func(t *testing.T) {
+		for _, twin := range []string{"instructions", "Instructions", "INSTRUCTIONS"} {
+			body, raw := build(&portal.ChatAudioSettings{
+				Instructions: design,
+				Passthrough:  map[string]json.RawMessage{twin: json.RawMessage(`"a bright, high voice"`)},
+			})
+			if body["instructions"] != design || len(body) != 3 {
+				t.Fatalf("twin %q: the first-class instructions must win, got: %s", twin, raw)
+			}
+			if n := strings.Count(strings.ToLower(string(raw)), `"instructions"`); n != 1 {
+				t.Fatalf("twin %q: instructions must be sent exactly once, got %d in %s", twin, n, raw)
+			}
+		}
+	})
+
+	t.Run("a passthrough instructions goes through when the control is unset", func(t *testing.T) {
+		body, raw := build(&portal.ChatAudioSettings{
+			Passthrough: map[string]json.RawMessage{"instructions": json.RawMessage(`"a bright, high voice"`)},
+		})
+		if body["instructions"] != "a bright, high voice" {
+			t.Fatalf("instructions is not reserved, the passthrough one must go through: %s", raw)
+		}
+	})
+}
+
+// With the run's voice-design gate closed (a model not every candidate mapping of which the
+// operator marked speech_voice_design), the thread's first-class description is not sent --
+// on the buffered body and the streamed one alike -- while a passthrough "instructions", the
+// user's own raw JSON, still goes through as before, even beside a gated-off description.
+func TestBuildSpeechBodyInstructionsGateClosed(t *testing.T) {
+	const design = "a calm, deep male voice"
+	for name, build := range map[string]func(PrepareRunResult, bool) ([]byte, error){
+		"buffered": buildSpeechBody,
+		"streamed": buildSpeechStreamBody,
+	} {
+		t.Run(name, func(t *testing.T) {
+			prep := speechRunPrep()
+			prep.Settings.Audio = &portal.ChatAudioSettings{Voice: "alloy", Instructions: design}
+			raw, err := build(prep, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if body := decodeSpeechBody(t, raw); body["instructions"] != nil || body["voice"] != "alloy" {
+				t.Fatalf("a gated-off description must not be sent (the voice still is): %s", raw)
+			}
+
+			prep.Settings.Audio.Passthrough = map[string]json.RawMessage{"instructions": json.RawMessage(`"Speak warmly."`)}
+			raw, err = build(prep, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if body := decodeSpeechBody(t, raw); body["instructions"] != "Speak warmly." {
+				t.Fatalf("the passthrough instructions must still go through with the gate closed: %s", raw)
+			}
+		})
+	}
+}
+
 // A passthrough value that is not valid JSON cannot be marshalled into the body;
 // buildSpeechBody reports it instead of sending a broken request.
 func TestBuildSpeechBodyReportsAnInvalidPassthroughValue(t *testing.T) {
@@ -307,7 +400,7 @@ func TestBuildSpeechBodyReportsAnInvalidPassthroughValue(t *testing.T) {
 	prep.Settings.Audio = &portal.ChatAudioSettings{
 		Passthrough: map[string]json.RawMessage{"instructions": json.RawMessage(`{not json`)},
 	}
-	if raw, err := buildSpeechBody(prep); err == nil {
+	if raw, err := buildSpeechBody(prep, false); err == nil {
 		t.Fatalf("buildSpeechBody = %s, want an error for an invalid raw value", raw)
 	}
 }
@@ -321,7 +414,7 @@ func TestBuildSpeechBodyUsesTheLastUserMessagesText(t *testing.T) {
 		{Role: "assistant", Content: json.RawMessage(`"ok"`)},
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"read this aloud"}]`)},
 	}
-	raw, err := buildSpeechBody(prep)
+	raw, err := buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,7 +429,7 @@ func TestBuildSpeechBodyUsesTheLastUserMessagesText(t *testing.T) {
 func TestBuildSpeechBodyLeavesAnEmptyInputToTheEndpoint(t *testing.T) {
 	prep := speechRunPrep()
 	prep.History = nil
-	raw, err := buildSpeechBody(prep)
+	raw, err := buildSpeechBody(prep, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1260,5 +1353,71 @@ func TestBufferedBareServerUsesTheDefaultCaps(t *testing.T) {
 	}
 	if wavs := committedWAVs(t, raw); len(wavs) != 1 || !bytes.Equal(wavs[0], wav) {
 		t.Fatalf("committed %d parts, want the one WAV, byte for byte", len(wavs))
+	}
+}
+
+// The regression behind the server-side gate: the thread's run request carries its voice
+// description whatever the model (the client no longer drops it), so the chat it stores keeps
+// the description even after a run to a model without voice design -- and the gate, not the
+// client, keeps it out of that model's request. A model every candidate mapping of which is
+// marked (speech_voice_design, yes) gets it upstream.
+func TestSpeechRunGatesTheVoiceDescriptionButAlwaysStoresIt(t *testing.T) {
+	const design = "a calm, deep male voice"
+	for _, tc := range []struct {
+		name    string
+		capable bool
+	}{
+		{"a model without the verdict", false},
+		{"a voice-design model", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loopback, calls := newSpeechRunLoopback(t, http.StatusOK, "audio/wav", speechTestWAV())
+			srv, owner, _, _ := newSpeechRunTestServer(t, loopback.URL)
+			srv.selfBaseURL = loopback.URL
+			// A fresh thread: its first send establishes the speech kind (the fixture's
+			// chat already has a message, which pins it to text).
+			fresh, err := srv.Portal.CreateChat(context.Background(), owner, portal.CreateChatRequest{
+				Content: json.RawMessage(`{"settings":{},"messages":[]}`),
+			})
+			if err != nil {
+				t.Fatalf("CreateChat: %v", err)
+			}
+			chatID := fresh.ID
+			if tc.capable {
+				markVoiceDesign(t, srv, "route-tts", routing.CapabilityYes)
+			}
+
+			rec := startRunViaHandler(srv, chatID, `{"user_message":{"id":"u2","role":"user","content":"Read this aloud."},`+
+				`"settings":{"model":"`+speechGatewayModel+`","kind":"speech","audio":{"voice":"alloy","instructions":"`+design+`"}}}`)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("start = %d, want 201: %s", rec.Code, rec.Body.String())
+			}
+			var started struct {
+				RunID string `json:"run_id"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &started); err != nil {
+				t.Fatalf("decode 201: %v", err)
+			}
+			run := srv.ChatRuns.GetByID(owner.UserID, started.RunID)
+			if run == nil {
+				t.Fatal("the started run is not registered")
+			}
+			waitFor(t, func() bool { return run.statusValue() != "running" })
+
+			body := decodeSpeechBody(t, takeSpeechRunCall(t, calls).body)
+			if got, sent := body["instructions"]; sent != tc.capable || (tc.capable && got != design) {
+				t.Fatalf("upstream instructions = %v (sent %v), want sent only to a voice-design model", got, sent)
+			}
+			if body["voice"] != "alloy" {
+				t.Fatalf("upstream voice = %v, want alloy", body["voice"])
+			}
+			chat, err := srv.Portal.GetChat(context.Background(), owner, chatID)
+			if err != nil {
+				t.Fatalf("GetChat: %v", err)
+			}
+			if !strings.Contains(string(chat.Content), `"instructions":"`+design+`"`) {
+				t.Fatalf("the stored chat lost the voice description: %s", chat.Content)
+			}
+		})
 	}
 }

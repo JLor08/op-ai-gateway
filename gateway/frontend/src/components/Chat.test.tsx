@@ -1903,6 +1903,63 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
+    // Voice design (settings.audio.instructions): a multi-line free-text description of the
+    // voice, offered only for a model the operator marked speech_voice_design (the model
+    // listing's flag, nothing fetched), sent trimmed as `instructions`; blank sends nothing.
+    describe('the voice description', () => {
+      const designModels: ModelOption[] = [{ ...speechModels[0], speech_voice_design: true }];
+      const field = () => screen.queryByRole('textbox', { name: t.chatSpeechVoiceDescription });
+
+      it('is offered, blank and multi-line, for a model marked speech_voice_design', async () => {
+        await renderSpeechThread(designModels);
+        openSettings();
+
+        const description = await screen.findByRole('textbox', {
+          name: t.chatSpeechVoiceDescription,
+        });
+        expect(description.tagName).toBe('TEXTAREA');
+        expect(description).toHaveValue('');
+        expect(description).toHaveAttribute('placeholder', t.chatSpeechVoiceDescriptionPlaceholder);
+        expect(description).toHaveAccessibleDescription(t.chatSpeechVoiceDescriptionHint);
+        // Capped at 500 characters, a plain sanity bound on free text.
+        expect(description).toHaveAttribute('maxlength', '500');
+      });
+
+      it('is absent for a speech model without the flag', async () => {
+        await renderSpeechThread();
+        openSettings();
+        await flushMicrotasks();
+
+        expect(field()).not.toBeInTheDocument();
+        expect(screen.getByRole('combobox', { name: t.chatSpeechVoice })).toBeInTheDocument();
+      });
+
+      it('sends the typed description trimmed as instructions', async () => {
+        await renderSpeechThread(designModels);
+        openSettings();
+        fireEvent.change(
+          await screen.findByRole('textbox', { name: t.chatSpeechVoiceDescription }),
+          { target: { value: '  a calm, deep male voice, slightly hoarse ' } },
+        );
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).toEqual({
+          instructions: 'a calm, deep male voice, slightly hoarse',
+        });
+      });
+
+      it('sends nothing for a blank description', async () => {
+        await renderSpeechThread(designModels);
+        openSettings();
+        await screen.findByRole('textbox', { name: t.chatSpeechVoiceDescription });
+
+        await sendSpeech();
+        await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+        expect(startedSettings().audio).not.toHaveProperty('instructions');
+      });
+    });
+
     // Answer-audio retention (#281): a checkbox ("keep audio answers", on by default) over a
     // keep-all / keep-last-N radio whose N field exists only for "keep last N". Unchecking is
     // "do not store" and is only selectable while the thread streams (the same gate as the

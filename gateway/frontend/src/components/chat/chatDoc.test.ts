@@ -470,6 +470,7 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
       voice: '',
       speed: '',
       language: '',
+      instructions: '',
       passthrough: '',
       stream: true,
       keepAudio: true,
@@ -516,6 +517,30 @@ describe('the persisted audio settings mirror the backend omitempty', () => {
     expect(audioSetting('speech', audioSettingsFrom(wire))).toEqual({ audio: wire });
     expect(audioSettingsFrom({}).language).toBe('');
     expect(audioSettingsFrom({ language: 7 as unknown as string }).language).toBe('');
+  });
+
+  // The voice description (voice design) follows the language: trimmed, OMITTED when blank,
+  // round-tripped through the persisted document. Interior line breaks are the user's text.
+  it('sends the voice description trimmed as instructions, and nothing for a blank one', () => {
+    expect(
+      audioSetting('speech', {
+        ...DEFAULT_AUDIO_SETTINGS,
+        instructions: '  a calm, deep male voice,\nslightly hoarse ',
+      }),
+    ).toEqual({ audio: { instructions: 'a calm, deep male voice,\nslightly hoarse' } });
+    for (const instructions of ['', '  \n ']) {
+      const audio = audioSetting('speech', { ...DEFAULT_AUDIO_SETTINGS, instructions }).audio ?? {};
+      expect('instructions' in audio).toBe(false);
+    }
+    expect(audioSetting('image', { ...DEFAULT_AUDIO_SETTINGS, instructions: 'calm' })).toEqual({});
+  });
+
+  it('round-trips the voice description through audioSettingsFrom, and reads a mistyped one as blank', () => {
+    const wire = { voice: 'af_heart', language: 'de', instructions: 'a calm, deep male voice' };
+    expect(audioSettingsFrom(wire).instructions).toBe('a calm, deep male voice');
+    expect(audioSetting('speech', audioSettingsFrom(wire))).toEqual({ audio: wire });
+    expect(audioSettingsFrom({}).instructions).toBe('');
+    expect(audioSettingsFrom({ instructions: 7 as unknown as string }).instructions).toBe('');
   });
 
   it('omits a blank or unparseable speed, so the model keeps its own', () => {

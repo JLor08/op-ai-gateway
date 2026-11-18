@@ -53,6 +53,9 @@ const SIDEBAR_COLLAPSED_KEY = 'op.chat.sidebarCollapsed';
 // speech endpoint documents. A placeholder only -- a blank speed is never written, so
 // the model keeps its own default (and its own range, which the portal does not clamp).
 const SPEECH_SPEED_PLACEHOLDER = '1.0';
+// The longest voice description (voice design) the speech composer takes, in characters: a
+// plain sanity bound on free text, not a limit any other part of the system depends on.
+const SPEECH_VOICE_DESCRIPTION_MAX_LENGTH = 500;
 
 // The small round close button on the corner of an attached image's (or mask's)
 // thumbnail in the composer's attach strip.
@@ -745,6 +748,34 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
                         htmlInput: { min: 0, step: 0.1 },
                       }}
                     />
+                    {/* The voice description (voice design): free multi-line text the run sends
+                      as the OpenAI-style `instructions`, offered only for a model the operator
+                      marked speech_voice_design (c.speechVoiceDesign). Blank sends nothing; a
+                      description kept on the thread from an earlier model stays stored, and the
+                      backend forwards it upstream only to a voice-design model. Capped at
+                      SPEECH_VOICE_DESCRIPTION_MAX_LENGTH characters as a plain sanity bound. */}
+                    {c.speechVoiceDesign && (
+                      <TextField
+                        id="chat-speech-voice-description"
+                        label={t.chatSpeechVoiceDescription}
+                        multiline
+                        minRows={2}
+                        fullWidth
+                        value={c.audioSettings.instructions}
+                        placeholder={t.chatSpeechVoiceDescriptionPlaceholder}
+                        helperText={t.chatSpeechVoiceDescriptionHint}
+                        onChange={(event) =>
+                          c.setAudioSettings((s) => ({ ...s, instructions: event.target.value }))
+                        }
+                        disabled={c.streaming}
+                        sx={{ gridColumn: '1 / -1' }}
+                        slotProps={{
+                          inputLabel: { shrink: true },
+                          input: { notched: true },
+                          htmlInput: { maxLength: SPEECH_VOICE_DESCRIPTION_MAX_LENGTH },
+                        }}
+                      />
+                    )}
                   </Box>
                   {/* The streaming toggle exists only for a model the gateway says it can
                     stream (c.speechStreaming: it streams and its output rate is known).

@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"log/slog"
@@ -253,6 +254,32 @@ func scopeLessByteRate(rows []routing.ModelMappingCacheRow) (uint32, bool) {
 	return 0, false
 }
 
+// errSpeechRunNoPortal is speechRunModel's answer for a run-as token with no portal to
+// authorize it against.
+var errSpeechRunNoPortal = errors.New("no portal to authorize the run-as token")
+
+// speechRunModel is the gateway model a speech run's request will ROUTE for: the thread's,
+// rewritten by the run-as token's model override when the run names one
+// (resolveModelOverride, as inferencePreflight applies it to the loopback request). The run's
+// gates (speechRunStreamRate, speechRunVoiceDesign) judge this model and not the thread's
+// own, which a model override would make a different one. An error -- the run-as token is not
+// usable, or there is no portal to authorize it -- is the caller's to fail closed on.
+func (s *Server) speechRunModel(ctx context.Context, owner auth.Token, prep PrepareRunResult) (string, error) {
+	model := prep.Settings.Model
+	id := prep.Settings.RunAsTokenID
+	if id == "" {
+		return model, nil
+	}
+	if s.Portal == nil {
+		return "", errSpeechRunNoPortal
+	}
+	runAs, err := s.Portal.AuthorizeRunAsToken(ctx, owner, id)
+	if err != nil {
+		return "", err
+	}
+	return resolveModelOverride(ctx, runAs, model, s.Portal), nil
+}
+
 // speechStreamOptedOut reports whether a thread's ChatAudioSettings.Stream says NOT to stream: an
 // explicit false. Unset (nil) is not an opt-out -- the model's own capability decides then. It is
 // the one place that reads the toggle, so the run's streaming gate (speechRunStreamRate) and the
@@ -280,17 +307,10 @@ func (s *Server) speechRunStreamRate(ctx context.Context, owner auth.Token, prep
 	if audio := prep.Settings.Audio; audio != nil && speechStreamOptedOut(audio.Stream) {
 		return 0, false
 	}
-	model := prep.Settings.Model
-	if id := prep.Settings.RunAsTokenID; id != "" {
-		if s.Portal == nil {
-			return 0, false
-		}
-		runAs, err := s.Portal.AuthorizeRunAsToken(ctx, owner, id)
-		if err != nil {
-			slog.Debug("speech run: the run-as token is not usable; the run is buffered", "err", err)
-			return 0, false
-		}
-		model = resolveModelOverride(ctx, runAs, model, s.Portal)
+	model, err := s.speechRunModel(ctx, owner, prep)
+	if err != nil {
+		slog.Debug("speech run: the run-as token is not usable; the run is buffered", "err", err)
+		return 0, false
 	}
 	rate, ok, err := s.portalSpeechStreamRate(ctx, owner, model)
 	if err != nil {
@@ -447,8 +467,8 @@ type portalTranscriptionStreamingResponse struct {
 // would not parse the raw PCM the other format answers with. response_format is NOT stated:
 // a stream is pcm, which is also what the endpoint takes when it is absent
 // (validateSpeechRequest), so nothing is left to choose.
-func buildSpeechStreamBody(prep PrepareRunResult) ([]byte, error) {
-	fields, err := speechBodyFields(prep)
+func buildSpeechStreamBody(prep PrepareRunResult, voiceDesign bool) ([]byte, error) {
+	fields, err := speechBodyFields(prep, voiceDesign)
 	if err != nil {
 		return nil, err
 	}

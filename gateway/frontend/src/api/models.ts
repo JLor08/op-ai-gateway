@@ -611,6 +611,18 @@ export type ModelOption = {
   // OPTIONAL and fail-closed: a model that omits it derives `speech_clone_voices
   // === false`, so a clone model stays hidden unless the backend vouches for it.
   speech_clone_voices?: boolean;
+  // True when this speech model — and, for a group, EVERY offered member — accepts a
+  // natural-language VOICE DESCRIPTION (voice design): the chat's speech composer then
+  // offers a description field and a speech run sends its text upstream as the
+  // OpenAI-style `instructions`. It is the backend's own fold of the
+  // (speech_voice_design, yes) verdict, an AND across mappings like `speech`
+  // (ModelDTO.SpeechVoiceDesign); the client never recomputes it. No probe sets it:
+  // the operator's manual yes on the mapping is the only source (sglang_omni, e.g.
+  // Ming-3.0-tts-0.5B).
+  //
+  // OPTIONAL and fail-closed: a model that omits it derives `speech_voice_design ===
+  // false`, so the composer shows no description field and the run sends none.
+  speech_voice_design?: boolean;
 };
 
 // The per-model sd-server image options GET /api/portal/model-image-options

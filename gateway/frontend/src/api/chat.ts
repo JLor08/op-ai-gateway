@@ -88,8 +88,18 @@ export type ChatAudioSettings = {
   // pre-filled by the composer from the portal's UI language where the model takes a
   // `language` (api.modelSpeechLanguage). The gateway merges it into the speech request and
   // audio.cpp drops it for a model without such a parameter; omitted = the model's default.
-  // Declared last, like the backend's field, so a stored thread's keys do not move.
+  // Declared after the older fields, like the backend's field, so a stored thread's keys do
+  // not move.
   language?: string;
+  // A natural-language description of the voice (voice design), e.g. "a calm, deep male
+  // voice, slightly hoarse", for a model the operator marked speech_voice_design
+  // (ModelOption.speech_voice_design). The gateway sends it as the top-level OpenAI-style
+  // `instructions` of /v1/audio/speech, where it wins over a passthrough `instructions` key.
+  // Omitted = none (blank is never written). Persisted and carried by a run whatever the
+  // model; the gateway forwards it upstream only when every speech mapping the run's model
+  // could route to has the (speech_voice_design, yes) verdict.
+  // Declared after `language`, mirroring the backend's field order.
+  instructions?: string;
 };
 
 // The speech-to-text knobs of a "transcription" thread, as sent on the wire and persisted

@@ -529,6 +529,13 @@ export type AudioSettings = {
   // control exists only then). "" = the model's own default; audioSetting() trims it and omits
   // it when blank, so an empty string is never sent.
   language: string;
+  // The voice description (voice design), free multi-line text such as "a calm, deep male
+  // voice, slightly hoarse", sent upstream as the OpenAI-style `instructions`. The composer's
+  // control exists only for a model marked speech_voice_design. "" = none; audioSetting()
+  // trims it and omits it when blank. The thread stores it and a run carries it whatever the
+  // model (the run's settings are what the backend persists as the thread's); the backend
+  // forwards it upstream only when the run's model is voice-design capable.
+  instructions: string;
   // The advanced passthrough as the TEXT of a JSON object (the composer's textarea):
   // extra top-level request fields merged verbatim into /v1/audio/speech -- the OpenAI
   // `instructions` field and any audio.cpp-native knob -- each value keeping the JSON
@@ -559,6 +566,7 @@ export const DEFAULT_AUDIO_SETTINGS: AudioSettings = {
   voice: '',
   speed: '',
   language: '',
+  instructions: '',
   passthrough: '',
   stream: true,
   keepAudio: true,
@@ -697,6 +705,8 @@ export function audioSetting(
   if (speed !== undefined) audio.speed = speed;
   const language = s.language.trim();
   if (language) audio.language = language;
+  const instructions = s.instructions.trim();
+  if (instructions) audio.instructions = instructions;
   const passthrough = parseAudioPassthrough(s.passthrough);
   if (passthrough.status === 'ok') audio.passthrough = passthrough.value;
   // Only the opt-out is written: streaming is the default, so an unset thread persists
@@ -812,6 +822,8 @@ export function audioSettingsFrom(audio: ChatAudioSettings | undefined): AudioSe
     voice: typeof s.voice === 'string' ? s.voice : DEFAULT_AUDIO_SETTINGS.voice,
     speed: imageNumToStr(s.speed),
     language: typeof s.language === 'string' ? s.language : DEFAULT_AUDIO_SETTINGS.language,
+    instructions:
+      typeof s.instructions === 'string' ? s.instructions : DEFAULT_AUDIO_SETTINGS.instructions,
     passthrough,
     // Anything but an explicit false is the default (on): a missing or mistyped value must
     // not silently turn streaming off.

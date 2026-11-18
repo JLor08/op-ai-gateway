@@ -523,9 +523,9 @@ type ChatImageSettings struct {
 // ChatAudioSettings are the text-to-speech knobs a portal "speech" thread
 // forwards to /v1/audio/speech. Every field is optional and omitted when unset,
 // so an unset field leaves the model on its own default rather than being handed
-// an inert zero. Only the first-class knobs (voice, speed and language) live here;
-// everything else -- the OpenAI "instructions" field and any other native audio.cpp
-// knob -- rides Passthrough. buildSpeechBody (chat_runs_audio.go) forwards the set fields and
+// an inert zero. Only the first-class knobs (voice, speed, language and the OpenAI
+// "instructions" field, the voice-design description) live here; everything else --
+// any other native upstream knob -- rides Passthrough. buildSpeechBody (chat_runs_audio.go) forwards the set fields and
 // merges Passthrough into the request JSON (the gateway relays the body to
 // audio.cpp unchanged), refusing the keys that would override the body the run
 // itself owns (model/input/stream/stream_format/response_format). The turn the run
@@ -573,8 +573,18 @@ type ChatAudioSettings struct {
 	// of ChatTranscriptionSettings.Language; "" leaves the model on its default. It rides
 	// the body as a top-level "language" field, which audio.cpp applies per model and
 	// silently drops where the model has no such parameter. Declared after KeepLastAudio,
-	// last, for the same reason: a stored chat's serialized bytes must not move.
+	// for the same reason: a stored chat's serialized bytes must not move.
 	Language string `json:"language,omitempty"`
+	// Instructions is the natural-language description of the voice to synthesise
+	// ("a calm, deep male voice"): VOICE DESIGN, sent as the OpenAI-style top-level
+	// "instructions" field; "" sends none. The thread stores it whatever the model (the
+	// run's settings are what PrepareChatRun persists); the composer shows it only for a
+	// model whose ModelDTO.SpeechVoiceDesign is true, and the run forwards it upstream only
+	// when every offerable speech mapping of the run's model has the (speech_voice_design,
+	// yes) verdict (gateway.Server.speechRunVoiceDesign, fail-closed). Before it was
+	// first-class it could only ride Passthrough, which is forwarded as before. Declared after Language, last,
+	// for the same reason: a stored chat's serialized bytes must not move.
+	Instructions string `json:"instructions,omitempty"`
 }
 
 // ChatTranscriptionSettings are the speech-to-text knobs a portal
