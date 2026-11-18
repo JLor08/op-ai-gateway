@@ -643,7 +643,7 @@ it, both through the **native Anthropic Messages client**
 An inbound **Anthropic Messages** request (`POST /v1/messages`, also served as
 `/anthropic/v1/messages`; the **fine** `anthropic_messages` flavor) to an Anthropic
 **api-key** account is relayed **verbatim** (bar the `model` rewrite and the
-[provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough), below) to the platform's
+[provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)) to the platform's
 `https://api.anthropic.com/v1/messages` rather than translated. The translate path
 parses the request into the provider-neutral model and renders it back, and that
 model carries only what the chat-style dialects share, so everything else is lost
@@ -819,7 +819,7 @@ account (§5).
   meets Anthropic's own validation, because Anthropic receives the body as the
   client wrote it. The relay was exercised end to end against a stub upstream
   (bearer, merged beta, block first with the client's `system` and `cache_control`
-  intact, body otherwise verbatim (nothing to sanitize in the stub's history), SSE byte for byte, usage attributed to the
+  intact, body otherwise verbatim, SSE byte for byte, usage attributed to the
   account), not against a live Anthropic OAuth session.
 
 **Scope decision: no CLI-fingerprint headers.** The passthrough sends **none** of
@@ -1014,7 +1014,7 @@ why it refused a request only there.
 An inbound **OpenAI Responses** request (`POST /v1/responses`, the **fine**
 `openai_responses` flavor) to an OpenAI **api-key** account is relayed
 **verbatim** (bar the `model` rewrite and the
-[provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough), below) to the platform's `https://api.openai.com/v1/responses` rather than
+[provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)) to the platform's `https://api.openai.com/v1/responses` rather than
 translated to `/v1/chat/completions`, which cannot carry what a Responses client
 sends (tools, reasoning, `previous_response_id`, `store`, `include`, ...). The
 resolver sets `ResponsesMode = passthrough` for exactly this one case
@@ -2106,8 +2106,9 @@ Two behaviours to know:
   account's `/v1/responses`, §4.2, or an Anthropic api-key or subscription
   account's `/v1/messages`, §4.1) the gateway rewrites the request's `model`
   field to the bare slug (the Anthropic subscription's relay additionally
-  injects the Claude-Code system block, which does not touch `model`, and both
-  relays remove replayed reasoning/thinking the vendor cannot read and may retry
+  injects the Claude-Code system block, which does not touch `model`, and all
+  four relays (`vendor_openai_subscription`, `vendor_openai`, `vendor_anthropic`)
+  remove replayed reasoning/thinking the vendor cannot read and may retry
   once, which touch neither `model` nor the echo: [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). The vendor's response is relayed verbatim and there is
   no response-side rewrite, so its `model` field echoes the **bare** slug, not
   the prefixed name the client asked for. A recorded usage event keeps the
