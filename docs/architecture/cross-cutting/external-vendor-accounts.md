@@ -532,8 +532,8 @@ matrix:
 
 | Account | Serves | How |
 |---|---|---|
-| **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed verbatim to `https://api.openai.com/v1/responses` instead (§4.2). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. **A second exception, for the decision model only** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): a decision request (`POST /v1/decisions`, `POST /v1/systemone`) for `gpt-6-luna` gets the `decisions` flavor added, `DecisionsMode = passthrough` and `SystemOneMode = translate`, and reaches `https://api.openai.com/v1/decisions` (§4.2, *Api-key Decisions*). Its chat dialects stay listed and unchanged: chat completions and the `anthropic` dialect stay translate, and a `/v1/responses` request for it stays the passthrough of the first exception. |
-| **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed verbatim to `https://api.anthropic.com/v1/messages` instead (§4.1). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. The client's `anthropic-beta` is forwarded verbatim on that relay (§4.1). |
+| **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed to `https://api.openai.com/v1/responses` instead (§4.2; verbatim apart from the `model` rewrite and the [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. **A second exception, for the decision model only** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): a decision request (`POST /v1/decisions`, `POST /v1/systemone`) for `gpt-6-luna` gets the `decisions` flavor added, `DecisionsMode = passthrough` and `SystemOneMode = translate`, and reaches `https://api.openai.com/v1/decisions` (§4.2, *Api-key Decisions*). Its chat dialects stay listed and unchanged: chat completions and the `anthropic` dialect stay translate, and a `/v1/responses` request for it stays the passthrough of the first exception. |
+| **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed to `https://api.anthropic.com/v1/messages` instead (§4.1; verbatim apart from the `model` rewrite and the [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. The client's `anthropic-beta` is forwarded verbatim on that relay (§4.1). |
 | **Anthropic subscription** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, always with the Claude-Code masquerade (`Masquerade = claude_code`) and the OAuth headers. **An inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough`**: it is relayed to `https://api.anthropic.com/v1/messages` with the Claude-Code system block injected as the first `system` block, `Authorization: Bearer <oauth access token>`, and `anthropic-beta` = `oauth-2025-04-20` plus the client's own betas (§4.1). Every `openai_*` flavor stays translate (`MessagesMode` zero): the neutral request is rendered into `/v1/messages` with the masquerade block prepended. |
 | **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
 | **OpenAI-compatible api-key** (x.ai, OpenRouter, Kilo, Google, Custom) | the `openai` **and** `anthropic` dialects, **translate only** | `Target.APIFlavors = [openai, anthropic]`, both endpoint modes left zero: whichever dialect the caller used is translated through the neutral model to the provider's `{prefix}/chat/completions` on the account's own root (§4.4). **No exception**: Responses and Messages passthrough exist only for the native OpenAI and Anthropic accounts, so an inbound `openai_responses` or `anthropic_messages` request is translated like any other. |
@@ -642,7 +642,8 @@ it, both through the **native Anthropic Messages client**
 
 An inbound **Anthropic Messages** request (`POST /v1/messages`, also served as
 `/anthropic/v1/messages`; the **fine** `anthropic_messages` flavor) to an Anthropic
-**api-key** account is relayed **verbatim** to the platform's
+**api-key** account is relayed **verbatim** (bar the `model` rewrite and the
+[provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)) to the platform's
 `https://api.anthropic.com/v1/messages` rather than translated. The translate path
 parses the request into the provider-neutral model and renders it back, and that
 model carries only what the chat-style dialects share, so everything else is lost
@@ -661,10 +662,13 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
 `ProxyNative`, the account's opened sealed key sent as `x-api-key`
 (`upstreamAuthCtx`), and the usual usage attribution to the serving account (§5).
 
-- **Only `model` is rewritten.** It is set to the account's bare upstream id, which
+- **Only `model` is rewritten, plus one removal.** It is set to the account's bare upstream id, which
   equals the requested name when the account has no prefix. `system`, `tools`,
   `thinking`, `cache_control`, `metadata` and everything else reach Anthropic as the
-  client wrote it. The relay is value-lossless rather than byte-identical when a
+  client wrote it, with one exception: assistant `thinking` blocks Anthropic cannot
+  verify (an empty `signature`, or after a 400 ``Invalid `signature` in `thinking`
+  block`` the blocks of another account or vendor) are removed from the replayed
+  history and the request is retried once, see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo)). The relay is value-lossless rather than byte-identical when a
   rewrite happens (key order may change). The response and its SSE are relayed
   unchanged and are not rewritten back (§6.5).
 - **The headers are the gateway's, bar one.** Besides `Content-Type`, the
@@ -782,9 +786,11 @@ account (§5).
   deduplicated (*Client `anthropic-beta`*, above). No other inbound header is
   forwarded. The response and its SSE are relayed unchanged and are not rewritten
   back (§6.5); redirects are not followed, as for the api-key relay.
-- **The body is verbatim except two edits.** The gateway layer rewrites `model` to
+- **The body is verbatim except three edits.** The gateway layer rewrites `model` to
   the account's bare upstream id (equal to the requested name when the account has
-  no prefix). `AnthropicClient.ProxyNative` then **injects the Claude-Code block**
+  no prefix) and removes the replayed `thinking` blocks Anthropic cannot verify
+  (an empty `signature`; after a 400 ``Invalid `signature` in `thinking` block``,
+  every thinking block of the history, with one retry), see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo)). `AnthropicClient.ProxyNative` then **injects the Claude-Code block**
   the OAuth Messages path requires: the exact
   `{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}`
   becomes the **first** `system` block (the same block the translate path renders,
@@ -972,9 +978,12 @@ The subscription path splits by the inbound request shape:
 
 - An inbound **Codex `/v1/responses`** request has `ResponsesMode = passthrough`
   set by the resolver (from the **fine** `openai_responses` flavor), so it is
-  relayed **verbatim** to the ChatGPT backend's `/responses` (lossless; the one
-  edit is the request's `model` field, set to the bare vendor id when the account
-  has a prefix, and the response is not rewritten back, §6.5). It is
+  relayed **verbatim** to the ChatGPT backend's `/responses` (value-lossless; the
+  edits are the request's `model` field, set to the bare vendor id when the account
+  has a prefix, and the removal of replayed `reasoning` items the backend cannot
+  read (an empty `encrypted_content`, a non-empty `content`; after a 400
+  `invalid_encrypted_content`, every encrypted blob of the history, with one
+  retry; see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo))), and the response is not rewritten back, §6.5). It is
   `Target.Subscription` that makes `endpointModeFor` select the **bare** `/responses`
   path (not `/v1/responses`); an api-key OpenAI target, whose `Subscription` is
   false, is unaffected and keeps the platform `/v1/responses` (*Api-key Responses
@@ -1004,7 +1013,8 @@ why it refused a request only there.
 
 An inbound **OpenAI Responses** request (`POST /v1/responses`, the **fine**
 `openai_responses` flavor) to an OpenAI **api-key** account is relayed
-**verbatim** to the platform's `https://api.openai.com/v1/responses` rather than
+**verbatim** (bar the `model` rewrite and the
+[provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)) to the platform's `https://api.openai.com/v1/responses` rather than
 translated to `/v1/chat/completions`, which cannot carry what a Responses client
 sends (tools, reasoning, `previous_response_id`, `store`, `include`, ...). The
 resolver sets `ResponsesMode = passthrough` for exactly this one case
@@ -1015,9 +1025,12 @@ standard `/v1/responses` (a non-subscription OpenAI vendor target), the account'
 opened sealed key as the `Authorization: Bearer`, and the usual usage attribution
 to the serving account (§5).
 
-- **Only `model` is rewritten.** It is set to the account's bare upstream id,
+- **Only `model` is rewritten, plus one removal.** It is set to the account's bare upstream id,
   which equals the requested name when the account has no prefix. The rest of the
-  body reaches OpenAI as the client wrote it, **including `store`, `include` and
+  body reaches OpenAI as the client wrote it, except that replayed `reasoning`
+  items the platform cannot read are removed and the request retried once after
+  a 400 `invalid_encrypted_content` (the same rules as the subscription relay,
+  [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo)); the api-key behavior is VERIFY-LIVE, not probed), **including `store`, `include` and
   `previous_response_id`**: `store: false` is **not** forced here, because that
   is a requirement of the subscription backend, imposed by the subscription
   *translate* client only (above). The relay is value-lossless rather than
@@ -2091,9 +2104,12 @@ Two behaviours to know:
   API token can be given a different one, or none, per account (§11.1).
 - On the native-passthrough path (an OpenAI subscription's or an OpenAI api-key
   account's `/v1/responses`, §4.2, or an Anthropic api-key or subscription
-  account's `/v1/messages`, §4.1) the gateway rewrites only the request's `model`
+  account's `/v1/messages`, §4.1) the gateway rewrites the request's `model`
   field to the bare slug (the Anthropic subscription's relay additionally
-  injects the Claude-Code system block, which does not touch `model`). The vendor's response is relayed verbatim and there is
+  injects the Claude-Code system block, which does not touch `model`, and all
+  four relays (`vendor_openai_subscription`, `vendor_openai`, and `vendor_anthropic`, which serves both the Anthropic api-key and subscription relays)
+  remove replayed reasoning/thinking the vendor cannot read and may retry
+  once, which touch neither `model` nor the echo: [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). The vendor's response is relayed verbatim and there is
   no response-side rewrite, so its `model` field echoes the **bare** slug, not
   the prefixed name the client asked for. A recorded usage event keeps the
   requested (prefixed) name as its model and the bare slug as the provider

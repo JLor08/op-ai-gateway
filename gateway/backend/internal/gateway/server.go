@@ -538,6 +538,11 @@ type Server struct {
 	// one instance index at the same time. Built in New; a bare &Server{} leaves
 	// it nil, which holds nothing.
 	instanceClaims *instanceClaims
+	// switchMemo remembers, per client session, target and flavor, the opaque
+	// reasoning blobs a native passthrough target rejected as foreign
+	// (switch_history_memo.go), so a follow-up request is filtered before its
+	// first send. Built in New; a bare &Server{} leaves it nil, which is no memo.
+	switchMemo *rejectedBlobMemo
 	// clusters is the llama.cpp RPC cluster orchestration
 	// (cluster_orchestrator.go): the members-first start of a cluster head,
 	// its stop, and the reconciler that keeps pinned and force_running heads
@@ -1285,6 +1290,7 @@ func New(deps ServerDeps) *Server {
 	// the ensure route starts nothing), the upstream credential and the shutdown
 	// context, and it counts instances through the resolver's own instance source.
 	s.instanceClaims = newInstanceClaims()
+	s.switchMemo = newRejectedBlobMemo(time.Now)
 	if resolver != nil && instances != nil {
 		s.instanceScaler = newInstanceScaler(instanceScalerDeps{
 			store:     deps.Routes,

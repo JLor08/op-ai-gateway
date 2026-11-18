@@ -610,13 +610,14 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		return
 	}
 
-	// The only three edits ever made to a relayed body. Passthrough still means
+	// The only edits ever made to a relayed body. Passthrough still means
 	// the client's bytes reach the upstream as the client wrote them, apart
 	// from the mapped model name, -- under the operator's opt-in below --
-	// llama.cpp's `timings_per_token`, and -- under the token's opt-in, third
-	// below -- Claude Code's effort as `chat_template_kwargs.reasoning_effort`.
-	// The first two are described here; the third has its own paragraph after
-	// them.
+	// llama.cpp's `timings_per_token`, -- under the token's opt-in, third
+	// below -- Claude Code's effort as `chat_template_kwargs.reasoning_effort`,
+	// and the removal of replayed reasoning the target cannot read (the
+	// provider-switch edit, last). The first two are described here; the other
+	// two have their own paragraphs after them.
 	//
 	// That flag is what makes llama.cpp attach a top-level `timings` object to
 	// PARTIAL frames, and such an object is the only thing that can put a live
@@ -745,6 +746,39 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		}
 	}
 
+	// The provider-switch edit (switch_history.go), applied after the three above
+	// and, like them, only to a JSON relay and through helpers that return a fresh
+	// slice when they change anything and the original otherwise, so `raw` is never
+	// written to and a body that needs nothing reaches the upstream byte for byte.
+	// A conversation that moved between targets replays reasoning items the new
+	// target cannot read. Step 1 removes the ones it provably cannot (a gateway-
+	// minted item, readable text the vendor refuses, an opaque blob a local server
+	// cannot use); step 3 removes the blobs this target already rejected for this
+	// session (the memo, parsed only when the session has an entry for the target).
+	// Step 2, the one retry on a recognised refusal, follows the upstream call below.
+	switchFlavor := rel.pfReq.APIFlavor
+	switchApplies := relayContentType == jsonContentType && isSwitchHistoryFlavor(switchFlavor)
+	switchClass := switchTargetClassOf(rel.target)
+	useSwitchMemo := switchApplies && s.switchMemo != nil && si.ClientSession != ""
+	var switchKey rejectedBlobKey
+	if switchApplies {
+		var dropped, stripped int
+		upstreamBody, dropped, stripped = sanitizeSwitchHistory(upstreamBody, switchFlavor, switchClass)
+		if dropped+stripped > 0 {
+			slog.Debug("native passthrough: removed unreadable reasoning from replayed history", "api_flavor", switchFlavor, "target_class", switchClass, "dropped", dropped, "stripped", stripped)
+		}
+	}
+	if useSwitchMemo {
+		switchKey = switchMemoKey(si.ClientSession, rel.target, switchFlavor)
+		if s.switchMemo.Has(switchKey) {
+			var removed int
+			upstreamBody, removed = removeBlobs(upstreamBody, switchFlavor, s.switchMemo.Match(switchKey, opaqueBlobHashes(upstreamBody, switchFlavor)))
+			if removed > 0 {
+				slog.Debug("native passthrough: removed reasoning the target rejected earlier in this session", "api_flavor", switchFlavor, "target_class", switchClass, "removed", removed)
+			}
+		}
+	}
+
 	// Deadline policy: a stream uses an idle watchdog (cancel on no upstream
 	// activity for `idle`), a buffered completion uses a total timeout. Both cancel
 	// the upstream request context.
@@ -860,6 +894,39 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 			return
 		}
 		slog.Error("audio upstream refused to stream and the buffered retry could not be built; relaying the refusal", "path", r.URL.Path, "model", rel.pfReq.Model, "server", serverName, "err", buildErr)
+	}
+
+	// A target that refuses a replayed reasoning blob it cannot verify (a blob
+	// another account or vendor produced: OpenAI's invalid_encrypted_content, or
+	// Anthropic's invalid thinking signature -- see isForeignReasoningRefusal) gets
+	// the request once more without every opaque blob of the history, exactly like
+	// the audio retry above: nothing has been written to the client, the refused
+	// attempt records nothing, its resources are released first, and the retry runs
+	// through this whole function again so it gets one usage row. The blobs are
+	// recorded in the session memo first, so a follow-up request of the session is
+	// filtered before its first send (the recorded set is safe: the first refused
+	// request after a switch only carries blobs from before it; after a restart, another instance or TTL expiry the next refusal records the new target's own earlier blobs too, so they are filtered for the grace window). foreignRetried
+	// keeps it to one retry; a body with nothing to remove is not sent again, and
+	// any other answer -- every 429, 5xx and other 400 -- is relayed as it came.
+	if switchApplies && !rel.foreignRetried && peekForeignReasoningRefusal(resp) {
+		hashes := opaqueBlobHashes(upstreamBody, switchFlavor)
+		if useSwitchMemo {
+			s.switchMemo.Record(switchKey, hashes)
+		}
+		filtered, removed := removeBlobs(upstreamBody, switchFlavor, blobSet(hashes))
+		if removed > 0 && !bytes.Equal(filtered, upstreamBody) {
+			slog.Debug("native passthrough: target refused replayed reasoning; retrying once without it", "api_flavor", switchFlavor, "target_class", switchClass, "removed", removed)
+			resp.Body.Close()
+			if watchdog != nil {
+				watchdog.Stop()
+			}
+			cancel()
+			s.Active.Remove(id)
+			rel.foreignRetried = true
+			rel.upstreamBody = filtered
+			s.proxyNative(w, r, rel)
+			return
+		}
 	}
 
 	// A decisions response that must be rewritten (translated, or normalized for
@@ -1294,6 +1361,11 @@ type nativeRelay struct {
 	// normalization. Nil on every other relay, which keeps them on the copier
 	// byte for byte.
 	decisionsRewrite *decisionsRewrite
+	// foreignRetried marks the one retry proxyNative sends after a target refused
+	// a replayed reasoning blob (peekForeignReasoningRefusal): set on that retry,
+	// whose upstreamBody is the history without the opaque blobs, so a second
+	// refusal is relayed rather than retried again.
+	foreignRetried bool
 }
 
 // failNativeExchange answers a relay that ends before any upstream answer reached the
