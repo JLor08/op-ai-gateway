@@ -1873,6 +1873,29 @@ const (
 	// (usage.BillingUnitAudioSecond).
 	CapabilitySpeechStreaming = "speech_streaming"
 
+	// CapabilitySpeechVoiceDesign means the model accepts a natural-language
+	// description of the voice to synthesise ("a calm, deep male voice") in the
+	// speech request's top-level instructions field: VOICE DESIGN. It refines
+	// CapabilitySpeech the way CapabilitySpeechClone does and, like it, gates no
+	// route: no request declares it required, so a model without it is still a
+	// speech candidate for POST /v1/audio/speech, and the speech relay passes an
+	// instructions field through whatever this verdict says. Two readers fold it
+	// per model, each as a fail-closed AND: the portal's model listing, into the
+	// flag the chat speech composer uses to show a voice-description field on a
+	// yes, and the chat speech run (gateway.Server.speechRunVoiceDesign), which
+	// forwards the thread's stored description upstream only when every offerable
+	// speech mapping of the run's model says yes. Both treat a no and no row at
+	// all alike -- the absence is "unknown", never "designable".
+	//
+	// It is only ever set MANUALLY by the operator: no probe writes it, since the
+	// backend that consumes it (sglang_omni) has no capability probe (ADR-103). It
+	// is therefore no reserved manual verdict either -- no writer owns a no, and an
+	// absent row already reads as one.
+	//
+	// Like CapabilitySpeech the string does not coincide with the billable unit
+	// (usage.BillingUnitAudioSecond).
+	CapabilitySpeechVoiceDesign = "speech_voice_design"
+
 	// CapabilityDecision means the model is a System One DECISION model: it
 	// answers the decision endpoints (flavor APIFlavorDecisions). It says
 	// nothing about chat: a mapping whose flavors are [decisions] only is kept

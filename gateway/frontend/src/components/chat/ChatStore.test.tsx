@@ -352,6 +352,8 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
       {/* Whether the speech composer may offer the language control (the gate says the model
           takes a language). */}
       <span data-testid="speech-language">{String(c.speechLanguage)}</span>
+      {/* Whether the speech composer may offer the voice-description field (the model flag). */}
+      <span data-testid="speech-voice-design">{String(c.speechVoiceDesign)}</span>
       {/* Whether the transcription composer may offer a live recording (the gate is open). */}
       <span data-testid="transcription-streaming">{String(c.transcriptionStreaming)}</span>
       {/* The live transcription session: its state, the transcript so far and its error. */}
@@ -492,6 +494,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
             voice: 'af_heart',
             speed: '1.25',
             language: 'de',
+            instructions: '',
             passthrough: '{"seed":3}',
             stream: true,
             keepAudio: true,
@@ -500,6 +503,15 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
         }
       >
         set-audio
+      </button>
+      {/* The voice description (voice design), padded so the trim on the wire is visible. */}
+      <button
+        type="button"
+        onClick={() =>
+          c.setAudioSettings((s) => ({ ...s, instructions: '  a calm, deep male voice  ' }))
+        }
+      >
+        set-voice-description
       </button>
       <button
         type="button"
@@ -5500,6 +5512,68 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(startSettings().audio).toEqual({});
     });
 
+    // Voice design: the flag is the model listing's speech_voice_design (no fetched gate), the
+    // composer field exists only while it is true, and a run carries the trimmed description as
+    // `instructions` whatever the model: the backend persists the run's settings as the
+    // thread's, and itself decides whether the description goes upstream.
+    const ming: ModelOption = {
+      ...kokoro,
+      id: 'ming',
+      display_name: 'ming',
+      speech_voice_design: true,
+    };
+
+    it('exposes speechVoiceDesign from the model flag only', async () => {
+      renderProvider([], { models: [...models, kokoro, ming] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-kokoro' }));
+      expect(screen.getByTestId('speech-voice-design').textContent).toBe('false');
+      fireEvent.click(screen.getByRole('button', { name: 'pick-ming' }));
+      expect(screen.getByTestId('speech-voice-design').textContent).toBe('true');
+      // A non-speech model never offers it.
+      fireEvent.click(screen.getByRole('button', { name: 'pick-gpt-oss-20b' }));
+      expect(screen.getByTestId('speech-voice-design').textContent).toBe('false');
+    });
+
+    it('sends the trimmed voice description as instructions for a voice-design model', async () => {
+      renderProvider([], { models: [...models, ming] });
+      await waitForReady();
+      fireEvent.click(screen.getByRole('button', { name: 'pick-ming' }));
+      fireEvent.click(screen.getByRole('button', { name: 'set-voice-description' }));
+      sendText('hello');
+
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalledTimes(1));
+      expect(startSettings().kind).toBe('speech');
+      expect(startSettings().audio).toEqual({ instructions: 'a calm, deep male voice' });
+    });
+
+    it('keeps and still sends a voice description for a model without the flag', async () => {
+      chatApi = makeChatApi(speechThread({ instructions: 'a calm, deep male voice' }));
+      renderProvider([], { models: speechModels });
+      await waitForReady();
+      expect(screen.getByTestId('speech-voice-design').textContent).toBe('false');
+      expect(JSON.parse(screen.getByTestId('audio-settings').textContent!)).toMatchObject({
+        instructions: 'a calm, deep male voice',
+      });
+
+      // The thread keeps the text: an unrelated save writes it back (the PUT full-replaces
+      // the blob, so a field dropped here would be erased).
+      fireEvent.click(screen.getByRole('button', { name: 'set-system' }));
+      await waitFor(() => expect(chatApi.spies.saveChat).toHaveBeenCalled(), { timeout: 3000 });
+      const saved = chatApi.spies.saveChat.mock.calls.at(-1)![1] as {
+        content: { settings: { audio?: unknown } };
+      };
+      expect(saved.content.settings.audio).toEqual({ instructions: 'a calm, deep male voice' });
+
+      // ...and so does a run to this model, though the field stays hidden: the run's settings
+      // are what the backend stores as the thread's, so dropping the description from the run
+      // would erase it server-side (the backend gates what goes upstream).
+      sendText('hello');
+      await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
+      expect(startSettings().audio).toEqual({ instructions: 'a calm, deep male voice' });
+      expect(screen.getByTestId('speech-voice-design').textContent).toBe('false');
+    });
+
     // Review focus: a text or image thread must be byte-identical. Neither carries an
     // audio key on the run body, and a text thread still carries no image one.
     it.each([
@@ -5639,6 +5713,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         voice: 'bf_emma',
         speed: '0.8',
         language: '',
+        instructions: '',
         passthrough: '',
         stream: true,
         keepAudio: true,

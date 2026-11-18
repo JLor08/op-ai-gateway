@@ -392,6 +392,14 @@ export type ChatStore = {
   // The same answer's declared default drives the pre-fill of an empty speech thread (see the
   // store's pre-fill effect): this only decides whether the control exists.
   speechLanguage: boolean;
+  // Whether the speech composer may offer the VOICE DESCRIPTION field (voice design) for the
+  // effective model: its ModelOption.speech_voice_design, the backend's fail-closed fold of the
+  // operator's manual (speech_voice_design, yes) verdict -- no probe states it, so unlike
+  // speechLanguage there is nothing to fetch. False for a non-speech model and for one that
+  // lacks the flag. It gates the FIELD only: a run carries a saved description whatever the
+  // model (its settings are what the backend persists as the thread's, so dropping it there
+  // would erase it), and the backend forwards it upstream only to a voice-design model.
+  speechVoiceDesign: boolean;
   // Whether the transcription composer may offer a LIVE recording for the effective model: the
   // gateway's own answer (api.modelTranscriptionStreaming) that every mapping the model could
   // be served by is known to stream a transcription (#266). The speech gate's twin, minus the
@@ -952,6 +960,12 @@ export function ChatStoreProvider({
   // (#301; presetCloneOffered). The voices effect below starts such a model on the first preset
   // voice it lists.
   const modelPresetClone = presetCloneOffered(effectiveOption);
+  // Whether the effective SPEECH model takes a natural-language voice description (voice
+  // design, sent as `instructions`), read as served: ModelOption.speech_voice_design, the
+  // backend's fail-closed fold of the operator's manual verdict. Only meaningful for a model
+  // the speech composer opens for.
+  const modelSpeechVoiceDesign =
+    modelSpeechCapable && effectiveOption?.speech_voice_design === true;
   // Whether the effective model TRANSCRIBES speech (drives the transcription-thread composer),
   // read as served like `speech`: the backend's own fold of the transcription verdict.
   const modelTranscriptionCapable =
@@ -1501,7 +1515,9 @@ export function ChatStoreProvider({
       ...imageSetting(chatKindRef.current, imageSettingsRef.current),
       // The audio knobs, present only on a speech thread (audioSetting keys off the
       // kind), so a text or image thread's run body carries no audio key. The backend
-      // forwards the set fields to /v1/audio/speech.
+      // forwards the set fields to /v1/audio/speech. The voice description rides whatever the
+      // model: the backend persists these settings as the thread's, and itself forwards the
+      // description upstream only to a voice-design model.
       ...audioSetting(chatKindRef.current, audioSettingsRef.current),
       // The transcription knobs, present only on a transcription thread
       // (transcriptionSetting keys off the kind), so a text, image or speech thread's run
@@ -3091,6 +3107,7 @@ export function ChatStoreProvider({
     modelVoices,
     speechStreaming: speechStreamingGate.streaming,
     speechLanguage: speechLanguageGate.accepts,
+    speechVoiceDesign: modelSpeechVoiceDesign,
     transcriptionStreaming,
     chatKind,
     imageSettings,

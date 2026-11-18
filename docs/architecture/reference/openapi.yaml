@@ -5330,6 +5330,20 @@ components:
             declared default is not `auto`. A first-class language wins over a
             `language` key of the passthrough object. Declared after
             keep_last_audio, so an existing chat's stored bytes do not move.
+        instructions:
+          type: string
+          description: >
+            A natural-language description of the voice to speak in (voice
+            design, e.g. "a calm, deep male voice"), merged into the speech
+            request as a top-level `instructions` when non-empty. The thread
+            always stores it; the portal composer shows the field only for a
+            model whose listing says speech_voice_design; and the run forwards
+            it upstream only when every offerable speech mapping of the run's
+            model has the (speech_voice_design, yes) verdict, omitting it
+            otherwise (fail-closed). A first-class instructions that is
+            forwarded wins over an `instructions` key of the passthrough
+            object; a passthrough `instructions` is forwarded as before. Declared after language, so an existing chat's
+            stored bytes do not move.
     ChatAudioPruneRequest:
       type: object
       description: The body of POST /api/portal/chats/{id}/audio/prune.

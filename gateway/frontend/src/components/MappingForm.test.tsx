@@ -472,6 +472,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         label: t.mappingSpeechClone,
         hint: t.mappingSpeechCloneHint,
       },
+      // speech_voice_design has no probe at all (only the manual yes enables it,
+      // for an engine such as sglang_omni); it still offers no selectable no, so
+      // the loop's rules hold for it unchanged.
+      {
+        capability: 'speech_voice_design',
+        label: t.mappingSpeechVoiceDesign,
+        hint: t.mappingSpeechVoiceDesignHint,
+      },
     ] as const) {
       const { capability, label, hint } = control;
 
@@ -585,6 +593,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       renderForm({ row: makeMapping({ capabilities: [capRow('speech_clone', 'yes')] }) });
       expect(screen.getByText(t.mappingSpeechCloneHint)).toBeInTheDocument();
       expect(t.mappingSpeechCloneHint).not.toBe(t.mappingSpeechCapableUnknownHint);
+    });
+
+    it('keeps the speech_voice_design hint visible on a yes, because it says what the yes enables', () => {
+      renderForm({ row: makeMapping({ capabilities: [capRow('speech_voice_design', 'yes')] }) });
+      expect(screen.getByText(t.mappingSpeechVoiceDesignHint)).toBeInTheDocument();
+      expect(t.mappingSpeechVoiceDesignHint).not.toBe(t.mappingSpeechCloneHint);
     });
 
     // realtime gates GET /v1/realtime. Nothing probes it, so the operator's verdict is the

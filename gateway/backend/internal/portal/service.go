@@ -1548,6 +1548,16 @@ type ModelDTO struct {
 	// offering mapping (or, for a group, every offerable member) has a (rerank,
 	// yes) verdict. Same fold, same independence, same absence of any route.
 	Rerank bool `json:"rerank"`
+	// SpeechVoiceDesign marks a speech model that accepts a natural-language
+	// voice description in the speech request's instructions field (voice
+	// design, routing.CapabilitySpeechVoiceDesign). It is the fail-closed AND
+	// of Embedding: true only when EVERY offering mapping (or, for a group,
+	// every offerable member) has a (speech_voice_design, yes) row, which only
+	// an operator ever writes. It gates NO route; what reads it is the portal
+	// chat speech composer, which shows its voice-description field only when
+	// it is true. (The chat speech run re-folds the verdict itself, over the
+	// run's offerable speech mappings, before it forwards a description.)
+	SpeechVoiceDesign bool `json:"speech_voice_design"`
 	// Role is the model's single derived role -- one of the routing.ModelRole
 	// values ("asr", "tts", "image", "embedding", "reranker", "chat", "other"),
 	// never empty: routing.DeriveRole over each offering mapping's runtime type
@@ -3001,6 +3011,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 			// Neither is a ModelOffering.Capable fold (nothing requires them).
 			embeddingOn := verdictYesFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityEmbedding))
 			rerankOn := verdictYesFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilityRerank))
+			// speech_voice_design is the same plain fail-closed AND: an
+			// operator-set refinement of speech that gates no route.
+			speechVoiceDesignOn := verdictYesFlagsByName(views, capabilityRowsFor(capsByMapping, routing.CapabilitySpeechVoiceDesign))
 			// role is roleByName: routing.DeriveRole per mapping from the same
 			// capability batch and runtime-spec index, reconciled per name. NOT an
 			// AND, and not fail-closed: see ModelDTO.Role.
@@ -3166,6 +3179,8 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				// embedding and rerank are the AND again, like every serve-style flag.
 				groupEmbedding := groupCapabilityFlags(entries, embeddingOn)
 				groupRerank := groupCapabilityFlags(entries, rerankOn)
+				// speech_voice_design OFFERS a composer field, so it is the AND too.
+				groupSpeechVoiceDesign := groupCapabilityFlags(entries, speechVoiceDesignOn)
 				// A group's role is the best-ranked role of its offerable members.
 				groupRole := groupRoleByName(entries, roleOn)
 				// Suppress hidden/locked models from the standalone listing (the
@@ -3212,6 +3227,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					speechCloneVoicesOn[e.Name] = groupSpeechCloneVoices[e.Name]
 					embeddingOn[e.Name] = groupEmbedding[e.Name]
 					rerankOn[e.Name] = groupRerank[e.Name]
+					speechVoiceDesignOn[e.Name] = groupSpeechVoiceDesign[e.Name]
 					roleOn[e.Name] = groupRole[e.Name]
 					isGroup[e.Name] = struct{}{}
 				}
@@ -3304,6 +3320,9 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 					if v, ok := rerankOn[target]; ok {
 						rerankOn[name] = v
 					}
+					if v, ok := speechVoiceDesignOn[target]; ok {
+						speechVoiceDesignOn[name] = v
+					}
 					if v, ok := roleOn[target]; ok {
 						roleOn[name] = v
 					}
@@ -3382,6 +3401,7 @@ func (s *Service) modelsResponse(ctx context.Context, token auth.Token, suppress
 				dto.SpeechCloneVoices = speechCloneVoicesOn[id]
 				dto.Embedding = embeddingOn[id]
 				dto.Rerank = rerankOn[id]
+				dto.SpeechVoiceDesign = speechVoiceDesignOn[id]
 				dto.Role = string(roleOrOther(roleOn[id]))
 				if v, ok := visibility[id]; ok {
 					dto.Visibility = v

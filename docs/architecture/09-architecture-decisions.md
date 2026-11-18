@@ -12643,6 +12643,15 @@ version accepted are closed. Everything else below stands.)**
   `--host 127.0.0.1` and say that speech and transcription verdicts are manual. The mapping form offers a manual `yes` for
   `speech`, `transcription` and their refinements `speech_streaming`, `transcription_streaming` and `speech_clone` (the `no` of
   each is reserved for the audio.cpp probe), so a streamed sglang-omni call is enabled there.
+- **Voice design is a manual `speech_voice_design` yes.** A mapping marked so makes the portal model listing's
+  `speech_voice_design` flag true (a fail-closed AND over the name's mappings), and only then does the portal chat's speech
+  composer show a voice-description field. The thread always stores the description; the run forwards it as the top-level
+  `instructions` of the speech request only when every offerable speech mapping of the run's model has the yes verdict
+  (fail-closed: otherwise, or on a store error, it is omitted); a passthrough `instructions` is forwarded as before. No probe writes the
+  verdict and none owns its `no`, so it is not reserved. The gateway relays `instructions` verbatim and does not check what
+  the engine does with it: sglang-omni v0.2.0 accepts the field for every model but its Ming-3.0-tts pipeline (`ming3_tts`)
+  ignores it, so voice design with `inclusionAI/Ming-3.0-tts-0.5B` needs an sglang-omni build whose `ming3_tts` turns
+  `instructions` into Ming's VOICE_DESIGN caption. Setting the yes on a stock v0.2.0 mapping shows a field that has no effect.
 - **A passthrough mode on an `sglang_omni` target is served as translate.** The portal default does not reach an Auto-typed spec, a
   spec written through the API or a row stored before the type existed, so the gateway's `endpointModeFor` answers `passthrough` as
   `translate` for such a target: `/v1/responses` and `/v1/messages` go through the media guard like chat, and the usage row's

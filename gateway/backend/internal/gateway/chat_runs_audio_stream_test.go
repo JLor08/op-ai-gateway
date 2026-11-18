@@ -441,17 +441,20 @@ func addSpeechMapping(t *testing.T, srv *Server, id, gatewayModel string, stream
 func TestBuildSpeechStreamBodyAddsTheStreamFieldsToTheSettingsBody(t *testing.T) {
 	prep := speechRunPrep()
 	speed := 1.5
-	prep.Settings.Audio = &portal.ChatAudioSettings{Voice: "alloy", Speed: &speed}
+	prep.Settings.Audio = &portal.ChatAudioSettings{Voice: "alloy", Speed: &speed, Language: "de", Instructions: "a calm, deep male voice"}
 
-	buffered, err := buildSpeechBody(prep)
+	buffered, err := buildSpeechBody(prep, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	streamed, err := buildSpeechStreamBody(prep)
+	streamed, err := buildSpeechStreamBody(prep, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, want := decodeSpeechBody(t, streamed), decodeSpeechBody(t, buffered)
+	if got["instructions"] != "a calm, deep male voice" || got["language"] != "de" {
+		t.Fatalf("streaming body = %s, want the thread's instructions and language", streamed)
+	}
 	if got["stream"] != true || got["stream_format"] != "sse" {
 		t.Fatalf("streaming body = %s, want stream=true and stream_format=sse", streamed)
 	}
@@ -478,10 +481,10 @@ func TestBuildSpeechBodyRejectsAStreamFormatPassthrough(t *testing.T) {
 	for _, key := range []string{"stream_format", "Stream_Format"} {
 		prep := speechRunPrep()
 		prep.Settings.Audio = &portal.ChatAudioSettings{Passthrough: map[string]json.RawMessage{key: json.RawMessage(`"audio"`)}}
-		if raw, err := buildSpeechBody(prep); err == nil {
+		if raw, err := buildSpeechBody(prep, false); err == nil {
 			t.Fatalf("%q was admitted: %s", key, raw)
 		}
-		if raw, err := buildSpeechStreamBody(prep); err == nil {
+		if raw, err := buildSpeechStreamBody(prep, false); err == nil {
 			t.Fatalf("%q was admitted on a streaming body: %s", key, raw)
 		}
 	}
@@ -1382,5 +1385,95 @@ func TestStreamUncommittedStreamBuildsNoTailPart(t *testing.T) {
 				t.Fatalf("half-sample log = %v, want %v (log: %q)", said, tc.wantLog, logged.String())
 			}
 		})
+	}
+}
+
+// --- the voice-design gate ---------------------------------------------------
+
+// markVoiceDesign writes the operator's manual speech_voice_design verdict on a mapping.
+func markVoiceDesign(t *testing.T, srv *Server, mappingID, verdict string) {
+	t.Helper()
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	if err := srv.Routes.UpsertMappingCapabilities(context.Background(), mappingID, []routing.CapabilityRow{{
+		Capability: routing.CapabilitySpeechVoiceDesign, Verdict: verdict,
+		Source: routing.CapabilitySourceManual, CheckedAt: now,
+	}}); err != nil {
+		t.Fatalf("UpsertMappingCapabilities %s: %v", mappingID, err)
+	}
+}
+
+// The run's voice-design gate is the fail-closed AND over every mapping a speech request for
+// the model could be routed to (the offerable set the streaming and language gates read): it
+// opens only when each one carries the operator's (speech_voice_design, yes). A no, a missing
+// row on any candidate, and an empty candidate set all close it.
+func TestPortalSpeechVoiceDesignIsTheANDOverTheOfferableMappings(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arrange func(t *testing.T, srv *Server)
+		model   string
+		want    bool
+	}{
+		{"the one mapping marked yes", func(t *testing.T, srv *Server) {
+			markVoiceDesign(t, srv, "route-tts", routing.CapabilityYes)
+		}, speechGatewayModel, true},
+		{"the one mapping without a verdict", func(t *testing.T, srv *Server) {}, speechGatewayModel, false},
+		{"the one mapping marked no", func(t *testing.T, srv *Server) {
+			markVoiceDesign(t, srv, "route-tts", routing.CapabilityNo)
+		}, speechGatewayModel, false},
+		{"a sibling without the verdict", func(t *testing.T, srv *Server) {
+			markVoiceDesign(t, srv, "route-tts", routing.CapabilityYes)
+			addSpeechMapping(t, srv, "route-tts-2", speechGatewayModel, nil, "")
+		}, speechGatewayModel, false},
+		{"every sibling marked yes", func(t *testing.T, srv *Server) {
+			markVoiceDesign(t, srv, "route-tts", routing.CapabilityYes)
+			addSpeechMapping(t, srv, "route-tts-2", speechGatewayModel, nil, "")
+			markVoiceDesign(t, srv, "route-tts-2", routing.CapabilityYes)
+		}, speechGatewayModel, true},
+		{"an unknown model (no candidate)", func(t *testing.T, srv *Server) {
+			markVoiceDesign(t, srv, "route-tts", routing.CapabilityYes)
+		}, "tts-nobody", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, _ := newSSESpeechUpstream(t, speechSSEDone, speechSSEEnd)
+			srv, owner, _, _ := newSpeechRunTestServer(t, up.URL)
+			tc.arrange(t, srv)
+
+			got, err := srv.portalSpeechVoiceDesign(context.Background(), owner, tc.model)
+			if err != nil {
+				t.Fatalf("portalSpeechVoiceDesign: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("gate = %v, want %v", got, tc.want)
+			}
+			prep := speechRunPrep()
+			prep.Settings.Model = tc.model
+			prep.Settings.Audio = &portal.ChatAudioSettings{Instructions: "a calm, deep male voice"}
+			if run := srv.speechRunVoiceDesign(context.Background(), owner, prep); run != tc.want {
+				t.Fatalf("run gate = %v, want %v (the portal gate's answer)", run, tc.want)
+			}
+		})
+	}
+}
+
+// A store failure is an error from the portal gate, never an answer, and the run's gate
+// reads it as closed (the description is not sent) rather than failing the run. A thread
+// without a description never asks.
+func TestSpeechRunVoiceDesignFailsClosed(t *testing.T) {
+	up, _ := newSSESpeechUpstream(t, speechSSEDone, speechSSEEnd)
+	srv, owner, _, _ := newSpeechRunTestServer(t, up.URL)
+	markVoiceDesign(t, srv, "route-tts", routing.CapabilityYes)
+	srv.Routes = capabilityBatchFailingStore{Store: srv.Routes}
+
+	if _, err := srv.portalSpeechVoiceDesign(context.Background(), owner, speechGatewayModel); err == nil {
+		t.Fatal("a failed capability read must be an error")
+	}
+	prep := speechRunPrep()
+	prep.Settings.Audio = &portal.ChatAudioSettings{Instructions: "a calm, deep male voice"}
+	if srv.speechRunVoiceDesign(context.Background(), owner, prep) {
+		t.Fatal("a failed capability read must close the run's gate")
+	}
+	prep.Settings.Audio = &portal.ChatAudioSettings{Voice: "alloy"}
+	if srv.speechRunVoiceDesign(context.Background(), owner, prep) {
+		t.Fatal("a thread without a description has nothing to gate open")
 	}
 }

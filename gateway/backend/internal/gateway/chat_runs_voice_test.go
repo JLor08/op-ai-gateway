@@ -769,12 +769,12 @@ func TestVoiceSpeechPrepCarriesTheTicketsVoiceIntoTheSpeechRequestBody(t *testin
 	audio := portal.ChatAudioSettings{Voice: "marius", Speed: &speed}
 	prep := voiceSpeechPrep("the spoken answer", routing.Target{Model: "voice-tts"}, audio, "de")
 
-	for name, build := range map[string]func(PrepareRunResult) ([]byte, error){
+	for name, build := range map[string]func(PrepareRunResult, bool) ([]byte, error){
 		"the buffered body":  buildSpeechBody,
 		"the streaming body": buildSpeechStreamBody,
 	} {
 		t.Run(name, func(t *testing.T) {
-			raw, err := build(prep)
+			raw, err := build(prep, false)
 			if err != nil {
 				t.Fatalf("build: %v", err)
 			}
@@ -793,7 +793,7 @@ func TestVoiceSpeechPrepCarriesTheTicketsVoiceIntoTheSpeechRequestBody(t *testin
 func TestVoiceSpeechPrepSendsNoVoiceWhenTheTicketHasNone(t *testing.T) {
 	prep := voiceSpeechPrep("answer", routing.Target{Model: "voice-tts"}, portal.ChatAudioSettings{}, "")
 
-	fields, err := speechBodyFields(prep)
+	fields, err := speechBodyFields(prep, false)
 	if err != nil {
 		t.Fatalf("speechBodyFields: %v", err)
 	}
@@ -835,7 +835,7 @@ func TestVoiceSpeechPrep_SetsLanguage(t *testing.T) {
 	if prep.Settings.Audio == nil || prep.Settings.Audio.Language != "de" {
 		t.Fatalf("prep.Settings.Audio = %+v, want Language %q", prep.Settings.Audio, "de")
 	}
-	fields, err := speechBodyFields(prep)
+	fields, err := speechBodyFields(prep, false)
 	if err != nil {
 		t.Fatalf("speechBodyFields: %v", err)
 	}
@@ -852,7 +852,7 @@ func TestVoiceSpeechPrep_EmptyLanguageUnset(t *testing.T) {
 	if prep.Settings.Audio == nil || prep.Settings.Audio.Language != "" {
 		t.Fatalf("prep.Settings.Audio = %+v, want an unset Language", prep.Settings.Audio)
 	}
-	fields, err := speechBodyFields(prep)
+	fields, err := speechBodyFields(prep, false)
 	if err != nil {
 		t.Fatalf("speechBodyFields: %v", err)
 	}

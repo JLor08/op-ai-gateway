@@ -12,11 +12,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"maps"
 	"mime"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
 	"slices"
 	"strings"
 	"time"
@@ -245,11 +247,12 @@ type speechAttemptOptions struct {
 // says how it is made and relayed (speechAttemptOptions).
 func (s *Server) speechTurnAttempt(ctx context.Context, owner auth.Token, run *ChatRun, prep PrepareRunResult, opts speechAttemptOptions) speechAttemptResult {
 	sampleRate, streaming := s.speechRunStreamRate(ctx, owner, prep)
+	voiceDesign := s.speechRunVoiceDesign(ctx, owner, prep)
 	build := buildSpeechBody
 	if streaming {
 		build = buildSpeechStreamBody
 	}
-	body, err := build(prep)
+	body, err := build(prep, voiceDesign)
 	if err != nil {
 		log.Printf("chat run %s: build speech body failed: %v", run.ID, err)
 		if errors.Is(err, errSpeechPassthroughReserved) {
@@ -514,26 +517,29 @@ func speechAudioMediaTypeOf(contentType string) bool {
 // message's text. response_format is NOT stated -- the endpoint answers WAV when it
 // is absent and refuses every other value (validateSpeechRequest), so there is
 // nothing to choose and an unset field is omitted, the discipline imageRequestFields
-// keeps for every knob. The set first-class settings (voice and language when
-// non-empty, speed when set) come from the thread's ChatAudioSettings; an unset one is omitted so
-// audio.cpp stays on its own default rather than being handed an inert zero.
+// keeps for every knob. The set first-class settings (voice, language and instructions
+// -- the voice-design description -- when non-empty, speed when set) come from the
+// thread's ChatAudioSettings; an unset one is omitted so the upstream stays on its own
+// default rather than being handed an inert zero. instructions is forwarded only while
+// voiceDesign (the run's speechRunVoiceDesign gate) is true; with the gate closed it is
+// treated as unset.
 //
-// Everything else -- the OpenAI instructions field and any audio.cpp-native knob --
-// rides ChatAudioSettings.Passthrough and is merged in as the raw JSON the user
-// wrote (the gateway relays the body to audio.cpp unchanged). A key the run owns
-// (speechReservedFields, matched ignoring case because the readers of this body
-// decode case-insensitively) is REJECTED with errSpeechPassthroughReserved and no
-// body is returned. A key that repeats a first-class setting which IS set (voice,
-// speed, language, again ignoring case) is not sent a second time: the first-class control
-// is the visible one, so it wins; with it unset, the passthrough key is the only
-// statement of it and goes through.
+// Everything else -- any audio.cpp-native knob -- rides ChatAudioSettings.Passthrough and
+// is merged in as the raw JSON the user wrote (the gateway relays the body to audio.cpp
+// unchanged). A key the run owns (speechReservedFields, matched ignoring case because the
+// readers of this body decode case-insensitively) is REJECTED with
+// errSpeechPassthroughReserved and no body is returned. A key that repeats a first-class
+// setting which IS sent (voice, speed, language, instructions, again ignoring case) is not
+// sent a second time: the first-class control is the visible one, so it wins; with it
+// unset (or, for instructions, gated off), the passthrough key is the only statement of it
+// and goes through.
 //
 // A history with no user text yields an empty input, which is NOT rejected here:
 // validateSpeechRequest owns "input is required" (speech.input_required) and a
 // second copy of that rule in the executor would be free to drift from it. The
 // refusal reaches the run through upstreamErrorCode.
-func buildSpeechBody(prep PrepareRunResult) ([]byte, error) {
-	fields, err := speechBodyFields(prep)
+func buildSpeechBody(prep PrepareRunResult, voiceDesign bool) ([]byte, error) {
+	fields, err := speechBodyFields(prep, voiceDesign)
 	if err != nil {
 		return nil, err
 	}
@@ -542,7 +548,13 @@ func buildSpeechBody(prep PrepareRunResult) ([]byte, error) {
 
 // speechBodyFields is the body buildSpeechBody and buildSpeechStreamBody share, before it
 // is encoded: the fields, or errSpeechPassthroughReserved for a reserved passthrough key.
-func speechBodyFields(prep PrepareRunResult) (map[string]any, error) {
+//
+// voiceDesign is the run's voice-design gate (speechRunVoiceDesign): the thread's
+// first-class Instructions is forwarded only when it is true, so a description the thread
+// keeps from an earlier, voice-design model is not handed to one the operator never marked
+// as taking it. It does not touch the passthrough: an "instructions" key there is the
+// user's own raw JSON and is merged as before, gate or no gate.
+func speechBodyFields(prep PrepareRunResult, voiceDesign bool) (map[string]any, error) {
 	body := map[string]any{
 		"model": prep.Settings.Model,
 		"input": lastUserPrompt(prep.History),
@@ -568,6 +580,9 @@ func speechBodyFields(prep PrepareRunResult) (map[string]any, error) {
 	if audio.Language != "" {
 		body["language"] = audio.Language
 	}
+	if audio.Instructions != "" && voiceDesign {
+		body["instructions"] = audio.Instructions
+	}
 	for _, key := range passthroughKeys {
 		if hasKeyFold(body, key) {
 			log.Printf("speech passthrough key %q repeats a setting the thread already carries; the setting wins", key)
@@ -576,6 +591,53 @@ func speechBodyFields(prep PrepareRunResult) (map[string]any, error) {
 		body[key] = audio.Passthrough[key]
 	}
 	return body, nil
+}
+
+// speechRunVoiceDesign is the run-time voice-design gate: whether this run may forward the
+// thread's first-class voice description (ChatAudioSettings.Instructions) upstream as the
+// top-level "instructions" field. It is portalSpeechVoiceDesign for the model the request will
+// ROUTE for (speechRunModel), evaluated here and never taken from the client: the thread
+// stores its description whatever the model, and the composer's flag
+// (ModelDTO.SpeechVoiceDesign) only decides whether the field is shown.
+//
+// A thread without a description asks nothing (no store read). Every failure to ask -- an
+// unusable run-as token, a store error -- closes the gate and is logged; it never fails the
+// run, which then synthesizes without the description.
+func (s *Server) speechRunVoiceDesign(ctx context.Context, owner auth.Token, prep PrepareRunResult) bool {
+	if audio := prep.Settings.Audio; audio == nil || audio.Instructions == "" {
+		return false
+	}
+	model, err := s.speechRunModel(ctx, owner, prep)
+	if err != nil {
+		slog.Debug("speech run: the run-as token is not usable; the voice description is not sent", "err", err)
+		return false
+	}
+	ok, err := s.portalSpeechVoiceDesign(ctx, owner, model)
+	if err != nil {
+		slog.Warn("speech run: the voice-design gate could not be read; the voice description is not sent", "model", model, "err", err)
+		return false
+	}
+	return ok
+}
+
+// portalSpeechVoiceDesign reports whether gatewayModel takes a natural-language voice
+// description: true only when EVERY mapping a speech request for it could be routed to (the
+// offerable set, portalOfferableSpeechMappings, which the streaming and language gates read
+// too) has a (speech_voice_design, yes) row -- the fail-closed AND the ModelDTO flag folds,
+// since the route is picked per request after this is asked. The verdict is only ever set
+// manually by the operator (ADR-103); a no and an absent row alike close the gate, and so
+// does an empty candidate set. A store failure is an error, never read as an answer.
+func (s *Server) portalSpeechVoiceDesign(ctx context.Context, principal auth.Token, gatewayModel string) (bool, error) {
+	candidates, verdicts, err := s.portalOfferableSpeechMappings(ctx, principal, gatewayModel)
+	if err != nil || len(candidates) == 0 {
+		return false, err
+	}
+	for _, id := range candidates {
+		if routing.CapabilityRowsByName(verdicts[id])[routing.CapabilitySpeechVoiceDesign].Verdict != routing.CapabilityYes {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // isSpeechReservedField reports whether key names a field in speechReservedFields,
