@@ -567,6 +567,14 @@ Installing WSL, the distro and the engines is yours to do; the agent needs:
   a loaded model. `[wsl2]` `memory=` is the VM's own RAM ceiling (half of the
   host's by default); the agent admits WSL models against it as well, minus
   `OP_AGENT_WSL_RAM_RESERVE_MB`.
+- **Mirrored networking.** Add `networkingMode=mirrored` under `[wsl2]` in the
+  same `.wslconfig`, then run `wsl --shutdown` once. The agent reaches the model
+  at `127.0.0.1:<port>` from Windows. In a live test, WSL's default NAT mode did
+  not forward a server listening on `127.0.0.1` inside the distro: from Windows
+  the port refused the connection while it answered inside the distro. The
+  symptom is a WSL spec that stays *starting* until its startup timeout, while
+  the runtime log shows the server listening. To check, run
+  `curl.exe http://127.0.0.1:<port>/health` on Windows while the model starts.
 - **Models in the distro's own ext4 filesystem** (for example under
   `/opt` or the user's home), not under `/mnt/c`, which is far slower.
 - **`build-essential` in the distro for vLLM** (`sudo apt install
@@ -606,12 +614,21 @@ Installing WSL, the distro and the engines is yours to do; the agent needs:
   environment variables) are gone. An old config that still carries one starts
   anyway; the agent logs a warning naming the replacement and ignores it.
 
-For vLLM, bind `--host 127.0.0.1 --port ${PORT}` (WSL forwards the port to
-Windows) and set `--gpu-memory-utilization` explicitly: the agent attributes
+For vLLM, bind `--host 127.0.0.1 --port ${PORT}` (reachable from Windows with
+mirrored networking, above) and set `--gpu-memory-utilization` explicitly: the agent attributes
 VRAM to a WSL model as the VM's growth across that model's start, which is a
 stable figure when the engine reserves a fixed share of the card. Pass the API key
 as `VLLM_API_KEY` in `env` rather than as `--api-key`, since an argument is
 visible to `ps` inside the VM.
+
+A wheel-only SGLang or sglang-omni install (a uv venv, no CUDA toolkit) needs
+`CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13` and
+`LIBRARY_PATH=/usr/lib/wsl/lib` in the spec `env`, `build-essential` and
+`ninja-build` in the distro (a spec cannot set `PATH`, so the venv's own
+`ninja` is not found), and the CUDA wheel fixes from
+[sgl-project/sglang#49209](https://github.com/sgl-project/sglang/issues/49209).
+`env` values are not expanded by a shell: write absolute paths. Details in
+ADR-103.
 
 **The WSL boundary is not a security boundary.** A Linux process can read the
 Windows user's files under `/mnt/<drive>` and, through interop, start Windows

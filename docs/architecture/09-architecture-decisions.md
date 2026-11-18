@@ -937,6 +937,22 @@ dropped for voices, because audio.cpp ignores `?model=`).
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [API Surface](reference/api-surface.md#53-the-agents-own-router-port-not-a-gateway-endpoint).
 
+**Amended: the gateway's probe through the passthrough is narrowed by spec type.** The
+router forwards `/upstream/{model}/props` to whatever child runs, and the gateway's
+resolver used to send it for every loaded mapping. Once [ADR-103](#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)
+added types without `/props`, a running sglang-omni child logged a 404 for it on every
+app-health tick (the application's health-check interval, 30 s by default, plus a retry
+2 s later). The gateway now resolves the default per mapping
+(`routing.EffectiveMappingContextProbePath`) and sends none for a spec whose effective
+type serves no `/props`: `vllm`, `tgi`, `ollama`, `vllm_sr`, `sglang`,
+`stable_diffusion_cpp`, `audio_cpp` and `sglang_omni`. `llama_cpp` and `custom` (which
+may be a llama-server under another name) are still probed, and an operator-set
+`context_probe_path` still wins. Nothing is lost: only a llama.cpp `/props` document
+carries the context size and the verdicts this probe reads, and the skipped types' context
+sizes, where they have one, arrive through the agent's own per-type probe.
+→ [Agent-Managed Model Runtime
+§3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation).
+
 ## ADR-038 — Capability detection: one `/props` read, three states, an open vocabulary
 **Context:** #49 sub-project 2 needed a persisted answer for "does this
 upstream take images/video/audio, and does its chat template support tool
@@ -12742,6 +12758,22 @@ version accepted are closed. Everything else below stands.)**
   upstream ends after its done event, closing cleanly, is complete by definition, as a raw stream's clean close is (ADR-068).
 - **Not verified live:** an sglang-omni server end to end through the agent. The contracts were read off the pinned commits.
 - **Older agents** ignore the type strings: the gateway sees a best-effort context and no SGLang queue gauge.
+- **A wheel-only SGLang or sglang-omni install in WSL needs host setup the gateway cannot do** (amended 2026-11-14, from a
+  live sglang-omni 0.2.0 install in a uv venv on Ubuntu 24.04 under WSL; the CUDA items match upstream
+  [sgl-project/sglang#49209](https://github.com/sgl-project/sglang/issues/49209)):
+  - `deep_gemm` asserts at import without `CUDA_HOME`/`CUDA_PATH`, `nvcc` on `PATH` or `/usr/local/cuda`: set
+    `CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13` in the spec `env`.
+  - JIT builds need a C compiler (`build-essential`) and, on WSL, `LIBRARY_PATH=/usr/lib/wsl/lib` in `env` for `-lcuda`. The
+    wheel has no `nvidia/cu13/lib64`, so link `lib64/libcudart.so -> ../lib/libcudart.so.13`; an nvcc newer than the runtime
+    headers (13.5 against 13.0) was fixed with `uv pip install "nvidia-cuda-runtime==13.5.*"`.
+  - flashinfer's JIT runs `ninja` by name. A spec cannot set `PATH` (reserved) and the venv is not activated, so
+    `<venv>/bin/ninja` is not found: install the distro's `ninja-build` or link `ninja` into `/usr/local/bin`.
+  - `env` values reach the process through `WSLENV` and `wsl.exe --exec`, not a shell, so `$HOME` or `~` stays literal: use
+    absolute paths.
+
+  The `sglang` and `sglang_omni` type notes in the portal say this briefly. No agent change: these are properties of the
+  wheels, and installing engines stays the operator's job
+  ([runtime manager §3.8](cross-cutting/agent-runtime-manager.md#38-execution-modes-wsl2)).
 
 ## ADR-104 — `/v1/realtime`: a WebSocket relayed through a new agent `/realtime/{model}` route that holds the spec admitted for the session, meters one usage row and is served only by an agent that declared `realtime_proxy`
 

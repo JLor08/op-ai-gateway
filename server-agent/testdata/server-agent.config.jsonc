@@ -149,6 +149,11 @@
   // The distro user every WSL process runs as (wsl.exe -u). No default: empty
   // refuses every WSL spec. "root" is refused too -- the agent never hands a
   // gateway-supplied command line or environment to a root process.
+  // WSL models also need networkingMode=mirrored under [wsl2] in the Windows
+  // user's %UserProfile%\.wslconfig (then wsl --shutdown): the agent reaches
+  // them at 127.0.0.1:<port> from Windows, and in a live test the default NAT
+  // mode did not forward that port, so the spec stayed "starting" until its
+  // startup timeout. See the server-agent README, "WSL2 workloads".
   "runtime_wsl_user": "",
 
   // Where the last known-good runtime-config document from the gateway is

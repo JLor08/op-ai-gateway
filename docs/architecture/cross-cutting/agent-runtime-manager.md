@@ -1129,9 +1129,21 @@ in `internal/routing/application_probes.go` supply what the fields would say:
   application whose agent declares `runtime_upstream_props`
   ([§7](#7-feature-negotiation)), because an older router answers that probe
   with 404 forever.
-- Neither knows the spec type. A child that is not llama.cpp answers the
-  router's `/props` passthrough with 404, and the benchmark then falls back to
-  the agent's own probe
+- `EffectiveMappingContextProbePath` narrows that answer for one mapping by
+  its spec's effective type (`EffectiveRuntimeSpecType`): the router default
+  becomes "no probe" for a type whose server serves no `/props` — `vllm`,
+  `tgi`, `ollama`, `vllm_sr` and `sglang`, which state their context size on
+  another path (the table below), and `stable_diffusion_cpp`, `audio_cpp` and
+  `sglang_omni`, which have none. `llama_cpp` and `custom` (the detection
+  fallback, which may be a llama-server under another name) keep the default,
+  and a stored `context_probe_path` still wins for every type. The router
+  forwards the passthrough to whatever child runs, so before this narrowing a
+  child without `/props` answered 404 to app health's `{model}` pass on every
+  cadence tick (the application's health-check interval, 30 s by default), a
+  second time after the 2 s retry, and gave back nothing: no context size and
+  no capability verdict, which only a llama.cpp `/props` document carries.
+  Such a type's context size, where it has one, comes from the agent's own
+  per-type probe, which the benchmark falls back to
   ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)).
 
 The readers that go through the resolvers are the speed benchmark's cold
@@ -2448,10 +2460,17 @@ host index 1 and not on index 2. Secrets in `env` travel through `WSLENV` and st
 out of the argv, which `ps` inside the VM would show.
 
 **Port, health and config files.** `${PORT}` is chosen on the Windows side, as
-always, and the workload binds `127.0.0.1:${PORT}` inside the VM; WSL's localhost
-forwarding (NAT mode, the default) or mirrored networking makes it reachable from
-Windows, so the router and the 500 ms health poll work unchanged (the forwarder
-scans for new listeners about once a second). Config files are written on the
+always, and the workload binds `127.0.0.1:${PORT}` inside the VM. The router and
+the 500 ms health poll reach it from Windows at `127.0.0.1:${PORT}`, which needs
+**mirrored networking** (`[wsl2]` `networkingMode=mirrored` in the Windows user's
+`%UserProfile%\.wslconfig`, then `wsl --shutdown`); the operator setup requires it.
+WSL's localhost forwarding in NAT mode (the default) was not reliable for a
+`127.0.0.1` listener in a live test (WSL 3.0.5, Windows build 26300): Windows got
+"connection refused" while the same request inside the distro got 200, so the
+health poll timed out and the instance never left `starting`. With mirrored
+networking the same setup answered from Windows. **A WSL spec that stays in
+`starting` until `startup_timeout_seconds` elapses (`runtime.start_timeout`) while
+its runtime log shows the server listening is this symptom.** Config files are written on the
 Windows side as always (§3.5), and `${CONFIG_DIR}` expands to that directory's
 `/mnt/<drive>/…` path inside the distro; a UNC base directory, or one whose `..`
 climbs above its drive's root, is a placeholder error and so `not_permitted`. Its
@@ -2863,7 +2882,9 @@ makes the benchmark a second consumer of
 [ADR-037](../09-architecture-decisions.md#adr-037--the-runtime-router-grows-a-get-only-per-model-props-passthrough-the-gateway-probes-through-it-with-the-specs-token)'s
 passthrough, on the same terms: it attaches the mapping's own
 `routing.SpecUpstreamAuth` credential, and it asks only an agent that
-declares `runtime_upstream_props`. None of these reads starts a child or
+declares `runtime_upstream_props`. Both skip a mapping whose spec type serves
+no `/props` (`routing.EffectiveMappingContextProbePath`,
+[§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)). None of these reads starts a child or
 writes the loaded-model registry: `/running` is a status read, and the router
 answers `/upstream/{model}/props` for a cold child with
 `runtime.model_not_running` (§4.3).
@@ -3984,6 +4005,17 @@ removes the pressure that makes the measurement self-heal. Measurement
 capability is deliberately *not* a negotiated feature flag — flags negotiate
 protocol, not hardware — an agent with no measurement path simply omits the
 field.
+
+On **native Linux**, compute-app rows are attributed to the process group
+created for each managed runtime, whose group ID is the root PID (§3.1).
+The collector resolves each GPU-owning PID's group before checking the UUID
+cache, then sums all group members per GPU under that root PID. This includes
+vLLM's EngineCore workers even when the API process holds no GPU memory, and
+keeps separately managed runtimes isolated. Exited or inaccessible PIDs are
+omitted rather than assigned a guessed owner. Processes that detach into a
+different group remain outside this boundary, matching native group termination;
+other platforms retain their existing PID attribution. No gateway setting or
+additional feature flag is involved.
 
 The **compute-apps** measurer (every non-Windows host) resolves GPU UUID →
 index from a cached `--query-gpu=index,uuid` mapping, re-fetched only on the
@@ -5329,7 +5361,9 @@ The agent's router serves `GET /upstream/{model}/props` ([§4.1](#41-control-rou
 — and the gateway's app-health `{model}` probe pass
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)) only
 sends a probe down that path at an agent whose *reported* capabilities name
-`runtime_upstream_props`: an agent that predates the route has no
+`runtime_upstream_props` (and, per mapping, only for a spec type that may
+serve `/props`,
+[§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)): an agent that predates the route has no
 `/upstream/{model}/props` control route to answer with, so the bodiless GET
 falls through to model routing (§4.2), which sees no JSON body naming a
 managed model and answers `404 runtime.model_not_managed` (§4.3) — not once,
