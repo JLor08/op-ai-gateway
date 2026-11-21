@@ -40,9 +40,12 @@ type cachedRateLimitWindow struct {
 }
 
 type cachedRateLimitEntry struct {
-	observed time.Time
-	claim    string
-	windows  map[string]cachedRateLimitWindow
+	// accountID is the vendor account the observation came from, so a later
+	// revocation seen on that account can drop it (Forget).
+	accountID string
+	observed  time.Time
+	claim     string
+	windows   map[string]cachedRateLimitWindow
 }
 
 // rateLimitWindowCache is a mutex-guarded, hard-capped map from principal key to its
@@ -71,14 +74,15 @@ func principalKey(token auth.Token) (string, bool) {
 // response without the top-level status header is ignored, so a non-subscription
 // response never overwrites the cache. Expired entries are pruned on write; at the
 // cap the entry with the oldest observation is evicted.
-func (c *rateLimitWindowCache) Observe(key string, h http.Header, now time.Time) {
+func (c *rateLimitWindowCache) Observe(key, accountID string, h http.Header, now time.Time) {
 	if h.Get(unifiedRateLimitPrefix+"status") == "" {
 		return
 	}
 	entry := cachedRateLimitEntry{
-		observed: now,
-		claim:    h.Get(unifiedRateLimitPrefix + "representative-claim"),
-		windows:  make(map[string]cachedRateLimitWindow, len(rateLimitWindowNames)),
+		accountID: accountID,
+		observed:  now,
+		claim:     h.Get(unifiedRateLimitPrefix + "representative-claim"),
+		windows:   make(map[string]cachedRateLimitWindow, len(rateLimitWindowNames)),
 	}
 	for _, w := range rateLimitWindowNames {
 		win := cachedRateLimitWindow{fields: make(map[string]string, len(rateLimitWindowFields))}
@@ -108,6 +112,17 @@ func (c *rateLimitWindowCache) Observe(key string, h http.Header, now time.Time)
 		}
 	}
 	c.entries[key] = entry
+}
+
+// Forget deletes the principal's entry when, and only when, it was observed from
+// accountID. An entry from another account (or none) is left alone, so a revocation on
+// one account never discards figures legitimately observed from another.
+func (c *rateLimitWindowCache) Forget(key, accountID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[key]; ok && e.accountID == accountID {
+		delete(c.entries, key)
+	}
 }
 
 // evictOldest removes the entry with the oldest observation. The caller holds c.mu.
@@ -179,17 +194,23 @@ func (c *rateLimitWindowCache) Attach(key string, dst http.Header, now time.Time
 
 // observeRateLimitWindows records the unified windows of a vendor-Anthropic response
 // for the caller, when the caller is entitled to see that account's figures. Other
-// providers, responses without the top-level status and unentitled callers are
-// ignored; the entitlement lookup only runs when there is something to record.
+// providers and responses without the top-level status are ignored; the entitlement
+// lookup only runs when there is something to record. An unentitled caller records
+// nothing and, because the response proves the caller now reaches that account
+// without entitlement (a revoked opt-in or role), loses any entry cached from it.
 func (s *Server) observeRateLimitWindows(token auth.Token, target routing.Target, h http.Header) {
 	if s.rateLimitWindows == nil || target.Provider != routing.ProviderVendorAnthropic || h.Get(unifiedRateLimitPrefix+"status") == "" {
 		return
 	}
 	key, ok := principalKey(token)
-	if !ok || !s.rateLimitFiguresEntitled(context.Background(), token, target) {
+	if !ok {
 		return
 	}
-	s.rateLimitWindows.Observe(key, h, time.Now())
+	if !s.rateLimitFiguresEntitled(context.Background(), token, target) {
+		s.rateLimitWindows.Forget(key, target.VendorAccountID)
+		return
+	}
+	s.rateLimitWindows.Observe(key, target.VendorAccountID, h, time.Now())
 }
 
 // attachRateLimitWindows writes the caller's last observed subscription windows into

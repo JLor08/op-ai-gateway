@@ -31,7 +31,7 @@ func windowHeaders(now time.Time, fiveHourOffset, sevenDayOffset time.Duration) 
 func TestWindowCacheAttachCopiesFutureWindows(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	c := newRateLimitWindowCache(10)
-	c.Observe("user:a", windowHeaders(now, time.Hour, 24*time.Hour), now)
+	c.Observe("user:a", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now)
 
 	dst := http.Header{}
 	if !c.Attach("user:a", dst, now) {
@@ -65,7 +65,7 @@ func TestWindowCacheNeverRejected(t *testing.T) {
 	h := windowHeaders(now, time.Hour, 24*time.Hour)
 	h.Set(rlp+"status", "rejected")
 	h.Set(rlp+"5h-status", "rejected")
-	c.Observe("user:a", h, now)
+	c.Observe("user:a", "acct1", h, now)
 
 	dst := http.Header{}
 	if !c.Attach("user:a", dst, now) {
@@ -82,7 +82,7 @@ func TestWindowCacheNeverRejected(t *testing.T) {
 func TestWindowCacheDropsExpiredWindows(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	c := newRateLimitWindowCache(10)
-	c.Observe("user:a", windowHeaders(now, time.Hour, 24*time.Hour), now)
+	c.Observe("user:a", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now)
 
 	later := now.Add(2 * time.Hour)
 	dst := http.Header{}
@@ -103,7 +103,7 @@ func TestWindowCacheDropsExpiredWindows(t *testing.T) {
 func TestWindowCacheAllExpiredPrunes(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	c := newRateLimitWindowCache(10)
-	c.Observe("user:a", windowHeaders(now, time.Hour, 2*time.Hour), now)
+	c.Observe("user:a", "acct1", windowHeaders(now, time.Hour, 2*time.Hour), now)
 
 	later := now.Add(3 * time.Hour)
 	if c.Attach("user:a", http.Header{}, later) {
@@ -123,8 +123,8 @@ func TestWindowCacheAllExpiredPrunes(t *testing.T) {
 func TestWindowCacheIgnoresHeaderlessObserve(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	c := newRateLimitWindowCache(10)
-	c.Observe("user:a", windowHeaders(now, time.Hour, 24*time.Hour), now)
-	c.Observe("user:a", http.Header{"Content-Type": {"application/json"}}, now.Add(time.Minute))
+	c.Observe("user:a", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now)
+	c.Observe("user:a", "acct1", http.Header{"Content-Type": {"application/json"}}, now.Add(time.Minute))
 
 	dst := http.Header{}
 	if !c.Attach("user:a", dst, now) || dst.Get(rlp+"5h-utilization") != "0.42" {
@@ -135,11 +135,11 @@ func TestWindowCacheIgnoresHeaderlessObserve(t *testing.T) {
 func TestWindowCacheLastAccountWins(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	c := newRateLimitWindowCache(10)
-	c.Observe("user:a", windowHeaders(now, time.Hour, 24*time.Hour), now)
+	c.Observe("user:a", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now)
 	second := windowHeaders(now, 2*time.Hour, 48*time.Hour)
 	second.Set(rlp+"5h-utilization", "0.77")
 	second.Del(rlp + "7d-surpassed-threshold")
-	c.Observe("user:a", second, now.Add(time.Second))
+	c.Observe("user:a", "acct1", second, now.Add(time.Second))
 
 	dst := http.Header{}
 	if !c.Attach("user:a", dst, now) {
@@ -162,7 +162,7 @@ func TestWindowCacheNeverAttachesOverageOrRetry(t *testing.T) {
 	h.Set(rlp+"fallback-percentage", "0.5")
 	h.Set("Retry-After", "30")
 	h.Set("X-Should-Retry", "true")
-	c.Observe("user:a", h, now)
+	c.Observe("user:a", "acct1", h, now)
 
 	dst := http.Header{}
 	c.Attach("user:a", dst, now)
@@ -176,9 +176,9 @@ func TestWindowCacheNeverAttachesOverageOrRetry(t *testing.T) {
 func TestWindowCacheCap(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	c := newRateLimitWindowCache(2)
-	c.Observe("user:a", windowHeaders(now, time.Hour, 24*time.Hour), now)
-	c.Observe("user:b", windowHeaders(now, time.Hour, 24*time.Hour), now.Add(time.Second))
-	c.Observe("user:c", windowHeaders(now, time.Hour, 24*time.Hour), now.Add(2*time.Second))
+	c.Observe("user:a", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now)
+	c.Observe("user:b", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now.Add(time.Second))
+	c.Observe("user:c", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now.Add(2*time.Second))
 
 	if c.Attach("user:a", http.Header{}, now) {
 		t.Error("oldest entry user:a survived the cap")
@@ -197,5 +197,20 @@ func TestWindowCachePrincipalKey(t *testing.T) {
 	}
 	if k, ok := principalKey(auth.Token{Kind: "service", ServiceID: "s1"}); !ok || k != "service:s1" {
 		t.Errorf("service key = %q, %v", k, ok)
+	}
+}
+
+func TestWindowCacheForgetOnlyDropsEntryFromThatAccount(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	c := newRateLimitWindowCache(10)
+	c.Observe("user:a", "acct1", windowHeaders(now, time.Hour, 24*time.Hour), now)
+
+	c.Forget("user:a", "acct2")
+	if !c.Attach("user:a", http.Header{}, now) {
+		t.Fatal("Forget for another account removed the entry")
+	}
+	c.Forget("user:a", "acct1")
+	if c.Attach("user:a", http.Header{}, now) {
+		t.Fatal("Forget for the originating account kept the entry")
 	}
 }

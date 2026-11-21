@@ -48,6 +48,38 @@ func hasUnifiedRateLimitHeader(h http.Header) bool {
 	return false
 }
 
+// redactCapturedAccountHeaders keeps a vendor account's figures out of a payload
+// capture the caller's principal is not entitled to see. The translate path stores the
+// upstream response headers verbatim, and a capture is readable by its owner and, for
+// non-secret captures, by admins, so for a vendor-account target the unified
+// rate-limit family and anthropic-organization-id are dropped (from a copy; the
+// sink's own header set is shared with the usage scrape) unless the principal is
+// entitled to the figures. The entitlement lookup only runs when such a header is
+// present; it is cached and fails closed.
+func (s *Server) redactCapturedAccountHeaders(ctx context.Context, token auth.Token, target routing.Target, h http.Header) http.Header {
+	if target.VendorAccountID == "" || len(h) == 0 {
+		return h
+	}
+	sensitive := false
+	for name := range h {
+		if isUnifiedRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id") {
+			sensitive = true
+			break
+		}
+	}
+	if !sensitive || s.rateLimitFiguresEntitled(ctx, token, target) {
+		return h
+	}
+	out := make(http.Header, len(h))
+	for name, values := range h {
+		if isUnifiedRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id") {
+			continue
+		}
+		out[name] = values
+	}
+	return out
+}
+
 // forwardRateLimitHeaders copies the response headers the Messages passthrough relays
 // from src to dst: retry-after and x-should-retry always (they steer the client's retry
 // behavior), the unified rate-limit family only when includeUnified is set. Every value

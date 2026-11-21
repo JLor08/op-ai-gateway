@@ -256,3 +256,61 @@ func TestChatCompletionsGetNoWindows(t *testing.T) {
 		requireNoUnified(t, rec)
 	}
 }
+
+// A principal whose entitlement was revoked stops getting frozen windows: the next
+// vendor response they receive without entitlement drops the entry that account made.
+func TestWindowsForgottenWhenEntitlementRevoked(t *testing.T) {
+	f := newWindowsFixture(t, routing.EndpointModePassthrough)
+	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
+	shared := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a", VendorShareUsageWithMembers: true}
+	revoked := shared
+	revoked.VendorShareUsageWithMembers = false
+	f.srv.Portal = &usageManagerPortal{API: f.srv.Portal, ok: false}
+
+	f.srv.observeRateLimitWindows(member, shared, subscriptionWindowHeaders())
+	requireWindowsAttached(t, f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, false))
+
+	// A not-entitled observation from another account leaves the entry alone.
+	other := revoked
+	other.VendorAccountID = "acc_other"
+	f.srv.observeRateLimitWindows(member, other, subscriptionWindowHeaders())
+	requireWindowsAttached(t, f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, false))
+
+	// From the originating account it removes it.
+	f.srv.observeRateLimitWindows(member, revoked, subscriptionWindowHeaders())
+	requireNoUnified(t, f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, false))
+}
+
+func TestCapturedAccountHeadersRedactedForNonEntitled(t *testing.T) {
+	f := newWindowsFixture(t, routing.EndpointModePassthrough)
+	deny := &usageManagerPortal{API: f.srv.Portal, ok: false}
+	f.srv.Portal = deny
+	target := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a"}
+	h := subscriptionWindowHeaders()
+	h.Set("Anthropic-Organization-Id", "org-secret")
+	h.Set("Content-Type", "application/json")
+	ctx := context.Background()
+
+	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
+	got := f.srv.redactCapturedAccountHeaders(ctx, member, target, h)
+	if hasUnifiedRateLimitHeader(got) || got.Get("Anthropic-Organization-Id") != "" {
+		t.Fatalf("non-entitled capture kept account headers: %v", got)
+	}
+	if got.Get("Content-Type") != "application/json" || got.Get("Retry-After") != "30" {
+		t.Fatalf("unrelated headers lost: %v", got)
+	}
+	if !hasUnifiedRateLimitHeader(h) || h.Get("Anthropic-Organization-Id") == "" {
+		t.Fatal("the shared sink header set was mutated")
+	}
+
+	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true}
+	if got := f.srv.redactCapturedAccountHeaders(ctx, owner, target, h); !hasUnifiedRateLimitHeader(got) || got.Get("Anthropic-Organization-Id") != "org-secret" {
+		t.Fatalf("entitled owner lost headers: %v", got)
+	}
+	plain := http.Header{"Content-Type": {"application/json"}}
+	callsBefore := deny.calls
+	f.srv.redactCapturedAccountHeaders(ctx, member, target, plain)
+	if deny.calls != callsBefore {
+		t.Fatal("entitlement looked up although no sensitive header was present")
+	}
+}

@@ -851,6 +851,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// place that logic lives, so this never drifts out of sync with it again.
 	// Fire-and-forget (persistCapture logs+discards errors).
 	if capture != nil && s.capturingEnabled(token) {
+		capture.TranslatedRespHeaders = s.redactCapturedAccountHeaders(context.Background(), token, target, capture.TranslatedRespHeaders)
 		s.persistCapture(id, capture)
 	}
 	// Opportunistic metric feedback: on a SUCCESSFUL real inference whose serving
