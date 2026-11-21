@@ -1178,6 +1178,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 && !hasCodexRateLimitHeader(resp.Header) {
 			s.attachCodexRateLimitWindows(rel.token, w.Header())
 		}
+		// A principal with quotas or budgets then has its own fullest limit written in
+		// the default x-codex family on any 2xx that carries no Codex figures yet
+		// (including a vendor family withheld from a non-entitled caller). It writes
+		// the client header set only.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			attachCodexPrincipalLimitStanding(r.Context(), w.Header(), time.Now())
+		}
 	}
 	w.WriteHeader(resp.StatusCode)
 

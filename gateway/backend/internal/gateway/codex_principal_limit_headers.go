@@ -6,6 +6,7 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"op-ai-gateway/internal/auth"
 	"strconv"
 	"time"
 )
@@ -85,6 +86,14 @@ func attachCodexPrincipalLimitStanding(ctx context.Context, dst http.Header, now
 		return
 	}
 	writeCodexLimitStanding(dst, r)
+}
+
+// attachTranslatedCodexUsageLimits fills the client header set of a translated
+// /v1/responses success: the Codex windows last observed for the caller, then the
+// principal's own fullest limit unless those windows already put figures there.
+func (s *Server) attachTranslatedCodexUsageLimits(r *http.Request, token auth.Token, dst http.Header) {
+	s.attachCodexRateLimitWindows(token, dst)
+	attachCodexPrincipalLimitStanding(r.Context(), dst, time.Now())
 }
 
 // writeCodexLimitBlocked answers a quota or budget denial on the Codex flavor: 429,

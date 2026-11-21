@@ -115,6 +115,11 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		if handled {
 			return
 		}
+		// The principal's limit standing rides the request context to the success
+		// writers (native passthrough and the translate paths).
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
+		}
 		// Native passthrough: if the resolved application supports Codex natively,
 		// proxy the raw body to the upstream /v1/responses instead of translating.
 		if s.tryProxyNative(w, r, &token, raw, inference.APIFlavorOpenAIResponses, endpointResponses, pf) {
@@ -139,6 +144,9 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		pf, handled = s.inferencePreflight(w, r, token, raw, inferenceShape{apiFlavor: inference.APIFlavorOpenAIResponses, endpoint: endpointResponses, model: req.Model, stream: req.Stream})
 		if handled {
 			return
+		}
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
 		}
 	}
 	req = pf.mergeInto(req)
