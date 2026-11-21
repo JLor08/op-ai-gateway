@@ -157,6 +157,23 @@ func TestWriteOverageStandingThresholds(t *testing.T) {
 	}
 }
 
+func TestWriteOverageStandingThresholdBoundaries(t *testing.T) {
+	reset := utc(2026, 11, 22, 0, 0, 0)
+	for _, tc := range []struct {
+		used             float64
+		value, threshold string
+	}{{75, "0.75", "0.75"}, {74.99, "0.74", ""}, {95, "0.95", "0.95"}} {
+		dst := http.Header{}
+		writeOverageStanding(dst, overageReading(tc.used, reset))
+		if got := dst.Get(unifiedRateLimitPrefix + "overage-utilization"); got != tc.value {
+			t.Errorf("used %v: utilization = %q, want %q", tc.used, got, tc.value)
+		}
+		if got := dst.Get(unifiedRateLimitPrefix + "overage-surpassed-threshold"); got != tc.threshold {
+			t.Errorf("used %v: threshold = %q, want %q", tc.used, got, tc.threshold)
+		}
+	}
+}
+
 func TestStandingOverlayReplacesSubscriptionTopLevel(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	reset := utc(2026, 11, 22, 0, 0, 0)

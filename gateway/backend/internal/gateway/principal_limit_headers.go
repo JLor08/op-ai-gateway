@@ -158,7 +158,7 @@ func writeOverageStanding(dst http.Header, r LimitReading) {
 		topStatus = "allowed_warning"
 	}
 
-	dst.Set(unifiedRateLimitPrefix+"overage-utilization", overageUtilizationValue(r.Utilization()))
+	dst.Set(unifiedRateLimitPrefix+"overage-utilization", fmt.Sprintf("0.%02d", cents))
 	if threshold != "" {
 		dst.Set(unifiedRateLimitPrefix+"overage-surpassed-threshold", threshold)
 	} else {

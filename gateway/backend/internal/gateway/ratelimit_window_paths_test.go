@@ -114,6 +114,9 @@ func (f *windowsFixture) post(t *testing.T, secret, path, model string, stream b
 	if path == "/v1/chat/completions" {
 		body = `{"model":"` + model + `","messages":[{"role":"user","content":"hi"}]`
 	}
+	if path == "/v1/responses" {
+		body = `{"model":"` + model + `","input":"hi"`
+	}
 	if stream {
 		body += `,"stream":true`
 	}

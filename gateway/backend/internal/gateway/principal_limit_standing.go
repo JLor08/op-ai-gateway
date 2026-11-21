@@ -75,9 +75,10 @@ func (s LimitStanding) Fullest() (LimitReading, bool) {
 
 // Blocking returns the reading to describe on a denial (design spec §6): among
 // the breached readings the one with the latest reset (when the user can work
-// again), ties to the earlier position. When none is breached, for example
-// because the cache moved since Admit decided, it falls back to the reading of
-// the kind Admit named, failed or not. ok is false when that kind is absent.
+// again), ties to the earlier position. When none is breached (a
+// defensive fallback, not an expected race: Evaluate takes its reason from the
+// same standing scans, so a breached reading exists on a quota or budget
+// denial) it falls back to the reading of the kind Admit named, failed or not. ok is false when that kind is absent.
 func (s LimitStanding) Blocking(fallback LimitKind) (LimitReading, bool) {
 	var best LimitReading
 	found := false

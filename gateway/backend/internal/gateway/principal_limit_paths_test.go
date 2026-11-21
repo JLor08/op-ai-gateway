@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -119,12 +120,41 @@ func TestStandingWithCachedWindows(t *testing.T) {
 func TestStandingNotAttachedToOtherFlavors(t *testing.T) {
 	f := newWindowsFixture(t, routing.EndpointModeTranslate)
 	f.capPrincipal()
-	for _, stream := range []bool{false, true} {
-		rec := f.post(t, vaOwnerSecret, "/v1/chat/completions", windowsLocalModel, stream)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("stream=%v status = %d, body = %s", stream, rec.Code, rec.Body.String())
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		for _, stream := range []bool{false, true} {
+			rec := f.post(t, vaOwnerSecret, path, windowsLocalModel, stream)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s stream=%v status = %d, body = %s", path, stream, rec.Code, rec.Body.String())
+			}
+			requireNoUnified(t, rec)
 		}
-		requireNoUnified(t, rec)
+	}
+}
+
+// TestStandingBlockCarriesNoWindows pins design spec section 6: the 429 billing_error
+// never carries #407's subscription windows, even when they are cached for the principal.
+func TestStandingBlockCarriesNoWindows(t *testing.T) {
+	f := newWindowsFixture(t, routing.EndpointModePassthrough)
+	f.observeViaVendor(t, vaOwnerSecret)
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "usr_va_a"}
+	store := newFakePrincipalStore()
+	store.setConfig(p, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"})
+	store.setAggregate(p, 0, 100, 0)
+	f.srv.Limiter = NewPrincipalLimiter(store, PrincipalLimiterOptions{})
+
+	rec := f.post(t, vaOwnerSecret, "/v1/messages", windowsLocalModel, false)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), `"billing_error"`) {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	for k := range rec.Header() {
+		lk := strings.ToLower(k)
+		if strings.HasPrefix(lk, rlp+"5h-") || strings.HasPrefix(lk, rlp+"7d-") ||
+			lk == rlp+"representative-claim" || lk == rlp+"overage-status" {
+			t.Fatalf("block carries %s: %v", k, rec.Header())
+		}
+	}
+	if rec.Header().Get(rlp+"status") != "rejected" {
+		t.Fatalf("block headers missing: %v", rec.Header())
 	}
 }
 

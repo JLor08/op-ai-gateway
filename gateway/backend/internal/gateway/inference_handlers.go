@@ -175,7 +175,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if handled {
 			return
 		}
-		r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
+		}
 		// Native passthrough: if the resolved application supports Claude Code natively,
 		// proxy the raw body to the upstream /v1/messages instead of translating (this
 		// is also the only way Anthropic streaming works, since the translate path
@@ -199,7 +201,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if handled {
 			return
 		}
-		r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
+		}
 	}
 	req = pf.mergeInto(req)
 	s.logInferenceRequest(r, token, req)
