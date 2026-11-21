@@ -1356,6 +1356,9 @@ func New(deps ServerDeps) *Server {
 			// A start's end wakes every request parked for the head's server.
 			wake: admission.releaseAll,
 			runs: runs,
+			// Step one sends an agent the document it waits for when the
+			// agent applied another one (checkConfigGate).
+			push: s.PushRuntimeConfig,
 		}, defaultClusterTimings())
 	}
 	s.routes()

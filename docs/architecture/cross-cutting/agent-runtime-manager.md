@@ -2207,7 +2207,10 @@ every usage write names the run it read):
   and only while the member reports that head's hold.
 - During a run the stored value only rises, and the run's own peak is kept
   beside it (`run_peak_*`), so a gateway restart in the middle keeps both. A
-  rise pushes nothing: the agent already charges `max(live, demand)`.
+  rise pushes nothing: the agent already charges `max(live, demand)`. A cluster
+  start that reaches its configuration step during the run sends the member
+  the document it lacks ([Runtime View
+  §6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start)).
 - When a run that formed ends, its peak replaces the stored value, a lower one
   included, and the member server's document is pushed: after the head
   disconnects the member falls back to its idle footprint, and its agent no
@@ -6604,6 +6607,14 @@ which is what keeps them from being the rejected allow-list:
 An auditor applying the rule without this list finds six apparent violations
 and either "fixes" them — the VRAM one would create a push storm at telemetry
 cadence — or concludes the rule is not real.
+
+Because of these exclusions, and the member usage rise of a running cluster
+(§3.7), an agent's applied document can lag the derived one by up to the 60 s
+poll without anything being wrong. A gate that waits for an agent to
+acknowledge the *current* document must therefore send it rather than only
+wait: the cluster start's configuration step pushes the document to an agent
+that applied another one ([Runtime View
+§6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start)).
 
 **The diagnostic signature of a missing notification** is that a runtime change
 takes effect *after about a minute*, because the agent's 60 s poll is the
