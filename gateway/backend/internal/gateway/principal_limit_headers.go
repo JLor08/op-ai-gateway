@@ -14,6 +14,16 @@ import (
 	"time"
 )
 
+// Unified-header suffixes appended to unifiedRateLimitPrefix.
+const (
+	unifiedStatus                    = "status"
+	unifiedReset                     = "reset"
+	unifiedOverageStatus             = "overage-status"
+	unifiedOverageReset              = "overage-reset"
+	unifiedOverageUtilization        = "overage-utilization"
+	unifiedOverageSurpassedThreshold = "overage-surpassed-threshold"
+)
+
 // limitBlockedBody is the one gateway error body that carries a top-level "type":
 // Claude Code reads error.type and error.message of an Anthropic-shaped error, and
 // only a "billing_error" with this envelope shows our sentence. Every other gateway
@@ -90,11 +100,11 @@ func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time) {
 	h := w.Header()
 	h.Set("Retry-After", strconv.Itoa(seconds))
 	h.Set("X-Should-Retry", "false")
-	h.Set(unifiedRateLimitPrefix+"status", "rejected")
-	h.Set(unifiedRateLimitPrefix+"reset", reset)
-	h.Set(unifiedRateLimitPrefix+"overage-reset", reset)
-	h.Set(unifiedRateLimitPrefix+"overage-utilization", "1")
-	h.Set(unifiedRateLimitPrefix+"overage-surpassed-threshold", "1")
+	h.Set(unifiedRateLimitPrefix+unifiedStatus, "rejected")
+	h.Set(unifiedRateLimitPrefix+unifiedReset, reset)
+	h.Set(unifiedRateLimitPrefix+unifiedOverageReset, reset)
+	h.Set(unifiedRateLimitPrefix+unifiedOverageUtilization, "1")
+	h.Set(unifiedRateLimitPrefix+unifiedOverageSurpassedThreshold, "1")
 	if period := limitBlockedPeriod(r.Period); period != "" {
 		h.Set(unifiedRateLimitPrefix+"overage-period", period)
 	}
@@ -158,17 +168,17 @@ func writeOverageStanding(dst http.Header, r LimitReading) {
 		topStatus = "allowed_warning"
 	}
 
-	dst.Set(unifiedRateLimitPrefix+"overage-utilization", fmt.Sprintf("0.%02d", cents))
+	dst.Set(unifiedRateLimitPrefix+unifiedOverageUtilization, fmt.Sprintf("0.%02d", cents))
 	if threshold != "" {
-		dst.Set(unifiedRateLimitPrefix+"overage-surpassed-threshold", threshold)
+		dst.Set(unifiedRateLimitPrefix+unifiedOverageSurpassedThreshold, threshold)
 	} else {
-		dst.Del(unifiedRateLimitPrefix + "overage-surpassed-threshold")
+		dst.Del(unifiedRateLimitPrefix + unifiedOverageSurpassedThreshold)
 	}
-	dst.Set(unifiedRateLimitPrefix+"overage-status", status)
-	dst.Set(unifiedRateLimitPrefix+"overage-reset", reset)
-	dst.Set(unifiedRateLimitPrefix+"reset", reset)
+	dst.Set(unifiedRateLimitPrefix+unifiedOverageStatus, status)
+	dst.Set(unifiedRateLimitPrefix+unifiedOverageReset, reset)
+	dst.Set(unifiedRateLimitPrefix+unifiedReset, reset)
 	dst.Set(unifiedRateLimitPrefix+"representative-claim", "overage")
-	dst.Set(unifiedRateLimitPrefix+"status", topStatus)
+	dst.Set(unifiedRateLimitPrefix+unifiedStatus, topStatus)
 	dst.Del(unifiedRateLimitPrefix + "overage-period")
 }
 
