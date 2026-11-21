@@ -1144,7 +1144,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		}
 	}
 	if rel.pfReq.APIFlavor == inference.APIFlavorAnthropicMessages {
-		forwardRateLimitHeaders(w.Header(), resp.Header, s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target))
+		// Entitlement is looked up only when there are unified figures to gate.
+		forwardRateLimitHeaders(w.Header(), resp.Header,
+			hasUnifiedRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target))
 	}
 	w.WriteHeader(resp.StatusCode)
 

@@ -2484,18 +2484,23 @@ service, on an application's create and on every runtime-spec write
 upstream now serves both native endpoints (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
 
-**Response headers on the Messages passthrough.** The passthrough writes no upstream
-response header to the client except, for the `anthropic_messages` flavor only, an
-allowlist (`forwardRateLimitHeaders`, `ratelimit_headers.go`): `retry-after` and
-`x-should-retry` always, and the unified rate-limit family
-(`anthropic-ratelimit-unified-*`, every value) only when the caller is entitled to the
-routed account's figures (`rateLimitFiguresEntitled`: a self-hosted target, the account
-owner, any caller when the owner opted in, or a system-scope principal or community
-manager of the account per `VendorAccountUsageManager`, cached 60 s; a portal error is
-not entitled). They are copied from the final upstream response only, at the point the
-status line is written, so a discarded re-selection attempt contributes none. Request
-ids, organization ids and the per-minute `anthropic-ratelimit-*` limit headers are never
-forwarded, and neither is anything on the Responses flavor.
+**Response headers on the Messages passthrough.** Of the upstream's other response
+headers, only an allowlist is relayed, and only for the `anthropic_messages` flavor
+(`forwardRateLimitHeaders`, `ratelimit_headers.go`): `retry-after` and `x-should-retry`
+always, and the unified rate-limit family (`anthropic-ratelimit-unified-*`, every value)
+only when the caller is entitled to the routed account's figures
+(`rateLimitFiguresEntitled`). On inference the figures reach the account owner, a
+community manager of a `shared`/`full` account, or anyone when the owner opted in
+(`share_usage_with_members`); an inference token never carries system scope, which
+matches what the same principal sees in the portal without elevation. A self-hosted
+target is always entitled. The portal answer (`VendorAccountUsageManager`) is cached
+60 s per principal and account, bounded to 2 s per lookup, and a portal error or
+timeout is not entitled (cached 5 s); a response with no unified header skips the
+lookup entirely. The headers are copied from the final upstream response only, at the
+point the status line is written, so a discarded re-selection attempt contributes none.
+Request ids, organization ids and the `anthropic-ratelimit-requests-*` /
+`anthropic-ratelimit-tokens-*` headers are never forwarded, and neither is anything on
+the Responses flavor.
 
 **One exception at dispatch: `sglang_omni`.** For a target whose effective kind
 (`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a

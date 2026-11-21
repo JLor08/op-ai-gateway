@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func rateLimitSrcHeaders() http.Header {
@@ -30,6 +31,68 @@ func rateLimitSrcHeaders() http.Header {
 	h.Set("Anthropic-Organization-Id", "org")
 	h.Set("Anthropic-Ratelimit-Requests-Limit", "50")
 	return h
+}
+
+type slowPortal struct {
+	usageManagerPortal
+}
+
+func (p *slowPortal) VendorAccountUsageManager(ctx context.Context, _ auth.Token, _ string) (bool, error) {
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	<-ctx.Done()
+	return true, ctx.Err()
+}
+
+func TestRateLimitFiguresEntitledFailureModes(t *testing.T) {
+	member := auth.Token{ID: "tok_m", UserID: "usr_m", Active: true}
+	vendor := routing.Target{VendorAccountID: "acc_1", VendorAccountOwnerUserID: "usr_owner"}
+
+	t.Run("error cached within the negative TTL", func(t *testing.T) {
+		p := &usageManagerPortal{ok: true, err: errors.New("boom")}
+		srv := &Server{Portal: p}
+		for i := 0; i < 3; i++ {
+			if srv.rateLimitFiguresEntitled(context.Background(), member, vendor) {
+				t.Fatalf("call %d entitled on a portal error", i)
+			}
+		}
+		if p.calls != 1 {
+			t.Fatalf("portal calls = %d, want 1 (error cached)", p.calls)
+		}
+	})
+
+	t.Run("slow portal times out not entitled", func(t *testing.T) {
+		p := &slowPortal{}
+		srv := &Server{Portal: p}
+		start := time.Now()
+		if srv.rateLimitFiguresEntitled(context.Background(), member, vendor) {
+			t.Fatal("entitled on a timed-out lookup")
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("lookup took %v, want it bounded near %v", d, rateLimitEntitlementTimeout)
+		}
+		srv.rateLimitFiguresEntitled(context.Background(), member, vendor)
+		if p.calls != 1 {
+			t.Fatalf("portal calls = %d, want 1 (timeout cached)", p.calls)
+		}
+	})
+}
+
+func TestNativeMessagesWithoutUnifiedHeadersNeverConsultsPortal(t *testing.T) {
+	h := http.Header{"Retry-After": []string{"37"}, "X-Should-Retry": []string{"false"}, "Content-Type": []string{jsonContentType}}
+	prov := &headerProxyProvider{answers: []headerAnswer{{status: 429, header: h, body: `{"type":"error"}`}}}
+	srv := newNativeProxyTestServer(prov, false, true)
+	p := &usageManagerPortal{API: srv.Portal, ok: true}
+	srv.Portal = p
+	target := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: "acc_x", VendorAccountOwnerUserID: "usr_other", ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}
+	rec := relayRateLimit(srv, target, inference.APIFlavorAnthropicMessages, endpointMessages, nil)
+	if p.calls != 0 {
+		t.Fatalf("portal consulted %d times for a response with no unified headers", p.calls)
+	}
+	if rec.Header().Get("Retry-After") != "37" || rec.Header().Get("X-Should-Retry") != "false" {
+		t.Fatalf("retry headers not forwarded: %v", rec.Header())
+	}
 }
 
 func TestForwardRateLimitHeadersAllowlist(t *testing.T) {
@@ -53,10 +116,10 @@ func TestForwardRateLimitHeadersAllowlist(t *testing.T) {
 		}
 	}
 
-	min := http.Header{}
-	forwardRateLimitHeaders(min, src, false)
-	if len(min) != 2 || min.Get("Retry-After") != "37" || min.Get("X-Should-Retry") != "false" {
-		t.Fatalf("includeUnified=false copied %v, want only Retry-After and X-Should-Retry", min)
+	only := http.Header{}
+	forwardRateLimitHeaders(only, src, false)
+	if len(only) != 2 || only.Get("Retry-After") != "37" || only.Get("X-Should-Retry") != "false" {
+		t.Fatalf("includeUnified=false copied %v, want only Retry-After and X-Should-Retry", only)
 	}
 }
 

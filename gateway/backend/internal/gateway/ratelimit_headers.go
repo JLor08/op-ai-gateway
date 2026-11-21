@@ -18,6 +18,15 @@ import (
 // as its usage limits.
 const unifiedRateLimitPrefix = "anthropic-ratelimit-unified-"
 
+// rateLimitEntitlementErrorTTL is how long a failed or timed-out portal lookup is
+// remembered as "not entitled", so a store outage costs one lookup per principal and
+// account per window rather than one per request.
+const rateLimitEntitlementErrorTTL = 5 * time.Second
+
+// rateLimitEntitlementTimeout bounds one portal lookup, so a slow store cannot hold
+// back the response status line.
+const rateLimitEntitlementTimeout = 2 * time.Second
+
 // rateLimitEntitlementTTL bounds how long a portal answer for "may this principal see
 // this account's rate-limit figures" is reused on the inference hot path.
 const rateLimitEntitlementTTL = 60 * time.Second
@@ -26,6 +35,17 @@ const rateLimitEntitlementTTL = 60 * time.Second
 // (case-insensitive prefix test).
 func isUnifiedRateLimitHeader(name string) bool {
 	return len(name) >= len(unifiedRateLimitPrefix) && strings.EqualFold(name[:len(unifiedRateLimitPrefix)], unifiedRateLimitPrefix)
+}
+
+// hasUnifiedRateLimitHeader reports whether h carries any unified rate-limit header,
+// i.e. whether there is anything for the entitlement gate to decide.
+func hasUnifiedRateLimitHeader(h http.Header) bool {
+	for name := range h {
+		if isUnifiedRateLimitHeader(name) {
+			return true
+		}
+	}
+	return false
 }
 
 // forwardRateLimitHeaders copies the response headers the Messages passthrough relays
@@ -62,7 +82,14 @@ type rateLimitEntitlement struct {
 // self-hosted target (no vendor account) is always entitled; so is the account's owner;
 // so is anyone when the owner shared the figures with members; otherwise the portal
 // decides (system scope or a community manager of the account), cached per principal
-// and account. A portal error, or no portal, is not entitled.
+// and account. A portal error, a lookup slower than rateLimitEntitlementTimeout, or no
+// portal, is not entitled (fail closed; the failure is cached for
+// rateLimitEntitlementErrorTTL).
+//
+// Inference narrows the portal predicate: API tokens never carry system scope (it
+// exists only on an elevated session principal, and /v1/messages is bearer-only), so on
+// this path the figures reach the owner, a community manager of a shared/full account,
+// or anyone when the owner opted in.
 func (s *Server) rateLimitFiguresEntitled(ctx context.Context, token auth.Token, target routing.Target) bool {
 	if target.VendorAccountID == "" {
 		return true
@@ -77,7 +104,7 @@ func (s *Server) rateLimitFiguresEntitled(ctx context.Context, token auth.Token,
 		return false
 	}
 	principalType, principalID := "user", token.UserID
-	if token.Kind == "service" {
+	if token.IsService() {
 		principalType, principalID = "service", token.ServiceID
 	}
 	key := principalType + "\x00" + principalID + "\x00" + target.VendorAccountID
@@ -90,9 +117,12 @@ func (s *Server) rateLimitFiguresEntitled(ctx context.Context, token auth.Token,
 	}
 	c.mu.Unlock()
 
-	ok, err := s.Portal.VendorAccountUsageManager(ctx, token, target.VendorAccountID)
+	lookupCtx, cancel := context.WithTimeout(ctx, rateLimitEntitlementTimeout)
+	defer cancel()
+	ok, err := s.Portal.VendorAccountUsageManager(lookupCtx, token, target.VendorAccountID)
+	ttl := rateLimitEntitlementTTL
 	if err != nil {
-		return false
+		ok, ttl = false, rateLimitEntitlementErrorTTL
 	}
 	c.mu.Lock()
 	if c.entries == nil {
@@ -103,7 +133,7 @@ func (s *Server) rateLimitFiguresEntitled(ctx context.Context, token auth.Token,
 			delete(c.entries, k)
 		}
 	}
-	c.entries[key] = rateLimitEntitlement{ok: ok, expires: now.Add(rateLimitEntitlementTTL)}
+	c.entries[key] = rateLimitEntitlement{ok: ok, expires: now.Add(ttl)}
 	c.mu.Unlock()
 	return ok
 }

@@ -681,8 +681,10 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
   `anthropic-beta` (*Client `anthropic-beta` on the Messages passthrough*, below);
   an api-key target has no beta of its own, so that is the whole header, and a
   request without one sends none. No other inbound header is forwarded, the
-  client's own `anthropic-version` included. The response side is the same allowlist as the subscription relay below (`retry-after`, `x-should-retry`, and the entitlement-gated `anthropic-ratelimit-unified-*` family). Redirects from the upstream are not
-  followed, because net/http strips `Authorization` but not `x-api-key` when a
+  client's own `anthropic-version` included. The response side is the same
+  allowlist as the subscription relay below (`retry-after`, `x-should-retry`, and the
+  entitlement-gated `anthropic-ratelimit-unified-*` family). Redirects from the
+  upstream are not followed, because net/http strips `Authorization` but not `x-api-key` when a
   redirect leaves the host.
 - **Verbatim in body and in beta opt-in, pinned in version.** A beta-gated body
   feature (for example a `context_management` field) reaches Anthropic together
@@ -788,9 +790,13 @@ account (§5).
   back (§6.5), except that the Messages passthrough forwards a response-header
   allowlist to the client: `retry-after` and `x-should-retry` always, and the
   `anthropic-ratelimit-unified-*` family only for a caller entitled to the account's
-  figures (its owner, anyone when the owner shared them with members, or a community
-  manager of the account; `rateLimitFiguresEntitled`). Every other upstream response
-  header is dropped. Redirects are not followed, as for the api-key relay.
+  figures. On inference those are the account owner, a community manager of a
+  `shared`/`full` account, or anyone when the owner opted in
+  (`share_usage_with_members`); inference tokens never carry system scope, which
+  matches what the same principal sees in the portal without elevation
+  (`rateLimitFiguresEntitled`). The `anthropic-ratelimit-requests-*` /
+  `anthropic-ratelimit-tokens-*` headers, request ids and every other upstream
+  response header are dropped. Redirects are not followed, as for the api-key relay.
 - **The body is verbatim except three edits.** The gateway layer rewrites `model` to
   the account's bare upstream id (equal to the requested name when the account has
   no prefix) and removes the replayed `thinking` blocks Anthropic cannot verify

@@ -840,6 +840,9 @@ type Server struct {
 	// varies per call (GetTTL), shorter for an error-derived miss so a transient
 	// NetBird blip self-heals fast.
 	sourcePeerIP settingCache[string]
+	// rateLimitEntitlements caches the portal's per-principal, per-account answer
+	// behind rateLimitFiguresEntitled (ratelimit_headers.go); zero value ready.
+	rateLimitEntitlements rateLimitEntitlementCache
 	// vendorEnabledCache / vendorRoutingModeCache are the TTL caches
 	// (settingCache, invalidatable mode -- ttlcache.go) backing the resolver's
 	// injected vendor-account accessors (SetVendorAccountAccessors), so the
@@ -849,9 +852,6 @@ type Server struct {
 	// (invalidateVendorSettingsCache), so an operator toggling either in the
 	// portal sees the effect on the next request rather than after the TTL; they
 	// share edgeSwitch's generation-based disarm-race guard.
-	// rateLimitEntitlements caches the portal's per-principal, per-account answer
-	// behind rateLimitFiguresEntitled (ratelimit_headers.go); zero value ready.
-	rateLimitEntitlements  rateLimitEntitlementCache
 	vendorEnabledCache     settingCache[bool]
 	vendorRoutingModeCache settingCache[string]
 	// vendorSubscriptionsEnabledCache is the same kind of cache for the
