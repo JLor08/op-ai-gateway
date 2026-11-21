@@ -3919,6 +3919,8 @@ Claude Code can show an Anthropic subscription's usage limits (the 5 hour and 7 
 windows) from the `anthropic-ratelimit-unified-*` response headers of `/v1/messages`.
 Through the gateway this works for a user who routes to a vendor subscription account and
 to local models in one session, under three conditions.
+The gateway's own request quota, token quota and cost budget are reported in the same header
+family; that is §9.4.
 
 **Client condition.** Claude Code only reads those headers when its bearer token
 (`ANTHROPIC_AUTH_TOKEN`) is a JWT whose payload `aud` is `claude-gateway`. A token gets such
@@ -3978,11 +3980,111 @@ client response headers, which the relay already gates.
 **What Claude Code shows.** The per-window utilization and reset in its own status and
 warning display. It does not show the Claude Desktop usage card or the `/usage` plan
 panel, which read Anthropic's own endpoints and need a first-party login; the gateway does
-not emulate them.
+not emulate them. The gateway's own limits are
+§9.4.
 
 **Dependency.** All of this relies on undocumented Claude Code behavior (the `aud`
 check, the header names and the clear-on-missing rule). A client update can change it
 without notice; nothing in the gateway breaks, the display just stops working.
+
+### 9.4 Claude Code display of the gateway's own limits
+
+§9.3 shows an Anthropic subscription's windows. This section covers the other limits Claude Code can report: the
+principal's own request quota, token quota and cost budget (`routing.LimitConfig`, enforced by `PrincipalLimiter`;
+see [Telemetry, Usage & Observability](telemetry-usage-observability.md)). A developer hears about them before they
+bite, and when one bites Claude Code shows one sentence (which limit, when it resets, whom to ask) instead of retrying.
+Decisions: [ADR-107](../09-architecture-decisions.md#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
+
+**Contract and verified client behavior.** The shape is the "Usage-limit headers — optional" section of the Claude apps
+gateway `/protocol` text embedded in the Claude Code binary; its public counterpart is [Usage warnings in Claude
+Code](https://code.claude.com/docs/en/claude-apps-gateway-spend-limits.md). Verified in Claude Code 2.1.328:
+
+- With a JWT-shaped token (`aud: claude-gateway`, the `claude_code_usage_display` option of §9.3) the client reads the
+  overage window (a `rate_limit_event` with `rateLimitType: overage`, utilization and threshold) and prints the contract
+  429's `error.message` verbatim, after one request. With an opaque token it prints `API Error: Request rejected (429) ·
+  <message>`, also after one request.
+- The status line's `rate_limits.spend_limit` and the `/usage` "Spend limit" bar appear only in a gateway sign-in session
+  (`CLAUDE_CODE_USE_GATEWAY=1` or `/login` to a gateway), which Claude Desktop cannot use. The same headers feed them
+  there with no further work.
+- The client picks its warning from the first window with a surpassed threshold, in the order `5h`, `7d`, `7d_oi`,
+  `overage`.
+- Before this behavior, a quota denial (a 429 without `Retry-After` or `x-should-retry`) made Claude Code retry with
+  backoff (8 retries in 90 s, still retrying), and the cost-budget 402 printed `API Error: 402 cost budget exceeded`.
+
+**Readings at admission.** `PrincipalLimiter.Evaluate` is `Admit` with its readings kept (`Admit` calls it). After the
+rate check it reads every configured limit (threshold above 0 and a period set, the rule every check uses) through the
+existing cached aggregate path and returns an `Admission`: the verdict, the instant `At`, and a `LimitStanding`, one
+`LimitReading` per configured limit in the fixed order request quota, token quota, cost budget. A reading holds the kind,
+the period `used`, the `cap`, the period and the `Reset`, the end of the current UTC calendar period
+(`routing.PeriodEnd`). `utilization = used / cap`. A read that failed yields a reading with `Failed` set, which is not
+zero used. `inferencePreflight` returns the standing in `preflight.Standing`, and `handleAnthropicMessages` puts it on the
+request context (`withLimitStanding`) for the attach points. No store I/O happens on the response path: the figures are
+the ones admission judged, and `Record` bumps from concurrent requests during the upstream call are not reflected.
+
+**Success (2xx, `/v1/messages`).** `LimitStanding.Fullest` picks the reading to describe: highest utilization, ties to
+the later reset, then to the fixed order. It reports no reading when the standing is empty or any reading failed, because
+a partial picture could name the wrong limit; no gateway header is then written and §9.3's headers stay as they were. A
+principal with no quota or budget is unaffected byte for byte. `attachPrincipalLimitStanding`
+(`principal_limit_headers.go`) runs as the last header step at the three attach points of §9.3: the native passthrough on
+any 2xx before the status line, and on the translate path (through `attachTranslatedUsageLimits`) the buffered JSON
+answer and the SSE header block. It changes only the client header set, never the upstream set that `recordUsage`, the
+window cache and the vendor usage scrape read. The overage window is written by `writeOverageStanding`:
+
+| Header | Value |
+|---|---|
+| `anthropic-ratelimit-unified-overage-utilization` | `floor(utilization × 100) / 100` with two decimals, at most `0.99` (concurrent bumps can push the cached figure to 1 or above on an admitted request; the contract wants it below 1 while requests are allowed) |
+| `anthropic-ratelimit-unified-overage-surpassed-threshold` | `0.95` from a written 0.95, `0.75` from a written 0.75, otherwise absent |
+| `anthropic-ratelimit-unified-overage-status` | `allowed_warning` when a threshold is written, otherwise `allowed` |
+| `anthropic-ratelimit-unified-overage-reset` and `anthropic-ratelimit-unified-reset` | the reading's reset, unix seconds |
+| `anthropic-ratelimit-unified-representative-claim` | `overage` |
+| `anthropic-ratelimit-unified-status` | `allowed_warning` when the overage window warns or a kept subscription window is `allowed_warning` or `rejected`, otherwise `allowed` |
+
+There is no `anthropic-ratelimit-unified-overage-period` on a success, which the contract does not list there.
+
+**Coexistence with §9.3.** For a principal with a describable standing, the §9.3 steps run first (relay, or cached
+windows on another provider's success). Then every unified header is removed except the per-window fields of `5h`, `7d`
+and `7d_oi` (utilization, reset, status and surpassed-threshold), which also drops the subscription's own
+top-level fields and its `overage-*` fields (they describe Anthropic's extra usage, not this gateway's cap), the fallback and upgrade-paths fields. Then the overage window above is written. The gateway's cap owns the top-level fields, as the contract
+wants, and the subscription windows stay visible beside it.
+
+**Block (`/v1/messages` only).** A quota or budget denial on the Anthropic Messages flavor (`/v1/messages` and its
+aliases; `count_tokens` never admits) is answered by `writeLimitBlocked`, called from `admitPrincipal`, which now takes
+the flavor. The cost budget is a 429 here, not its 402 elsewhere. `LimitStanding.Blocking` picks the limit to name: among
+the breached readings the one with the latest reset (when the user can work again), ties to the fixed order; when none is
+breached any more (the cache moved since `Admit` decided) the reading of the limit `Admit` named. A failed read counts as
+not breached. Response:
+
+- **Body:** `{"type":"error","error":{"type":"billing_error","code":"<code>","message":"<sentence>"}}`, with the limit's
+  stable code (`limit.request_quota_exceeded`, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`). The
+  top-level `"type":"error"` exists for this one body; every other gateway error keeps the `apierror` shape.
+- **Sentence:** `<request quota|token quota|cost budget> reached · resets <Mon D, HH:MM> UTC · ask your gateway
+  administrator to raise it`, for example `token quota reached · resets Nov 22, 00:00 UTC · ask your gateway
+  administrator to raise it`.
+- **Headers:** `Retry-After` (seconds to the reset, rounded up, at least 1), `X-Should-Retry: false`,
+  `anthropic-ratelimit-unified-status: rejected`, `anthropic-ratelimit-unified-reset` and `anthropic-ratelimit-unified-overage-reset` (unix seconds), `anthropic-ratelimit-unified-overage-utilization: 1`,
+  `anthropic-ratelimit-unified-overage-surpassed-threshold: 1`, `anthropic-ratelimit-unified-overage-period` (`daily`, `weekly` or `monthly`; absent for `hour`, which the
+  client accepts), `anthropic-ratelimit-unified-overage-disabled-reason: org_spend_cap_reached`. `representative-claim` and `overage-status` stay
+  absent on purpose: with them Claude Code composes its own line and drops ours. No subscription windows are attached.
+- A denied request is still not recorded as a usage event and never reaches `Resolve`. The short rate limit is unchanged
+  everywhere (429 with `Retry-After`, `apierror` body).
+
+**Other endpoints.** Every other caller of the shared admission (chat completions, responses, images, speech,
+transcription, live transcription, the `/v1/realtime` handshake, the portal loopback paths) keeps each quota or budget
+denial's status (quota 429, budget 402) and `apierror` body and gains `X-Should-Retry: false` (`writeLimitDenied`), so the
+Anthropic and OpenAI SDKs stop retrying into a block that holds until the period resets. The rate denial keeps its
+`Retry-After` and no `X-Should-Retry`.
+
+**Memory driver.** It holds no `usage_events`, so every aggregate is zero and a configured principal reads 0 %, which
+matches what enforcement sees (quotas and budgets are a persistent-store feature).
+
+**End to end.** Run against Claude Code 2.1.328 with a sqlite-mode gateway and a stub upstream: at 88 % of a daily token
+quota the gateway sent `allowed_warning` with threshold `0.75` and Claude Code emitted the overage `rate_limit_event`; past
+the cap the 429 sentence was printed verbatim with no upstream request and no retries.
+
+**Dependency.** The display relies on undocumented client behavior (the `aud` gate, the header names and the window
+order); a client update can stop it without breaking the gateway. The 429 shape and `x-should-retry` are documented in the
+contract and help every client. The server agent, the store schema and the portal are untouched. See [Risks & Technical
+Debt](../11-risks-and-technical-debt.md#111-operational-risks).
 
 ## 10. Request bodies and size limits
 
@@ -5207,8 +5309,8 @@ Every inference error response uses the gateway-wide envelope
 |---|---|---|
 | `request.*` (e.g. `request.model_required`, `openai.content_required`, `anthropic.content_unsupported`) | 400 | body failed `compat.Parse*`/`inference.Request.Validate` |
 | `model.not_allowed` | 403 | service-token allowlist (§6 step 2) |
-| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate; `.token_quota_exceeded` is also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
-| `limit.cost_budget_exceeded` | 402 | `PrincipalLimiter` admission gate; also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
+| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate; the two quota codes also carry `X-Should-Retry: false`, and on `/v1/messages` they come as a `billing_error` body (§9.4); `.token_quota_exceeded` is also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
+| `limit.cost_budget_exceeded` | 402 (429 `billing_error` on `/v1/messages`, §9.4) | `PrincipalLimiter` admission gate, with `X-Should-Retry: false`; also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |

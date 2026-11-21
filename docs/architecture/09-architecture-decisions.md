@@ -13007,12 +13007,12 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
   Messages betas such as context management.
 - **Anthropic's Claude apps gateway sign-in (device flow).** Large, brings the same beta loss, and adds no display beyond the token shape.
 - **Every token JWT-shaped.** An opt-in leaves other clients and existing tokens untouched.
-- **Recording the gateway's own limits in the spend-limit shape, and forwarding Codex `x-codex-*` headers.** Not part of this change.
+- **Recording the gateway's own limits in the spend-limit shape (done in ADR-107), and forwarding Codex `x-codex-*` headers.** Not part of this change.
 
 **Consequences and limits.**
 
-- Claude Code's Desktop usage card and the `/usage` plan panel stay unreachable for any gateway; the gateway's own principal limits in
-  the spend-limit shape are a follow-up.
+- Claude Code's Desktop usage card and the `/usage` plan panel stay unreachable for any gateway. The gateway's own principal limits reach
+  Claude Code in the overage-window shape, see [ADR-107](#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
 - The window cache is per process and best effort (capped at 10 000 principals, lost on restart, not shared between replicas). Entitlement is checked at
   observe time, and each entry remembers its account: a later response from that account to a principal who is no longer entitled drops the entry. A principal
   whose entitlement is revoked and who then uses only other providers keeps receiving its last frozen figures on local-model replies until the windows
@@ -13022,3 +13022,50 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
 - → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
   [member view](cross-cutting/external-vendor-accounts.md#82-what-each-viewer-reads),
   [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).
+
+## ADR-107 — The gateway's own principal limits reach Claude Code as the overage window and a 429 billing_error, from readings taken at admission
+
+**Context.** ADR-106 made a subscription's windows visible in Claude Code. The gateway's own limits (a principal's request quota, token
+quota and cost budget) stayed invisible, and a denial hurt: a quota 429 without `Retry-After` or `x-should-retry` made Claude Code retry
+with backoff (8 retries in 90 s, still going), and the cost-budget 402 printed a bare `API Error: 402 cost budget exceeded` (issue #413).
+Verified in Claude Code 2.1.328: the documented gateway contract ("Usage-limit headers — optional") describes a cap as the window-agnostic
+`overage` window and a block as a `429 billing_error`; with a JWT-shaped token the client reads that window and prints the 429's message
+verbatim after one request, with an opaque token it prints the message in `API Error: Request rejected (429) · <message>`, and the status
+line's spend-limit field and the `/usage` bar exist only in a gateway sign-in session.
+
+**Decision.**
+
+- **Describe the fullest limit as the overage window.** On a `/v1/messages` 2xx, for a principal with at least one quota or budget, write
+  the `anthropic-ratelimit-unified-overage-*` family and the top-level fields for the limit with the highest utilization (ties: later reset,
+  then fixed order). A principal with no limit gets no gateway header.
+- **Take the readings at admission, carry them to the response.** `PrincipalLimiter.Evaluate` reads every configured limit through the
+  existing cached path and returns them (`LimitStanding`); the handlers carry them on the request context to the attach points. The response
+  path does no store I/O, the figures are exactly the ones admission judged, and a failed read is a `Failed` reading that suppresses the
+  display (a partial picture could name the wrong limit) while admission still fails open.
+- **Answer a `/v1/messages` quota or budget denial with the contract's 429.** A `billing_error` body naming the limit that frees the user
+  last, one fixed sentence (which limit, reset in UTC, whom to ask), `Retry-After`, `X-Should-Retry: false` and the `rejected` headers. The
+  cost budget becomes a 429 on this endpoint only.
+- **Every other endpoint keeps its status and body** and gains `X-Should-Retry: false` on a quota or budget denial; the rate limit is
+  unchanged everywhere.
+- **The gateway's cap owns the top-level fields** and #407's subscription windows (`5h`, `7d`, `7d_oi`) stay beside it; the subscription's
+  own top-level and overage fields are removed on such a response. A principal without limits keeps ADR-106's behavior byte for byte.
+
+**Rejected:**
+
+- **A fresh read when the response headers go out.** Those go out when the upstream answers, often after the 10 s cache, and would hold the
+  response on the store.
+- **`GET /api/oauth/usage`.** Read only in gateway sign-in sessions and USD-only, while the budget is energy-based.
+- **Emitting `representative-claim` and `overage-status` on a block.** The client then composes its own line and drops the gateway's.
+- **Changing the other endpoints' bodies or statuses**, and the contract's pool and fail-closed variants (there are no shared pools, and the
+  limiter fails open).
+
+**Consequences and limits.**
+
+- The client takes its warning from the first window with a surpassed threshold in the order `5h`, `7d`, `7d_oi`, `overage`: while a
+  subscription window warns, the gateway's overage warning is not the one shown (both are in the `rate_limit_event`).
+- The memory driver has no `usage_events`, so a configured principal reads 0 % there.
+- The display rests on undocumented client behavior (the `aud` gate, the header names, the window order); the 429 shape and `x-should-retry`
+  are documented and help every client. See the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits),
+  [the limiter](cross-cutting/telemetry-usage-observability.md).

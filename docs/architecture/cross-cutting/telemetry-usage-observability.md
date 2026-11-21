@@ -3205,6 +3205,15 @@ session's own consumption is not in the aggregate it reads until its one row is
 written when it ends, so the session's maximum lifetime
 (`OP_AI_GATEWAY_REALTIME_MAX_SESSION`) is what bounds its overrun.
 
+`PrincipalLimiter.Evaluate` is `Admit` with its readings kept (`Admit` is a thin wrapper). After the rate check it
+reads the aggregate of **every** configured limit through the same caches, before judging any breach, and returns an
+`Admission`: the verdict and a `LimitStanding` with one `LimitReading` per configured limit (used, cap, period, reset).
+A rate denial stops before any read and a principal with no configured quota or budget has no standing. An aggregate
+read that fails gives a `Failed` reading: admission still fails open on it as before, but it is distinguishable from
+zero used, and a standing with a failed reading is not reported to the client. The standing travels with the request, so
+the response path does no store I/O. How Claude Code displays it: [Compatibility & Inference
+§9.4](compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits).
+
 All of that is the *configured* case. A principal with no limits never reaches
 any of it: `Admit` short-circuits on the zero `routing.LimitConfig` — no
 `principal_limits` row at all, or a row whose every field is zero — and allows
