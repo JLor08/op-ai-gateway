@@ -13007,7 +13007,8 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
   Messages betas such as context management.
 - **Anthropic's Claude apps gateway sign-in (device flow).** Large, brings the same beta loss, and adds no display beyond the token shape.
 - **Every token JWT-shaped.** An opt-in leaves other clients and existing tokens untouched.
-- **Recording the gateway's own limits in the spend-limit shape (done in ADR-107), and forwarding Codex `x-codex-*` headers.** Not part of this change.
+- **Showing the gateway's own principal limits in the same change.** Done separately: they reach Claude Code as the overage window, see [ADR-107](#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
+- **Forwarding Codex `x-codex-*` headers.** Rejected here; not part of this change.
 
 **Consequences and limits.**
 

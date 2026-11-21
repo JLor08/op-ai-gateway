@@ -3919,8 +3919,6 @@ Claude Code can show an Anthropic subscription's usage limits (the 5 hour and 7 
 windows) from the `anthropic-ratelimit-unified-*` response headers of `/v1/messages`.
 Through the gateway this works for a user who routes to a vendor subscription account and
 to local models in one session, under three conditions.
-The gateway's own request quota, token quota and cost budget are reported in the same header
-family; that is §9.4.
 
 **Client condition.** Claude Code only reads those headers when its bearer token
 (`ANTHROPIC_AUTH_TOKEN`) is a JWT whose payload `aud` is `claude-gateway`. A token gets such
@@ -3980,8 +3978,8 @@ client response headers, which the relay already gates.
 **What Claude Code shows.** The per-window utilization and reset in its own status and
 warning display. It does not show the Claude Desktop usage card or the `/usage` plan
 panel, which read Anthropic's own endpoints and need a first-party login; the gateway does
-not emulate them. The gateway's own limits are
-§9.4.
+not emulate them. The gateway's own request quota, token quota and cost budget are reported in
+the same header family; that is [§9.4](#94-claude-code-display-of-the-gateways-own-limits).
 
 **Dependency.** All of this relies on undocumented Claude Code behavior (the `aud`
 check, the header names and the clear-on-missing rule). A client update can change it
@@ -4020,6 +4018,9 @@ the period `used`, the `cap`, the period and the `Reset`, the end of the current
 zero used. `inferencePreflight` returns the standing in `preflight.Standing`, and `handleAnthropicMessages` puts it on the
 request context (`withLimitStanding`) for the attach points. No store I/O happens on the response path: the figures are
 the ones admission judged, and `Record` bumps from concurrent requests during the upstream call are not reflected.
+Because the readings are fixed at admission, a response that arrives after a calendar-period boundary (an hourly quota
+with a slow first byte, a long buffered completion) carries the old period's utilization and a reset already in the
+past; the next response corrects it.
 
 **Success (2xx, `/v1/messages`).** `LimitStanding.Fullest` picks the reading to describe: highest utilization, ties to
 the later reset, then to the fixed order. It reports no reading when the standing is empty or any reading failed, because
@@ -4043,15 +4044,17 @@ There is no `anthropic-ratelimit-unified-overage-period` on a success, which the
 
 **Coexistence with §9.3.** For a principal with a describable standing, the §9.3 steps run first (relay, or cached
 windows on another provider's success). Then every unified header is removed except the per-window fields of `5h`, `7d`
-and `7d_oi` (utilization, reset, status and surpassed-threshold), which also drops the subscription's own
-top-level fields and its `overage-*` fields (they describe Anthropic's extra usage, not this gateway's cap), the fallback and upgrade-paths fields. Then the overage window above is written. The gateway's cap owns the top-level fields, as the contract
+and `7d_oi` (utilization, reset, status and surpassed-threshold). What goes is the subscription's own top-level
+fields, its `overage-*` fields (they describe Anthropic's extra usage, not this gateway's cap) and the fallback and
+upgrade-paths fields. Then the overage window above is written. The gateway's cap owns the top-level fields, as the contract
 wants, and the subscription windows stay visible beside it.
 
 **Block (`/v1/messages` only).** A quota or budget denial on the Anthropic Messages flavor (`/v1/messages` and its
 aliases; `count_tokens` never admits) is answered by `writeLimitBlocked`, called from `admitPrincipal`, which now takes
 the flavor. The cost budget is a 429 here, not its 402 elsewhere. `LimitStanding.Blocking` picks the limit to name: among
-the breached readings the one with the latest reset (when the user can work again), ties to the fixed order; when none is
-breached any more (the cache moved since `Admit` decided) the reading of the limit `Admit` named. A failed read counts as
+the breached readings the one with the latest reset (when the user can work again), ties to the fixed order; a defensive
+fallback, not an expected race (the denial and `Blocking` read the same standing, so a breached reading always exists on
+a quota or budget denial), takes the reading of the limit `Admit` named when none is breached. A failed read counts as
 not breached. Response:
 
 - **Body:** `{"type":"error","error":{"type":"billing_error","code":"<code>","message":"<sentence>"}}`, with the limit's
@@ -4077,9 +4080,10 @@ Anthropic and OpenAI SDKs stop retrying into a block that holds until the period
 **Memory driver.** It holds no `usage_events`, so every aggregate is zero and a configured principal reads 0 %, which
 matches what enforcement sees (quotas and budgets are a persistent-store feature).
 
-**End to end.** Run against Claude Code 2.1.328 with a sqlite-mode gateway and a stub upstream: at 88 % of a daily token
-quota the gateway sent `allowed_warning` with threshold `0.75` and Claude Code emitted the overage `rate_limit_event`; past
-the cap the 429 sentence was printed verbatim with no upstream request and no retries.
+**End to end.** Run against Claude Code 2.1.328 with a sqlite-mode gateway and a stub upstream. The gateway's own
+response at 88 % of a daily token quota carried `allowed_warning` with threshold `0.75`. Claude Code's overage
+`rate_limit_event` came from a later request, at 99 %: `rateLimitType: overage`, utilization `0.99`, threshold `0.95`.
+Past the cap the 429 sentence was printed verbatim, with zero upstream requests and no retries.
 
 **Dependency.** The display relies on undocumented client behavior (the `aud` gate, the header names and the window
 order); a client update can stop it without breaking the gateway. The 429 shape and `x-should-retry` are documented in the

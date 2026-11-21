@@ -425,8 +425,8 @@ same refusals as plain HTTP statuses before any PCM moves (§1's row).
 | `auth.csrf_required` / `auth.insufficient_scope` | 403 | a session cookie without `X-OP-CSRF` on the ticket POST / a principal without the scope |
 | `routing.no_model_route` / `routing.model_not_capable` | 404 | the buffered transcription's own routing refusals, unchanged |
 | `model.not_allowed` / `server_override.forbidden` | 403 | the shared gate: the effective model is outside a service account's allowlist / the token's server override is forbidden |
-| `limit.rate_limited` (with `Retry-After`) / `limit.request_quota_exceeded` / `limit.token_quota_exceeded` (both quota codes with `X-Should-Retry: false`; on `/v1/messages` a `billing_error` body, [§9.4](../cross-cutting/compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits)) | 429 | the shared preflight's **one** rate or quota admission, spent at **`/v1/audio/transcriptions/live`** (not at the ticket) |
-| `limit.cost_budget_exceeded` | 402 (429 `billing_error` on `/v1/messages`), with `X-Should-Retry: false` | the shared preflight's cost budget, at `/v1/audio/transcriptions/live` |
+| `limit.rate_limited` (with `Retry-After`) / `limit.request_quota_exceeded` / `limit.token_quota_exceeded` (both quota codes with `X-Should-Retry: false`) | 429 | the shared preflight's **one** rate or quota admission, spent at **`/v1/audio/transcriptions/live`** (not at the ticket) |
+| `limit.cost_budget_exceeded` | 402, with `X-Should-Retry: false` | the shared preflight's cost budget, at `/v1/audio/transcriptions/live` |
 | `routing.no_healthy_host` / `routing.admission_queue_timeout` / `routing.admission_queue_full` | 503 | the resolve: every candidate gated, or the admission queue timed out or is full (the ticket's resolve and `/v1`'s) |
 
 **What the ticket's holder can and cannot do.** The ticket is redeemed **once**, within about 30 seconds, on the
