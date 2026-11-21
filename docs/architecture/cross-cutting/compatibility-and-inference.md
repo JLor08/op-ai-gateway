@@ -2511,7 +2511,8 @@ carries the caller's last subscription windows instead; see [§9.3](#93-claude-c
 above (`rateLimitFiguresEntitled`, looked up only when the upstream sent a family header). It applies on any status, from the final
 upstream response only. `x-codex-turn-state` and every other `x-codex-` header outside the family, request ids, organization ids,
 `x-ratelimit-*` and the unified Anthropic family are never forwarded. A success from a target that reports no Codex windows carries the
-caller's last observed ones instead; see [§9.5](#95-codex-usage-limit-display).
+caller's last observed ones instead; see [§9.5](#95-codex-usage-limit-display). A caller who is not entitled gets neither the relayed
+family nor cached windows on a response whose upstream carries the family, so Codex shows no limits for that response.
 
 **One exception at dispatch: `sglang_omni`.** For a target whose effective kind
 (`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
@@ -4136,7 +4137,8 @@ entries never evict or overwrite each other.
   upstream answers). An error, a response with fresh upstream windows (a vendor 429 included: its own headers are never overlaid) and
   every other flavor get nothing.
 - Only windows whose reset time is still in the future are written, and a family's `limit-name` only with at least one of its windows.
-- Per process and best effort, with the bounds of §9.3: in memory, capped at 10 000 principals (oldest observation evicted), pruned as
+- Per process and best effort, with the bounds of §9.3: in memory, capped at 10 000 principals (oldest observation evicted), at most 8 families per
+  observation (the default `x-codex` family first, the others in sorted order) and no header value longer than 256 bytes (such a value counts as absent), pruned as
   windows expire, lost on restart, not shared between replicas. The entitlement revocation behavior and its known limitation are those
   of §9.3.
 

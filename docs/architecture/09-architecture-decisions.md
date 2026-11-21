@@ -13116,7 +13116,7 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
   hides the nudge with `notices.hide_rate_limit_model_nudge = true`.
 - Before the first subscription response of a session, and after a gateway restart, the display is empty: Codex's startup prefetch exists
   only for a ChatGPT login.
-- The cache has the bounds and the revocation limit of ADR-106 (per process, capped at 10 000 principals, lost on restart, not shared
+- The cache has the bounds and the revocation limit of ADR-106 (per process, capped at 10 000 principals and, per observation, at 8 families and 256 bytes per header value, lost on restart, not shared
   between replicas; a principal whose entitlement is revoked and who then uses only other providers keeps receiving its last frozen
   figures on local-model replies until the windows reset). Nothing new is disclosed.
 - The display rests on undocumented client behavior (the header names and the clear-on-missing rule); see the risk entry in
