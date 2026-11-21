@@ -13008,7 +13008,7 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
 - **Anthropic's Claude apps gateway sign-in (device flow).** Large, brings the same beta loss, and adds no display beyond the token shape.
 - **Every token JWT-shaped.** An opt-in leaves other clients and existing tokens untouched.
 - **Showing the gateway's own principal limits in the same change.** Done separately: they reach Claude Code as the overage window, see [ADR-107](#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
-- **Forwarding Codex `x-codex-*` headers.** Rejected here; not part of this change.
+- **Forwarding Codex `x-codex-*` headers.** Rejected here; not part of this change. Done separately for the Responses flavor, see [ADR-108](#adr-108--codex-shows-an-openai-subscriptions-usage-limits-through-an-allowlisted-x-codex-relay-and-a-per-principal-window-cache).
 
 **Consequences and limits.**
 
@@ -13070,3 +13070,55 @@ line's spend-limit field and the `/usage` bar exist only in a gateway sign-in se
   [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
 - → [Display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits),
   [the limiter](cross-cutting/telemetry-usage-observability.md).
+
+## ADR-108 — Codex shows an OpenAI subscription's usage limits through an allowlisted x-codex relay and a per-principal window cache
+
+**Context.** The Codex CLI shows an OpenAI (ChatGPT) subscription's plan usage from the `x-codex-*` rate-limit headers of the HTTP
+`/v1/responses` stream: status-line items, `/status` bars with reset times, warnings at 75, 90 and 95 % and, on a 429
+`usage_limit_reached`, a message with the reset time (issue #416). Verified in Codex CLI 0.137.0: it parses them on every HTTP
+`/responses` stream whatever the login type or provider, so unlike Claude Code (ADR-106) it needs no token shape; custom providers use
+HTTP, not WebSocket. Each response's snapshot replaces the windows, so a response without the headers clears the display
+(`/status` then says `Limits: not available for this account`), and every answer of a local model is such a response. Codex does not read
+`retry-after`; other OpenAI SDK clients of `/v1/responses` do. The gateway relayed none of these headers on the Responses passthrough.
+
+**Decision.** ADR-106's pattern, applied to `/v1/responses`:
+
+- **Forward an allowlist, not everything.** On the `openai_responses` flavor of the native passthrough, copy `retry-after` and
+  `x-should-retry` always, plus the Codex rate-limit family from the final upstream response at the point the status line is written,
+  on any status. The family (`isCodexRateLimitHeader`) is a name starting with `x-codex-` that ends with one of `used-percent`,
+  `window-minutes`, `reset-at` or `limit-name` (after a dash), or is one of `x-codex-credits-has-credits`, `x-codex-credits-unlimited`,
+  `x-codex-credits-balance`, `x-codex-active-limit`, `x-codex-rate-limit-reached-type` or `x-codex-promo-message`. One predicate
+  drives the relay, the entitlement trigger and the capture redaction.
+- **Same entitlement as ADR-106.** The family reaches only a caller for whom `rateLimitFiguresEntitled` holds (self-hosted target; the
+  owner; a community manager of a `shared`/`full` account; anyone when the owner opted in with `share_usage_with_members`). The lookup runs
+  only when the upstream sent a family header, is cached per principal and account, and fails closed. `retry-after` and `x-should-retry`
+  still reach a non-entitled caller.
+- **A per-principal window cache for Codex.** The gateway remembers the principal's last observed family windows in memory (a second
+  `rateLimitWindowCache` instance next to the Anthropic one, so a principal using Claude Code and Codex in turn never evicts one family
+  with the other) and attaches those still in the future to `/v1/responses` successes that carry no family header of their own. Credits,
+  the 429-only headers and the retry headers are not stored.
+- **Capture redaction.** The Codex family counts as account-sensitive: a payload capture of a vendor-account target drops it unless the
+  principal is entitled, as it does the unified family.
+
+**Rejected:**
+
+- **Relaying every `x-codex-*` header.** `x-codex-turn-state` is a sticky-routing token of the vendor's backend and other names carry no
+  display value; their effect through a gateway is unverified, and a whole-prefix rule would relay whatever the vendor adds next. The
+  explicit allowlist is a conservative choice and can grow.
+- **A token opt-in.** Codex needs no token shape (ADR-106's JWT gate does not exist here), so an opt-in would only hide a working
+  feature. Entitlement is the only gate.
+- **Relaying `x-codex-turn-state`.** It is not a limit figure, and no effect of dropping it was observed.
+- **Showing the gateway's own principal limits in Codex in the same change.** Possible later as an extra limit family; not part of #416.
+
+**Consequences and limits.**
+
+- Codex's own model-switch nudge to `gpt-5.4-mini` comes with the warning at 90 % and above; the gateway may not map that model. Codex
+  hides the nudge with `notices.hide_rate_limit_model_nudge = true`.
+- Before the first subscription response of a session, and after a gateway restart, the display is empty: Codex's startup prefetch exists
+  only for a ChatGPT login.
+- The cache has the bounds and the revocation limit of ADR-106 (per process, capped at 10 000 principals, lost on restart, not shared
+  between replicas; a principal whose entitlement is revoked and who then uses only other providers keeps receiving its last frozen
+  figures on local-model replies until the windows reset). Nothing new is disclosed.
+- The display rests on undocumented client behavior (the header names and the clear-on-missing rule); see the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Codex usage-limit display](cross-cutting/compatibility-and-inference.md#95-codex-usage-limit-display).

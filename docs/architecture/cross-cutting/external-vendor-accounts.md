@@ -1002,7 +1002,7 @@ The subscription path splits by the inbound request shape:
   has a prefix, and the removal of replayed `reasoning` items the backend cannot
   read (an empty `encrypted_content`, a non-empty `content`; after a 400
   `invalid_encrypted_content`, every encrypted blob of the history, with one
-  retry; see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo))), and the response is not rewritten back, §6.5). It is
+  retry; see [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough) ([ADR-105](../09-architecture-decisions.md#adr-105--a-provider-switch-drops-foreign-reasoning-from-the-replayed-history-shape-rules-then-one-optimistic-retry-and-a-per-session-memo))), and the response is not rewritten back, §6.5, except for the response-header allowlist: `retry-after` and `x-should-retry` always, and the Codex `x-codex-*` rate-limit family only for a caller entitled to the account's figures, see [Codex usage-limit display](compatibility-and-inference.md#95-codex-usage-limit-display)). It is
   `Target.Subscription` that makes `endpointModeFor` select the **bare** `/responses`
   path (not `/v1/responses`); an api-key OpenAI target, whose `Subscription` is
   false, is unaffected and keeps the platform `/v1/responses` (*Api-key Responses
@@ -1054,7 +1054,11 @@ to the serving account (§5).
   is a requirement of the subscription backend, imposed by the subscription
   *translate* client only (above). The relay is value-lossless rather than
   byte-identical when a rewrite happens (key order may change). The response and
-  its SSE are relayed unchanged and are not rewritten back (§6.5).
+  its SSE are relayed unchanged and are not rewritten back (§6.5), except that the Responses passthrough forwards a
+  response-header allowlist to the client: `retry-after` and `x-should-retry` always, and the Codex `x-codex-*` rate-limit
+  family only for a caller entitled to the account's figures, by the same rule as the Anthropic one
+  ([Codex usage-limit display](compatibility-and-inference.md#95-codex-usage-limit-display)). Request ids, organization ids,
+  `x-ratelimit-*` and `x-codex-turn-state` are not forwarded.
 - **Unchanged:** chat completions and every other `openai` flavor to an api-key
   account, the `anthropic` dialect to any account, the **Anthropic** api-key
   account (an inbound Responses request there still translates to `/v1/messages`;

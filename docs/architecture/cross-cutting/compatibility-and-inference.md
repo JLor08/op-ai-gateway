@@ -2499,9 +2499,19 @@ timeout is not entitled (cached 5 s); a response with no unified header skips th
 lookup entirely. The headers are copied from the final upstream response only, at the
 point the status line is written, so a discarded re-selection attempt contributes none.
 Request ids, organization ids and the `anthropic-ratelimit-requests-*` /
-`anthropic-ratelimit-tokens-*` headers are never forwarded, and neither is anything on
-the Responses flavor. A success from a target that reports no unified figures of its own
+`anthropic-ratelimit-tokens-*` headers are never forwarded, and neither is anything
+of the unified family on the Responses flavor (it has its own allowlist, below). A success from a target that reports no unified figures of its own
 carries the caller's last subscription windows instead; see [§9.3](#93-claude-code-usage-limit-display).
+
+**Response headers on the Responses passthrough.** The `openai_responses` flavor relays the same kind of allowlist
+(`forwardRateLimitHeaders`): `retry-after` and `x-should-retry` always, and the Codex rate-limit family
+(`isCodexRateLimitHeader`: `x-codex-` names ending with one of `used-percent`, `window-minutes`, `reset-at` or `limit-name` (after a dash), plus
+`x-codex-credits-has-credits`, `x-codex-credits-unlimited`, `x-codex-credits-balance`, `x-codex-active-limit`,
+`x-codex-rate-limit-reached-type` and `x-codex-promo-message`; every value) only when the caller is entitled to the routed account's figures, by the rule of the Messages paragraph
+above (`rateLimitFiguresEntitled`, looked up only when the upstream sent a family header). It applies on any status, from the final
+upstream response only. `x-codex-turn-state` and every other `x-codex-` header outside the family, request ids, organization ids,
+`x-ratelimit-*` and the unified Anthropic family are never forwarded. A success from a target that reports no Codex windows carries the
+caller's last observed ones instead; see [§9.5](#95-codex-usage-limit-display).
 
 **One exception at dispatch: `sglang_omni`.** For a target whose effective kind
 (`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
@@ -4088,6 +4098,65 @@ Past the cap the 429 sentence was printed verbatim, with zero upstream requests 
 **Dependency.** The display relies on undocumented client behavior (the `aud` gate, the header names and the window
 order); a client update can stop it without breaking the gateway. The 429 shape and `x-should-retry` are documented in the
 contract and help every client. The server agent, the store schema and the portal are untouched. See [Risks & Technical
+Debt](../11-risks-and-technical-debt.md#111-operational-risks).
+
+### 9.5 Codex usage-limit display
+
+The Codex CLI can show an OpenAI subscription's usage limits from the `x-codex-*` response headers of `/v1/responses`. Through
+the gateway this works for a user who routes to a vendor subscription account and to local models in one session, with no token
+option. Decisions: [ADR-108](../09-architecture-decisions.md#adr-108--codex-shows-an-openai-subscriptions-usage-limits-through-an-allowlisted-x-codex-relay-and-a-per-principal-window-cache).
+
+**Client behavior** (Codex CLI 0.137.0, issue #416). Codex parses the family on every HTTP `/responses` stream, whatever the auth
+mode or provider (a custom provider uses HTTP, not WebSocket), so no token shape is needed. Each response's snapshot replaces the
+primary and secondary windows; only credits and plan type carry over. A response without the headers clears them, and `/status`
+then says `Limits: not available for this account`. Codex does not read `retry-after` (other OpenAI SDK clients do). On a 429 with
+`error.type = usage_limit_reached` it makes one request, no retry, and prints "You've hit your usage limit ... try again at ...",
+using the windows of the family that `x-codex-active-limit` names.
+
+**Relay.** A vendor subscription response's family reaches the client through the allowlist and entitlement rule of §6 (*Response
+headers on the Responses passthrough*). The family is the six single names and the four window suffixes listed there, for the default
+`x-codex` family and any further `x-codex-<id>` family (for example `x-codex-other-*`); an id outside the `x-codex` prefix is not
+relayed. One predicate drives the relay, the entitlement trigger and the capture redaction.
+
+**Window cache.** Because a headerless response clears Codex's display, the gateway remembers the caller's last observed windows
+(`rateLimitWindowCache` as the server field `codexRateLimitWindows`, `codex_window_cache.go`) and attaches them to `/v1/responses`
+successes that carry none of their own. It is a second instance of the store §9.3 describes, so one principal's Claude Code and Codex
+entries never evict or overwrite each other.
+
+- Observed in `recordUsage`, from the upstream headers of any response of an OpenAI vendor provider
+  (`routing.IsOpenAIVendorProvider`) that carries a `primary-used-percent` or `secondary-used-percent` header of the `x-codex` family or an `x-codex-<id>` family (any
+  status; native passthrough and translate), and only when the caller is entitled to the account's figures. A caller who is not
+  entitled loses that account's entry (`Forget`). A token with no principal (neither user nor service id) caches nothing.
+- Stored per family: the primary and secondary window (`used-percent`, `window-minutes`, `reset-at`) and the family's `limit-name`, from
+  the first value of each header. A window without a positive integer `reset-at` is not stored, because it could never expire; the other
+  windows still are. Credits, `x-codex-active-limit`, `x-codex-rate-limit-reached-type`, `x-codex-promo-message` and the retry headers
+  are not stored (Codex carries credits over itself).
+- Attached only for the Responses flavor, on a success (2xx) that carries no family header of its own: the native passthrough before
+  the status line, and the translate path on both the buffered JSON answer and the SSE header block (written with the 200 before the
+  upstream answers). An error, a response with fresh upstream windows (a vendor 429 included: its own headers are never overlaid) and
+  every other flavor get nothing.
+- Only windows whose reset time is still in the future are written, and a family's `limit-name` only with at least one of its windows.
+- Per process and best effort, with the bounds of §9.3: in memory, capped at 10 000 principals (oldest observation evicted), pruned as
+  windows expire, lost on restart, not shared between replicas. The entitlement revocation behavior and its known limitation are those
+  of §9.3.
+
+**Payload captures.** The translate path stores the upstream response headers in a capture. For a vendor-account target the Codex
+family is removed from them, with the unified family and `anthropic-organization-id`, unless the principal is entitled to the
+account's figures (`redactCapturedAccountHeaders`). Native passthrough captures hold the client headers, which the relay already gates.
+
+**What Codex shows.** The windows in its status-line items (`five-hour-limit`, `weekly-limit`), the `/status` bars with reset times, and
+warnings at 75, 90 and 95 % ("Heads up, you have less than ...% of your 5h limit left"). At 90 % and above Codex also nudges the user
+to switch to `gpt-5.4-mini`, which the gateway may not map; `notices.hide_rate_limit_model_nudge = true` in Codex's configuration hides
+it. Before the first subscription response of a session, and after a gateway restart, the display is empty: Codex's startup prefetch
+exists only for a ChatGPT login.
+
+**End to end.** Run against Codex CLI 0.137.0 with a memory-mode gateway and a self-hosted stub (always entitled) answering
+`/v1/responses` with the family: the status line showed `5h 57% left · weekly 83% left` and `/status` showed both bars. The
+vendor-only parts (entitlement and cache observe) are covered by handler tests, because the ChatGPT backend URL is fixed in the
+resolver and cannot be pointed at a stub.
+
+**Dependency.** The display relies on undocumented Codex behavior (the header names and the clear-on-missing rule). A client update can
+change it without notice; nothing in the gateway breaks, the display just stops working. See [Risks & Technical
 Debt](../11-risks-and-technical-debt.md#111-operational-risks).
 
 ## 10. Request bodies and size limits
