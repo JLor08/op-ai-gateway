@@ -418,8 +418,10 @@ func principalFor(token auth.Token) (Principal, bool) {
 // s.Limiter.Evaluate; on a denial it writes the mapped HTTP response and
 // reports handled=true so the caller returns immediately. A quota or budget
 // denial on the Anthropic Messages flavor is answered by writeLimitBlocked (429
-// billing_error naming the limit that frees the user last); every other denial,
-// and a block whose standing lacks the reading, goes through writeLimitDenied.
+// billing_error naming the limit that frees the user last) and on the OpenAI
+// Responses flavor by writeCodexLimitBlocked (429 usage_limit_reached for the
+// Codex CLI, naming the same limit); every other denial, and a block whose
+// standing lacks the reading, goes through writeLimitDenied.
 // On an allow it returns the limiter's standing for the caller to report.
 // Mirroring writeModelNotAllowed, a denied request never reaches Resolve/an
 // AI-server and is never recorded as a usage event.
@@ -449,10 +451,16 @@ func (s *Server) admitPrincipal(w http.ResponseWriter, r *http.Request, token au
 	if a.Allow {
 		return a.Standing, false
 	}
-	if apiFlavor == inference.APIFlavorAnthropicMessages && a.Reason != "rate" {
+	if a.Reason != "rate" {
 		if reading, ok := a.Standing.Blocking(LimitKind(a.Reason)); ok {
-			writeLimitBlocked(w, reading, a.At)
-			return nil, true
+			switch apiFlavor {
+			case inference.APIFlavorAnthropicMessages:
+				writeLimitBlocked(w, reading, a.At)
+				return nil, true
+			case inference.APIFlavorOpenAIResponses:
+				writeCodexLimitBlocked(w, reading, a.At)
+				return nil, true
+			}
 		}
 	}
 	writeLimitDenied(w, a.Reason, a.RetryAfter)
@@ -558,7 +566,7 @@ type inferenceShape struct {
 //     model.
 //  5. admitPrincipal (rate/quota/budget) -- TERMINAL on failure (429, or 402
 //     for a cost budget; a quota or budget block on /v1/messages is a 429
-//     billing_error).
+//     billing_error, on /v1/responses a 429 usage_limit_reached).
 //  6. extractClientSession -- pure, never fails.
 //
 // Called EXACTLY ONCE per client request: the three translate handlers below
@@ -686,9 +694,9 @@ const (
 // except the rate limit also sets X-Should-Retry: false, because a quota or
 // budget stays exhausted until its period resets and a client retry cannot help
 // (the rate limit clears in seconds and keeps the client's default). The
-// Anthropic Messages flavor does not come through here for a quota or budget
-// denial: admitPrincipal answers it with writeLimitBlocked (429 for the cost
-// budget too).
+// Anthropic Messages and OpenAI Responses flavors do not come through here for a
+// quota or budget denial: admitPrincipal answers them with writeLimitBlocked and
+// writeCodexLimitBlocked (429 for the cost budget too).
 //
 // Only the rate-limit reason carries a Retry-After header (whole seconds,
 // floored at 1 so a sub-second computed wait never reads as "retry
