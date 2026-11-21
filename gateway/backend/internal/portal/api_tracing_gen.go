@@ -2857,6 +2857,18 @@ func (_d *APIWithTracing) VendorAccountSharingEnabled(ctx context.Context) (b1 b
 	return _d.API.VendorAccountSharingEnabled(ctx)
 }
 
+func (_d *APIWithTracing) VendorAccountUsageManager(ctx context.Context, t1 auth.Token, s1 string) (b1 bool, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountUsageManager")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.VendorAccountUsageManager(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) VendorAccountsEnabled(ctx context.Context) (b1 bool) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.VendorAccountsEnabled")
 	defer span.End()

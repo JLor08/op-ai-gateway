@@ -611,6 +611,30 @@ func (s *Service) authorizeVendorAccountRead(ctx context.Context, principal auth
 	return routing.VendorAccount{}, vendorViewerNone, ErrVendorAccountNotFound
 }
 
+// VendorAccountUsageManager reports whether principal holds the MANAGEMENT view of
+// the vendor account for the purpose of seeing its plan-usage figures (#407): system
+// scope, or a CM of the account while it is `shared` or `full` by its effective level.
+// It is the management arm of authorizeVendorAccountRead, built on the same two checks
+// (isSystem, isManagerOfSharedVendorAccount) so the two cannot disagree.
+//
+// The owner is deliberately NOT covered: the gateway recognises the owner itself from
+// the routing target, so this asks only about everyone else. A member, a stranger and
+// an unknown account id are all (false, nil); a store error is returned, never read as
+// true.
+func (s *Service) VendorAccountUsageManager(ctx context.Context, principal auth.Token, accountID string) (bool, error) {
+	acc, err := s.loadVendorAccount(ctx, accountID)
+	if err != nil {
+		if errors.Is(err, ErrVendorAccountNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	if isSystem(principal) {
+		return true, nil
+	}
+	return s.isManagerOfSharedVendorAccount(ctx, principal, acc)
+}
+
 // isMemberOfSharedVendorAccount reports whether principal can ROUTE to acc through a
 // resource group: the single-account form of the shared arm of the routing grant
 // (sharedVendorAccountsForRouting), so the member read and the list's member rows
