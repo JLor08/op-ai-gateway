@@ -1477,7 +1477,7 @@ alone). What it does parse is merged over the stored row (§5.3).
 
 | Vendor | Headers (lowercased; VERIFY-LIVE) | Normalization |
 |---|---|---|
-| Anthropic subscription | `anthropic-ratelimit-unified-5h-utilization`, `-7d-utilization`, `-reset` | A 0..1 utilization **fraction** → ×100 percent; the single unified reset is attributed to the five-hour window. |
+| Anthropic subscription | `anthropic-ratelimit-unified-5h-utilization`, `-7d-utilization`, `-5h-reset`, `-7d-reset`, `-reset`, `anthropic-ratelimit-unified-representative-claim` | A 0..1 utilization **fraction** → ×100 percent; each window takes its own `-5h-reset` / `-7d-reset`. The top-level `-reset` belongs to the representative claim, so it fills only a window whose own reset is absent and only the one the claim names (`five_hour` → five-hour, `seven_day` → weekly); with no claim it is ignored. |
 | OpenAI subscription | `x-codex-primary-used-percent` + `x-codex-primary-reset-at` (five-hour), `x-codex-secondary-used-percent` + `x-codex-secondary-reset-at` (weekly), `x-codex-credits-balance` | A 0..100 **percent** used as-is; the credit balance is an opaque string. |
 
 Parsing is **tolerant**: a missing/non-numeric value leaves the window at its

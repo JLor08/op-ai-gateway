@@ -21,15 +21,24 @@ import (
 // lookup is tolerant of any casing the vendor sends).
 //
 // Anthropic reports a 0..1 UTILIZATION FRACTION for a five-hour ("unified-5h")
-// and a seven-day ("unified-7d") window plus a single unix-epoch reset; OpenAI/
+// and a seven-day ("unified-7d") window, each with its own unix-epoch reset (plus a
+// top-level reset that belongs to the representative claim); OpenAI/
 // Codex reports a 0..100 USED-PERCENT for a "primary" (five-hour) and a
 // "secondary" (weekly) window, each with its own unix-epoch reset, plus a raw
 // credit-balance string. Both are normalized onto VendorAccountUsage's 0..100
 // percent scale (-1 = unknown) and five-hour/weekly slots.
 const (
-	hdrAnthropicFiveHourUtil = "anthropic-ratelimit-unified-5h-utilization"
-	hdrAnthropicWeeklyUtil   = "anthropic-ratelimit-unified-7d-utilization"
-	hdrAnthropicReset        = "anthropic-ratelimit-unified-reset"
+	hdrAnthropicFiveHourUtil  = "anthropic-ratelimit-unified-5h-utilization"
+	hdrAnthropicWeeklyUtil    = "anthropic-ratelimit-unified-7d-utilization"
+	hdrAnthropicFiveHourReset = "anthropic-ratelimit-unified-5h-reset"
+	hdrAnthropicWeeklyReset   = "anthropic-ratelimit-unified-7d-reset"
+	// The top-level reset belongs to the representative claim (the window that is
+	// currently binding), named by hdrAnthropicClaim.
+	hdrAnthropicReset = "anthropic-ratelimit-unified-reset"
+	hdrAnthropicClaim = "anthropic-ratelimit-unified-representative-claim"
+
+	anthropicClaimFiveHour = "five_hour"
+	anthropicClaimSevenDay = "seven_day"
 
 	hdrCodexPrimaryPct     = "x-codex-primary-used-percent"
 	hdrCodexPrimaryReset   = "x-codex-primary-reset-at"
@@ -121,10 +130,29 @@ func scrapeAnthropicUsage(hdr map[string]string, snapshot *routing.VendorAccount
 		snapshot.WeeklyPct = pct
 		found = true
 	}
-	// A single unified reset; attribute it to the five-hour window (the weekly
-	// reset is not advertised as its own header -- VERIFY-LIVE).
-	if ts, ok := parseEpochSeconds(hdr[hdrAnthropicReset]); ok {
-		snapshot.FiveHourResetAt = &ts
+	fiveReset, hasFiveReset := parseEpochSeconds(hdr[hdrAnthropicFiveHourReset])
+	weekReset, hasWeekReset := parseEpochSeconds(hdr[hdrAnthropicWeeklyReset])
+	// The top-level reset only fills a window whose own reset is absent, and only
+	// for the window the representative claim names; without a claim it is
+	// ambiguous and is ignored.
+	if top, ok := parseEpochSeconds(hdr[hdrAnthropicReset]); ok {
+		switch hdr[hdrAnthropicClaim] {
+		case anthropicClaimFiveHour:
+			if !hasFiveReset {
+				fiveReset, hasFiveReset = top, true
+			}
+		case anthropicClaimSevenDay:
+			if !hasWeekReset {
+				weekReset, hasWeekReset = top, true
+			}
+		}
+	}
+	if hasFiveReset {
+		snapshot.FiveHourResetAt = &fiveReset
+		found = true
+	}
+	if hasWeekReset {
+		snapshot.WeeklyResetAt = &weekReset
 		found = true
 	}
 	return found
