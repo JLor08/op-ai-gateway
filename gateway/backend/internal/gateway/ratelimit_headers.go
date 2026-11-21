@@ -96,11 +96,18 @@ func hasCodexRateLimitHeader(h http.Header) bool {
 	return false
 }
 
+// isAccountSensitiveHeader reports whether an upstream response header carries a vendor
+// account's figures or identity: the Anthropic unified family, anthropic-organization-id
+// and the Codex rate-limit family.
+func isAccountSensitiveHeader(name string) bool {
+	return isUnifiedRateLimitHeader(name) || isCodexRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id")
+}
+
 // redactCapturedAccountHeaders keeps a vendor account's figures out of a payload
 // capture the caller's principal is not entitled to see. The translate path stores the
 // upstream response headers verbatim, and a capture is readable by its owner and, for
 // non-secret captures, by admins, so for a vendor-account target the unified
-// rate-limit family and anthropic-organization-id are dropped (from a copy; the
+// and Codex rate-limit families and anthropic-organization-id are dropped (from a copy; the
 // sink's own header set is shared with the usage scrape) unless the principal is
 // entitled to the figures. The entitlement lookup only runs when such a header is
 // present; it is cached and fails closed.
@@ -110,7 +117,7 @@ func (s *Server) redactCapturedAccountHeaders(ctx context.Context, token auth.To
 	}
 	sensitive := false
 	for name := range h {
-		if isUnifiedRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id") {
+		if isAccountSensitiveHeader(name) {
 			sensitive = true
 			break
 		}
@@ -120,7 +127,7 @@ func (s *Server) redactCapturedAccountHeaders(ctx context.Context, token auth.To
 	}
 	out := make(http.Header, len(h))
 	for name, values := range h {
-		if isUnifiedRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id") {
+		if isAccountSensitiveHeader(name) {
 			continue
 		}
 		out[name] = values
