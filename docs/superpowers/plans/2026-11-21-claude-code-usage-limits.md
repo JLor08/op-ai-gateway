@@ -12,7 +12,7 @@
 
 **Tech Stack:** Go 1.26 (`gateway/backend`, module `op-ai-gateway`), three store drivers (memory / sqlite / postgres through the shared `SQLStore`), React + TypeScript + Vite + MUI portal (`gateway/frontend`), Vitest.
 
-**Spec:** `docs/superpowers/specs/2026-11-21-claude-code-usage-limits-design.md` (approved). Issue: JLor08/op-ai-gateway#407. Read the spec before your task. It holds the why and the exact rules this plan cites by section (§5.1–§5.5).
+**Spec:** the approved design document `2026-11-21-claude-code-usage-limits-design.md` in the sibling `specs` folder. Issue: JLor08/op-ai-gateway#407. Read the spec before your task. It holds the why and the exact rules this plan cites by section (§5.1–§5.5).
 
 ## Global Constraints
 
@@ -458,5 +458,5 @@ Controller-run after Task 12, not a subagent task:
 - the end-to-end check from the spec §7 with Claude Code 2.1.328 against a locally started memory-mode gateway and a loopback stub;
 - the full gates (both Go modules' `golangci-lint fmt --diff` / `run` / `go test`, the postgres leg, the four frontend gates, `make lint-docs`, `make sonar-scan` with branch-attributed findings);
 - the final whole-branch review;
-- removing `docs/superpowers/` and confirming with `git diff --name-only main...HEAD`;
+- removing the branch-local working documents and confirming with `git diff --name-only main...HEAD`;
 - push over SSH, the PR, and enabling Auto-fix.

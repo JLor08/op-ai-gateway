@@ -203,7 +203,7 @@ With a token created with the new setting and pasted into Claude Desktop (3P gat
 - Portal i18n keys in German and English together.
 - No change to the server agent, so no agent version bump.
 - `internal/compat` stays the only place for dialect mapping. The header allowlist is relay plumbing, not translation, so it lives in the gateway package.
-- The architecture docs are updated in the same branch. `docs/superpowers/` is removed before the PR.
+- The architecture docs are updated in the same branch. The branch-local working documents are removed before the PR.
 
 ## 7. Verification
 
