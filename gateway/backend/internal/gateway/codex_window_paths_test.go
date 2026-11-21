@@ -201,34 +201,69 @@ func TestCodexWindowsNotAttachedOnErrorOrOverFresh(t *testing.T) {
 	})
 }
 
+// A member's real vendor /v1/responses requests drive recordUsage's observe call: with
+// the owner's opt-in on, the member's windows are cached (and shown on a local-model
+// answer); after the owner opts out, the next vendor response from that account makes
+// recordUsage drop the member's entry, so the member's local answers carry none. Before
+// the opt-in, the member's vendor responses cache nothing.
 func TestCodexWindowsNotObservedForNonEntitledAndForgottenOnRevocation(t *testing.T) {
-	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
-	deny := &usageManagerPortal{API: f.srv.Portal, ok: false}
-	f.srv.Portal = deny
-	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
-	private := routing.Target{Provider: routing.ProviderVendorOpenAISubscription, VendorAccountID: codexWindowsAccountID, VendorAccountOwnerUserID: "usr_va_a"}
-	shared := private
-	shared.VendorShareUsageWithMembers = true
-
-	f.srv.observeCodexRateLimitWindows(member, private, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
-	if deny.calls != 1 {
-		t.Fatalf("portal consulted %d times, want 1 (its answer must be what dropped the observation)", deny.calls)
+	mf, accountID := vaMemberFixture(t, routing.VendorShareLevelShared)
+	srv := mf.srv
+	const vendorModel, memberSecret = "shared-responses-model", "member-codex-windows-secret"
+	if err := mf.routes.SetVendorAccountModels(context.Background(), accountID, []routing.VendorAccountModel{
+		{AccountID: accountID, GatewayModel: vendorModel, UpstreamModel: vendorModel, APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
 	}
-	requireNoCodex(t, f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, false))
+	seedWindowsLocalModel(t, mf.routes, routing.EndpointModeTranslate)
+	app, err := mf.routes.ApplicationByID(context.Background(), "app-local")
+	if err != nil {
+		t.Fatalf("ApplicationByID: %v", err)
+	}
+	app.ResponsesMode = routing.EndpointModePassthrough
+	if err := mf.routes.UpdateApplication(context.Background(), app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_cw_member", UserID: "usr_va_b", Active: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
+	cprov := &codexWindowsProvider{windowsProvider: windowsProvider{localStatus: http.StatusOK}, vendorStatus: http.StatusOK, vendorHdr: codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour)}
+	srv.Provider = cprov
+	f := &windowsFixture{srv: srv, prov: &cprov.windowsProvider}
 
-	// Sharing on: the member's observation is recorded.
-	f.srv.observeCodexRateLimitWindows(member, shared, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
-	requireCodexWindowsAttached(t, f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, false), "42.5")
+	vendorCall := func() {
+		t.Helper()
+		if rec := f.post(t, memberSecret, "/v1/responses", vendorModel, false); rec.Code != http.StatusOK {
+			t.Fatalf("vendor request status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+	}
+	localCall := func() *httptest.ResponseRecorder {
+		t.Helper()
+		rec := f.post(t, memberSecret, "/v1/responses", windowsLocalModel, false)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("local request status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		return rec
+	}
+	setSharing := func(on bool) {
+		t.Helper()
+		body := map[bool]string{true: `{"enabled":true}`, false: `{"enabled":false}`}[on]
+		if rec := vaDo(t, srv, http.MethodPut, shareUsagePath(accountID), vaSystemSecret, body); rec.Code != http.StatusOK {
+			t.Fatalf("share-usage PUT = %d, body = %s", rec.Code, rec.Body.String())
+		}
+	}
 
-	// Another account's non-entitled observation leaves the entry alone.
-	elsewhere := private
-	elsewhere.VendorAccountID = "acc_other"
-	f.srv.observeCodexRateLimitWindows(member, elsewhere, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
-	requireCodexWindowsAttached(t, f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, false), "42.5")
+	// Opt-in off: the member's vendor response is not observed.
+	vendorCall()
+	requireNoCodex(t, localCall())
 
-	// Sharing off again: the next response from the originating account drops it.
-	f.srv.observeCodexRateLimitWindows(member, private, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
-	requireNoCodex(t, f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, false))
+	// Opt-in on: observed, shown on the next local answer.
+	setSharing(true)
+	vendorCall()
+	requireCodexWindowsAttached(t, localCall(), "42.5")
+
+	// Opt-in off again: the next vendor response drops the member's entry.
+	setSharing(false)
+	vendorCall()
+	requireNoCodex(t, localCall())
 }
 
 func TestCodexWindowsObservedFrom429(t *testing.T) {
