@@ -82,8 +82,19 @@ func (c *rateLimitWindowCache) Observe(key, accountID string, h http.Header, now
 		accountID: accountID,
 		observed:  now,
 		claim:     h.Get(unifiedRateLimitPrefix + "representative-claim"),
-		windows:   make(map[string]cachedRateLimitWindow, len(rateLimitWindowNames)),
+		windows:   parseRateLimitWindows(h),
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pruneAndMakeRoom(key, now)
+	c.entries[key] = entry
+}
+
+// parseRateLimitWindows reads the per-window fields of h. A window whose reset is
+// missing or not a unix timestamp is skipped: without a reset it could never expire.
+func parseRateLimitWindows(h http.Header) map[string]cachedRateLimitWindow {
+	windows := make(map[string]cachedRateLimitWindow, len(rateLimitWindowNames))
 	for _, w := range rateLimitWindowNames {
 		win := cachedRateLimitWindow{fields: make(map[string]string, len(rateLimitWindowFields))}
 		for _, f := range rateLimitWindowFields {
@@ -96,22 +107,26 @@ func (c *rateLimitWindowCache) Observe(key, accountID string, h http.Header, now
 			continue
 		}
 		win.reset = time.Unix(secs, 0)
-		entry.windows[w] = win
+		windows[w] = win
 	}
+	return windows
+}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// pruneAndMakeRoom drops every entry whose windows have all reset and, when key is new
+// and the cache is at its cap, evicts the oldest observations until one slot is free.
+// The caller holds c.mu.
+func (c *rateLimitWindowCache) pruneAndMakeRoom(key string, now time.Time) {
 	for k, e := range c.entries {
 		if !e.hasFutureWindow(now) {
 			delete(c.entries, k)
 		}
 	}
-	if _, replacing := c.entries[key]; !replacing && c.maxEntries > 0 {
-		for len(c.entries) >= c.maxEntries {
-			c.evictOldest()
-		}
+	if _, replacing := c.entries[key]; replacing || c.maxEntries <= 0 {
+		return
 	}
-	c.entries[key] = entry
+	for len(c.entries) >= c.maxEntries {
+		c.evictOldest()
+	}
 }
 
 // Forget deletes the principal's entry when, and only when, it was observed from
@@ -156,21 +171,40 @@ func (e cachedRateLimitEntry) hasFutureWindow(now time.Time) bool {
 // the claim maps to an attached window. When no window is in the future the entry is
 // deleted and false returned.
 func (c *rateLimitWindowCache) Attach(key string, dst http.Header, now time.Time) bool {
-	c.mu.Lock()
-	entry, ok := c.entries[key]
-	if ok && !entry.hasFutureWindow(now) {
-		delete(c.entries, key)
-		ok = false
-	}
-	c.mu.Unlock()
+	entry, ok := c.liveEntry(key, now)
 	if !ok {
 		return false
 	}
+	attached, status := entry.writeOpenWindows(dst, now)
+	dst.Set(unifiedRateLimitPrefix+"status", status)
+	if win, ok := attached[rateLimitClaimWindow[entry.claim]]; ok {
+		dst.Set(unifiedRateLimitPrefix+"representative-claim", entry.claim)
+		dst.Set(unifiedRateLimitPrefix+"reset", win.fields["reset"])
+	}
+	return true
+}
 
+// liveEntry returns the principal's entry while at least one of its windows is still
+// open; an entry whose windows have all reset is deleted and reported as absent.
+func (c *rateLimitWindowCache) liveEntry(key string, now time.Time) (cachedRateLimitEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if ok && !entry.hasFutureWindow(now) {
+		delete(c.entries, key)
+		return cachedRateLimitEntry{}, false
+	}
+	return entry, ok
+}
+
+// writeOpenWindows writes the fields of every window still open at now into dst and
+// returns those windows plus the top-level status they imply: allowed_warning when any
+// of them is warning or rejected, otherwise allowed (never rejected).
+func (e cachedRateLimitEntry) writeOpenWindows(dst http.Header, now time.Time) (map[string]cachedRateLimitWindow, string) {
 	status := "allowed"
-	attached := make(map[string]cachedRateLimitWindow, len(entry.windows))
+	attached := make(map[string]cachedRateLimitWindow, len(e.windows))
 	for _, w := range rateLimitWindowNames {
-		win, present := entry.windows[w]
+		win, present := e.windows[w]
 		if !present || !win.reset.After(now) {
 			continue
 		}
@@ -184,12 +218,7 @@ func (c *rateLimitWindowCache) Attach(key string, dst http.Header, now time.Time
 			status = "allowed_warning"
 		}
 	}
-	dst.Set(unifiedRateLimitPrefix+"status", status)
-	if win, ok := attached[rateLimitClaimWindow[entry.claim]]; ok {
-		dst.Set(unifiedRateLimitPrefix+"representative-claim", entry.claim)
-		dst.Set(unifiedRateLimitPrefix+"reset", win.fields["reset"])
-	}
-	return true
+	return attached, status
 }
 
 // observeRateLimitWindows records the unified windows of a vendor-Anthropic response
