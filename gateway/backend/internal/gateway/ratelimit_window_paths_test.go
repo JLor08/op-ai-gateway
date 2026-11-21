@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
@@ -312,5 +313,87 @@ func TestCapturedAccountHeadersRedactedForNonEntitled(t *testing.T) {
 	f.srv.redactCapturedAccountHeaders(ctx, member, target, plain)
 	if deny.calls != callsBefore {
 		t.Fatal("entitlement looked up although no sensitive header was present")
+	}
+}
+
+// captureSinkVendorProvider answers the translate path (Complete) the way a real
+// upstream client does: it records the upstream response headers into the capture
+// sink threaded via the context.
+type captureSinkVendorProvider struct {
+	respHeaders http.Header
+}
+
+func (p captureSinkVendorProvider) Complete(ctx context.Context, _ routing.Target, _ inference.Request) (provider.Response, error) {
+	if sink := provider.CaptureSinkFrom(ctx); sink != nil {
+		sink.RecordRequest(http.Header{"Content-Type": {"application/json"}}, []byte(`{"model":"up"}`))
+		sink.RecordResponseHeaders(p.respHeaders.Clone())
+		sink.WriteResponse([]byte(`{"ok":true}`))
+	}
+	return provider.Response{Text: "hi", Usage: inference.Usage{InputTokens: 1, OutputTokens: 1}}, nil
+}
+
+// TestTranslatedCaptureRedactsAccountHeadersThroughRequestPath pins the call site of
+// redactCapturedAccountHeaders in recordUsage: through the real request path, a
+// captured translate-path response from a vendor account loses the usage-limit family
+// and the organization id for a member the owner did not opt in, and keeps them for
+// the account's owner. The account is shared to the member through a resource group.
+func TestTranslatedCaptureRedactsAccountHeadersThroughRequestPath(t *testing.T) {
+	f, accountID := vaMemberFixture(t, routing.VendorShareLevelShared)
+	srv := f.srv
+	const gatewayModel, ownerSecret, memberSecret = "shared-chat-model", "owner-capture-secret", "member-capture-secret"
+	if err := f.routes.SetVendorAccountModels(context.Background(), accountID, []routing.VendorAccountModel{
+		{AccountID: accountID, GatewayModel: gatewayModel, UpstreamModel: gatewayModel, APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
+	tokens := srv.Tokens.(*auth.TokenStore)
+	tokens.AddPlainToken(auth.Token{ID: "tok_cap_owner", UserID: "usr_va_sys", Active: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{All: true}}, ownerSecret)
+	tokens.AddPlainToken(auth.Token{ID: "tok_cap_member", UserID: "usr_va_b", Active: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
+
+	cs := &fakeCaptureStore{}
+	srv.Captures = cs
+	cipher, err := capture.New(testCaptureKey)
+	if err != nil {
+		t.Fatalf("capture.New: %v", err)
+	}
+	srv.Cipher = cipher
+	srv.CaptureOverride = func() bool { return true }
+	hdr := subscriptionWindowHeaders()
+	hdr.Set("Anthropic-Organization-Id", "org-secret")
+	hdr.Set("Content-Type", "application/json")
+	srv.Provider = captureSinkVendorProvider{respHeaders: hdr}
+
+	capturedHeaders := func(secret string) http.Header {
+		t.Helper()
+		cs.mu.Lock()
+		before := len(cs.saved)
+		cs.mu.Unlock()
+		body := `{"model":"` + gatewayModel + `","messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+secret)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+		cs.mu.Lock()
+		defer cs.mu.Unlock()
+		if len(cs.saved) != before+1 {
+			t.Fatalf("captures saved = %d, want %d", len(cs.saved), before+1)
+		}
+		return http.Header(decryptCapture(t, cs.saved[len(cs.saved)-1].Blob).TranslatedRespHeaders)
+	}
+
+	member := capturedHeaders(memberSecret)
+	if hasUnifiedRateLimitHeader(member) || member.Get("Anthropic-Organization-Id") != "" {
+		t.Fatalf("non-entitled capture kept account headers: %v", member)
+	}
+	if member.Get("Content-Type") != "application/json" {
+		t.Fatalf("unrelated header lost: %v", member)
+	}
+	owner := capturedHeaders(ownerSecret)
+	if !hasUnifiedRateLimitHeader(owner) || owner.Get("Anthropic-Organization-Id") != "org-secret" {
+		t.Fatalf("owner capture lost account headers: %v", owner)
 	}
 }
