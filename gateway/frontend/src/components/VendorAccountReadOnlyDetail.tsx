@@ -24,8 +24,8 @@ import { VendorAccountModels } from './VendorAccountModels';
  * base-URL field and no date (the withheld timestamps would read 0001-01-01). The
  * usage snapshot is withheld too unless the owner opted in to share it; this
  * component renders no usage panel itself, VendorAccountsView adds the read-only
- * VendorAccountUsageSection beneath it when \`account.usage\` is present. The panels that act on the account (the settings form, the
- * credential check, the connect flows, the models refresh) are not rendered either.
+ * VendorAccountUsageSection beneath it when `account.usage` is present. The
+ * panels that act on the account (the settings form, the credential check, the connect flows, the models refresh) are not rendered either.
  *
  * `status` is the status the list shows (a subscription account is shown disabled
  * while the subscriptions switch is off), not necessarily the stored one.

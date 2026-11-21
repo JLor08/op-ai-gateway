@@ -721,7 +721,7 @@ export function VendorAccountsView({
           )}
           <VendorAccountReadOnlyDetail t={t} account={account} status={effectiveStatus(account)} />
           {/* The usage figures only when the owner shared them (the backend omits
-              \`usage\` from a member's view otherwise). Read-only: no refresh. */}
+              `usage` from a member's view otherwise). Read-only: no refresh. */}
           {account.usage && (
             <VendorAccountUsageSection
               t={t}

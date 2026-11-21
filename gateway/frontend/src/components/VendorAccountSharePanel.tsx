@@ -179,7 +179,7 @@ export function VendorAccountSharePanel({
     void run(() => api.setVendorAccountShareLevel(account.id, next), t.vendorAccountShareSaved);
   }
 
-  // The owner's opt-in to share the rate-limit figures (#407): a write of its own,
+  // The owner's opt-in to share the rate limits and spend (#407): a write of its own,
   // answered with the account as it now reads, like a share-level change.
   function setShareUsage(enabled: boolean) {
     void run(

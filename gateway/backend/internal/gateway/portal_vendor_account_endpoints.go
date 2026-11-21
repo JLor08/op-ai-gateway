@@ -321,7 +321,8 @@ func (s *Server) handlePortalVendorAccountShareLevel(w http.ResponseWriter, r *h
 
 // handlePortalVendorAccountShareUsage (PUT .../share-usage) sets the owner's opt-in to
 // show the account's usage figures to members ({"enabled": bool}, #407; a body without
-// `enabled` is a 400 request.invalid_json and writes nothing). The handler only decodes; the service decides: the owner alone (a CM or a member, who can see the
+// `enabled` is a 400 request.invalid_json and writes nothing). The handler only decodes; the service decides: the owner
+// alone (a CM or a member, who can see the
 // account, is a 403 vendor_account.forbidden; a stranger, an unknown id and system scope
 // are the same 404). Not gated on the sharing flags. The response is the credential-free
 // management view.

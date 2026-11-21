@@ -3745,7 +3745,7 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Vendor-account detail (includes the usage snapshot for a management view)
+      summary: Vendor-account detail (includes the usage snapshot for a management view, and for a member view when the owner opted in)
       description: >
         Rendered in the view the caller's relation to the account earns: the
         management view for the owner, a CM of a shared or full account and
@@ -3755,7 +3755,7 @@ paths:
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200':
-          description: The credential-free account, with its rate-limit usage snapshot when one has been scraped (management view only)
+          description: The credential-free account, with its rate-limit usage snapshot when one has been scraped (management view; also the member view when the owner's share_usage_with_members opt-in is on)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }

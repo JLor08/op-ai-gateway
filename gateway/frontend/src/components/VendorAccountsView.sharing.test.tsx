@@ -199,7 +199,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       pollVendorAccountDeviceConnect: vi.fn<PortalApi['pollVendorAccountDeviceConnect']>(
         async () => ({ connected: false }),
       ),
-      // The single read carries the usage snapshot (the management view only).
+      // The single read carries the usage snapshot (management view, and member view when shared).
       vendorAccount: vi.fn<PortalApi['vendorAccount']>(async (id) => ({
         ...byId(id),
         usage: USAGE,

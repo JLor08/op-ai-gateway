@@ -143,7 +143,7 @@ type VendorAccountDTO struct {
 	Usage                 *VendorAccountUsageDTO  `json:"usage,omitempty"`
 	// ShareUsageWithMembers is the owner's opt-in (#407) to show the usage snapshot to
 	// members. The management views report the stored value; a member's view carries the
-	// account's actual value too (true exactly when the member sees usage).
+	// account's actual value too (true whenever the opt-in is on; `usage` is then present only once a snapshot has been stored).
 	ShareUsageWithMembers bool          `json:"share_usage_with_members"`
 	CreatedAt             time.Time     `json:"created_at"`
 	UpdatedAt             time.Time     `json:"updated_at"`
