@@ -312,13 +312,17 @@ func memberVendorAccountModelDTO(row routing.VendorAccountModel) VendorAccountMo
 //   - APIKeySet / SubscriptionConnected: the credential BOOLEANS and never the
 //     credential (the sealed key and token set are not copied, only their presence);
 //   - IsOwner (always false: an owner is never rendered here) and SharedBy (the
-//     owner's display name, best effort).
+//     owner's display name, best effort);
+//   - ShareUsageWithMembers and Usage, together: the owner's opt-in (#407) and, only
+//     when it is on, the owner's rate-limit and spend snapshot. The flag is the
+//     account's actual value, so a member who sees Usage never reads a false flag
+//     beside it; a member who sees no Usage reads false.
 //
 // Everything else is withheld, as zero values (AdminGroups as a non-nil empty slice so
 // it serializes as []): ShareLevel (how the owner delegated management), AdminGroups,
 // SystemGroupID and SystemGroupName (who manages it and where it is rooted), BaseURL
-// (where the owner's key is sent), Usage (the owner's rate-limit and spend snapshot),
-// each model's UpstreamModel, and the timestamps. When in doubt a field is left out.
+// (where the owner's key is sent), each model's UpstreamModel, and the timestamps. When
+// in doubt a field is left out.
 func (s *Service) memberVendorAccountDTO(ctx context.Context, acc routing.VendorAccount) (VendorAccountDTO, error) {
 	models, err := s.vendorAccountModelDTOs(ctx, acc.ID, true)
 	if err != nil {
@@ -337,6 +341,7 @@ func (s *Service) memberVendorAccountDTO(ctx context.Context, acc routing.Vendor
 		AdminGroups:           []GroupRefDTO{},
 		IsOwner:               false,
 		SharedBy:              s.vendorAccountOwnerName(ctx, acc),
+		ShareUsageWithMembers: acc.ShareUsageWithMembers,
 	}
 	if acc.ShareUsageWithMembers {
 		// The owner's opt-in (#407) is the one way a member sees the figures. A failed

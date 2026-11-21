@@ -50,6 +50,9 @@ var vendorMemberDTOFields = map[string]string{
 	"models":                 "the gateway names the member can request (gateway_model, api_flavor, display_name; upstream_model is withheld)",
 	"is_owner":               "viewer relation (always false for a member)",
 	"shared_by":              "viewer relation (the owner's display name)",
+	// The owner's usage opt-in (#407), the account's actual value. The snapshot it
+	// unlocks is NOT listed: it is conditional, see memberDTOExtraFields.
+	"share_usage_with_members": "the owner's opt-in to show usage to members",
 }
 
 // memberDTOExtraFields returns the wire fields of dto that hold a value although a member
@@ -64,6 +67,9 @@ func memberDTOExtraFields(dto VendorAccountDTO) []string {
 		f := v.Field(i)
 		if f.IsZero() || (f.Kind() == reflect.Slice && f.Len() == 0) {
 			continue
+		}
+		if name == "usage" && dto.ShareUsageWithMembers {
+			continue // the one conditional field: the snapshot the owner's opt-in unlocks
 		}
 		if _, ok := vendorMemberDTOFields[name]; !ok {
 			extra = append(extra, name)

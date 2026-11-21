@@ -6116,10 +6116,10 @@ components:
         models (gateway_model, api_flavor and display_name only), the two
         credential booleans, is_owner false and shared_by. Everything else is
         withheld and reads as its zero value: share_level, admin_groups,
-        system_group_id and system_group_name, base_url, share_usage_with_members,
-        each model's upstream_model and the two timestamps. usage is added to the
-        member view only when the owner opted in (share_usage_with_members), and is
-        omitted otherwise.
+        system_group_id and system_group_name, base_url, each model's
+        upstream_model and the two timestamps. share_usage_with_members is
+        carried (the account's actual value); usage is added to the member view
+        only when it is true, and is omitted otherwise.
       required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by, share_usage_with_members]
       properties:
         id: { type: string, description: 'va_-prefixed, random hex.' }
@@ -6171,7 +6171,8 @@ components:
           type: boolean
           description: >
             The owner's opt-in to show usage to members (PUT .../share-usage).
-            Management view only; always false in the member view.
+            Carried in the member view too, as the account's actual value (a
+            member who sees usage reads true).
         shared_by:
           type: string
           description: >

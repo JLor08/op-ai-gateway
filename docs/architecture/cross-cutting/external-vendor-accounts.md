@@ -2484,13 +2484,13 @@ provisioned into the account's group reads the management view):
   nothing, never by blanking the management DTO): `id`, `vendor`, `auth_type`, `name`,
   `status`, `model_prefix`, `models` (each only the gateway name, the dialect and the
   display name), the two credential booleans, `is_owner: false` and `shared_by`, plus
-  `usage` (the owner's rate-limit and spend figures) **only when the owner opted in**
-  (`share_usage_with_members`, the usage opt-in in §1.3; it also unlocks Claude Code's
-  figures, §6.5). **Withheld**: `share_level`, `admin_groups`, `system_group_id` and
-  `system_group_name` (who manages the account and where it is rooted), `base_url`
-  (where the owner's key is sent), `usage` without that opt-in, the opt-in flag
-  `share_usage_with_members` itself, each model's `upstream_model` and the
-  timestamps. One builder renders it for both the single read
+  the opt-in flag `share_usage_with_members` (the account's actual value, so a member
+  who sees usage never reads a false flag) and, **only when it is on**, `usage` (the
+  owner's rate-limit and spend figures; see the usage opt-in in §1.3, which also
+  unlocks Claude Code's figures, §6.5). **Withheld**: `share_level`, `admin_groups`,
+  `system_group_id` and `system_group_name` (who manages the account and where it is
+  rooted), `base_url` (where the owner's key is sent), `usage` without that opt-in,
+  each model's `upstream_model` and the timestamps. One builder renders it for both the single read
   and the member-only rows of the list, so the two cannot differ.
 - **Nothing**: everyone else, the same `404`.
 

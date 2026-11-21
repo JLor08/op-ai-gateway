@@ -1652,7 +1652,7 @@ credential-free allowlist. The sharing fields, always on the wire:
 | `system_group_id`, `system_group_name` | The containment root (name best effort, `""` when the group has since vanished). |
 | `is_owner` | Whether the viewer owns the account. A CM's answer to any call that returns an account says `false`, not the owner's. |
 | `shared_by` | The owner's **display name** (never the e-mail address) for a viewer who is not the owner; `""` for the owner and when the owner's name cannot be resolved. |
-| `share_usage_with_members` | The owner's opt-in (`PUT .../share-usage`): whether members may see the account's `usage`. Management view only; a member's view always reads `false`. |
+| `share_usage_with_members` | The owner's opt-in (`PUT .../share-usage`): whether members may see the account's `usage`. Carried as the account's actual value in the member view too (a member who sees `usage` reads `true`). |
 
 The three views, tried **widest first** (so a CM who is also provisioned into the
 account's group reads the management view):
@@ -1666,11 +1666,14 @@ account's group reads the management view):
   deny by default, and holds only what a borrower needs to find, understand and request
   the account: `id`, `vendor`, `auth_type`, `name`, `status` (it sees that it cannot use a
   disabled account), `model_prefix`, `models` (each only `gateway_model`, `api_flavor`
-  and `display_name`), the two credential booleans, `is_owner: false` and `shared_by`.
+  and `display_name`), the two credential booleans, `is_owner: false` and `shared_by`,
+  plus the owner's usage opt-in `share_usage_with_members` (the account's actual value)
+  and, **only when it is on**, `usage` (the owner's rate-limit and spend figures; the
+  list's member rows and so the dashboard carry it too).
   **Everything else is withheld** and reads as its zero value on the wire (`usage` is
-  omitted): `share_level`, `admin_groups`, `system_group_id` / `system_group_name` (who
-  manages the account and where it is rooted), `base_url` (where the owner's key is sent),
-  `usage` (the owner's rate-limit and spend figures), each model's `upstream_model` (the
+  omitted without the opt-in): `share_level`, `admin_groups`, `system_group_id` /
+  `system_group_name` (who manages the account and where it is rooted), `base_url`
+  (where the owner's key is sent), each model's `upstream_model` (the
   vendor's own id; the member requests the gateway name) and the timestamps. One builder
   renders it for **both** the single read and the member-only rows of the list, so the two
   cannot differ.

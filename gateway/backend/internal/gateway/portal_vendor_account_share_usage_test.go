@@ -54,16 +54,22 @@ func TestVendorAccountShareUsageOverHTTP(t *testing.T) {
 		t.Errorf("owner PUT: dto %+v, stored %v, want the management DTO with share_usage_with_members", dto, stored())
 	}
 
-	// The member now reads the figures, and still not the flag.
+	// The member now reads the figures, and the flag that unlocked them.
 	_, body, raw := vaGetRaw(t, f, vaOtherSecret, id)
 	if body["usage"] == nil {
 		t.Errorf("member read after opt-in lacks usage: %s", raw)
 	}
-	if body["share_usage_with_members"] != false {
-		t.Errorf("member read reports share_usage_with_members = %v, want false: %s", body["share_usage_with_members"], raw)
+	if body["share_usage_with_members"] != true {
+		t.Errorf("member read reports share_usage_with_members = %v, want true: %s", body["share_usage_with_members"], raw)
 	}
 
-	// And off again.
+	// And off again: the member loses usage and reads the flag false.
+	defer func() {
+		_, body, raw := vaGetRaw(t, f, vaOtherSecret, id)
+		if body["usage"] != nil || body["share_usage_with_members"] != false {
+			t.Errorf("member read after opt-out: %s", raw)
+		}
+	}()
 	rec = vaDo(t, f.srv, http.MethodPut, path, vaSystemSecret, `{"enabled":false}`)
 	if rec.Code != http.StatusOK || vaDecode(t, rec).ShareUsageWithMembers || stored() {
 		t.Errorf("owner PUT off = %d %s, stored %v", rec.Code, rec.Body.String(), stored())
