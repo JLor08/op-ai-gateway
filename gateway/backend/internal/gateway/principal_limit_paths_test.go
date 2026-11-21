@@ -78,7 +78,10 @@ func TestStandingWithSubscriptionRelay(t *testing.T) {
 		t.Fatalf("overage-status = %q, want the gateway's own (the upstream's rejected is gone)", got)
 	}
 
-	// #407 is unchanged: the cache observed the upstream set, not the overlay.
+	// #407 is unchanged: the cache observed the upstream set, not the overlay. The
+	// follow-up runs without limits, so any gateway field on it would have come out
+	// of the cache.
+	f.srv.Limiter = NewPrincipalLimiter(newFakePrincipalStore(), PrincipalLimiterOptions{})
 	local := f.post(t, vaOwnerSecret, "/v1/messages", windowsLocalModel, false)
 	if local.Code != http.StatusOK {
 		t.Fatalf("local status = %d, body = %s", local.Code, local.Body.String())
@@ -87,8 +90,13 @@ func TestStandingWithSubscriptionRelay(t *testing.T) {
 	if lh.Get(rlp+"5h-utilization") != "0.42" || lh.Get(rlp+"7d-utilization") != "0.10" {
 		t.Fatalf("cached windows not attached: %v", lh)
 	}
-	if lh.Get(rlp+"representative-claim") != "overage" || lh.Get(rlp+"overage-utilization") != "0.80" {
-		t.Fatalf("overlay missing on the later local request: %v", lh)
+	if got := lh.Get(rlp + "representative-claim"); got != "five_hour" {
+		t.Fatalf("representative-claim = %q, want the upstream's five_hour", got)
+	}
+	for _, name := range []string{"overage-utilization", "overage-status", "overage-reset", "overage-surpassed-threshold"} {
+		if got := lh.Get(rlp + name); got != "" {
+			t.Fatalf("%s = %q leaked from the overlay into the cache: %v", name, got, lh)
+		}
 	}
 }
 
