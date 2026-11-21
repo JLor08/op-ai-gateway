@@ -143,6 +143,10 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 		// #407's cached subscription windows, then the principal's own limit standing.
 		s.attachTranslatedUsageLimits(r, token, w.Header())
 	}
+	if req.APIFlavor == inference.APIFlavorOpenAIResponses {
+		// The Codex windows last observed for the caller (translated streams carry none).
+		s.attachCodexRateLimitWindows(token, w.Header())
+	}
 	w.WriteHeader(http.StatusOK)
 
 	if idle > 0 {

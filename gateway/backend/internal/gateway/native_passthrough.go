@@ -1171,6 +1171,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 			gated = isCodexRateLimitHeader
 		}
 		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
+		// A success from a provider that reports no Codex windows of its own (a local
+		// model) carries the caller's last observed ones, so the Codex CLI keeps its
+		// usage display. Fresh upstream windows are never overlaid, and an error
+		// response keeps exactly what the upstream said.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && !hasCodexRateLimitHeader(resp.Header) {
+			s.attachCodexRateLimitWindows(rel.token, w.Header())
+		}
 	}
 	w.WriteHeader(resp.StatusCode)
 
