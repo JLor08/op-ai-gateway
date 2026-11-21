@@ -150,7 +150,7 @@ window. During a block `/status` therefore labels the row `Daily limit` without 
 status line shows `daily 0% left`. A subscription user sees the gateway's 0 % until the next successful vendor response.
 
 What Codex prints: `You've hit your usage limit. OP AI Gateway token quota reached; ask your gateway administrator to raise
-it, or try again at 1:00 AM.` A denied request is still not recorded as a usage event and never reaches `Resolve`.
+it, or try again at 1:00 AM.` (for a client in UTC+1). A denied request is still not recorded as a usage event and never reaches `Resolve`.
 
 ## 7. Unchanged
 
@@ -183,7 +183,20 @@ it, or try again at 1:00 AM.` A denied request is still not recorded as a usage 
 - Risks entry (undocumented Codex behavior: last-family-wins, credits flag, promo precedence), and the telemetry/limiter
   section if it lists the per-flavor denial shapes.
 
-## 10. Left to the builder
+## 10. Calls made by the designer (not discussed with the owner)
+
+- Fullest reading only, one window, as ADR-107; integer percent, floored, at most 99 on a success.
+- Nominal window minutes (month 43200) so every month reads `monthly`; an hourly limit takes Codex's fallback label `usage`.
+- The limit name carries the kind (`OP AI Gateway token quota`), because one window cannot say which limit it is.
+- Precedence keyed on *any* Codex rate-limit header in the client header set, so the subscription wins whole.
+- No header when the reading's reset has already passed at write time (ADR-107 writes a stale reset; Codex would show a
+  past reset time).
+- Consequence to record in ADR-109: Codex carries credits over between responses, so once a gateway response has set
+  `has-credits: true`, a later local-model reply that carries only cached subscription windows also suppresses the
+  subscription's popup, until the next vendor response sends its own credits headers.
+- The end-to-end Codex run is a documented manual run (the #416 precedent), not a committed test.
+
+## 11. Left to the builder
 
 - Function and file names, and whether the success writer shares helpers with ADR-107's (`overageUtilizationCents`,
   `limitBlockedLabel`, `limitBlockedCode`, `limitBlockedMessage`).
