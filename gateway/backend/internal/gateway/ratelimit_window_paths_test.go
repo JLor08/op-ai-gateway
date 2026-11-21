@@ -135,7 +135,7 @@ func (f *windowsFixture) observeViaVendor(t *testing.T, secret string) {
 
 func requireWindowsAttached(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
-	h := rec.Header()
+	h := rec.Result().Header
 	if h.Get(rlp+"status") != "allowed" || h.Get(rlp+"5h-utilization") != "0.42" || h.Get(rlp+"7d-utilization") != "0.10" || h.Get(rlp+"5h-reset") == "" {
 		t.Fatalf("subscription windows not attached: %v", h)
 	}
@@ -211,24 +211,28 @@ func TestWindowsNotAttachedOverFreshHeaders(t *testing.T) {
 	f.prov.localHdr = own
 
 	rec := f.post(t, vaOwnerSecret, "/v1/messages", windowsLocalModel, false)
-	if got := rec.Header().Values(rlp + "status"); len(got) != 1 || got[0] != "allowed_warning" {
+	if got := rec.Result().Header.Values(rlp + "status"); len(got) != 1 || got[0] != "allowed_warning" {
 		t.Fatalf("status header = %v, want the upstream's own only", got)
 	}
-	if rec.Header().Get(rlp+"5h-utilization") != "0.91" {
-		t.Fatalf("5h utilization = %q, want 0.91", rec.Header().Get(rlp+"5h-utilization"))
+	if rec.Result().Header.Get(rlp+"5h-utilization") != "0.91" {
+		t.Fatalf("5h utilization = %q, want 0.91", rec.Result().Header.Get(rlp+"5h-utilization"))
 	}
-	if rec.Header().Get(rlp+"7d-utilization") != "" {
-		t.Fatalf("cached 7d window mixed into fresh headers: %v", rec.Header())
+	if rec.Result().Header.Get(rlp+"7d-utilization") != "" {
+		t.Fatalf("cached 7d window mixed into fresh headers: %v", rec.Result().Header)
 	}
 }
 
 func TestWindowsNotObservedForNonEntitled(t *testing.T) {
 	f := newWindowsFixture(t, routing.EndpointModePassthrough)
-	f.srv.Portal = &usageManagerPortal{API: f.srv.Portal, ok: false}
+	deny := &usageManagerPortal{API: f.srv.Portal, ok: false}
+	f.srv.Portal = deny
 	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
 	target := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a"}
 
 	f.srv.observeRateLimitWindows(member, target, subscriptionWindowHeaders())
+	if deny.calls != 1 {
+		t.Fatalf("portal consulted %d times, want 1 (its answer must be what dropped the observation)", deny.calls)
+	}
 
 	rec := f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, false)
 	if rec.Code != http.StatusOK {

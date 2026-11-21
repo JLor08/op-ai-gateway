@@ -3943,7 +3943,9 @@ remembers the caller's last subscription windows (`rateLimitWindowCache`,
   unified status of its own: the native passthrough before the status line, and the
   translate path on both the buffered JSON answer and the SSE header block. An error,
   a response with fresh upstream figures, and every other flavor (Chat Completions,
-  Responses) get nothing.
+  Responses) get nothing. On the SSE translate path the windows are written with the 200
+  header block before the upstream has answered, so a stream whose upstream then fails
+  carries them together with its SSE error event.
 - Only windows whose reset time is still in the future are written. The top-level status is
   `allowed`, or `allowed_warning` when an attached window warns or is rejected; it is never
   `rejected`, because the response of another provider was not refused. Overage, fallback
@@ -3952,6 +3954,12 @@ remembers the caller's last subscription windows (`rateLimitWindowCache`,
   evicted), pruned as windows expire, lost on restart and not shared between replicas.
   After a restart or on another replica the display simply stays blank until the next
   subscription response.
+
+**Known limitation.** Entitlement is checked when a window is observed, not when it is
+attached. A principal whose entitlement is revoked later (for example the owner turns off
+`share_usage_with_members`) keeps receiving its last stored figures, frozen, on local-model
+replies until those windows reset (up to 7 days) or the process restarts. Nothing new is
+disclosed (the principal already saw these figures), and sharing is off by default.
 
 **What Claude Code shows.** The per-window utilization and reset in its own status and
 warning display. It does not show the Claude Desktop usage card or the `/usage` plan
