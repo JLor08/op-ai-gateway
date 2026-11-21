@@ -85,6 +85,12 @@ func limitBlockedMessage(r LimitReading) string {
 		" UTC · ask your gateway administrator to raise it"
 }
 
+// limitRetryAfterSeconds is the Retry-After value for a block: the seconds until
+// reset, rounded up, at least 1.
+func limitRetryAfterSeconds(reset, now time.Time) int {
+	return max(int(math.Ceil(reset.Sub(now).Seconds())), 1)
+}
+
 // writeLimitBlocked answers a quota or budget denial on the Anthropic Messages
 // flavor (design spec §6): 429 with a billing_error body and the unified headers
 // that make Claude Code print r's sentence. representative-claim and overage-status
@@ -92,13 +98,9 @@ func limitBlockedMessage(r LimitReading) string {
 // X-Should-Retry false stops the client's retry loop; Retry-After is the seconds
 // until the reset, rounded up, at least 1.
 func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time) {
-	seconds := int(math.Ceil(r.Reset.Sub(now).Seconds()))
-	if seconds < 1 {
-		seconds = 1
-	}
 	reset := strconv.FormatInt(r.Reset.Unix(), 10)
 	h := w.Header()
-	h.Set("Retry-After", strconv.Itoa(seconds))
+	h.Set("Retry-After", strconv.Itoa(limitRetryAfterSeconds(r.Reset, now)))
 	h.Set("X-Should-Retry", "false")
 	h.Set(unifiedRateLimitPrefix+unifiedStatus, "rejected")
 	h.Set(unifiedRateLimitPrefix+unifiedReset, reset)
