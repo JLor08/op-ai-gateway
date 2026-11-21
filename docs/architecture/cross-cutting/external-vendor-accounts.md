@@ -681,7 +681,7 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
   `anthropic-beta` (*Client `anthropic-beta` on the Messages passthrough*, below);
   an api-key target has no beta of its own, so that is the whole header, and a
   request without one sends none. No other inbound header is forwarded, the
-  client's own `anthropic-version` included. Redirects from the upstream are not
+  client's own `anthropic-version` included. The response side is the same allowlist as the subscription relay below (`retry-after`, `x-should-retry`, and the entitlement-gated `anthropic-ratelimit-unified-*` family). Redirects from the upstream are not
   followed, because net/http strips `Authorization` but not `x-api-key` when a
   redirect leaves the host.
 - **Verbatim in body and in beta opt-in, pinned in version.** A beta-gated body
@@ -785,7 +785,12 @@ account (§5).
   `anthropic-beta` = `oauth-2025-04-20` followed by the client's own tokens,
   deduplicated (*Client `anthropic-beta`*, above). No other inbound header is
   forwarded. The response and its SSE are relayed unchanged and are not rewritten
-  back (§6.5); redirects are not followed, as for the api-key relay.
+  back (§6.5), except that the Messages passthrough forwards a response-header
+  allowlist to the client: `retry-after` and `x-should-retry` always, and the
+  `anthropic-ratelimit-unified-*` family only for a caller entitled to the account's
+  figures (its owner, anyone when the owner shared them with members, or a community
+  manager of the account; `rateLimitFiguresEntitled`). Every other upstream response
+  header is dropped. Redirects are not followed, as for the api-key relay.
 - **The body is verbatim except three edits.** The gateway layer rewrites `model` to
   the account's bare upstream id (equal to the requested name when the account has
   no prefix) and removes the replayed `thinking` blocks Anthropic cannot verify

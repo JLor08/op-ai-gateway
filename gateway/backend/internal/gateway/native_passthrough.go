@@ -1143,6 +1143,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 			w.Header().Set(contentLengthHeader, strconv.FormatInt(n, 10))
 		}
 	}
+	if rel.pfReq.APIFlavor == inference.APIFlavorAnthropicMessages {
+		forwardRateLimitHeaders(w.Header(), resp.Header, s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target))
+	}
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
