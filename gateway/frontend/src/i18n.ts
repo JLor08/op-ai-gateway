@@ -3456,7 +3456,9 @@ const de = {
     'Meldet die Konfidenz von Entscheidungen (/v1/decisions und /v1/systemone) immer auf einer Skala von 0 bis 1, auch wenn das Modell eine andere Skala verwendet.',
   tokenClaudeCodeUsageDisplay: 'Claude-Code-Nutzungslimits anzeigen',
   tokenClaudeCodeUsageDisplayHint:
-    'Claude Code zeigt dann die Nutzungslimits des Plans (5-Stunden- und Wochenlimit) an, wenn dieser Token als ANTHROPIC_AUTH_TOKEN verwendet wird. Dafür hat das Geheimnis eine längere Form; die Option lässt sich nur beim Anlegen wählen.',
+    'Claude Code zeigt dann die Nutzungslimits des Plans (5-Stunden- und Wochenlimit) an, wenn dieser Token als ANTHROPIC_AUTH_TOKEN verwendet wird. Dafür hat das Geheimnis eine längere Form; bei einem bestehenden Token erzeugt eine Änderung ein neues Geheimnis.',
+  tokenClaudeCodeUsageRotateWarning:
+    'Beim Speichern wird der Token rotiert: Das bisherige Geheimnis funktioniert danach nicht mehr, das neue wird einmalig angezeigt.',
   tokenClaudeCodeBadge: 'Claude Code',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
@@ -7385,7 +7387,9 @@ const en: PortalMessages = {
     'Reports the confidence of decisions (/v1/decisions and /v1/systemone) on a 0 to 1 scale whatever scale the model uses itself.',
   tokenClaudeCodeUsageDisplay: 'Show Claude Code usage limits',
   tokenClaudeCodeUsageDisplayHint:
-    "Makes Claude Code show the plan's usage limits (5-hour and weekly) when this token is used as ANTHROPIC_AUTH_TOKEN. The secret has a longer form for this; the option can only be chosen when the token is created.",
+    "Makes Claude Code show the plan's usage limits (5-hour and weekly) when this token is used as ANTHROPIC_AUTH_TOKEN. The secret has a longer form for this; on an existing token, changing it creates a new secret.",
+  tokenClaudeCodeUsageRotateWarning:
+    'Saving rotates the token: the current secret stops working and the new one is shown once.',
   tokenClaudeCodeBadge: 'Claude Code',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',

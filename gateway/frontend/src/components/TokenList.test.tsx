@@ -742,6 +742,100 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`TokenList Claude Code option on an existing token (#407) [${locale}]`, () => {
+    const box = () => screen.getByRole('checkbox', { name: t.tokenClaudeCodeUsageDisplay });
+    const rotateMock = (fakeApi: { rotateToken: unknown }) =>
+      fakeApi.rotateToken as unknown as { mock: { calls: unknown[][] } };
+
+    it('shows the stored value and no warning until it is changed', () => {
+      renderTokenList({
+        tokens: [makeToken({ id: 'tok_e', claude_code_usage_display: true })],
+      });
+      openEdit();
+      expect(box()).toBeChecked();
+      expect(screen.queryByText(t.tokenClaudeCodeUsageRotateWarning)).not.toBeInTheDocument();
+      fireEvent.click(box());
+      expect(screen.getByText(t.tokenClaudeCodeUsageRotateWarning)).toBeInTheDocument();
+      fireEvent.click(box());
+      expect(screen.queryByText(t.tokenClaudeCodeUsageRotateWarning)).not.toBeInTheDocument();
+    });
+
+    it('saves, rotates with the new value and reveals the new secret', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ id: 'tok_e', claude_code_usage_display: false })],
+      });
+      openEdit();
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() =>
+        expect(fakeApi.rotateToken).toHaveBeenCalledWith('tok_e', {
+          claude_code_usage_display: true,
+        }),
+      );
+      const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+        .calls[0];
+      expect(body).not.toHaveProperty('claude_code_usage_display');
+      expect(await screen.findByText('opaigw_rotated_secret')).toBeInTheDocument();
+    });
+
+    it('does not rotate when the checkbox is left unchanged', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ id: 'tok_e', claude_code_usage_display: true })],
+      });
+      openEdit();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(rotateMock(fakeApi).mock.calls).toHaveLength(0);
+    });
+
+    it('shows the error and keeps the old setting when the rotation fails after the save', async () => {
+      const fakeApi = {
+        createToken: vi.fn(),
+        updateToken: vi.fn(async (id: string, body: Record<string, unknown>) =>
+          makeToken({ id, name: (body.name as string) ?? '', claude_code_usage_display: false }),
+        ),
+        deleteToken: vi.fn(),
+        rotateToken: vi.fn(async () => {
+          throw new PortalApiError(500, 'internal', 'boom');
+        }),
+        updateChatSettings: vi.fn(),
+        myProjects: vi.fn(async () => defaultProjects),
+        serverModels: vi.fn(async () => []),
+        vendorAccounts: vi.fn(async () => ({ data: [] })),
+      };
+      const setTokens = vi.fn();
+      render(
+        <ToastProvider>
+          <TokenList
+            t={t}
+            api={fakeApi}
+            tokens={[makeToken({ id: 'tok_e', claude_code_usage_display: false })]}
+            setTokens={setTokens}
+            role="admin"
+            models={models}
+            servers={[]}
+          />
+        </ToastProvider>,
+      );
+      openEdit();
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.rotateToken).toHaveBeenCalled());
+      // The rotate warning plus the error toast.
+      await waitFor(() => expect(screen.getAllByRole('alert')).toHaveLength(2));
+      expect(screen.queryByText('opaigw_rotated_secret')).not.toBeInTheDocument();
+      // The list state only ever received the PATCH result (old setting).
+      for (const [updater] of setTokens.mock.calls) {
+        const next = (updater as (rows: PortalToken[]) => PortalToken[])([
+          makeToken({ id: 'tok_e' }),
+        ]);
+        expect(next.every((row) => row.claude_code_usage_display === false)).toBe(true);
+      }
+    });
+  });
+
   describe(`TokenList rotate action [${locale}]`, () => {
     it('requires confirmation, then rotates and reveals the new secret', async () => {
       const { fakeApi } = renderTokenList({

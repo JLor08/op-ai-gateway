@@ -188,9 +188,13 @@ export function tokensApi(fetcher: Fetcher) {
     tokens: () => request<{ data: PortalToken[] }>(fetcher, '/api/portal/tokens'),
     createToken: (body: CreateTokenRequest) =>
       request<CreateTokenResponse>(fetcher, '/api/portal/tokens', { method: 'POST', body }),
-    rotateToken: (id: string) =>
+    // The optional body switches the Claude Code secret shape together with the
+    // rotation (a secret's shape cannot change in place); without it the shape
+    // is kept.
+    rotateToken: (id: string, body?: { claude_code_usage_display: boolean }) =>
       request<CreateTokenResponse>(fetcher, `/api/portal/tokens/${encodeURIComponent(id)}/rotate`, {
         method: 'POST',
+        body,
       }),
     updateToken: (id: string, body: UpdateTokenRequest) =>
       request<PortalToken>(fetcher, `/api/portal/tokens/${encodeURIComponent(id)}`, {

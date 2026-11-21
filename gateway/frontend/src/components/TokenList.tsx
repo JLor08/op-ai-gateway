@@ -22,6 +22,7 @@ import type {
 import type { Translation, MessageKey, PortalApi } from './shared/types';
 import { formatPortalError } from './shared/format';
 import {
+  Alert,
   Box,
   Button,
   Checkbox,
@@ -337,6 +338,7 @@ export function TokenList({
     setClaudeAliases(row.claude_model_aliases ?? false);
     setClaudeEffort(row.claude_effort_compatibility ?? false);
     setDecisionsNormalize(row.decisions_confidence_normalize ?? false);
+    setClaudeCodeUsage(row.claude_code_usage_display);
     setLogCommunication(row.log_communication);
     setSecret(row.secret);
     setProjectId(row.project_id ?? '');
@@ -432,8 +434,22 @@ export function TokenList({
       // vendor_access keeps the stored policy.
       const vendorAccess = buildVendorAccess();
       if (vendorAccess) body.vendor_access = vendorAccess;
+      // claude_code_usage_display is never part of the PATCH: the backend
+      // accepts it only as a no-op, and a change goes through the rotation.
       const updated = await api.updateToken(id, body);
       setTokens((current) => current.map((row) => (row.id === id ? updated : row)));
+      if (claudeCodeUsage !== mode.edit.claude_code_usage_display) {
+        try {
+          const rotated = await api.rotateToken(id, { claude_code_usage_display: claudeCodeUsage });
+          setTokens((current) => current.map((row) => (row.id === id ? rotated.token : row)));
+          setCreatedSecret(rotated.secret);
+        } catch (err) {
+          // The other edits are saved, the row keeps the old setting (the
+          // PATCH result above); stay in the form so the user can retry.
+          showError(formatPortalError(err, t));
+          return;
+        }
+      }
       setMode('list');
     } catch (err) {
       showError(formatPortalError(err, t));
@@ -810,25 +826,25 @@ export function TokenList({
                 {t.tokenDecisionsConfidenceNormalizeHint}
               </Typography>
             </Box>
-            {/* The option fixes the secret's shape, so it is only offered at
-                creation; showing and rotating it on an existing token is a
-                separate flow. */}
-            {mode === 'create' && (
-              <Box sx={{ display: 'grid', gap: 1 }}>
-                <FormControlLabel
-                  control={
-                    <Checkbox
-                      checked={claudeCodeUsage}
-                      onChange={(e) => setClaudeCodeUsage(e.target.checked)}
-                    />
-                  }
-                  label={t.tokenClaudeCodeUsageDisplay}
-                />
-                <Typography variant="caption" color="text.secondary">
-                  {t.tokenClaudeCodeUsageDisplayHint}
-                </Typography>
-              </Box>
-            )}
+            {/* The option fixes the secret's shape. On an existing token a change
+                is saved together with a rotation, so the form warns first. */}
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={claudeCodeUsage}
+                    onChange={(e) => setClaudeCodeUsage(e.target.checked)}
+                  />
+                }
+                label={t.tokenClaudeCodeUsageDisplay}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenClaudeCodeUsageDisplayHint}
+              </Typography>
+              {mode !== 'create' && claudeCodeUsage !== mode.edit.claude_code_usage_display && (
+                <Alert severity="warning">{t.tokenClaudeCodeUsageRotateWarning}</Alert>
+              )}
+            </Box>
             {/* The vendor-access section is hidden entirely while the vendor-accounts
                 master flag is off. Account names are vendor/owner-supplied text:
                 rendered as text only. */}

@@ -632,6 +632,23 @@ describe('portal api', () => {
     expect(res.token.secret_prefix).toBe('opaigw_new');
   });
 
+  it('sends the optional rotate body only when given', async () => {
+    const fetcher = vi.fn().mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ token: {}, secret: 's' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    const api = createPortalApi(fetcher);
+
+    await api.rotateToken('tok_1');
+    await api.rotateToken('tok_1', { claude_code_usage_display: true });
+
+    expect(fetcher.mock.calls[0][1].body).toBeUndefined();
+    expect(fetcher.mock.calls[1][1].body).toBe(JSON.stringify({ claude_code_usage_display: true }));
+  });
+
   it('lists AI servers', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(
