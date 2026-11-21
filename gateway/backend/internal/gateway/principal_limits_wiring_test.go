@@ -722,28 +722,28 @@ func TestResponsesBlockOnNativeModel(t *testing.T) {
 
 func TestResponsesRateDenialUnchanged(t *testing.T) {
 	srv, _ := blockTestServer(t, routing.LimitConfig{RateRequests: 1, RateWindowSeconds: 60}, 0, 0, 0)
-	for i := 0; i < 2; i++ {
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
-		if i == 0 {
-			continue
-		}
-		if rec.Code != http.StatusTooManyRequests {
-			t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
-		}
-		if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.rate_limited" {
-			t.Fatalf("code = %q", got)
-		}
-		if top, inner := decodeErrorType(t, rec.Body.Bytes()); top != "" || inner != "" {
-			t.Fatalf("type = %q/%q, want none (apierror shape)", top, inner)
-		}
-		if rec.Header().Get("Retry-After") == "" {
-			t.Fatalf("Retry-After missing")
-		}
-		for name := range rec.Header() {
-			if strings.HasPrefix(strings.ToLower(name), "x-codex-") {
-				t.Fatalf("unexpected %s on a rate denial", name)
-			}
+	first := httptest.NewRecorder()
+	srv.ServeHTTP(first, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200, body = %s", first.Code, first.Body.String())
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.rate_limited" {
+		t.Fatalf("code = %q", got)
+	}
+	if top, inner := decodeErrorType(t, rec.Body.Bytes()); top != "" || inner != "" {
+		t.Fatalf("type = %q/%q, want none (apierror shape)", top, inner)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("Retry-After missing")
+	}
+	for name := range rec.Header() {
+		if strings.HasPrefix(strings.ToLower(name), "x-codex-") {
+			t.Fatalf("unexpected %s on a rate denial", name)
 		}
 	}
 }

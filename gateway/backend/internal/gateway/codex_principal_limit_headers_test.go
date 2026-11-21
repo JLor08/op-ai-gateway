@@ -207,3 +207,24 @@ func TestWriteCodexLimitBlocked(t *testing.T) {
 		}
 	})
 }
+
+func TestLimitRetryAfterSeconds(t *testing.T) {
+	now := codexTestNow
+	for _, tc := range []struct {
+		name  string
+		reset time.Time
+		want  int
+	}{
+		{"ten seconds", now.Add(10 * time.Second), 10},
+		{"rounds up", now.Add(9400 * time.Millisecond), 10},
+		{"sub-second", now.Add(200 * time.Millisecond), 1},
+		{"equal", now, 1},
+		{"past", now.Add(-5 * time.Second), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := limitRetryAfterSeconds(tc.reset, now); got != tc.want {
+				t.Fatalf("limitRetryAfterSeconds = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

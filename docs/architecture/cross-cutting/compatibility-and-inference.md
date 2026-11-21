@@ -4064,7 +4064,7 @@ wants, and the subscription windows stay visible beside it.
 
 **Block (`/v1/messages` only).** A quota or budget denial on the Anthropic Messages flavor (`/v1/messages` and its
 aliases; `count_tokens` never admits) is answered by `writeLimitBlocked`, called from `admitPrincipal`, which now takes
-the flavor. The cost budget is a 429 here, not its 402 elsewhere. `LimitStanding.Blocking` picks the limit to name: among
+the flavor. The cost budget is a 429 here and on `/v1/responses` ([§9.6](#96-codex-display-of-the-gateways-own-limits)), not the 402 of *Other endpoints*. `LimitStanding.Blocking` picks the limit to name: among
 the breached readings the one with the latest reset (when the user can work again), ties to the fixed order; a defensive
 fallback, not an expected race (the denial and `Blocking` read the same standing, so a breached reading always exists on
 a quota or budget denial), takes the reading of the limit `Admit` named when none is breached. A failed read counts as
@@ -4072,7 +4072,7 @@ not breached. Response:
 
 - **Body:** `{"type":"error","error":{"type":"billing_error","code":"<code>","message":"<sentence>"}}`, with the limit's
   stable code (`limit.request_quota_exceeded`, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`). The
-  top-level `"type":"error"` exists for this one body; every other gateway error keeps the `apierror` shape.
+  top-level `"type":"error"` exists for this one body; every other gateway error keeps the `apierror` shape, except [§9.6](#96-codex-display-of-the-gateways-own-limits)'s Codex `usage_limit_reached` body.
 - **Sentence:** `<request quota|token quota|cost budget> reached · resets <Mon D, HH:MM> UTC · ask your gateway
   administrator to raise it`, for example `token quota reached · resets Nov 22, 00:00 UTC · ask your gateway
   administrator to raise it`.
@@ -5527,7 +5527,7 @@ serving endpoint with the session cookie and names the file from the response's
 ## 13. Errors
 
 Every inference error response uses the gateway-wide envelope
-(`apierror.Response`, `internal/apierror/`):
+(`apierror.Response`, `internal/apierror/`), with two exceptions: the §9.4 `billing_error` body on `/v1/messages` and the §9.6 `usage_limit_reached` body on `/v1/responses`; both still carry the stable `error.code`:
 
 ```json
 {"error": {"code": "provider.unavailable", "message": "...", "request_id": "req_..."}}

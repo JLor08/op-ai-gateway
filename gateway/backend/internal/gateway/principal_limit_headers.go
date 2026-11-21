@@ -27,7 +27,8 @@ const (
 // limitBlockedBody is the one gateway error body that carries a top-level "type":
 // Claude Code reads error.type and error.message of an Anthropic-shaped error, and
 // only a "billing_error" with this envelope shows our sentence. Every other gateway
-// error keeps the apierror shape (design spec §6).
+// error keeps the apierror shape (design spec §6), except the Codex
+// usage_limit_reached body (codexLimitBlockedBody in codex_principal_limit_headers.go).
 type limitBlockedBody struct {
 	Type  string            `json:"type"`
 	Error limitBlockedError `json:"error"`

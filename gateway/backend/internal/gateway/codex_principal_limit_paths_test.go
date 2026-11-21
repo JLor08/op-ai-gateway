@@ -23,7 +23,7 @@ func requireCodexStandingAttached(t *testing.T, rec *httptest.ResponseRecorder) 
 	}
 }
 
-func requireOK(t *testing.T, rec *httptest.ResponseRecorder) {
+func requireCodexStandingOK(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -35,7 +35,7 @@ func TestCodexStandingAttachedOnLocalPassthrough(t *testing.T) {
 	f.capPrincipal()
 
 	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
-	requireOK(t, rec)
+	requireCodexStandingOK(t, rec)
 	requireCodexStandingAttached(t, rec)
 }
 
@@ -45,7 +45,7 @@ func TestCodexStandingAttachedOnTranslateStreamAndBuffered(t *testing.T) {
 
 	for _, stream := range []bool{false, true} {
 		rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, stream)
-		requireOK(t, rec)
+		requireCodexStandingOK(t, rec)
 		requireCodexStandingAttached(t, rec)
 	}
 }
@@ -58,7 +58,7 @@ func TestCodexStandingYieldsToVendorFigures(t *testing.T) {
 	f.cprov.mu.Unlock()
 
 	rec := f.post(t, vaOwnerSecret, "/v1/responses", codexWindowsModel, false)
-	requireOK(t, rec)
+	requireCodexStandingOK(t, rec)
 	h := rec.Result().Header
 	if h.Get("X-Codex-Primary-Used-Percent") != "42.5" || h.Get("X-Codex-Limit-Name") != "codex" || h.Get("X-Codex-Credits-Has-Credits") != "" {
 		t.Fatalf("vendor figures not preserved: %v", h)
@@ -71,10 +71,29 @@ func TestCodexStandingYieldsToCachedWindows(t *testing.T) {
 	f.observeViaVendor(t, vaOwnerSecret)
 
 	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
-	requireOK(t, rec)
+	requireCodexStandingOK(t, rec)
 	requireCodexWindowsAttached(t, rec, "42.5")
 	if got := rec.Result().Header.Get("X-Codex-Limit-Name"); got != "codex" {
 		t.Fatalf("limit name = %q, want codex", got)
+	}
+}
+
+func TestCodexStandingYieldsToCachedWindowsOnTranslate(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModeTranslate)
+	f.capPrincipal()
+	f.observeViaVendor(t, vaOwnerSecret)
+
+	for _, stream := range []bool{false, true} {
+		rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, stream)
+		requireCodexStandingOK(t, rec)
+		requireCodexWindowsAttached(t, rec, "42.5")
+		h := rec.Result().Header
+		if got := h.Get("X-Codex-Limit-Name"); got != "codex" {
+			t.Fatalf("stream=%v limit name = %q, want codex", stream, got)
+		}
+		if got := h.Get("X-Codex-Credits-Has-Credits"); got != "" {
+			t.Fatalf("stream=%v credits header = %q, want none", stream, got)
+		}
 	}
 }
 
@@ -98,7 +117,7 @@ func TestCodexStandingForNonEntitledVendorCaller(t *testing.T) {
 	f := &windowsFixture{srv: srv, prov: &cprov.windowsProvider}
 
 	rec := f.post(t, memberSecret, "/v1/responses", vendorModel, false)
-	requireOK(t, rec)
+	requireCodexStandingOK(t, rec)
 	if got := rec.Result().Header.Get("X-Codex-Primary-Used-Percent"); got == "42.5" {
 		t.Fatalf("vendor figures leaked to a non-entitled caller: %v", rec.Result().Header)
 	}
@@ -121,7 +140,7 @@ func TestCodexStandingAbsentWithoutLimits(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
 
 	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
-	requireOK(t, rec)
+	requireCodexStandingOK(t, rec)
 	requireNoCodex(t, rec)
 }
 
@@ -130,7 +149,7 @@ func TestCodexStandingNotOnMessages(t *testing.T) {
 	f.capPrincipal()
 
 	rec := f.post(t, vaOwnerSecret, "/v1/messages", windowsLocalModel, false)
-	requireOK(t, rec)
+	requireCodexStandingOK(t, rec)
 	for k := range rec.Header() {
 		if strings.HasPrefix(strings.ToLower(k), codexRateLimitPrefix) {
 			t.Fatalf("unexpected Codex header %s: %v", k, rec.Header())
