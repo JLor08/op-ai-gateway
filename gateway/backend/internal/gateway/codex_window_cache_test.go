@@ -8,6 +8,7 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -177,6 +178,55 @@ func TestCodexCacheFirstValueOfMultiValuedHeader(t *testing.T) {
 	}
 	if got := dst.Values("x-codex-primary-used-percent"); len(got) != 1 {
 		t.Errorf("primary values = %v, want one", got)
+	}
+	if got := dst.Get("x-codex-secondary-used-percent"); got != "17" {
+		t.Errorf("secondary = %q, want first value 17", got)
+	}
+}
+
+func TestCodexCacheBoundsFamilies(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	reset := strconv.FormatInt(now.Add(time.Hour).Unix(), 10)
+	h := codexWindowHeaders(now, time.Hour, 24*time.Hour)
+	for _, id := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"} {
+		h.Set("x-codex-"+id+"-primary-used-percent", "1")
+		h.Set("x-codex-"+id+"-primary-reset-at", reset)
+	}
+	windows, _, fresh := parseCodexWindows(h)
+	if !fresh {
+		t.Fatal("fresh = false")
+	}
+	fams := map[string]struct{}{}
+	for base := range windows {
+		if fam, ok := codexFamilyOfBase(base); ok {
+			fams[fam] = struct{}{}
+		}
+	}
+	if len(fams) != codexMaxFamilies {
+		t.Errorf("families kept = %d (%v), want %d", len(fams), fams, codexMaxFamilies)
+	}
+	if _, ok := fams["x-codex"]; !ok {
+		t.Error("default family x-codex dropped")
+	}
+	if _, ok := fams["x-codex-j"]; ok {
+		t.Error("last sorted family kept over earlier ones")
+	}
+}
+
+func TestCodexCacheSkipsOversizedValue(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	h := codexWindowHeaders(now, time.Hour, 24*time.Hour)
+	h.Set("x-codex-limit-name", strings.Repeat("n", codexMaxValueLen+1))
+	h.Set("x-codex-secondary-window-minutes", strings.Repeat("9", codexMaxValueLen+1))
+	c := newRateLimitWindowCache(10)
+	c.ObserveCodex("user:a", "acct1", h, now)
+	dst := http.Header{}
+	c.AttachCodex("user:a", dst, now)
+	if dst.Get("x-codex-limit-name") != "" || dst.Get("x-codex-secondary-window-minutes") != "" {
+		t.Errorf("oversized value stored: %v", dst)
+	}
+	if dst.Get("x-codex-primary-used-percent") != "42.5" || dst.Get("x-codex-secondary-used-percent") != "17" {
+		t.Errorf("normal windows lost: %v", dst)
 	}
 }
 

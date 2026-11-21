@@ -503,3 +503,40 @@ func TestNativeMessagesReselectionDropsFirstAttemptHeaders(t *testing.T) {
 		t.Fatalf("Retry-After = %v, want only the final attempt's 1", got)
 	}
 }
+
+func TestNativeResponsesReselectionDropsFirstAttemptHeaders(t *testing.T) {
+	gone := http.Header{"Retry-After": []string{"99"}, "X-Codex-Primary-Used-Percent": []string{"99"}, "Content-Type": []string{jsonContentType}}
+	final := http.Header{"Retry-After": []string{"1"}, "X-Codex-Primary-Used-Percent": []string{"5"}, "Content-Type": []string{jsonContentType}}
+	first := &headerProxyProvider{answers: []headerAnswer{{status: 409, header: gone, body: `{"error":{"code":"runtime.instance_no_capacity","message":"full"}}`}}}
+	second := &headerProxyProvider{answers: []headerAnswer{{status: 200, header: final, body: `{"output_text":"hi"}`}}}
+	srv := newNativeProxyTestServer(first, false, true)
+	base := routing.Target{ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}
+	lost := base
+	lost.InstanceKey = "inst#1"
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(rlMessagesBody))
+	rec := httptest.NewRecorder()
+	nr := nativeRelay{
+		token:    auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true},
+		target:   lost,
+		path:     "/v1/responses",
+		raw:      []byte(rlMessagesBody),
+		pfReq:    inference.Request{Model: "gw-model", RequestedModel: "gw-model", APIFlavor: inference.APIFlavorOpenAIResponses},
+		endpoint: endpointResponses,
+	}
+	nr.reselect = func(routing.Target, error) {
+		srv.Provider = second
+		again := nr
+		again.target = base
+		again.reselect = nil
+		srv.proxyNative(rec, req, again)
+	}
+	srv.proxyNative(rec, req, nr)
+
+	if got := rec.Header().Values("Retry-After"); len(got) != 1 || got[0] != "1" {
+		t.Fatalf("Retry-After = %v, want only the final attempt's 1", got)
+	}
+	if got := rec.Header().Values("X-Codex-Primary-Used-Percent"); len(got) != 1 || got[0] != "5" {
+		t.Fatalf("X-Codex-Primary-Used-Percent = %v, want only the final attempt's 5", got)
+	}
+}

@@ -70,10 +70,10 @@ func hasUnifiedRateLimitHeader(h http.Header) bool {
 // (case-insensitive): the x-codex- prefix plus a window suffix or an explicit name.
 // Everything else under x-codex- (x-codex-turn-state, x-codex-beta-features) is not.
 func isCodexRateLimitHeader(name string) bool {
-	n := strings.ToLower(name)
-	if !strings.HasPrefix(n, codexRateLimitPrefix) {
+	if len(name) < len(codexRateLimitPrefix) || !strings.EqualFold(name[:len(codexRateLimitPrefix)], codexRateLimitPrefix) {
 		return false
 	}
+	n := strings.ToLower(name)
 	if _, ok := codexRateLimitNames[n]; ok {
 		return true
 	}
@@ -165,19 +165,19 @@ type rateLimitEntitlement struct {
 	expires time.Time
 }
 
-// rateLimitFiguresEntitled reports whether the caller may receive the unified
-// rate-limit figures of the account target was routed through. Evaluated in order: a
-// self-hosted target (no vendor account) is always entitled; so is the account's owner;
-// so is anyone when the owner shared the figures with members; otherwise the portal
-// decides (system scope or a community manager of the account), cached per principal
-// and account. A portal error, a lookup slower than rateLimitEntitlementTimeout, or no
-// portal, is not entitled (fail closed; the failure is cached for
-// rateLimitEntitlementErrorTTL).
+// rateLimitFiguresEntitled reports whether the caller may receive the rate-limit
+// figures (the Anthropic unified family and the Codex family) of the account target
+// was routed through. Evaluated in order: a self-hosted target (no vendor account) is
+// always entitled; so is the account's owner; so is anyone when the owner shared the
+// figures with members; otherwise the portal decides (system scope or a community
+// manager of the account), cached per principal and account. A portal error, a lookup
+// slower than rateLimitEntitlementTimeout, or no portal, is not entitled (fail closed;
+// the failure is cached for rateLimitEntitlementErrorTTL).
 //
 // Inference narrows the portal predicate: API tokens never carry system scope (it
-// exists only on an elevated session principal, and /v1/messages is bearer-only), so on
-// this path the figures reach the owner, a community manager of a shared/full account,
-// or anyone when the owner opted in.
+// exists only on an elevated session principal, and /v1/messages and /v1/responses are
+// bearer-only), so on this path the figures reach the owner, a community manager of a
+// shared/full account, or anyone when the owner opted in.
 func (s *Server) rateLimitFiguresEntitled(ctx context.Context, token auth.Token, target routing.Target) bool {
 	if target.VendorAccountID == "" {
 		return true
