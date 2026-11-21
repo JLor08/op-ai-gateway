@@ -29,14 +29,14 @@ func TestSetVendorAccountShareUsage(t *testing.T) {
 		return got.ShareUsageWithMembers
 	}
 
-	dto, err := e.svc.SetVendorAccountShareUsage(e.ctx, owner, acc.ID, SetVendorAccountShareUsageRequest{Enabled: true})
+	dto, err := e.svc.SetVendorAccountShareUsage(e.ctx, owner, acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 	if err != nil {
 		t.Fatalf("owner on: %v", err)
 	}
 	if !dto.ShareUsageWithMembers || !stored() || !dto.IsOwner {
 		t.Errorf("owner on: dto %+v, stored %v, want the management DTO with the opt-in set", dto, stored())
 	}
-	dto, err = e.svc.SetVendorAccountShareUsage(e.ctx, owner, acc.ID, SetVendorAccountShareUsageRequest{Enabled: false})
+	dto, err = e.svc.SetVendorAccountShareUsage(e.ctx, owner, acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(false)})
 	if err != nil {
 		t.Fatalf("owner off: %v", err)
 	}
@@ -50,23 +50,23 @@ func TestSetVendorAccountShareUsage(t *testing.T) {
 		want error
 	}{
 		{"cm", func() error {
-			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token("usr_cm", "admin"), acc.ID, SetVendorAccountShareUsageRequest{Enabled: true})
+			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token("usr_cm", "admin"), acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 			return err
 		}, ErrVendorAccountForbidden},
 		{"member", func() error {
-			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, e.member, acc.ID, SetVendorAccountShareUsageRequest{Enabled: true})
+			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, e.member, acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 			return err
 		}, ErrVendorAccountForbidden},
 		{"stranger", func() error {
-			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token("usr_stranger"), acc.ID, SetVendorAccountShareUsageRequest{Enabled: true})
+			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token("usr_stranger"), acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 			return err
 		}, ErrVendorAccountNotFound},
 		{"system scope", func() error {
-			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token("usr_s", "system", "admin"), acc.ID, SetVendorAccountShareUsageRequest{Enabled: true})
+			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token("usr_s", "system", "admin"), acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 			return err
 		}, ErrVendorAccountNotFound},
 		{"unknown id", func() error {
-			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, owner, "vacc_does_not_exist", SetVendorAccountShareUsageRequest{Enabled: true})
+			_, err := e.svc.SetVendorAccountShareUsage(e.ctx, owner, "vacc_does_not_exist", SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 			return err
 		}, ErrVendorAccountNotFound},
 	}
@@ -94,7 +94,7 @@ func TestSetVendorAccountShareUsageAtAnyLevel(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertVendorAccountUsage: %v", err)
 	}
-	dto, err := e.svc.SetVendorAccountShareUsage(e.ctx, token(vendorAuthzOwnerID), acc.ID, SetVendorAccountShareUsageRequest{Enabled: true})
+	dto, err := e.svc.SetVendorAccountShareUsage(e.ctx, token(vendorAuthzOwnerID), acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 	if err != nil {
 		t.Fatalf("owner on a private account: %v", err)
 	}
@@ -121,13 +121,34 @@ func TestSetVendorAccountShareUsageAtAnyLevel(t *testing.T) {
 	}
 }
 
+// TestSetVendorAccountShareUsageRequiresEnabled: a body without `enabled` is refused
+// after the access gate and writes nothing.
+func TestSetVendorAccountShareUsageRequiresEnabled(t *testing.T) {
+	e := newVendorMemberEnv(t)
+	acc := e.accounts[routing.VendorShareLevelShared]
+	e.link(acc.ID)
+	owner := token(vendorAuthzOwnerID)
+	if _, err := e.svc.SetVendorAccountShareUsage(e.ctx, owner, acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)}); err != nil {
+		t.Fatalf("on: %v", err)
+	}
+	if _, err := e.svc.SetVendorAccountShareUsage(e.ctx, owner, acc.ID, SetVendorAccountShareUsageRequest{}); !errors.Is(err, ErrVendorAccountShareUsageEnabledRequired) {
+		t.Fatalf("err = %v, want ErrVendorAccountShareUsageEnabledRequired", err)
+	}
+	if got, _ := e.routes.VendorAccountByID(e.ctx, acc.ID); !got.ShareUsageWithMembers {
+		t.Error("a request without enabled switched the opt-in off")
+	}
+	if _, err := e.svc.SetVendorAccountShareUsage(e.ctx, e.member, acc.ID, SetVendorAccountShareUsageRequest{}); !errors.Is(err, ErrVendorAccountForbidden) {
+		t.Errorf("member without enabled = %v, want the 403 first", err)
+	}
+}
+
 // TestSetVendorAccountShareUsageIsRefusedWhileVendorAccountsAreOff: the module flag
 // answers first, as for every vendor-account write.
 func TestSetVendorAccountShareUsageIsRefusedWhileVendorAccountsAreOff(t *testing.T) {
 	e := newVendorMemberEnv(t)
 	acc := e.accounts[routing.VendorShareLevelShared]
 	setVendorAccountsEnabled(t, e.svc, false)
-	_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token(vendorAuthzOwnerID), acc.ID, SetVendorAccountShareUsageRequest{Enabled: true})
+	_, err := e.svc.SetVendorAccountShareUsage(e.ctx, token(vendorAuthzOwnerID), acc.ID, SetVendorAccountShareUsageRequest{Enabled: boolPtr(true)})
 	if !errors.Is(err, ErrVendorAccountsDisabled) {
 		t.Errorf("err = %v, want ErrVendorAccountsDisabled", err)
 	}

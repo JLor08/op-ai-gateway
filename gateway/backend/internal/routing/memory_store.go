@@ -3308,9 +3308,10 @@ func (m *MemoryStore) DeleteServerRuntimeReport(_ context.Context, serverID stri
 
 // CreateVendorAccount stores a new account; a duplicate id is ErrConflict,
 // mirroring the vendor_accounts primary key. Like the SQL driver (whose INSERT
-// omits both columns) it ignores ShareLevel and SystemGroupID: a new account
-// starts at the column DEFAULTs ('none' and the empty string), so a zero-value
-// struct never stores an empty share level.
+// omits these columns) it ignores ShareLevel, SystemGroupID and
+// ShareUsageWithMembers: a new account starts at the column DEFAULTs ('none', the
+// empty string and false), so a zero-value struct never stores an empty share level
+// and a create can never switch the usage opt-in on.
 func (m *MemoryStore) CreateVendorAccount(_ context.Context, a VendorAccount) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3319,6 +3320,7 @@ func (m *MemoryStore) CreateVendorAccount(_ context.Context, a VendorAccount) er
 	}
 	a.ShareLevel = VendorShareLevelNone
 	a.SystemGroupID = ""
+	a.ShareUsageWithMembers = false
 	m.vendorAccounts[a.ID] = copyVendorAccount(a)
 	return nil
 }

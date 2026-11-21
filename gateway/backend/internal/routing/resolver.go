@@ -299,8 +299,9 @@ type Target struct {
 	// VendorAccountOwnerUserID and VendorShareUsageWithMembers are the serving
 	// account's owner and the owner's opt-in to showing its usage limits to members
 	// (VendorAccount.ShareUsageWithMembers). They are stamped on every vendor target
-	// next to VendorAccountID so the usage-limit header gate decides from the target
-	// alone: the owner always qualifies, anyone else only with the opt-in.
+	// next to VendorAccountID so the usage-limit header gate needs no account read: the
+	// owner qualifies, so does a community manager of a shared/full account
+	// (the portal's usage-manager predicate), and anyone else only with the opt-in.
 	VendorAccountOwnerUserID    string
 	VendorShareUsageWithMembers bool
 	// Subscription marks a SUBSCRIPTION (OAuth) vendor target whose upstream bearer

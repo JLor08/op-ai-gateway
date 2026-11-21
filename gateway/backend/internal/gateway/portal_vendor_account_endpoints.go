@@ -42,6 +42,10 @@ const (
 	// share-level endpoint (PUT .../share-level): a store failure.
 	codeVendorAccountShareLevelFailed = "vendor_account.share_level_failed"
 
+	// codeVendorAccountShareUsageFailed is the uncategorized fallback of the owner's
+	// usage opt-in (PUT .../share-usage): a store failure.
+	codeVendorAccountShareUsageFailed = "vendor_account.share_usage_failed"
+
 	// codeVendorAccountAdminGroupsFailed is the uncategorized fallback of the
 	// management-group assignment (PUT .../admin-groups) and
 	// codeVendorAccountAdminGroupCandidatesFailed that of its candidate list: a store
@@ -316,8 +320,8 @@ func (s *Server) handlePortalVendorAccountShareLevel(w http.ResponseWriter, r *h
 }
 
 // handlePortalVendorAccountShareUsage (PUT .../share-usage) sets the owner's opt-in to
-// show the account's usage figures to members ({"enabled": bool}, #407). The handler
-// only decodes; the service decides: the owner alone (a CM or a member, who can see the
+// show the account's usage figures to members ({"enabled": bool}, #407; a body without
+// `enabled` is a 400 request.invalid_json and writes nothing). The handler only decodes; the service decides: the owner alone (a CM or a member, who can see the
 // account, is a 403 vendor_account.forbidden; a stranger, an unknown id and system scope
 // are the same 404). Not gated on the sharing flags. The response is the credential-free
 // management view.
@@ -336,7 +340,7 @@ func (s *Server) handlePortalVendorAccountShareUsage(w http.ResponseWriter, r *h
 	}
 	dto, err := s.Portal.SetVendorAccountShareUsage(r.Context(), token, id, req)
 	if err != nil {
-		writePortalVendorAccountError(w, err, codeVendorAccountShareLevelFailed)
+		writePortalVendorAccountError(w, err, codeVendorAccountShareUsageFailed)
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
@@ -712,6 +716,7 @@ var portalVendorAccountErrRows = []errRow{
 	// answered only AFTER the 404/403 gate, so none of them confirms an account to a
 	// caller who may not see it (the level's own shape is account-independent).
 	{err: portal.ErrVendorAccountShareLevelInvalid, status: http.StatusBadRequest, code: "vendor_account.share_level_invalid", msg: "the share level must be none, shared or full"},
+	{err: portal.ErrVendorAccountShareUsageEnabledRequired, status: http.StatusBadRequest, code: codeRequestInvalidJSON, msg: "enabled is required"},
 	{err: portal.ErrVendorAccountShareLevelUnchanged, status: http.StatusBadRequest, code: "vendor_account.share_level_unchanged", msg: "the request does not change the share level in the direction asked for; use a higher level to raise or a lower one to lower"},
 	{err: portal.ErrVendorAccountSubscriptionShareCapped, status: http.StatusBadRequest, code: "vendor_account.subscription_share_capped", msg: "a subscription account can be shared at most at the shared level, never full"},
 	{err: portal.ErrVendorAccountAdminGroupRequired, status: http.StatusBadRequest, code: "vendor_account.admin_group_required", msg: "at least one management group is required to share an account"},

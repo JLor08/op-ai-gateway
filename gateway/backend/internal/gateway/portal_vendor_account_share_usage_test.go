@@ -45,6 +45,18 @@ func TestVendorAccountShareUsageOverHTTP(t *testing.T) {
 	// A malformed body is a 400 before anything is written.
 	requireStatusCode(t, "malformed body", vaDo(t, f.srv, http.MethodPut, path, vaSystemSecret, `{"enabled":`), http.StatusBadRequest, codeRequestInvalidJSON)
 
+	// A body without `enabled` is a 400 and writes nothing (it must not read as false).
+	if rec := vaDo(t, f.srv, http.MethodPut, path, vaSystemSecret, `{"enabled":true}`); rec.Code != http.StatusOK {
+		t.Fatalf("seed PUT = %d", rec.Code)
+	}
+	requireStatusCode(t, "missing enabled", vaDo(t, f.srv, http.MethodPut, path, vaSystemSecret, `{}`), http.StatusBadRequest, codeRequestInvalidJSON)
+	if !stored() {
+		t.Fatal("a PUT without enabled switched the opt-in off")
+	}
+	if rec := vaDo(t, f.srv, http.MethodPut, path, vaSystemSecret, `{"enabled":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("reset PUT = %d", rec.Code)
+	}
+
 	// The owner turns it on: 200 with the management DTO, and the store agrees.
 	rec := vaDo(t, f.srv, http.MethodPut, path, vaSystemSecret, `{"enabled":true}`)
 	if rec.Code != http.StatusOK {

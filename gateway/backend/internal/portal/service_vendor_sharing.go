@@ -51,8 +51,11 @@ type SetVendorAccountShareLevelRequest struct {
 // /api/portal/vendor-accounts/{id}/share-usage: the owner's opt-in to show the
 // account's usage figures (the plan windows and spend, #407) to everyone allowed to
 // use it.
+//
+// Enabled is a pointer so a body without it is told apart from an explicit false:
+// the handler rejects a missing value instead of silently switching the opt-in off.
 type SetVendorAccountShareUsageRequest struct {
-	Enabled bool `json:"enabled"`
+	Enabled *bool `json:"enabled"`
 }
 
 // vendorShareLevelRank orders the share levels: none < shared < full. A level the
@@ -130,10 +133,13 @@ func (s *Service) SetVendorAccountShareUsage(ctx context.Context, principal auth
 		}
 		return VendorAccountDTO{}, ErrVendorAccountForbidden
 	}
-	if err := s.routes.UpdateVendorAccountShareUsage(ctx, acc.ID, req.Enabled); err != nil {
+	if req.Enabled == nil {
+		return VendorAccountDTO{}, ErrVendorAccountShareUsageEnabledRequired
+	}
+	if err := s.routes.UpdateVendorAccountShareUsage(ctx, acc.ID, *req.Enabled); err != nil {
 		return VendorAccountDTO{}, err
 	}
-	acc.ShareUsageWithMembers = req.Enabled
+	acc.ShareUsageWithMembers = *req.Enabled
 	return s.vendorAccountDTO(ctx, principal, acc)
 }
 

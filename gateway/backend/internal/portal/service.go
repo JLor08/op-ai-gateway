@@ -205,16 +205,19 @@ var (
 	// ErrVendorAccountNotShared: the request needs a shared account (management groups
 	// can only be assigned to one that is `shared` or `full`) and the account is not
 	// one. Asked of the owner only, after the 404/403 gate. A 400.
-	ErrVendorAccountSharingDisabled          = errors.New("vendor_accounts.sharing_disabled")
-	ErrVendorSubscriptionSharingDisabled     = errors.New("vendor_accounts.subscription_sharing_disabled")
-	ErrVendorAccountSubscriptionShareCapped  = errors.New("vendor_account.subscription_share_capped")
-	ErrVendorAccountShareLevelInvalid        = errors.New("vendor_account.share_level_invalid")
-	ErrVendorAccountShareLevelUnchanged      = errors.New("vendor_account.share_level_unchanged")
-	ErrVendorAccountAdminGroupRequired       = errors.New("vendor_account.admin_group_required")
-	ErrVendorAccountAdminGroupInvalid        = errors.New("vendor_account.admin_group_invalid")
-	ErrVendorAccountAdminGroupParentMismatch = errors.New("vendor_account.admin_group_parent_mismatch")
-	ErrVendorAccountRootMismatch             = errors.New("vendor_account.root_mismatch")
-	ErrVendorAccountNotShared                = errors.New("vendor_account.not_shared")
+	ErrVendorAccountSharingDisabled         = errors.New("vendor_accounts.sharing_disabled")
+	ErrVendorSubscriptionSharingDisabled    = errors.New("vendor_accounts.subscription_sharing_disabled")
+	ErrVendorAccountSubscriptionShareCapped = errors.New("vendor_account.subscription_share_capped")
+	ErrVendorAccountShareLevelInvalid       = errors.New("vendor_account.share_level_invalid")
+	ErrVendorAccountShareLevelUnchanged     = errors.New("vendor_account.share_level_unchanged")
+	// ErrVendorAccountShareUsageEnabledRequired: a PUT .../share-usage body without
+	// `enabled` (a 400, answered after the 404/403 gate; nothing is written).
+	ErrVendorAccountShareUsageEnabledRequired = errors.New("vendor_account.share_usage_enabled_required")
+	ErrVendorAccountAdminGroupRequired        = errors.New("vendor_account.admin_group_required")
+	ErrVendorAccountAdminGroupInvalid         = errors.New("vendor_account.admin_group_invalid")
+	ErrVendorAccountAdminGroupParentMismatch  = errors.New("vendor_account.admin_group_parent_mismatch")
+	ErrVendorAccountRootMismatch              = errors.New("vendor_account.root_mismatch")
+	ErrVendorAccountNotShared                 = errors.New("vendor_account.not_shared")
 
 	// Subscription connect (the OAuth code-paste flow and the token import).
 	// ErrVendorAccountNotSubscription: connect operates on an auth_type

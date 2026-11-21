@@ -348,8 +348,9 @@ type VendorAccount struct {
 	// ClearVendorAccountSharing only.
 	SystemGroupID string
 	// ShareUsageWithMembers is the owner's opt-in (migration 110) to let members who
-	// reach this account through sharing also see its subscription usage limits in
-	// Claude Code; the owner always sees them. Written only by
+	// reach this account through sharing also see its usage figures: the rate-limit
+	// windows and spend in the portal (account page, member view and dashboard) and the
+	// subscription's usage limits in Claude Code; the owner always sees them. Written only by
 	// UpdateVendorAccountShareUsage (default false); CreateVendorAccount and
 	// UpdateVendorAccount never write it.
 	ShareUsageWithMembers bool
