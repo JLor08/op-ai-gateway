@@ -109,7 +109,8 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	} else {
 		slog.Debug("inference ok", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "server", s.serverName(target.ServerID), "output_tokens", resp.Usage.OutputTokens, "duration_ms", time.Since(start).Milliseconds())
 		if req.APIFlavor == inference.APIFlavorAnthropicMessages {
-			s.attachRateLimitWindows(token, w.Header())
+			// #407's cached subscription windows, then the principal's own limit standing.
+			s.attachTranslatedUsageLimits(r, token, w.Header())
 		}
 		body = writeJSONCaptured(w, http.StatusOK, render(resp))
 	}

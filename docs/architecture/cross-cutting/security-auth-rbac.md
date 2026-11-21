@@ -1044,7 +1044,8 @@ enforces nothing".**
   narrows a non-`system` caller to its `ManageableUserIDs` set — checked once,
   before the method switch, so GET and PUT 404 identically on a target outside
   it. There is deliberately no self-service path, not even for one's own
-  limits. Behind that gate the two service methods differ: the **read**,
+  limits. The limit configuration stays admin-only; a principal's own standing (utilization and reset of its fullest
+  quota or budget) is reported on its own `/v1/messages` responses, see [Compatibility & Inference §9.4](compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits). Behind that gate the two service methods differ: the **read**,
   `UserLimits(ctx, userID)`, takes no `auth.Token` and checks nothing, so its
   route's gate really is its only gate; the **write**,
   `SetUserLimits(ctx, principal, …)`, opens with `isAdmin(principal)` and

@@ -1153,6 +1153,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get(unifiedRateLimitPrefix+"status") == "" {
 			s.attachRateLimitWindows(rel.token, w.Header())
 		}
+		// A principal with quotas or budgets then has its own fullest limit laid over
+		// the top-level fields, on any 2xx whatever the upstream sent. It writes the
+		// client header set only: resp.Header stays what recordUsage and the window
+		// cache observe.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			attachPrincipalLimitStanding(r.Context(), w.Header())
+		}
 	}
 	w.WriteHeader(resp.StatusCode)
 
