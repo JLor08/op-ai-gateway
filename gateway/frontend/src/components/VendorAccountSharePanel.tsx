@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useState, type ReactNode } from 'react';
-import { Alert, Box, Button, Typography } from '@mui/material';
+import { Alert, Box, Button, Checkbox, FormControlLabel, Typography } from '@mui/material';
 import type { AdminGroupCandidate, VendorAccount, VendorAccountShareLevel } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
@@ -84,6 +84,7 @@ export function VendorAccountSharePanel({
   api: Pick<
     PortalApi,
     | 'setVendorAccountShareLevel'
+    | 'setVendorAccountShareUsage'
     | 'setVendorAccountAdminGroups'
     | 'vendorAccountAdminGroupCandidates'
   >;
@@ -178,6 +179,15 @@ export function VendorAccountSharePanel({
     void run(() => api.setVendorAccountShareLevel(account.id, next), t.vendorAccountShareSaved);
   }
 
+  // The owner's opt-in to share the rate-limit figures (#407): a write of its own,
+  // answered with the account as it now reads, like a share-level change.
+  function setShareUsage(enabled: boolean) {
+    void run(
+      () => api.setVendorAccountShareUsage(account.id, enabled),
+      t.vendorAccountShareUsageSaved,
+    );
+  }
+
   function saveAdminGroups(ids: string[]) {
     void run(
       () => api.setVendorAccountAdminGroups(account.id, ids),
@@ -235,6 +245,23 @@ export function VendorAccountSharePanel({
             <Typography variant="body2" color="text.secondary">
               {t.vendorAccountShareSubscriptionNote}
             </Typography>
+          )}
+          {account.is_owner && (
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={account.share_usage_with_members}
+                    disabled={disabled}
+                    onChange={(e) => setShareUsage(e.target.checked)}
+                  />
+                }
+                label={t.vendorAccountShareUsageLabel}
+              />
+              <Typography variant="body2" color="text.secondary">
+                {t.vendorAccountShareUsageHelp}
+              </Typography>
+            </Box>
           )}
           {raising && (
             <>

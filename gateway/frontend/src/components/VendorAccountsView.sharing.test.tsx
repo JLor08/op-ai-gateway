@@ -45,6 +45,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     system_group_name: '',
     is_owner: true,
     shared_by: '',
+    share_usage_with_members: false,
     ...overrides,
   };
 }
@@ -169,6 +170,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       resourceGroups?: VendorAccountResourceGroup[];
       setVendorAccountShareLevel?: PortalApi['setVendorAccountShareLevel'];
       setVendorAccountAdminGroups?: PortalApi['setVendorAccountAdminGroups'];
+      setVendorAccountShareUsage?: PortalApi['setVendorAccountShareUsage'];
       updateVendorAccount?: PortalApi['updateVendorAccount'];
     } = {},
   ) {
@@ -241,6 +243,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             };
           }),
       ),
+      // The owner's usage opt-in: the fake applies the flag the call carries.
+      setVendorAccountShareUsage: vi.fn<PortalApi['setVendorAccountShareUsage']>(
+        opts.setVendorAccountShareUsage ??
+          (async (id, enabled) => ({ ...byId(id), share_usage_with_members: enabled })),
+      ),
       setVendorAccountAdminGroups: vi.fn<PortalApi['setVendorAccountAdminGroups']>(
         opts.setVendorAccountAdminGroups ??
           (async (id, groupIds) => ({
@@ -287,6 +294,54 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   const shareRegion = () => screen.queryByRole('region', { name: t.vendorAccountShareTitle });
   const groupsRegion = () =>
     screen.queryByRole('region', { name: t.vendorAccountAdminGroupsSectionTitle });
+
+  describe(`VendorAccountsView share-usage opt-in [${locale}]`, () => {
+    it('lets the owner of a shared account turn the opt-in on and shows the new state', async () => {
+      const { fakeApi } = renderView({ accounts: [shared()] });
+      await openDetail();
+
+      const panel = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      const box = panel.getByRole('checkbox', { name: t.vendorAccountShareUsageLabel });
+      expect(box).not.toBeChecked();
+      // The help text names both effects: Claude Code, and the account page and
+      // dashboard.
+      expect(panel.getByText(t.vendorAccountShareUsageHelp)).toBeInTheDocument();
+
+      fireEvent.click(box);
+
+      await waitFor(() =>
+        expect(fakeApi.setVendorAccountShareUsage).toHaveBeenCalledWith('va_1', true),
+      );
+      expect(await screen.findByText(t.vendorAccountShareUsageSaved)).toBeInTheDocument();
+      await waitFor(() =>
+        expect(
+          within(shareRegion()!).getByRole('checkbox', { name: t.vendorAccountShareUsageLabel }),
+        ).toBeChecked(),
+      );
+    });
+
+    it('reflects an opt-in that is already on and turns it off', async () => {
+      const { fakeApi } = renderView({ accounts: [shared({ share_usage_with_members: true })] });
+      await openDetail();
+
+      const panel = within(await screen.findByRole('region', { name: t.vendorAccountShareTitle }));
+      const box = panel.getByRole('checkbox', { name: t.vendorAccountShareUsageLabel });
+      expect(box).toBeChecked();
+      fireEvent.click(box);
+
+      await waitFor(() =>
+        expect(fakeApi.setVendorAccountShareUsage).toHaveBeenCalledWith('va_1', false),
+      );
+    });
+
+    it('does not offer the opt-in to a co-manager', async () => {
+      renderView({ accounts: [managed()] });
+      await openDetail();
+
+      await screen.findByRole('region', { name: t.vendorAccountShareTitle });
+      expect(screen.queryByRole('checkbox', { name: t.vendorAccountShareUsageLabel })).toBeNull();
+    });
+  });
 
   describe(`VendorAccountsView share-level control [${locale}]`, () => {
     it('lets an admin owner raise a personal account to Shared, naming its management group', async () => {

@@ -162,6 +162,7 @@ export function VendorAccountsView({
     | 'refreshModels'
     | 'refreshUsage'
     | 'setVendorAccountShareLevel'
+    | 'setVendorAccountShareUsage'
     | 'setVendorAccountAdminGroups'
     | 'vendorAccountAdminGroupCandidates'
     | 'vendorAccountResourceGroups'

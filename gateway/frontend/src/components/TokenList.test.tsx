@@ -86,6 +86,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     system_group_name: '',
     is_owner: true,
     shared_by: '',
+    share_usage_with_members: false,
     ...overrides,
   };
 }
