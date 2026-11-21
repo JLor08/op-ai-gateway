@@ -24,8 +24,8 @@ const vendorAccountInsertColumns = `id, owner_user_id, vendor, auth_type, name, 
 
 // vendorAccountColumns is the single column list every vendor_accounts reader
 // selects, in the order scanVendorAccount scans them: the insert columns, then
-// the two sharing columns the narrow writers own.
-const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id`
+// the three sharing columns the narrow writers own.
+const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id, share_usage_with_members`
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
 // exactly as given -- the caller seals them first. ShareLevel and SystemGroupID
@@ -168,6 +168,17 @@ func (s *SQLiteStore) UpdateVendorAccountShareLevel(ctx context.Context, id, lev
 	result, err := s.exec(ctx, `update vendor_accounts set share_level = ? where id = ?`, level, id)
 	if err != nil {
 		return fmt.Errorf("update vendor account share level: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateVendorAccountShareUsage writes only share_usage_with_members (migration
+// 110) with a targeted UPDATE of that one column, like UpdateVendorAccountShareLevel
+// (updated_at is left alone). An unknown id is ErrNotFound.
+func (s *SQLiteStore) UpdateVendorAccountShareUsage(ctx context.Context, id string, enabled bool) error {
+	result, err := s.exec(ctx, `update vendor_accounts set share_usage_with_members = ? where id = ?`, enabled, id)
+	if err != nil {
+		return fmt.Errorf("update vendor account share usage: %w", err)
 	}
 	return requireAffected(result)
 }
@@ -451,7 +462,7 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
-	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID)
+	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID, &a.ShareUsageWithMembers)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccount{}, ErrNotFound
 	}

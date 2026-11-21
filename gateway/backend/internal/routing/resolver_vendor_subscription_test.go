@@ -341,6 +341,7 @@ func TestVendorSubscriptionUnknownVendorDoesNotMatch(t *testing.T) {
 var vendorSubscriptionTargetMayBeZero = map[string]bool{
 	"DecisionsMode":               true, // a subscription target never serves the decision endpoints
 	"VendorDecisionModel":         true, // a subscription account serves no decision model (IsVendorDecisionModel)
+	"VendorShareUsageWithMembers": true, // the owner opt-in; this fixture leaves it off
 	"SystemOneMode":               true, // a subscription target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server
 	"APIToken":                    true, // bearer resolved at dispatch, not carried here
@@ -364,6 +365,7 @@ var vendorSubscriptionTargetMayBeZero = map[string]bool{
 var vendorSubscriptionOpenAITargetMayBeZero = map[string]bool{
 	"DecisionsMode":               true, // a subscription target never serves the decision endpoints
 	"VendorDecisionModel":         true, // a subscription account serves no decision model (IsVendorDecisionModel)
+	"VendorShareUsageWithMembers": true, // the owner opt-in; this fixture leaves it off
 	"SystemOneMode":               true, // a subscription target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server
 	"APIToken":                    true, // bearer resolved at dispatch, not carried here

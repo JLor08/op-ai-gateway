@@ -3491,6 +3491,20 @@ func (m *MemoryStore) UpdateVendorAccountShareLevel(_ context.Context, id, level
 	return nil
 }
 
+// UpdateVendorAccountShareUsage writes ONLY the share-usage opt-in of an existing
+// account. An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateVendorAccountShareUsage(_ context.Context, id string, enabled bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.vendorAccounts[id]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	cur.ShareUsageWithMembers = enabled
+	m.vendorAccounts[id] = copyVendorAccount(cur)
+	return nil
+}
+
 // UpdateVendorAccountSystemGroup writes ONLY the containment root of an
 // existing account. An unknown id is ErrNotFound.
 func (m *MemoryStore) UpdateVendorAccountSystemGroup(_ context.Context, id, systemGroupID string) error {

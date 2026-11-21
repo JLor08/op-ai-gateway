@@ -142,6 +142,7 @@ var migrations = []migration{
 	{version: 107, name: "application_decision_modes", up: migration107Up},
 	{version: 108, name: "token_decisions_confidence_normalize", up: migration108Up},
 	{version: 109, name: "runtime_spec_execution_mode", up: migration109Up},
+	{version: 110, name: "vendor_account_share_usage", up: migration110Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4812,4 +4813,14 @@ func migration109Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration110Up adds the owner's opt-in vendor_accounts.share_usage_with_members
+// flag (#407): when set, a member who reaches the account through sharing also
+// receives its subscription's usage-limit headers in Claude Code; the owner always
+// does. A boolean is `integer not null default 0` on both dialects, and existing
+// accounts land on 0 = off, so the upgrade exposes no usage data to anyone new.
+// addColumnIfMissing keeps it re-runnable.
+func migration110Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "vendor_accounts", "share_usage_with_members integer not null default 0")
 }
