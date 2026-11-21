@@ -89,11 +89,29 @@ paths:
         Bearer-only, scope `gateway:use` or `llm:invoke`. Attempts native
         passthrough to an upstream that speaks the Responses API before
         falling back to translation. Alias: /openai/v1/responses.
+        A principal with a quota or budget gets its fullest limit in the
+        default `x-codex-*` headers of a success that carries no
+        subscription figures.
       security: [{ bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: >
+            The rate limit: the Error envelope with code `limit.rate_limited`
+            and a Retry-After header. A request quota, token quota or cost
+            budget block (the cost budget too, not a 402): the Codex body
+            `{"error":{"type":"usage_limit_reached","code","message","resets_at"}}`
+            with `code` `limit.request_quota_exceeded`,
+            `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, the
+            limit's sentence as `message` and its reset as `resets_at` (unix
+            seconds), plus Retry-After, `X-Should-Retry: false`,
+            `x-codex-promo-message` and the default `x-codex` primary window
+            at 100 %. See compatibility-and-inference.md section 9.6.
+          content:
+            application/json:
+              schema: { type: object }
   /openai/v1/responses:
     post:
       tags: [inference]
@@ -103,6 +121,21 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: >
+            The rate limit: the Error envelope with code `limit.rate_limited`
+            and a Retry-After header. A request quota, token quota or cost
+            budget block (the cost budget too, not a 402): the Codex body
+            `{"error":{"type":"usage_limit_reached","code","message","resets_at"}}`
+            with `code` `limit.request_quota_exceeded`,
+            `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, the
+            limit's sentence as `message` and its reset as `resets_at` (unix
+            seconds), plus Retry-After, `X-Should-Retry: false`,
+            `x-codex-promo-message` and the default `x-codex` primary window
+            at 100 %. See compatibility-and-inference.md section 9.6.
+          content:
+            application/json:
+              schema: { type: object }
   /v1/messages:
     post:
       tags: [inference]

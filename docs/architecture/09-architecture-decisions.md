@@ -13047,7 +13047,8 @@ line's spend-limit field and the `/usage` bar exist only in a gateway sign-in se
   last, one fixed sentence (which limit, reset in UTC, whom to ask), `Retry-After`, `X-Should-Retry: false` and the `rejected` headers. The
   cost budget becomes a 429 on this endpoint only.
 - **Every other endpoint keeps its status and body** and gains `X-Should-Retry: false` on a quota or budget denial; the rate limit is
-  unchanged everywhere.
+  unchanged everywhere. `/v1/responses` later became the second exception, see
+  [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
 - **The gateway's cap owns the top-level fields** and #407's subscription windows (`5h`, `7d`, `7d_oi`) stay beside it; the subscription's
   own top-level and overage fields are removed on such a response. A principal without limits keeps ADR-106's behavior byte for byte.
 
@@ -13108,7 +13109,8 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
 - **A token opt-in.** Codex needs no token shape (ADR-106's JWT gate does not exist here), so an opt-in would only hide a working
   feature. Entitlement is the only gate.
 - **Relaying `x-codex-turn-state`.** It is not a limit figure, and no effect of dropping it was observed.
-- **Showing the gateway's own principal limits in Codex in the same change.** Possible later as an extra limit family; not part of #416.
+- **Showing the gateway's own principal limits in Codex in the same change.** Done separately, in the default family rather than as an extra
+  family, see [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
 
 **Consequences and limits.**
 
@@ -13122,3 +13124,73 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
 - The display rests on undocumented client behavior (the header names and the clear-on-missing rule); see the risk entry in
   [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
 - → [Codex usage-limit display](cross-cutting/compatibility-and-inference.md#95-codex-usage-limit-display).
+
+## ADR-109 — The gateway's own principal limits reach Codex in the default x-codex family and as a 429 usage_limit_reached, and a subscription's figures win
+
+**Context.** ADR-107 made a principal's own request quota, token quota and cost budget visible in Claude Code, and ADR-108 relays an
+OpenAI subscription's `x-codex-*` windows to Codex on `/v1/responses`. Codex users still saw no gateway limit, and a block hurt: a quota
+429 printed `exceeded retry limit, last status: 429 Too Many Requests`, with no limit and no reset time, and the cost-budget 402 was
+retried five times in about 7 s and then printed `unexpected status 402 Payment Required: cost budget exceeded, url: …`
+([issue #418](https://github.com/JLor08/op-ai-gateway/issues/418)). Verified in Codex CLI 0.137.0 (stub runs and a code read, issue #418):
+Codex keeps one rate-limit snapshot per response, so only the response's last header family reaches the display, and an extra family
+beside the subscription's `x-codex-*` windows hides them; only the default family `x-codex` drives the status line and the warnings at 75,
+90 and 95 %, while an extra family is a `/status` row only; at 90 % of the default family Codex opens a `gpt-5.4-mini` model-switch popup
+with the switch preselected, which `x-codex-credits-has-credits: true` with `x-codex-credits-unlimited: false` and no balance suppresses;
+a 429 whose `error.type` is `usage_limit_reached` is never retried and prints the `x-codex-promo-message` sentence with the reset taken
+from `error.resets_at`, unless the active family carries a `limit-name` header, which wins and tells the user to switch models. Codex reads
+neither `retry-after` nor `x-should-retry`.
+
+**Decision.** ADR-107's data source, in Codex's shapes, on `/v1/responses`:
+
+- **The fullest limit in the default family.** On a `/v1/responses` 2xx, for a principal with a describable standing, write the limit
+  ADR-107 picks (highest utilization) as the primary window of the default `x-codex` family: an integer percent, floored and at most 99;
+  the nominal period length in minutes (60, 1440, 10080, 43200), which Codex labels `daily`, `weekly` or `monthly` (an hourly limit takes
+  its fallback label `usage`); the reset; and `x-codex-limit-name` `OP AI Gateway <request quota|token quota|cost budget>`, because one
+  window cannot say which limit it is. One window, no extra family.
+- **Suppress the model-switch popup.** Every response that carries the gateway's window also carries `x-codex-credits-has-credits: true`
+  and `x-codex-credits-unlimited: false`, without a balance, so Codex does not lead the user into a model switch that cannot help with a
+  gateway limit.
+- **The subscription wins, whole.** The gateway writes nothing when, after ADR-108's relay and cache, the client header set already
+  carries any Codex rate-limit header (`isCodexRateLimitHeader`). It also writes nothing when the standing is empty or a reading failed,
+  or when the reading's reset is not after the moment of writing.
+- **Readings from admission, as in ADR-107.** `handleOpenAIResponses` puts the admission standing on the request context, and ADR-108's
+  three attach points (native passthrough, translate JSON, translate SSE header block) read it. The response path does no store I/O and
+  changes only the client header set.
+- **Answer a `/v1/responses` quota or budget denial with Codex's 429.** Body
+  `{"error":{"type":"usage_limit_reached","code":"<limit code>","message":"<ADR-107's sentence>","resets_at":<unix seconds>}}`,
+  `Retry-After`, `X-Should-Retry: false`, the promo message
+  `OP AI Gateway <limit> reached; ask your gateway administrator to raise it`, the primary window at 100 % with its length and reset,
+  and the credits flags; no `x-codex-limit-name`. Codex prints its usage-limit line with that sentence and the reset in local time, after
+  one request. The cost budget becomes a 429 on this endpoint too.
+- **Everything else stays.** Every other flavor (`/v1/messages` as ADR-107 describes it), the rate denial everywhere, ADR-108's relay,
+  cache, entitlement and capture redaction, and a principal without a quota or budget are unchanged byte for byte.
+
+**Rejected:**
+
+- **An extra limit family** (`x-codex-<id>-*` or `x-opaigw-*`). Codex shows only a response's last family: beside the subscription's
+  windows it would hide them on every response that carries both, and on its own it is a `/status` row without status line or warnings.
+- **Documenting the popup only** (Codex's `notices.hide_rate_limit_model_nudge`). Every user would first meet a preselected switch to a
+  model the gateway may not route; the credits flag removes the popup at the source, for the gateway's window.
+- **A block with `x-codex-limit-name`.** Codex then prints `You've hit your usage limit for <name>. Switch to another model now, …`,
+  wrong advice for a gateway quota, and drops the gateway's sentence.
+- **Keeping `writeLimitDenied` on this endpoint.** Codex names no limit and no reset for its quota 429, retries its budget 402, and reads
+  no `X-Should-Retry` that could stop that.
+
+**Consequences and limits.**
+
+- A principal who also uses an OpenAI subscription sees the gateway's limit only on responses that carry no subscription figure, relayed
+  or cached. While cached windows are still in the future (a weekly window up to 7 days), local-model replies show the subscription and
+  Codex gives no gateway warning; a block still names the gateway's limit.
+- Codex carries credits over between responses: once a gateway response has set `x-codex-credits-has-credits: true`, a later local-model
+  reply that carries only cached subscription windows also suppresses the subscription's popup, until the next vendor response sends its
+  own credits headers.
+- During a block the 100 % window replaces the display; `/status` labels the row `Daily limit` without the `OP AI Gateway` prefix (a block
+  carries no limit name), and a subscription user sees the gateway's 0 % until a later success carries the subscription's figures again.
+- The figures are those of admission. A response that outlives its period's boundary carries no gateway header (ADR-107 writes the stale
+  reset there), and the next response corrects it.
+- The memory driver has no `usage_events`, so a configured principal reads 0 % there.
+- The display and the block sentence rest on undocumented client behavior (the last family wins, the credits flag's effect on the popup,
+  the promo message's precedence below a `limit-name` header, the window-minute labels). See the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
+  [the limiter](cross-cutting/telemetry-usage-observability.md).
