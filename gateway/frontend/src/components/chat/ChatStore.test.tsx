@@ -2528,6 +2528,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         model_override_map: { 'model-b': { to: 'model-a', offer: false, hide_target: false } }, // requesting model-b -> model-a
         log_communication: false,
         secret: false,
+        claude_code_usage_display: false,
         is_chat_session: false,
         deletable: true,
       };
@@ -2567,6 +2568,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         model_override: 'gpt-oss-20b', // catch-all, no map
         log_communication: false,
         secret: false,
+        claude_code_usage_display: false,
         is_chat_session: false,
         deletable: true,
       };
@@ -2601,6 +2603,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         model_override: 'unavailable-override',
         log_communication: false,
         secret: false,
+        claude_code_usage_display: false,
         is_chat_session: false,
         deletable: true,
       };

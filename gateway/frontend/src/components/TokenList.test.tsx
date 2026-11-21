@@ -114,6 +114,7 @@ function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
     model_override: '',
     log_communication: false,
     secret: false,
+    claude_code_usage_display: false,
     is_chat_session: false,
     deletable: true,
     ...overrides,
@@ -151,6 +152,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // OWN account list api.vendorAccounts() resolves with.
     vendorAccountsEnabled?: boolean;
     vendorAccounts?: VendorAccount[];
+    createdSecret?: string;
   }) {
     const created = opts.created ?? [];
     const tokens = opts.tokens ?? [];
@@ -165,8 +167,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           scopes: body.scopes,
           model_override: body.model_override ?? '',
           log_communication: body.log_communication ?? false,
+          claude_code_usage_display: body.claude_code_usage_display ?? false,
         });
-        return { token, secret: 'opaigw_created_secret' };
+        return { token, secret: opts.createdSecret ?? 'opaigw_created_secret' };
       }),
       updateToken: vi.fn(async (id: string, body: Record<string, unknown>) =>
         makeToken({ id, name: (body.name as string) ?? '', ...body }),
@@ -683,6 +686,59 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const dialog = await screen.findByRole('dialog');
       expect(dialog).toHaveClass('MuiDialog-paperWidthMd');
       expect(within(dialog).getByText('opaigw_created_secret')).toBeInTheDocument();
+    });
+  });
+
+  describe(`TokenList Claude Code usage display option (#407) [${locale}]`, () => {
+    const box = () => screen.getByRole('checkbox', { name: t.tokenClaudeCodeUsageDisplay });
+
+    it('defaults to off, shows the hint and sends false on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      expect(box()).not.toBeChecked();
+      expect(screen.getByText(t.tokenClaudeCodeUsageDisplayHint)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ claude_code_usage_display: false });
+    });
+
+    it('sends true on create when checked and shows the long secret unchanged', async () => {
+      const longSecret = `eyJhbGciOi.${'a'.repeat(130)}.signature`;
+      const { fakeApi, created } = renderTokenList({ createdSecret: longSecret });
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'cc' } });
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ claude_code_usage_display: true });
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByText(longSecret)).toBeInTheDocument();
+    });
+
+    it('resets to off when the create form is opened again', async () => {
+      const { fakeApi } = renderTokenList({});
+      openCreate();
+      fireEvent.click(box());
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'cc' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      fireEvent.click(await screen.findByRole('button', { name: t.captureClose }));
+      fireEvent.click(await screen.findByRole('button', { name: t.tokenCreate }));
+      expect(box()).not.toBeChecked();
+    });
+
+    it('shows a Claude Code chip only on tokens with the flag', () => {
+      renderTokenList({
+        tokens: [
+          makeToken({ id: 'tok_a', name: 'With Flag', claude_code_usage_display: true }),
+          makeToken({ id: 'tok_b', name: 'Without Flag' }),
+        ],
+      });
+      const withRow = screen.getByText('With Flag').closest('tr') as HTMLElement;
+      const withoutRow = screen.getByText('Without Flag').closest('tr') as HTMLElement;
+      expect(within(withRow).getByText(t.tokenClaudeCodeBadge)).toBeInTheDocument();
+      expect(within(withoutRow).queryByText(t.tokenClaudeCodeBadge)).not.toBeInTheDocument();
     });
   });
 

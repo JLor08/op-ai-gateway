@@ -25,6 +25,7 @@ import {
   Box,
   Button,
   Checkbox,
+  Chip,
   Dialog,
   DialogActions,
   DialogContent,
@@ -173,6 +174,7 @@ export function TokenList({
   // Opt-in decision-confidence normalization (#373): /v1/decisions and
   // /v1/systemone report a 0..1 confidence whatever the model's own scale is.
   const [decisionsNormalize, setDecisionsNormalize] = useState(false);
+  const [claudeCodeUsage, setClaudeCodeUsage] = useState(false);
   const [logCommunication, setLogCommunication] = useState(false);
   const [secret, setSecret] = useState(false);
   // Project attribution (spec: 2026-08-08-projects-design.md §6): "" = no project.
@@ -298,6 +300,7 @@ export function TokenList({
     setClaudeAliases(false);
     setClaudeEffort(false);
     setDecisionsNormalize(false);
+    setClaudeCodeUsage(false);
     setLogCommunication(false);
     setSecret(false);
     setProjectId('');
@@ -386,6 +389,7 @@ export function TokenList({
         claude_model_aliases: claudeAliases,
         claude_effort_compatibility: claudeEffort,
         decisions_confidence_normalize: decisionsNormalize,
+        claude_code_usage_display: claudeCodeUsage,
         log_communication: logCommunication,
         secret,
         project_id: projectId,
@@ -484,7 +488,21 @@ export function TokenList({
   }
 
   const columns: ListColumn<PortalToken>[] = [
-    { id: 'name', label: t.tableName, value: (r) => r.name, filter: 'text' },
+    {
+      id: 'name',
+      label: t.tableName,
+      value: (r) => r.name,
+      filter: 'text',
+      render: (r) =>
+        r.claude_code_usage_display ? (
+          <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
+            {r.name}
+            <Chip size="small" variant="outlined" label={t.tokenClaudeCodeBadge} />
+          </Box>
+        ) : (
+          r.name
+        ),
+    },
     {
       id: 'scope',
       label: t.tableScope,
@@ -792,6 +810,25 @@ export function TokenList({
                 {t.tokenDecisionsConfidenceNormalizeHint}
               </Typography>
             </Box>
+            {/* The option fixes the secret's shape, so it is only offered at
+                creation; showing and rotating it on an existing token is a
+                separate flow. */}
+            {mode === 'create' && (
+              <Box sx={{ display: 'grid', gap: 1 }}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={claudeCodeUsage}
+                      onChange={(e) => setClaudeCodeUsage(e.target.checked)}
+                    />
+                  }
+                  label={t.tokenClaudeCodeUsageDisplay}
+                />
+                <Typography variant="caption" color="text.secondary">
+                  {t.tokenClaudeCodeUsageDisplayHint}
+                </Typography>
+              </Box>
+            )}
             {/* The vendor-access section is hidden entirely while the vendor-accounts
                 master flag is off. Account names are vendor/owner-supplied text:
                 rendered as text only. */}

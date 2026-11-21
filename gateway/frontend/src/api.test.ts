@@ -541,6 +541,43 @@ describe('portal api', () => {
     expect(token.status).toBe('disabled');
   });
 
+  it('creates a token with the Claude Code usage-display opt-in and returns the full secret', async () => {
+    const longSecret = `eyJhbGciOi.${'x'.repeat(130)}.sig`;
+    const fetcher = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          token: {
+            id: 'tok_cc',
+            name: 'cc',
+            secret_prefix: 'eyJhbGci',
+            status: 'active',
+            scopes: ['gateway:use'],
+            expires_at: null,
+            last_used_at: null,
+            created_at: '2026-07-11T00:00:00Z',
+            claude_code_usage_display: true,
+          },
+          secret: longSecret,
+        }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const api = createPortalApi(fetcher);
+
+    const res = await api.createToken({
+      name: 'cc',
+      scopes: ['gateway:use'],
+      claude_code_usage_display: true,
+    });
+
+    const [path, init] = fetcher.mock.calls[0];
+    expect(path).toBe('/api/portal/tokens');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toMatchObject({ claude_code_usage_display: true });
+    expect(res.token.claude_code_usage_display).toBe(true);
+    expect(res.secret).toBe(longSecret);
+  });
+
   it('deletes a token via DELETE', async () => {
     const fetcher = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true }), {
