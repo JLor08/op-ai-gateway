@@ -300,7 +300,6 @@ an opted-in token (a translated `/v1/decisions` answer is buffered for every tok
 onto the run (`AuthorizeRunAsToken` copies the field); the portal session principal itself
 never has it.
 
-
 #### Claude Code token secret shape
 
 A user token can opt into `claude_code_usage_display` (default off). Claude Code shows an
@@ -318,6 +317,7 @@ the requested shape and retires the old one; a PATCH cannot change it
 keep the plain `opaigw_` secret. The shape only makes Claude Code look at the rate-limit
 headers; what the gateway sends is described in [Claude Code usage-limit
 display](compatibility-and-inference.md#93-claude-code-usage-limit-display).
+
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 
 Portal chat runs as the logged-in **session** principal, but the operator may
@@ -1263,7 +1263,11 @@ canonicalizes header casing:
 Each matched header's value is replaced with the literal marker
 `[redacted]`; the header *name* is kept so the capture viewer can still show
 that the header was present. Response headers are stored verbatim (a
-response never carries an inbound credential). On the **translate** path —
+response never carries an inbound credential), with one exception: on the translate path a
+vendor account's `anthropic-ratelimit-unified-*` headers and `anthropic-organization-id` are
+dropped from the captured upstream response headers unless the principal is entitled to that
+account's figures ([Claude Code usage-limit
+display](compatibility-and-inference.md#93-claude-code-usage-limit-display)). On the **translate** path —
 where the gateway rewrites a client request into a different upstream
 protocol (e.g. Anthropic-shaped in, Chat-Completions-shaped out) — the
 translated *upstream* request headers are redacted with the exact same list,

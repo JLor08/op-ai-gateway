@@ -190,7 +190,7 @@ piece, and routing eligibility does **not** (§4.6):
   a member is `403`, a stranger, an unknown id and system scope `404`); behind the
   `vendor_accounts_enabled` flag but **not** gated on the sharing flags and allowed at
   any level (it grants nothing while the account is private). It unlocks the figures in
-  the member view (§8.2) and Claude Code's rate-limit response headers (§6.5).
+  the member view (§8.2) and Claude Code's rate-limit response headers (§4.1, *Anthropic subscription Messages passthrough*).
 - **Memory-store cascades.** Deleting an account drops its management-group links by a
   single-key delete and its resource-group links by a **reverse-direction loop over
   every group** (the map is keyed group to account, like `resource_group_servers`); a
@@ -2487,7 +2487,7 @@ provisioned into the account's group reads the management view):
   the opt-in flag `share_usage_with_members` (the account's actual value, so a member
   who sees usage never reads a false flag) and, **only when it is on**, `usage` (the
   owner's rate-limit and spend figures; see the usage opt-in in §1.3, which also
-  unlocks Claude Code's figures, §6.5). **Withheld**: `share_level`, `admin_groups`,
+  unlocks Claude Code's figures, §4.1 *Anthropic subscription Messages passthrough*). **Withheld**: `share_level`, `admin_groups`,
   `system_group_id` and `system_group_name` (who manages the account and where it is
   rooted), `base_url` (where the owner's key is sent), `usage` without that opt-in,
   each model's `upstream_model` and the timestamps. One builder renders it for both the single read

@@ -4113,7 +4113,9 @@ paths:
         Body {enabled}. The owner only: 403 vendor_account.forbidden for a CM or
         a member (who can see the account), 404 vendor_account.not_found for a
         stranger, an unknown id and system scope. 400 request.invalid_json for a
-        malformed body; 409 while the vendor-accounts module flag is off. Not
+        malformed body or a body without enabled (nothing is written); 409 while
+        the vendor-accounts module flag is off; 500 vendor_account.share_usage_failed
+        on a store failure. Not
         gated on the sharing switches and allowed at any share level. With the
         opt-in on, a member's read of the account carries usage, and Claude
         Code's responses carry the plan's rate-limit headers.

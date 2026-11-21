@@ -3955,11 +3955,25 @@ remembers the caller's last subscription windows (`rateLimitWindowCache`,
   After a restart or on another replica the display simply stays blank until the next
   subscription response.
 
-**Known limitation.** Entitlement is checked when a window is observed, not when it is
-attached. A principal whose entitlement is revoked later (for example the owner turns off
-`share_usage_with_members`) keeps receiving its last stored figures, frozen, on local-model
-replies until those windows reset (up to 7 days) or the process restarts. Nothing new is
-disclosed (the principal already saw these figures), and sharing is off by default.
+**Revocation.** Entitlement is checked when a window is observed, not when it is
+attached. The cache therefore also records which vendor account each entry came from: when
+a later `vendor_anthropic` response carrying the unified status reaches a principal who is
+no longer entitled to that account (for example the owner turned off
+`share_usage_with_members`), that principal's entry from the same account is dropped
+(`Forget`), and an entry observed from another account is left alone. **Known
+limitation:** the drop needs such a response, so a principal who has lost entitlement and
+then uses only other providers keeps receiving its last stored figures, frozen, on
+local-model replies until those windows reset (up to 7 days) or the process restarts.
+Nothing new is disclosed (the principal already saw these figures), and sharing is off by
+default.
+
+**Payload captures.** The translate path stores the upstream response headers in a payload
+capture, which its owner (and admins, for a non-secret capture) can read. For a
+vendor-account target, the `anthropic-ratelimit-unified-*` headers and
+`anthropic-organization-id` are removed from the captured upstream response headers unless
+the principal is entitled to the account's figures, so a capture never hands them to
+someone the relay would have withheld them from. Native passthrough captures hold the
+client response headers, which the relay already gates.
 
 **What Claude Code shows.** The per-window utilization and reset in its own status and
 warning display. It does not show the Claude Desktop usage card or the `/usage` plan

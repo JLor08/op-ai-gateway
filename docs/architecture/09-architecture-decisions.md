@@ -13013,9 +13013,10 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
 
 - Claude Code's Desktop usage card and the `/usage` plan panel stay unreachable for any gateway; the gateway's own principal limits in
   the spend-limit shape are a follow-up.
-- The window cache is per process and best effort (capped, lost on restart, not shared between replicas). Entitlement is checked at
-  observe time: a principal whose entitlement is revoked keeps receiving its last frozen figures on local-model replies until the windows reset or the
-  process restarts. Nothing new is disclosed.
+- The window cache is per process and best effort (capped at 10 000 principals, lost on restart, not shared between replicas). Entitlement is checked at
+  observe time, and each entry remembers its account: a later response from that account to a principal who is no longer entitled drops the entry. A principal
+  whose entitlement is revoked and who then uses only other providers keeps receiving its last frozen figures on local-model replies until the windows
+  reset or the process restarts. Nothing new is disclosed.
 - The whole display rests on undocumented client behavior; see the risk entry in
   [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
 - → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
