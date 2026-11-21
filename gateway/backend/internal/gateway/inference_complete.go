@@ -108,6 +108,9 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 		body = writeCompletionErrorCaptured(w, err)
 	} else {
 		slog.Debug("inference ok", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "server", s.serverName(target.ServerID), "output_tokens", resp.Usage.OutputTokens, "duration_ms", time.Since(start).Milliseconds())
+		if req.APIFlavor == inference.APIFlavorAnthropicMessages {
+			s.attachRateLimitWindows(token, w.Header())
+		}
 		body = writeJSONCaptured(w, http.StatusOK, render(resp))
 	}
 	ci := buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor)
@@ -838,6 +841,10 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// no-op for a non-vendor target, a nil header set, or a response carrying no
 	// recognized headers; any failure is swallowed (never faults this request).
 	s.scrapeVendorAccountUsage(target, upstreamHeaders)
+	// Remember a subscription response's rate-limit windows for the caller so a later
+	// /v1/messages answer from another provider can carry them (Claude Code clears
+	// its usage display otherwise). Entitlement-gated; a no-op for other providers.
+	s.observeRateLimitWindows(token, target, upstreamHeaders)
 	// Opt-in payload capture: capture is already nil unless the caller decided to
 	// capture; capturingEnabled re-checks the FULL gate (global switch + opt-in +
 	// store/cipher wiring) defensively — capturingEnabled (capture.go) is the single

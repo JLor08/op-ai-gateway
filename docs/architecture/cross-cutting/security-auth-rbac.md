@@ -315,7 +315,9 @@ none` is harmless because nothing verifies the signature, there is none to forge
 fixed at issue time: the flag changes only through rotation, which issues a fresh secret in
 the requested shape and retires the old one; a PATCH cannot change it
 (`portal.token_claude_code_usage_display_requires_rotation`). Service tokens and agent tokens
-keep the plain `opaigw_` secret.
+keep the plain `opaigw_` secret. The shape only makes Claude Code look at the rate-limit
+headers; what the gateway sends is described in [Claude Code usage-limit
+display](compatibility-and-inference.md#93-claude-code-usage-limit-display).
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 
 Portal chat runs as the logged-in **session** principal, but the operator may

@@ -167,7 +167,7 @@ func TestWindowCacheNeverAttachesOverageOrRetry(t *testing.T) {
 	dst := http.Header{}
 	c.Attach("user:a", dst, now)
 	for _, k := range []string{rlp + "overage-status", rlp + "overage-reset", rlp + "fallback-percentage", "Retry-After", "X-Should-Retry"} {
-		if _, ok := dst[k]; ok {
+		if dst.Get(k) != "" {
 			t.Errorf("%s attached", k)
 		}
 	}

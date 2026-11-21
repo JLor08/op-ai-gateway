@@ -4,8 +4,10 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
 	"strconv"
 	"sync"
 	"time"
@@ -173,4 +175,31 @@ func (c *rateLimitWindowCache) Attach(key string, dst http.Header, now time.Time
 		dst.Set(unifiedRateLimitPrefix+"reset", win.fields["reset"])
 	}
 	return true
+}
+
+// observeRateLimitWindows records the unified windows of a vendor-Anthropic response
+// for the caller, when the caller is entitled to see that account's figures. Other
+// providers, responses without the top-level status and unentitled callers are
+// ignored; the entitlement lookup only runs when there is something to record.
+func (s *Server) observeRateLimitWindows(token auth.Token, target routing.Target, h http.Header) {
+	if s.rateLimitWindows == nil || target.Provider != routing.ProviderVendorAnthropic || h.Get(unifiedRateLimitPrefix+"status") == "" {
+		return
+	}
+	key, ok := principalKey(token)
+	if !ok || !s.rateLimitFiguresEntitled(context.Background(), token, target) {
+		return
+	}
+	s.rateLimitWindows.Observe(key, h, time.Now())
+}
+
+// attachRateLimitWindows writes the caller's last observed subscription windows into
+// dst, the header set of a /v1/messages response answered by another provider. The
+// callers decide that the flavor is Anthropic Messages and the response a success.
+func (s *Server) attachRateLimitWindows(token auth.Token, dst http.Header) {
+	if s.rateLimitWindows == nil {
+		return
+	}
+	if key, ok := principalKey(token); ok {
+		s.rateLimitWindows.Attach(key, dst, time.Now())
+	}
 }

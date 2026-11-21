@@ -1147,6 +1147,12 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// Entitlement is looked up only when there are unified figures to gate.
 		forwardRateLimitHeaders(w.Header(), resp.Header,
 			hasUnifiedRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target))
+		// A success from a provider that reports no subscription windows of its own
+		// (a local model) carries the caller's last observed ones, so Claude Code
+		// keeps its usage display. Fresh upstream windows are never overlaid.
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get(unifiedRateLimitPrefix+"status") == "" {
+			s.attachRateLimitWindows(rel.token, w.Header())
+		}
 	}
 	w.WriteHeader(resp.StatusCode)
 

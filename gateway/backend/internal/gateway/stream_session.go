@@ -139,6 +139,9 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	if req.APIFlavor == inference.APIFlavorAnthropicMessages {
+		s.attachRateLimitWindows(token, w.Header())
+	}
 	w.WriteHeader(http.StatusOK)
 
 	if idle > 0 {

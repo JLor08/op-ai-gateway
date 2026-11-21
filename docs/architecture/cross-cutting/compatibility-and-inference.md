@@ -2500,7 +2500,8 @@ lookup entirely. The headers are copied from the final upstream response only, a
 point the status line is written, so a discarded re-selection attempt contributes none.
 Request ids, organization ids and the `anthropic-ratelimit-requests-*` /
 `anthropic-ratelimit-tokens-*` headers are never forwarded, and neither is anything on
-the Responses flavor.
+the Responses flavor. A success from a target that reports no unified figures of its own
+carries the caller's last subscription windows instead; see [§9.3](#93-claude-code-usage-limit-display).
 
 **One exception at dispatch: `sglang_omni`.** For a target whose effective kind
 (`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
@@ -3911,6 +3912,55 @@ llama.cpp that maps `output_config.effort` itself would be an alternative to the
 native edit; the deployed build and template are what decide, and a manual smoke
 test that the template actually consumes the injected value, not merely that the
 gateway sent it, is the check to run. The reasoning is recorded in [ADR-059](../09-architecture-decisions.md#adr-059--claude-code-effort-is-delivered-as-a-chat-template-kwarg-on-both-paths-for-llamacpp-and-vllm-and-is-a-management-only-token-setting).
+
+### 9.3 Claude Code usage-limit display
+
+Claude Code can show an Anthropic subscription's usage limits (the 5 hour and 7 day
+windows) from the `anthropic-ratelimit-unified-*` response headers of `/v1/messages`.
+Through the gateway this works for a user who routes to a vendor subscription account and
+to local models in one session, under three conditions.
+
+**Client condition.** Claude Code only reads those headers when its bearer token
+(`ANTHROPIC_AUTH_TOKEN`) is a JWT whose payload `aud` is `claude-gateway`. A token gets such
+a secret through the opt-in `claude_code_usage_display` token option, set at creation or
+through rotation; see [Claude Code token secret
+shape](security-auth-rbac.md#claude-code-token-secret-shape). The gateway does not look at
+the shape; the rest of this section is independent of it.
+
+**Relay.** A vendor subscription response's unified figures reach the client through the
+allowlist and entitlement rule of §6 (*Response headers on the Messages passthrough*).
+
+**Window cache.** Claude Code clears its per-window display when a `/v1/messages` response
+arrives without unified headers, as every answer of a local model does. So the gateway
+remembers the caller's last subscription windows (`rateLimitWindowCache`,
+`ratelimit_window_cache.go`) and attaches them to `/v1/messages` responses of other targets:
+
+- Observed in `recordUsage`, from the upstream headers of any `vendor_anthropic` response
+  that carries `anthropic-ratelimit-unified-status` (a 2xx or a 429; native passthrough and
+  translate), and only when the caller is entitled to the account's figures
+  (`rateLimitFiguresEntitled`). The key is the principal (`user:<id>` or `service:<id>`).
+- Attached only for the Anthropic Messages flavor, on a success (2xx) that carries no
+  unified status of its own: the native passthrough before the status line, and the
+  translate path on both the buffered JSON answer and the SSE header block. An error,
+  a response with fresh upstream figures, and every other flavor (Chat Completions,
+  Responses) get nothing.
+- Only windows whose reset time is still in the future are written. The top-level status is
+  `allowed`, or `allowed_warning` when an attached window warns or is rejected; it is never
+  `rejected`, because the response of another provider was not refused. Overage, fallback
+  and retry headers are never replayed.
+- Per process and best effort: in memory, capped at 10 000 principals (oldest observation
+  evicted), pruned as windows expire, lost on restart and not shared between replicas.
+  After a restart or on another replica the display simply stays blank until the next
+  subscription response.
+
+**What Claude Code shows.** The per-window utilization and reset in its own status and
+warning display. It does not show the Claude Desktop usage card or the `/usage` plan
+panel, which read Anthropic's own endpoints and need a first-party login; the gateway does
+not emulate them.
+
+**Dependency.** All of this relies on undocumented Claude Code behavior (the `aud`
+check, the header names and the clear-on-missing rule). A client update can change it
+without notice; nothing in the gateway breaks, the display just stops working.
 
 ## 10. Request bodies and size limits
 
