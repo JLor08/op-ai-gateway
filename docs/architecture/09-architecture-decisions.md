@@ -12972,3 +12972,52 @@ flavor and spread rules over the provider clients, one of which (`OpenAICompatib
 - **VERIFY-LIVE (not probed, no account available):** an OpenAI api-key target, an Anthropic api-key target, and a switch between two
   accounts of one vendor (expected to behave like probes O4/A3). The rules are shared code and covered by unit and integration tests; only
   the vendor's live answer is unverified.
+
+## ADR-106 — Claude Code shows a subscription's usage limits through an allowlisted header relay, an opt-in JWT-shaped token secret, an entitlement that follows the portal's view, and a per-principal window cache
+
+**Context.** Claude Code reads an Anthropic subscription's 5 hour and 7 day windows from the `anthropic-ratelimit-unified-*` response
+headers of `/v1/messages` and shows them in its status line, warnings and limit banners (issue #407). Verified in Claude Code 2.1.328
+and with a live end-to-end run: behind a gateway it reads them only when its bearer token (`ANTHROPIC_AUTH_TOKEN`) is a JWT whose
+payload `aud` is `claude-gateway` (decoded, never verified), and an opaque `opaigw_` token makes it ignore the headers. It also
+clears its per-window values on any `/v1/messages` response without the headers, which every answer of a local model is. The gateway
+relayed none of these headers, issued only opaque tokens, and withholds a shared account's rate-limit figures from its members.
+
+**Decision.**
+
+- **Forward an allowlist, not everything.** On the `anthropic_messages` flavor of the native passthrough, copy `anthropic-ratelimit-unified-*`,
+  `retry-after` and `x-should-retry` from the final upstream response at the point the status line is written. No `request-id`, no
+  organization headers, no `anthropic-ratelimit-requests-*` / `-tokens-*` (an API-key organization's quotas), nothing on other flavors.
+- **An opt-in JWT-shaped user-token secret.** The token option `claude_code_usage_display` (default off) issues the secret as
+  `<header>.<payload>.<opaigw_ secret>` with payload `{"aud":"claude-gateway"}`. The gateway still hashes the whole string and parses
+  nothing; the third segment carries the entropy, so `alg: none` is harmless. The setting changes only through rotation, because the
+  shape of a secret cannot change in place; PATCH refuses a different value.
+- **Entitlement follows the portal's management view.** The unified figures of a vendor account reach the owner, a community manager of a
+  `shared`/`full` account, and, when the owner opted in with `share_usage_with_members`, every principal that may use the account. An
+  inference token never carries system scope. The opt-in also puts `usage` into the portal member view and the dashboard, so one setting
+  has one meaning. The check is cached per principal and account and fails closed. A non-entitled principal still gets `retry-after`
+  and `x-should-retry`, so Claude Code waits correctly on a 429.
+- **A per-principal window cache.** The gateway remembers a principal's last subscription windows in memory and attaches those still in
+  the future to `/v1/messages` successes of other targets, so the display stays stable when a local model answers. It never attaches a top-level
+  `rejected` and never replays overage or retry headers.
+
+**Rejected:**
+
+- **Forward every upstream header.** It would leak request and organization ids and an API-key organization's quotas.
+- **`CLAUDE_CODE_USE_GATEWAY=1`.** It does not work inside Claude Desktop's 3P mode, where the host's environment wins, and it costs
+  Messages betas such as context management.
+- **Anthropic's Claude apps gateway sign-in (device flow).** Large, brings the same beta loss, and adds no display beyond the token shape.
+- **Every token JWT-shaped.** An opt-in leaves other clients and existing tokens untouched.
+- **Recording the gateway's own limits in the spend-limit shape, and forwarding Codex `x-codex-*` headers.** Not part of this change.
+
+**Consequences and limits.**
+
+- Claude Code's Desktop usage card and the `/usage` plan panel stay unreachable for any gateway; the gateway's own principal limits in
+  the spend-limit shape are a follow-up.
+- The window cache is per process and best effort (capped, lost on restart, not shared between replicas). Entitlement is checked at
+  observe time: a principal whose entitlement is revoked keeps receiving its last frozen figures on local-model replies until the windows reset or the
+  process restarts. Nothing new is disclosed.
+- The whole display rests on undocumented client behavior; see the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
+  [member view](cross-cutting/external-vendor-accounts.md#82-what-each-viewer-reads),
+  [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).
