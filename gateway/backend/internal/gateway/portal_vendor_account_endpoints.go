@@ -211,6 +211,10 @@ func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Reques
 		s.handlePortalVendorAccountShareLevel(w, r, token, parts[0])
 		return true
 	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "share-usage" {
+		s.handlePortalVendorAccountShareUsage(w, r, token, parts[0])
+		return true
+	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "admin-groups" {
 		s.handlePortalVendorAccountAdminGroups(w, r, token, parts[0])
 		return true
@@ -304,6 +308,33 @@ func (s *Server) handlePortalVendorAccountShareLevel(w http.ResponseWriter, r *h
 		return
 	}
 	dto, err := s.Portal.SetVendorAccountShareLevel(r.Context(), token, id, req)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountShareLevelFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// handlePortalVendorAccountShareUsage (PUT .../share-usage) sets the owner's opt-in to
+// show the account's usage figures to members ({"enabled": bool}, #407). The handler
+// only decodes; the service decides: the owner alone (a CM or a member, who can see the
+// account, is a 403 vendor_account.forbidden; a stranger, an unknown id and system scope
+// are the same 404). Not gated on the sharing flags. The response is the credential-free
+// management view.
+func (s *Server) handlePortalVendorAccountShareUsage(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPut) {
+		return
+	}
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return
+	}
+	var req portal.SetVendorAccountShareUsageRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+		return
+	}
+	dto, err := s.Portal.SetVendorAccountShareUsage(r.Context(), token, id, req)
 	if err != nil {
 		writePortalVendorAccountError(w, err, codeVendorAccountShareLevelFailed)
 		return

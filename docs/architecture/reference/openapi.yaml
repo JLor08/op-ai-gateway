@@ -4068,6 +4068,36 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-accounts/{id}/share-usage:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Set the owner's opt-in to show a vendor account's usage to members
+      description: >
+        Body {enabled}. The owner only: 403 vendor_account.forbidden for a CM or
+        a member (who can see the account), 404 vendor_account.not_found for a
+        stranger, an unknown id and system scope. 400 request.invalid_json for a
+        malformed body; 409 while the vendor-accounts module flag is off. Not
+        gated on the sharing switches and allowed at any share level. With the
+        opt-in on, a member's read of the account carries usage, and Claude
+        Code's responses carry the plan's rate-limit headers.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountShareUsageRequest' }
+      responses:
+        '200':
+          description: The credential-free management view with the new opt-in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/admin-groups:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -5971,6 +6001,12 @@ components:
         subscriptions_enabled: { type: boolean, description: The vendor_subscriptions_enabled switch (default true). }
         sharing_enabled: { type: boolean, description: The vendor_account_sharing_enabled master switch (default false). }
         subscription_sharing_enabled: { type: boolean, description: The vendor_subscription_sharing_enabled switch (default false), whether a subscription account may be raised to shared. }
+    VendorAccountShareUsageRequest:
+      type: object
+      description: portal.SetVendorAccountShareUsageRequest.
+      required: [enabled]
+      properties:
+        enabled: { type: boolean, description: "Whether members may see the account's usage." }
     VendorAccountShareLevelRequest:
       type: object
       description: portal.SetVendorAccountShareLevelRequest.
@@ -6079,10 +6115,12 @@ components:
         a minimal allowlist: id, vendor, auth_type, name, status, model_prefix,
         models (gateway_model, api_flavor and display_name only), the two
         credential booleans, is_owner false and shared_by. Everything else is
-        withheld and reads as its zero value (usage is omitted): share_level,
-        admin_groups, system_group_id and system_group_name, base_url, usage, each
-        model's upstream_model and the two timestamps.
-      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by]
+        withheld and reads as its zero value: share_level, admin_groups,
+        system_group_id and system_group_name, base_url, share_usage_with_members,
+        each model's upstream_model and the two timestamps. usage is added to the
+        member view only when the owner opted in (share_usage_with_members), and is
+        omitted otherwise.
+      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by, share_usage_with_members]
       properties:
         id: { type: string, description: 'va_-prefixed, random hex.' }
         vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, google_native, openai_compatible] }
@@ -6129,6 +6167,11 @@ components:
         system_group_id: { type: string, description: 'The containment root, empty until the account is first raised.' }
         system_group_name: { type: string, description: "The root's name, best effort." }
         is_owner: { type: boolean, description: Whether the viewer owns the account. }
+        share_usage_with_members:
+          type: boolean
+          description: >
+            The owner's opt-in to show usage to members (PUT .../share-usage).
+            Management view only; always false in the member view.
         shared_by:
           type: string
           description: >

@@ -141,14 +141,17 @@ type VendorAccountDTO struct {
 	SubscriptionConnected bool                    `json:"subscription_connected"`
 	Models                []VendorAccountModelDTO `json:"models"`
 	Usage                 *VendorAccountUsageDTO  `json:"usage,omitempty"`
-	CreatedAt             time.Time               `json:"created_at"`
-	UpdatedAt             time.Time               `json:"updated_at"`
-	ShareLevel            string                  `json:"share_level"`
-	AdminGroups           []GroupRefDTO           `json:"admin_groups"`
-	SystemGroupID         string                  `json:"system_group_id"`
-	SystemGroupName       string                  `json:"system_group_name"`
-	IsOwner               bool                    `json:"is_owner"`
-	SharedBy              string                  `json:"shared_by"`
+	// ShareUsageWithMembers is the owner's opt-in (#407) to show the usage snapshot to
+	// members. Management view only: a member's view never reports it.
+	ShareUsageWithMembers bool          `json:"share_usage_with_members"`
+	CreatedAt             time.Time     `json:"created_at"`
+	UpdatedAt             time.Time     `json:"updated_at"`
+	ShareLevel            string        `json:"share_level"`
+	AdminGroups           []GroupRefDTO `json:"admin_groups"`
+	SystemGroupID         string        `json:"system_group_id"`
+	SystemGroupName       string        `json:"system_group_name"`
+	IsOwner               bool          `json:"is_owner"`
+	SharedBy              string        `json:"shared_by"`
 }
 
 // VendorAccountListResponse is the {data:[...]} envelope of the list endpoint.
@@ -242,6 +245,7 @@ func (s *Service) vendorAccountDTO(ctx context.Context, principal auth.Token, ac
 		SystemGroupName:       s.vendorAccountSystemGroupName(ctx, acc),
 		IsOwner:               owner,
 		SharedBy:              sharedBy,
+		ShareUsageWithMembers: acc.ShareUsageWithMembers,
 	}, nil
 }
 
@@ -320,7 +324,7 @@ func (s *Service) memberVendorAccountDTO(ctx context.Context, acc routing.Vendor
 	if err != nil {
 		return VendorAccountDTO{}, err
 	}
-	return VendorAccountDTO{
+	dto := VendorAccountDTO{
 		ID:                    acc.ID,
 		Vendor:                acc.Vendor,
 		AuthType:              acc.AuthType,
@@ -333,7 +337,14 @@ func (s *Service) memberVendorAccountDTO(ctx context.Context, acc routing.Vendor
 		AdminGroups:           []GroupRefDTO{},
 		IsOwner:               false,
 		SharedBy:              s.vendorAccountOwnerName(ctx, acc),
-	}, nil
+	}
+	if acc.ShareUsageWithMembers {
+		// The owner's opt-in (#407) is the one way a member sees the figures. A failed
+		// read leaves the view without them rather than failing the read, as the
+		// list's management rows do.
+		dto.Usage = s.vendorAccountListUsage(ctx, acc.ID)
+	}
+	return dto, nil
 }
 
 // storedVendorAccountShareLevel is the share level the DTO reports: the stored one
@@ -1194,7 +1205,8 @@ func (s *Service) ListVendorAccounts(ctx context.Context, principal auth.Token) 
 //     scraped) and, unlike the list, fails when that snapshot cannot be read;
 //   - one they can route to through a resource group they are provisioned into (a
 //     MEMBER): the minimal key-free view (memberVendorAccountDTO), without the
-//     management fields and without usage, which is not even read.
+//     management fields and, unless the owner opted in to share usage (#407), without
+//     usage, which is then not even read.
 //
 // Anyone else gets ErrVendorAccountNotFound (404-no-leak).
 // ErrVendorAccountsDisabled while the master flag is off.

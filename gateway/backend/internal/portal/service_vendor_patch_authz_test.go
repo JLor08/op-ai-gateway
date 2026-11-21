@@ -641,6 +641,9 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"RaiseVendorAccountShareLevel": "raise",
 		"LowerVendorAccountShareLevel": "lower",
 		"SetVendorAccountShareLevel":   "share-level",
+		// The usage opt-in (service_vendor_sharing.go) is the raise gate's owner check
+		// without the admin role, pinned by TestSetVendorAccountShareUsage.
+		"SetVendorAccountShareUsage": "share-usage",
 		// Management-group assignment (service_vendor_sharing.go) is the spec's
 		// "owner-only at `shared`, owner + CM at `full`" row: the credential gate's
 		// shape, but not a credential write (it opens no credential and sends nothing

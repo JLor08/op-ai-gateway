@@ -2547,6 +2547,18 @@ func (_d *APIWithTracing) SetVendorAccountShareLevel(ctx context.Context, t1 aut
 	return _d.API.SetVendorAccountShareLevel(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) SetVendorAccountShareUsage(ctx context.Context, t1 auth.Token, s1 string, s2 SetVendorAccountShareUsageRequest) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetVendorAccountShareUsage")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetVendorAccountShareUsage(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) SyncApplicationModels(ctx context.Context, t1 auth.Token, s1 string) (s2 SyncResultDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SyncApplicationModels")
 	defer span.End()
