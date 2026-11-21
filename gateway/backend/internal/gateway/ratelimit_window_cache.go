@@ -46,6 +46,8 @@ type cachedRateLimitEntry struct {
 	observed  time.Time
 	claim     string
 	windows   map[string]cachedRateLimitWindow
+	// names holds the Codex families' limit names; nil for Anthropic entries.
+	names map[string]string
 }
 
 // rateLimitWindowCache is a mutex-guarded, hard-capped map from principal key to its
@@ -84,11 +86,16 @@ func (c *rateLimitWindowCache) Observe(key, accountID string, h http.Header, now
 		claim:     h.Get(unifiedRateLimitPrefix + "representative-claim"),
 		windows:   parseRateLimitWindows(h),
 	}
+	c.put(key, entry, now)
+}
 
+// put stores e as the principal's latest observation: it prunes expired entries and,
+// at the cap, evicts the oldest observation to make room for a new key.
+func (c *rateLimitWindowCache) put(key string, e cachedRateLimitEntry, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pruneAndMakeRoom(key, now)
-	c.entries[key] = entry
+	c.entries[key] = e
 }
 
 // parseRateLimitWindows reads the per-window fields of h. A window whose reset is
