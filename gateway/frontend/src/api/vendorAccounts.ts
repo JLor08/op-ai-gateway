@@ -151,7 +151,7 @@ export type VendorAccount = {
   // for a viewer who does not ("" for the owner, or when the name is unknown).
   is_owner: boolean;
   shared_by: string;
-  // The owner's opt-in (#407) to share the account's rate-limit figures with the
+  // The owner's opt-in (#407) to share the account's usage figures (rate limits and spend) with the
   // members it is shared with: they then see them in Claude Code and, as `usage`,
   // on the account page and the dashboard. Every read carries it, the member view
   // too (with the account's real value); only the owner may change it.
@@ -363,7 +363,7 @@ export function vendorAccountsApi(fetcher: Fetcher) {
           body: adminGroupIds === undefined ? { level } : { level, admin_group_ids: adminGroupIds },
         },
       ),
-    // Turns the owner's opt-in to share the account's rate-limit figures with its
+    // Turns the owner's opt-in to share the account's usage figures with its
     // members on or off (PUT .../share-usage, #407). Owner only: a co-manager or a
     // member gets a 403, a stranger the 404 of an unknown id. Answers the
     // credential-free account as the owner now reads it.

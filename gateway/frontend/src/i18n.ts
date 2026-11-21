@@ -3955,9 +3955,9 @@ const de = {
     'Dem Konto ist keine Verwaltungsgruppe zugeordnet. Zuerst unten eine Verwaltungsgruppe zuordnen.',
   vendorAccountShareReadOnlyNote: 'Die Freigabe dieses Kontos verwaltet der Besitzer.',
   vendorAccountShareSaved: 'Freigabe gespeichert.',
-  vendorAccountShareUsageLabel: 'Ratenlimit-Werte mit Mitgliedern teilen',
+  vendorAccountShareUsageLabel: 'Nutzungswerte (Ratenlimits und Ausgaben) mit Mitgliedern teilen',
   vendorAccountShareUsageHelp:
-    'Mitglieder sehen die Auslastung des Kontos in Claude Code sowie auf der Kontoseite und im Dashboard.',
+    'Mitglieder sehen dann die Ratenlimits und Ausgaben des Kontos im Portal (Kontoseite und Dashboard) und die Ratenlimit-Fenster in Claude Code.',
   vendorAccountShareUsageSaved: 'Einstellung gespeichert.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as
@@ -7883,9 +7883,9 @@ const en: PortalMessages = {
     'The account has no management group. Assign a management group below first.',
   vendorAccountShareReadOnlyNote: "This account's sharing is managed by its owner.",
   vendorAccountShareSaved: 'Sharing saved.',
-  vendorAccountShareUsageLabel: 'Share rate-limit figures with members',
+  vendorAccountShareUsageLabel: 'Share usage figures (rate limits and spend) with members',
   vendorAccountShareUsageHelp:
-    'Members see the same figures in Claude Code, and on the account page and the dashboard.',
+    "Members then see the account's rate limits and spend in the portal (account page and dashboard), and its rate-limit windows in Claude Code.",
   vendorAccountShareUsageSaved: 'Setting saved.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as

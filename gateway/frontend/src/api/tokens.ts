@@ -134,7 +134,7 @@ export type CreateTokenRequest = {
   // Decision-confidence normalization (see PortalToken); omitted = off.
   decisions_confidence_normalize?: boolean;
   // Claude Code usage display (see PortalToken); omitted = off. Fixes the
-  // secret's shape, so it can only be chosen at creation.
+  // secret's shape, so it changes only through rotation.
   claude_code_usage_display?: boolean;
   log_communication?: boolean;
   secret?: boolean;

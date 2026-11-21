@@ -1154,6 +1154,33 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(fakeApi.vendorAccountAdminGroupCandidates).not.toHaveBeenCalled();
     });
 
+    it('shows the usage figures read-only when the owner shared them, with no refresh', async () => {
+      const { fakeApi } = renderView({
+        accounts: [
+          member({ ...OPENAI_SUBSCRIPTION, usage: USAGE, share_usage_with_members: true }),
+        ],
+      });
+      await openDetail();
+
+      const usage = await screen.findByRole('region', { name: t.vendorUsageTitle });
+      expect(within(usage).getByText(t.vendorUsageFiveHour)).toBeInTheDocument();
+      expect(
+        within(usage).queryByRole('button', { name: t.vendorUsageRefreshAction }),
+      ).not.toBeInTheDocument();
+      expect(fakeApi.refreshUsage).not.toHaveBeenCalled();
+      // The management panels stay withheld.
+      expect(shareRegion()).not.toBeInTheDocument();
+    });
+
+    it('shows no usage panel for a member when the owner did not share it', async () => {
+      const { fakeApi } = renderView({ accounts: [member({ ...OPENAI_SUBSCRIPTION })] });
+      await openDetail();
+      await screen.findByRole('region', { name: t.vendorAccountMemberTitle });
+
+      expect(screen.queryByRole('region', { name: t.vendorUsageTitle })).not.toBeInTheDocument();
+      expect(fakeApi.vendorAccount).not.toHaveBeenCalled();
+    });
+
     it('never renders the zero timestamp the member DTO carries, as a date or as text', async () => {
       const { container } = renderView({ accounts: [member()] });
       await openDetail();
