@@ -55,6 +55,7 @@ type API interface {
 	ChatBlobBytes(context.Context, auth.Token, string) ([]byte, string, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
+	VendorAccountUsageManager(context.Context, auth.Token, string) (bool, error)
 	ClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)
 	ClusterPlan(context.Context, string) (ClusterPlan, error)
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
@@ -207,7 +208,7 @@ type API interface {
 	RotateCertificateCA(context.Context, auth.Token) error
 	RotateNetbirdToken(context.Context, auth.Token) (RotateNetbirdTokenResult, error)
 	RotateServiceToken(context.Context, auth.Token, string, string) (CreateServiceTokenResponse, error)
-	RotateToken(context.Context, auth.Token, string) (CreateTokenResponse, error)
+	RotateToken(context.Context, auth.Token, string, RotateTokenRequest) (CreateTokenResponse, error)
 	RuntimeWarnings(context.Context, auth.Token, string) ([]string, error)
 	SMTPRuntimeConfig(context.Context) (SMTPRuntimeConfig, error)
 	SaveChat(context.Context, auth.Token, string, UpdateChatRequest) (ChatDTO, error)
@@ -245,6 +246,7 @@ type API interface {
 	SetUserPreference(context.Context, string, string, json.RawMessage) error
 	SetVendorAccountAdminGroups(context.Context, auth.Token, string, []string) (VendorAccountDTO, error)
 	SetVendorAccountShareLevel(context.Context, auth.Token, string, SetVendorAccountShareLevelRequest) (VendorAccountDTO, error)
+	SetVendorAccountShareUsage(context.Context, auth.Token, string, SetVendorAccountShareUsageRequest) (VendorAccountDTO, error)
 	SyncApplicationModels(context.Context, auth.Token, string) (SyncResultDTO, error)
 	SyncApplicationModelsForApp(context.Context, routing.AIServer, routing.Application) (SyncResultDTO, error)
 	SystemAdminModeRequirePassword(context.Context) bool

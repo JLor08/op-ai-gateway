@@ -612,6 +612,100 @@ func testTokenClaudeEffortCompatibilityRoundTrip(t *testing.T, s *SQLStore) {
 	}
 }
 
+// TestConformanceTokenClaudeCodeUsageDisplayRoundTrip proves the opt-in
+// api_tokens.claude_code_usage_display flag (#407) on both dialects: written by
+// CreatePlainToken and read by TokenByID and TokensByUser; written by
+// RotateUserTokenSecret TOGETHER with the new hash and prefix (the old secret
+// stops resolving, the new one resolves the same token); and NEVER written by
+// UpdateTokenMetadata, so a metadata edit carrying a stale record cannot flip
+// the shape of a secret it did not rotate. RotateTokenSecret (the service-token
+// rotation) leaves the flag alone.
+func TestConformanceTokenClaudeCodeUsageDisplayRoundTrip(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateUser(ctx, newTestUser("usr_ccud", "ccud@example.test", now)); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		on := TokenRecord{ID: "tok_ccud_on", UserID: "usr_ccud", Name: "on", CreatedAt: now, UpdatedAt: now, ClaudeCodeUsageDisplay: true}
+		off := TokenRecord{ID: "tok_ccud_off", UserID: "usr_ccud", Name: "off", CreatedAt: now, UpdatedAt: now}
+		if err := s.CreatePlainToken(ctx, on, "ccud-on-secret"); err != nil {
+			t.Fatalf("CreatePlainToken(on): %v", err)
+		}
+		if err := s.CreatePlainToken(ctx, off, "ccud-off-secret"); err != nil {
+			t.Fatalf("CreatePlainToken(off): %v", err)
+		}
+		gotOn, err := s.TokenByID(ctx, "tok_ccud_on")
+		if err != nil || !gotOn.ClaudeCodeUsageDisplay {
+			t.Fatalf("TokenByID(on) err=%v flag=%v, want true", err, gotOn.ClaudeCodeUsageDisplay)
+		}
+		gotOff, err := s.TokenByID(ctx, "tok_ccud_off")
+		if err != nil || gotOff.ClaudeCodeUsageDisplay {
+			t.Fatalf("TokenByID(off) err=%v flag=%v, want false", err, gotOff.ClaudeCodeUsageDisplay)
+		}
+		byUser, err := s.TokensByUser(ctx, "usr_ccud")
+		if err != nil {
+			t.Fatalf("TokensByUser: %v", err)
+		}
+		listed := map[string]bool{}
+		for _, rec := range byUser {
+			listed[rec.ID] = rec.ClaudeCodeUsageDisplay
+		}
+		if len(listed) != 2 || !listed["tok_ccud_on"] || listed["tok_ccud_off"] {
+			t.Fatalf("TokensByUser flags = %v, want on=true off=false", listed)
+		}
+
+		// UpdateTokenMetadata never writes the flag, in either direction.
+		gotOn.ClaudeCodeUsageDisplay = false
+		gotOn.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, gotOn); err != nil {
+			t.Fatalf("UpdateTokenMetadata(on): %v", err)
+		}
+		gotOff.ClaudeCodeUsageDisplay = true
+		gotOff.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, gotOff); err != nil {
+			t.Fatalf("UpdateTokenMetadata(off): %v", err)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_on"); !rec.ClaudeCodeUsageDisplay {
+			t.Fatal("UpdateTokenMetadata cleared claude_code_usage_display")
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_off"); rec.ClaudeCodeUsageDisplay {
+			t.Fatal("UpdateTokenMetadata set claude_code_usage_display")
+		}
+
+		// RotateUserTokenSecret switches the flag with the secret.
+		rotatedAt := now.Add(time.Hour)
+		if err := s.RotateUserTokenSecret(ctx, "tok_ccud_off", auth.HashSecret("ccud-off-rotated"), "ccud-off", true, rotatedAt); err != nil {
+			t.Fatalf("RotateUserTokenSecret(off->on): %v", err)
+		}
+		if _, ok := s.LookupBearer("Bearer ccud-off-secret"); ok {
+			t.Fatal("old secret must stop working after rotate")
+		}
+		if resolved, ok := s.LookupBearer("Bearer ccud-off-rotated"); !ok || resolved.ID != "tok_ccud_off" {
+			t.Fatalf("rotated secret lookup: ok=%v resolved=%+v", ok, resolved)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_off"); !rec.ClaudeCodeUsageDisplay || rec.SecretPrefix != "ccud-off" {
+			t.Fatalf("after rotate(off->on): %+v", rec)
+		}
+		if err := s.RotateUserTokenSecret(ctx, "tok_ccud_on", auth.HashSecret("ccud-on-rotated"), "ccud-on-", false, rotatedAt); err != nil {
+			t.Fatalf("RotateUserTokenSecret(on->off): %v", err)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_on"); rec.ClaudeCodeUsageDisplay {
+			t.Fatal("rotate(on->off) did not clear claude_code_usage_display")
+		}
+		// The plain rotation leaves the flag alone.
+		if err := s.RotateTokenSecret(ctx, "tok_ccud_off", auth.HashSecret("ccud-off-plain"), "ccud-off", rotatedAt); err != nil {
+			t.Fatalf("RotateTokenSecret: %v", err)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_off"); !rec.ClaudeCodeUsageDisplay {
+			t.Fatal("RotateTokenSecret cleared claude_code_usage_display")
+		}
+		if err := s.RotateUserTokenSecret(ctx, "nope", auth.HashSecret("x"), "x", true, rotatedAt); err != ErrNotFound {
+			t.Fatalf("rotate missing id = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 // TestConformanceTokenDecisionsConfidenceNormalizeRoundTrip proves the opt-in
 // api_tokens.decisions_confidence_normalize flag (#373) is carried by the whole
 // token path on both dialects, so the Postgres leg exercises the widened
@@ -6527,6 +6621,10 @@ func TestConformanceMigration40ServiceAccountsRebuild(t *testing.T) {
 		// ...and v108's per-token decisions confidence normalization opt-in.
 		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column decisions_confidence_normalize integer not null default 0`); err != nil {
 			t.Fatalf("reapply api_tokens.decisions_confidence_normalize after migration40RawUp: %v", err)
+		}
+		// ...and v111's per-token Claude Code usage display opt-in.
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column claude_code_usage_display integer not null default 0`); err != nil {
+			t.Fatalf("reapply api_tokens.claude_code_usage_display after migration40RawUp: %v", err)
 		}
 
 		// The token's OWN data survived the rebuild losslessly, via the NEW

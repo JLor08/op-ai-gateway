@@ -183,6 +183,14 @@ piece, and routing eligibility does **not** (§4.6):
   also scrubs a leftover link. `full` to `shared` changes only the level (the groups,
   the root and the links stay). A downgrade takes effect on the next resolve, because
   the grant re-reads the live level (§4.6).
+- **Usage opt-in** (`PUT /api/portal/vendor-accounts/{id}/share-usage`, `{enabled}`,
+  `SetVendorAccountShareUsage`): the **owner's** decision to show the account's usage
+  figures to everyone allowed to use it (column `share_usage_with_members`, migration
+  110, default off). The owner check of the raise gate without the admin role (a CM or
+  a member is `403`, a stranger, an unknown id and system scope `404`); behind the
+  `vendor_accounts_enabled` flag but **not** gated on the sharing flags and allowed at
+  any level (it grants nothing while the account is private). It unlocks the figures in
+  the member view (§8.2) and Claude Code's rate-limit response headers (§4.1, *Anthropic subscription Messages passthrough*).
 - **Memory-store cascades.** Deleting an account drops its management-group links by a
   single-key delete and its resource-group links by a **reverse-direction loop over
   every group** (the map is keyed group to account, like `resource_group_servers`); a
@@ -681,8 +689,10 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
   `anthropic-beta` (*Client `anthropic-beta` on the Messages passthrough*, below);
   an api-key target has no beta of its own, so that is the whole header, and a
   request without one sends none. No other inbound header is forwarded, the
-  client's own `anthropic-version` included. Redirects from the upstream are not
-  followed, because net/http strips `Authorization` but not `x-api-key` when a
+  client's own `anthropic-version` included. The response side is the same
+  allowlist as the subscription relay below (`retry-after`, `x-should-retry`, and the
+  entitlement-gated `anthropic-ratelimit-unified-*` family). Redirects from the
+  upstream are not followed, because net/http strips `Authorization` but not `x-api-key` when a
   redirect leaves the host.
 - **Verbatim in body and in beta opt-in, pinned in version.** A beta-gated body
   feature (for example a `context_management` field) reaches Anthropic together
@@ -785,7 +795,16 @@ account (§5).
   `anthropic-beta` = `oauth-2025-04-20` followed by the client's own tokens,
   deduplicated (*Client `anthropic-beta`*, above). No other inbound header is
   forwarded. The response and its SSE are relayed unchanged and are not rewritten
-  back (§6.5); redirects are not followed, as for the api-key relay.
+  back (§6.5), except that the Messages passthrough forwards a response-header
+  allowlist to the client: `retry-after` and `x-should-retry` always, and the
+  `anthropic-ratelimit-unified-*` family only for a caller entitled to the account's
+  figures. On inference those are the account owner, a community manager of a
+  `shared`/`full` account, or anyone when the owner opted in
+  (`share_usage_with_members`); inference tokens never carry system scope, which
+  matches what the same principal sees in the portal without elevation
+  (`rateLimitFiguresEntitled`). The `anthropic-ratelimit-requests-*` /
+  `anthropic-ratelimit-tokens-*` headers, request ids and every other upstream
+  response header are dropped. Redirects are not followed, as for the api-key relay.
 - **The body is verbatim except three edits.** The gateway layer rewrites `model` to
   the account's bare upstream id (equal to the requested name when the account has
   no prefix) and removes the replayed `thinking` blocks Anthropic cannot verify
@@ -1466,7 +1485,7 @@ alone). What it does parse is merged over the stored row (§5.3).
 
 | Vendor | Headers (lowercased; VERIFY-LIVE) | Normalization |
 |---|---|---|
-| Anthropic subscription | `anthropic-ratelimit-unified-5h-utilization`, `-7d-utilization`, `-reset` | A 0..1 utilization **fraction** → ×100 percent; the single unified reset is attributed to the five-hour window. |
+| Anthropic subscription | `anthropic-ratelimit-unified-5h-utilization`, `-7d-utilization`, `-5h-reset`, `-7d-reset`, `-reset`, `anthropic-ratelimit-unified-representative-claim` | A 0..1 utilization **fraction** → ×100 percent; each window takes its own `-5h-reset` / `-7d-reset`. The top-level `-reset` belongs to the representative claim, so it fills only a window whose own reset is absent and only the one the claim names (`five_hour` → five-hour, `seven_day` → weekly); with no claim it is ignored. |
 | OpenAI subscription | `x-codex-primary-used-percent` + `x-codex-primary-reset-at` (five-hour), `x-codex-secondary-used-percent` + `x-codex-secondary-reset-at` (weekly), `x-codex-credits-balance` | A 0..100 **percent** used as-is; the credit balance is an opaque string. |
 
 Parsing is **tolerant**: a missing/non-numeric value leaves the window at its
@@ -2464,11 +2483,14 @@ provisioned into the account's group reads the management view):
   group. Built **from an allowlist, deny by default** (`memberVendorAccountDTO`, from
   nothing, never by blanking the management DTO): `id`, `vendor`, `auth_type`, `name`,
   `status`, `model_prefix`, `models` (each only the gateway name, the dialect and the
-  display name), the two credential booleans, `is_owner: false` and `shared_by`.
-  **Withheld**: `share_level`, `admin_groups`, `system_group_id` and `system_group_name`
-  (who manages the account and where it is rooted), `base_url` (where the owner's key
-  is sent), `usage` (the owner's rate-limit and spend figures), each model's
-  `upstream_model` and the timestamps. One builder renders it for both the single read
+  display name), the two credential booleans, `is_owner: false` and `shared_by`, plus
+  the opt-in flag `share_usage_with_members` (the account's actual value, so a member
+  who sees usage never reads a false flag) and, **only when it is on**, `usage` (the
+  owner's rate-limit and spend figures; see the usage opt-in in §1.3, which also
+  unlocks Claude Code's figures, §4.1 *Anthropic subscription Messages passthrough*). **Withheld**: `share_level`, `admin_groups`,
+  `system_group_id` and `system_group_name` (who manages the account and where it is
+  rooted), `base_url` (where the owner's key is sent), `usage` without that opt-in,
+  each model's `upstream_model` and the timestamps. One builder renders it for both the single read
   and the member-only rows of the list, so the two cannot differ.
 - **Nothing**: everyone else, the same `404`.
 
@@ -2695,7 +2717,7 @@ deliberate, named choice**, because `all: true` never covers a shared account (�
 
 The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 (column, a JSON string on `api_tokens`, migration 85;
-[Data Model](../reference/data-model.md#4-migration-history-109-migrations)):
+[Data Model](../reference/data-model.md#4-migration-history-111-migrations)):
 
 ```json
 { "all": false,

@@ -3454,6 +3454,12 @@ const de = {
   tokenDecisionsConfidenceNormalize: 'Entscheidungs-Konfidenz normalisieren',
   tokenDecisionsConfidenceNormalizeHint:
     'Meldet die Konfidenz von Entscheidungen (/v1/decisions und /v1/systemone) immer auf einer Skala von 0 bis 1, auch wenn das Modell eine andere Skala verwendet.',
+  tokenClaudeCodeUsageDisplay: 'Claude-Code-Nutzungslimits anzeigen',
+  tokenClaudeCodeUsageDisplayHint:
+    'Claude Code zeigt dann die Nutzungslimits des Plans (5-Stunden- und Wochenlimit) an, wenn dieser Token als ANTHROPIC_AUTH_TOKEN verwendet wird. Dafür hat das Geheimnis eine längere Form; bei einem bestehenden Token erzeugt eine Änderung ein neues Geheimnis.',
+  tokenClaudeCodeUsageRotateWarning:
+    'Beim Speichern wird der Token rotiert: Das bisherige Geheimnis funktioniert danach nicht mehr, das neue wird einmalig angezeigt.',
+  tokenClaudeCodeBadge: 'Claude Code',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
@@ -3949,6 +3955,10 @@ const de = {
     'Dem Konto ist keine Verwaltungsgruppe zugeordnet. Zuerst unten eine Verwaltungsgruppe zuordnen.',
   vendorAccountShareReadOnlyNote: 'Die Freigabe dieses Kontos verwaltet der Besitzer.',
   vendorAccountShareSaved: 'Freigabe gespeichert.',
+  vendorAccountShareUsageLabel: 'Nutzungswerte (Ratenlimits und Ausgaben) mit Mitgliedern teilen',
+  vendorAccountShareUsageHelp:
+    'Mitglieder sehen dann die Ratenlimits und Ausgaben des Kontos im Portal (Kontoseite und Dashboard) und die Ratenlimit-Fenster in Claude Code.',
+  vendorAccountShareUsageSaved: 'Einstellung gespeichert.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as
   // personal, so nothing can be raised, lowered or reassigned.
@@ -7375,6 +7385,12 @@ const en: PortalMessages = {
   tokenDecisionsConfidenceNormalize: 'Normalize decision confidence',
   tokenDecisionsConfidenceNormalizeHint:
     'Reports the confidence of decisions (/v1/decisions and /v1/systemone) on a 0 to 1 scale whatever scale the model uses itself.',
+  tokenClaudeCodeUsageDisplay: 'Show Claude Code usage limits',
+  tokenClaudeCodeUsageDisplayHint:
+    "Makes Claude Code show the plan's usage limits (5-hour and weekly) when this token is used as ANTHROPIC_AUTH_TOKEN. The secret has a longer form for this; on an existing token, changing it creates a new secret.",
+  tokenClaudeCodeUsageRotateWarning:
+    'Saving rotates the token: the current secret stops working and the new one is shown once.',
+  tokenClaudeCodeBadge: 'Claude Code',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',
@@ -7867,6 +7883,10 @@ const en: PortalMessages = {
     'The account has no management group. Assign a management group below first.',
   vendorAccountShareReadOnlyNote: "This account's sharing is managed by its owner.",
   vendorAccountShareSaved: 'Sharing saved.',
+  vendorAccountShareUsageLabel: 'Share usage figures (rate limits and spend) with members',
+  vendorAccountShareUsageHelp:
+    "Members then see the account's rate limits and spend in the portal (account page and dashboard), and its rate-limit windows in Claude Code.",
+  vendorAccountShareUsageSaved: 'Setting saved.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as
   // personal, so nothing can be raised, lowered or reassigned.

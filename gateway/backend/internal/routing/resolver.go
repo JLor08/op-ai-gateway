@@ -296,6 +296,15 @@ type Target struct {
 	// trigger it once was: that trigger moved to the explicit Subscription flag
 	// below. A self-hosted target leaves this "".
 	VendorAccountID string
+	// VendorAccountOwnerUserID and VendorShareUsageWithMembers are the serving
+	// account's owner and the owner's opt-in to showing its usage limits to members
+	// (VendorAccount.ShareUsageWithMembers). They are stamped on every vendor target
+	// next to VendorAccountID for the usage-limit header gate: the owner qualifies,
+	// so does system scope (inference tokens never carry it) and a community manager
+	// of a shared/full account (a cached portal lookup, VendorAccountUsageManager),
+	// and anyone else only with the opt-in.
+	VendorAccountOwnerUserID    string
+	VendorShareUsageWithMembers bool
 	// Subscription marks a SUBSCRIPTION (OAuth) vendor target whose upstream bearer
 	// is NOT carried in APIToken but resolved -- and refreshed if stale -- at
 	// dispatch time from the account's sealed OAuth tokens (upstreamAuthCtx keys the
@@ -1413,7 +1422,9 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 		// recorded usage_events.account_id and the scraped rate-limit snapshot). It
 		// is NOT the subscription-bearer trigger -- Subscription stays false, so
 		// upstreamAuthCtx keeps using the sealed APIToken above, not an OAuth bearer.
-		VendorAccountID: acc.ID,
+		VendorAccountID:             acc.ID,
+		VendorAccountOwnerUserID:    acc.OwnerUserID,
+		VendorShareUsageWithMembers: acc.ShareUsageWithMembers,
 		// Both inbound dialects are served; the zero endpoint modes mean translate,
 		// so native-passthrough converts whichever one the caller used to the
 		// vendor's native wire format. The two exceptions are set below: an OpenAI
@@ -1491,19 +1502,21 @@ func vendorAccountTarget(acc VendorAccount, m VendorAccountModel, model, apiFlav
 // canonical home and the ToS caveat.
 func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target {
 	t := Target{
-		RouteID:         vendorRoutePrefix + acc.ID + ":" + model,
-		ServerID:        "",
-		Provider:        ProviderVendorAnthropic,
-		Endpoint:        "https://api.anthropic.com",
-		Model:           model,
-		ProviderModel:   m.UpstreamModel,
-		Timeout:         vendorAccountDefaultTimeout,
-		APIFlavor:       apiFlavor,
-		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
-		APITokenHeader:  "",
-		VendorAccountID: acc.ID,
-		Subscription:    true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
-		Masquerade:      MasqueradeClaudeCode,
+		RouteID:                     vendorRoutePrefix + acc.ID + ":" + model,
+		ServerID:                    "",
+		Provider:                    ProviderVendorAnthropic,
+		Endpoint:                    "https://api.anthropic.com",
+		Model:                       model,
+		ProviderModel:               m.UpstreamModel,
+		Timeout:                     vendorAccountDefaultTimeout,
+		APIFlavor:                   apiFlavor,
+		APIToken:                    "", // bearer resolved + refreshed at dispatch from OAuthTokens
+		APITokenHeader:              "",
+		VendorAccountID:             acc.ID,
+		VendorAccountOwnerUserID:    acc.OwnerUserID,
+		VendorShareUsageWithMembers: acc.ShareUsageWithMembers,
+		Subscription:                true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
+		Masquerade:                  MasqueradeClaudeCode,
 		ExtraHeaders: map[string]string{
 			"anthropic-version": "2023-06-01",
 			"anthropic-beta":    "oauth-2025-04-20",
@@ -1556,18 +1569,20 @@ func vendorSubscriptionAnthropicTarget(acc VendorAccount, m VendorAccountModel, 
 // the Anthropic target's approach).
 func vendorSubscriptionOpenAITarget(acc VendorAccount, m VendorAccountModel, model, apiFlavor, fineFlavor string) Target {
 	t := Target{
-		RouteID:         vendorRoutePrefix + acc.ID + ":" + model,
-		ServerID:        "",
-		Provider:        ProviderVendorOpenAISubscription,
-		Endpoint:        "https://chatgpt.com/backend-api/codex",
-		Model:           model,
-		ProviderModel:   m.UpstreamModel,
-		Timeout:         vendorAccountDefaultTimeout,
-		APIFlavor:       apiFlavor,
-		APIToken:        "", // bearer resolved + refreshed at dispatch from OAuthTokens
-		APITokenHeader:  "",
-		VendorAccountID: acc.ID,
-		Subscription:    true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
+		RouteID:                     vendorRoutePrefix + acc.ID + ":" + model,
+		ServerID:                    "",
+		Provider:                    ProviderVendorOpenAISubscription,
+		Endpoint:                    "https://chatgpt.com/backend-api/codex",
+		Model:                       model,
+		ProviderModel:               m.UpstreamModel,
+		Timeout:                     vendorAccountDefaultTimeout,
+		APIFlavor:                   apiFlavor,
+		APIToken:                    "", // bearer resolved + refreshed at dispatch from OAuthTokens
+		APITokenHeader:              "",
+		VendorAccountID:             acc.ID,
+		VendorAccountOwnerUserID:    acc.OwnerUserID,
+		VendorShareUsageWithMembers: acc.ShareUsageWithMembers,
+		Subscription:                true, // OAuth bearer resolved at dispatch -- the subscription-bearer trigger
 		ExtraHeaders: map[string]string{
 			"OpenAI-Beta": "responses=experimental",
 			"originator":  "codex_cli_rs",

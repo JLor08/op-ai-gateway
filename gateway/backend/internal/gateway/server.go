@@ -840,6 +840,13 @@ type Server struct {
 	// varies per call (GetTTL), shorter for an error-derived miss so a transient
 	// NetBird blip self-heals fast.
 	sourcePeerIP settingCache[string]
+	// rateLimitEntitlements caches the portal's per-principal, per-account answer
+	// behind rateLimitFiguresEntitled (ratelimit_headers.go); zero value ready.
+	rateLimitEntitlements rateLimitEntitlementCache
+	// rateLimitWindows remembers each principal's last subscription rate-limit
+	// windows so they can ride along on /v1/messages responses from other providers
+	// (ratelimit_window_cache.go). Nil in a bare &Server{}; the helpers tolerate that.
+	rateLimitWindows *rateLimitWindowCache
 	// vendorEnabledCache / vendorRoutingModeCache are the TTL caches
 	// (settingCache, invalidatable mode -- ttlcache.go) backing the resolver's
 	// injected vendor-account accessors (SetVendorAccountAccessors), so the
@@ -1183,6 +1190,7 @@ func New(deps ServerDeps) *Server {
 		// assembled Server for its provider/routes/upstream-auth); see below.
 	}
 	s := &Server{
+		rateLimitWindows:            newRateLimitWindowCache(10000),
 		Tokens:                      deps.Tokens,
 		Usage:                       deps.Usage,
 		UsageEvents:                 broker,

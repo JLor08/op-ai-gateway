@@ -55,6 +55,7 @@ function makeToken(over: Partial<PortalToken> = {}): PortalToken {
     model_override: '',
     log_communication: false,
     secret: false,
+    claude_code_usage_display: false,
     is_chat_session: false,
     deletable: true,
     ...over,

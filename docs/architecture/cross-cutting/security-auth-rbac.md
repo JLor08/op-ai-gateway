@@ -300,6 +300,24 @@ an opted-in token (a translated `/v1/decisions` answer is buffered for every tok
 onto the run (`AuthorizeRunAsToken` copies the field); the portal session principal itself
 never has it.
 
+#### Claude Code token secret shape
+
+A user token can opt into `claude_code_usage_display` (default off). Claude Code shows an
+Anthropic subscription's usage limits only when its bearer token (`ANTHROPIC_AUTH_TOKEN`)
+is a JWT whose payload `aud` is `claude-gateway`; it decodes the payload and verifies
+nothing. A token with the flag therefore gets a secret of the form
+`<header>.<payload>.<opaigw_ secret>`, where the header is `{"alg":"none","typ":"JWT"}` and
+the payload is `{"aud":"claude-gateway"}`, both base64url. The gateway never parses or
+verifies this shape: the whole string is an opaque bearer that is SHA-256 hashed like any
+other, and the **third segment, the `opaigw_` secret, is what carries the entropy**. `alg:
+none` is harmless because nothing verifies the signature, there is none to forge. The shape is
+fixed at issue time: the flag changes only through rotation, which issues a fresh secret in
+the requested shape and retires the old one; a PATCH cannot change it
+(`portal.token_claude_code_usage_display_requires_rotation`). Service tokens and agent tokens
+keep the plain `opaigw_` secret. The shape only makes Claude Code look at the rate-limit
+headers; what the gateway sends is described in [Claude Code usage-limit
+display](compatibility-and-inference.md#93-claude-code-usage-limit-display).
+
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 
 Portal chat runs as the logged-in **session** principal, but the operator may
@@ -1245,7 +1263,11 @@ canonicalizes header casing:
 Each matched header's value is replaced with the literal marker
 `[redacted]`; the header *name* is kept so the capture viewer can still show
 that the header was present. Response headers are stored verbatim (a
-response never carries an inbound credential). On the **translate** path —
+response never carries an inbound credential), with one exception: on the translate path a
+vendor account's `anthropic-ratelimit-unified-*` headers and `anthropic-organization-id` are
+dropped from the captured upstream response headers unless the principal is entitled to that
+account's figures ([Claude Code usage-limit
+display](compatibility-and-inference.md#93-claude-code-usage-limit-display)). On the **translate** path —
 where the gateway rewrites a client request into a different upstream
 protocol (e.g. Anthropic-shaped in, Chat-Completions-shaped out) — the
 translated *upstream* request headers are redacted with the exact same list,

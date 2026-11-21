@@ -1023,7 +1023,7 @@ func TestRotateTokenReturnsFreshSecretAndPersistsHash(t *testing.T) {
 	})
 	owner := auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}}
 
-	got, err := svc.RotateToken(context.Background(), owner, "tok_1")
+	got, err := svc.RotateToken(context.Background(), owner, "tok_1", RotateTokenRequest{})
 	if err != nil {
 		t.Fatalf("RotateToken returned %v", err)
 	}
@@ -1055,13 +1055,13 @@ func TestRotateTokenRejectsForeignOwnerChatSessionAndMissing(t *testing.T) {
 	})
 	owner := auth.Token{UserID: "usr_1", Scopes: []string{"gateway:use"}}
 
-	if _, err := svc.RotateToken(context.Background(), owner, "tok_other"); !errors.Is(err, ErrTokenNotFound) {
+	if _, err := svc.RotateToken(context.Background(), owner, "tok_other", RotateTokenRequest{}); !errors.Is(err, ErrTokenNotFound) {
 		t.Fatalf("foreign owner = %v, want ErrTokenNotFound", err)
 	}
-	if _, err := svc.RotateToken(context.Background(), owner, ChatSessionTokenID); !errors.Is(err, ErrTokenNotFound) {
+	if _, err := svc.RotateToken(context.Background(), owner, ChatSessionTokenID, RotateTokenRequest{}); !errors.Is(err, ErrTokenNotFound) {
 		t.Fatalf("chat-session = %v, want ErrTokenNotFound", err)
 	}
-	if _, err := svc.RotateToken(context.Background(), owner, "tok_missing"); !errors.Is(err, ErrTokenNotFound) {
+	if _, err := svc.RotateToken(context.Background(), owner, "tok_missing", RotateTokenRequest{}); !errors.Is(err, ErrTokenNotFound) {
 		t.Fatalf("missing = %v, want ErrTokenNotFound", err)
 	}
 }
@@ -1253,6 +1253,19 @@ func (f *fakeTokens) RotateTokenSecret(ctx context.Context, id, secretHash, secr
 		if record.ID == id {
 			f.records[i].SecretHash = secretHash
 			f.records[i].SecretPrefix = secretPrefix
+			f.records[i].UpdatedAt = updatedAt
+			return nil
+		}
+	}
+	return store.ErrNotFound
+}
+
+func (f *fakeTokens) RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error {
+	for i, record := range f.records {
+		if record.ID == id {
+			f.records[i].SecretHash = secretHash
+			f.records[i].SecretPrefix = secretPrefix
+			f.records[i].ClaudeCodeUsageDisplay = claudeCodeUsageDisplay
 			f.records[i].UpdatedAt = updatedAt
 			return nil
 		}

@@ -4858,6 +4858,10 @@ func (f failingTokens) RotateTokenSecret(ctx context.Context, id, secretHash, se
 	return f.err
 }
 
+func (f failingTokens) RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error {
+	return f.err
+}
+
 func (f failingTokens) SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error {
 	return f.err
 }

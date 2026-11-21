@@ -40,6 +40,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     system_group_name: '',
     is_owner: true,
     shared_by: '',
+    share_usage_with_members: false,
     ...overrides,
   };
 }
@@ -269,6 +270,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // accounts, who is never offered them (VendorAccountsView.sharing.test.tsx
       // covers the share area), so the stubs only satisfy the view's api type.
       setVendorAccountShareLevel: vi.fn<PortalApi['setVendorAccountShareLevel']>(async (id) =>
+        makeVendorAccount({ id }),
+      ),
+      setVendorAccountShareUsage: vi.fn<PortalApi['setVendorAccountShareUsage']>(async (id) =>
         makeVendorAccount({ id }),
       ),
       setVendorAccountAdminGroups: vi.fn<PortalApi['setVendorAccountAdminGroups']>(async (id) =>

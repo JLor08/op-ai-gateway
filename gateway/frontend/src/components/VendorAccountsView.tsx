@@ -162,6 +162,7 @@ export function VendorAccountsView({
     | 'refreshModels'
     | 'refreshUsage'
     | 'setVendorAccountShareLevel'
+    | 'setVendorAccountShareUsage'
     | 'setVendorAccountAdminGroups'
     | 'vendorAccountAdminGroupCandidates'
     | 'vendorAccountResourceGroups'
@@ -719,6 +720,18 @@ export function VendorAccountsView({
             </Alert>
           )}
           <VendorAccountReadOnlyDetail t={t} account={account} status={effectiveStatus(account)} />
+          {/* The usage figures only when the owner shared them (the backend omits
+              `usage` from a member's view otherwise). Read-only: no refresh. */}
+          {account.usage && (
+            <VendorAccountUsageSection
+              t={t}
+              api={api}
+              account={account}
+              refreshKey={usageRefreshes}
+              onRefresh={refreshAccountUsage}
+              canRefresh={false}
+            />
+          )}
         </>
       );
     }

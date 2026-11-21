@@ -63,7 +63,11 @@ var (
 	// ErrTokenVendorAccessConflict: with all=false, two of the selected accounts
 	// would advertise the same public model name under their effective prefixes.
 	ErrTokenVendorAccessConflict = errors.New("portal.token_vendor_access_conflict")
-	ErrTokenNotDeletable         = errors.New("token.not_deletable")
+	// ErrTokenClaudeCodeUsageDisplayRequiresRotation: an update asked to change
+	// claude_code_usage_display. The flag shapes the token's secret, so it
+	// changes only through rotation (a PATCH with the stored value is a no-op).
+	ErrTokenClaudeCodeUsageDisplayRequiresRotation = errors.New("portal.token_claude_code_usage_display_requires_rotation")
+	ErrTokenNotDeletable                           = errors.New("token.not_deletable")
 
 	ErrServerNotFound       = errors.New(CodeServerNotFound)
 	ErrServerForbidden      = errors.New("server.forbidden")
@@ -201,16 +205,19 @@ var (
 	// ErrVendorAccountNotShared: the request needs a shared account (management groups
 	// can only be assigned to one that is `shared` or `full`) and the account is not
 	// one. Asked of the owner only, after the 404/403 gate. A 400.
-	ErrVendorAccountSharingDisabled          = errors.New("vendor_accounts.sharing_disabled")
-	ErrVendorSubscriptionSharingDisabled     = errors.New("vendor_accounts.subscription_sharing_disabled")
-	ErrVendorAccountSubscriptionShareCapped  = errors.New("vendor_account.subscription_share_capped")
-	ErrVendorAccountShareLevelInvalid        = errors.New("vendor_account.share_level_invalid")
-	ErrVendorAccountShareLevelUnchanged      = errors.New("vendor_account.share_level_unchanged")
-	ErrVendorAccountAdminGroupRequired       = errors.New("vendor_account.admin_group_required")
-	ErrVendorAccountAdminGroupInvalid        = errors.New("vendor_account.admin_group_invalid")
-	ErrVendorAccountAdminGroupParentMismatch = errors.New("vendor_account.admin_group_parent_mismatch")
-	ErrVendorAccountRootMismatch             = errors.New("vendor_account.root_mismatch")
-	ErrVendorAccountNotShared                = errors.New("vendor_account.not_shared")
+	ErrVendorAccountSharingDisabled         = errors.New("vendor_accounts.sharing_disabled")
+	ErrVendorSubscriptionSharingDisabled    = errors.New("vendor_accounts.subscription_sharing_disabled")
+	ErrVendorAccountSubscriptionShareCapped = errors.New("vendor_account.subscription_share_capped")
+	ErrVendorAccountShareLevelInvalid       = errors.New("vendor_account.share_level_invalid")
+	ErrVendorAccountShareLevelUnchanged     = errors.New("vendor_account.share_level_unchanged")
+	// ErrVendorAccountShareUsageEnabledRequired: a PUT .../share-usage body without
+	// `enabled` (a 400, answered after the 404/403 gate; nothing is written).
+	ErrVendorAccountShareUsageEnabledRequired = errors.New("vendor_account.share_usage_enabled_required")
+	ErrVendorAccountAdminGroupRequired        = errors.New("vendor_account.admin_group_required")
+	ErrVendorAccountAdminGroupInvalid         = errors.New("vendor_account.admin_group_invalid")
+	ErrVendorAccountAdminGroupParentMismatch  = errors.New("vendor_account.admin_group_parent_mismatch")
+	ErrVendorAccountRootMismatch              = errors.New("vendor_account.root_mismatch")
+	ErrVendorAccountNotShared                 = errors.New("vendor_account.not_shared")
 
 	// Subscription connect (the OAuth code-paste flow and the token import).
 	// ErrVendorAccountNotSubscription: connect operates on an auth_type
@@ -292,6 +299,10 @@ type TokenRepository interface {
 	UpdateTokenMetadata(ctx context.Context, token store.TokenRecord) error
 	DeleteToken(ctx context.Context, id string) error
 	RotateTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, updatedAt time.Time) error
+	// RotateUserTokenSecret is RotateTokenSecret for a USER token: it also
+	// writes api_tokens.claude_code_usage_display in the same write, since the
+	// flag decides the shape of the secret being stored.
+	RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error
 	// SetTokenLastUsedModel records the gateway model or group name of a token's
 	// last SUCCESSFULLY routed request (the api_tokens.last_used_model column),
 	// or returns store.ErrNotFound when no token has that id — including the empty
@@ -1254,6 +1265,10 @@ type TokenDTO struct {
 	// default and ungated like ClaudeModelAliases; always emitted so a client
 	// reading a token and writing it back preserves it.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// ClaudeCodeUsageDisplay reports that the token's secret carries the Claude
+	// Code shape, so Claude Code shows the usage limits. Always emitted. It
+	// changes only through rotation (RotateTokenRequest).
+	ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1328,6 +1343,17 @@ type CreateTokenRequest struct {
 	// DecisionsConfidenceNormalize opts the token into recomputed decision
 	// confidence (see TokenDTO). Off when omitted.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// ClaudeCodeUsageDisplay gives the new token's secret the Claude Code shape
+	// (see claudeCodeTokenSecret). Off when omitted.
+	ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
+}
+
+// RotateTokenRequest is the optional body of a token rotation.
+type RotateTokenRequest struct {
+	// ClaudeCodeUsageDisplay: nil = keep the stored shape, a non-nil value
+	// switches the token to it. Rotation is the only way to change the flag,
+	// because the secret has to change with it.
+	ClaudeCodeUsageDisplay *bool `json:"claude_code_usage_display,omitempty"`
 }
 
 type CreateTokenResponse struct {
@@ -1373,6 +1399,10 @@ type UpdateTokenRequest struct {
 	// DecisionsConfidenceNormalize: nil = keep the stored flag, a non-nil value
 	// replaces it.
 	DecisionsConfidenceNormalize *bool `json:"decisions_confidence_normalize,omitempty"`
+	// ClaudeCodeUsageDisplay: nil or equal to the stored value = no-op; a
+	// different value is ErrTokenClaudeCodeUsageDisplayRequiresRotation (the
+	// secret has to change with it, see RotateTokenRequest).
+	ClaudeCodeUsageDisplay *bool `json:"claude_code_usage_display,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -2001,6 +2031,10 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		ClaudeModelAliases:           req.ClaudeModelAliases,
 		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
+		ClaudeCodeUsageDisplay:       req.ClaudeCodeUsageDisplay,
+	}
+	if req.ClaudeCodeUsageDisplay {
+		secret = claudeCodeTokenSecret(secret)
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -2031,6 +2065,12 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	// the same request — can be half-written on a refusal.
 	if req.ClaudeEffortCompatibility != nil && !principalMayManageTokenSetting(owner) {
 		return TokenDTO{}, ErrPrincipalForbidden
+	}
+	// The flag shapes the secret, so only a rotation may change it; the same
+	// value is accepted (a client writing a token back unchanged). Checked
+	// before any field is applied, like the refusal above.
+	if req.ClaudeCodeUsageDisplay != nil && *req.ClaudeCodeUsageDisplay != record.ClaudeCodeUsageDisplay {
+		return TokenDTO{}, ErrTokenClaudeCodeUsageDisplayRequiresRotation
 	}
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
@@ -2195,8 +2235,10 @@ func (s *Service) DeleteToken(ctx context.Context, owner auth.Token, tokenID str
 // stops working immediately; the fresh secret is returned once, exactly like
 // CreateToken, so the frontend reuses the reveal flow. The chat-session pseudo
 // id has no stored secret and is rejected as not-found. Owner-scoped: a foreign
-// or missing token is ErrTokenNotFound with no existence leak.
-func (s *Service) RotateToken(ctx context.Context, owner auth.Token, id string) (CreateTokenResponse, error) {
+// or missing token is ErrTokenNotFound with no existence leak. The secret keeps
+// the token's Claude Code shape; req.ClaudeCodeUsageDisplay switches it, and
+// the flag is stored together with the new hash so the two never disagree.
+func (s *Service) RotateToken(ctx context.Context, owner auth.Token, id string, req RotateTokenRequest) (CreateTokenResponse, error) {
 	id = strings.TrimSpace(id)
 	if id == "" || id == ChatSessionTokenID {
 		return CreateTokenResponse{}, ErrTokenNotFound
@@ -2210,7 +2252,13 @@ func (s *Service) RotateToken(ctx context.Context, owner auth.Token, id string) 
 		return CreateTokenResponse{}, err
 	}
 	now := s.clock().UTC()
-	if err := s.tokens.RotateTokenSecret(ctx, record.ID, auth.HashSecret(secret), secretPrefix(secret), now); err != nil {
+	if req.ClaudeCodeUsageDisplay != nil {
+		record.ClaudeCodeUsageDisplay = *req.ClaudeCodeUsageDisplay
+	}
+	if record.ClaudeCodeUsageDisplay {
+		secret = claudeCodeTokenSecret(secret)
+	}
+	if err := s.tokens.RotateUserTokenSecret(ctx, record.ID, auth.HashSecret(secret), secretPrefix(secret), record.ClaudeCodeUsageDisplay, now); err != nil {
 		return CreateTokenResponse{}, err
 	}
 	record.SecretPrefix = secretPrefix(secret)
@@ -5929,6 +5977,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
+		ClaudeCodeUsageDisplay:         record.ClaudeCodeUsageDisplay,
 	}
 }
 
@@ -6203,6 +6252,21 @@ func percentile95(values []int64) int64 {
 		index = 1
 	}
 	return values[index-1]
+}
+
+// claudeCodeTokenSecretPrefix is `{"alg":"none","typ":"JWT"}` and
+// `{"aud":"claude-gateway"}`, each base64url-encoded, plus the separating dot.
+// Claude Code shows an Anthropic subscription's usage limits only when its
+// bearer token is a JWT whose payload `aud` is `claude-gateway`; it decodes the
+// payload without verifying anything. The gateway never parses or verifies this
+// shape either: the whole string is an opaque bearer that is only SHA-256
+// hashed, and the opaigw_ secret after the last dot is what carries the
+// entropy.
+const claudeCodeTokenSecretPrefix = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJhdWQiOiJjbGF1ZGUtZ2F0ZXdheSJ9."
+
+// claudeCodeTokenSecret gives a freshly generated secret the Claude Code shape.
+func claudeCodeTokenSecret(secret string) string {
+	return claudeCodeTokenSecretPrefix + secret
 }
 
 func generateSecret() (string, error) {

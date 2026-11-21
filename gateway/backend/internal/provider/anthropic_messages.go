@@ -317,11 +317,13 @@ func (c *AnthropicClient) post(ctx context.Context, target routing.Target, body 
 		}
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
+	// Record the headers before the status check so a 429 (which carries the
+	// rate-limit headers) is scraped too, as OpenAIResponsesClient.post does.
+	sink.RecordResponseHeaders(httpResp.Header)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		httpResp.Body.Close()
 		return nil, unavailableStatus(httpResp.StatusCode)
 	}
-	sink.RecordResponseHeaders(httpResp.Header)
 	return httpResp, nil
 }
 

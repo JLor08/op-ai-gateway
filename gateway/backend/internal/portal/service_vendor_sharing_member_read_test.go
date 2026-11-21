@@ -50,6 +50,9 @@ var vendorMemberDTOFields = map[string]string{
 	"models":                 "the gateway names the member can request (gateway_model, api_flavor, display_name; upstream_model is withheld)",
 	"is_owner":               "viewer relation (always false for a member)",
 	"shared_by":              "viewer relation (the owner's display name)",
+	// The owner's usage opt-in (#407), the account's actual value. The snapshot it
+	// unlocks is NOT listed: it is conditional, see memberDTOExtraFields.
+	"share_usage_with_members": "the owner's opt-in to show usage to members",
 }
 
 // memberDTOExtraFields returns the wire fields of dto that hold a value although a member
@@ -64,6 +67,9 @@ func memberDTOExtraFields(dto VendorAccountDTO) []string {
 		f := v.Field(i)
 		if f.IsZero() || (f.Kind() == reflect.Slice && f.Len() == 0) {
 			continue
+		}
+		if name == "usage" && dto.ShareUsageWithMembers {
+			continue // the one conditional field: the snapshot the owner's opt-in unlocks
 		}
 		if _, ok := vendorMemberDTOFields[name]; !ok {
 			extra = append(extra, name)
@@ -285,14 +291,14 @@ func TestVendorAccountMemberReadOfAFullyPopulatedAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("owner read: %v", err)
 	}
-	if zero := zeroDTOFields(owner); !slices.Equal(zero, []string{"subscription_connected", "shared_by"}) {
-		t.Fatalf("the owner's view of the fixture has empty fields %v, want only subscription_connected (an api key account) and shared_by: the fixture does not populate everything, so the member assertions would be vacuous", zero)
+	if zero := zeroDTOFields(owner); !slices.Equal(zero, []string{"subscription_connected", "share_usage_with_members", "shared_by"}) {
+		t.Fatalf("the owner's view of the fixture has empty fields %v, want only subscription_connected (an api key account), share_usage_with_members (off: the member-safe state, the opt-in has its own tests) and shared_by: the fixture does not populate everything, so the member assertions would be vacuous", zero)
 	}
 	cm, err := e.svc.GetVendorAccount(e.ctx, token("usr_cm", "admin"), acc.ID)
 	if err != nil {
 		t.Fatalf("CM read: %v", err)
 	}
-	if zero := zeroDTOFields(cm); !slices.Equal(zero, []string{"subscription_connected", "is_owner"}) {
+	if zero := zeroDTOFields(cm); !slices.Equal(zero, []string{"subscription_connected", "share_usage_with_members", "is_owner"}) {
 		t.Fatalf("the CM's view has empty fields %v, want only subscription_connected and is_owner (the management view is whole)", zero)
 	}
 	if leaked := leakedSecrets(cm, secrets); len(leaked) > 0 {

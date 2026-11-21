@@ -86,6 +86,7 @@ function makeAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
     system_group_name: '',
     is_owner: true,
     shared_by: '',
+    share_usage_with_members: false,
     ...overrides,
   };
 }
@@ -168,6 +169,32 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(claude).getAllByText(new RegExp(updatedPrefix(t)))).toHaveLength(1);
 
       expect(within(section).getAllByRole('listitem')).toHaveLength(2);
+    });
+
+    it('lists a member-only row that carries usage (the owner opted in)', async () => {
+      // The member view: not the owner, share_level withheld, the opt-in on and the
+      // snapshot present. canReportUsage must accept it.
+      const { api } = makeApi([
+        makeAccount({
+          id: 'va_member',
+          vendor: 'anthropic',
+          auth_type: 'subscription',
+          name: 'Shared Claude Max',
+          api_key_set: false,
+          subscription_connected: true,
+          is_owner: false,
+          shared_by: 'Olga Owner',
+          share_level: '',
+          share_usage_with_members: true,
+          usage: makeUsage({ five_hour_pct: 55 }),
+        }),
+      ]);
+      renderDashboard(t, { api, vendorAccountsEnabled: true });
+
+      await screen.findByRole('region', { name: t.dashboardVendorUsageTitle });
+      const card = cardOf('Shared Claude Max');
+      expect(within(card).getByText(t.vendorUsageFiveHour)).toBeInTheDocument();
+      expect(within(card).getByText(t.vendorUsagePercentUsed(55))).toBeInTheDocument();
     });
 
     it('draws the bars of a card dense (6px)', async () => {

@@ -641,6 +641,9 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"RaiseVendorAccountShareLevel": "raise",
 		"LowerVendorAccountShareLevel": "lower",
 		"SetVendorAccountShareLevel":   "share-level",
+		// The usage opt-in (service_vendor_sharing.go) is the raise gate's owner check
+		// without the admin role, pinned by TestSetVendorAccountShareUsage.
+		"SetVendorAccountShareUsage": "share-usage",
 		// Management-group assignment (service_vendor_sharing.go) is the spec's
 		// "owner-only at `shared`, owner + CM at `full`" row: the credential gate's
 		// shape, but not a credential write (it opens no credential and sends nothing
@@ -670,6 +673,10 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		// sends nothing upstream (the sealed key is only carried to the dispatch edge,
 		// inside the resolved Target), so it is neither of the write gates.
 		"VendorAccountsForRouting": "routing-grant",
+		// The usage-figure predicate (#407): a read-only yes/no on the management arm of
+		// authorizeVendorAccountRead (system scope, or a CM of a shared/full account). It
+		// writes nothing and opens no credential.
+		"VendorAccountUsageManager": "usage-reader",
 		// Operate gate (authorizeVendorAccountOperate).
 		"TestVendorAccountConnection": "operate",
 		"RefreshVendorAccountModels":  "operate",

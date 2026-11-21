@@ -347,8 +347,15 @@ type VendorAccount struct {
 	// private. Same write rules as ShareLevel -- UpdateVendorAccountSystemGroup and
 	// ClearVendorAccountSharing only.
 	SystemGroupID string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// ShareUsageWithMembers is the owner's opt-in (migration 110) to let members who
+	// reach this account through sharing also see its usage figures: the rate-limit
+	// windows and spend in the portal (account page, member view and dashboard) and the
+	// subscription's usage limits in Claude Code; the owner always sees them. Written only by
+	// UpdateVendorAccountShareUsage (default false); CreateVendorAccount and
+	// UpdateVendorAccount never write it.
+	ShareUsageWithMembers bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // VendorAccountOperatePatch is a change to the OPERATE columns of a vendor account
@@ -3562,6 +3569,10 @@ type VendorAccountStore interface {
 	// deciding who may change it is the service's job. An unknown id is
 	// ErrNotFound.
 	UpdateVendorAccountShareLevel(ctx context.Context, id, level string) error
+	// UpdateVendorAccountShareUsage writes only share_usage_with_members (migration
+	// 110) with a targeted UPDATE of that one column; updated_at is left alone.
+	// Who may change it is the service's job. An unknown id is ErrNotFound.
+	UpdateVendorAccountShareUsage(ctx context.Context, id string, enabled bool) error
 	// UpdateVendorAccountSystemGroup writes only system_group_id -- the
 	// containment root (migration 91) -- with a targeted UPDATE of that one
 	// column, mirroring UpdateServerSystemGroup. An unknown id is ErrNotFound.

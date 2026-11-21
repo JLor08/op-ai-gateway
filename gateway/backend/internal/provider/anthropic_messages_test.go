@@ -1075,3 +1075,24 @@ func TestAnthropicClientProxyNativeDoesNotFollowRedirects(t *testing.T) {
 		t.Fatal("ProxyNative mutated the caller's http.Client.CheckRedirect")
 	}
 }
+
+// TestAnthropicClientRecordsHeadersOn429: the rate-limit headers of a rejected
+// (429) response reach the capture sink, so the usage scrape sees them.
+func TestAnthropicClientRecordsHeadersOn429(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer upstream.Close()
+	sink := NewCaptureSink(1 << 20)
+	ctx := WithCaptureSink(WithUpstreamAuth(context.Background(), "x-api-key", "sk-ant-test"), sink)
+
+	_, err := NewAnthropicClient(http.DefaultClient).Complete(ctx, anthropicTarget(upstream.URL),
+		inference.Request{Messages: []inference.Message{anthropicTextMsg(inference.RoleUser, "hi")}})
+	if err == nil {
+		t.Fatal("Complete on a 429 returned nil error")
+	}
+	if got := sink.ResponseHeaders().Get("Anthropic-Ratelimit-Unified-Status"); got != "rejected" {
+		t.Fatalf("captured Anthropic-Ratelimit-Unified-Status = %q, want rejected", got)
+	}
+}

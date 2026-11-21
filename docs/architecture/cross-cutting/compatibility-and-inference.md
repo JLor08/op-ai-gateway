@@ -2484,6 +2484,25 @@ service, on an application's create and on every runtime-spec write
 upstream now serves both native endpoints (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
 
+**Response headers on the Messages passthrough.** Of the upstream's other response
+headers, only an allowlist is relayed, and only for the `anthropic_messages` flavor
+(`forwardRateLimitHeaders`, `ratelimit_headers.go`): `retry-after` and `x-should-retry`
+always, and the unified rate-limit family (`anthropic-ratelimit-unified-*`, every value)
+only when the caller is entitled to the routed account's figures
+(`rateLimitFiguresEntitled`). On inference the figures reach the account owner, a
+community manager of a `shared`/`full` account, or anyone when the owner opted in
+(`share_usage_with_members`); an inference token never carries system scope, which
+matches what the same principal sees in the portal without elevation. A self-hosted
+target is always entitled. The portal answer (`VendorAccountUsageManager`) is cached
+60 s per principal and account, bounded to 2 s per lookup, and a portal error or
+timeout is not entitled (cached 5 s); a response with no unified header skips the
+lookup entirely. The headers are copied from the final upstream response only, at the
+point the status line is written, so a discarded re-selection attempt contributes none.
+Request ids, organization ids and the `anthropic-ratelimit-requests-*` /
+`anthropic-ratelimit-tokens-*` headers are never forwarded, and neither is anything on
+the Responses flavor. A success from a target that reports no unified figures of its own
+carries the caller's last subscription windows instead; see [§9.3](#93-claude-code-usage-limit-display).
+
 **One exception at dispatch: `sglang_omni`.** For a target whose effective kind
 (`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
 `passthrough` mode as `translate`, so the relay decision and the usage row's
@@ -3893,6 +3912,77 @@ llama.cpp that maps `output_config.effort` itself would be an alternative to the
 native edit; the deployed build and template are what decide, and a manual smoke
 test that the template actually consumes the injected value, not merely that the
 gateway sent it, is the check to run. The reasoning is recorded in [ADR-059](../09-architecture-decisions.md#adr-059--claude-code-effort-is-delivered-as-a-chat-template-kwarg-on-both-paths-for-llamacpp-and-vllm-and-is-a-management-only-token-setting).
+
+### 9.3 Claude Code usage-limit display
+
+Claude Code can show an Anthropic subscription's usage limits (the 5 hour and 7 day
+windows) from the `anthropic-ratelimit-unified-*` response headers of `/v1/messages`.
+Through the gateway this works for a user who routes to a vendor subscription account and
+to local models in one session, under three conditions.
+
+**Client condition.** Claude Code only reads those headers when its bearer token
+(`ANTHROPIC_AUTH_TOKEN`) is a JWT whose payload `aud` is `claude-gateway`. A token gets such
+a secret through the opt-in `claude_code_usage_display` token option, set at creation or
+through rotation; see [Claude Code token secret
+shape](security-auth-rbac.md#claude-code-token-secret-shape). The gateway does not look at
+the shape; the rest of this section is independent of it.
+
+**Relay.** A vendor subscription response's unified figures reach the client through the
+allowlist and entitlement rule of §6 (*Response headers on the Messages passthrough*).
+
+**Window cache.** Claude Code clears its per-window display when a `/v1/messages` response
+arrives without unified headers, as every answer of a local model does. So the gateway
+remembers the caller's last subscription windows (`rateLimitWindowCache`,
+`ratelimit_window_cache.go`) and attaches them to `/v1/messages` responses of other targets:
+
+- Observed in `recordUsage`, from the upstream headers of any `vendor_anthropic` response
+  that carries `anthropic-ratelimit-unified-status` (a 2xx or a 429; native passthrough and
+  translate), and only when the caller is entitled to the account's figures
+  (`rateLimitFiguresEntitled`). The key is the principal (`user:<id>` or `service:<id>`).
+- Attached only for the Anthropic Messages flavor, on a success (2xx) that carries no
+  unified status of its own: the native passthrough before the status line, and the
+  translate path on both the buffered JSON answer and the SSE header block. An error,
+  a response with fresh upstream figures, and every other flavor (Chat Completions,
+  Responses) get nothing. On the SSE translate path the windows are written with the 200
+  header block before the upstream has answered, so a stream whose upstream then fails
+  carries them together with its SSE error event.
+- Only windows whose reset time is still in the future are written. The top-level status is
+  `allowed`, or `allowed_warning` when an attached window warns or is rejected; it is never
+  `rejected`, because the response of another provider was not refused. Overage, fallback
+  and retry headers are never replayed.
+- Per process and best effort: in memory, capped at 10 000 principals (oldest observation
+  evicted), pruned as windows expire, lost on restart and not shared between replicas.
+  After a restart or on another replica the display simply stays blank until the next
+  subscription response.
+
+**Revocation.** Entitlement is checked when a window is observed, not when it is
+attached. The cache therefore also records which vendor account each entry came from: when
+a later `vendor_anthropic` response carrying the unified status reaches a principal who is
+no longer entitled to that account (for example the owner turned off
+`share_usage_with_members`), that principal's entry from the same account is dropped
+(`Forget`), and an entry observed from another account is left alone. **Known
+limitation:** the drop needs such a response, so a principal who has lost entitlement and
+then uses only other providers keeps receiving its last stored figures, frozen, on
+local-model replies until those windows reset (up to 7 days) or the process restarts.
+Nothing new is disclosed (the principal already saw these figures), and sharing is off by
+default.
+
+**Payload captures.** The translate path stores the upstream response headers in a payload
+capture, which its owner (and admins, for a non-secret capture) can read. For a
+vendor-account target, the `anthropic-ratelimit-unified-*` headers and
+`anthropic-organization-id` are removed from the captured upstream response headers unless
+the principal is entitled to the account's figures, so a capture never hands them to
+someone the relay would have withheld them from. Native passthrough captures hold the
+client response headers, which the relay already gates.
+
+**What Claude Code shows.** The per-window utilization and reset in its own status and
+warning display. It does not show the Claude Desktop usage card or the `/usage` plan
+panel, which read Anthropic's own endpoints and need a first-party login; the gateway does
+not emulate them.
+
+**Dependency.** All of this relies on undocumented Claude Code behavior (the `aud`
+check, the header names and the clear-on-missing rule). A client update can change it
+without notice; nothing in the gateway breaks, the display just stops working.
 
 ## 10. Request bodies and size limits
 
