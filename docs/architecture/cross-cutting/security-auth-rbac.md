@@ -1265,10 +1265,11 @@ Each matched header's value is replaced with the literal marker
 `[redacted]`; the header *name* is kept so the capture viewer can still show
 that the header was present. Response headers are stored verbatim (a
 response never carries an inbound credential), with one exception: on the translate path a
-vendor account's `anthropic-ratelimit-unified-*` headers and `anthropic-organization-id` are
-dropped from the captured upstream response headers unless the principal is entitled to that
-account's figures ([Claude Code usage-limit
-display](compatibility-and-inference.md#93-claude-code-usage-limit-display)). On the **translate** path —
+vendor account's `anthropic-ratelimit-unified-*` headers, its Codex `x-codex-*` rate-limit family and
+`anthropic-organization-id` are dropped from the captured upstream response headers unless the principal
+is entitled to that account's figures ([Claude Code usage-limit
+display](compatibility-and-inference.md#93-claude-code-usage-limit-display), [Codex usage-limit
+display](compatibility-and-inference.md#95-codex-usage-limit-display)). On the **translate** path —
 where the gateway rewrites a client request into a different upstream
 protocol (e.g. Anthropic-shaped in, Chat-Completions-shaped out) — the
 translated *upstream* request headers are redacted with the exact same list,

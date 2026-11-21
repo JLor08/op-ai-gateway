@@ -18,6 +18,24 @@ import (
 // as its usage limits.
 const unifiedRateLimitPrefix = "anthropic-ratelimit-unified-"
 
+// codexRateLimitPrefix starts every header of the Codex CLI's rate-limit family
+// (x-codex-*), the figures Codex renders as its usage limits.
+const codexRateLimitPrefix = "x-codex-"
+
+// codexRateLimitSuffixes end the per-window headers of the Codex family (primary,
+// secondary and any additional named limit, e.g. x-codex-other-primary-used-percent).
+var codexRateLimitSuffixes = []string{"-used-percent", "-window-minutes", "-reset-at", "-limit-name"}
+
+// codexRateLimitNames are the single, non-windowed headers of the Codex family.
+var codexRateLimitNames = map[string]struct{}{
+	"x-codex-credits-has-credits":     {},
+	"x-codex-credits-unlimited":       {},
+	"x-codex-credits-balance":         {},
+	"x-codex-active-limit":            {},
+	"x-codex-rate-limit-reached-type": {},
+	"x-codex-promo-message":           {},
+}
+
 // rateLimitEntitlementErrorTTL is how long a failed or timed-out portal lookup is
 // remembered as "not entitled", so a store outage costs one lookup per principal and
 // account per window rather than one per request.
@@ -48,11 +66,48 @@ func hasUnifiedRateLimitHeader(h http.Header) bool {
 	return false
 }
 
+// isCodexRateLimitHeader reports whether name is in the Codex rate-limit family
+// (case-insensitive): the x-codex- prefix plus a window suffix or an explicit name.
+// Everything else under x-codex- (x-codex-turn-state, x-codex-beta-features) is not.
+func isCodexRateLimitHeader(name string) bool {
+	if len(name) < len(codexRateLimitPrefix) || !strings.EqualFold(name[:len(codexRateLimitPrefix)], codexRateLimitPrefix) {
+		return false
+	}
+	n := strings.ToLower(name)
+	if _, ok := codexRateLimitNames[n]; ok {
+		return true
+	}
+	for _, suffix := range codexRateLimitSuffixes {
+		if strings.HasSuffix(n, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCodexRateLimitHeader reports whether h carries any Codex rate-limit header, i.e.
+// whether there is anything for the entitlement gate to decide.
+func hasCodexRateLimitHeader(h http.Header) bool {
+	for name := range h {
+		if isCodexRateLimitHeader(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAccountSensitiveHeader reports whether an upstream response header carries a vendor
+// account's figures or identity: the Anthropic unified family, anthropic-organization-id
+// and the Codex rate-limit family.
+func isAccountSensitiveHeader(name string) bool {
+	return isUnifiedRateLimitHeader(name) || isCodexRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id")
+}
+
 // redactCapturedAccountHeaders keeps a vendor account's figures out of a payload
 // capture the caller's principal is not entitled to see. The translate path stores the
 // upstream response headers verbatim, and a capture is readable by its owner and, for
 // non-secret captures, by admins, so for a vendor-account target the unified
-// rate-limit family and anthropic-organization-id are dropped (from a copy; the
+// and Codex rate-limit families and anthropic-organization-id are dropped (from a copy; the
 // sink's own header set is shared with the usage scrape) unless the principal is
 // entitled to the figures. The entitlement lookup only runs when such a header is
 // present; it is cached and fails closed.
@@ -62,7 +117,7 @@ func (s *Server) redactCapturedAccountHeaders(ctx context.Context, token auth.To
 	}
 	sensitive := false
 	for name := range h {
-		if isUnifiedRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id") {
+		if isAccountSensitiveHeader(name) {
 			sensitive = true
 			break
 		}
@@ -72,7 +127,7 @@ func (s *Server) redactCapturedAccountHeaders(ctx context.Context, token auth.To
 	}
 	out := make(http.Header, len(h))
 	for name, values := range h {
-		if isUnifiedRateLimitHeader(name) || strings.EqualFold(name, "anthropic-organization-id") {
+		if isAccountSensitiveHeader(name) {
 			continue
 		}
 		out[name] = values
@@ -80,15 +135,16 @@ func (s *Server) redactCapturedAccountHeaders(ctx context.Context, token auth.To
 	return out
 }
 
-// forwardRateLimitHeaders copies the response headers the Messages passthrough relays
-// from src to dst: retry-after and x-should-retry always (they steer the client's retry
-// behavior), the unified rate-limit family only when includeUnified is set. Every value
-// of a header is copied; nothing else is (request ids, organization ids and the
-// per-minute limit headers stay upstream).
-func forwardRateLimitHeaders(dst, src http.Header, includeUnified bool) {
+// forwardRateLimitHeaders copies the response headers a native passthrough relays from
+// src to dst: retry-after and x-should-retry always (they steer the client's retry
+// behavior), plus every header gated accepts (called with the canonical name; nil
+// accepts none). Every value of a header is copied under its canonical key; nothing
+// else is (request ids, organization ids and the per-minute limit headers stay
+// upstream).
+func forwardRateLimitHeaders(dst, src http.Header, gated func(name string) bool) {
 	for name, values := range src {
 		canon := http.CanonicalHeaderKey(name)
-		if canon != "Retry-After" && canon != "X-Should-Retry" && !(includeUnified && isUnifiedRateLimitHeader(canon)) {
+		if canon != "Retry-After" && canon != "X-Should-Retry" && (gated == nil || !gated(canon)) {
 			continue
 		}
 		for _, v := range values {
@@ -109,19 +165,19 @@ type rateLimitEntitlement struct {
 	expires time.Time
 }
 
-// rateLimitFiguresEntitled reports whether the caller may receive the unified
-// rate-limit figures of the account target was routed through. Evaluated in order: a
-// self-hosted target (no vendor account) is always entitled; so is the account's owner;
-// so is anyone when the owner shared the figures with members; otherwise the portal
-// decides (system scope or a community manager of the account), cached per principal
-// and account. A portal error, a lookup slower than rateLimitEntitlementTimeout, or no
-// portal, is not entitled (fail closed; the failure is cached for
-// rateLimitEntitlementErrorTTL).
+// rateLimitFiguresEntitled reports whether the caller may receive the rate-limit
+// figures (the Anthropic unified family and the Codex family) of the account target
+// was routed through. Evaluated in order: a self-hosted target (no vendor account) is
+// always entitled; so is the account's owner; so is anyone when the owner shared the
+// figures with members; otherwise the portal decides (system scope or a community
+// manager of the account), cached per principal and account. A portal error, a lookup
+// slower than rateLimitEntitlementTimeout, or no portal, is not entitled (fail closed;
+// the failure is cached for rateLimitEntitlementErrorTTL).
 //
 // Inference narrows the portal predicate: API tokens never carry system scope (it
-// exists only on an elevated session principal, and /v1/messages is bearer-only), so on
-// this path the figures reach the owner, a community manager of a shared/full account,
-// or anyone when the owner opted in.
+// exists only on an elevated session principal, and /v1/messages and /v1/responses are
+// bearer-only), so on this path the figures reach the owner, a community manager of a
+// shared/full account, or anyone when the owner opted in.
 func (s *Server) rateLimitFiguresEntitled(ctx context.Context, token auth.Token, target routing.Target) bool {
 	if target.VendorAccountID == "" {
 		return true

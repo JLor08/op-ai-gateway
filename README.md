@@ -54,7 +54,8 @@ servers, models, launch specifications, users, and policies in a bilingual
   Claude Code (Messages API) run against it unchanged; per API token, the
   gateway can also offer Claude-compatible alias names for local models and
   pass Claude Code's effort setting on to llama.cpp and vLLM, and show a
-  vendor subscription's usage limits in Claude Code (opt-in token format).
+  vendor subscription's usage limits in Claude Code (opt-in token format)
+  and in Codex (no token option needed).
 
 **Portal chat**
 

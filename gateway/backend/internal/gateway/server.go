@@ -847,6 +847,9 @@ type Server struct {
 	// windows so they can ride along on /v1/messages responses from other providers
 	// (ratelimit_window_cache.go). Nil in a bare &Server{}; the helpers tolerate that.
 	rateLimitWindows *rateLimitWindowCache
+	// codexRateLimitWindows is the Codex-family counterpart on /v1/responses, kept
+	// apart so one principal using both clients never has one family evict the other.
+	codexRateLimitWindows *rateLimitWindowCache
 	// vendorEnabledCache / vendorRoutingModeCache are the TTL caches
 	// (settingCache, invalidatable mode -- ttlcache.go) backing the resolver's
 	// injected vendor-account accessors (SetVendorAccountAccessors), so the
@@ -1191,6 +1194,7 @@ func New(deps ServerDeps) *Server {
 	}
 	s := &Server{
 		rateLimitWindows:            newRateLimitWindowCache(10000),
+		codexRateLimitWindows:       newRateLimitWindowCache(10000),
 		Tokens:                      deps.Tokens,
 		Usage:                       deps.Usage,
 		UsageEvents:                 broker,

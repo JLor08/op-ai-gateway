@@ -112,6 +112,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 			// #407's cached subscription windows, then the principal's own limit standing.
 			s.attachTranslatedUsageLimits(r, token, w.Header())
 		}
+		if req.APIFlavor == inference.APIFlavorOpenAIResponses {
+			// The Codex windows last observed for the caller (translated answers carry none).
+			s.attachCodexRateLimitWindows(token, w.Header())
+		}
 		body = writeJSONCaptured(w, http.StatusOK, render(resp))
 	}
 	ci := buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor)
@@ -846,6 +850,10 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// /v1/messages answer from another provider can carry them (Claude Code clears
 	// its usage display otherwise). Entitlement-gated; a no-op for other providers.
 	s.observeRateLimitWindows(token, target, upstreamHeaders)
+	// The Codex counterpart: an OpenAI vendor response's family windows, kept so a
+	// later /v1/responses answer from another provider carries them (the Codex CLI
+	// clears its usage display otherwise). Entitlement-gated; a no-op otherwise.
+	s.observeCodexRateLimitWindows(token, target, upstreamHeaders)
 	// Opt-in payload capture: capture is already nil unless the caller decided to
 	// capture; capturingEnabled re-checks the FULL gate (global switch + opt-in +
 	// store/cipher wiring) defensively — capturingEnabled (capture.go) is the single

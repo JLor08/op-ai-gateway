@@ -3957,7 +3957,7 @@ const de = {
   vendorAccountShareSaved: 'Freigabe gespeichert.',
   vendorAccountShareUsageLabel: 'Nutzungswerte (Ratenlimits und Ausgaben) mit Mitgliedern teilen',
   vendorAccountShareUsageHelp:
-    'Mitglieder sehen dann die Ratenlimits und Ausgaben des Kontos im Portal (Kontoseite und Dashboard) und die Ratenlimit-Fenster in Claude Code.',
+    'Mitglieder sehen dann die Ratenlimits und Ausgaben des Kontos im Portal (Kontoseite und Dashboard) und die Ratenlimit-Fenster in Claude Code und Codex.',
   vendorAccountShareUsageSaved: 'Einstellung gespeichert.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as
@@ -7885,7 +7885,7 @@ const en: PortalMessages = {
   vendorAccountShareSaved: 'Sharing saved.',
   vendorAccountShareUsageLabel: 'Share usage figures (rate limits and spend) with members',
   vendorAccountShareUsageHelp:
-    "Members then see the account's rate limits and spend in the portal (account page and dashboard), and its rate-limit windows in Claude Code.",
+    "Members then see the account's rate limits and spend in the portal (account page and dashboard), and its rate-limit windows in Claude Code and Codex.",
   vendorAccountShareUsageSaved: 'Setting saved.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as

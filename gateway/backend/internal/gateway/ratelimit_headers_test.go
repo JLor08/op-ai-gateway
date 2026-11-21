@@ -99,7 +99,7 @@ func TestForwardRateLimitHeadersAllowlist(t *testing.T) {
 	src := rateLimitSrcHeaders()
 
 	full := http.Header{}
-	forwardRateLimitHeaders(full, src, true)
+	forwardRateLimitHeaders(full, src, isUnifiedRateLimitHeader)
 	want := http.Header{}
 	want.Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.82")
 	want.Add("Anthropic-Ratelimit-Unified-Status", "allowed")
@@ -107,7 +107,7 @@ func TestForwardRateLimitHeadersAllowlist(t *testing.T) {
 	want.Set("Retry-After", "37")
 	want.Set("X-Should-Retry", "false")
 	if len(full) != len(want) {
-		t.Fatalf("includeUnified=true copied %v, want exactly %v", full, want)
+		t.Fatalf("gated unified copied %v, want exactly %v", full, want)
 	}
 	for k, vs := range want {
 		got := full.Values(k)
@@ -117,9 +117,9 @@ func TestForwardRateLimitHeadersAllowlist(t *testing.T) {
 	}
 
 	only := http.Header{}
-	forwardRateLimitHeaders(only, src, false)
+	forwardRateLimitHeaders(only, src, nil)
 	if len(only) != 2 || only.Get("Retry-After") != "37" || only.Get("X-Should-Retry") != "false" {
-		t.Fatalf("includeUnified=false copied %v, want only Retry-After and X-Should-Retry", only)
+		t.Fatalf("nil gate copied %v, want only Retry-After and X-Should-Retry", only)
 	}
 }
 
@@ -298,16 +298,170 @@ func TestNativeMessagesRateLimitHeadersNonEntitled(t *testing.T) {
 	assertRateLimitHeaders(t, rec, false)
 }
 
-func TestNativeResponsesDoesNotForwardRateLimitHeaders(t *testing.T) {
+func TestNativeResponsesDoesNotForwardUnifiedHeaders(t *testing.T) {
 	h := rateLimitSrcHeaders()
 	h.Set("Content-Type", jsonContentType)
 	prov := &headerProxyProvider{answers: []headerAnswer{{status: 200, header: h, body: `{"output_text":"hi"}`}}}
 	srv := newNativeProxyTestServer(prov, true, false)
 	rec := relayRateLimit(srv, routing.Target{ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}, inference.APIFlavorOpenAIResponses, endpointResponses, nil)
-	for _, name := range []string{"Retry-After", "X-Should-Retry", "Anthropic-Ratelimit-Unified-Status", "Anthropic-Ratelimit-Unified-5h-Utilization"} {
+	for _, name := range []string{"Anthropic-Ratelimit-Unified-Status", "Anthropic-Ratelimit-Unified-5h-Utilization"} {
 		if v := rec.Header().Get(name); v != "" {
 			t.Fatalf("%s = %q forwarded on the Responses flavor", name, v)
 		}
+	}
+	if rec.Header().Get("Retry-After") != "37" {
+		t.Fatalf("Retry-After = %q, want 37 relayed on the Responses flavor", rec.Header().Get("Retry-After"))
+	}
+}
+
+func TestIsCodexRateLimitHeader(t *testing.T) {
+	for _, n := range []string{
+		"x-codex-primary-used-percent", "X-Codex-Secondary-Reset-At", "x-codex-primary-window-minutes",
+		"x-codex-limit-name", "x-codex-other-primary-used-percent", "x-codex-other-limit-name",
+		"x-codex-credits-has-credits", "x-codex-credits-unlimited", "x-codex-credits-balance",
+		"x-codex-active-limit", "x-codex-rate-limit-reached-type", "x-codex-promo-message",
+	} {
+		if !isCodexRateLimitHeader(n) {
+			t.Errorf("%s not in the family, want in", n)
+		}
+	}
+	for _, n := range []string{
+		"x-codex-turn-state", "x-codex-beta-features", "x-request-id", "x-ratelimit-remaining-requests",
+		"x-other-primary-used-percent", "anthropic-ratelimit-unified-status", "retry-after", "",
+	} {
+		if isCodexRateLimitHeader(n) {
+			t.Errorf("%s in the family, want out", n)
+		}
+	}
+	if hasCodexRateLimitHeader(http.Header{"X-Codex-Turn-State": {"x"}}) {
+		t.Error("turn-state alone counted as a family header")
+	}
+	if !hasCodexRateLimitHeader(http.Header{"x-codex-limit-name": {"x"}}) {
+		t.Error("non-canonical family header not detected")
+	}
+}
+
+func codexRateLimitSrcHeaders() http.Header {
+	h := http.Header{}
+	h.Set("X-Codex-Primary-Used-Percent", "42.5")
+	h.Set("X-Codex-Primary-Window-Minutes", "300")
+	h.Set("X-Codex-Primary-Reset-At", "1795290566")
+	h.Set("X-Codex-Secondary-Used-Percent", "17")
+	h.Set("X-Codex-Credits-Balance", "0")
+	h.Set("X-Codex-Turn-State", "ts_1")
+	h.Set("X-Request-Id", "req_1")
+	h.Set("X-Ratelimit-Remaining-Requests", "50")
+	h.Set("Retry-After", "37")
+	h.Set("X-Should-Retry", "false")
+	h.Set("Anthropic-Ratelimit-Unified-Status", "allowed")
+	return h
+}
+
+func assertCodexHeaders(t *testing.T, rec *httptest.ResponseRecorder, family bool) {
+	t.Helper()
+	h := rec.Header()
+	if h.Get("Retry-After") != "37" || h.Get("X-Should-Retry") != "false" {
+		t.Fatalf("Retry-After/X-Should-Retry = %q/%q, want 37/false (headers %v)", h.Get("Retry-After"), h.Get("X-Should-Retry"), h)
+	}
+	want := map[string]string{
+		"X-Codex-Primary-Used-Percent": "42.5", "X-Codex-Primary-Window-Minutes": "300",
+		"X-Codex-Primary-Reset-At": "1795290566", "X-Codex-Secondary-Used-Percent": "17", "X-Codex-Credits-Balance": "0",
+	}
+	for k, v := range want {
+		got, present := h[k]
+		if family && (len(got) != 1 || got[0] != v) {
+			t.Fatalf("%s = %v, want [%s] (headers %v)", k, got, v, h)
+		}
+		if !family && present {
+			t.Fatalf("%s forwarded to a non-entitled client: %v", k, h)
+		}
+	}
+	for _, name := range []string{"X-Codex-Turn-State", "X-Request-Id", "X-Ratelimit-Remaining-Requests", "Anthropic-Ratelimit-Unified-Status"} {
+		if v := h.Get(name); v != "" {
+			t.Fatalf("%s = %q leaked to the client", name, v)
+		}
+	}
+}
+
+func TestNativeResponsesForwardsCodexRateLimitHeaders(t *testing.T) {
+	cases := []struct {
+		name, contentType, body string
+		status                  int
+	}{
+		{"sse", "text/event-stream", "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\"}}\n\n", 200},
+		{"json", jsonContentType, `{"output_text":"hi"}`, 200},
+		{"429", jsonContentType, `{"error":{"type":"rate_limit_error","message":"slow down"}}`, 429},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := codexRateLimitSrcHeaders()
+			h.Set("Content-Type", tc.contentType)
+			prov := &headerProxyProvider{answers: []headerAnswer{{status: tc.status, header: h, body: tc.body}}}
+			srv := newNativeProxyTestServer(prov, true, false)
+			rec := relayRateLimit(srv, routing.Target{ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}, inference.APIFlavorOpenAIResponses, endpointResponses, nil)
+			if rec.Code != tc.status || rec.Body.String() != tc.body {
+				t.Fatalf("status %d body %q, want %d %q", rec.Code, rec.Body.String(), tc.status, tc.body)
+			}
+			assertCodexHeaders(t, rec, true)
+		})
+	}
+}
+
+func codexVendorTarget(owner string) routing.Target {
+	return routing.Target{Provider: routing.ProviderVendorOpenAISubscription, VendorAccountID: "acc_x", VendorAccountOwnerUserID: owner, ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}
+}
+
+func TestNativeResponsesCodexHeadersNonEntitled(t *testing.T) {
+	h := codexRateLimitSrcHeaders()
+	h.Set("Content-Type", jsonContentType)
+	prov := &headerProxyProvider{answers: []headerAnswer{{status: 429, header: h, body: `{"error":{}}`}}}
+	srv := newNativeProxyTestServer(prov, true, false)
+	srv.Portal = &usageManagerPortal{API: srv.Portal, ok: false}
+	rec := relayRateLimit(srv, codexVendorTarget("usr_other"), inference.APIFlavorOpenAIResponses, endpointResponses, nil)
+	assertCodexHeaders(t, rec, false)
+}
+
+func TestNativeResponsesCodexHeadersEntitledOwner(t *testing.T) {
+	h := codexRateLimitSrcHeaders()
+	h.Set("Content-Type", jsonContentType)
+	prov := &headerProxyProvider{answers: []headerAnswer{{status: 429, header: h, body: `{"error":{}}`}}}
+	srv := newNativeProxyTestServer(prov, true, false)
+	srv.Portal = &usageManagerPortal{API: srv.Portal, ok: false}
+	rec := relayRateLimit(srv, codexVendorTarget("usr_dev"), inference.APIFlavorOpenAIResponses, endpointResponses, nil)
+	assertCodexHeaders(t, rec, true)
+}
+
+func TestNativeResponsesWithoutCodexHeadersNeverConsultsPortal(t *testing.T) {
+	h := http.Header{"Retry-After": []string{"37"}, "X-Should-Retry": []string{"false"}, "X-Codex-Turn-State": []string{"ts"}, "Content-Type": []string{jsonContentType}}
+	prov := &headerProxyProvider{answers: []headerAnswer{{status: 429, header: h, body: `{"error":{}}`}}}
+	srv := newNativeProxyTestServer(prov, true, false)
+	p := &usageManagerPortal{API: srv.Portal, ok: true}
+	srv.Portal = p
+	rec := relayRateLimit(srv, codexVendorTarget("usr_other"), inference.APIFlavorOpenAIResponses, endpointResponses, nil)
+	if p.calls != 0 {
+		t.Fatalf("portal consulted %d times for a response with no family headers", p.calls)
+	}
+	if rec.Header().Get("Retry-After") != "37" || rec.Header().Get("X-Should-Retry") != "false" {
+		t.Fatalf("retry headers not forwarded: %v", rec.Header())
+	}
+	if rec.Header().Get("X-Codex-Turn-State") != "" {
+		t.Fatalf("turn state leaked: %v", rec.Header())
+	}
+}
+
+func TestNativeResponsesCodexHeaderValuesAndCase(t *testing.T) {
+	h := http.Header{"Content-Type": []string{jsonContentType}}
+	h["x-codex-primary-used-percent"] = []string{"9"} // direct assignment: non-canonical key
+	h["X-Codex-Limit-Name"] = []string{"codex", "codex_other"}
+	prov := &headerProxyProvider{answers: []headerAnswer{{status: 200, header: h, body: `{"output_text":"hi"}`}}}
+	srv := newNativeProxyTestServer(prov, true, false)
+	rec := relayRateLimit(srv, routing.Target{ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}, inference.APIFlavorOpenAIResponses, endpointResponses, nil)
+	got := rec.Header()
+	if v := got["X-Codex-Primary-Used-Percent"]; len(v) != 1 || v[0] != "9" {
+		t.Fatalf("canonical used-percent = %v, want [9] (headers %v)", v, got)
+	}
+	if v := got["X-Codex-Limit-Name"]; len(v) != 2 || v[0] != "codex" || v[1] != "codex_other" {
+		t.Fatalf("limit-name = %v, want both values", v)
 	}
 }
 
@@ -347,5 +501,42 @@ func TestNativeMessagesReselectionDropsFirstAttemptHeaders(t *testing.T) {
 
 	if got := rec.Header().Values("Retry-After"); len(got) != 1 || got[0] != "1" {
 		t.Fatalf("Retry-After = %v, want only the final attempt's 1", got)
+	}
+}
+
+func TestNativeResponsesReselectionDropsFirstAttemptHeaders(t *testing.T) {
+	gone := http.Header{"Retry-After": []string{"99"}, "X-Codex-Primary-Used-Percent": []string{"99"}, "Content-Type": []string{jsonContentType}}
+	final := http.Header{"Retry-After": []string{"1"}, "X-Codex-Primary-Used-Percent": []string{"5"}, "Content-Type": []string{jsonContentType}}
+	first := &headerProxyProvider{answers: []headerAnswer{{status: 409, header: gone, body: `{"error":{"code":"runtime.instance_no_capacity","message":"full"}}`}}}
+	second := &headerProxyProvider{answers: []headerAnswer{{status: 200, header: final, body: `{"output_text":"hi"}`}}}
+	srv := newNativeProxyTestServer(first, false, true)
+	base := routing.Target{ServerID: "srv-native", Model: "gw-model", ProviderModel: "upstream-model"}
+	lost := base
+	lost.InstanceKey = "inst#1"
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(rlMessagesBody))
+	rec := httptest.NewRecorder()
+	nr := nativeRelay{
+		token:    auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true},
+		target:   lost,
+		path:     "/v1/responses",
+		raw:      []byte(rlMessagesBody),
+		pfReq:    inference.Request{Model: "gw-model", RequestedModel: "gw-model", APIFlavor: inference.APIFlavorOpenAIResponses},
+		endpoint: endpointResponses,
+	}
+	nr.reselect = func(routing.Target, error) {
+		srv.Provider = second
+		again := nr
+		again.target = base
+		again.reselect = nil
+		srv.proxyNative(rec, req, again)
+	}
+	srv.proxyNative(rec, req, nr)
+
+	if got := rec.Header().Values("Retry-After"); len(got) != 1 || got[0] != "1" {
+		t.Fatalf("Retry-After = %v, want only the final attempt's 1", got)
+	}
+	if got := rec.Header().Values("X-Codex-Primary-Used-Percent"); len(got) != 1 || got[0] != "5" {
+		t.Fatalf("X-Codex-Primary-Used-Percent = %v, want only the final attempt's 5", got)
 	}
 }

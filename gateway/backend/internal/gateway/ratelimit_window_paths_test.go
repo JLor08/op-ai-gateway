@@ -319,6 +319,40 @@ func TestCapturedAccountHeadersRedactedForNonEntitled(t *testing.T) {
 	}
 }
 
+func TestCapturedCodexHeadersRedactedForNonEntitled(t *testing.T) {
+	f := newWindowsFixture(t, routing.EndpointModePassthrough)
+	f.srv.Portal = &usageManagerPortal{API: f.srv.Portal, ok: false}
+	target := routing.Target{Provider: routing.ProviderVendorOpenAISubscription, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a"}
+	h := http.Header{}
+	h.Set("X-Codex-Primary-Used-Percent", "42")
+	h.Set("X-Codex-Credits-Balance", "9.50")
+	h.Set("X-Codex-Turn-State", "state")
+	h.Set("Content-Type", "application/json")
+	ctx := context.Background()
+
+	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
+	got := f.srv.redactCapturedAccountHeaders(ctx, member, target, h)
+	if hasCodexRateLimitHeader(got) {
+		t.Fatalf("non-entitled capture kept the Codex family: %v", got)
+	}
+	if got.Get("X-Codex-Turn-State") != "state" || got.Get("Content-Type") != "application/json" {
+		t.Fatalf("unrelated headers lost: %v", got)
+	}
+	if !hasCodexRateLimitHeader(h) || len(h) != 4 {
+		t.Fatalf("the shared sink header set was mutated: %v", h)
+	}
+
+	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true}
+	if got := f.srv.redactCapturedAccountHeaders(ctx, owner, target, h); len(got) != 4 {
+		t.Fatalf("entitled owner lost headers: %v", got)
+	}
+
+	selfHosted := routing.Target{Provider: routing.ProviderVendorOpenAISubscription}
+	if got := f.srv.redactCapturedAccountHeaders(ctx, member, selfHosted, h); len(got) != 4 {
+		t.Fatalf("target without an account was redacted: %v", got)
+	}
+}
+
 // captureSinkVendorProvider answers the translate path (Complete) the way a real
 // upstream client does: it records the upstream response headers into the capture
 // sink threaded via the context.
