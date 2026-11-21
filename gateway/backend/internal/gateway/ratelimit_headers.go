@@ -18,6 +18,24 @@ import (
 // as its usage limits.
 const unifiedRateLimitPrefix = "anthropic-ratelimit-unified-"
 
+// codexRateLimitPrefix starts every header of the Codex CLI's rate-limit family
+// (x-codex-*), the figures Codex renders as its usage limits.
+const codexRateLimitPrefix = "x-codex-"
+
+// codexRateLimitSuffixes end the per-window headers of the Codex family (primary,
+// secondary and any additional named limit, e.g. x-codex-other-primary-used-percent).
+var codexRateLimitSuffixes = []string{"-used-percent", "-window-minutes", "-reset-at", "-limit-name"}
+
+// codexRateLimitNames are the single, non-windowed headers of the Codex family.
+var codexRateLimitNames = map[string]struct{}{
+	"x-codex-credits-has-credits":     {},
+	"x-codex-credits-unlimited":       {},
+	"x-codex-credits-balance":         {},
+	"x-codex-active-limit":            {},
+	"x-codex-rate-limit-reached-type": {},
+	"x-codex-promo-message":           {},
+}
+
 // rateLimitEntitlementErrorTTL is how long a failed or timed-out portal lookup is
 // remembered as "not entitled", so a store outage costs one lookup per principal and
 // account per window rather than one per request.
@@ -42,6 +60,36 @@ func isUnifiedRateLimitHeader(name string) bool {
 func hasUnifiedRateLimitHeader(h http.Header) bool {
 	for name := range h {
 		if isUnifiedRateLimitHeader(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// isCodexRateLimitHeader reports whether name is in the Codex rate-limit family
+// (case-insensitive): the x-codex- prefix plus a window suffix or an explicit name.
+// Everything else under x-codex- (x-codex-turn-state, x-codex-beta-features) is not.
+func isCodexRateLimitHeader(name string) bool {
+	n := strings.ToLower(name)
+	if !strings.HasPrefix(n, codexRateLimitPrefix) {
+		return false
+	}
+	if _, ok := codexRateLimitNames[n]; ok {
+		return true
+	}
+	for _, suffix := range codexRateLimitSuffixes {
+		if strings.HasSuffix(n, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCodexRateLimitHeader reports whether h carries any Codex rate-limit header, i.e.
+// whether there is anything for the entitlement gate to decide.
+func hasCodexRateLimitHeader(h http.Header) bool {
+	for name := range h {
+		if isCodexRateLimitHeader(name) {
 			return true
 		}
 	}
@@ -80,15 +128,16 @@ func (s *Server) redactCapturedAccountHeaders(ctx context.Context, token auth.To
 	return out
 }
 
-// forwardRateLimitHeaders copies the response headers the Messages passthrough relays
-// from src to dst: retry-after and x-should-retry always (they steer the client's retry
-// behavior), the unified rate-limit family only when includeUnified is set. Every value
-// of a header is copied; nothing else is (request ids, organization ids and the
-// per-minute limit headers stay upstream).
-func forwardRateLimitHeaders(dst, src http.Header, includeUnified bool) {
+// forwardRateLimitHeaders copies the response headers a native passthrough relays from
+// src to dst: retry-after and x-should-retry always (they steer the client's retry
+// behavior), plus every header gated accepts (called with the canonical name; nil
+// accepts none). Every value of a header is copied under its canonical key; nothing
+// else is (request ids, organization ids and the per-minute limit headers stay
+// upstream).
+func forwardRateLimitHeaders(dst, src http.Header, gated func(name string) bool) {
 	for name, values := range src {
 		canon := http.CanonicalHeaderKey(name)
-		if canon != "Retry-After" && canon != "X-Should-Retry" && !(includeUnified && isUnifiedRateLimitHeader(canon)) {
+		if canon != "Retry-After" && canon != "X-Should-Retry" && (gated == nil || !gated(canon)) {
 			continue
 		}
 		for _, v := range values {

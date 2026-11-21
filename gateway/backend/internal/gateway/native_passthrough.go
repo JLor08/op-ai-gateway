@@ -1145,8 +1145,11 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	}
 	if rel.pfReq.APIFlavor == inference.APIFlavorAnthropicMessages {
 		// Entitlement is looked up only when there are unified figures to gate.
-		forwardRateLimitHeaders(w.Header(), resp.Header,
-			hasUnifiedRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target))
+		var gated func(string) bool
+		if hasUnifiedRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
+			gated = isUnifiedRateLimitHeader
+		}
+		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
 		// A success from a provider that reports no subscription windows of its own
 		// (a local model) carries the caller's last observed ones, so Claude Code
 		// keeps its usage display. Fresh upstream windows are never overlaid.
@@ -1160,6 +1163,14 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			attachPrincipalLimitStanding(r.Context(), w.Header())
 		}
+	} else if rel.pfReq.APIFlavor == inference.APIFlavorOpenAIResponses {
+		// The Codex family is gated like the unified one: the lookup runs only when
+		// the upstream sent a family header. retry-after and x-should-retry always pass.
+		var gated func(string) bool
+		if hasCodexRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
+			gated = isCodexRateLimitHeader
+		}
+		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
 	}
 	w.WriteHeader(resp.StatusCode)
 
