@@ -208,7 +208,7 @@ type API interface {
 	RotateCertificateCA(context.Context, auth.Token) error
 	RotateNetbirdToken(context.Context, auth.Token) (RotateNetbirdTokenResult, error)
 	RotateServiceToken(context.Context, auth.Token, string, string) (CreateServiceTokenResponse, error)
-	RotateToken(context.Context, auth.Token, string) (CreateTokenResponse, error)
+	RotateToken(context.Context, auth.Token, string, RotateTokenRequest) (CreateTokenResponse, error)
 	RuntimeWarnings(context.Context, auth.Token, string) ([]string, error)
 	SMTPRuntimeConfig(context.Context) (SMTPRuntimeConfig, error)
 	SaveChat(context.Context, auth.Token, string, UpdateChatRequest) (ChatDTO, error)

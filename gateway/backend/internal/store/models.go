@@ -193,6 +193,13 @@ type TokenRecord struct {
 	// (ADR-098). Stored as api_tokens.decisions_confidence_normalize; off means
 	// no behaviour change. Ungated, like ClaudeModelAliases.
 	DecisionsConfidenceNormalize bool
+	// ClaudeCodeUsageDisplay is the opt-in (default false) that gives the
+	// token's secret the Claude Code shape (a JWT-looking prefix around the
+	// opaigw_ secret) so Claude Code shows the usage limits. Stored as
+	// api_tokens.claude_code_usage_display. It changes only through secret
+	// rotation (RotateUserTokenSecret): UpdateTokenMetadata never writes it,
+	// because the secret has to change with it.
+	ClaudeCodeUsageDisplay bool
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored

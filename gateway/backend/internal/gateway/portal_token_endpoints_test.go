@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"testing"
 	"time"
 )
@@ -283,5 +284,88 @@ func TestPortalTokensVendorAccessRoundTrip(t *testing.T) {
 	}
 	if _, va = decodeToken(rec, false); va != nil {
 		t.Fatalf("policy after reset = %+v, want omitted", va)
+	}
+}
+
+// claudeCodeSecretPrefix is the JWT-looking prefix a claude_code_usage_display
+// token's secret starts with (header + payload segments and their dots).
+const claudeCodeSecretPrefix = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJhdWQiOiJjbGF1ZGUtZ2F0ZXdheSJ9.opaigw_"
+
+func rotateTokenSecretOf(t *testing.T, srv *Server, id, body string) (int, string, portalTokenRotateBody) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPost, "/api/portal/tokens/"+id+"/rotate", body))
+	var out portalTokenRotateBody
+	if rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode rotate response: %v (%s)", err, rec.Body.String())
+		}
+	}
+	return rec.Code, rec.Body.String(), out
+}
+
+type portalTokenRotateBody struct {
+	Secret string `json:"secret"`
+	Token  struct {
+		ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
+	} `json:"token"`
+}
+
+// TestPortalTokenRotateClaudeCodeUsageDisplay pins the rotate endpoint's
+// optional body (#407): {"claude_code_usage_display":true} switches the token to
+// the Claude Code secret shape, an empty body keeps the current shape, a
+// malformed body is a 400, and a PATCH that would change the flag is refused
+// with the stable code (the same value is accepted).
+func TestPortalTokenRotateClaudeCodeUsageDisplay(t *testing.T) {
+	srv := NewTestServer()
+	id := createEditableToken(t, srv, "cc-rotate")
+
+	code, body, got := rotateTokenSecretOf(t, srv, id, `{"claude_code_usage_display": true}`)
+	if code != http.StatusOK || !strings.HasPrefix(got.Secret, claudeCodeSecretPrefix) || !got.Token.ClaudeCodeUsageDisplay {
+		t.Fatalf("rotate(true) = %d %s", code, body)
+	}
+
+	// An empty body is today's behaviour: the shape is kept.
+	code, body, got = rotateTokenSecretOf(t, srv, id, "")
+	if code != http.StatusOK || !strings.HasPrefix(got.Secret, claudeCodeSecretPrefix) || !got.Token.ClaudeCodeUsageDisplay {
+		t.Fatalf("rotate(empty) = %d %s", code, body)
+	}
+
+	// Malformed JSON is a 400.
+	code, body, _ = rotateTokenSecretOf(t, srv, id, `{"claude_code_usage_display":`)
+	if code != http.StatusBadRequest || !strings.Contains(body, "request.invalid_json") {
+		t.Fatalf("rotate(malformed) = %d %s, want 400 request.invalid_json", code, body)
+	}
+
+	// PATCH with the stored value is accepted, a different one is refused.
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/tokens/"+id, `{"claude_code_usage_display": true}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH same value = %d %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/tokens/"+id, `{"claude_code_usage_display": false}`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH different value = %d, want 400 (%s)", rec.Code, rec.Body.String())
+	}
+	if c := errorBodyOf(t, rec); c != "portal.token_claude_code_usage_display_requires_rotation" {
+		t.Fatalf("PATCH error code = %q", c)
+	}
+
+	// Rotating back to false returns an opaque secret.
+	code, body, got = rotateTokenSecretOf(t, srv, id, `{"claude_code_usage_display": false}`)
+	if code != http.StatusOK || !strings.HasPrefix(got.Secret, "opaigw_") || got.Token.ClaudeCodeUsageDisplay {
+		t.Fatalf("rotate(false) = %d %s", code, body)
+	}
+}
+
+// TestPortalTokenRotateWithoutBodyKeepsOpaqueShape: a plain rotate of an
+// ordinary token still returns an opaque opaigw_ secret.
+func TestPortalTokenRotateWithoutBodyKeepsOpaqueShape(t *testing.T) {
+	srv := NewTestServer()
+	id := createEditableToken(t, srv, "plain-rotate")
+	code, body, got := rotateTokenSecretOf(t, srv, id, "")
+	if code != http.StatusOK || !strings.HasPrefix(got.Secret, "opaigw_") || got.Token.ClaudeCodeUsageDisplay {
+		t.Fatalf("rotate(empty) = %d %s", code, body)
 	}
 }

@@ -1506,7 +1506,11 @@ paths:
       carries the opt-in decisions_confidence_normalize flag (default false,
       always present on a read): when true, the confidence of the choice and
       score answers of /v1/decisions and /v1/systemone is recomputed from
-      their probabilities. It is NOT management-gated.
+      their probabilities. It is NOT management-gated. A token also
+      carries the opt-in claude_code_usage_display flag (default false, always
+      present on a read): when true, its secret has the Claude Code shape (a
+      JWT-looking prefix around the opaigw_ secret) so Claude Code shows the
+      usage limits. It is set on create and changed only by rotation.
     get:
       tags: [portal]
       summary: List own API tokens (each row carries vendor_access when the token has any)
@@ -1535,6 +1539,7 @@ paths:
                         claude_model_aliases: { type: boolean }
                         claude_effort_compatibility: { type: boolean }
                         decisions_confidence_normalize: { type: boolean }
+                        claude_code_usage_display: { type: boolean }
     post:
       tags: [portal]
       summary: Create an API token (optionally with a vendor_access policy)
@@ -1561,8 +1566,8 @@ paths:
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
-                claude_effort_compatibility and
-                decisions_confidence_normalize are modeled here.
+                claude_effort_compatibility, decisions_confidence_normalize
+                and claude_code_usage_display are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1581,6 +1586,12 @@ paths:
                   description: >
                     Opt into recomputed decision confidence. Absent means off.
                     Not management-gated.
+                claude_code_usage_display:
+                  type: boolean
+                  description: >
+                    Give the new token's secret the Claude Code shape (a
+                    JWT-looking prefix around the opaigw_ secret) so Claude
+                    Code shows the usage limits. Absent means off.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1609,8 +1620,8 @@ paths:
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
-                claude_effort_compatibility and
-                decisions_confidence_normalize are modeled here.
+                claude_effort_compatibility, decisions_confidence_normalize
+                and claude_code_usage_display are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1631,6 +1642,13 @@ paths:
                   description: >
                     Replaces the stored flag when present (true or false);
                     absent keeps it. Not management-gated.
+                claude_code_usage_display:
+                  type: boolean
+                  description: >
+                    Accepted only with the stored value (a no-op). A different
+                    value is a 400 portal.token_claude_code_usage_display_requires_rotation:
+                    the flag shapes the secret and changes only through
+                    POST /api/portal/tokens/{id}/rotate.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1645,11 +1663,28 @@ paths:
     post:
       tags: [portal]
       summary: Rotate an own API token
+      description: >
+        Issues a fresh secret (returned once) and retires the old one. The body
+        is optional: an empty body keeps the token's secret shape, a malformed
+        one is a 400 request.invalid_json. claude_code_usage_display switches
+        the token to (true) or from (false) the Claude Code secret shape; it is
+        the only way to change that flag on an existing token.
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                claude_code_usage_display:
+                  type: boolean
+                  description: Absent keeps the stored shape.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
   /api/portal/chats:
     get:
       tags: [portal]

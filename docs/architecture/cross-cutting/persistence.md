@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 110 migrations in order, same as
+- **Only-pending.** A fresh install runs all 111 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -230,6 +230,12 @@ Rules that keep this safe over time:
   name at the same token sites and at `AuthorizeRunAsToken`'s field-by-field copy); it is
   **ungated**, like `claude_model_aliases` ([Security, Authentication & Authorization
   §4](security-auth-rbac.md#decision-confidence-normalization-is-an-ordinary-non-gated-token-setting)).
+  Migration 111 (`token_claude_code_usage_display`) adds `api_tokens.claude_code_usage_display`
+  the same way (`integer not null default 0`, every existing token backfilled to *off*), with
+  one difference from its siblings: it is **not** written by `UpdateTokenMetadata`, only by the
+  create insert and by `RotateUserTokenSecret`, which sets it in the same statement as the new
+  hash and prefix because the flag decides the shape of the secret (the migration-40 rebuild
+  test re-applies this column too).
   Migration 107 (`application_decision_modes`) is the endpoint-mode migration 72's
   twin: two `text not null default ''` columns on both `applications` and
   `agent_runtime_specs`, each blank value then backfilled under a `where ... = ''` guard

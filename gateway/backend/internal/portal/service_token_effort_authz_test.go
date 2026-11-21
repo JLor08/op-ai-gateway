@@ -66,6 +66,11 @@ func (w *writeCountingTokens) RotateTokenSecret(ctx context.Context, id, secretH
 	return w.TokenRepository.RotateTokenSecret(ctx, id, secretHash, secretPrefix, updatedAt)
 }
 
+func (w *writeCountingTokens) RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error {
+	w.writes++
+	return w.TokenRepository.RotateUserTokenSecret(ctx, id, secretHash, secretPrefix, claudeCodeUsageDisplay, updatedAt)
+}
+
 func (w *writeCountingTokens) SetTokenLastUsedModel(ctx context.Context, tokenID, model string) error {
 	w.writes++
 	return w.TokenRepository.SetTokenLastUsedModel(ctx, tokenID, model)

@@ -6,6 +6,7 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"op-ai-gateway/internal/apierror"
 	"op-ai-gateway/internal/portal"
@@ -186,7 +187,16 @@ func (s *Server) handlePortalTokenRotate(w http.ResponseWriter, r *http.Request,
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeTokenNotFound, msgTokenNotFound, ""))
 		return
 	}
-	resp, err := s.Portal.RotateToken(r.Context(), token, id)
+	// The body is optional: an empty one is a plain rotation that keeps the
+	// token's secret shape; anything else must be one JSON object.
+	var req portal.RotateTokenRequest
+	body := http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+	defer body.Close()
+	if err := json.NewDecoder(body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeJSONDecodeError(w, err)
+		return
+	}
+	resp, err := s.Portal.RotateToken(r.Context(), token, id, req)
 	if err != nil {
 		writePortalTokenError(w, err)
 		return
@@ -210,6 +220,7 @@ var portalTokenErrRows = []errRow{
 	{err: portal.ErrTokenModelOverrideInvalid, status: http.StatusBadRequest, code: "portal.token_model_override_invalid", msg: "token model override is invalid"},
 	{err: portal.ErrTokenVendorAccessInvalid, status: http.StatusBadRequest, code: "portal.token_vendor_access_invalid", msg: "token vendor access is invalid"},
 	{err: portal.ErrTokenVendorAccessConflict, status: http.StatusBadRequest, code: "portal.token_vendor_access_conflict", msg: "token vendor access names collide"},
+	{err: portal.ErrTokenClaudeCodeUsageDisplayRequiresRotation, status: http.StatusBadRequest, code: "portal.token_claude_code_usage_display_requires_rotation", msg: "claude_code_usage_display changes only through token rotation"},
 	{err: portal.ErrTokenNotDeletable, status: http.StatusBadRequest, code: "token.not_deletable", msg: "token cannot be modified or deleted"},
 	{err: portal.ErrTokenNotFound, status: http.StatusNotFound, code: portal.CodeTokenNotFound, msg: msgTokenNotFound},
 	{err: store.ErrNotFound, status: http.StatusNotFound, code: portal.CodeTokenNotFound, msg: msgTokenNotFound},

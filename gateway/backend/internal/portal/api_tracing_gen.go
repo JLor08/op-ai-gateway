@@ -2087,7 +2087,7 @@ func (_d *APIWithTracing) RotateServiceToken(ctx context.Context, t1 auth.Token,
 	return _d.API.RotateServiceToken(ctx, t1, s1, s2)
 }
 
-func (_d *APIWithTracing) RotateToken(ctx context.Context, t1 auth.Token, s1 string) (c2 CreateTokenResponse, err error) {
+func (_d *APIWithTracing) RotateToken(ctx context.Context, t1 auth.Token, s1 string, r1 RotateTokenRequest) (c2 CreateTokenResponse, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.RotateToken")
 	defer span.End()
 	defer func() {
@@ -2096,7 +2096,7 @@ func (_d *APIWithTracing) RotateToken(ctx context.Context, t1 auth.Token, s1 str
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.RotateToken(ctx, t1, s1)
+	return _d.API.RotateToken(ctx, t1, s1, r1)
 }
 
 func (_d *APIWithTracing) RuntimeWarnings(ctx context.Context, t1 auth.Token, s1 string) (sa1 []string, err error) {

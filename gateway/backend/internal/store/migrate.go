@@ -143,6 +143,7 @@ var migrations = []migration{
 	{version: 108, name: "token_decisions_confidence_normalize", up: migration108Up},
 	{version: 109, name: "runtime_spec_execution_mode", up: migration109Up},
 	{version: 110, name: "vendor_account_share_usage", up: migration110Up},
+	{version: 111, name: "token_claude_code_usage_display", up: migration111Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4823,4 +4824,14 @@ func migration109Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // addColumnIfMissing keeps it re-runnable.
 func migration110Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "vendor_accounts", "share_usage_with_members integer not null default 0")
+}
+
+// migration111Up adds the opt-in api_tokens.claude_code_usage_display flag
+// (#407): when set, the token's secret carries the JWT-shaped prefix Claude
+// Code needs before it shows the usage limits. The flag is recorded so the
+// shape survives a rotation. `integer not null default 0` on both dialects,
+// existing tokens land on 0 = opaque secret, so the upgrade changes nothing.
+// addColumnIfMissing keeps it re-runnable.
+func migration111Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_code_usage_display integer not null default 0")
 }

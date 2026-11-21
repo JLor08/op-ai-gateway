@@ -380,6 +380,28 @@ func (m *MemoryDirectory) RotateTokenSecret(ctx context.Context, id, secretHash,
 	return nil
 }
 
+// RotateUserTokenSecret is RotateTokenSecret that also stores the token's
+// claude_code_usage_display flag, so the flag and the secret it shapes change
+// under one lock.
+func (m *MemoryDirectory) RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing, ok := m.tokens[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	existing.SecretHash = secretHash
+	existing.SecretPrefix = secretPrefix
+	existing.ClaudeCodeUsageDisplay = claudeCodeUsageDisplay
+	existing.UpdatedAt = updatedAt
+	m.tokens[id] = existing
+	m.auth.RekeyToken(id, secretHash)
+	return nil
+}
+
 func (m *MemoryDirectory) DeleteToken(ctx context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
