@@ -43,6 +43,19 @@ import type {
   VRAMReportDTO,
 } from '../api';
 
+// One per-test timeout for this whole file (#175). Its tests drive the portal's
+// largest form, where DOM queries are expensive: one getByLabelText on the open
+// create form (about 1,000 elements) takes 70-110 ms on a developer machine,
+// and a test makes up to dozens of them, so some 40 tests take over 1 s there
+// and the slowest about 3.6 s. A shared CI runner under the full suite's
+// parallel load runs this file 3-4.5 times slower, which has pushed a test of
+// one describe block after another past vitest's 5 s default -- a different one
+// each time. A budget raised block by block only moved the failure on, so the
+// file sets one for every test, with room for its slowest test on the slowest
+// runner seen. A test that hangs still fails, at this bound. vi.setConfig
+// applies to this file only.
+vi.setConfig({ testTimeout: 30_000 });
+
 const t = messages.de;
 
 const server: PortalServer = {
@@ -1371,7 +1384,7 @@ describe('RuntimeAdminSection launch specs list', () => {
   });
 });
 
-describe('RuntimeAdminSection vllm_sr launch-spec kind', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection vllm_sr launch-spec kind', () => {
   async function openCreate() {
     const rendered = renderSection({
       application: { ...application, api_flavors: ['openai', 'anthropic'] },
@@ -1436,7 +1449,7 @@ describe('RuntimeAdminSection vllm_sr launch-spec kind', { timeout: 15_000 }, ()
   });
 });
 
-describe('RuntimeAdminSection sglang launch-spec kinds', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection sglang launch-spec kinds', () => {
   it('offers both types and shows each note only for its own type', async () => {
     renderSection();
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
@@ -2900,7 +2913,7 @@ describe('RuntimeAdminSection edit + delete', () => {
  * effective flavors (a create, an edit, a spec delete) re-reads them; the
  * model-mapping tab's edit mask reads the marker off those rows.
  */
-describe('RuntimeAdminSection reloads the mappings after a spec write', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection reloads the mappings after a spec write', () => {
   /**
    * Wraps the fake's mappings read, keeping what it answers, so that every
    * later call records how many entries `writes` held when it was issued. A
@@ -4332,7 +4345,9 @@ describe('RuntimeAdminSection probe-reachability column (task 6)', () => {
     stream.setStatus('open');
     await screen.findByText('Alpha');
 
-    const chips = screen.getAllByText(
+    // Awaited: the chips render once the status row arrived, after the mapping
+    // row itself; a loaded runner has read them before that.
+    const chips = await screen.findAllByText(
       probeLabel(t.runtimeProbeMetricsPrefix, t.runtimeProbeStateNa),
     );
     expect(chips.length).toBeGreaterThan(0);
@@ -5081,7 +5096,7 @@ describe('RuntimeAdminSection restart sequence', () => {
 // says `pinned: false`, and a body built from it would undo the re-pin. Each
 // write therefore reads the spec first, inside its own bound, and builds its
 // body from what the read returns.
-describe('RuntimeAdminSection override writes read the spec fresh', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection override writes read the spec fresh', () => {
   function setup() {
     const handles = renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
@@ -8549,7 +8564,7 @@ describe('RuntimeAdminSection visibility mode', () => {
  * destroy rows the launch specs depend on -- and with the ownership boundary
  * enforced in the one direction the spec form does not enforce it.
  */
-describe('RuntimeAdminSection model-mapping tab', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection model-mapping tab', () => {
   it('places the model-mapping tab to the LEFT of the runtime specs', async () => {
     renderSection({ mappings: [makeMapping({ id: 'map_1' })] });
     await screen.findByText('gw-model');
@@ -10467,10 +10482,7 @@ describe('RuntimeAdminSection launch-spec flavor hints', () => {
 // A switch of Type to or from stable_diffusion_cpp moves the API-variant block
 // only while it still holds the values the form put there, judged against the
 // parent template and the sd default.
-// Each case drives one or two whole launch-spec form sessions through several
-// MUI selects. On a loaded CI runner the longest of them takes well over half
-// of vitest's 5 s default, so the block sets its own budget.
-describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection launch-spec type-switch flavor defaults', () => {
   it('sets openai_images with both modes disabled when an untouched Create switches to sd', async () => {
     const { putSpecs } = renderSection({
       application: {
@@ -10726,7 +10738,7 @@ describe('RuntimeAdminSection launch-spec type-switch flavor defaults', { timeou
 // block: speech only, both coding-agent modes disabled. The rule is the sd one
 // (only values the form put there move), and audio.cpp answers GET /health, so
 // unlike sd its health path default stays /health.
-describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection audio_cpp launch-spec kind', () => {
   async function openCreateWithBinary(
     parent: Partial<PortalApplication> = { api_flavors: ['openai', 'anthropic'] },
     binary = '/opt/audiocpp/audiocpp_server',
@@ -10972,11 +10984,7 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', { timeout: 15_000 }, 
 // files set through the API (which this form may never have touched) is the
 // property that matters most here.
 // ---------------------------------------------------------------------------
-// Timeout raised from the 5000ms default: these tests drive many click-by-click
-// renders of this large form (each config-file row is two MUI text fields), which
-// can outrun 5s on a loaded/degraded CI runner even though they pass comfortably
-// otherwise. The behaviour under test is unchanged; only the deadline is relaxed.
-describe('RuntimeAdminSection config files editor (#257)', { timeout: 20000 }, () => {
+describe('RuntimeAdminSection config files editor (#257)', () => {
   const filesOnTheServer = [
     { name: 'models.ini', content: '[a]\nmodel = /models/a.gguf\nport = ${PORT}\n' },
     { name: 'Chat.Template.jinja', content: '{{ messages }}\n' },
@@ -11602,13 +11610,8 @@ describe('RuntimeAdminSection instance settings', () => {
     });
   });
 
-  // The timeout is raised for a cost this test cannot shed: it fills the
-  // create form, the largest DOM on the portal, and each of its eight
-  // label/role queries walks all of it (60-100 ms apiece on a developer
-  // machine, about 1.2 s in all; the same on main). A shared CI runner under
-  // the full suite's parallel load has taken more than the default 5 s for
-  // it. The test awaits nothing but the PUT, and the checkbox is looked up
-  // once.
+  // The test awaits nothing but the PUT, and the checkbox is looked up once:
+  // every label query on the create form is costly (see the file's timeout).
   it('sends the neutral 0/0/0 once unticked, and never refuses what the hidden fields hold', async () => {
     const { created, putSpecs } = await openFilledCreate();
     const replicableBox = screen.getByLabelText(t.runtimeSpecReplicable);
@@ -11631,7 +11634,7 @@ describe('RuntimeAdminSection instance settings', () => {
       max_instances: 0,
       instance_parallelism: 0,
     });
-  }, 15_000);
+  });
 
   it('saves a stored replicable spec unticked as the neutral 0/0/0', async () => {
     const { putSpecs } = await openApiTokenSpecEdit({
@@ -12193,8 +12196,12 @@ describe('RuntimeAdminSection per-instance live status', () => {
     );
 
     await screen.findByText('Alpha');
-    expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(
-      t.runtimeSpecIdleTimeoutNever,
+    // Awaited: the cell reads "—" until the row's spec has loaded, which comes
+    // after the mapping row; a loaded runner has read it before that.
+    await waitFor(() =>
+      expect(cellForColumn('Alpha', t.runtimeSpecIdleTimeout)).toHaveTextContent(
+        t.runtimeSpecIdleTimeoutNever,
+      ),
     );
   });
 
@@ -13095,11 +13102,7 @@ describe('RuntimeAdminSection live-status Start, Stop and Pin', () => {
 // The spec PUT is a full document: a save without the cluster fields turns
 // the cluster off and clears its membership. Every save from the form must
 // therefore carry them, a member the caller cannot see included.
-// The edit-form round trips here render the whole spec form with the cluster
-// block and its members several times (up to ~1.6 s locally); a shared CI runner
-// under the full suite's parallel load has pushed that past the 5 s default, as
-// for the other form-heavy describes in this file.
-describe('RuntimeAdminSection cluster head round trip', { timeout: 15_000 }, () => {
+describe('RuntimeAdminSection cluster head round trip', () => {
   const visibleMember = {
     position: 0,
     server_id: 'srv_b',
