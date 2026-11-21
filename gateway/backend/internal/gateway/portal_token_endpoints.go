@@ -192,8 +192,26 @@ func (s *Server) handlePortalTokenRotate(w http.ResponseWriter, r *http.Request,
 	var req portal.RotateTokenRequest
 	body := http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	defer body.Close()
-	if err := json.NewDecoder(body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		writeJSONDecodeError(w, err)
+	dec := json.NewDecoder(body)
+	if err := dec.Decode(&req); err != nil {
+		// io.EOF here means an empty or whitespace-only body: no body.
+		if !errors.Is(err, io.EOF) {
+			writeJSONDecodeError(w, err)
+			return
+		}
+	} else if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		// Same rule as readRawJSONLimit: exactly one JSON value. Checked before
+		// rotating, because a rotation revokes the old secret.
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeBodyTooLarge(w)
+			return
+		}
+		message := "request body must contain exactly one JSON value"
+		if err != nil {
+			message = err.Error()
+		}
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, message, ""))
 		return
 	}
 	resp, err := s.Portal.RotateToken(r.Context(), token, id, req)

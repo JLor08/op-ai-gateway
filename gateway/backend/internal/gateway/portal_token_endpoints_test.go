@@ -331,6 +331,29 @@ func TestPortalTokenRotateClaudeCodeUsageDisplay(t *testing.T) {
 		t.Fatalf("rotate(empty) = %d %s", code, body)
 	}
 
+	// Whitespace-only counts as no body: a plain rotation keeping the shape.
+	code, body, got = rotateTokenSecretOf(t, srv, id, " \n\t ")
+	if code != http.StatusOK || !strings.HasPrefix(got.Secret, claudeCodeSecretPrefix) || !got.Token.ClaudeCodeUsageDisplay {
+		t.Fatalf("rotate(whitespace) = %d %s", code, body)
+	}
+
+	// Trailing data after the first value is a 400 and NOTHING is rotated: the
+	// secret from the last good rotation must still authenticate.
+	live := got.Secret
+	for _, bad := range []string{`{"claude_code_usage_display":false}garbage`, `{}{}`} {
+		code, body, _ = rotateTokenSecretOf(t, srv, id, bad)
+		if code != http.StatusBadRequest || !strings.Contains(body, "request.invalid_json") {
+			t.Fatalf("rotate(%s) = %d %s, want 400 request.invalid_json", bad, code, body)
+		}
+		req := httptest.NewRequest(http.MethodGet, "/api/portal/tokens", nil)
+		req.Header.Set("Authorization", "Bearer "+live)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("after rejected rotate(%s) the old secret no longer authenticates: %d %s", bad, rec.Code, rec.Body.String())
+		}
+	}
+
 	// Malformed JSON is a 400.
 	code, body, _ = rotateTokenSecretOf(t, srv, id, `{"claude_code_usage_display":`)
 	if code != http.StatusBadRequest || !strings.Contains(body, "request.invalid_json") {
