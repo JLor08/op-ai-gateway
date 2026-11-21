@@ -67,3 +67,22 @@ func PeriodStart(period string, now time.Time) time.Time {
 		return time.Time{}
 	}
 }
+
+// PeriodEnd returns the start of the calendar period after the one containing
+// now, i.e. the moment the current period's aggregate resets (design spec §5).
+// Unknown periods, including "", give the zero time.Time like PeriodStart.
+func PeriodEnd(period string, now time.Time) time.Time {
+	start := PeriodStart(period, now)
+	switch period {
+	case LimitPeriodHour:
+		return start.Add(time.Hour)
+	case LimitPeriodDay:
+		return start.AddDate(0, 0, 1)
+	case LimitPeriodWeek:
+		return start.AddDate(0, 0, 7)
+	case LimitPeriodMonth:
+		return start.AddDate(0, 1, 0)
+	default:
+		return time.Time{}
+	}
+}
