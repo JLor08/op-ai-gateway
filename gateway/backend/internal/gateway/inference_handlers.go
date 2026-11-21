@@ -175,6 +175,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if handled {
 			return
 		}
+		r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
 		// Native passthrough: if the resolved application supports Claude Code natively,
 		// proxy the raw body to the upstream /v1/messages instead of translating (this
 		// is also the only way Anthropic streaming works, since the translate path
@@ -198,6 +199,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if handled {
 			return
 		}
+		r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
 	}
 	req = pf.mergeInto(req)
 	s.logInferenceRequest(r, token, req)
@@ -406,14 +408,15 @@ func principalFor(token auth.Token) (Principal, bool) {
 // denial on the Anthropic Messages flavor is answered by writeLimitBlocked (429
 // billing_error naming the limit that frees the user last); every other denial,
 // and a block whose standing lacks the reading, goes through writeLimitDenied.
-// On an allow it returns the limiter's standing for the caller to report -- mirroring writeModelNotAllowed, a denied request never
-// reaches Resolve/an AI-server and is never recorded as a usage event.
+// On an allow it returns the limiter's standing for the caller to report.
+// Mirroring writeModelNotAllowed, a denied request never reaches Resolve/an
+// AI-server and is never recorded as a usage event.
 //
-// s.Limiter.Admit is itself nil-safe (a nil *PrincipalLimiter, a nil-backed
-// store, or an unconfigured principal all simply allow), so calling this
-// unconditionally at every inference entry point is the no-op invariant
-// (design spec §10): with nothing configured for anyone, behavior is
-// byte-identical to before this feature existed.
+// Evaluate is nil-safe (a nil *PrincipalLimiter, a nil-backed store, or an
+// unconfigured principal all simply allow), so calling this unconditionally at
+// every inference entry point is the no-op invariant (design spec §10): with
+// nothing configured for anyone, behavior is byte-identical to before this
+// feature existed.
 //
 // admitPrincipal has exactly ONE call site in the whole package --
 // inferencePreflight -- which itself runs exactly once per client request
@@ -665,20 +668,22 @@ const (
 	codeLimitCostBudgetExceeded   = "limit.cost_budget_exceeded"
 )
 
-// writeLimitDenied writes the HTTP response for a PrincipalLimiter.Admit
-// denial, mapping each limit reason to its stable error code and status per
-// design spec §8: rate-limit and both quotas -> 429, cost budget -> 402. Every
-// reason except the rate limit also sets X-Should-Retry: false, because a
-// quota or budget stays exhausted until its period resets and a client retry
-// cannot help (the rate limit clears in seconds and keeps the client's default).
-// The Anthropic Messages flavor does not come through here for a quota or
-// budget denial: admitPrincipal answers it with writeLimitBlocked (429 for the
-// cost budget too). Only the rate-limit reason carries a Retry-After header (whole seconds, floored
-// at 1 so a sub-second computed wait never reads as "retry immediately") --
-// quota/budget denials give no concrete retry time (the period reset is
-// calendar-aligned, not a short countdown). Written BEFORE any Resolve/
-// upstream call, mirroring writeModelNotAllowed, so a denied request never
-// reaches an AI-server and leaks no principal-internal detail (a static
+// writeLimitDenied writes the HTTP response for a PrincipalLimiter denial,
+// mapping each limit reason to its stable error code and status per design
+// spec §8: rate-limit and both quotas -> 429, cost budget -> 402. Every reason
+// except the rate limit also sets X-Should-Retry: false, because a quota or
+// budget stays exhausted until its period resets and a client retry cannot help
+// (the rate limit clears in seconds and keeps the client's default). The
+// Anthropic Messages flavor does not come through here for a quota or budget
+// denial: admitPrincipal answers it with writeLimitBlocked (429 for the cost
+// budget too).
+//
+// Only the rate-limit reason carries a Retry-After header (whole seconds,
+// floored at 1 so a sub-second computed wait never reads as "retry
+// immediately"); quota/budget denials give no concrete retry time (the period
+// reset is calendar-aligned, not a short countdown). Written BEFORE any
+// Resolve/upstream call, mirroring writeModelNotAllowed, so a denied request
+// never reaches an AI-server and leaks no principal-internal detail (a static
 // message per reason, never a store error).
 func writeLimitDenied(w http.ResponseWriter, reason string, retryAfter time.Duration) {
 	status := http.StatusTooManyRequests

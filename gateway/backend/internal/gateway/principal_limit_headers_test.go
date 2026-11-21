@@ -4,8 +4,11 @@
 package gateway
 
 import (
+	"context"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -83,5 +86,143 @@ func TestWriteLimitBlockedHourPeriod(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got != "1" {
 		t.Errorf("Retry-After = %q, want 1", got)
+	}
+}
+
+func TestOverageUtilizationValueFloatEdges(t *testing.T) {
+	for _, tc := range []struct {
+		u    float64
+		want string
+	}{
+		{82.0 / 100, "0.82"},
+		{29.0 / 100, "0.29"},
+		{57.0 / 100, "0.57"},
+		{0.749, "0.74"},
+		{0.75, "0.75"},
+		{0.999, "0.99"},
+		{1.2, "0.99"},
+		{0, "0.00"},
+	} {
+		if got := overageUtilizationValue(tc.u); got != tc.want {
+			t.Errorf("overageUtilizationValue(%v) = %q, want %q", tc.u, got, tc.want)
+		}
+	}
+}
+
+func overageReading(used float64, reset time.Time) LimitReading {
+	return LimitReading{Kind: LimitKindTokenQuota, Used: used, Cap: 100, Period: "day", Reset: reset}
+}
+
+func TestWriteOverageStandingBelowThreshold(t *testing.T) {
+	reset := utc(2026, 11, 22, 0, 0, 0)
+	dst := http.Header{}
+	writeOverageStanding(dst, overageReading(50, reset))
+
+	unix := strconv.FormatInt(reset.Unix(), 10)
+	for name, want := range map[string]string{
+		"overage-utilization":  "0.50",
+		"overage-status":       "allowed",
+		"status":               "allowed",
+		"representative-claim": "overage",
+		"reset":                unix,
+		"overage-reset":        unix,
+	} {
+		if got := dst.Get(unifiedRateLimitPrefix + name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	for _, name := range []string{"overage-surpassed-threshold", "overage-period"} {
+		if _, ok := dst[http.CanonicalHeaderKey(unifiedRateLimitPrefix+name)]; ok {
+			t.Errorf("%s must be absent", name)
+		}
+	}
+}
+
+func TestWriteOverageStandingThresholds(t *testing.T) {
+	reset := utc(2026, 11, 22, 0, 0, 0)
+	for _, tc := range []struct {
+		used      float64
+		threshold string
+	}{{80, "0.75"}, {96, "0.95"}} {
+		dst := http.Header{}
+		writeOverageStanding(dst, overageReading(tc.used, reset))
+		if got := dst.Get(unifiedRateLimitPrefix + "overage-surpassed-threshold"); got != tc.threshold {
+			t.Errorf("used %v: threshold = %q, want %q", tc.used, got, tc.threshold)
+		}
+		for _, name := range []string{"overage-status", "status"} {
+			if got := dst.Get(unifiedRateLimitPrefix + name); got != "allowed_warning" {
+				t.Errorf("used %v: %s = %q, want allowed_warning", tc.used, name, got)
+			}
+		}
+	}
+}
+
+func TestStandingOverlayReplacesSubscriptionTopLevel(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	reset := utc(2026, 11, 22, 0, 0, 0)
+	dst := windowHeaders(now, time.Hour, 24*time.Hour)
+	dst.Set(rlp+"overage-status", "rejected")
+	dst.Set(rlp+"overage-disabled-reason", "org_level_disabled")
+	dst.Set(rlp+"fallback-percentage", "0.5")
+	dst.Set(rlp+"upgrade-paths", "x")
+	before := dst.Clone()
+
+	ctx := withLimitStanding(context.Background(), LimitStanding{overageReading(10, reset)})
+	attachPrincipalLimitStanding(ctx, dst)
+
+	if got := dst.Get(rlp + "representative-claim"); got != "overage" {
+		t.Errorf("representative-claim = %q, want overage", got)
+	}
+	if got := dst.Get(rlp + "overage-status"); got != "allowed" {
+		t.Errorf("overage-status = %q, want allowed", got)
+	}
+	if got, want := dst.Get(rlp+"reset"), strconv.FormatInt(reset.Unix(), 10); got != want {
+		t.Errorf("reset = %q, want %q", got, want)
+	}
+	for _, name := range []string{"overage-disabled-reason", "fallback-percentage", "upgrade-paths"} {
+		if _, ok := dst[http.CanonicalHeaderKey(rlp+name)]; ok {
+			t.Errorf("%s must be removed", name)
+		}
+	}
+	for _, w := range rateLimitWindowNames {
+		for _, f := range rateLimitWindowFields {
+			name := rlp + w + "-" + f
+			if got, want := dst.Values(name), before.Values(name); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s = %v, want unchanged %v", name, got, want)
+			}
+		}
+	}
+	if dst.Get(rlp+"7d-surpassed-threshold") != "0.1" {
+		t.Errorf("7d-surpassed-threshold not kept: %v", dst)
+	}
+}
+
+func TestStandingStatusMergesSubscriptionWarning(t *testing.T) {
+	dst := http.Header{}
+	dst.Set(rlp+"5h-status", "allowed_warning")
+	writeOverageStanding(dst, overageReading(10, utc(2026, 11, 22, 0, 0, 0)))
+	if got := dst.Get(rlp + "status"); got != "allowed_warning" {
+		t.Errorf("status = %q, want allowed_warning", got)
+	}
+	if got := dst.Get(rlp + "overage-status"); got != "allowed" {
+		t.Errorf("overage-status = %q, want allowed", got)
+	}
+}
+
+func TestAttachPrincipalLimitStandingNoop(t *testing.T) {
+	reset := utc(2026, 11, 22, 0, 0, 0)
+	failed := overageReading(10, reset)
+	failed.Failed = true
+	for name, ctx := range map[string]context.Context{
+		"no standing":    context.Background(),
+		"empty standing": withLimitStanding(context.Background(), LimitStanding{}),
+		"failed reading": withLimitStanding(context.Background(), LimitStanding{overageReading(10, reset), failed}),
+	} {
+		dst := windowHeaders(time.Unix(1_800_000_000, 0), time.Hour, 24*time.Hour)
+		want := dst.Clone()
+		attachPrincipalLimitStanding(ctx, dst)
+		if !maps.EqualFunc(dst, want, func(a, b []string) bool { return reflect.DeepEqual(a, b) }) {
+			t.Errorf("%s: dst changed to %v, want %v", name, dst, want)
+		}
 	}
 }

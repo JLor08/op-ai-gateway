@@ -140,7 +140,8 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	if req.APIFlavor == inference.APIFlavorAnthropicMessages {
-		s.attachRateLimitWindows(token, w.Header())
+		// #407's cached subscription windows, then the principal's own limit standing.
+		s.attachTranslatedUsageLimits(r, token, w.Header())
 	}
 	w.WriteHeader(http.StatusOK)
 
