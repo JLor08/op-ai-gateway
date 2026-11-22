@@ -93,13 +93,13 @@ func limitRetryAfterSeconds(reset, now time.Time) int {
 }
 
 // writeLimitBlocked answers a quota or budget denial on the Anthropic Messages
-// flavor (design spec §6): 429 with a billing_error body. With the unified headers
-// (sendUsage, the token's send_usage_limits opt-in, #420) Claude Code prints the
-// body's sentence verbatim (ADR-107); without them it shows its generic form,
-// "API Error: Request rejected (429) · <message>". Either way the retries stop,
-// through X-Should-Retry false; Retry-After is the seconds until the reset, rounded
-// up, at least 1. Those two headers and the body are unconditional. The unified
-// headers carry status rejected and the reset; representative-claim and
+// flavor (design spec §6): 429 with a billing_error body. With a JWT-shaped token
+// Claude Code prints the body's sentence verbatim, with an opaque token as
+// "API Error: Request rejected (429) · <message>" (ADR-107). Either way the retries
+// stop, through X-Should-Retry false; Retry-After is the seconds until the reset,
+// rounded up, at least 1. Those two headers and the body are unconditional. The
+// unified headers are written only with sendUsage (the token's send_usage_limits
+// opt-in, #420); they carry status rejected and the reset; representative-claim and
 // overage-status stay absent on purpose: with them the client composes its own line
 // and drops ours.
 func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time, sendUsage bool) {
