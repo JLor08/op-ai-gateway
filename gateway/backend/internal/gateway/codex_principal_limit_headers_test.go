@@ -244,7 +244,7 @@ func TestCodexGatewayLimitTakesOver(t *testing.T) {
 		{"74 percent", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(749, 1000)}), false},
 		{"75 percent", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(750, 1000)}), true},
 		{"clamped 99", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(1000, 1000)}), true},
-		{"fullest decides", withLimitStanding(context.Background(), LimitStanding{requestQuota, codexTokenReading(100, 1000)}), true},
+		{"fullest decides", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(100, 1000), requestQuota}), true},
 		{"no standing", context.Background(), false},
 		{"failed reading", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(900, 1000), {Kind: LimitKindCostBudget, Failed: true}}), false},
 		{"reset equals now", withLimitStanding(context.Background(), LimitStanding{at(900, 1000, codexTestNow)}), false},

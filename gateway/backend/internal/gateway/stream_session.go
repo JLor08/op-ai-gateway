@@ -144,7 +144,7 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 		s.attachTranslatedUsageLimits(r, token, w.Header())
 	}
 	if req.APIFlavor == inference.APIFlavorOpenAIResponses {
-		// The Codex windows last observed for the caller, then the principal's own limit standing.
+		// The Codex windows last observed for the caller (unless the gateway's own limit takes over from 75 %), then the principal's own limit standing.
 		s.attachTranslatedCodexUsageLimits(r, token, w.Header())
 	}
 	w.WriteHeader(http.StatusOK)
