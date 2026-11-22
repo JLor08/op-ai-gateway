@@ -1589,6 +1589,8 @@ paths:
                         claude_effort_compatibility: { type: boolean }
                         decisions_confidence_normalize: { type: boolean }
                         claude_code_usage_display: { type: boolean }
+                        send_usage_limits: { type: boolean }
+                        codex_model_switch_prompt: { type: boolean }
     post:
       tags: [portal]
       summary: Create an API token (optionally with a vendor_access policy)

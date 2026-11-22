@@ -13116,7 +13116,7 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
 - **Showing the gateway's own principal limits in Codex in the same change.** Done separately, in the default family rather than as an extra
   family, see [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
 
-**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a token opt-in now exists).** The "A token opt-in" rejection below no longer holds: since #420 the `x-codex-*` family is relayed, cached and attached only for a token with `send_usage_limits`. The reason it was rejected, that Codex needs no token shape, is unchanged; the opt-in is a deliberate privacy choice, not a client requirement. The popup note below changed too: a token with `codex_model_switch_prompt` lets Codex show the nudge.
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a token opt-in now exists).** The "A token opt-in" rejection below no longer holds: since #420 the `x-codex-*` family is relayed, cached and attached only for a token with `send_usage_limits`. The reason it was rejected, that Codex needs no token shape, is unchanged; the opt-in is a deliberate privacy choice, not a client requirement. The popup note under Consequences changed too: a token with `codex_model_switch_prompt` lets Codex show the nudge.
 
 **Consequences and limits.**
 
