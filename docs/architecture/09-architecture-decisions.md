@@ -13010,6 +13010,8 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
 - **Showing the gateway's own principal limits in the same change.** Done separately: they reach Claude Code as the overage window, see [ADR-107](#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
 - **Forwarding Codex `x-codex-*` headers.** Rejected here; not part of this change. Done separately for the Responses flavor, see [ADR-108](#adr-108--codex-shows-an-openai-subscriptions-usage-limits-through-an-allowlisted-x-codex-relay-and-a-per-principal-window-cache).
 
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a per-token switch for every usage signal).** The relay, the cached windows and the shape's effect are no longer unconditional: a token needs `send_usage_limits` (default off; migration 112 set it on for tokens that already had the Claude Code token format) besides the JWT-shaped secret. Without it the unified headers are neither relayed, cached nor attached, and `retry-after` and `x-should-retry` still reach the client.
+
 **Consequences and limits.**
 
 - Claude Code's Desktop usage card and the `/usage` plan panel stay unreachable for any gateway. The gateway's own principal limits reach
@@ -13061,6 +13063,8 @@ line's spend-limit field and the `/usage` bar exist only in a gateway sign-in se
 - **Changing the other endpoints' bodies or statuses**, and the contract's pool and fail-closed variants (there are no shared pools, and the
   limiter fails open).
 
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (the overage window and the block headers are opt-in).** The overage window of a success and the unified headers of the block are written only for a token with `send_usage_limits`. Without it the block keeps the 429, `Retry-After`, `X-Should-Retry: false` and the same `billing_error` body.
+
 **Consequences and limits.**
 
 - The client takes its warning from the first window with a surpassed threshold in the order `5h`, `7d`, `7d_oi`, `overage`: while a
@@ -13111,6 +13115,8 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
 - **Relaying `x-codex-turn-state`.** It is not a limit figure, and no effect of dropping it was observed.
 - **Showing the gateway's own principal limits in Codex in the same change.** Done separately, in the default family rather than as an extra
   family, see [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
+
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a token opt-in now exists).** The "A token opt-in" rejection below no longer holds: since #420 the `x-codex-*` family is relayed, cached and attached only for a token with `send_usage_limits`. The reason it was rejected, that Codex needs no token shape, is unchanged; the opt-in is a deliberate privacy choice, not a client requirement. The popup note below changed too: a token with `codex_model_switch_prompt` lets Codex show the nudge.
 
 **Consequences and limits.**
 
@@ -13176,6 +13182,8 @@ neither `retry-after` nor `x-should-retry`.
 - **Keeping `writeLimitDenied` on this endpoint.** Codex names no limit and no reset for its quota 429, retries its budget 402, and reads
   no `X-Should-Retry` that could stop that.
 
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (opt-in and the popup switch).** The standing on a success and the window of the block need `send_usage_limits`; without it the block keeps only the 429, `Retry-After`, `X-Should-Retry: false`, the same body and `x-codex-promo-message`. With `codex_model_switch_prompt` the gateway no longer writes its own credits flag, which this ADR used to suppress the popup.
+
 **Consequences and limits.**
 
 - A principal who also uses an OpenAI subscription sees the gateway's limit only on responses that carry no subscription figure, relayed
@@ -13194,3 +13202,63 @@ neither `retry-after` nor `x-should-retry`.
   [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
 - → [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
   [the limiter](cross-cutting/telemetry-usage-observability.md).
+
+## ADR-110 — Usage-limit signals leave the gateway only for tokens that opt in, and what stops a retry survives without it
+
+**Context.** After ADR-106 to ADR-109 (#407, #413, #416, #418) every principal's responses told coding clients about usage limits: a vendor
+subscription's windows (`anthropic-ratelimit-unified-*`, `x-codex-*`), cached copies of them, and the gateway's own quota and budget
+standing. There was no token setting for it, and ADR-108 had rejected one. The owner wants it to be a deliberate per-token choice: a token
+sends nothing about usage unless its owner switched it on, except what stops a client from retrying uselessly once nothing is left. Second,
+the gateway always suppressed the Codex CLI's `Switch to gpt-5.4-mini` popup through the credits flag, which someone who only works with a
+Codex subscription may want (issue #420).
+
+**Decision.**
+
+- **Two per-token switches, both default off, on user tokens and service tokens.** `send_usage_limits` and `codex_model_switch_prompt`
+  (`api_tokens` columns, migration 112). User tokens set them on create and PATCH and read them back; they are ungated and need no rotation.
+  Service tokens set them on create and read them back; editing one is follow-up issue #421, so until then turning a switch on for a service
+  token means recreating it, and every existing service token is off after the upgrade.
+- **With `send_usage_limits` off, no usage-limit header reaches the client on any path.** That is no `anthropic-ratelimit-unified-*` and no
+  `x-codex-*` header, on the native relay (vendor credits headers included), the cached-window attach, the translate path (buffered and SSE),
+  the gateway's own standing on a success, and the blocks. The window caches neither observe nor attach for that token. With it on,
+  behavior is as before, and the vendor-account entitlement still applies on top for vendor figures.
+- **What survives without the opt-in:** the status codes, `Retry-After`, `X-Should-Retry`, and the `billing_error` and `usage_limit_reached`
+  bodies including the sentence and `resets_at`. These stop the retry, verified on the clients: Claude Code stops on `X-Should-Retry: false`;
+  Codex 0.137.0 never retries a 429 `usage_limit_reached`, ignores the retry headers, and retries a 402 five times (so the Codex block
+  stays a 429).
+- **The one exception, `X-Codex-Promo-Message` on the Codex block.** Codex 0.137.0 prints only its own `You've hit your usage limit` line plus
+  that header and never the body's `message`; without it a gateway block would read like a ChatGPT plan limit. The header carries no figure,
+  only that it is the gateway's quota and whom to ask.
+- **`codex_model_switch_prompt` is effective only together with `send_usage_limits`.** When on, the gateway never writes its own
+  `X-Codex-Credits-Has-Credits` or `X-Codex-Credits-Unlimited`, on the success standing or the block, so Codex shows the popup at 90 % of its
+  default window. The vendor's relayed credits headers are untouched.
+- **Two switches, not one.** The existing `claude_code_usage_display` option only shapes the secret (the "Claude Code token format") and
+  changes only through rotation, because a secret's shape cannot change in place. Merging it with a live switch would make a toggle
+  rotate a credential. Claude Code needs both the format and `send_usage_limits`; Codex needs only the switch.
+- **Backfill.** Migration 112 sets `send_usage_limits = 1` for user tokens with `claude_code_usage_display = 1`, so a token that already
+  showed the limits in Claude Code keeps doing so. Every other token starts off, and so does every `codex_model_switch_prompt`.
+
+**Unchanged:** capture redaction (entitlement-based), `writeLimitDenied`, the verbatim relay of vendor error bodies, status codes and error
+types of blocks, and the ServerAgent.
+
+**Rejected:**
+
+- **One switch that also shapes the secret.** See above: a toggle would have to rotate the token.
+- **Dropping `Retry-After` and `X-Should-Retry` with the figures.** They carry no usage figure and are what keeps Claude Code and the SDKs from
+  retrying into a block.
+- **Dropping `X-Codex-Promo-Message` with the rest.** A block would then read as a ChatGPT plan limit.
+- **A service-token update route in the same change.** Service tokens have no field-level update today; #421.
+- **Gating by entitlement only.** Entitlement says who may see a vendor account's figures, not whether a token's owner wants a client to
+  display them.
+
+**Consequences and limits.**
+
+- Codex carries credits over between responses: with `codex_model_switch_prompt` on, the popup also appears while the default window shows the
+  gateway's own limit, and a credits flag a gateway response set earlier no longer suppresses it.
+- A vendor response on a token with `send_usage_limits` off does not reach the window cache's revocation purge (`Forget`). The caches are
+  keyed per principal, so another opted-in token of the same principal can keep receiving that account's last, frozen windows until they
+  expire or an opted-in token reaches the account. Nothing new is disclosed; this widens the observe-time revocation limitation of ADR-106.
+- Service tokens cannot change a switch until #421; recreate the token.
+- → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
+  [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
+  [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).

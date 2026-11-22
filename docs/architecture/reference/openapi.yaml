@@ -91,7 +91,10 @@ paths:
         falling back to translation. Alias: /openai/v1/responses.
         A principal with a quota or budget gets its fullest limit in the
         default `x-codex-*` headers of a success that carries no
-        subscription figures.
+        subscription figures. Every x-codex-* usage header (relayed, cached
+        or the gateway's own) goes out only for a token with
+        send_usage_limits; without it only Retry-After and X-Should-Retry
+        pass, and a block keeps x-codex-promo-message.
       security: [{ bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -107,8 +110,10 @@ paths:
             `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, the
             limit's sentence as `message` and its reset as `resets_at` (unix
             seconds), plus Retry-After, `X-Should-Retry: false`,
-            `x-codex-promo-message` and the default `x-codex` primary window
-            at 100 %. See compatibility-and-inference.md section 9.6.
+            `x-codex-promo-message` and, only for a token with
+            send_usage_limits, the default `x-codex` primary window at 100 %
+            (credits flags only without codex_model_switch_prompt). See
+            compatibility-and-inference.md section 9.6.
           content:
             application/json:
               schema: { type: object }
@@ -131,8 +136,10 @@ paths:
             `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, the
             limit's sentence as `message` and its reset as `resets_at` (unix
             seconds), plus Retry-After, `X-Should-Retry: false`,
-            `x-codex-promo-message` and the default `x-codex` primary window
-            at 100 %. See compatibility-and-inference.md section 9.6.
+            `x-codex-promo-message` and, only for a token with
+            send_usage_limits, the default `x-codex` primary window at 100 %
+            (credits flags only without codex_model_switch_prompt). See
+            compatibility-and-inference.md section 9.6.
           content:
             application/json:
               schema: { type: object }
@@ -152,6 +159,10 @@ paths:
         non-object `chat_template_kwargs` or a `chat_template_kwargs.reasoning_effort`
         that conflicts with the effort is a 400 `messages.invalid_output_config`;
         a token without the setting is never rejected for `output_config`.
+        The anthropic-ratelimit-unified-* headers (relayed, cached or the
+        gateway's own overage window, also on the 429 billing_error block)
+        go out only for a token with send_usage_limits; Retry-After,
+        X-Should-Retry and the block body always do.
       security: [{ bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -1543,7 +1554,12 @@ paths:
       carries the opt-in claude_code_usage_display flag (default false, always
       present on a read): when true, its secret has the Claude Code shape (a
       JWT-looking prefix around the opaigw_ secret) so Claude Code shows the
-      usage limits. It is set on create and changed only by rotation.
+      usage limits. It is set on create and changed only by rotation. A token
+      also carries the opt-in send_usage_limits and codex_model_switch_prompt
+      flags (default false, always present on a read, not gated, no
+      rotation): without send_usage_limits no usage-limit header reaches the
+      client; codex_model_switch_prompt lets Codex offer the gpt-5.4-mini
+      switch and counts only together with send_usage_limits.
     get:
       tags: [portal]
       summary: List own API tokens (each row carries vendor_access when the token has any)
@@ -1600,7 +1616,8 @@ paths:
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
                 claude_effort_compatibility, decisions_confidence_normalize
-                and claude_code_usage_display are modeled here.
+                claude_code_usage_display, send_usage_limits and
+                codex_model_switch_prompt are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1625,6 +1642,17 @@ paths:
                     Give the new token's secret the Claude Code shape (a
                     JWT-looking prefix around the opaigw_ secret) so Claude
                     Code shows the usage limits. Absent means off.
+                send_usage_limits:
+                  type: boolean
+                  description: >
+                    Send usage-limit headers to the client. Absent means off.
+                    Not gated, no rotation.
+                codex_model_switch_prompt:
+                  type: boolean
+                  description: >
+                    Let Codex offer the gpt-5.4-mini switch (the gateway
+                    omits its own credits flags). Effective only with
+                    send_usage_limits. Absent means off.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1654,7 +1682,8 @@ paths:
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
                 claude_effort_compatibility, decisions_confidence_normalize
-                and claude_code_usage_display are modeled here.
+                claude_code_usage_display, send_usage_limits and
+                codex_model_switch_prompt are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1682,6 +1711,16 @@ paths:
                     value is a 400 portal.token_claude_code_usage_display_requires_rotation:
                     the flag shapes the secret and changes only through
                     POST /api/portal/tokens/{id}/rotate.
+                send_usage_limits:
+                  type: boolean
+                  description: >
+                    Replaces the stored flag when present (true or false);
+                    absent keeps it. Not gated, no rotation.
+                codex_model_switch_prompt:
+                  type: boolean
+                  description: >
+                    Replaces the stored flag when present (true or false);
+                    absent keeps it. Effective only with send_usage_limits.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -3440,7 +3479,10 @@ paths:
       token with it true from an inference-only bearer is a 403
       portal.principal_forbidden, while a portal session or an admin-scope
       bearer may. It takes the opt-in decisions_confidence_normalize flag on
-      create only too, ungated.
+      create only too, ungated. It takes send_usage_limits and
+      codex_model_switch_prompt (default false, ungated) on create only and
+      reads them back; changing one on an existing service token is not
+      possible until issue #421, so a token is recreated.
     get:
       tags: [portal]
       summary: List services

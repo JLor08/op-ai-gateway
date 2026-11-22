@@ -190,7 +190,7 @@ piece, and routing eligibility does **not** (§4.6):
   a member is `403`, a stranger, an unknown id and system scope `404`); behind the
   `vendor_accounts_enabled` flag but **not** gated on the sharing flags and allowed at
   any level (it grants nothing while the account is private). It unlocks the figures in
-  the member view (§8.2) and the rate-limit response headers of Claude Code (§4.1, *Anthropic subscription Messages passthrough*) and Codex (compatibility-and-inference §9.5, ADR-108).
+  the member view (§8.2) and the rate-limit response headers of Claude Code (§4.1, *Anthropic subscription Messages passthrough*) and Codex (compatibility-and-inference §9.5, ADR-108), and then only on a token that has `send_usage_limits` (ADR-110): the entitlement decides who may see the figures, the token switch whether its client is sent them.
 - **Memory-store cascades.** Deleting an account drops its management-group links by a
   single-key delete and its resource-group links by a **reverse-direction loop over
   every group** (the map is keyed group to account, like `resource_group_servers`); a
@@ -691,7 +691,7 @@ reading the target's mode through `endpointModeFor`, the Anthropic client's
   request without one sends none. No other inbound header is forwarded, the
   client's own `anthropic-version` included. The response side is the same
   allowlist as the subscription relay below (`retry-after`, `x-should-retry`, and the
-  entitlement-gated `anthropic-ratelimit-unified-*` family). Redirects from the
+  entitlement- and switch-gated `anthropic-ratelimit-unified-*` family). Redirects from the
   upstream are not followed, because net/http strips `Authorization` but not `x-api-key` when a
   redirect leaves the host.
 - **Verbatim in body and in beta opt-in, pinned in version.** A beta-gated body
@@ -798,7 +798,7 @@ account (§5).
   back (§6.5), except that the Messages passthrough forwards a response-header
   allowlist to the client: `retry-after` and `x-should-retry` always, and the
   `anthropic-ratelimit-unified-*` family only for a caller entitled to the account's
-  figures. On inference those are the account owner, a community manager of a
+  figures whose token has `send_usage_limits`. On inference those are the account owner, a community manager of a
   `shared`/`full` account, or anyone when the owner opted in
   (`share_usage_with_members`); inference tokens never carry system scope, which
   matches what the same principal sees in the portal without elevation
@@ -1056,7 +1056,7 @@ to the serving account (§5).
   byte-identical when a rewrite happens (key order may change). The response and
   its SSE are relayed unchanged and are not rewritten back (§6.5), except that the Responses passthrough forwards a
   response-header allowlist to the client: `retry-after` and `x-should-retry` always, and the Codex `x-codex-*` rate-limit
-  family only for a caller entitled to the account's figures, by the same rule as the Anthropic one
+  family only for a caller entitled to the account's figures whose token has `send_usage_limits`, by the same rule as the Anthropic one
   ([Codex usage-limit display](compatibility-and-inference.md#95-codex-usage-limit-display)). Request ids, organization ids,
   `x-ratelimit-*` and `x-codex-turn-state` are not forwarded.
 - **Unchanged:** chat completions and every other `openai` flavor to an api-key
