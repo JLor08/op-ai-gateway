@@ -231,11 +231,12 @@ func (e cachedRateLimitEntry) writeOpenWindows(dst http.Header, now time.Time) (
 // observeRateLimitWindows records the unified windows of a vendor-Anthropic response
 // for the caller, when the caller is entitled to see that account's figures. Other
 // providers and responses without the top-level status are ignored; the entitlement
-// lookup only runs when there is something to record. An unentitled caller records
+// lookup only runs when there is something to record. A token without the
+// send_usage_limits opt-in (#420) records nothing. An unentitled caller records
 // nothing and, because the response proves the caller now reaches that account
 // without entitlement (a revoked opt-in or role), loses any entry cached from it.
 func (s *Server) observeRateLimitWindows(token auth.Token, target routing.Target, h http.Header) {
-	if s.rateLimitWindows == nil || target.Provider != routing.ProviderVendorAnthropic || h.Get(unifiedRateLimitPrefix+"status") == "" {
+	if !token.SendUsageLimits || s.rateLimitWindows == nil || target.Provider != routing.ProviderVendorAnthropic || h.Get(unifiedRateLimitPrefix+"status") == "" {
 		return
 	}
 	key, ok := principalKey(token)
@@ -253,7 +254,7 @@ func (s *Server) observeRateLimitWindows(token auth.Token, target routing.Target
 // dst, the header set of a /v1/messages response answered by another provider. The
 // callers decide that the flavor is Anthropic Messages and the response a success.
 func (s *Server) attachRateLimitWindows(token auth.Token, dst http.Header) {
-	if s.rateLimitWindows == nil {
+	if !token.SendUsageLimits || s.rateLimitWindows == nil {
 		return
 	}
 	if key, ok := principalKey(token); ok {

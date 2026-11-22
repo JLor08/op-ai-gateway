@@ -296,8 +296,9 @@ func TestCodexWindowsNeedAPrincipal(t *testing.T) {
 
 func TestMessagesGetNoCodexWindowsAndResponsesGetNoUnified(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
+	f.setSendUsageLimits(t, true) // the Messages half needs the Claude Code opt-in (#420)
 	f.observeViaVendor(t, vaOwnerSecret)
-	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true}
+	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true, SendUsageLimits: true}
 	anthropic := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: "acc_anthropic", VendorAccountOwnerUserID: "usr_va_a"}
 	f.srv.observeRateLimitWindows(owner, anthropic, subscriptionWindowHeaders())
 

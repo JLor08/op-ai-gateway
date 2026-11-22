@@ -18,7 +18,7 @@ func TestWriteLimitBlockedDailyTokenQuota(t *testing.T) {
 	reset := utc(2026, 11, 22, 0, 0, 0)
 	now := utc(2026, 11, 21, 13, 30, 0)
 	rec := httptest.NewRecorder()
-	writeLimitBlocked(rec, LimitReading{Kind: LimitKindTokenQuota, Used: 1000, Cap: 1000, Period: "day", Reset: reset}, now)
+	writeLimitBlocked(rec, LimitReading{Kind: LimitKindTokenQuota, Used: 1000, Cap: 1000, Period: "day", Reset: reset}, now, true)
 
 	if rec.Code != 429 {
 		t.Fatalf("status = %d, want 429", rec.Code)
@@ -63,7 +63,7 @@ func TestWriteLimitBlockedPeriods(t *testing.T) {
 		{LimitKindRequestQuota, "day", "daily", "limit.request_quota_exceeded", "request quota"},
 	} {
 		rec := httptest.NewRecorder()
-		writeLimitBlocked(rec, LimitReading{Kind: tc.kind, Used: 1, Cap: 1, Period: tc.period, Reset: reset}, now)
+		writeLimitBlocked(rec, LimitReading{Kind: tc.kind, Used: 1, Cap: 1, Period: tc.period, Reset: reset}, now, true)
 		if got := rec.Header().Get(unifiedRateLimitPrefix + "overage-period"); got != tc.want {
 			t.Errorf("%s period = %q, want %q", tc.period, got, tc.want)
 		}
@@ -80,7 +80,7 @@ func TestWriteLimitBlockedHourPeriod(t *testing.T) {
 	reset := utc(2026, 11, 21, 14, 0, 0)
 	now := utc(2026, 11, 21, 13, 59, 59).Add(400 * time.Millisecond)
 	rec := httptest.NewRecorder()
-	writeLimitBlocked(rec, LimitReading{Kind: LimitKindRequestQuota, Used: 5, Cap: 5, Period: "hour", Reset: reset}, now)
+	writeLimitBlocked(rec, LimitReading{Kind: LimitKindRequestQuota, Used: 5, Cap: 5, Period: "hour", Reset: reset}, now, true)
 	if _, ok := rec.Header()[http.CanonicalHeaderKey(unifiedRateLimitPrefix+"overage-period")]; ok {
 		t.Errorf("overage-period must be absent for the hour")
 	}

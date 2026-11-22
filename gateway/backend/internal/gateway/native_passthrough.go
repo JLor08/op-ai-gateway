@@ -1144,23 +1144,27 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		}
 	}
 	if rel.pfReq.APIFlavor == inference.APIFlavorAnthropicMessages {
-		// Entitlement is looked up only when there are unified figures to gate.
+		// The unified family reaches the client only when the token opts in
+		// (send_usage_limits, #420) and, for vendor figures, is entitled. The switch is
+		// checked first so the entitlement lookup stays lazy. Retry-After and
+		// X-Should-Retry always pass.
+		sendUsage := rel.token.SendUsageLimits
 		var gated func(string) bool
-		if hasUnifiedRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
+		if sendUsage && hasUnifiedRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
 			gated = isUnifiedRateLimitHeader
 		}
 		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
 		// A success from a provider that reports no subscription windows of its own
 		// (a local model) carries the caller's last observed ones, so Claude Code
 		// keeps its usage display. Fresh upstream windows are never overlaid.
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get(unifiedRateLimitPrefix+"status") == "" {
+		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get(unifiedRateLimitPrefix+"status") == "" {
 			s.attachRateLimitWindows(rel.token, w.Header())
 		}
 		// A principal with quotas or budgets then has its own fullest limit laid over
 		// the top-level fields, on any 2xx whatever the upstream sent. It writes the
 		// client header set only: resp.Header stays what recordUsage and the window
 		// cache observe.
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			attachPrincipalLimitStanding(r.Context(), w.Header())
 		}
 	} else if rel.pfReq.APIFlavor == inference.APIFlavorOpenAIResponses {

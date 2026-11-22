@@ -229,7 +229,7 @@ func relayRateLimit(srv *Server, target routing.Target, flavor string, endpoint 
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(rlMessagesBody))
 	rec := httptest.NewRecorder()
 	nr := nativeRelay{
-		token:    auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true},
+		token:    auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true, SendUsageLimits: true},
 		target:   target,
 		path:     path,
 		raw:      []byte(rlMessagesBody),

@@ -97,21 +97,25 @@ func limitRetryAfterSeconds(reset, now time.Time) int {
 // that make Claude Code print r's sentence. representative-claim and overage-status
 // stay absent on purpose: with them the client composes its own line and drops ours.
 // X-Should-Retry false stops the client's retry loop; Retry-After is the seconds
-// until the reset, rounded up, at least 1.
-func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time) {
+// until the reset, rounded up, at least 1. Those two and the body are what stop the
+// retries and show the sentence, so they are unconditional; the unified headers go
+// out only when sendUsage (the token's send_usage_limits opt-in, #420) is set.
+func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time, sendUsage bool) {
 	reset := strconv.FormatInt(r.Reset.Unix(), 10)
 	h := w.Header()
 	h.Set("Retry-After", strconv.Itoa(limitRetryAfterSeconds(r.Reset, now)))
 	h.Set("X-Should-Retry", "false")
-	h.Set(unifiedRateLimitPrefix+unifiedStatus, "rejected")
-	h.Set(unifiedRateLimitPrefix+unifiedReset, reset)
-	h.Set(unifiedRateLimitPrefix+unifiedOverageReset, reset)
-	h.Set(unifiedRateLimitPrefix+unifiedOverageUtilization, "1")
-	h.Set(unifiedRateLimitPrefix+unifiedOverageSurpassedThreshold, "1")
-	if period := limitBlockedPeriod(r.Period); period != "" {
-		h.Set(unifiedRateLimitPrefix+"overage-period", period)
+	if sendUsage {
+		h.Set(unifiedRateLimitPrefix+unifiedStatus, "rejected")
+		h.Set(unifiedRateLimitPrefix+unifiedReset, reset)
+		h.Set(unifiedRateLimitPrefix+unifiedOverageReset, reset)
+		h.Set(unifiedRateLimitPrefix+unifiedOverageUtilization, "1")
+		h.Set(unifiedRateLimitPrefix+unifiedOverageSurpassedThreshold, "1")
+		if period := limitBlockedPeriod(r.Period); period != "" {
+			h.Set(unifiedRateLimitPrefix+"overage-period", period)
+		}
+		h.Set(unifiedRateLimitPrefix+"overage-disabled-reason", "org_spend_cap_reached")
 	}
-	h.Set(unifiedRateLimitPrefix+"overage-disabled-reason", "org_spend_cap_reached")
 	writeJSON(w, http.StatusTooManyRequests, limitBlockedBody{
 		Type: "error",
 		Error: limitBlockedError{
@@ -255,6 +259,9 @@ func attachPrincipalLimitStanding(ctx context.Context, dst http.Header) {
 // success: #407's cached subscription windows, then the principal's limit standing
 // from the request context.
 func (s *Server) attachTranslatedUsageLimits(r *http.Request, token auth.Token, dst http.Header) {
+	if !token.SendUsageLimits {
+		return
+	}
 	s.attachRateLimitWindows(token, dst)
 	attachPrincipalLimitStanding(r.Context(), dst)
 }
