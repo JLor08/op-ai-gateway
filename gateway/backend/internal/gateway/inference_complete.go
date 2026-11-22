@@ -113,8 +113,8 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 			s.attachTranslatedUsageLimits(r, token, w.Header())
 		}
 		if req.APIFlavor == inference.APIFlavorOpenAIResponses {
-			// The Codex windows last observed for the caller (translated answers carry none).
-			s.attachCodexRateLimitWindows(token, w.Header())
+			// The Codex windows last observed for the caller, then the principal's own limit standing.
+			s.attachTranslatedCodexUsageLimits(r, token, w.Header())
 		}
 		body = writeJSONCaptured(w, http.StatusOK, render(resp))
 	}

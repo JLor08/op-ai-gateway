@@ -3212,7 +3212,8 @@ A rate denial stops before any read and a principal with no configured quota or 
 read that fails gives a `Failed` reading: admission still fails open on it as before, but it is distinguishable from
 zero used, and a standing with a failed reading is not reported to the client. The standing travels with the request, so
 the response path does no store I/O. How Claude Code displays it: [Compatibility & Inference
-§9.4](compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits).
+§9.4](compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits); how Codex displays it: [Compatibility &
+Inference §9.6](compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits).
 
 All of that is the *configured* case. A principal with no limits never reaches
 any of it: `Admit` short-circuits on the zero `routing.LimitConfig` — no

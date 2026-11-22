@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -474,6 +475,9 @@ func TestPrincipalLimiterAppliesToUserToken(t *testing.T) {
 const (
 	messagesBlockBody = `{"model":"qwen-coder","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
 	chatBlockBody     = `{"model":"qwen-coder","messages":[{"role":"user","content":"hi"}]}`
+
+	responsesBlockBody       = `{"model":"qwen-coder","input":"hi"}`
+	responsesNativeBlockBody = `{"model":"native-model","input":"hi"}`
 )
 
 // blockTestServer wires a svc_1 service principal with cfg and aggregates
@@ -612,6 +616,134 @@ func TestMessagesRateDenialUnchanged(t *testing.T) {
 		}
 		if got := rec.Header().Get(unifiedRateLimitPrefix + "status"); got != "" {
 			t.Fatalf("unified status = %q, want absent", got)
+		}
+	}
+}
+
+// --- /v1/responses block (Codex usage_limit_reached) -------------------------
+
+func decodeResetsAt(t *testing.T, body []byte) int64 {
+	t.Helper()
+	var v struct {
+		Error struct {
+			ResetsAt int64 `json:"resets_at"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	return v.Error.ResetsAt
+}
+
+func assertNoCodexBlockLeaks(t *testing.T, h http.Header) {
+	t.Helper()
+	for _, name := range []string{"X-Codex-Limit-Name", "X-Codex-Active-Limit", "X-Codex-Rate-Limit-Reached-Type", "X-Codex-Secondary-Used-Percent"} {
+		if got := h.Get(name); got != "" {
+			t.Fatalf("%s = %q, want absent", name, got)
+		}
+	}
+}
+
+func assertResponsesTokenQuotaBlock(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, inner := decodeErrorType(t, rec.Body.Bytes()); inner != "usage_limit_reached" {
+		t.Fatalf("error.type = %q, want usage_limit_reached", inner)
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.token_quota_exceeded" {
+		t.Fatalf("code = %q", got)
+	}
+	if decodeResetsAt(t, rec.Body.Bytes()) <= 0 {
+		t.Fatalf("error.resets_at not set, body = %s", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("X-Should-Retry = %q", got)
+	}
+	if n, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || n <= 0 {
+		t.Fatalf("Retry-After = %q, want > 0", rec.Header().Get("Retry-After"))
+	}
+	if got := rec.Header().Get("X-Codex-Primary-Used-Percent"); got != "100" {
+		t.Fatalf("primary used percent = %q, want 100", got)
+	}
+	if got := rec.Header().Get("X-Codex-Promo-Message"); got != codexPromoMessage(LimitKindTokenQuota) {
+		t.Fatalf("promo = %q", got)
+	}
+	assertNoCodexBlockLeaks(t, rec.Header())
+}
+
+func TestResponsesQuotaDenialIsUsageLimitReached(t *testing.T) {
+	srv, recorder := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 0, 100, 0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	assertResponsesTokenQuotaBlock(t, rec)
+	if n := len(recorder.All()); n != 0 {
+		t.Fatalf("recorded usage events = %d, want 0", n)
+	}
+}
+
+func TestResponsesCostBudgetDenialIs429(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{CostBudget: 1, CostBudgetPeriod: "month"}, 0, 0, 1.0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.cost_budget_exceeded" {
+		t.Fatalf("code = %q", got)
+	}
+	if got := rec.Header().Get("X-Codex-Primary-Window-Minutes"); got != "43200" {
+		t.Fatalf("window minutes = %q, want 43200", got)
+	}
+}
+
+func TestResponsesBlockDescribesLatestReset(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day", CostBudget: 1, CostBudgetPeriod: "month"}, 0, 100, 1.0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.cost_budget_exceeded" {
+		t.Fatalf("code = %q, want the cost budget (later reset)", got)
+	}
+}
+
+func TestResponsesBlockOnNativeModel(t *testing.T) {
+	srv, recorder := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 0, 100, 0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesNativeBlockBody, "svc-secret"))
+	assertResponsesTokenQuotaBlock(t, rec)
+	if n := len(recorder.All()); n != 0 {
+		t.Fatalf("recorded usage events = %d, want 0 (the denied native-passthrough request must not reach the upstream)", n)
+	}
+}
+
+func TestResponsesRateDenialUnchanged(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{RateRequests: 1, RateWindowSeconds: 60}, 0, 0, 0)
+	first := httptest.NewRecorder()
+	srv.ServeHTTP(first, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200, body = %s", first.Code, first.Body.String())
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.rate_limited" {
+		t.Fatalf("code = %q", got)
+	}
+	if top, inner := decodeErrorType(t, rec.Body.Bytes()); top != "" || inner != "" {
+		t.Fatalf("type = %q/%q, want none (apierror shape)", top, inner)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("Retry-After missing")
+	}
+	for name := range rec.Header() {
+		if strings.HasPrefix(strings.ToLower(name), "x-codex-") {
+			t.Fatalf("unexpected %s on a rate denial", name)
 		}
 	}
 }

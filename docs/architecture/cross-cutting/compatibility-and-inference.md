@@ -2512,7 +2512,9 @@ above (`rateLimitFiguresEntitled`, looked up only when the upstream sent a famil
 upstream response only. `x-codex-turn-state` and every other `x-codex-` header outside the family, request ids, organization ids,
 `x-ratelimit-*` and the unified Anthropic family are never forwarded. A success from a target that reports no Codex windows carries the
 caller's last observed ones instead; see [§9.5](#95-codex-usage-limit-display). A caller who is not entitled gets neither the relayed
-family nor cached windows on a response whose upstream carries the family, so Codex shows no limits for that response.
+family nor cached windows on a response whose upstream carries the family, so Codex shows no subscription limits for that response. A
+2xx that ends up with no family header at all (a local model with nothing cached, or such a withheld response) carries the principal's
+own fullest quota or budget instead, when it has one ([§9.6](#96-codex-display-of-the-gateways-own-limits)).
 
 **One exception at dispatch: `sglang_omni`.** For a target whose effective kind
 (`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
@@ -4062,7 +4064,7 @@ wants, and the subscription windows stay visible beside it.
 
 **Block (`/v1/messages` only).** A quota or budget denial on the Anthropic Messages flavor (`/v1/messages` and its
 aliases; `count_tokens` never admits) is answered by `writeLimitBlocked`, called from `admitPrincipal`, which now takes
-the flavor. The cost budget is a 429 here, not its 402 elsewhere. `LimitStanding.Blocking` picks the limit to name: among
+the flavor. The cost budget is a 429 here and on `/v1/responses` ([§9.6](#96-codex-display-of-the-gateways-own-limits)), not the 402 of *Other endpoints*. `LimitStanding.Blocking` picks the limit to name: among
 the breached readings the one with the latest reset (when the user can work again), ties to the fixed order; a defensive
 fallback, not an expected race (the denial and `Blocking` read the same standing, so a breached reading always exists on
 a quota or budget denial), takes the reading of the limit `Admit` named when none is breached. A failed read counts as
@@ -4070,7 +4072,7 @@ not breached. Response:
 
 - **Body:** `{"type":"error","error":{"type":"billing_error","code":"<code>","message":"<sentence>"}}`, with the limit's
   stable code (`limit.request_quota_exceeded`, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`). The
-  top-level `"type":"error"` exists for this one body; every other gateway error keeps the `apierror` shape.
+  top-level `"type":"error"` exists for this one body; every other gateway error keeps the `apierror` shape, except [§9.6](#96-codex-display-of-the-gateways-own-limits)'s Codex `usage_limit_reached` body.
 - **Sentence:** `<request quota|token quota|cost budget> reached · resets <Mon D, HH:MM> UTC · ask your gateway
   administrator to raise it`, for example `token quota reached · resets Nov 22, 00:00 UTC · ask your gateway
   administrator to raise it`.
@@ -4082,11 +4084,12 @@ not breached. Response:
 - A denied request is still not recorded as a usage event and never reaches `Resolve`. The short rate limit is unchanged
   everywhere (429 with `Retry-After`, `apierror` body).
 
-**Other endpoints.** Every other caller of the shared admission (chat completions, responses, images, speech,
-transcription, live transcription, the `/v1/realtime` handshake, the portal loopback paths) keeps each quota or budget
-denial's status (quota 429, budget 402) and `apierror` body and gains `X-Should-Retry: false` (`writeLimitDenied`), so the
-Anthropic and OpenAI SDKs stop retrying into a block that holds until the period resets. The rate denial keeps its
-`Retry-After` and no `X-Should-Retry`.
+**Other endpoints.** Every other caller of the shared admission (chat completions, images, speech, transcription, live
+transcription, the `/v1/realtime` handshake, the portal loopback paths) keeps each quota or budget denial's status (quota
+429, budget 402) and `apierror` body and gains `X-Should-Retry: false` (`writeLimitDenied`), so the Anthropic and OpenAI SDKs
+stop retrying into a block that holds until the period resets. `/v1/responses` is the second exception: there a quota or
+budget denial is Codex's 429 `usage_limit_reached`, see [§9.6](#96-codex-display-of-the-gateways-own-limits). The rate
+denial keeps its `Retry-After` and no `X-Should-Retry`.
 
 **Memory driver.** It holds no `usage_events`, so every aggregate is zero and a configured principal reads 0 %, which
 matches what enforcement sees (quotas and budgets are a persistent-store feature).
@@ -4150,7 +4153,9 @@ account's figures (`redactCapturedAccountHeaders`). Native passthrough captures 
 warnings at 75, 90 and 95 % ("Heads up, you have less than ...% of your 5h limit left"). At 90 % and above Codex also nudges the user
 to switch to `gpt-5.4-mini`, which the gateway may not map; `notices.hide_rate_limit_model_nudge = true` in Codex's configuration hides
 it. Before the first subscription response of a session, and after a gateway restart, the display is empty: Codex's startup prefetch
-exists only for a ChatGPT login.
+exists only for a ChatGPT login. The gateway's own request quota, token quota and cost budget are written in the same default family,
+but only on a success that carries no subscription figures, relayed or cached, so the subscription always wins; that is
+[§9.6](#96-codex-display-of-the-gateways-own-limits).
 
 **End to end.** Run against Codex CLI 0.137.0 with a memory-mode gateway and a self-hosted stub (always entitled) answering
 `/v1/responses` with the family: the status line showed `5h 57% left · weekly 83% left` and `/status` showed both bars. The
@@ -4160,6 +4165,154 @@ resolver and cannot be pointed at a stub.
 **Dependency.** The display relies on undocumented Codex behavior (the header names and the clear-on-missing rule). A client update can
 change it without notice; nothing in the gateway breaks, the display just stops working. See [Risks & Technical
 Debt](../11-risks-and-technical-debt.md#111-operational-risks).
+
+### 9.6 Codex display of the gateway's own limits
+
+§9.5 shows an OpenAI subscription's windows in Codex. This section brings the limits of §9.4 there: the principal's own
+request quota, token quota and cost budget (`routing.LimitConfig`, enforced by `PrincipalLimiter`). The fullest of them
+appears in Codex's status line, `/status` and warnings on a `/v1/responses` success, and a quota or budget block prints one
+sentence with the reset time after exactly one request. Decisions:
+[ADR-109](../09-architecture-decisions.md#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
+
+**Verified client behavior** (Codex CLI 0.137.0, [issue #418](https://github.com/JLor08/op-ai-gateway/issues/418): stub runs
+with an isolated `CODEX_HOME` and a code read at tag `rust-v0.137.0`):
+
+- **One family per response.** Codex parses every header family (`x-codex-*` first, then each `x-<id>-*` family in sorted id
+  order) but keeps one snapshot slot and emits it once per response, so only the response's last family reaches the display.
+  An extra family on a response that also carries the subscription's `x-codex-*` windows hides the subscription.
+- **Only the default family `x-codex` drives the status line and the warnings.** An extra family is a `/status` row only,
+  without a status-line item, warning or popup. With `x-codex-limit-name: <name>` and one window, the default family gives the
+  status line `daily 38% left`, the `/status` row `<name> Daily limit: […] 38% left (resets …)` and warnings at 75, 90 and
+  95 % such as `Heads up, you have less than 10% of your daily limit left. Run /status for a breakdown.`
+- **Window labels** come from the family's `window-minutes` header, within ±5 %: 1440 `daily`, 10080 `weekly`, 43200
+  `monthly`. Anything else, 60 included, falls back to `usage`.
+- **The model-switch popup and the credits flag.** At 90 % or more of the default family Codex opens the popup
+  `Switch to gpt-5.4-mini for lower credit usage?` with the switch preselected; one Enter switched a test session's model,
+  which a gateway may not route. `x-codex-credits-has-credits: true` with `x-codex-credits-unlimited: false` and no balance
+  suppresses the popup and adds no `/status` row; in Codex's code the flag affects only the popup and the credits row.
+  Credits carry over between responses (§9.5).
+- **The block path.** A 429 whose body `error.type` is `usage_limit_reached` is never retried. With `x-codex-promo-message`
+  and no `limit-name` header on the active family, Codex prints
+  `You've hit your usage limit. <promo>, or try again at <reset in local time>.`, the time taken from `error.resets_at`. A
+  `limit-name` header on the active family wins over the promo and yields
+  `You've hit your usage limit for <name>. Switch to another model now, or try again at …`. The 429's family windows (the
+  default family when `x-codex-active-limit` is absent) replace the display; a 429 without windows clears it.
+- **Retries.** Codex reads neither `retry-after` nor `x-should-retry`. No 429 is retried (`retry_429` is false for every
+  provider); a 402 is retried at turn level. Before this behavior a quota 429 printed
+  `exceeded retry limit, last status: 429 Too Many Requests` after one request, and the cost-budget 402 was retried five
+  times in about 7 s and then printed `unexpected status 402 Payment Required: cost budget exceeded, url: …`.
+
+**Readings at admission.** The same as §9.4: `PrincipalLimiter.Evaluate` returns the `LimitStanding` that admission judged, and
+`inferencePreflight` returns it in `preflight.Standing`. `handleOpenAIResponses` puts it on the request context
+(`withLimitStanding`) after either of its two `inferencePreflight` calls (on the probed model before the native passthrough is
+tried, and on the parsed model when the probe found none), as `handleAnthropicMessages` does. The response path does no
+store I/O.
+
+**Success (2xx, `/v1/responses`).** `attachCodexPrincipalLimitStanding` (`codex_principal_limit_headers.go`) runs as the last
+header step at the three attach points of §9.5, for the `openai_responses` flavor only: the native passthrough on any 2xx,
+after the relay and the cache attach and before the status line; and on the translate path, through
+`attachTranslatedCodexUsageLimits` (which runs `attachCodexRateLimitWindows` first), the buffered JSON answer and the SSE
+header block written with the 200. It changes only the client header set, never the upstream set that `recordUsage`, the window
+caches and the vendor usage scrape read. `LimitStanding.Fullest` picks the reading as in §9.4 (highest utilization, ties to
+the later reset, then the fixed order; none when the standing is empty or any reading failed). Nothing is written when it
+reports none, or when the reading's reset is not after the moment of writing: a response that outlives the period boundary
+stays headerless, and the next one corrects it (§9.4 writes the stale reset there; Codex would show a reset in the past).
+Otherwise `writeCodexLimitStanding` writes the primary window of the default family:
+
+| Header | Value |
+|---|---|
+| `x-codex-primary-used-percent` | `floor(utilization × 100)` as an integer, at least 0 and at most 99 (§9.4's rule: an admitted request stays below 100) |
+| `x-codex-primary-window-minutes` | the nominal period length: hour `60`, day `1440`, week `10080`, month `43200` (nominal, so a 28-day February still reads `monthly`) |
+| `x-codex-primary-reset-at` | the reading's reset, unix seconds |
+| `x-codex-limit-name` | `OP AI Gateway request quota`, `OP AI Gateway token quota` or `OP AI Gateway cost budget` (one window cannot say which limit it is) |
+| `x-codex-credits-has-credits` | `true`, which suppresses the model-switch popup |
+| `x-codex-credits-unlimited` | `false` |
+
+There is no secondary window, no `x-codex-credits-balance` and no `x-codex-active-limit`. Codex then shows the status line
+`daily 62% left` (an hourly limit takes the fallback label `usage`), the `/status` row
+`OP AI Gateway token quota Daily limit: […] 62% left (resets …)`, its warnings at 75, 90 and 95 %, and no popup.
+
+**Precedence with §9.5.** The subscription wins, whole. The gateway writes nothing when, after §9.5's relay or cache attach,
+the client header set already carries any Codex rate-limit header (`hasCodexRateLimitHeader`, over the family of §6): one
+family per response leaves room for only one of the two, and the vendor's figures stay exactly as ADR-108 writes them.
+`retry-after` and `x-should-retry` are not in the family and do not count. This has three consequences:
+
+- A principal who also uses an OpenAI subscription sees the gateway's limit only on responses that carry no subscription
+  figure, relayed or cached. While cached windows are still in the future (a weekly window up to 7 days), local-model replies
+  show the subscription and Codex gives no gateway warning; a block still names the gateway's limit.
+- A vendor family that the relay withheld from a caller who is not entitled (§6) is not in the client header set, so that
+  caller gets the gateway's limit instead.
+- Codex carries credits over between responses: once a gateway response has set `x-codex-credits-has-credits: true`, a later
+  local-model reply that carries only cached subscription windows also suppresses the subscription's popup, until the next
+  vendor response sends its own credits headers.
+
+**Block (`/v1/responses` only).** A quota or budget denial on the OpenAI Responses flavor (`/v1/responses` and
+`/openai/v1/responses`) is answered by `writeCodexLimitBlocked`, called from `admitPrincipal`'s flavor switch beside §9.4's
+`writeLimitBlocked`. `LimitStanding.Blocking` picks the limit to name exactly as in §9.4 (the breached reading with the latest
+reset, ties to the fixed order, the defensive fallback to the reading `Admit` named); when it reports none, the request falls
+back to `writeLimitDenied`. The status is 429 for all three kinds: the cost budget is a 429 here too, not its 402.
+
+**Body** (`Content-Type: application/json`), for example:
+
+```json
+{"error":{"type":"usage_limit_reached","code":"limit.token_quota_exceeded","message":"token quota reached · resets Nov 22, 00:00 UTC · ask your gateway administrator to raise it","resets_at":1795305600}}
+```
+
+`code` is the limit's stable code (`limit.request_quota_exceeded`, `limit.token_quota_exceeded` or
+`limit.cost_budget_exceeded`), `message` is §9.4's sentence (`limitBlockedMessage`) for SDK clients that print
+`error.message`, and `resets_at` is the reading's reset in unix seconds, which Codex formats in local time. Like §9.4's body,
+it is not the `apierror` shape.
+
+**Headers:**
+
+| Header | Value |
+|---|---|
+| `Retry-After` | seconds to the reset, rounded up, at least 1 |
+| `X-Should-Retry` | `false` |
+| `x-codex-promo-message` | `OP AI Gateway <request quota\|token quota\|cost budget> reached; ask your gateway administrator to raise it` (ASCII only) |
+| `x-codex-primary-used-percent` | `100` |
+| `x-codex-primary-window-minutes` | the nominal period length, as on a success |
+| `x-codex-primary-reset-at` | the reading's reset, unix seconds |
+| `x-codex-credits-has-credits` | `true` |
+| `x-codex-credits-unlimited` | `false` |
+
+Deliberately absent: `x-codex-limit-name` (with it Codex prints "Switch to another model now" instead of the sentence),
+`x-codex-active-limit` (the default family is the one Codex reads), `x-codex-rate-limit-reached-type` and any secondary
+window. During a block `/status` therefore labels the row `Daily limit` without the `OP AI Gateway` prefix, and the status
+line shows `daily 0% left`. The 100 % window replaces whatever the display held, so a subscription user sees the gateway's
+0 % until a later success carries the subscription's figures again (relayed or cached).
+
+What Codex prints, after one request and without a retry (a daily quota, a client in UTC+1):
+`You've hit your usage limit. OP AI Gateway token quota reached; ask your gateway administrator to raise it, or try again at 1:00 AM.`
+
+A denied request is still not recorded as a usage event and never reaches `Resolve`. The short rate limit is unchanged (429
+`limit.rate_limited` with `Retry-After`, `apierror` body); Codex prints
+`exceeded retry limit, last status: 429 Too Many Requests` for it, after one request.
+
+**Unchanged.** Every other flavor keeps its denial: `/v1/messages` answers as §9.4 describes, and chat completions, images,
+speech, transcription, live transcription, the `/v1/realtime` handshake and the portal loopback paths keep
+`writeLimitDenied` (§9.4, *Other endpoints*). The rate denial is unchanged on every flavor, and so are §9.5's relay, cache,
+entitlement and capture redaction. An upstream error response (non-2xx) gets no gateway header. A principal with no quota or budget
+gets no gateway header, byte for byte as before, and neither does a success whose standing holds a failed reading.
+
+**Memory driver.** As in §9.4: it holds no `usage_events`, so a configured principal reads 0 % in Codex too, which matches
+enforcement.
+
+**End to end.** Run against Codex CLI 0.137.0 with a sqlite-mode gateway and a self-hosted stub answering `/v1/responses`
+with 12 tokens per request, for a principal with a token quota of 100 per day. At 60 % used the status line read
+`daily 40% left` and `/status` showed `OP AI Gateway token quota Daily limit: […] 40% left (resets 01:00)`. At 96 % Codex
+printed its warning `Heads up, you have less than 5% of your daily limit left. Run /status for a breakdown.`, the status line
+read `daily 4% left`, no `gpt-5.4-mini` popup opened and the model stayed unchanged. Past the cap the gateway answered the
+429 `usage_limit_reached` above; Codex sent the request once, the stub received none, and Codex printed
+`You've hit your usage limit. OP AI Gateway token quota reached; ask your gateway administrator to raise it, or try again at 1:00 AM.`,
+with the status line at `daily 0% left` and the `/status` row `Daily limit: … 0% left`. This is a documented manual run, as in
+§9.5; the gateway's paths are covered by handler tests.
+
+**Dependency.** The display and the block sentence rely on undocumented Codex behavior: one family per response with the last
+one winning, the default family as the only one with a status line and warnings, the window-minute labels, the credits flag's
+effect on the popup, and the promo message's precedence below a `limit-name` header. A client update can change any of them
+without notice; nothing in the gateway breaks, and the 429, `Retry-After`, `X-Should-Retry: false` and enforcement keep
+working. See [Risks & Technical Debt](../11-risks-and-technical-debt.md#111-operational-risks).
 
 ## 10. Request bodies and size limits
 
@@ -5374,7 +5527,7 @@ serving endpoint with the session cookie and names the file from the response's
 ## 13. Errors
 
 Every inference error response uses the gateway-wide envelope
-(`apierror.Response`, `internal/apierror/`):
+(`apierror.Response`, `internal/apierror/`), with two exceptions: the §9.4 `billing_error` body on `/v1/messages` and the §9.6 `usage_limit_reached` body on `/v1/responses`; both still carry the stable `error.code`:
 
 ```json
 {"error": {"code": "provider.unavailable", "message": "...", "request_id": "req_..."}}
@@ -5384,8 +5537,8 @@ Every inference error response uses the gateway-wide envelope
 |---|---|---|
 | `request.*` (e.g. `request.model_required`, `openai.content_required`, `anthropic.content_unsupported`) | 400 | body failed `compat.Parse*`/`inference.Request.Validate` |
 | `model.not_allowed` | 403 | service-token allowlist (§6 step 2) |
-| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate; the two quota codes also carry `X-Should-Retry: false`, and on `/v1/messages` they come as a `billing_error` body (§9.4); `.token_quota_exceeded` is also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
-| `limit.cost_budget_exceeded` | 402 (429 `billing_error` on `/v1/messages`, §9.4) | `PrincipalLimiter` admission gate, with `X-Should-Retry: false`; also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
+| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate; the two quota codes also carry `X-Should-Retry: false`, and on `/v1/messages` they come as a `billing_error` body (§9.4), on `/v1/responses` as a Codex `usage_limit_reached` body (§9.6); `.token_quota_exceeded` is also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
+| `limit.cost_budget_exceeded` | 402 (429 `billing_error` on `/v1/messages`, §9.4; 429 `usage_limit_reached` on `/v1/responses`, §9.6) | `PrincipalLimiter` admission gate, with `X-Should-Retry: false`; also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |
