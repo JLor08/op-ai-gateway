@@ -13186,7 +13186,7 @@ neither `retry-after` nor `x-should-retry`.
 
 **Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (opt-in and the popup switch).** The standing on a success and the window of the block need `send_usage_limits`; without it the block keeps only the 429, `Retry-After`, `X-Should-Retry: false`, the same body and `x-codex-promo-message`. With `codex_model_switch_prompt` the gateway no longer writes its own credits flag, which this ADR used to suppress the popup.
 
-**Amended (cached windows yield from 75 %, issue #418 follow-up).** On a `/v1/responses` success whose Codex figures would come only from
+**Amended (cached windows yield from 75 %, issue #418 follow-up, [PR #423](https://github.com/JLor08/op-ai-gateway/pull/423)).** On a `/v1/responses` success whose Codex figures would come only from
 ADR-108's window cache (a local model, a translated reply, or a native vendor reply without any Codex rate-limit header, as an API-key
 account usually sends), the gateway's own fullest limit replaces them, the whole cached set included, once its written percent (floored,
 at most 99) is 75 or more, which is Codex's first warning step (`codexGatewayLimitTakesOver`, `codexGatewayTakeoverPercent`). Fresh
