@@ -158,6 +158,9 @@ export function ServiceTokensSection({
   // Opt-in Claude Code effort compatibility — see TokenList.
   const [tokenClaudeEffort, setTokenClaudeEffort] = useState(false);
   const [tokenDecisionsNormalize, setTokenDecisionsNormalize] = useState(false);
+  // Usage-limit opt-ins (#420) — see TokenList. Create-only (no edit path, #421).
+  const [tokenSendUsageLimits, setTokenSendUsageLimits] = useState(false);
+  const [tokenCodexSwitchPrompt, setTokenCodexSwitchPrompt] = useState(false);
   const [tokenLogCommunication, setTokenLogCommunication] = useState(false);
   const [tokenSecretFlag, setTokenSecretFlag] = useState(false);
   const [tokenBusy, setTokenBusy] = useState(false);
@@ -209,6 +212,8 @@ export function ServiceTokensSection({
     setTokenClaudeAliases(false);
     setTokenClaudeEffort(false);
     setTokenDecisionsNormalize(false);
+    setTokenSendUsageLimits(false);
+    setTokenCodexSwitchPrompt(false);
     setTokenLogCommunication(false);
     setTokenSecretFlag(false);
     setTokenVaEntries([]);
@@ -242,6 +247,8 @@ export function ServiceTokensSection({
         claude_model_aliases: tokenClaudeAliases,
         claude_effort_compatibility: tokenClaudeEffort,
         decisions_confidence_normalize: tokenDecisionsNormalize,
+        send_usage_limits: tokenSendUsageLimits,
+        codex_model_switch_prompt: tokenSendUsageLimits && tokenCodexSwitchPrompt,
         log_communication: tokenLogCommunication,
         secret: tokenSecretFlag,
         vendor_access: buildVendorAccess(),
@@ -542,6 +549,38 @@ export function ServiceTokensSection({
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenDecisionsConfidenceNormalizeHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenSendUsageLimits}
+                    onChange={(e) => {
+                      setTokenSendUsageLimits(e.target.checked);
+                      if (!e.target.checked) setTokenCodexSwitchPrompt(false);
+                    }}
+                  />
+                }
+                label={t.tokenSendUsageLimits}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenSendUsageLimitsHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenCodexSwitchPrompt}
+                    disabled={!tokenSendUsageLimits}
+                    onChange={(e) => setTokenCodexSwitchPrompt(e.target.checked)}
+                  />
+                }
+                label={t.tokenCodexModelSwitchPrompt}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenCodexModelSwitchPromptHint}
               </Typography>
             </Box>
             {/* Hidden entirely while the vendor-accounts master flag is off. Create

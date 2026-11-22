@@ -1141,6 +1141,24 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       return { fakeApi, createDialog };
     }
 
+    it('sends both usage-limit switches on a service token create, Codex gated on the first', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog('svc_ul');
+      const send = () => createDialog.getByRole('checkbox', { name: t.tokenSendUsageLimits });
+      const codex = () =>
+        createDialog.getByRole('checkbox', { name: t.tokenCodexModelSwitchPrompt });
+      expect(createDialog.getByText(t.tokenSendUsageLimitsHint)).toBeInTheDocument();
+      expect(createDialog.getByText(t.tokenCodexModelSwitchPromptHint)).toBeInTheDocument();
+      expect(codex()).toBeDisabled();
+      fireEvent.click(send());
+      fireEvent.click(codex());
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+        'svc_ul',
+        expect.objectContaining({ send_usage_limits: true, codex_model_switch_prompt: true }),
+      );
+    });
+
     it('defaults decisions_confidence_normalize to off and sends it on a service token create', async () => {
       const { fakeApi, createDialog } = await openCreateDialog('svc_dcn');
       const box = () =>

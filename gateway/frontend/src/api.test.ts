@@ -541,6 +541,56 @@ describe('portal api', () => {
     expect(token.status).toBe('disabled');
   });
 
+  it('sends the usage-limit switches on create and PATCH and reads them back', async () => {
+    const tokenJson = {
+      id: 'tok_ul',
+      name: 'ul',
+      secret_prefix: 'opaigw_u',
+      status: 'active',
+      scopes: ['gateway:use'],
+      expires_at: null,
+      last_used_at: null,
+      created_at: '2026-07-11T00:00:00Z',
+      send_usage_limits: true,
+      codex_model_switch_prompt: true,
+    };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ token: tokenJson, secret: 's' }), {
+          status: 201,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(tokenJson), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      );
+    const api = createPortalApi(fetcher);
+
+    const created = await api.createToken({
+      name: 'ul',
+      scopes: ['gateway:use'],
+      send_usage_limits: true,
+      codex_model_switch_prompt: true,
+    });
+    expect(JSON.parse(fetcher.mock.calls[0][1].body as string)).toMatchObject({
+      send_usage_limits: true,
+      codex_model_switch_prompt: true,
+    });
+    expect(created.token.send_usage_limits).toBe(true);
+    expect(created.token.codex_model_switch_prompt).toBe(true);
+
+    await api.updateToken('tok_ul', { send_usage_limits: false, codex_model_switch_prompt: false });
+    expect(fetcher.mock.calls[1][1].method).toBe('PATCH');
+    expect(JSON.parse(fetcher.mock.calls[1][1].body as string)).toEqual({
+      send_usage_limits: false,
+      codex_model_switch_prompt: false,
+    });
+  });
+
   it('creates a token with the Claude Code usage-display opt-in and returns the full secret', async () => {
     const longSecret = `eyJhbGciOi.${'x'.repeat(130)}.sig`;
     const fetcher = vi.fn().mockResolvedValue(

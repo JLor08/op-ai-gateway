@@ -115,6 +115,8 @@ function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
     log_communication: false,
     secret: false,
     claude_code_usage_display: false,
+    send_usage_limits: false,
+    codex_model_switch_prompt: false,
     is_chat_session: false,
     deletable: true,
     ...overrides,
@@ -168,6 +170,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           model_override: body.model_override ?? '',
           log_communication: body.log_communication ?? false,
           claude_code_usage_display: body.claude_code_usage_display ?? false,
+          send_usage_limits: body.send_usage_limits ?? false,
+          codex_model_switch_prompt: body.codex_model_switch_prompt ?? false,
         });
         return { token, secret: opts.createdSecret ?? 'opaigw_created_secret' };
       }),
@@ -833,6 +837,138 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         ]);
         expect(next.every((row) => row.claude_code_usage_display === false)).toBe(true);
       }
+    });
+  });
+
+  describe(`TokenList usage-limit switches (#420) [${locale}]`, () => {
+    const send = () => screen.getByRole('checkbox', { name: t.tokenSendUsageLimits });
+    const codex = () => screen.getByRole('checkbox', { name: t.tokenCodexModelSwitchPrompt });
+    const format = () => screen.getByRole('checkbox', { name: t.tokenClaudeCodeUsageDisplay });
+    const bodyOf = (fn: unknown) =>
+      (fn as { mock: { calls: unknown[][] } }).mock.calls[0][1] as Record<string, unknown>;
+
+    it('shows both help texts', () => {
+      renderTokenList({});
+      openCreate();
+      expect(screen.getByText(t.tokenSendUsageLimitsHint)).toBeInTheDocument();
+      expect(screen.getByText(t.tokenCodexModelSwitchPromptHint)).toBeInTheDocument();
+      expect(t.tokenSendUsageLimitsHint).toMatch(/Codex/);
+      expect(t.tokenCodexModelSwitchPromptHint).toMatch(/gpt-5\.4-mini/);
+      expect(t.tokenCodexModelSwitchPromptHint).toMatch(/90/);
+    });
+
+    it('sends both switches false by default on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      expect(send()).not.toBeChecked();
+      expect(codex()).not.toBeChecked();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'n' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({
+        send_usage_limits: false,
+        codex_model_switch_prompt: false,
+      });
+    });
+
+    it('sends both switches on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'n' } });
+      fireEvent.click(send());
+      fireEvent.click(codex());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({
+        send_usage_limits: true,
+        codex_model_switch_prompt: true,
+      });
+    });
+
+    it('keeps the Codex switch disabled until usage limits are sent, and clears it with them', () => {
+      renderTokenList({});
+      openCreate();
+      expect(codex()).toBeDisabled();
+      fireEvent.click(send());
+      expect(codex()).toBeEnabled();
+      fireEvent.click(codex());
+      expect(codex()).toBeChecked();
+      fireEvent.click(send());
+      expect(codex()).not.toBeChecked();
+      expect(codex()).toBeDisabled();
+    });
+
+    it('ticks usage limits with the Claude Code token format, and lets the user untick them', () => {
+      renderTokenList({});
+      openCreate();
+      fireEvent.click(format());
+      expect(send()).toBeChecked();
+      fireEvent.click(send());
+      expect(send()).not.toBeChecked();
+      expect(format()).toBeChecked();
+    });
+
+    it('resets both switches when the create form is opened again', async () => {
+      const { fakeApi } = renderTokenList({});
+      openCreate();
+      fireEvent.click(send());
+      fireEvent.click(codex());
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'n' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      fireEvent.click(await screen.findByRole('button', { name: t.captureClose }));
+      fireEvent.click(await screen.findByRole('button', { name: t.tokenCreate }));
+      expect(send()).not.toBeChecked();
+      expect(codex()).not.toBeChecked();
+    });
+
+    it('PATCHes both changed values on edit without rotating', async () => {
+      const { fakeApi } = renderTokenList({ tokens: [makeToken({ id: 'tok_e' })] });
+      openEdit();
+      expect(send()).not.toBeChecked();
+      fireEvent.click(send());
+      fireEvent.click(codex());
+      expect(screen.queryByText(t.tokenClaudeCodeUsageRotateWarning)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(bodyOf(fakeApi.updateToken)).toMatchObject({
+        send_usage_limits: true,
+        codex_model_switch_prompt: true,
+      });
+      expect(
+        (fakeApi.rotateToken as unknown as { mock: { calls: unknown[][] } }).mock.calls,
+      ).toHaveLength(0);
+    });
+
+    it('shows the stored values on edit and PATCHes an unchecked pair', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [
+          makeToken({ id: 'tok_e', send_usage_limits: true, codex_model_switch_prompt: true }),
+        ],
+      });
+      openEdit();
+      expect(send()).toBeChecked();
+      expect(codex()).toBeChecked();
+      fireEvent.click(send());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(bodyOf(fakeApi.updateToken)).toMatchObject({
+        send_usage_limits: false,
+        codex_model_switch_prompt: false,
+      });
+    });
+
+    it('shows a badge only on tokens that send usage limits', () => {
+      renderTokenList({
+        tokens: [
+          makeToken({ id: 'tok_a', name: 'Sends', send_usage_limits: true }),
+          makeToken({ id: 'tok_b', name: 'Silent' }),
+        ],
+      });
+      const on = screen.getByText('Sends').closest('tr') as HTMLElement;
+      const off = screen.getByText('Silent').closest('tr') as HTMLElement;
+      expect(within(on).getByText(t.tokenUsageLimitsBadge)).toBeInTheDocument();
+      expect(within(off).queryByText(t.tokenUsageLimitsBadge)).not.toBeInTheDocument();
     });
   });
 

@@ -336,6 +336,8 @@ function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
     log_communication: false,
     secret: false,
     claude_code_usage_display: false,
+    send_usage_limits: false,
+    codex_model_switch_prompt: false,
     is_chat_session: false,
     deletable: true,
     ...overrides,

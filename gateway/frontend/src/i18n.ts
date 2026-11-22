@@ -3460,6 +3460,13 @@ const de = {
   tokenClaudeCodeUsageRotateWarning:
     'Beim Speichern wird der Token rotiert: Das bisherige Geheimnis funktioniert danach nicht mehr, das neue wird einmalig angezeigt.',
   tokenClaudeCodeBadge: 'Claude Code',
+  tokenSendUsageLimits: 'Nutzungslimits senden',
+  tokenSendUsageLimitsHint:
+    'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Claude Code braucht dafür zusätzlich das Claude-Code-Token-Format. Wirkt sofort, das Geheimnis bleibt unverändert.',
+  tokenCodexModelSwitchPrompt: 'Codex: Wechsel auf gpt-5.4-mini anbieten',
+  tokenCodexModelSwitchPromptHint:
+    'Wirkt nur zusammen mit „Nutzungslimits senden“. Codex bietet dann bei 90 % seines Hauptfensters den Wechsel auf gpt-5.4-mini an, auch wenn das Limit des Gateways das angezeigte ist.',
+  tokenUsageLimitsBadge: 'Nutzungslimits',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
@@ -7391,6 +7398,13 @@ const en: PortalMessages = {
   tokenClaudeCodeUsageRotateWarning:
     'Saving rotates the token: the current secret stops working and the new one is shown once.',
   tokenClaudeCodeBadge: 'Claude Code',
+  tokenSendUsageLimits: 'Send usage limits',
+  tokenSendUsageLimitsHint:
+    'Clients (Claude Code, Codex CLI) then show the remaining usage. Claude Code also needs the Claude Code token format. Takes effect immediately; the secret stays unchanged.',
+  tokenCodexModelSwitchPrompt: 'Codex: offer switching to gpt-5.4-mini',
+  tokenCodexModelSwitchPromptHint:
+    'Only takes effect together with "Send usage limits". Codex then offers the switch to gpt-5.4-mini at 90 % of its main window, also when the gateway\'s own limit is the one shown.',
+  tokenUsageLimitsBadge: 'Usage limits',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',
