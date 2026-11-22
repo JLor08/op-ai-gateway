@@ -3995,19 +3995,14 @@ attached. The cache therefore also records which vendor account each entry came 
 a later `vendor_anthropic` response carrying the unified status reaches a principal who is
 no longer entitled to that account (for example the owner turned off
 `share_usage_with_members`), that principal's entry from the same account is dropped
-(`Forget`), and an entry observed from another account is left alone. **Known
-limitation:** the drop needs such a response, so a principal who has lost entitlement and
+(`Forget`), and an entry observed from another account is left alone. A token without
+`send_usage_limits` observes nothing, but its vendor response on that account still runs this
+check when its principal has an entry from there, so an opted-out token purges a revoked entry
+too. **Known limitation:** the drop needs such a response, so a principal who has lost entitlement and
 then uses only other providers keeps receiving its last stored figures, frozen, on
 local-model replies until those windows reset (up to 7 days) or the process restarts.
 Nothing new is disclosed (the principal already saw these figures), and sharing is off by
 default.
-
-**Known edge of the opt-in.** A vendor response on a token without `send_usage_limits` records
-nothing, so it also does not trigger the revocation drop above. The cache is keyed per principal, not per
-token: another token of the same principal that does send usage limits can keep receiving that
-account's last, frozen windows until they expire or until one of its own vendor responses reaches the
-account. This widens the observe-time limitation above; it discloses nothing new, because the
-principal's other token already saw these figures.
 
 **Payload captures.** The translate path stores the upstream response headers in a payload
 capture, which its owner (and admins, for a non-secret capture) can read. For a
@@ -4166,8 +4161,8 @@ entries never evict or overwrite each other.
 - Observed in `recordUsage`, from the upstream headers of any response of an OpenAI vendor provider
   (`routing.IsOpenAIVendorProvider`) that carries a `primary-used-percent` or `secondary-used-percent` header of the `x-codex` family or an `x-codex-<id>` family (any
   status; native passthrough and translate), and only when the caller is entitled to the account's figures. A caller who is not
-  entitled loses that account's entry (`Forget`). A token with no principal (neither user nor service id) caches nothing, and neither does a token
-  without `send_usage_limits`, whose vendor response does not reach the `Forget` either: the known edge of §9.3 applies.
+  entitled loses that account's entry (`Forget`). A token with no principal (neither user nor service id) caches nothing. A token without `send_usage_limits` observes nothing
+  either, but its vendor response still purges a revoked entry of its principal from that account (`Forget`, after an entitlement check that only runs when such an entry exists).
 - Stored per family: the primary and secondary window (`used-percent`, `window-minutes`, `reset-at`) and the family's `limit-name`, from
   the first value of each header. A window without a positive integer `reset-at` is not stored, because it could never expire; the other
   windows still are. Credits, `x-codex-active-limit`, `x-codex-rate-limit-reached-type`, `x-codex-promo-message` and the retry headers
@@ -4179,7 +4174,7 @@ entries never evict or overwrite each other.
 - Only windows whose reset time is still in the future are written, and a family's `limit-name` only with at least one of its windows.
 - Per process and best effort, with the bounds of §9.3: in memory, capped at 10 000 principals (oldest observation evicted), at most 8 families per
   observation (the default `x-codex` family first, the others in sorted order) and no header value longer than 256 bytes (such a value counts as absent), pruned as
-  windows expire, lost on restart, not shared between replicas. The entitlement revocation behavior and its known limitation are those
+  windows expire, lost on restart, not shared between replicas. The entitlement revocation behavior, the purge by an opted-out token and the known limitation are those
   of §9.3.
 
 **Payload captures.** The translate path stores the upstream response headers in a capture. For a vendor-account target the Codex
@@ -4188,8 +4183,10 @@ account's figures (`redactCapturedAccountHeaders`). Native passthrough captures 
 
 **What Codex shows.** The windows in its status-line items (`five-hour-limit`, `weekly-limit`), the `/status` bars with reset times, and
 warnings at 75, 90 and 95 % ("Heads up, you have less than ...% of your 5h limit left"). At 90 % and above Codex also nudges the user
-to switch to `gpt-5.4-mini`, which the gateway may not map. The gateway suppresses that popup by default (the credits flag of
-§9.6) and shows it only for a token that also has `codex_model_switch_prompt`; `notices.hide_rate_limit_model_nudge = true` in Codex's
+to switch to `gpt-5.4-mini`, which the gateway may not map. The gateway writes its credits flag (§9.6) only in its own standing and its own block, never
+next to subscription figures, relayed or cached, so on those the vendor's relayed credits headers decide. The gateway influences the popup
+only through Codex's credits carry-over after one of its own standing or block responses, and only for a token without
+`codex_model_switch_prompt`; `notices.hide_rate_limit_model_nudge = true` in Codex's
 configuration hides it client-side. Before the first subscription response of a session, and after a gateway restart, the display is empty: Codex's startup prefetch
 exists only for a ChatGPT login. The gateway's own request quota, token quota and cost budget are written in the same default family
 (for a token with `send_usage_limits`), but only on a success that carries no subscription figures, relayed or cached, so the subscription always wins; that is
@@ -4291,8 +4288,8 @@ family per response leaves room for only one of the two, and the vendor's figure
 it no `x-codex-*` header is written at all). When on, the gateway never writes its own `x-codex-credits-has-credits` or
 `x-codex-credits-unlimited`, neither on the success standing above nor on the block below, so Codex shows its
 `Switch to gpt-5.4-mini` popup at 90 % of its default window. Because Codex carries credits over between responses, the popup also appears
-while the default window shows the gateway's own limit, and the credits state the gateway set earlier is no longer there to
-suppress it. The vendor's own relayed credits headers are untouched. Verified on the Codex CLI 0.137.0 TUI: the popup with the switch, only the
+while the default window shows the gateway's own limit, because with the switch the gateway sets no credits flag, so none carries over
+from its responses. A session that already received one from the gateway before the switch was turned on keeps it until it restarts. The vendor's own relayed credits headers are untouched. Verified on the Codex CLI 0.137.0 TUI: the popup with the switch, only the
 warning without it. Meant for a user who works with a Codex subscription and wants the offer.
 
 **Block (`/v1/responses` only).** A quota or budget denial on the OpenAI Responses flavor (`/v1/responses` and

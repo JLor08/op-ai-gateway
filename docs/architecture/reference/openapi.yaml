@@ -1553,8 +1553,8 @@ paths:
       their probabilities. It is NOT management-gated. A token also
       carries the opt-in claude_code_usage_display flag (default false, always
       present on a read): when true, its secret has the Claude Code shape (a
-      JWT-looking prefix around the opaigw_ secret) so Claude Code shows the
-      usage limits. It is set on create and changed only by rotation. A token
+      JWT-looking prefix around the opaigw_ secret) so Claude Code can read usage
+      limits, which it shows only together with send_usage_limits. It is set on create and changed only by rotation. A token
       also carries the opt-in send_usage_limits and codex_model_switch_prompt
       flags (default false, always present on a read, not gated, no
       rotation): without send_usage_limits no usage-limit header reaches the
@@ -1643,7 +1643,8 @@ paths:
                   description: >
                     Give the new token's secret the Claude Code shape (a
                     JWT-looking prefix around the opaigw_ secret) so Claude
-                    Code shows the usage limits. Absent means off.
+                    Code can read usage limits, which it shows only together
+                    with send_usage_limits. Absent means off.
                 send_usage_limits:
                   type: boolean
                   description: >

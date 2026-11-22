@@ -13254,10 +13254,11 @@ types of blocks, and the ServerAgent.
 **Consequences and limits.**
 
 - Codex carries credits over between responses: with `codex_model_switch_prompt` on, the popup also appears while the default window shows the
-  gateway's own limit, and a credits flag a gateway response set earlier no longer suppresses it.
-- A vendor response on a token with `send_usage_limits` off does not reach the window cache's revocation purge (`Forget`). The caches are
-  keyed per principal, so another opted-in token of the same principal can keep receiving that account's last, frozen windows until they
-  expire or an opted-in token reaches the account. Nothing new is disclosed; this widens the observe-time revocation limitation of ADR-106.
+  gateway's own limit, because with the switch the gateway sets no credits flag, so none carries over from its responses. A session that already received one from
+  the gateway before the switch was turned on keeps it until it restarts.
+- A token with `send_usage_limits` off observes nothing into the window caches, but a vendor response on it still purges a revoked entry of
+  its principal from that account (`Forget`), after an entitlement check that only runs when such an entry exists. An opted-in sibling token
+  therefore never keeps frozen windows beyond the observe-time limitation of ADR-106.
 - Service tokens cannot change a switch until #421; recreate the token.
 - → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
   [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
