@@ -70,6 +70,7 @@ import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
 import { runtimeSpecTemplate } from './shared/runtimeSpecTemplate';
+import { strataSpecTemplate } from './shared/strataTemplate';
 import {
   formSpecIsLlamaCpp,
   formSpecIsStableDiffusion,
@@ -755,14 +756,15 @@ function runtimeSpecHealthPathDefault(type: RuntimeSpec['type']): string {
 }
 
 // The Type select's helper text: the note of a kind with something the operator
-// must know to launch or route it (sd-server, audio.cpp, vllm-srun, SGLang and
-// sglang-omni), nothing for every other kind, Auto included.
+// must know to launch or route it (sd-server, audio.cpp, vllm-srun, SGLang,
+// sglang-omni and Strata), nothing for every other kind, Auto included.
 function runtimeSpecTypeNote(type: RuntimeSpec['type'], t: Translation): string | undefined {
   if (type === 'stable_diffusion_cpp') return t.runtimeSpecTypeStableDiffusionCppNote;
   if (type === 'audio_cpp') return t.runtimeSpecTypeAudioCppNote;
   if (type === 'vllm_sr') return t.runtimeSpecTypeVllmSrNote;
   if (type === 'sglang') return t.runtimeSpecTypeSglangNote;
   if (type === 'sglang_omni') return t.runtimeSpecTypeSglangOmniNote;
+  if (type === 'strata') return t.runtimeSpecTypeStrataNote;
   return undefined;
 }
 
@@ -1293,6 +1295,13 @@ const apiTokenBackendRows: {
     envKey: 'runtimeSpecApiTokenRowTgiEnv',
     argsKey: 'runtimeSpecApiTokenRowTgiArgs',
     clientKey: 'runtimeSpecApiTokenRowTgiClient',
+  },
+  {
+    key: 'strata',
+    backendKey: 'runtimeSpecApiTokenRowStrataBackend',
+    envKey: 'runtimeSpecApiTokenRowStrataEnv',
+    argsKey: 'runtimeSpecApiTokenRowStrataArgs',
+    clientKey: 'runtimeSpecApiTokenRowStrataClient',
   },
 ];
 
@@ -3526,6 +3535,25 @@ export function RuntimeAdminSection({
     setSpecFlavorsBeforeKindDefault(change.remembered);
   }
 
+  // The Strata launch template (strataSpecTemplate), filled in when the Type
+  // select switches to strata on a spec's FIRST write only: an edit of a
+  // stored spec keeps what it stores. Args and env the operator already typed
+  // are kept, as is a startup timeout moved off the stock 180 s; the
+  // visible-devices option is turned off (Strata takes host card numbers), and
+  // the API variants are the template's. The health path follows the Type
+  // select's own default rule, which already gives /health.
+  function applyStrataTemplate() {
+    if (!specFirstWrite) return;
+    const template = strataSpecTemplate();
+    if (argsText === '') setArgsText(formatArgsText(template.args));
+    if (envText === '') setEnvText(formatEnvText(template.env));
+    if (startupTimeoutSeconds === 180) setStartupTimeoutSeconds(template.startupTimeoutSeconds);
+    setSetVisibleDevices(template.setVisibleDevices);
+    setSpecApiFlavors(template.flavors);
+    setSpecResponsesMode(template.responsesMode);
+    setSpecMessagesMode(template.messagesMode);
+  }
+
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     if (specFlavorsMissing()) return;
@@ -5067,7 +5095,11 @@ export function RuntimeAdminSection({
               }}
               binaries={serverBinaries}
               required
-              placeholder="/usr/local/bin/llama-server"
+              placeholder={
+                specType === 'strata'
+                  ? strataSpecTemplate().binaryHint
+                  : '/usr/local/bin/llama-server'
+              }
             />
             {/* RuntimeSpec Type: explicit backend kind ('' = auto-detect from
                 `binary` above), plus the per-type metrics/context-probe path
@@ -5127,6 +5159,7 @@ export function RuntimeAdminSection({
                   setHealthPath(runtimeSpecHealthPathDefault(next));
                 }
                 applySpecTypeFlavorDefaults(next);
+                if (next === 'strata' && next !== specType) applyStrataTemplate();
                 setSpecDecisionsMode(decisionsModeForKind(specDecisionsMode, next));
                 setSpecSystemOneMode(systemOneModeForKind(specSystemOneMode, next));
                 setSpecType(next);
@@ -5144,6 +5177,7 @@ export function RuntimeAdminSection({
               <option value="vllm_sr">{t.runtimeSpecTypeVllmSr}</option>
               <option value="sglang">{t.runtimeSpecTypeSglang}</option>
               <option value="sglang_omni">{t.runtimeSpecTypeSglangOmni}</option>
+              <option value="strata">{t.runtimeSpecTypeStrata}</option>
               <option value="custom">{t.runtimeSpecTypeCustom}</option>
             </SelectField>
             <Field

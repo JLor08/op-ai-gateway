@@ -177,6 +177,39 @@ func TestHandlePortalMappingRuntimeSpecPutSGLangTypesAccepted(t *testing.T) {
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutStrataTypeAccepted pins that a PUT with
+// type strata is saved and echoed (200, not runtime_spec.type_invalid), and
+// that the type_invalid message lists strata among the accepted kinds.
+func TestHandlePortalMappingRuntimeSpecPutStrataTypeAccepted(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd","type":"strata"}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+	var saved struct {
+		Type          string `json:"type"`
+		EffectiveType string `json:"effective_type"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+		t.Fatalf("unmarshal %s: %v", rec.Body.String(), err)
+	}
+	if saved.Type != "strata" || saved.EffectiveType != "strata" {
+		t.Fatalf("type/effective_type = %q/%q, want strata for both", saved.Type, saved.EffectiveType)
+	}
+
+	bad := httptest.NewRecorder()
+	srv.ServeHTTP(bad, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", `{"binary":"/usr/local/bin/llama-server","type":"bogus"}`))
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("bogus type status = %d, want 400", bad.Code)
+	}
+	if !strings.Contains(bad.Body.String(), "sglang_omni, strata, custom") {
+		t.Fatalf("type_invalid body = %s, want the message to list strata", bad.Body.String())
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400 pins the WIRE
 // contract of portal.ErrRuntimeSpecConfigFilesInvalid (#257): 400 with its own
 // code, a message that names the offending file and rule, and no echo of the

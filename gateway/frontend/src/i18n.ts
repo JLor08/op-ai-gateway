@@ -1283,6 +1283,7 @@ const de = {
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeSglang: 'SGLang',
   runtimeSpecTypeSglangOmni: 'sglang-omni',
+  runtimeSpecTypeStrata: 'Strata',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Benutzerdefiniert',
   runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
@@ -1557,6 +1558,10 @@ const de = {
   runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
   runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
   runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowStrataBackend: 'Strata (`strata serve`)',
+  runtimeSpecApiTokenRowStrataEnv: 'STRATA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataClient: 'Authorization: Bearer (oder x-api-key)',
   runtimeSpecApiTokenArgsLeakWarning:
     'Der Token steht damit als Klartext in der Prozessliste (ps aux, /proc/<pid>/cmdline) und unter Umständen in den Startprotokollen des Modellservers selbst — verwende stattdessen die Umgebungsvariable (Env).',
   runtimeSpecApiTokenBackendBanner:
@@ -1640,6 +1645,8 @@ const de = {
     'SGLang bedient Chat über /v1/chat/completions. Startvorlage: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Auf einer geteilten Karte --mem-fraction-static setzen, denn der automatische Standard belegt den Großteil des Speichers. Mit --api-key bleiben /health und /metrics offen, /v1/models verlangt dann aber den Schlüssel, sodass die Kontextabfrage nichts liest. Chat-Bilder nimmt das Gateway nur als data:-, http://- oder https://-URL an, einen Pfad auf dem Modell-Host lehnt es ab. Steht Codex (Responses-API) oder Claude Code (Anthropic Messages) auf „Durchreichen“, prüft das Gateway diese Anfragen (/v1/responses, /v1/messages) nicht; mit „Umwandlung“ gilt die Prüfung auch für sie. Unter Windows im WSL-Ausführungsmodus starten. Bei einer reinen Wheel-Installation (uv-venv ohne CUDA-Toolkit) in env CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 und LIBRARY_PATH=/usr/lib/wsl/lib setzen, build-essential und ninja-build in der Distribution installieren (PATH ist reserviert, das ninja der venv wird nicht gefunden) und die CUDA-Hinweise aus sgl-project/sglang#49209 befolgen. env-Werte expandiert keine Shell: absolute Pfade angeben.',
   runtimeSpecTypeSglangOmniNote:
     'sglang-omni bedient Chat, Sprachsynthese und Transkription. Startvorlage: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. --host 127.0.0.1 beibehalten: sglang-omni prüft keine Anmeldung und lauscht standardmäßig auf 0.0.0.0. Sprache und Transkription brauchen manuelle Fähigkeitsurteile, und an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein. Stimmreferenzen und Chat-Bilder werden nur inline als data:-URL angenommen, eine Bildbearbeitung nur mit hochgeladener Quelldatei. Audio im Chat (input_audio, modalities/audio) reicht das Gateway nicht weiter: Den Chat von sglang-omni erreichen nur Text und Inline-Bilder. Für /v1/realtime --enable-realtime anhängen und das Fähigkeitsurteil „realtime“ auf Ja setzen. Unter Windows im WSL-Ausführungsmodus starten. Bei einer reinen Wheel-Installation (uv-venv ohne CUDA-Toolkit) in env CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 und LIBRARY_PATH=/usr/lib/wsl/lib setzen, build-essential und ninja-build in der Distribution installieren (PATH ist reserviert, das ninja der venv wird nicht gefunden) und die CUDA-Hinweise aus sgl-project/sglang#49209 befolgen. env-Werte expandiert keine Shell: absolute Pfade angeben.',
+  runtimeSpecTypeStrataNote:
+    'Strata (`strata serve`) bedient Chat über die OpenAI- und die Anthropic-API. Bei einer neuen Spezifikation setzt diese Auswahl die Startvorlage ein: serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --gpu ${HOST_GPU_IDS_MAIN_LAST} --output jsonl --shutdown-timeout 3, dazu STRATA_API_KEY=${API_TOKEN} in env. --host 127.0.0.1 beibehalten: Der Agent erreicht den Server über Loopback. Als Programm den absoluten Pfad von strata.cmd eintragen (C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd) und ihn auf dem Agent in runtime_allowed_binaries aufnehmen. Die Laufkonfiguration als Konfigurationsdatei strata.json hinterlegen, ohne api_key – der Schlüssel kommt aus env. Sichtbare Geräte ausgeschaltet lassen: --gpu erwartet die Kartennummern des Hosts, die Hauptkarte zuletzt. Der Start-Timeout beträgt 960 s und liegt damit über der Zeit, die Strata selbst auf die Engine wartet (900 s); den Timeout der übergeordneten server_agent-Anwendung auf mindestens 960000 ms setzen, sonst warnt das Portal, dass ein Kaltstart abgebrochen wird. Chat-Bilder nimmt das Gateway nur als data:-, http://- oder https://-URL an.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -5370,6 +5377,7 @@ const en: PortalMessages = {
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeSglang: 'SGLang',
   runtimeSpecTypeSglangOmni: 'sglang-omni',
+  runtimeSpecTypeStrata: 'Strata',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Custom',
   runtimeSpecMetricsPath: 'Metrics path (override)',
@@ -5624,6 +5632,10 @@ const en: PortalMessages = {
   runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
   runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
   runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowStrataBackend: 'Strata (`strata serve`)',
+  runtimeSpecApiTokenRowStrataEnv: 'STRATA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataClient: 'Authorization: Bearer (or x-api-key)',
   runtimeSpecApiTokenArgsLeakWarning:
     "This puts the token in plaintext in the process listing (ps aux, /proc/<pid>/cmdline) and possibly in the model server's own startup logs — use the environment variable (Env) instead.",
   runtimeSpecApiTokenBackendBanner:
@@ -5699,6 +5711,8 @@ const en: PortalMessages = {
     "SGLang serves chat over /v1/chat/completions. Launch template: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Set --mem-fraction-static when the card is shared, because the automatic default takes most of it. With --api-key, /health and /metrics stay open, but /v1/models then needs the key, so the context probe reads nothing. The gateway accepts chat images only as data:, http:// or https:// URLs and refuses a path on the model host. While Codex (Responses API) or Claude Code (Anthropic Messages) is set to Pass-through, the gateway does not check those requests (/v1/responses, /v1/messages); with Translate the check covers them too. On Windows, run it in the WSL execution mode. For a wheel-only install (a uv venv without the CUDA toolkit), set CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 and LIBRARY_PATH=/usr/lib/wsl/lib in env, install build-essential and ninja-build in the distro (PATH is reserved, so the venv's ninja is not found) and apply the CUDA fixes from sgl-project/sglang#49209. No shell expands env values: use absolute paths.",
   runtimeSpecTypeSglangOmniNote:
     'sglang-omni serves chat, speech and transcription. Launch template: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. Keep --host 127.0.0.1: sglang-omni authenticates nothing and listens on 0.0.0.0 by default. Speech and transcription need manual capability verdicts, and the parent server_agent application needs "openai_audio (speech synthesis)" ticked too. Voice references and chat images are accepted only inline, as data: URLs, and an image edit only with an uploaded source file. The gateway does not relay chat audio (input_audio, modalities/audio): only text and inline images reach sglang-omni chat. For /v1/realtime, add --enable-realtime and set the realtime capability verdict to yes. On Windows, run it in the WSL execution mode. For a wheel-only install (a uv venv without the CUDA toolkit), set CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 and LIBRARY_PATH=/usr/lib/wsl/lib in env, install build-essential and ninja-build in the distro (PATH is reserved, so the venv\'s ninja is not found) and apply the CUDA fixes from sgl-project/sglang#49209. No shell expands env values: use absolute paths.',
+  runtimeSpecTypeStrataNote:
+    "Strata (`strata serve`) serves chat over the OpenAI and the Anthropic API. On a new spec, choosing this type fills in the launch template: serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --gpu ${HOST_GPU_IDS_MAIN_LAST} --output jsonl --shutdown-timeout 3, with STRATA_API_KEY=${API_TOKEN} in env. Keep --host 127.0.0.1: the agent reaches the server on loopback. As the binary, enter the absolute path of strata.cmd (C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd) and add it to runtime_allowed_binaries on the agent. Put the run config into the config file strata.json, without api_key: the key comes from env. Leave the visible devices off: --gpu takes the host's card numbers, the main card last. The startup timeout is 960 s, above Strata's own engine wait of 900 s; set the parent server_agent application's timeout to at least 960000 ms, or the portal warns that a cold start is cut short. The gateway accepts chat images only as data:, http:// or https:// URLs.",
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:

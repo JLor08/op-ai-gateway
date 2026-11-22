@@ -76,6 +76,7 @@ const specTypeKeys: Record<RuntimeSpec['type'], true> = {
   vllm_sr: true,
   sglang: true,
   sglang_omni: true,
+  strata: true,
   custom: true,
 };
 const allSpecTypes = Object.keys(specTypeKeys) as RuntimeSpec['type'][];

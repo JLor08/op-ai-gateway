@@ -1497,6 +1497,119 @@ describe('RuntimeAdminSection sglang launch-spec kinds', () => {
   });
 });
 
+describe('RuntimeAdminSection strata launch-spec kind', () => {
+  it('offers strata and shows its note as the type description, and only for it', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByText(t.runtimeSpecTypeStrataNote)).not.toBeInTheDocument();
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.getByRole('combobox', { name: t.runtimeSpecType })).toHaveAccessibleDescription(
+      t.runtimeSpecTypeStrataNote,
+    );
+    expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveAttribute(
+      'placeholder',
+      '%LOCALAPPDATA%\\Strata\\terminal\\current\\bin\\strata.cmd',
+    );
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+    expect(screen.queryByText(t.runtimeSpecTypeStrataNote)).not.toBeInTheDocument();
+  });
+
+  it('prefills exactly the template on a new spec and sends it', async () => {
+    const { putSpecs } = renderSection({
+      application: {
+        ...application,
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'translate',
+        messages_mode: 'translate',
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: {
+        value: 'C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd',
+      },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body.type).toBe('strata');
+    expect(body.args).toEqual([
+      'serve',
+      '--config',
+      '${CONFIG_DIR}/strata.json',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '${PORT}',
+      '--gpu',
+      '${HOST_GPU_IDS_MAIN_LAST}',
+      '--output',
+      'jsonl',
+      '--shutdown-timeout',
+      '3',
+    ]);
+    expect(body.env).toEqual({ STRATA_API_KEY: '${API_TOKEN}' });
+    expect(body.set_visible_devices).toBe(false);
+    expect(body.startup_timeout_seconds).toBe(960);
+    expect(body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(body.responses_mode).toBe('passthrough');
+    expect(body.messages_mode).toBe('passthrough');
+    // Scheduling stays the stock create defaults: not pinned, on demand.
+    expect(body.pinned).toBe(false);
+    expect(body.idle_timeout_seconds).toBe(0);
+    expect(body.admission_wait_timeout_seconds).toBe(0);
+  });
+
+  it('keeps args and env the operator already typed', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/strata/bin/strata' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: 'serve\n--port\n${PORT}' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'STRATA_API_KEY=${API_TOKEN}\nFOO=bar' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.args).toEqual(['serve', '--port', '${PORT}']);
+    expect(putSpecs[0].body.env).toEqual({ STRATA_API_KEY: '${API_TOKEN}', FOO: 'bar' });
+    expect(putSpecs[0].body.startup_timeout_seconds).toBe(960);
+  });
+
+  it('does not prefill an existing spec switched to strata', async () => {
+    const { putSpecs } = await openFlavorSpecEdit({
+      binary: '/opt/strata/bin/strata',
+      args: [],
+      env: {},
+      type: 'llama_cpp',
+      startup_timeout_seconds: 180,
+      api_flavors: ['openai'],
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('strata');
+    expect(putSpecs[0].body.args).toEqual([]);
+    expect(putSpecs[0].body.env).toEqual({});
+    expect(putSpecs[0].body.startup_timeout_seconds).toBe(180);
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
+  });
+
+  it('lists the Strata row in the API-token backend table', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set' });
+    expect(screen.getByText(t.runtimeSpecApiTokenRowStrataEnv)).toBeInTheDocument();
+  });
+});
+
 describe('RuntimeAdminSection decisions modes in the spec form', () => {
   const decisionsField = () => screen.getByRole('combobox', { name: t.applicationDecisionsMode });
   const systemOneField = () => screen.getByRole('combobox', { name: t.applicationSystemOneMode });
@@ -10093,7 +10206,7 @@ describe('RuntimeAdminSection API-token backend hints', () => {
     expect(screen.getByText(t.runtimeSpecApiTokenRowLlamaCppEnv)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeSpecApiTokenRowTgiEnv)).toBeInTheDocument();
     // Args column is marked readable -- the whole point of the warning below.
-    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark)).toHaveLength(3);
+    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark)).toHaveLength(4);
   });
 
   it('shows the loud Args-leak warning only while ${API_TOKEN} sits in the Args field', async () => {

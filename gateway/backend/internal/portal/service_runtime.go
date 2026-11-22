@@ -125,7 +125,7 @@ var (
 	// checkHeaderName's shape check. HTTP 400.
 	ErrRuntimeSpecAPITokenHeaderInvalid = errors.New("runtime_spec.api_token_header_invalid")
 	// ErrRuntimeSpecTypeInvalid rejects a type that is not one of
-	// ""/vllm/llama_cpp/tgi/ollama/stable_diffusion_cpp/audio_cpp/vllm_sr/sglang/sglang_omni/custom
+	// ""/vllm/llama_cpp/tgi/ollama/stable_diffusion_cpp/audio_cpp/vllm_sr/sglang/sglang_omni/strata/custom
 	// (design 2026-09-07; see validRuntimeSpecType). "" is valid --
 	// it means auto-detect from Binary (routing.EffectiveRuntimeSpecType) --
 	// so this is the same "empty is fine, everything else must be a known
@@ -588,8 +588,8 @@ type RuntimeSpecDTO struct {
 	// header and the "app has no token ⇒ auth off" hint under app mode.
 	AppAPITokenSet    bool   `json:"app_api_token_set"`
 	AppAPITokenHeader string `json:"app_api_token_header"`
-	// Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
-	// "tgi" | "ollama" | "custom"); see routing.RuntimeSpec.Type. "" means
+	// Type is the explicit runtime-server kind ("" or one of the values
+	// validRuntimeSpecType accepts); see routing.RuntimeSpec.Type. "" means
 	// auto-detect from Binary -- EffectiveType below is what that resolves to.
 	Type string `json:"type"`
 	// MetricsPath / ContextProbePath are the operator's raw overrides (""
@@ -764,7 +764,7 @@ type PutRuntimeSpecRequest struct {
 	// write.
 	APITokenRotate bool `json:"api_token_rotate"`
 	// Type / MetricsPath / ContextProbePath: see RuntimeSpecDTO's doc. Type
-	// is validated by validRuntimeSpecType (empty or one of the five
+	// is validated by validRuntimeSpecType (empty or one of the eleven
 	// routing.RuntimeSpecType values); MetricsPath/ContextProbePath are
 	// freeform and only trimmed -- no shape validation.
 	Type             string `json:"type"`
@@ -1990,20 +1990,22 @@ func validRuntimeAPITokenMode(s string) bool {
 }
 
 // validRuntimeSpecType reports whether s is "" (auto-detect from Binary, the
-// default and every pre-feature row's stored value) or one of the ten
+// default and every pre-feature row's stored value) or one of the eleven
 // routing.RuntimeSpecType values (vllm, llama_cpp, tgi, ollama,
-// stable_diffusion_cpp, audio_cpp, vllm_sr, sglang, sglang_omni, custom). Unlike validRuntimeAPITokenMode,
+// stable_diffusion_cpp, audio_cpp, vllm_sr, sglang, sglang_omni, strata,
+// custom). Unlike validRuntimeAPITokenMode,
 // empty IS accepted directly here (mirrors validVisibleDevicesMode) -- callers
 // pass req.Type through untouched, they don't normalize "" to a concrete value
 // first, because "" is itself a legitimate stored/wire value (auto), not a
-// default that collapses into one of the ten kinds.
+// default that collapses into one of the eleven kinds.
 func validRuntimeSpecType(s string) bool {
 	switch routing.RuntimeSpecType(s) {
 	case "", routing.RuntimeSpecTypeVLLM, routing.RuntimeSpecTypeLlamaCpp,
 		routing.RuntimeSpecTypeTGI, routing.RuntimeSpecTypeOllama,
 		routing.RuntimeSpecTypeStableDiffusionCpp, routing.RuntimeSpecTypeAudioCpp,
 		routing.RuntimeSpecTypeVllmSR, routing.RuntimeSpecTypeSGLang,
-		routing.RuntimeSpecTypeSGLangOmni, routing.RuntimeSpecTypeCustom:
+		routing.RuntimeSpecTypeSGLangOmni, routing.RuntimeSpecTypeStrata,
+		routing.RuntimeSpecTypeCustom:
 		return true
 	}
 	return false

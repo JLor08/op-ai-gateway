@@ -958,6 +958,15 @@ func extractContext(specType string, v any) (int, bool) {
 		return extractBestEffortContext(v)
 	case "llama_cpp":
 		return extractLlamaCppContext(v)
+	case "strata":
+		// `strata serve` answers /props (its default context probe path) in
+		// llama.cpp's shape, default_generation_settings.n_ctx. Any other body
+		// (an override at /v1/models, whose newer releases carry
+		// context_length) falls back to the best-effort scan.
+		if n, ok := extractLlamaCppContext(v); ok {
+			return n, true
+		}
+		return extractBestEffortContext(v)
 	case "tgi":
 		return extractTGIContext(v)
 	case "ollama":

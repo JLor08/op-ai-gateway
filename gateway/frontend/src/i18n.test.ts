@@ -4787,6 +4787,41 @@ describe('sglang i18n keys', () => {
   });
 });
 
+describe('strata runtime spec i18n keys', () => {
+  it('defines the type label, the note and the API-token row in de and en', () => {
+    const keys = [
+      'runtimeSpecTypeStrata',
+      'runtimeSpecTypeStrataNote',
+      'runtimeSpecApiTokenRowStrataBackend',
+      'runtimeSpecApiTokenRowStrataEnv',
+      'runtimeSpecApiTokenRowStrataArgs',
+      'runtimeSpecApiTokenRowStrataClient',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.en.runtimeSpecTypeStrataNote).not.toBe(messages.de.runtimeSpecTypeStrataNote);
+    expect(messages.en.runtimeSpecApiTokenRowStrataClient).not.toBe(
+      messages.de.runtimeSpecApiTokenRowStrataClient,
+    );
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].runtimeSpecTypeStrataNote;
+      // The launch template, the key, the binary allowlist, the host GPU
+      // numbering and the parent timeout the 960 s startup timeout needs.
+      expect(note).toContain('--host 127.0.0.1');
+      expect(note).toContain('STRATA_API_KEY=${API_TOKEN}');
+      expect(note).toContain('strata.json');
+      expect(note).toContain('runtime_allowed_binaries');
+      expect(note).toContain('<user>');
+      expect(note).toContain('${HOST_GPU_IDS_MAIN_LAST}');
+      expect(note).toContain('960000');
+      expect(messages[locale].runtimeSpecApiTokenRowStrataEnv).toBe('STRATA_API_KEY=${API_TOKEN}');
+    }
+  });
+});
+
 describe('realtime capability i18n keys', () => {
   it('has the form control, hint and chip keys in de and en; the labels match and the hint differs', () => {
     for (const key of [
