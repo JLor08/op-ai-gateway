@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Type string is exactly `strata` for both `routing.ProviderStrata` and `routing.RuntimeSpecTypeStrata`.
-- Agent `Version` goes 0.20.1 → **0.21.0** once (Task 7), flags `runtime_gpu_main_last` and `runtime_process_tree_job`, `Since: "0.21.0"`. Rebase onto main's version before finalizing.
+- Agent `Version` goes 0.20.1 → **0.21.0** once (Task 6), flags `runtime_gpu_main_last` and `runtime_process_tree_job`, `Since: "0.21.0"`. Rebase onto main's version before finalizing.
 - Migration **113** `runtime_spec_process_tree`: `agent_runtime_specs.process_tree text not null default 'direct'`; all three stores; postgres leg run with `OP_AI_GATEWAY_TEST_POSTGRES_DSN`.
 - `process_tree` values: `direct` (default) | `job`. Error codes: 400 `runtime_spec.process_tree_invalid`, 400 `runtime_spec.process_tree_unsupported`.
 - No secret in config-file content; Strata key only via `env` `STRATA_API_KEY=${API_TOKEN}`.
@@ -101,7 +101,7 @@
 
 **Interfaces:**
 - Produces: frontend `strataSpecTemplate(): Partial<RuntimeSpecDraft>` in `components/shared/strataTemplate.ts` returning
-  `{binaryHint: '%LOCALAPPDATA%\\Strata\\terminal\\current\\bin\\strata.cmd', args: ['serve','--config','${CONFIG_DIR}/strata.json','--host','0.0.0.0','--port','${PORT}','--gpu','${HOST_GPU_IDS_MAIN_LAST}','--output','jsonl','--shutdown-timeout','3'], env: {STRATA_API_KEY: '${API_TOKEN}'}, setVisibleDevices: false, processTree: 'job', startupTimeoutSeconds: 960, healthPath: '/health', flavors: ['openai','anthropic'], responsesMode: 'passthrough', messagesMode: 'passthrough'}`; pinned/idle/admission fields as the llama.cpp template. Bind address: if the llama.cpp/sglang templates use `127.0.0.1` with the agent proxy, use the same and adjust the args literal; the test pins whichever is chosen. `processTree` is wired in Task 12; until then the template omits it.
+  `{binaryHint: '%LOCALAPPDATA%\\Strata\\terminal\\current\\bin\\strata.cmd', args: ['serve','--config','${CONFIG_DIR}/strata.json','--host','0.0.0.0','--port','${PORT}','--gpu','${HOST_GPU_IDS_MAIN_LAST}','--output','jsonl','--shutdown-timeout','3'], env: {STRATA_API_KEY: '${API_TOKEN}'}, setVisibleDevices: false, processTree: 'job', startupTimeoutSeconds: 960, healthPath: '/health', flavors: ['openai','anthropic'], responsesMode: 'passthrough', messagesMode: 'passthrough'}`; pinned/idle/admission fields as the llama.cpp template. Bind address: if the llama.cpp/sglang templates use `127.0.0.1` with the agent proxy, use the same and adjust the args literal; the test pins whichever is chosen. `processTree` is wired in Task 10; until then the template omits it.
 
 - [ ] **Step 1: Failing tests** — spec PUT with `type: strata` → 200; 400 message lists `strata`; choosing type `strata` in a new-spec form prefills exactly the template; note visible; `extractContext("strata", <props body n_ctx 262144>)` → 262144; i18n keys both locales.
 - [ ] **Step 2: Run** → FAIL.
