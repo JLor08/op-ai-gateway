@@ -156,10 +156,10 @@ const codeMediaURLUnsupported = "chat.media_url_unsupported"
 func mediaURLsRefused(target routing.Target, req inference.Request) error {
 	var allowed func(string) bool
 	var refusal error
-	switch target.LiveProgressSpecType {
+	switch target.EffectiveKind() {
 	case string(routing.RuntimeSpecTypeSGLangOmni):
 		allowed, refusal = isDataURL, errMediaURLUnsupported
-	case string(routing.RuntimeSpecTypeSGLang):
+	case string(routing.RuntimeSpecTypeSGLang), string(routing.RuntimeSpecTypeStrata):
 		allowed, refusal = isDataOrHTTPURL, errMediaPathUnsupported
 	default:
 		return nil
