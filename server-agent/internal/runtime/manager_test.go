@@ -6,6 +6,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -3911,6 +3912,8 @@ func TestSnapshotStatusCopiesProbeConfig(t *testing.T) {
 	spec.Type = "vllm"
 	spec.MetricsPath = "/metrics"
 	spec.ContextProbePath = "/v1/internal/context"
+	spec.APIToken = "tok-status-copy"
+	spec.APITokenHeader = "X-Api-Key"
 
 	o, _ := newSnapshotOwner(spec, 4242, nil)
 
@@ -3927,6 +3930,19 @@ func TestSnapshotStatusCopiesProbeConfig(t *testing.T) {
 	}
 	if got.ContextProbePath != spec.ContextProbePath {
 		t.Errorf("Status.ContextProbePath = %q, want %q (spec.ContextProbePath)", got.ContextProbePath, spec.ContextProbePath)
+	}
+	// The probe credential (#424): the agent's own child probes authenticate
+	// with the spec's token in its effective header.
+	if got.APIToken != spec.APIToken || got.APITokenHeader != spec.APITokenHeader {
+		t.Errorf("Status probe credential = (%q, %q), want the spec's (%q, %q)", got.APIToken, got.APITokenHeader, spec.APIToken, spec.APITokenHeader)
+	}
+	// ... and it never rides Status's JSON form.
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), spec.APIToken) || strings.Contains(string(raw), "api_token") {
+		t.Errorf("Status JSON carries the probe credential: %s", raw)
 	}
 }
 
@@ -4142,6 +4158,9 @@ func TestSameLaunchShape(t *testing.T) {
 		"Type":                        func(s *Spec) { s.Type = "vllm" },
 		"MetricsPath":                 func(s *Spec) { s.MetricsPath = "/m2" },
 		"ContextProbePath":            func(s *Spec) { s.ContextProbePath = "/p2" },
+		// The token header is read only by the agent's own child probes
+		// (#424); no placeholder bakes it into the process.
+		"APITokenHeader": func(s *Spec) { s.APITokenHeader = "X-Api-Key" },
 		// A GPU row's vram_mb is the admission DEMAND, not a launch input; the
 		// gateway churns it via measured-VRAM write-back, so an edit to it alone
 		// must not bounce a running child (issue #63 review finding).

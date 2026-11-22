@@ -2583,6 +2583,74 @@ func TestAgentRuntimeConfigPushesDecryptedAPIToken(t *testing.T) {
 	}
 }
 
+// TestAgentRuntimeConfigPushesEffectiveAPITokenHeader pins api_token_header
+// (#424): beside a non-empty api_token the pushed spec names the effective
+// header the token travels in (routing.SpecUpstreamAuth -- the spec's custom
+// header, else the application's; "" is Authorization: Bearer), so the
+// agent's own child probes authenticate exactly as the gateway does. A spec
+// that pushes no token pushes no header either.
+func TestAgentRuntimeConfigPushesEffectiveAPITokenHeader(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	cipher := newTestCipher(t)
+	svc, routeStore := newServerTestServiceWithCipher(t, now, cipher, false)
+	server := createTestServer(t, svc, "S", "s.example.test")
+	app := seedServerAgentApplication(t, routeStore, server.ID, now)
+	appSealed, err := capture.SealSecret(cipher, false, "tok-app")
+	if err != nil {
+		t.Fatalf("seal app token: %v", err)
+	}
+	app.APIToken = appSealed
+	app.APITokenHeader = "X-App-Key"
+	if err := routeStore.UpdateApplication(ctx, app); err != nil {
+		t.Fatalf("UpdateApplication: %v", err)
+	}
+	specSealed, err := capture.SealSecret(cipher, false, "tok-set")
+	if err != nil {
+		t.Fatalf("seal spec token: %v", err)
+	}
+	seedSpec := func(model, mode, sealedToken, headerSource, header string) string {
+		t.Helper()
+		mapping, err := svc.CreateMapping(ctx, ownerToken(), app.ID, CreateMappingRequest{GatewayModelName: model, AppModelName: model})
+		if err != nil {
+			t.Fatalf("CreateMapping(%s): %v", model, err)
+		}
+		specID := "rspec_" + compactRandomHex(16)
+		if err := routeStore.UpsertRuntimeSpec(ctx, routing.RuntimeSpec{
+			ID: specID, MappingID: mapping.ID, Enabled: true,
+			Binary: "/usr/bin/x", Args: "[]", Env: "{}",
+			APITokenMode: mode, APIToken: sealedToken,
+			APITokenHeaderSource: headerSource, APITokenHeader: header,
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("seed spec(%s): %v", model, err)
+		}
+		return specID
+	}
+	appModeID := seedSpec("m-app", string(routing.RuntimeAPITokenModeApp), "", "app", "")
+	customID := seedSpec("m-custom", string(routing.RuntimeAPITokenModeSet), specSealed, "custom", "X-Spec-Key")
+	offID := seedSpec("m-off", string(routing.RuntimeAPITokenModeOff), "", "custom", "X-Spec-Key")
+
+	cfg, err := svc.AgentRuntimeConfig(ctx, server.ID)
+	if err != nil {
+		t.Fatalf("AgentRuntimeConfig: %v", err)
+	}
+	type pair struct{ token, header string }
+	pushed := map[string]pair{}
+	for _, s := range cfg.Specs {
+		pushed[s.ID] = pair{s.APIToken, s.APITokenHeader}
+	}
+	for id, want := range map[string]pair{
+		appModeID: {"tok-app", "X-App-Key"},
+		customID:  {"tok-set", "X-Spec-Key"},
+		offID:     {"", ""},
+	} {
+		if got := pushed[id]; got != want {
+			t.Errorf("spec %s pushed (token, header) = %+v, want %+v", id, got, want)
+		}
+	}
+}
+
 // TestAgentRuntimeConfigPushesResolvedTypeAndProbePaths pins that the
 // agent-wire document carries the RESOLVED effective type + probe paths
 // (routing.EffectiveRuntimeSpecType / routing.DeriveProbePaths), never the

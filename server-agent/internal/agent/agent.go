@@ -1772,6 +1772,12 @@ type runtimeCapabilityEntry struct {
 //     literal copies of its type strings.)
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
+	// A spec with a token authenticates every probe below (#424): a keyed
+	// child (Strata, an api-key'd llama-server) answers 401 on everything but
+	// its health path otherwise. The context and capability probes read the
+	// credential from ctx; the metrics scrape takes it explicitly.
+	authHeader, authValue := childProbeAuth(st)
+	ctx = collector.WithProbeAuth(ctx, authHeader, authValue)
 
 	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
@@ -1796,6 +1802,22 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 // could re-parse the URL's Host off-loopback. Skip the probe rather than dial
 // it, and report it as unreachable: a path IS configured, it just cannot be
 // used.
+// childProbeAuth is the credential header the agent's own probes of st's
+// child send: none for a spec without a token (today's behaviour), else the
+// token in the spec's effective header -- "Authorization: Bearer <token>" when
+// the spec names no header, the raw token under a named one, exactly as the
+// gateway authenticates its own requests to the child (provider's
+// setUpstreamAuth).
+func childProbeAuth(st runtimectl.Status) (header, value string) {
+	if st.APIToken == "" {
+		return "", ""
+	}
+	if st.APITokenHeader != "" {
+		return st.APITokenHeader, st.APIToken
+	}
+	return "Authorization", "Bearer " + st.APIToken
+}
+
 func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
 	if st.MetricsPath == "" {
 		return "na"
@@ -1805,7 +1827,8 @@ func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base str
 		return "unreachable"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
+	authHeader, authValue := childProbeAuth(st)
+	active, queue, err := collector.NewPromScraper(base+st.MetricsPath, client, authHeader, authValue).Scrape(cctx)
 	cancel()
 	if err != nil {
 		slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)

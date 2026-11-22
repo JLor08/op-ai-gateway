@@ -2303,6 +2303,7 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Type = ""                       // reported for probes, read live
 		s.MetricsPath = ""                // "
 		s.ContextProbePath = ""           // "
+		s.APITokenHeader = ""             // the agent's own child probes, read live
 		// RAMMB is the host-RAM admission DEMAND, the spec-level twin of
 		// SpecGPU.VRAMMB below: consumed only by admission arithmetic, never
 		// baked into the child. The gateway pushes max(measured, estimate), and
@@ -6238,6 +6239,8 @@ func (o *owner) snapshotStatus() []Status {
 			Type:             st.spec.Type,
 			MetricsPath:      st.spec.MetricsPath,
 			ContextProbePath: st.spec.ContextProbePath,
+			APIToken:         st.spec.APIToken,
+			APITokenHeader:   st.spec.APITokenHeader,
 			Kind:             st.spec.Kind,
 		}
 		if st.measuredVRAM != nil {

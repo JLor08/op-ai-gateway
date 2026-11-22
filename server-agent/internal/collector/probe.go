@@ -259,7 +259,8 @@ func fetchProbeBodyWith(ctx context.Context, client *http.Client, baseURL, metho
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := client.Do(req)
+	auth, authed := probeAuthFrom(ctx)
+	resp, err := doProbe(client, req, auth, authed)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -3212,6 +3212,14 @@ type AgentRuntimeSpecDTO struct {
 	// surfaced in the portal UI; portal.Service adds no server-side guard of its
 	// own here because it does not hold the gateway public URL.
 	APIToken string `json:"api_token"`
+	// APITokenHeader is the effective header APIToken travels in
+	// (routing.SpecUpstreamAuth: the spec's custom header, else the
+	// application's; "" means Authorization: Bearer), so the agent's OWN
+	// probes of the child (metrics scrape, context and capability probes) can
+	// authenticate the way the gateway does (#424). Not a secret. Set only
+	// beside a non-empty APIToken; omitted otherwise, so a token-less spec's
+	// document is unchanged and an older agent ignores the unknown key.
+	APITokenHeader string `json:"api_token_header,omitempty"`
 	// Type is the RESOLVED effective runtime-server kind for this spec --
 	// routing.EffectiveRuntimeSpecType(spec): the explicit spec.Type when
 	// set, else the type auto-detected from Binary. Never the raw stored
@@ -3559,6 +3567,9 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		// so fail-closed (see resolvePushToken). agentApp is guaranteed non-nil
 		// here -- the builder returns the empty document above when it is nil.
 		specDTO.APIToken = s.resolvePushToken(spec, *agentApp)
+		if specDTO.APIToken != "" {
+			_, specDTO.APITokenHeader = routing.SpecUpstreamAuth(spec, *agentApp)
+		}
 		// Push the RESOLVED effective type + probe paths, not the raw stored
 		// spec.Type/MetricsPath/ContextProbePath -- the agent needs a concrete
 		// kind and concrete paths to probe, not "figure out the default

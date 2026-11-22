@@ -107,6 +107,16 @@ type Spec struct {
 	// the reported command. Never persisted by the agent; redacted in file-mode
 	// reports (report.go).
 	APIToken string `json:"api_token"`
+	// APITokenHeader is the header the agent's OWN probes of this child
+	// (metrics scrape, context and capability probes) send APIToken in: the
+	// gateway's effective header for the spec (routing.SpecUpstreamAuth -- the
+	// spec's custom header, else the application's). Empty means
+	// "Authorization: Bearer <token>"; a name sends the raw token under it,
+	// matching how the gateway authenticates its own requests to the child.
+	// Sent only beside a non-empty APIToken; an older gateway never sends it,
+	// which is the Bearer default. Not a secret, and not launch-affecting: no
+	// placeholder bakes it into the process (sameLaunchShape strips it).
+	APITokenHeader string `json:"api_token_header"`
 	// Type is the RESOLVED effective runtime-server kind for this spec
 	// (vllm/llama_cpp/tgi/ollama/custom) -- the gateway's
 	// AgentRuntimeSpecDTO.Type, which is always the explicit spec.Type when
@@ -938,6 +948,14 @@ type Status struct {
 	Type             string `json:"type"`
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
+
+	// APIToken and APITokenHeader are the spec's decrypted token and its
+	// effective header (Spec.APITokenHeader), copied by snapshotStatus so the
+	// agent's own child probes can authenticate against a keyed child (#424).
+	// A SECRET held only in memory: never on the status wire form (json "-")
+	// and never logged.
+	APIToken       string `json:"-"`
+	APITokenHeader string `json:"-"`
 
 	// Kind mirrors the spec's Kind (omitted for a model). RPC is an rpc_server
 	// member's live state, Cluster a head's launch facts, and AdmissionBlockedBy
