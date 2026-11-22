@@ -38,7 +38,13 @@ const (
 	// a multimodal server without /metrics, whose /v1/models carries no context
 	// length, so it has no probe path and no type-based role fallback.
 	RuntimeSpecTypeSGLangOmni RuntimeSpecType = "sglang_omni"
-	RuntimeSpecTypeCustom     RuntimeSpecType = "custom"
+	// RuntimeSpecTypeStrata is the agent-launched Strata server (release
+	// 0.2.17, engine 0.1.63, Niko1221/Strata@c6f6427): an OpenAI- and
+	// Anthropic-compatible local LLM server. `strata serve` answers the
+	// llama.cpp-style /props; its metrics are Prometheus text only when asked
+	// with ?format=prometheus (JSON otherwise); it has no /v1/decisions.
+	RuntimeSpecTypeStrata RuntimeSpecType = "strata"
+	RuntimeSpecTypeCustom RuntimeSpecType = "custom"
 )
 
 // VllmSRSupportedAPIMajor is the major version of the vllm-srun runtime API
@@ -83,7 +89,9 @@ const defaultPrometheusMetricsPath = "/metrics"
 // so an omni name never detects as sglang), sglang, vllm,
 // llama-server/llama_cpp/llama.cpp,
 // text-generation-launcher/tgi, sd-server/stable-diffusion,
-// audiocpp_server/audio.cpp, ollama -- in the order below (first match wins),
+// audiocpp_server/audio.cpp, ollama, strata (the strata.cmd Windows launcher,
+// the POSIX strata, and the strata.exe / strata-vision.exe engines; last, so
+// it shadows no other row) -- in the order below (first match wins),
 // and falls back to RuntimeSpecTypeCustom when nothing matches.
 func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 	name := strings.ToLower(filepath.Base(binary))
@@ -110,6 +118,8 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 		return RuntimeSpecTypeAudioCpp
 	case strings.Contains(name, "ollama"):
 		return RuntimeSpecTypeOllama
+	case strings.Contains(name, "strata"):
+		return RuntimeSpecTypeStrata
 	default:
 		return RuntimeSpecTypeCustom
 	}
@@ -208,6 +218,11 @@ func DeriveProbePaths(t RuntimeSpecType, metricsOverride, contextOverride string
 		// sglang-omni v0.2.0 has no /metrics, and its /v1/models carries no
 		// context length, so there is nothing honest to default either path to.
 		defaultMetrics, defaultContext = "", ""
+	case RuntimeSpecTypeStrata:
+		// Strata serves its metrics as Prometheus text only when asked with
+		// ?format=prometheus (the bare /metrics answers JSON), and `strata
+		// serve` answers the llama.cpp-style /props with the context size.
+		defaultMetrics, defaultContext = "/metrics?format=prometheus", "/props"
 	case RuntimeSpecTypeCustom:
 		defaultMetrics, defaultContext = "", ""
 	default:

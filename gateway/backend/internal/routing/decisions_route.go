@@ -8,10 +8,12 @@ package routing
 // route (ADR-098). The vLLM Semantic Router's /v1/decisions is its alias of
 // System One, not the OpenAI shape (ADR-099), so an OpenAI-shaped body must
 // never be passed through to it. Every other kind may (the probe decides per
-// model). ProviderLlamaCPP == RuntimeSpecTypeLlamaCpp and ProviderVllmSR ==
-// RuntimeSpecTypeVllmSR, so one comparison covers both vocabularies.
+// model). Strata has no /v1/decisions either. ProviderLlamaCPP ==
+// RuntimeSpecTypeLlamaCpp, ProviderVllmSR == RuntimeSpecTypeVllmSR and
+// ProviderStrata == RuntimeSpecTypeStrata, so one comparison covers both
+// vocabularies.
 func DecisionsPassthroughCapableKind(kind string) bool {
-	return kind != ProviderLlamaCPP && kind != ProviderVllmSR
+	return kind != ProviderLlamaCPP && kind != ProviderVllmSR && kind != ProviderStrata
 }
 
 // EffectiveDecisionsRoute computes the concrete route of an OpenAI Decisions

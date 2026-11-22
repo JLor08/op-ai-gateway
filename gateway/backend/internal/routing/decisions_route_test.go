@@ -48,7 +48,7 @@ func TestEffectiveDecisionsRoute(t *testing.T) {
 
 func TestDecisionsPassthroughCapableKind(t *testing.T) {
 	for kind, want := range map[string]bool{
-		ProviderLlamaCPP: false, ProviderVllmSR: false,
+		ProviderLlamaCPP: false, ProviderVllmSR: false, ProviderStrata: false,
 		"vllm": true, "custom": true, "server_agent": true, "": true,
 	} {
 		if got := DecisionsPassthroughCapableKind(kind); got != want {

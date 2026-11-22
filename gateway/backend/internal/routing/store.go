@@ -50,6 +50,14 @@ const (
 	// that one names the kind of an agent-launched vllm-srun worker on a
 	// server_agent application.
 	ProviderVllmSR = "vllm_sr"
+	// ProviderStrata is an operator-run Strata server (a llama.cpp-style local
+	// LLM server that speaks the OpenAI and Anthropic dialects). It shares the
+	// OpenAI-compatible provider client. The string equals
+	// RuntimeSpecTypeStrata, but it is a different namespace: that one names
+	// the kind of an agent-launched Strata runtime spec on a server_agent
+	// application. Upstream pin: Niko1221/Strata@c6f6427 (release 0.2.17,
+	// engine 0.1.63).
+	ProviderStrata = "strata"
 	// ProviderVendorOpenAI and ProviderVendorAnthropic are the provider kinds of
 	// a vendor-account target: inference served by a hosted vendor API
 	// (api.openai.com / api.anthropic.com) instead of an on-prem application.

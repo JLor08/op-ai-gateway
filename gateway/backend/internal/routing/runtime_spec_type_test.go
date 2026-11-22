@@ -355,3 +355,41 @@ func TestEffectiveRuntimeSpecTypeSGLangServeModelTypeOmni(t *testing.T) {
 		t.Errorf("role = %q, want other (no chat fallback for sglang_omni)", role)
 	}
 }
+
+// TestDetectRuntimeSpecTypeStrata pins Strata's three launch names: the
+// Windows launcher strata.cmd, the POSIX strata, and the engine binaries
+// strata.exe / strata-vision.exe.
+func TestDetectRuntimeSpecTypeStrata(t *testing.T) {
+	for _, tc := range []struct {
+		binary string
+		want   RuntimeSpecType
+	}{
+		{`C:\Users\ai\AppData\Local\strata\bin\strata.cmd`, RuntimeSpecTypeStrata},
+		{"/home/u/.local/bin/strata", RuntimeSpecTypeStrata},
+		{"strata-vision.exe", RuntimeSpecTypeStrata},
+		{"STRATA.EXE", RuntimeSpecTypeStrata},
+		{"python.exe", RuntimeSpecTypeCustom},
+		{"/opt/vllm/bin/vllm", RuntimeSpecTypeVLLM},
+		{"llama-server", RuntimeSpecTypeLlamaCpp},
+		{"sglang", RuntimeSpecTypeSGLang},
+		{"vllm-srun", RuntimeSpecTypeVllmSR},
+		{"text-generation-launcher", RuntimeSpecTypeTGI},
+	} {
+		if got := DetectRuntimeSpecType(tc.binary); got != tc.want {
+			t.Errorf("DetectRuntimeSpecType(%q) = %q, want %q", tc.binary, got, tc.want)
+		}
+	}
+	if RuntimeSpecTypeStrata != "strata" || ProviderStrata != "strata" {
+		t.Fatalf("both vocabularies must spell strata the same: %q / %q", RuntimeSpecTypeStrata, ProviderStrata)
+	}
+}
+
+func TestDeriveProbePathsStrata(t *testing.T) {
+	metrics, context := DeriveProbePaths(RuntimeSpecTypeStrata, "", "")
+	if metrics != "/metrics?format=prometheus" || context != "/props" {
+		t.Fatalf("probe paths = (%q, %q), want (/metrics?format=prometheus, /props)", metrics, context)
+	}
+	if m, c := DeriveProbePaths(RuntimeSpecTypeStrata, "/m", "/c"); m != "/m" || c != "/c" {
+		t.Fatalf("overrides = (%q, %q), want (/m, /c)", m, c)
+	}
+}

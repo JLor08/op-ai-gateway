@@ -1383,6 +1383,9 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// through the same OpenAI-compatible client (System One probe, model
 		// discovery).
 		routing.ProviderVllmSR: openAICompatible,
+		// ProviderStrata: Strata serves the OpenAI-compatible dialect and
+		// shares this client.
+		routing.ProviderStrata: openAICompatible,
 		// ProviderVendorOpenAI: api.openai.com speaks the OpenAI-compatible
 		// dialect, so a vendor-account target reuses the same client.
 		routing.ProviderVendorOpenAI: openAICompatible,
