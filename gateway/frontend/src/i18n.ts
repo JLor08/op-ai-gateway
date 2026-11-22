@@ -3454,15 +3454,17 @@ const de = {
   tokenDecisionsConfidenceNormalize: 'Entscheidungs-Konfidenz normalisieren',
   tokenDecisionsConfidenceNormalizeHint:
     'Meldet die Konfidenz von Entscheidungen (/v1/decisions und /v1/systemone) immer auf einer Skala von 0 bis 1, auch wenn das Modell eine andere Skala verwendet.',
-  tokenClaudeCodeUsageDisplay: 'Claude-Code-Nutzungslimits anzeigen',
+  tokenClaudeCodeUsageDisplay: 'Claude-Code-Token-Format',
   tokenClaudeCodeUsageDisplayHint:
-    'Claude Code zeigt dann die Nutzungslimits des Plans (5-Stunden- und Wochenlimit) an, wenn dieser Token als ANTHROPIC_AUTH_TOKEN verwendet wird. Dafür hat das Geheimnis eine längere Form; bei einem bestehenden Token erzeugt eine Änderung ein neues Geheimnis.',
+    'Das Geheimnis bekommt die Form, die Claude Code braucht, damit es Nutzungslimits liest, wenn dieser Token als ANTHROPIC_AUTH_TOKEN verwendet wird. Die Limits selbst werden nur mit „Nutzungslimits senden“ gesendet. Bei einem bestehenden Token erzeugt eine Änderung ein neues Geheimnis.',
   tokenClaudeCodeUsageRotateWarning:
     'Beim Speichern wird der Token rotiert: Das bisherige Geheimnis funktioniert danach nicht mehr, das neue wird einmalig angezeigt.',
   tokenClaudeCodeBadge: 'Claude Code',
   tokenSendUsageLimits: 'Nutzungslimits senden',
   tokenSendUsageLimitsHint:
     'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Claude Code braucht dafür zusätzlich das Claude-Code-Token-Format. Wirkt sofort, das Geheimnis bleibt unverändert.',
+  tokenSendUsageLimitsServiceHint:
+    'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Lässt sich nur beim Anlegen des Service-Tokens setzen; Bearbeiten folgt später.',
   tokenCodexModelSwitchPrompt: 'Codex: Wechsel auf gpt-5.4-mini anbieten',
   tokenCodexModelSwitchPromptHint:
     'Wirkt nur zusammen mit „Nutzungslimits senden“. Codex bietet dann bei 90 % seines Hauptfensters den Wechsel auf gpt-5.4-mini an, auch wenn das Limit des Gateways das angezeigte ist.',
@@ -7392,15 +7394,17 @@ const en: PortalMessages = {
   tokenDecisionsConfidenceNormalize: 'Normalize decision confidence',
   tokenDecisionsConfidenceNormalizeHint:
     'Reports the confidence of decisions (/v1/decisions and /v1/systemone) on a 0 to 1 scale whatever scale the model uses itself.',
-  tokenClaudeCodeUsageDisplay: 'Show Claude Code usage limits',
+  tokenClaudeCodeUsageDisplay: 'Claude Code token format',
   tokenClaudeCodeUsageDisplayHint:
-    "Makes Claude Code show the plan's usage limits (5-hour and weekly) when this token is used as ANTHROPIC_AUTH_TOKEN. The secret has a longer form for this; on an existing token, changing it creates a new secret.",
+    'Gives the secret the shape Claude Code needs before it reads usage limits when this token is used as ANTHROPIC_AUTH_TOKEN. The limits themselves are sent only with "Send usage limits". On an existing token, changing it creates a new secret.',
   tokenClaudeCodeUsageRotateWarning:
     'Saving rotates the token: the current secret stops working and the new one is shown once.',
   tokenClaudeCodeBadge: 'Claude Code',
   tokenSendUsageLimits: 'Send usage limits',
   tokenSendUsageLimitsHint:
     'Clients (Claude Code, Codex CLI) then show the remaining usage. Claude Code also needs the Claude Code token format. Takes effect immediately; the secret stays unchanged.',
+  tokenSendUsageLimitsServiceHint:
+    'Clients (Claude Code, Codex CLI) then show the remaining usage. It can only be set when the service token is created; editing comes later.',
   tokenCodexModelSwitchPrompt: 'Codex: offer switching to gpt-5.4-mini',
   tokenCodexModelSwitchPromptHint:
     'Only takes effect together with "Send usage limits". Codex then offers the switch to gpt-5.4-mini at 90 % of its main window, also when the gateway\'s own limit is the one shown.',

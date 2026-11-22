@@ -1146,7 +1146,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const send = () => createDialog.getByRole('checkbox', { name: t.tokenSendUsageLimits });
       const codex = () =>
         createDialog.getByRole('checkbox', { name: t.tokenCodexModelSwitchPrompt });
-      expect(createDialog.getByText(t.tokenSendUsageLimitsHint)).toBeInTheDocument();
+      expect(createDialog.getByText(t.tokenSendUsageLimitsServiceHint)).toBeInTheDocument();
       expect(createDialog.getByText(t.tokenCodexModelSwitchPromptHint)).toBeInTheDocument();
       expect(codex()).toBeDisabled();
       fireEvent.click(send());

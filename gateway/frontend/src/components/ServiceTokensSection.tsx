@@ -565,7 +565,7 @@ export function ServiceTokensSection({
                 label={t.tokenSendUsageLimits}
               />
               <Typography variant="caption" color="text.secondary">
-                {t.tokenSendUsageLimitsHint}
+                {t.tokenSendUsageLimitsServiceHint}
               </Typography>
             </Box>
             <Box sx={{ display: 'grid', gap: 1 }}>
