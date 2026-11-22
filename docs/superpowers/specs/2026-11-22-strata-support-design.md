@@ -181,8 +181,8 @@ config file `strata.json` (config-files facet) and proposes spec fields:
 - propose upstream model / client-facing model name from the old `model_name` if the
   form fields are empty.
 - reject (inline error, nothing written) a JSON that does not parse, has no `exe` or
-  no `args` array, or contains `api_key` with a value (tell the operator the key goes
-  in the spec's token, not the file — and drop it).
+  no `args` array. An `api_key` with a value is dropped with an inline notice that the
+  key belongs in the spec's token, not the file.
 - the import is a pure frontend transform with unit tests; the stored file is a normal
   config file afterwards, editable as text. Content size limit is the existing 64 KiB.
 
