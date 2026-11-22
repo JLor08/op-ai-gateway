@@ -124,6 +124,7 @@ func TestChatToStrataRefusesHostPathImages(t *testing.T) {
 		"/etc/passwd":                       true,
 		"file:///etc/passwd":                true,
 		"secret.png":                        true,
+		"HTTP://images.example.test/x.png":  true,
 	} {
 		t.Run(ref, func(t *testing.T) {
 			up, calls := newWireUpstream(t)
