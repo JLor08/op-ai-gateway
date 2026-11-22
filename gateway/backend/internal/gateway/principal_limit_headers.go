@@ -93,13 +93,15 @@ func limitRetryAfterSeconds(reset, now time.Time) int {
 }
 
 // writeLimitBlocked answers a quota or budget denial on the Anthropic Messages
-// flavor (design spec §6): 429 with a billing_error body and the unified headers
-// that make Claude Code print r's sentence. representative-claim and overage-status
-// stay absent on purpose: with them the client composes its own line and drops ours.
-// X-Should-Retry false stops the client's retry loop; Retry-After is the seconds
-// until the reset, rounded up, at least 1. Those two and the body are what stop the
-// retries and show the sentence, so they are unconditional; the unified headers go
-// out only when sendUsage (the token's send_usage_limits opt-in, #420) is set.
+// flavor (design spec §6): 429 with a billing_error body. With the unified headers
+// (sendUsage, the token's send_usage_limits opt-in, #420) Claude Code prints the
+// body's sentence verbatim (ADR-107); without them it shows its generic form,
+// "API Error: Request rejected (429) · <message>". Either way the retries stop,
+// through X-Should-Retry false; Retry-After is the seconds until the reset, rounded
+// up, at least 1. Those two headers and the body are unconditional. The unified
+// headers carry status rejected and the reset; representative-claim and
+// overage-status stay absent on purpose: with them the client composes its own line
+// and drops ours.
 func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time, sendUsage bool) {
 	reset := strconv.FormatInt(r.Reset.Unix(), 10)
 	h := w.Header()
@@ -257,7 +259,8 @@ func attachPrincipalLimitStanding(ctx context.Context, dst http.Header) {
 
 // attachTranslatedUsageLimits is the last header step of a translated /v1/messages
 // success: #407's cached subscription windows, then the principal's limit standing
-// from the request context.
+// from the request context. It writes nothing for a token without send_usage_limits
+// (#420).
 func (s *Server) attachTranslatedUsageLimits(r *http.Request, token auth.Token, dst http.Header) {
 	if !token.SendUsageLimits {
 		return

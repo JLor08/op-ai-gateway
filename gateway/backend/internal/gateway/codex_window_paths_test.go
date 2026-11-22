@@ -133,9 +133,9 @@ func requireCodexWindowsAttached(t *testing.T, rec *httptest.ResponseRecorder, w
 
 func requireNoCodex(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
-	for k := range rec.Header() {
+	for k := range rec.Result().Header {
 		if strings.HasPrefix(strings.ToLower(k), codexRateLimitPrefix) {
-			t.Fatalf("unexpected Codex header %s: %v", k, rec.Header())
+			t.Fatalf("unexpected Codex header %s: %v", k, rec.Result().Header)
 		}
 	}
 }
@@ -304,7 +304,6 @@ func TestCodexWindowsNeedAPrincipal(t *testing.T) {
 
 func TestMessagesGetNoCodexWindowsAndResponsesGetNoUnified(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
-	f.setSendUsageLimits(t, true) // the Messages half needs the Claude Code opt-in (#420)
 	f.observeViaVendor(t, vaOwnerSecret)
 	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true, SendUsageLimits: true}
 	anthropic := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: "acc_anthropic", VendorAccountOwnerUserID: "usr_va_a"}

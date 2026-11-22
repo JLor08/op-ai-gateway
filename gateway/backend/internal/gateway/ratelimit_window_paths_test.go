@@ -154,9 +154,9 @@ func requireWindowsAttached(t *testing.T, rec *httptest.ResponseRecorder) {
 
 func requireNoUnified(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
-	for k := range rec.Header() {
+	for k := range rec.Result().Header {
 		if strings.HasPrefix(strings.ToLower(k), rlp) {
-			t.Fatalf("unexpected unified header %s: %v", k, rec.Header())
+			t.Fatalf("unexpected unified header %s: %v", k, rec.Result().Header)
 		}
 	}
 }

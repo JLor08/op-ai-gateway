@@ -73,6 +73,9 @@ func writeCodexPrimaryWindow(h http.Header, r LimitReading, usedPercent int, off
 
 // writeCodexLimitStanding writes the success-path headers describing r in the Codex
 // CLI's default x-codex family, with the limit name so the CLI labels the bar.
+// offerModelSwitch (the token's codex_model_switch_prompt switch) leaves the credits
+// flag out, so Codex may offer its model-switch prompt; otherwise the credits flag
+// suppresses it.
 func writeCodexLimitStanding(dst http.Header, r LimitReading, offerModelSwitch bool) {
 	writeCodexPrimaryWindow(dst, r, overageUtilizationCents(r.Utilization()), offerModelSwitch)
 	dst.Set("X-Codex-Limit-Name", codexLimitName(r.Kind))
@@ -81,7 +84,8 @@ func writeCodexLimitStanding(dst http.Header, r LimitReading, offerModelSwitch b
 // attachCodexPrincipalLimitStanding lays the principal's fullest limit onto a
 // response header set dst. It does nothing when dst already carries any Codex
 // rate-limit header (the subscription's figures win), when ctx has no describable
-// standing, or when the reset is not after now.
+// standing, or when the reset is not after now. offerModelSwitch is passed through
+// to writeCodexLimitStanding.
 func attachCodexPrincipalLimitStanding(ctx context.Context, dst http.Header, now time.Time, offerModelSwitch bool) {
 	if hasCodexRateLimitHeader(dst) {
 		return
