@@ -48,7 +48,7 @@
 
 - [ ] **Step 1: Failing tests**
   - `TestDetectRuntimeSpecTypeStrata`: `DetectRuntimeSpecType(`C:\…\bin\strata.cmd`)` and `/home/u/.local/bin/strata` → `RuntimeSpecTypeStrata`; `strata-vision.exe` too; `python.exe` → `custom`; existing vllm/llama rows unchanged.
-  - `TestDeriveProbePathsStrata`: metrics `/metrics`, context probe `/props`.
+  - `TestDeriveProbePathsStrata`: metrics `/metrics?format=prometheus`, context probe `/props`.
   - `DeriveRole` table row: strata → `RoleChat`.
   - `DecisionsPassthroughCapableKind("strata") == false`.
   - Add both strata strings to the `kinds` slice in `TestLiveProgressUpstreamsCoverEveryRoutingCapableKind` and assert not live-progress/live-timings capable.
@@ -157,6 +157,26 @@
 - [ ] **Step 4: Run** → PASS; also `GOOS=windows go vet ./...`.
 - [ ] **Step 5: Commit** `feat(agent): main-last GPU placeholder and 0.21.0 feature flags (#424)`.
 
+### Task 6a: Agent child probes carry the spec token; Strata metrics and telemetry pins
+
+**Files:**
+- Modify: `server-agent/internal/collector/scrape.go` (`promScraper` gets an optional header), `collector/probe.go` (probe requests), `internal/agent/agent.go` (props/context/loaded-models probes of a child pass the spec's token + effective header), `runtime/types.go` if the wire spec lacks the header name
+- Test: `collector/scrape_test.go`, `collector/probe_test.go`, `agent/agent_test.go`; gateway `internal/gateway/passthrough_usage_scan_test.go` (Strata shapes)
+
+**Interfaces:**
+- Produces: `func NewPromScraper(url string, client *http.Client, authHeader, authValue string) *promScraper` (empty header → no auth, today's behaviour); probes take the same pair.
+
+- [ ] **Step 1: Failing tests**
+  - scrape against a stub that 401s without `Authorization: Bearer k` and returns Strata's Prometheus body (`llamacpp:requests_processing 2`, `llamacpp:requests_deferred 1`) only for `?format=prometheus` → active 2, queue 1 when constructed with the token; unchanged behaviour with empty header.
+  - custom header (`X-Api-Key`) used when the spec sets one.
+  - token never appears in any logged URL/error string (assert on captured slog output).
+  - agent props probe of a spec with `api_token` sends it.
+  - gateway: chat stream with Strata's `timings` on the final chunk → prompt 30.0 / gen 24.1 tps recorded; `/v1/responses` non-stream with top-level `timings` after `usage` → recorded; `/v1/messages` without timings → rates 0 (documented gap).
+- [ ] **Step 2: Run** `cd server-agent && go test ./internal/collector/ ./internal/agent/` and gateway `go test ./internal/gateway/ -run Strata` → FAIL (agent), gateway pins may already pass.
+- [ ] **Step 3: Implement**; the header value is the decrypted wire `api_token`, held only in memory.
+- [ ] **Step 4: Run** → PASS; `GOOS=windows go vet ./...`.
+- [ ] **Step 5: Commit** `fix(agent): authenticate the agent's own child probes with the spec token (#424)`.
+
 ### Task 7: `process_tree` field — gateway store, API, push
 
 **Files:**
@@ -243,7 +263,7 @@
 
 ### Task 11: Architecture docs, ADR-111, README/AGENTS
 
-**Files:** `docs/architecture/09-architecture-decisions.md` (ADR-111), `cross-cutting/agent-runtime-manager.md` (type section, placeholder table, §3.5 example, Windows process tree replacing the kill-only note, §5.6 table, §7 flags, §11.5 warnings), `cross-cutting/routing-and-model-selection.md`, `cross-cutting/compatibility-and-inference.md` (only if Task 3 added a guard), `reference/api-surface.md` (type lists, error codes), `reference/data-model.md` (migration 113, type list), `12-glossary.md`, `README.md`, `AGENTS.md` summary, `server-agent/README.md` (Windows Strata setup: allowlist `strata.cmd`, agent under the installing account, unsupported under LocalSystem).
+**Files:** `docs/architecture/09-architecture-decisions.md` (ADR-111), `cross-cutting/agent-runtime-manager.md` (type section incl. Strata telemetry endpoints per spec §4.7a, placeholder table, §3.5 example, Windows process tree replacing the kill-only note, §5.6 table, §7 flags, §11.5 warnings), `cross-cutting/routing-and-model-selection.md`, `cross-cutting/compatibility-and-inference.md` (only if Task 3 added a guard), `reference/api-surface.md` (type lists, error codes), `reference/data-model.md` (migration 113, type list), `12-glossary.md`, `README.md`, `AGENTS.md` summary, `server-agent/README.md` (Windows Strata setup: allowlist `strata.cmd`, agent under the installing account, unsupported under LocalSystem).
 
 - [ ] **Step 1:** Write; every claim cites code or the measured upstream behaviour; no host/user names.
 - [ ] **Step 2:** `make lint-docs` → PASS.

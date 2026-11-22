@@ -151,8 +151,9 @@ form) pre-fills:
   timeout (decision: mine, since a load is 1–2 min). The application timeout default
   must not trigger `timeout_ms_below_startup_timeout` for the template; the builder
   aligns the template with how the llama.cpp template avoids it.
-- health path `/health`, probe/loaded-models path `/v1/models`; `/props` probing as
-  for llama.cpp but tolerant of absence (PR #401 precedent for skipping `/props`).
+- health path `/health`, probe/loaded-models path `/v1/models`, metrics path
+  `/metrics?format=prometheus` (§4.7a); `/props` probing as for llama.cpp but tolerant
+  of absence (PR #401 precedent for skipping `/props`).
 - api flavors / modes as the application type.
 
 If Windows acceptance (§6) shows that `strata.cmd` misbehaves under the agent (Go's
@@ -278,6 +279,41 @@ finalizing (serial PRs collide on the version).
 No code change: passthrough already sums Anthropic cache fields. Add a test that pins
 Strata's shape (`input_tokens: 1` + cache fields) for `/v1/messages`, streaming and
 non-streaming, so the behaviour cannot regress silently.
+
+### 4.7a Telemetry: prepared, not yet surfaced (owner: "so vorbereiten, dass wir sie nutzen könnten")
+
+Strata offers more than the gateway reads today. This branch makes it **reachable**
+and **documented**; what to show in the portal is decided later (follow-up issue).
+
+Already covered by existing code (pin with tests only): per-request prompt and
+generation tokens/s from the llama.cpp-style `timings` object on chat completions and
+`/v1/responses` passthrough (`native_passthrough.go` usage scan), streaming and
+non-streaming. **Not** available: `/v1/messages` carries no `timings` upstream, so
+Claude Code requests to Strata record no tokens/s (documented gap; follow-up).
+
+Changes on this branch:
+- **Metrics format.** Strata's `/metrics` answers JSON unless asked for Prometheus
+  (`Accept: text/plain`/openmetrics or `?format=prometheus`, `serve/prometheus.py`).
+  Default metrics path for type `strata` is `/metrics?format=prometheus`; the
+  Prometheus body uses llama.cpp names (`llamacpp:requests_processing`,
+  `llamacpp:requests_deferred`, plus `llamacpp:prompt_tokens_seconds`,
+  `llamacpp:predicted_tokens_seconds`, `strata:drafts_offered_total`,
+  `strata:drafts_accepted_total`, …), so the existing running/queued parser works.
+- **Authenticated child probes (agent, generic).** The agent's own probes of a child
+  (metrics scrape, `/props`, loaded-models/context probe) send no credential today;
+  Strata (and an api-key'd llama-server) answer 401 on everything but `/health`. When
+  the pushed spec carries an `api_token`, the agent attaches it to its own child probes
+  using the spec's effective header (default `Authorization: Bearer`). Never logged,
+  never in a reported URL. Covered by the 0.21.0 bump; no flag (behaviour fix, the
+  gateway gates nothing on it).
+- **Documentation.** `agent-runtime-manager.md` gets a Strata section listing the
+  telemetry endpoints of `strata serve` — `/metrics` (JSON and Prometheus),
+  `/v1/telemetry` (versioned contract, field list from upstream
+  `docs/TERMINAL_TELEMETRY_FIELDS.md`), `/slots`, `/v1/status` (engine version) — with
+  their auth rules, and that the desktop-app share exposes none of them.
+- Follow-up (not this branch): which of these the portal shows (host tokens/s gauges,
+  speculative-draft acceptance, conversation-cache hits, engine version in the agent
+  panel, a gateway-measured tokens/s for `/v1/messages`).
 
 ### 4.8 Docs
 
