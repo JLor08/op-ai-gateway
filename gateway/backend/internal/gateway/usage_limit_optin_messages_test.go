@@ -5,22 +5,15 @@ package gateway
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"strings"
 	"testing"
 )
 
-// setSendUsageLimits sets the owner token's usage-limit opt-in (#420) in the
-// gateway's bearer store; the next request resolves the new value.
-func (f *windowsFixture) setSendUsageLimits(t *testing.T, on bool) {
-	t.Helper()
-	f.setSendUsageLimitsFor(t, vaOwnerSecret, on)
-}
-
-// setSendUsageLimitsFor is setSendUsageLimits for the token behind secret.
-func (f *windowsFixture) setSendUsageLimitsFor(t *testing.T, secret string, on bool) {
+// mutateToken applies mutate to the token behind secret in the gateway's bearer
+// store; the next request resolves the new value.
+func (f *windowsFixture) mutateToken(t *testing.T, secret string, mutate func(*auth.Token)) {
 	t.Helper()
 	store, ok := f.srv.Tokens.(*auth.TokenStore)
 	if !ok {
@@ -30,17 +23,20 @@ func (f *windowsFixture) setSendUsageLimitsFor(t *testing.T, secret string, on b
 	if !ok {
 		t.Fatal("token not found")
 	}
-	tok.SendUsageLimits = on
+	mutate(&tok)
 	store.UpdateToken(tok)
 }
 
-func requireNoUnifiedResult(t *testing.T, rec *httptest.ResponseRecorder) {
+// setSendUsageLimits sets the owner token's usage-limit opt-in (#420).
+func (f *windowsFixture) setSendUsageLimits(t *testing.T, on bool) {
 	t.Helper()
-	for k := range rec.Result().Header {
-		if strings.HasPrefix(strings.ToLower(k), rlp) {
-			t.Fatalf("unexpected unified header %s: %v", k, rec.Result().Header)
-		}
-	}
+	f.setSendUsageLimitsFor(t, vaOwnerSecret, on)
+}
+
+// setSendUsageLimitsFor is setSendUsageLimits for the token behind secret.
+func (f *windowsFixture) setSendUsageLimitsFor(t *testing.T, secret string, on bool) {
+	t.Helper()
+	f.mutateToken(t, secret, func(tok *auth.Token) { tok.SendUsageLimits = on })
 }
 
 func TestMessagesOptOutRelaysNoUnifiedHeaders(t *testing.T) {
@@ -53,7 +49,7 @@ func TestMessagesOptOutRelaysNoUnifiedHeaders(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	requireNoUnifiedResult(t, rec)
+	requireNoUnified(t, rec)
 	h := rec.Result().Header
 	if h.Get("Retry-After") != "30" || h.Get("X-Should-Retry") != "true" {
 		t.Fatalf("retry headers not relayed: %v", h)
@@ -81,7 +77,7 @@ func TestMessagesOptOutAttachesNoCachedWindows(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 			}
-			requireNoUnifiedResult(t, rec)
+			requireNoUnified(t, rec)
 		})
 	}
 }
@@ -90,36 +86,38 @@ func TestMessagesOptOutObservesNothing(t *testing.T) {
 	f := newWindowsFixture(t, routing.EndpointModePassthrough)
 	f.setSendUsageLimits(t, false)
 	f.observeViaVendor(t, vaOwnerSecret)
+	if n := len(f.srv.rateLimitWindows.entries); n != 0 {
+		t.Fatalf("opted-out token cached %d entries", n)
+	}
 
 	f.setSendUsageLimits(t, true)
 	rec := f.post(t, vaOwnerSecret, "/v1/messages", windowsLocalModel, false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	requireNoUnifiedResult(t, rec)
+	requireNoUnified(t, rec)
 }
 
 func TestMessagesOptOutNoPrincipalStanding(t *testing.T) {
 	cases := []struct {
 		name   string
 		mode   routing.EndpointMode
-		model  string
 		stream bool
 	}{
-		{"native", routing.EndpointModePassthrough, windowsLocalModel, false},
-		{"translate buffered", routing.EndpointModeTranslate, windowsLocalModel, false},
-		{"translate stream", routing.EndpointModeTranslate, windowsLocalModel, true},
+		{"native", routing.EndpointModePassthrough, false},
+		{"translate buffered", routing.EndpointModeTranslate, false},
+		{"translate stream", routing.EndpointModeTranslate, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newWindowsFixture(t, tc.mode)
 			f.setSendUsageLimits(t, false)
 			f.capPrincipal()
-			rec := f.post(t, vaOwnerSecret, "/v1/messages", tc.model, tc.stream)
+			rec := f.post(t, vaOwnerSecret, "/v1/messages", windowsLocalModel, tc.stream)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 			}
-			requireNoUnifiedResult(t, rec)
+			requireNoUnified(t, rec)
 		})
 	}
 }
@@ -146,7 +144,7 @@ func TestMessagesBlockOptOut(t *testing.T) {
 	if h.Get("Retry-After") == "" || h.Get("X-Should-Retry") != "false" {
 		t.Fatalf("retry headers missing: %v", h)
 	}
-	requireNoUnifiedResult(t, rec)
+	requireNoUnified(t, rec)
 	body := rec.Body.String()
 	if !strings.Contains(body, `"billing_error"`) || !strings.Contains(body, "token quota reached · resets ") ||
 		!strings.Contains(body, "ask your gateway administrator to raise it") {
@@ -179,5 +177,59 @@ func TestMessagesOptInUnchanged(t *testing.T) {
 	h := blocked.Result().Header
 	if blocked.Code != http.StatusTooManyRequests || h.Get(rlp+"status") != "rejected" || h.Get(rlp+"overage-disabled-reason") != "org_spend_cap_reached" || h.Get("X-Should-Retry") != "false" {
 		t.Fatalf("block changed: %d %v", blocked.Code, h)
+	}
+}
+
+// An opted-out token observes nothing, but a vendor response on the account an entry
+// of its principal came from still purges that entry once the principal's entitlement
+// is revoked: an opted-in sibling token must not keep frozen windows (#420).
+func TestMessagesOptOutStillPurgesRevokedEntry(t *testing.T) {
+	f := newWindowsFixture(t, routing.EndpointModePassthrough)
+	optedIn := auth.Token{ID: "tok_va_b1", UserID: "usr_va_b", Active: true, SendUsageLimits: true}
+	optedOut := auth.Token{ID: "tok_va_b2", UserID: "usr_va_b", Active: true}
+	shared := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a", VendorShareUsageWithMembers: true}
+	revoked := shared
+	revoked.VendorShareUsageWithMembers = false
+	portal := &usageManagerPortal{API: f.srv.Portal, ok: false}
+	f.srv.Portal = portal
+	key, _ := principalKey(optedIn)
+
+	f.srv.observeRateLimitWindows(optedIn, shared, subscriptionWindowHeaders())
+	if !f.srv.rateLimitWindows.hasEntryFrom(key, subMessagesAccountID) {
+		t.Fatal("opted-in observation not cached")
+	}
+
+	// Control: entitlement intact, the opted-out response purges and records nothing.
+	f.srv.observeRateLimitWindows(optedOut, shared, subscriptionWindowHeaders())
+	if !f.srv.rateLimitWindows.hasEntryFrom(key, subMessagesAccountID) {
+		t.Fatal("opted-out response with intact entitlement dropped the entry")
+	}
+
+	// Another account's response leaves the entry alone.
+	other := revoked
+	other.VendorAccountID = "acc_other"
+	f.srv.observeRateLimitWindows(optedOut, other, subscriptionWindowHeaders())
+	if !f.srv.rateLimitWindows.hasEntryFrom(key, subMessagesAccountID) {
+		t.Fatal("a response on another account purged the entry")
+	}
+
+	f.srv.observeRateLimitWindows(optedOut, revoked, subscriptionWindowHeaders())
+	if n := len(f.srv.rateLimitWindows.entries); n != 0 {
+		t.Fatalf("revoked entry kept: %d entries", n)
+	}
+}
+
+// With no entry of the principal to purge, an opted-out response triggers no
+// entitlement lookup at all.
+func TestMessagesOptOutWithoutEntryNeverLooksUpEntitlement(t *testing.T) {
+	f := newWindowsFixture(t, routing.EndpointModePassthrough)
+	optedOut := auth.Token{ID: "tok_va_b2", UserID: "usr_va_b", Active: true}
+	revoked := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a"}
+	portal := &usageManagerPortal{API: f.srv.Portal, ok: false}
+	f.srv.Portal = portal
+
+	f.srv.observeRateLimitWindows(optedOut, revoked, subscriptionWindowHeaders())
+	if portal.calls != 0 || len(f.srv.rateLimitWindows.entries) != 0 {
+		t.Fatalf("lookups = %d, entries = %d, want 0 and 0", portal.calls, len(f.srv.rateLimitWindows.entries))
 	}
 }

@@ -16,20 +16,10 @@ import (
 	"time"
 )
 
-// setCodexModelSwitchPrompt sets the owner token's codex_model_switch_prompt switch
-// (#420) in the gateway's bearer store; the next request resolves the new value.
+// setCodexModelSwitchPrompt sets the owner token's codex_model_switch_prompt switch (#420).
 func (f *windowsFixture) setCodexModelSwitchPrompt(t *testing.T, on bool) {
 	t.Helper()
-	store, ok := f.srv.Tokens.(*auth.TokenStore)
-	if !ok {
-		t.Fatalf("bearer store is %T, want *auth.TokenStore", f.srv.Tokens)
-	}
-	tok, ok := store.LookupBearer("Bearer " + vaOwnerSecret)
-	if !ok {
-		t.Fatal("token not found")
-	}
-	tok.CodexModelSwitchPrompt = on
-	store.UpdateToken(tok)
+	f.mutateToken(t, vaOwnerSecret, func(tok *auth.Token) { tok.CodexModelSwitchPrompt = on })
 }
 
 // codexHeaderNames returns the sorted lower-case x-codex-* header names of h.
@@ -42,13 +32,6 @@ func codexHeaderNames(h http.Header) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func requireNoCodexResult(t *testing.T, rec *httptest.ResponseRecorder) {
-	t.Helper()
-	if names := codexHeaderNames(rec.Result().Header); len(names) != 0 {
-		t.Fatalf("unexpected Codex headers %v: %v", names, rec.Result().Header)
-	}
 }
 
 func TestCodexOptOutRelaysNoFamily(t *testing.T) {
@@ -67,7 +50,7 @@ func TestCodexOptOutRelaysNoFamily(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	requireNoCodexResult(t, rec)
+	requireNoCodex(t, rec)
 	got := rec.Result().Header
 	if got.Get("Retry-After") != "30" || got.Get("X-Should-Retry") != "true" {
 		t.Fatalf("retry headers not relayed: %v", got)
@@ -105,7 +88,7 @@ func TestCodexOptOutAttachesNoCachedWindows(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 			}
-			requireNoCodexResult(t, rec)
+			requireNoCodex(t, rec)
 		})
 	}
 }
@@ -123,7 +106,7 @@ func TestCodexOptOutObservesNothing(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	requireNoCodexResult(t, rec)
+	requireNoCodex(t, rec)
 
 	// Positive control: with the switch on the observation is recorded.
 	f.observeViaVendor(t, vaOwnerSecret)
@@ -153,7 +136,7 @@ func TestCodexOptOutNoPrincipalStanding(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 			}
-			requireNoCodexResult(t, rec)
+			requireNoCodex(t, rec)
 		})
 	}
 }
@@ -271,7 +254,7 @@ func TestCodexModelSwitchPromptWithoutSendIsMoot(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
-	requireNoCodexResult(t, rec)
+	requireNoCodex(t, rec)
 
 	f.blockOwner()
 	rec = f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
@@ -345,5 +328,56 @@ func TestWriteCodexLimitBlockedHeaderSets(t *testing.T) {
 				t.Fatalf("body = %+v", body)
 			}
 		})
+	}
+}
+
+// An opted-out token observes nothing, but a vendor response on the account an entry
+// of its principal came from still purges that entry once the principal's entitlement
+// is revoked (#420).
+func TestCodexOptOutStillPurgesRevokedEntry(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
+	optedIn := auth.Token{ID: "tok_va_b1", UserID: "usr_va_b", Active: true, SendUsageLimits: true}
+	optedOut := auth.Token{ID: "tok_va_b2", UserID: "usr_va_b", Active: true}
+	shared := routing.Target{Provider: routing.ProviderVendorOpenAISubscription, VendorAccountID: "acc_codex", VendorAccountOwnerUserID: "usr_va_a", VendorShareUsageWithMembers: true}
+	revoked := shared
+	revoked.VendorShareUsageWithMembers = false
+	portal := &usageManagerPortal{API: f.srv.Portal, ok: false}
+	f.srv.Portal = portal
+	key, _ := principalKey(optedIn)
+	hdr := func() http.Header { return codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour) }
+
+	f.srv.observeCodexRateLimitWindows(optedIn, shared, hdr())
+	if !f.srv.codexRateLimitWindows.hasEntryFrom(key, "acc_codex") {
+		t.Fatal("opted-in observation not cached")
+	}
+
+	f.srv.observeCodexRateLimitWindows(optedOut, shared, hdr())
+	if !f.srv.codexRateLimitWindows.hasEntryFrom(key, "acc_codex") {
+		t.Fatal("opted-out response with intact entitlement dropped the entry")
+	}
+
+	other := revoked
+	other.VendorAccountID = "acc_other"
+	f.srv.observeCodexRateLimitWindows(optedOut, other, hdr())
+	if !f.srv.codexRateLimitWindows.hasEntryFrom(key, "acc_codex") {
+		t.Fatal("a response on another account purged the entry")
+	}
+
+	f.srv.observeCodexRateLimitWindows(optedOut, revoked, hdr())
+	if n := len(f.srv.codexRateLimitWindows.entries); n != 0 {
+		t.Fatalf("revoked entry kept: %d entries", n)
+	}
+}
+
+func TestCodexOptOutWithoutEntryNeverLooksUpEntitlement(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
+	optedOut := auth.Token{ID: "tok_va_b2", UserID: "usr_va_b", Active: true}
+	revoked := routing.Target{Provider: routing.ProviderVendorOpenAISubscription, VendorAccountID: "acc_codex", VendorAccountOwnerUserID: "usr_va_a"}
+	portal := &usageManagerPortal{API: f.srv.Portal, ok: false}
+	f.srv.Portal = portal
+
+	f.srv.observeCodexRateLimitWindows(optedOut, revoked, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
+	if portal.calls != 0 || len(f.srv.codexRateLimitWindows.entries) != 0 {
+		t.Fatalf("lookups = %d, entries = %d, want 0 and 0", portal.calls, len(f.srv.codexRateLimitWindows.entries))
 	}
 }
