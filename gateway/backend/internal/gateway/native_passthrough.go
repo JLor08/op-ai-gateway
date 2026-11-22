@@ -1180,17 +1180,21 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
 		// A success from a provider that reports no Codex windows of its own (a local
 		// model) carries the caller's last observed ones, so the Codex CLI keeps its
-		// usage display. Fresh upstream windows are never overlaid, and an error
-		// response keeps exactly what the upstream said.
-		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 && !hasCodexRateLimitHeader(resp.Header) {
+		// usage display, unless the gateway's own limit takes over (written percent at
+		// codexGatewayTakeoverPercent or more): then the cached windows are skipped and
+		// the standing below is the only figure. Fresh upstream windows are never
+		// overlaid, and an error response keeps exactly what the upstream said.
+		now := time.Now()
+		success := resp.StatusCode >= 200 && resp.StatusCode < 300
+		if sendUsage && success && !hasCodexRateLimitHeader(resp.Header) && !codexGatewayLimitTakesOver(r.Context(), now) {
 			s.attachCodexRateLimitWindows(rel.token, w.Header())
 		}
 		// A principal with quotas or budgets then has its own fullest limit written in
 		// the default x-codex family on any 2xx that carries no Codex figures yet
-		// (including a vendor family withheld from a non-entitled caller). It writes
-		// the client header set only.
-		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			attachCodexPrincipalLimitStanding(r.Context(), w.Header(), time.Now(), rel.token.CodexModelSwitchPrompt)
+		// (including a vendor family withheld from a non-entitled caller, and the
+		// cached windows a takeover skipped). It writes the client header set only.
+		if sendUsage && success {
+			attachCodexPrincipalLimitStanding(r.Context(), w.Header(), now, rel.token.CodexModelSwitchPrompt)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)

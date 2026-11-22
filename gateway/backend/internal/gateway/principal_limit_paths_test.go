@@ -14,11 +14,15 @@ import (
 
 // capPrincipal gives usr_va_a a 1000 tokens/day quota with 800 used, so every
 // admitted request reports the token quota at 80 %.
-func (f *windowsFixture) capPrincipal() {
+func (f *windowsFixture) capPrincipal() { f.capPrincipalAt(800) }
+
+// capPrincipalAt is capPrincipal with a chosen token aggregate against the same
+// 1000 tokens/day quota.
+func (f *windowsFixture) capPrincipalAt(tokens int64) {
 	p := Principal{Type: routing.PrincipalTypeUser, ID: "usr_va_a"}
 	store := newFakePrincipalStore()
 	store.setConfig(p, routing.LimitConfig{TokenQuota: 1000, TokenQuotaPeriod: "day"})
-	store.setAggregate(p, 0, 800, 0)
+	store.setAggregate(p, 0, tokens, 0)
 	f.srv.Limiter = NewPrincipalLimiter(store, PrincipalLimiterOptions{})
 }
 

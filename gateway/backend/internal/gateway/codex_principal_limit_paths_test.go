@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -65,22 +66,57 @@ func TestCodexStandingYieldsToVendorFigures(t *testing.T) {
 	}
 }
 
-func TestCodexStandingYieldsToCachedWindows(t *testing.T) {
+func requireNoCodexSecondary(t *testing.T, h http.Header) {
+	t.Helper()
+	if h.Get("X-Codex-Secondary-Used-Percent") != "" || h.Get("X-Codex-Secondary-Reset-At") != "" {
+		t.Fatalf("cached secondary window survived the takeover: %v", h)
+	}
+}
+
+func TestCodexStandingTakesOverCachedWindows(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
 	f.capPrincipal()
 	f.observeViaVendor(t, vaOwnerSecret)
 
 	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
 	requireCodexStandingOK(t, rec)
-	requireCodexWindowsAttached(t, rec, "42.5")
-	if got := rec.Result().Header.Get("X-Codex-Limit-Name"); got != "codex" {
-		t.Fatalf("limit name = %q, want codex", got)
+	requireCodexStandingAttached(t, rec)
+	requireNoCodexSecondary(t, rec.Result().Header)
+}
+
+func TestCodexStandingTakesOverCachedWindowsOnTranslate(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModeTranslate)
+	f.capPrincipal()
+	f.observeViaVendor(t, vaOwnerSecret)
+
+	for _, stream := range []bool{false, true} {
+		rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, stream)
+		requireCodexStandingOK(t, rec)
+		requireCodexStandingAttached(t, rec)
+		requireNoCodexSecondary(t, rec.Result().Header)
 	}
 }
 
-func TestCodexStandingYieldsToCachedWindowsOnTranslate(t *testing.T) {
+func TestCodexStandingYieldsToCachedWindowsBelowThreshold(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
+	f.capPrincipalAt(740)
+	f.observeViaVendor(t, vaOwnerSecret)
+
+	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
+	requireCodexStandingOK(t, rec)
+	requireCodexWindowsAttached(t, rec, "42.5")
+	h := rec.Result().Header
+	if got := h.Get("X-Codex-Limit-Name"); got != "codex" {
+		t.Fatalf("limit name = %q, want codex", got)
+	}
+	if got := h.Get("X-Codex-Credits-Has-Credits"); got != "" {
+		t.Fatalf("credits header = %q, want none", got)
+	}
+}
+
+func TestCodexStandingYieldsToCachedWindowsBelowThresholdOnTranslate(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModeTranslate)
-	f.capPrincipal()
+	f.capPrincipalAt(740)
 	f.observeViaVendor(t, vaOwnerSecret)
 
 	for _, stream := range []bool{false, true} {
@@ -95,6 +131,69 @@ func TestCodexStandingYieldsToCachedWindowsOnTranslate(t *testing.T) {
 			t.Fatalf("stream=%v credits header = %q, want none", stream, got)
 		}
 	}
+}
+
+// observeWithExtraFamily records the default family plus an x-codex-other-* family
+// in the owner's window cache through one vendor request.
+func (f *codexWindowsFixture) observeWithExtraFamily(t *testing.T) {
+	t.Helper()
+	now := time.Now()
+	h := codexWindowHeaders(now, time.Hour, 24*time.Hour)
+	h.Set("x-codex-other-primary-used-percent", "12")
+	h.Set("x-codex-other-primary-window-minutes", "60")
+	h.Set("x-codex-other-primary-reset-at", strconv.FormatInt(now.Add(time.Hour).Unix(), 10))
+	h.Set("x-codex-other-limit-name", "other")
+	f.cprov.mu.Lock()
+	f.cprov.vendorStatus, f.cprov.vendorHdr = http.StatusOK, h
+	f.cprov.mu.Unlock()
+	if rec := f.post(t, vaOwnerSecret, "/v1/responses", codexWindowsModel, false); rec.Code != http.StatusOK {
+		t.Fatalf("vendor request status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCodexTakeoverDropsCachedExtraFamily(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
+	f.observeWithExtraFamily(t)
+	f.capPrincipal()
+
+	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
+	requireCodexStandingOK(t, rec)
+	requireCodexStandingAttached(t, rec)
+	for k := range rec.Result().Header {
+		if strings.HasPrefix(strings.ToLower(k), "x-codex-other-") {
+			t.Fatalf("cached extra family survived the takeover: %v", rec.Result().Header)
+		}
+	}
+}
+
+func TestCodexBelowThresholdKeepsCachedExtraFamily(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
+	f.observeWithExtraFamily(t)
+	f.capPrincipalAt(740)
+
+	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
+	requireCodexStandingOK(t, rec)
+	if got := rec.Result().Header.Get("X-Codex-Other-Primary-Used-Percent"); got != "12" {
+		t.Fatalf("cached extra family = %q, want 12: %v", got, rec.Result().Header)
+	}
+}
+
+func TestCodexTakeoverWithModelSwitchPrompt(t *testing.T) {
+	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
+	f.capPrincipal()
+	f.observeViaVendor(t, vaOwnerSecret)
+	f.setCodexModelSwitchPrompt(t, true)
+
+	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
+	requireCodexStandingOK(t, rec)
+	h := rec.Result().Header
+	if h.Get("X-Codex-Primary-Used-Percent") != "80" || h.Get("X-Codex-Limit-Name") != "OP AI Gateway token quota" {
+		t.Fatalf("takeover not written: %v", h)
+	}
+	if h.Get("X-Codex-Credits-Has-Credits") != "" || h.Get("X-Codex-Credits-Unlimited") != "" {
+		t.Fatalf("credits headers present with the model-switch prompt on: %v", h)
+	}
+	requireNoCodexSecondary(t, h)
 }
 
 func TestCodexStandingForNonEntitledVendorCaller(t *testing.T) {

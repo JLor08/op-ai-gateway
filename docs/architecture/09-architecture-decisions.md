@@ -13102,6 +13102,7 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
   `rateLimitWindowCache` instance next to the Anthropic one, so a principal using Claude Code and Codex in turn never evicts one family
   with the other) and attaches those still in the future to `/v1/responses` successes that carry no family header of their own. Credits,
   the 429-only headers and the retry headers are not stored.
+  **Amended by [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win) (cached windows yield from 75 %, issue #418 follow-up).** The cache is not attached while the gateway's own limit takes over; see ADR-109's amendment and [§9.6](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits).
 - **Capture redaction.** The Codex family counts as account-sensitive: a payload capture of a vendor-account target drops it unless the
   principal is entitled, as it does the unified family.
 
@@ -13122,7 +13123,7 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
 
 - Codex's own model-switch nudge to `gpt-5.4-mini` comes with the warning at 90 % and above; the gateway may not map that model. Codex
   hides the nudge with `notices.hide_rate_limit_model_nudge = true`.
-- Before the first subscription response of a session, and after a gateway restart, the display is empty: Codex's startup prefetch exists
+- Before the first subscription response of a session, and after a gateway restart, the display is empty unless the gateway writes the principal's own limit (ADR-109): Codex's startup prefetch exists
   only for a ChatGPT login.
 - The cache has the bounds and the revocation limit of ADR-106 (per process, capped at 10 000 principals and, per observation, at 8 families and 256 bytes per header value, lost on restart, not shared
   between replicas; a principal whose entitlement is revoked and who then uses only other providers keeps receiving its last frozen
@@ -13156,7 +13157,8 @@ neither `retry-after` nor `x-should-retry`.
 - **Suppress the model-switch popup.** Every response that carries the gateway's window also carries `x-codex-credits-has-credits: true`
   and `x-codex-credits-unlimited: false`, without a balance, so Codex does not lead the user into a model switch that cannot help with a
   gateway limit.
-- **The subscription wins, whole.** The gateway writes nothing when, after ADR-108's relay and cache, the client header set already
+- **The subscription wins, whole.** The gateway writes nothing when, after ADR-108's relay and cache (the cache only while the
+  amendment below leaves it attached), the client header set already
   carries any Codex rate-limit header (`isCodexRateLimitHeader`). It also writes nothing when the standing is empty or a reading failed,
   or when the reading's reset is not after the moment of writing.
 - **Readings from admission, as in ADR-107.** `handleOpenAIResponses` puts the admission standing on the request context, and ADR-108's
@@ -13184,16 +13186,29 @@ neither `retry-after` nor `x-should-retry`.
 
 **Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (opt-in and the popup switch).** The standing on a success and the window of the block need `send_usage_limits`; without it the block keeps only the 429, `Retry-After`, `X-Should-Retry: false`, the same body and `x-codex-promo-message`. With `codex_model_switch_prompt` the gateway no longer writes its own credits flag, which this ADR used to suppress the popup.
 
+**Amended (cached windows yield from 75 %, issue #418 follow-up, [PR #423](https://github.com/JLor08/op-ai-gateway/pull/423)).** On a `/v1/responses` success whose Codex figures would come only from
+ADR-108's window cache (a local model, a translated reply, or a native vendor reply without any Codex rate-limit header, as an API-key
+account usually sends), the gateway's own fullest limit replaces them, the whole cached set included, once its written percent (floored,
+at most 99) is 75 or more, which is Codex's first warning step (`codexGatewayLimitTakesOver`, `codexGatewayTakeoverPercent`). Fresh
+relayed vendor figures still win whole. Below 75 %, for a principal without a quota or budget, with a failed reading, or with a reset not
+after the moment of writing, nothing changes: the cached windows are attached and the gateway writes nothing. Why: a local-model request
+does not consume the subscription, and with cached windows living up to 7 days a capped user's first notice was the block.
+
 **Consequences and limits.**
 
-- A principal who also uses an OpenAI subscription sees the gateway's limit only on responses that carry no subscription figure, relayed
-  or cached. While cached windows are still in the future (a weekly window up to 7 days), local-model replies show the subscription and
-  Codex gives no gateway warning; a block still names the gateway's limit.
-- Codex carries credits over between responses: once a gateway response has set `x-codex-credits-has-credits: true`, a later local-model
-  reply that carries only cached subscription windows also suppresses the subscription's popup, until the next vendor response sends its
-  own credits headers.
+- A principal who also uses an OpenAI subscription sees the gateway's limit on responses that carry no fresh subscription figure from
+  75 % of its fullest limit; below that the cached subscription windows are shown and Codex gives no gateway warning. Fresh relayed
+  vendor figures always win; a block still names the gateway's limit.
+- From 75 % the display alternates between the subscription (vendor replies) and the gateway (local replies). The subscription's weekly
+  (secondary) bar disappears on local replies, because the gateway writes one window, and returns with the next vendor reply. Codex keeps
+  one warning step counter per slot for the whole chat session, shared by whatever figure fills the default family's primary slot, so a
+  75 % warning already taken by the subscription's 5h window means the gateway's first warning comes at 90 %, and the other way round: a gateway warning taken first (at 80 %, say) swallows the
+  subscription's 5h warning at that step. The alternation repeats no warning (verified in Codex CLI 0.137.0).
+- Codex carries credits over between responses: once a gateway response has set `x-codex-credits-has-credits: true` (a takeover reply
+  included), a later local-model reply that carries only cached subscription windows also suppresses the subscription's popup, until the
+  next vendor response sends its own credits headers.
 - During a block the 100 % window replaces the display; `/status` labels the row `Daily limit` without the `OP AI Gateway` prefix (a block
-  carries no limit name), and a subscription user sees the gateway's 0 % until a later success carries the subscription's figures again.
+  carries no limit name), and a subscription user sees the gateway's 0 % until a later success carries other figures: the subscription's, relayed or cached, or the gateway's own window.
 - The figures are those of admission. A response that outlives its period's boundary carries no gateway header (ADR-107 writes the stale
   reset there), and the next response corrects it.
 - The memory driver has no `usage_events`, so a configured principal reads 0 % there.

@@ -2516,9 +2516,11 @@ and the caller is entitled to the routed account's figures, by the rule of the M
 above (`rateLimitFiguresEntitled`, looked up only when the upstream sent a family header). It applies on any status, from the final
 upstream response only. `x-codex-turn-state` and every other `x-codex-` header outside the family, request ids, organization ids,
 `x-ratelimit-*` and the unified Anthropic family are never forwarded. A success from a target that reports no Codex windows carries the
-caller's last observed ones instead; see [§9.5](#95-codex-usage-limit-display). A caller who is not entitled gets neither the relayed
+caller's last observed ones instead, unless the principal's own fullest limit is at 75 % or more: the cached windows are then not
+attached and the gateway's own window replaces them ([§9.6](#96-codex-display-of-the-gateways-own-limits)); see
+[§9.5](#95-codex-usage-limit-display). A caller who is not entitled gets neither the relayed
 family nor cached windows on a response whose upstream carries the family, so Codex shows no subscription limits for that response. A
-2xx that ends up with no family header at all (a local model with nothing cached, or such a withheld response) carries the principal's
+2xx that ends up with no family header at all (a local model with nothing cached, such a withheld response, or a reply on which the gateway's limit took over from the cache) carries the principal's
 own fullest quota or budget instead, when it has one ([§9.6](#96-codex-display-of-the-gateways-own-limits)).
 A token without `send_usage_limits` gets no `x-codex-*` header from the relay, the cache or the gateway's own standing,
 the vendor's credits headers included; `retry-after` and `x-should-retry` still reach it. The one `x-codex-*` header the
@@ -4169,7 +4171,7 @@ entries never evict or overwrite each other.
   are not stored (Codex carries credits over itself).
 - Attached only for the Responses flavor, on a success (2xx) that carries no family header of its own: the native passthrough before
   the status line, and the translate path on both the buffered JSON answer and the SSE header block (written with the 200 before the
-  upstream answers). An error, a response with fresh upstream windows (a vendor 429 included: its own headers are never overlaid),
+  upstream answers). Not attached while the gateway's own limit takes over from 75 % (§9.6, *Precedence with §9.5*). An error, a response with fresh upstream windows (a vendor 429 included: its own headers are never overlaid),
   every other flavor and a token without `send_usage_limits` get nothing.
 - Only windows whose reset time is still in the future are written, and a family's `limit-name` only with at least one of its windows.
 - Per process and best effort, with the bounds of §9.3: in memory, capped at 10 000 principals (oldest observation evicted), at most 8 families per
@@ -4184,12 +4186,14 @@ account's figures (`redactCapturedAccountHeaders`). Native passthrough captures 
 **What Codex shows.** The windows in its status-line items (`five-hour-limit`, `weekly-limit`), the `/status` bars with reset times, and
 warnings at 75, 90 and 95 % ("Heads up, you have less than ...% of your 5h limit left"). At 90 % and above Codex also nudges the user
 to switch to `gpt-5.4-mini`, which the gateway may not map. The gateway writes its credits flag (§9.6) only in its own standing and its own block, never
-next to subscription figures, relayed or cached, so on those the vendor's relayed credits headers decide. The gateway influences the popup
+next to subscription figures, relayed or cached, so on those the vendor's relayed credits headers decide (a reply on which the
+gateway's limit took over from the cache carries no subscription figure). The gateway influences the popup
 only through Codex's credits carry-over after one of its own standing or block responses, and only for a token without
 `codex_model_switch_prompt`; `notices.hide_rate_limit_model_nudge = true` in Codex's
-configuration hides it client-side. Before the first subscription response of a session, and after a gateway restart, the display is empty: Codex's startup prefetch
+configuration hides it client-side. Before the first subscription response of a session, and after a gateway restart, the display is empty unless the gateway writes the principal's own limit (§9.6): Codex's startup prefetch
 exists only for a ChatGPT login. The gateway's own request quota, token quota and cost budget are written in the same default family
-(for a token with `send_usage_limits`), but only on a success that carries no subscription figures, relayed or cached, so the subscription always wins; that is
+(for a token with `send_usage_limits`), but only on a success that carries no fresh subscription figures, and on one that carries only cached ones from 75 % of the
+limit; fresh figures always win, below 75 % the cached ones do too. That is
 [§9.6](#96-codex-display-of-the-gateways-own-limits).
 
 **End to end.** Run against Codex CLI 0.137.0 with a memory-mode gateway and a self-hosted stub (always entitled) answering
@@ -4249,7 +4253,7 @@ store I/O.
 **Success (2xx, `/v1/responses`).** `attachCodexPrincipalLimitStanding` (`codex_principal_limit_headers.go`) runs as the last
 header step at the three attach points of §9.5, for the `openai_responses` flavor only: the native passthrough on any 2xx,
 after the relay and the cache attach and before the status line; and on the translate path, through
-`attachTranslatedCodexUsageLimits` (which runs `attachCodexRateLimitWindows` first), the buffered JSON answer and the SSE
+`attachTranslatedCodexUsageLimits` (which runs `attachCodexRateLimitWindows` first, unless the gateway's limit takes over, below), the buffered JSON answer and the SSE
 header block written with the 200. A token without `send_usage_limits` gets nothing. It changes only the client header set, never the upstream set that `recordUsage`, the window
 caches and the vendor usage scrape read. `LimitStanding.Fullest` picks the reading as in §9.4 (highest utilization, ties to
 the later reset, then the fixed order; none when the standing is empty or any reading failed). Nothing is written when it
@@ -4270,19 +4274,51 @@ There is no secondary window, no `x-codex-credits-balance` and no `x-codex-activ
 `daily 62% left` (an hourly limit takes the fallback label `usage`), the `/status` row
 `OP AI Gateway token quota Daily limit: […] 62% left (resets …)`, its warnings at 75, 90 and 95 %, and no popup.
 
-**Precedence with §9.5.** The subscription wins, whole. The gateway writes nothing when, after §9.5's relay or cache attach,
-the client header set already carries any Codex rate-limit header (`hasCodexRateLimitHeader`, over the family of §6): one
-family per response leaves room for only one of the two, and the vendor's figures stay exactly as ADR-108 writes them.
-`retry-after` and `x-should-retry` are not in the family and do not count. This has three consequences:
+**Precedence with §9.5.** Fresh figures win whole; cached ones yield from 75 %. The gateway writes nothing when, after §9.5's
+relay or cache attach, the client header set already carries any Codex rate-limit header (`hasCodexRateLimitHeader`, over the family
+of §6): one family per response leaves room for only one of the two, and fresh vendor figures stay exactly as ADR-108 writes them.
+`retry-after` and `x-should-retry` are not in the family and do not count.
 
-- A principal who also uses an OpenAI subscription sees the gateway's limit only on responses that carry no subscription
-  figure, relayed or cached. While cached windows are still in the future (a weekly window up to 7 days), local-model replies
-  show the subscription and Codex gives no gateway warning; a block still names the gateway's limit.
+The cache attach is conditional. On a `/v1/responses` 2xx for a token with `send_usage_limits`, at the point where §9.5 would attach
+the cached windows (the upstream sent no Codex rate-limit header: a native vendor reply without one, a local-model passthrough, or the
+translate path, JSON or the SSE header block), `codexGatewayLimitTakesOver` decides. It takes the reading the writer above would use
+(`codexPrincipalLimitReading`: `Fullest()`, with a reset after now) and holds when its written percent (`overageUtilizationCents`,
+floored, at most 99) is at least `codexGatewayTakeoverPercent` (75, Codex's first warning step). On a takeover the cached windows are
+not attached, the default family, any further family and the limit names included, and the unchanged standing writer then writes the
+gateway's window alone. One `now` serves the decision and the writer, so they cannot disagree about the reset. Below 75 %, without a
+quota or budget, with a failed reading or a reset not after now there is no takeover and the cached windows attach as in §9.5. The
+decision is on the integer percent that is written: 74.99 % writes 74 and keeps the cache. It does not look at how full the cached
+subscription windows are: a local request does not consume the subscription, and the next vendor reply shows the subscription's fresh
+figures again. Observation is unchanged; vendor responses keep feeding the cache.
+
+| Reply | Gateway below 75 % (or no limit, failed reading) | Gateway at 75 % or more |
+|---|---|---|
+| Vendor reply with fresh figures, entitled caller | vendor figures | vendor figures |
+| Vendor reply, figures withheld (caller not entitled) | gateway window (none without a limit or with a failed reading) | gateway window |
+| Local reply (native passthrough without Codex headers, translate JSON, translate SSE) | cached windows | gateway window, no cached family |
+| Any non-2xx, and a block | as before | as before |
+
+A native vendor 2xx without Codex headers (normal for an API-key account) counts like a local reply. Nothing from the vendor is
+replaced there. No translate reply carries fresh Codex figures, because an OpenAI subscription or API-key target on `openai_responses` always
+uses native passthrough (`vendorAccountTarget`, `vendorSubscriptionOpenAITarget` in `internal/routing/resolver.go`); a
+`/v1/responses` request that translates goes to an Anthropic or OpenAI-compatible vendor account or a local model. This has four consequences:
+
+- A principal who also uses an OpenAI subscription sees the gateway's limit on responses that carry no fresh subscription figure from
+  75 % of its fullest limit; below that the cached windows are shown and Codex gives no gateway warning. A block still names the
+  gateway's limit.
 - A vendor family that the relay withheld from a caller who is not entitled (§6) is not in the client header set, so that
-  caller gets the gateway's limit instead.
-- Codex carries credits over between responses: once a gateway response has set `x-codex-credits-has-credits: true`, a later
-  local-model reply that carries only cached subscription windows also suppresses the subscription's popup, until the next
-  vendor response sends its own credits headers.
+  caller gets the gateway's limit instead, at any utilization.
+- From 75 % the display alternates between the subscription (vendor replies) and the gateway (local replies). The takeover reply has no
+  secondary window, so the subscription's weekly bar leaves the status line and `/status` on local replies and returns with the next
+  vendor reply. Codex keeps one warning step counter per slot (primary, secondary) for the whole chat session, never reset (read in Codex's
+  `RateLimitWarningState`, `codex-rs/tui/src/chatwidget/rate_limits.rs` at tag rust-v0.137.0), shared by
+  whatever figure fills the default family's primary slot. A 75 % warning already taken by the subscription's 5h window therefore
+  means the gateway's first warning comes at 90 %, and the other way round: a gateway warning taken first (at 80 %, say) swallows the
+  subscription's 5h warning at that step. The alternation repeats no warning. In the same file `take_warnings` returns no
+  warning for a snapshot whose primary or secondary window is at 100 %.
+- Codex carries credits over between responses: once a gateway response, a takeover reply included, has set
+  `x-codex-credits-has-credits: true`, a later local-model reply that carries only cached subscription windows also suppresses the
+  subscription's popup, until the next vendor response sends its own credits headers.
 
 **Popup switch (`codex_model_switch_prompt`).** A per-token boolean, default off, effective only together with `send_usage_limits` (without
 it no `x-codex-*` header is written at all). When on, the gateway never writes its own `x-codex-credits-has-credits` or
@@ -4333,7 +4369,7 @@ Deliberately absent: `x-codex-limit-name` (with it Codex prints "Switch to anoth
 `x-codex-active-limit` (the default family is the one Codex reads), `x-codex-rate-limit-reached-type` and any secondary
 window. During a block `/status` therefore labels the row `Daily limit` without the `OP AI Gateway` prefix, and the status
 line shows `daily 0% left`. The 100 % window replaces whatever the display held, so a subscription user sees the gateway's
-0 % until a later success carries the subscription's figures again (relayed or cached).
+0 % until a later success carries other figures: the subscription's, relayed or cached, or the gateway's own window.
 
 What Codex prints, after one request and without a retry (a daily quota, a client in UTC+1):
 `You've hit your usage limit. OP AI Gateway token quota reached; ask your gateway administrator to raise it, or try again at 1:00 AM.`
@@ -4361,6 +4397,14 @@ read `daily 4% left`, no `gpt-5.4-mini` popup opened and the model stayed unchan
 `You've hit your usage limit. OP AI Gateway token quota reached; ask your gateway administrator to raise it, or try again at 1:00 AM.`,
 with the status line at `daily 0% left` and the `/status` row `Daily limit: … 0% left`. This is a documented manual run, as in
 §9.5; the gateway's paths are covered by handler tests.
+
+The takeover from cached windows was run against Codex CLI 0.137.0 and a loopback stub that sent the header sets the gateway
+writes, without a gateway. In one session a subscription 5h window at 80 % with a weekly window at 17 % warned `less than 25% of your
+5h limit left` and showed `5h 20% left · weekly 83% left`. The gateway window at 80 % then showed `daily 20% left` without the weekly
+bar, with the `/status` row `OP AI Gateway token quota Daily limit: … 20% left` and no new 75 % warning. The subscription again
+restored `5h 20% left · weekly 83% left` without a warning, and the gateway at 91 % warned `less than 10% of your daily limit left`
+with `daily 9% left` and no `gpt-5.4-mini` popup. As in §9.5, the cached path itself is not end to end testable (the cache is filled
+only from an OpenAI vendor provider, whose ChatGPT backend URL is fixed); handler tests cover it.
 
 **Dependency.** The display and the block sentence rely on undocumented Codex behavior: one family per response with the last
 one winning, the default family as the only one with a status line and warnings, the window-minute labels, the credits flag's
