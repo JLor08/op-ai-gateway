@@ -4307,10 +4307,11 @@ passthrough. This has four consequences:
   caller gets the gateway's limit instead, at any utilization.
 - From 75 % the display alternates between the subscription (vendor replies) and the gateway (local replies). The takeover reply has no
   secondary window, so the subscription's weekly bar leaves the status line and `/status` on local replies and returns with the next
-  vendor reply. Codex keeps one warning step counter per slot (primary, secondary) for the whole chat session, never reset, shared by
+  vendor reply. Codex keeps one warning step counter per slot (primary, secondary) for the whole chat session, never reset (read in Codex's
+  `RateLimitWarningState`, `codex-rs/tui/src/chatwidget/rate_limits.rs` at tag rust-v0.137.0), shared by
   whatever figure fills the default family's primary slot. A 75 % warning already taken by the subscription's 5h window therefore
-  means the gateway's first warning comes at 90 %, and the alternation repeats no warning. A snapshot with a window at 100 % yields no
-  warning.
+  means the gateway's first warning comes at 90 %, and the alternation repeats no warning. In the same file `take_warnings` returns no
+  warning for a snapshot whose primary or secondary window is at 100 %.
 - Codex carries credits over between responses: once a gateway response, a takeover reply included, has set
   `x-codex-credits-has-credits: true`, a later local-model reply that carries only cached subscription windows also suppresses the
   subscription's popup, until the next vendor response sends its own credits headers.

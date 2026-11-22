@@ -90,8 +90,9 @@ paths:
         passthrough to an upstream that speaks the Responses API before
         falling back to translation. Alias: /openai/v1/responses.
         A principal with a quota or budget gets its fullest limit in the
-        default `x-codex-*` headers of a success that carries no
-        subscription figures. Every x-codex-* usage header (relayed, cached
+        default `x-codex-*` headers of a success that carries no fresh
+        subscription figures, and from 75 % of that limit instead of cached
+        ones. Every x-codex-* usage header (relayed, cached
         or the gateway's own) goes out only for a token with
         send_usage_limits; without it only Retry-After and X-Should-Retry
         pass, and a block keeps x-codex-promo-message.
