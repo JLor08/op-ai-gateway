@@ -647,7 +647,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-111-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -703,7 +703,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-111-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -872,7 +872,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-111-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1083,7 +1083,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-111-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1298,7 +1298,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-111-migrations),
+[§4](reference/data-model.md#4-migration-history-112-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1524,7 +1524,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-111-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-112-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1671,7 +1671,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-111-migrations),
+[§4](reference/data-model.md#4-migration-history-112-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3642,7 +3642,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-111-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-112-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3866,7 +3866,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-111-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-112-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4898,7 +4898,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-111-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5024,7 +5024,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-111-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5167,7 +5167,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-111-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-112-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7681,7 +7681,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-111-migrations),
+[Data Model](reference/data-model.md#4-migration-history-112-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7904,7 +7904,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-111-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-112-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8045,7 +8045,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-111-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-112-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8309,7 +8309,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-111-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-112-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -12165,7 +12165,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-111-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-112-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -13010,6 +13010,8 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
 - **Showing the gateway's own principal limits in the same change.** Done separately: they reach Claude Code as the overage window, see [ADR-107](#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
 - **Forwarding Codex `x-codex-*` headers.** Rejected here; not part of this change. Done separately for the Responses flavor, see [ADR-108](#adr-108--codex-shows-an-openai-subscriptions-usage-limits-through-an-allowlisted-x-codex-relay-and-a-per-principal-window-cache).
 
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a per-token switch for every usage signal).** The relay, the cached windows and the shape's effect are no longer unconditional: a token needs `send_usage_limits` (default off; migration 112 set it on for tokens that already had the Claude Code token format) besides the JWT-shaped secret. Without it the unified headers are neither relayed, cached nor attached, and `retry-after` and `x-should-retry` still reach the client.
+
 **Consequences and limits.**
 
 - Claude Code's Desktop usage card and the `/usage` plan panel stay unreachable for any gateway. The gateway's own principal limits reach
@@ -13061,6 +13063,8 @@ line's spend-limit field and the `/usage` bar exist only in a gateway sign-in se
 - **Changing the other endpoints' bodies or statuses**, and the contract's pool and fail-closed variants (there are no shared pools, and the
   limiter fails open).
 
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (the overage window and the block headers are opt-in).** The overage window of a success and the unified headers of the block are written only for a token with `send_usage_limits`. Without it the block keeps the 429, `Retry-After`, `X-Should-Retry: false` and the same `billing_error` body.
+
 **Consequences and limits.**
 
 - The client takes its warning from the first window with a surpassed threshold in the order `5h`, `7d`, `7d_oi`, `overage`: while a
@@ -13111,6 +13115,8 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
 - **Relaying `x-codex-turn-state`.** It is not a limit figure, and no effect of dropping it was observed.
 - **Showing the gateway's own principal limits in Codex in the same change.** Done separately, in the default family rather than as an extra
   family, see [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
+
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a token opt-in now exists).** The "A token opt-in" rejection above no longer holds: since #420 the `x-codex-*` family is relayed, cached and attached only for a token with `send_usage_limits`. The reason it was rejected, that Codex needs no token shape, is unchanged; the opt-in is a deliberate privacy choice, not a client requirement. The popup note under Consequences changed too: a token with `codex_model_switch_prompt` lets Codex show the nudge.
 
 **Consequences and limits.**
 
@@ -13176,6 +13182,8 @@ neither `retry-after` nor `x-should-retry`.
 - **Keeping `writeLimitDenied` on this endpoint.** Codex names no limit and no reset for its quota 429, retries its budget 402, and reads
   no `X-Should-Retry` that could stop that.
 
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (opt-in and the popup switch).** The standing on a success and the window of the block need `send_usage_limits`; without it the block keeps only the 429, `Retry-After`, `X-Should-Retry: false`, the same body and `x-codex-promo-message`. With `codex_model_switch_prompt` the gateway no longer writes its own credits flag, which this ADR used to suppress the popup.
+
 **Consequences and limits.**
 
 - A principal who also uses an OpenAI subscription sees the gateway's limit only on responses that carry no subscription figure, relayed
@@ -13194,3 +13202,64 @@ neither `retry-after` nor `x-should-retry`.
   [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
 - → [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
   [the limiter](cross-cutting/telemetry-usage-observability.md).
+
+## ADR-110 — Usage-limit signals leave the gateway only for tokens that opt in, and what stops a retry survives without it
+
+**Context.** After ADR-106 to ADR-109 (#407, #413, #416, #418) every principal's responses told coding clients about usage limits: a vendor
+subscription's windows (`anthropic-ratelimit-unified-*`, `x-codex-*`), cached copies of them, and the gateway's own quota and budget
+standing. There was no token setting for it, and ADR-108 had rejected one. The owner wants it to be a deliberate per-token choice: a token
+sends nothing about usage unless its owner switched it on, except what stops a client from retrying uselessly once nothing is left. Second,
+the gateway always suppressed the Codex CLI's `Switch to gpt-5.4-mini` popup through the credits flag, which someone who only works with a
+Codex subscription may want (issue #420).
+
+**Decision.**
+
+- **Two per-token switches, both default off, on user tokens and service tokens.** `send_usage_limits` and `codex_model_switch_prompt`
+  (`api_tokens` columns, migration 112). User tokens set them on create and PATCH and read them back; they are ungated and need no rotation.
+  Service tokens set them on create and read them back; editing one is follow-up issue #421, so until then turning a switch on for a service
+  token means recreating it, and every existing service token is off after the upgrade.
+- **With `send_usage_limits` off, no usage-limit header reaches the client on any path.** That is no `anthropic-ratelimit-unified-*` and no
+  `x-codex-*` header, on the native relay (vendor credits headers included), the cached-window attach, the translate path (buffered and SSE),
+  the gateway's own standing on a success, and the blocks. The window caches neither observe nor attach for that token. With it on,
+  behavior is as before, and the vendor-account entitlement still applies on top for vendor figures.
+- **What survives without the opt-in:** the status codes, `Retry-After`, `X-Should-Retry`, and the `billing_error` and `usage_limit_reached`
+  bodies including the sentence and `resets_at`. These stop the retry, verified on the clients: Claude Code stops on `X-Should-Retry: false`;
+  Codex 0.137.0 never retries a 429 `usage_limit_reached`, ignores the retry headers, and retries a 402 five times (so the Codex block
+  stays a 429).
+- **The one exception, `X-Codex-Promo-Message` on the Codex block.** Codex 0.137.0 prints only its own `You've hit your usage limit` line plus
+  that header and never the body's `message`; without it a gateway block would read like a ChatGPT plan limit. The header carries no figure,
+  only that it is the gateway's quota and whom to ask.
+- **`codex_model_switch_prompt` is effective only together with `send_usage_limits`.** When on, the gateway never writes its own
+  `X-Codex-Credits-Has-Credits` or `X-Codex-Credits-Unlimited`, on the success standing or the block, so Codex shows the popup at 90 % of its
+  default window. The vendor's relayed credits headers are untouched.
+- **Two switches, not one.** The existing `claude_code_usage_display` option only shapes the secret (the "Claude Code token format") and
+  changes only through rotation, because a secret's shape cannot change in place. Merging it with a live switch would make a toggle
+  rotate a credential. Claude Code needs both the format and `send_usage_limits`; Codex needs only the switch.
+- **Backfill.** Migration 112 sets `send_usage_limits = 1` for user tokens with `claude_code_usage_display = 1`, so a token that already
+  showed the limits in Claude Code keeps doing so. Every other token starts off, and so does every `codex_model_switch_prompt`.
+
+**Unchanged:** capture redaction (entitlement-based), `writeLimitDenied`, the verbatim relay of vendor error bodies, status codes and error
+types of blocks, and the ServerAgent.
+
+**Rejected:**
+
+- **One switch that also shapes the secret.** See above: a toggle would have to rotate the token.
+- **Dropping `Retry-After` and `X-Should-Retry` with the figures.** They carry no usage figure and are what keeps Claude Code and the SDKs from
+  retrying into a block.
+- **Dropping `X-Codex-Promo-Message` with the rest.** A block would then read as a ChatGPT plan limit.
+- **A service-token update route in the same change.** Service tokens have no field-level update today; #421.
+- **Gating by entitlement only.** Entitlement says who may see a vendor account's figures, not whether a token's owner wants a client to
+  display them.
+
+**Consequences and limits.**
+
+- Codex carries credits over between responses: with `codex_model_switch_prompt` on, the popup also appears while the default window shows the
+  gateway's own limit, because with the switch the gateway sets no credits flag, so none carries over from its responses. A session that already received one from
+  the gateway before the switch was turned on keeps it until it restarts.
+- A token with `send_usage_limits` off observes nothing into the window caches, but a vendor response on it still purges a revoked entry of
+  its principal from that account (`Forget`), after an entitlement check that only runs when such an entry exists. An opted-in sibling token
+  therefore never keeps frozen windows beyond the observe-time limitation of ADR-106.
+- Service tokens cannot change a switch until #421; recreate the token.
+- → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
+  [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
+  [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).

@@ -282,8 +282,8 @@ func TestCodexCacheCapAndForget(t *testing.T) {
 func TestObserveCodexRateLimitWindowsGatesOnEntitlement(t *testing.T) {
 	now := time.Now()
 	s := &Server{codexRateLimitWindows: newRateLimitWindowCache(10)}
-	owner := auth.Token{ID: "tok_o", UserID: "usr_o", Active: true}
-	member := auth.Token{ID: "tok_m", UserID: "usr_m", Active: true}
+	owner := auth.Token{ID: "tok_o", UserID: "usr_o", Active: true, SendUsageLimits: true}
+	member := auth.Token{ID: "tok_m", UserID: "usr_m", Active: true, SendUsageLimits: true}
 	target := routing.Target{Provider: routing.ProviderVendorOpenAI, VendorAccountID: "acct1", VendorAccountOwnerUserID: "usr_o"}
 	h := codexWindowHeaders(now, time.Hour, 24*time.Hour)
 

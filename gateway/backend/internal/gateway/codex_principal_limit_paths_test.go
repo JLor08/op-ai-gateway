@@ -106,7 +106,7 @@ func TestCodexStandingForNonEntitledVendorCaller(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SetVendorAccountModels: %v", err)
 	}
-	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_cs_member", UserID: "usr_va_b", Active: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
+	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_cs_member", UserID: "usr_va_b", Active: true, SendUsageLimits: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
 	cprov := &codexWindowsProvider{windowsProvider: windowsProvider{localStatus: http.StatusOK}, vendorStatus: http.StatusOK, vendorHdr: codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour)}
 	srv.Provider = cprov
 	p := Principal{Type: routing.PrincipalTypeUser, ID: "usr_va_b"}

@@ -485,7 +485,7 @@ const (
 func blockTestServer(t *testing.T, cfg routing.LimitConfig, requests, tokens int64, cost float64) (*Server, *usage.Recorder) {
 	t.Helper()
 	srv, tokenStore, recorder := newServiceScopeTestServer(t)
-	addServiceToken(tokenStore, "svc-secret", auth.Token{ID: "tok_svc", ServiceID: "svc_1", ServiceName: "Svc"})
+	addServiceToken(tokenStore, "svc-secret", auth.Token{ID: "tok_svc", ServiceID: "svc_1", ServiceName: "Svc", SendUsageLimits: true})
 	store := newFakePrincipalStore()
 	p := Principal{Type: routing.PrincipalTypeService, ID: "svc_1"}
 	store.setConfig(p, cfg)

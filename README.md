@@ -55,7 +55,7 @@ servers, models, launch specifications, users, and policies in a bilingual
   gateway can also offer Claude-compatible alias names for local models and
   pass Claude Code's effort setting on to llama.cpp and vLLM, and show a
   vendor subscription's usage limits in Claude Code (opt-in token format)
-  and in Codex (no token option needed).
+  and in Codex, each only for tokens that switch on `send_usage_limits`.
 
 **Portal chat**
 

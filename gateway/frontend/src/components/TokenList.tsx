@@ -176,6 +176,10 @@ export function TokenList({
   // /v1/systemone report a 0..1 confidence whatever the model's own scale is.
   const [decisionsNormalize, setDecisionsNormalize] = useState(false);
   const [claudeCodeUsage, setClaudeCodeUsage] = useState(false);
+  // Usage-limit opt-ins (#420). The Codex switch prompt only takes effect with
+  // the first switch, so it is forced off whenever that one is off.
+  const [sendUsageLimits, setSendUsageLimits] = useState(false);
+  const [codexSwitchPrompt, setCodexSwitchPrompt] = useState(false);
   const [logCommunication, setLogCommunication] = useState(false);
   const [secret, setSecret] = useState(false);
   // Project attribution (spec: 2026-08-08-projects-design.md §6): "" = no project.
@@ -302,6 +306,8 @@ export function TokenList({
     setClaudeEffort(false);
     setDecisionsNormalize(false);
     setClaudeCodeUsage(false);
+    setSendUsageLimits(false);
+    setCodexSwitchPrompt(false);
     setLogCommunication(false);
     setSecret(false);
     setProjectId('');
@@ -339,6 +345,8 @@ export function TokenList({
     setClaudeEffort(row.claude_effort_compatibility ?? false);
     setDecisionsNormalize(row.decisions_confidence_normalize ?? false);
     setClaudeCodeUsage(row.claude_code_usage_display);
+    setSendUsageLimits(row.send_usage_limits);
+    setCodexSwitchPrompt(row.send_usage_limits && row.codex_model_switch_prompt);
     setLogCommunication(row.log_communication);
     setSecret(row.secret);
     setProjectId(row.project_id ?? '');
@@ -392,6 +400,8 @@ export function TokenList({
         claude_effort_compatibility: claudeEffort,
         decisions_confidence_normalize: decisionsNormalize,
         claude_code_usage_display: claudeCodeUsage,
+        send_usage_limits: sendUsageLimits,
+        codex_model_switch_prompt: sendUsageLimits && codexSwitchPrompt,
         log_communication: logCommunication,
         secret,
         project_id: projectId,
@@ -427,6 +437,8 @@ export function TokenList({
       body.claude_model_aliases = claudeAliases;
       body.claude_effort_compatibility = claudeEffort;
       body.decisions_confidence_normalize = decisionsNormalize;
+      body.send_usage_limits = sendUsageLimits;
+      body.codex_model_switch_prompt = sendUsageLimits && codexSwitchPrompt;
       body.log_communication = logCommunication;
       body.secret = secret;
       body.project_id = projectId;
@@ -510,10 +522,15 @@ export function TokenList({
       value: (r) => r.name,
       filter: 'text',
       render: (r) =>
-        r.claude_code_usage_display ? (
+        r.claude_code_usage_display || r.send_usage_limits ? (
           <Box sx={{ display: 'inline-flex', alignItems: 'center', gap: 1 }}>
             {r.name}
-            <Chip size="small" variant="outlined" label={t.tokenClaudeCodeBadge} />
+            {r.claude_code_usage_display && (
+              <Chip size="small" variant="outlined" label={t.tokenClaudeCodeBadge} />
+            )}
+            {r.send_usage_limits && (
+              <Chip size="small" variant="outlined" label={t.tokenUsageLimitsBadge} />
+            )}
           </Box>
         ) : (
           r.name
@@ -833,7 +850,12 @@ export function TokenList({
                 control={
                   <Checkbox
                     checked={claudeCodeUsage}
-                    onChange={(e) => setClaudeCodeUsage(e.target.checked)}
+                    onChange={(e) => {
+                      setClaudeCodeUsage(e.target.checked);
+                      // Creating a Claude Code-format token almost always means
+                      // wanting its limits; the user can untick it again.
+                      if (mode === 'create' && e.target.checked) setSendUsageLimits(true);
+                    }}
                   />
                 }
                 label={t.tokenClaudeCodeUsageDisplay}
@@ -844,6 +866,38 @@ export function TokenList({
               {mode !== 'create' && claudeCodeUsage !== mode.edit.claude_code_usage_display && (
                 <Alert severity="warning">{t.tokenClaudeCodeUsageRotateWarning}</Alert>
               )}
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={sendUsageLimits}
+                    onChange={(e) => {
+                      setSendUsageLimits(e.target.checked);
+                      if (!e.target.checked) setCodexSwitchPrompt(false);
+                    }}
+                  />
+                }
+                label={t.tokenSendUsageLimits}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenSendUsageLimitsHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={codexSwitchPrompt}
+                    disabled={!sendUsageLimits}
+                    onChange={(e) => setCodexSwitchPrompt(e.target.checked)}
+                  />
+                }
+                label={t.tokenCodexModelSwitchPrompt}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenCodexModelSwitchPromptHint}
+              </Typography>
             </Box>
             {/* The vendor-access section is hidden entirely while the vendor-accounts
                 master flag is off. Account names are vendor/owner-supplied text:

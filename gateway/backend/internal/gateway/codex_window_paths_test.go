@@ -102,7 +102,11 @@ func newCodexWindowsFixture(t *testing.T, localResponsesMode routing.EndpointMod
 		}
 	}
 	enableVendorAccountsFlag(t, srv)
-	return &codexWindowsFixture{windowsFixture: &windowsFixture{srv: srv, prov: &cprov.windowsProvider}, cprov: cprov, routes: routes}
+	f := &codexWindowsFixture{windowsFixture: &windowsFixture{srv: srv, prov: &cprov.windowsProvider}, cprov: cprov, routes: routes}
+	// The owner's token opts into usage-limit signals (#420), as the scenarios of
+	// this file assume; usage_limit_optin_codex_test.go flips it off.
+	f.setSendUsageLimits(t, true)
+	return f
 }
 
 func (f *codexWindowsFixture) observeViaVendor(t *testing.T, secret string) {
@@ -129,9 +133,9 @@ func requireCodexWindowsAttached(t *testing.T, rec *httptest.ResponseRecorder, w
 
 func requireNoCodex(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
-	for k := range rec.Header() {
+	for k := range rec.Result().Header {
 		if strings.HasPrefix(strings.ToLower(k), codexRateLimitPrefix) {
-			t.Fatalf("unexpected Codex header %s: %v", k, rec.Header())
+			t.Fatalf("unexpected Codex header %s: %v", k, rec.Result().Header)
 		}
 	}
 }
@@ -146,6 +150,9 @@ func TestCodexWindowsObservedFromVendorThenAttachedOnLocalPassthrough(t *testing
 	}
 	requireCodexWindowsAttached(t, rec, "42.5")
 
+	// The other principal opts in too, so the empty answer proves the per-principal
+	// keying of the cache and not the switch gate.
+	f.setSendUsageLimitsFor(t, vaOtherSecret, true)
 	other := f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, false)
 	if other.Code != http.StatusOK {
 		t.Fatalf("other principal status = %d, body = %s", other.Code, other.Body.String())
@@ -166,6 +173,7 @@ func TestCodexWindowsAttachedOnTranslateStreamAndBuffered(t *testing.T) {
 			}
 			requireCodexWindowsAttached(t, rec, "42.5")
 
+			f.setSendUsageLimitsFor(t, vaOtherSecret, true) // isolation, not the switch gate, must explain the absence
 			requireNoCodex(t, f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, stream))
 		})
 	}
@@ -224,7 +232,7 @@ func TestCodexWindowsNotObservedForNonEntitledAndForgottenOnRevocation(t *testin
 	if err := mf.routes.UpdateApplication(context.Background(), app); err != nil {
 		t.Fatalf("UpdateApplication: %v", err)
 	}
-	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_cw_member", UserID: "usr_va_b", Active: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
+	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_cw_member", UserID: "usr_va_b", Active: true, SendUsageLimits: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
 	cprov := &codexWindowsProvider{windowsProvider: windowsProvider{localStatus: http.StatusOK}, vendorStatus: http.StatusOK, vendorHdr: codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour)}
 	srv.Provider = cprov
 	f := &windowsFixture{srv: srv, prov: &cprov.windowsProvider}
@@ -288,7 +296,7 @@ func TestCodexWindowsObservedFrom429(t *testing.T) {
 func TestCodexWindowsNeedAPrincipal(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
 	target := routing.Target{Provider: routing.ProviderVendorOpenAISubscription}
-	f.srv.observeCodexRateLimitWindows(auth.Token{ID: "t"}, target, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
+	f.srv.observeCodexRateLimitWindows(auth.Token{ID: "t", SendUsageLimits: true}, target, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
 	if n := len(f.srv.codexRateLimitWindows.entries); n != 0 {
 		t.Fatalf("a token without a principal cached %d entries", n)
 	}
@@ -297,7 +305,7 @@ func TestCodexWindowsNeedAPrincipal(t *testing.T) {
 func TestMessagesGetNoCodexWindowsAndResponsesGetNoUnified(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
 	f.observeViaVendor(t, vaOwnerSecret)
-	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true}
+	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true, SendUsageLimits: true}
 	anthropic := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: "acc_anthropic", VendorAccountOwnerUserID: "usr_va_a"}
 	f.srv.observeRateLimitWindows(owner, anthropic, subscriptionWindowHeaders())
 

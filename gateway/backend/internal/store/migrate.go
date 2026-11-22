@@ -144,6 +144,7 @@ var migrations = []migration{
 	{version: 109, name: "runtime_spec_execution_mode", up: migration109Up},
 	{version: 110, name: "vendor_account_share_usage", up: migration110Up},
 	{version: 111, name: "token_claude_code_usage_display", up: migration111Up},
+	{version: 112, name: "token_usage_limit_switches", up: migration112Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4835,4 +4836,29 @@ func migration110Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // addColumnIfMissing keeps it re-runnable.
 func migration111Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_code_usage_display integer not null default 0")
+}
+
+// migration112Up adds the two opt-in api_tokens switches that decide whether a
+// coding client sees the gateway's usage-limit signals (#420):
+// send_usage_limits (the rate-limit headers) and codex_model_switch_prompt
+// (the Codex CLI's model-switch popup). Both are `integer not null default 0`
+// on both dialects. send_usage_limits is backfilled from
+// claude_code_usage_display, so a token that already shows the limits in
+// Claude Code keeps showing them after the upgrade; every other token, and
+// every codex_model_switch_prompt, lands on 0 = off. The backfill is
+// idempotent: it only raises a 0 to 1 where the display flag is set.
+// addColumnIfMissing keeps the step re-runnable.
+func migration112Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"send_usage_limits integer not null default 0",
+		"codex_model_switch_prompt integer not null default 0",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "api_tokens", col); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "update api_tokens set send_usage_limits = 1 where claude_code_usage_display = 1"); err != nil {
+		return fmt.Errorf("backfill api_tokens.send_usage_limits: %w", err)
+	}
+	return nil
 }

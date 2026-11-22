@@ -87,6 +87,12 @@ type Token struct {
 	// recomputing `confidence` on /v1/decisions answers — see
 	// store.TokenRecord.
 	DecisionsConfidenceNormalize bool
+	// SendUsageLimits mirrors the token record's opt-in for sending the
+	// gateway's usage-limit headers to the client — see store.TokenRecord.
+	SendUsageLimits bool
+	// CodexModelSwitchPrompt mirrors the token record's opt-in for the Codex
+	// CLI's model-switch popup — see store.TokenRecord.
+	CodexModelSwitchPrompt bool
 }
 
 // IsService reports whether t is a service token (Kind=="service") — the

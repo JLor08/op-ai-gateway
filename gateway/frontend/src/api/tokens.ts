@@ -96,6 +96,12 @@ export type PortalToken = {
   // Claude Code reads the gateway's rate-limit headers and shows the plan's
   // usage limits. Always emitted by the server on every token read.
   claude_code_usage_display: boolean;
+  // Usage-limit opt-ins (#420): the gateway sends its rate-limit headers to
+  // the coding client only for a token with send_usage_limits; the Codex
+  // switch-prompt flag is meaningful only together with it. Both are always
+  // emitted by the server on every token read, and neither rotates the token.
+  send_usage_limits: boolean;
+  codex_model_switch_prompt: boolean;
   log_communication: boolean;
   secret: boolean;
   is_chat_session: boolean;
@@ -136,6 +142,9 @@ export type CreateTokenRequest = {
   // Claude Code usage display (see PortalToken); omitted = off. Fixes the
   // secret's shape, so it changes only through rotation.
   claude_code_usage_display?: boolean;
+  // Usage-limit switches (see PortalToken); omitted = off.
+  send_usage_limits?: boolean;
+  codex_model_switch_prompt?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // Optional project attribution (§6); "" = no project. Membership-checked
@@ -174,6 +183,9 @@ export type UpdateTokenRequest = {
   // Decision-confidence normalization (see PortalToken). Omitted = keep the
   // current value.
   decisions_confidence_normalize?: boolean;
+  // Usage-limit switches (see PortalToken). Omitted = keep the current value.
+  send_usage_limits?: boolean;
+  codex_model_switch_prompt?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // nil (omitted) = keep the current project attribution; "" = clear it;

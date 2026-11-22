@@ -82,7 +82,11 @@ func newWindowsFixture(t *testing.T, localMode routing.EndpointMode) *windowsFix
 	})
 	seedWindowsLocalModel(t, routes, localMode)
 	enableVendorAccountsFlag(t, srv)
-	return &windowsFixture{srv: srv, prov: prov}
+	f := &windowsFixture{srv: srv, prov: prov}
+	// The owner's token opts into usage-limit signals (#420), as the scenarios of
+	// this file assume; usage_limit_optin_messages_test.go flips it off.
+	f.setSendUsageLimits(t, true)
+	return f
 }
 
 func seedWindowsLocalModel(t *testing.T, routes *routing.MemoryStore, mode routing.EndpointMode) {
@@ -150,9 +154,9 @@ func requireWindowsAttached(t *testing.T, rec *httptest.ResponseRecorder) {
 
 func requireNoUnified(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
-	for k := range rec.Header() {
+	for k := range rec.Result().Header {
 		if strings.HasPrefix(strings.ToLower(k), rlp) {
-			t.Fatalf("unexpected unified header %s: %v", k, rec.Header())
+			t.Fatalf("unexpected unified header %s: %v", k, rec.Result().Header)
 		}
 	}
 }
@@ -167,6 +171,9 @@ func TestWindowsObservedFromVendorThenAttachedOnLocalPassthrough(t *testing.T) {
 	}
 	requireWindowsAttached(t, rec)
 
+	// The other principal opts in too, so the empty answer proves the per-principal
+	// keying of the cache and not the switch gate.
+	f.setSendUsageLimitsFor(t, vaOtherSecret, true)
 	other := f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, false)
 	if other.Code != http.StatusOK {
 		t.Fatalf("other principal status = %d, body = %s", other.Code, other.Body.String())
@@ -187,6 +194,7 @@ func TestWindowsAttachedOnTranslateStreamAndBuffered(t *testing.T) {
 			}
 			requireWindowsAttached(t, rec)
 
+			f.setSendUsageLimitsFor(t, vaOtherSecret, true) // isolation, not the switch gate, must explain the absence
 			requireNoUnified(t, f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, stream))
 		})
 	}
@@ -230,7 +238,8 @@ func TestWindowsNotObservedForNonEntitled(t *testing.T) {
 	f := newWindowsFixture(t, routing.EndpointModePassthrough)
 	deny := &usageManagerPortal{API: f.srv.Portal, ok: false}
 	f.srv.Portal = deny
-	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
+	f.setSendUsageLimitsFor(t, vaOtherSecret, true)
+	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true, SendUsageLimits: true}
 	target := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a"}
 
 	f.srv.observeRateLimitWindows(member, target, subscriptionWindowHeaders())
@@ -245,7 +254,7 @@ func TestWindowsNotObservedForNonEntitled(t *testing.T) {
 	requireNoUnified(t, rec)
 
 	// Control: the same call for an entitled caller (the owner) is recorded.
-	f.srv.observeRateLimitWindows(auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true}, target, subscriptionWindowHeaders())
+	f.srv.observeRateLimitWindows(auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true, SendUsageLimits: true}, target, subscriptionWindowHeaders())
 	requireWindowsAttached(t, f.post(t, vaOwnerSecret, "/v1/messages", windowsLocalModel, false))
 }
 
@@ -265,11 +274,12 @@ func TestChatCompletionsGetNoWindows(t *testing.T) {
 // vendor response they receive without entitlement drops the entry that account made.
 func TestWindowsForgottenWhenEntitlementRevoked(t *testing.T) {
 	f := newWindowsFixture(t, routing.EndpointModePassthrough)
-	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
+	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true, SendUsageLimits: true}
 	shared := routing.Target{Provider: routing.ProviderVendorAnthropic, VendorAccountID: subMessagesAccountID, VendorAccountOwnerUserID: "usr_va_a", VendorShareUsageWithMembers: true}
 	revoked := shared
 	revoked.VendorShareUsageWithMembers = false
 	f.srv.Portal = &usageManagerPortal{API: f.srv.Portal, ok: false}
+	f.setSendUsageLimitsFor(t, vaOtherSecret, true)
 
 	f.srv.observeRateLimitWindows(member, shared, subscriptionWindowHeaders())
 	requireWindowsAttached(t, f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, false))
@@ -295,7 +305,7 @@ func TestCapturedAccountHeadersRedactedForNonEntitled(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	ctx := context.Background()
 
-	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
+	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true, SendUsageLimits: true}
 	got := f.srv.redactCapturedAccountHeaders(ctx, member, target, h)
 	if hasUnifiedRateLimitHeader(got) || got.Get("Anthropic-Organization-Id") != "" {
 		t.Fatalf("non-entitled capture kept account headers: %v", got)
@@ -307,7 +317,7 @@ func TestCapturedAccountHeadersRedactedForNonEntitled(t *testing.T) {
 		t.Fatal("the shared sink header set was mutated")
 	}
 
-	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true}
+	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true, SendUsageLimits: true}
 	if got := f.srv.redactCapturedAccountHeaders(ctx, owner, target, h); !hasUnifiedRateLimitHeader(got) || got.Get("Anthropic-Organization-Id") != "org-secret" {
 		t.Fatalf("entitled owner lost headers: %v", got)
 	}
@@ -330,7 +340,7 @@ func TestCapturedCodexHeadersRedactedForNonEntitled(t *testing.T) {
 	h.Set("Content-Type", "application/json")
 	ctx := context.Background()
 
-	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true}
+	member := auth.Token{ID: "tok_va_b", UserID: "usr_va_b", Active: true, SendUsageLimits: true}
 	got := f.srv.redactCapturedAccountHeaders(ctx, member, target, h)
 	if hasCodexRateLimitHeader(got) {
 		t.Fatalf("non-entitled capture kept the Codex family: %v", got)
@@ -342,7 +352,7 @@ func TestCapturedCodexHeadersRedactedForNonEntitled(t *testing.T) {
 		t.Fatalf("the shared sink header set was mutated: %v", h)
 	}
 
-	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true}
+	owner := auth.Token{ID: "tok_va_a", UserID: "usr_va_a", Active: true, SendUsageLimits: true}
 	if got := f.srv.redactCapturedAccountHeaders(ctx, owner, target, h); len(got) != 4 {
 		t.Fatalf("entitled owner lost headers: %v", got)
 	}

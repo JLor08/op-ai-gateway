@@ -93,25 +93,31 @@ func limitRetryAfterSeconds(reset, now time.Time) int {
 }
 
 // writeLimitBlocked answers a quota or budget denial on the Anthropic Messages
-// flavor (design spec §6): 429 with a billing_error body and the unified headers
-// that make Claude Code print r's sentence. representative-claim and overage-status
-// stay absent on purpose: with them the client composes its own line and drops ours.
-// X-Should-Retry false stops the client's retry loop; Retry-After is the seconds
-// until the reset, rounded up, at least 1.
-func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time) {
+// flavor (design spec §6): 429 with a billing_error body. With a JWT-shaped token
+// Claude Code prints the body's sentence verbatim, with an opaque token as
+// "API Error: Request rejected (429) · <message>" (ADR-107). Either way the retries
+// stop, through X-Should-Retry false; Retry-After is the seconds until the reset,
+// rounded up, at least 1. Those two headers and the body are unconditional. The
+// unified headers are written only with sendUsage (the token's send_usage_limits
+// opt-in, #420); they carry status rejected and the reset; representative-claim and
+// overage-status stay absent on purpose: with them the client composes its own line
+// and drops ours.
+func writeLimitBlocked(w http.ResponseWriter, r LimitReading, now time.Time, sendUsage bool) {
 	reset := strconv.FormatInt(r.Reset.Unix(), 10)
 	h := w.Header()
 	h.Set("Retry-After", strconv.Itoa(limitRetryAfterSeconds(r.Reset, now)))
 	h.Set("X-Should-Retry", "false")
-	h.Set(unifiedRateLimitPrefix+unifiedStatus, "rejected")
-	h.Set(unifiedRateLimitPrefix+unifiedReset, reset)
-	h.Set(unifiedRateLimitPrefix+unifiedOverageReset, reset)
-	h.Set(unifiedRateLimitPrefix+unifiedOverageUtilization, "1")
-	h.Set(unifiedRateLimitPrefix+unifiedOverageSurpassedThreshold, "1")
-	if period := limitBlockedPeriod(r.Period); period != "" {
-		h.Set(unifiedRateLimitPrefix+"overage-period", period)
+	if sendUsage {
+		h.Set(unifiedRateLimitPrefix+unifiedStatus, "rejected")
+		h.Set(unifiedRateLimitPrefix+unifiedReset, reset)
+		h.Set(unifiedRateLimitPrefix+unifiedOverageReset, reset)
+		h.Set(unifiedRateLimitPrefix+unifiedOverageUtilization, "1")
+		h.Set(unifiedRateLimitPrefix+unifiedOverageSurpassedThreshold, "1")
+		if period := limitBlockedPeriod(r.Period); period != "" {
+			h.Set(unifiedRateLimitPrefix+"overage-period", period)
+		}
+		h.Set(unifiedRateLimitPrefix+"overage-disabled-reason", "org_spend_cap_reached")
 	}
-	h.Set(unifiedRateLimitPrefix+"overage-disabled-reason", "org_spend_cap_reached")
 	writeJSON(w, http.StatusTooManyRequests, limitBlockedBody{
 		Type: "error",
 		Error: limitBlockedError{
@@ -253,8 +259,12 @@ func attachPrincipalLimitStanding(ctx context.Context, dst http.Header) {
 
 // attachTranslatedUsageLimits is the last header step of a translated /v1/messages
 // success: #407's cached subscription windows, then the principal's limit standing
-// from the request context.
+// from the request context. It writes nothing for a token without send_usage_limits
+// (#420).
 func (s *Server) attachTranslatedUsageLimits(r *http.Request, token auth.Token, dst http.Header) {
+	if !token.SendUsageLimits {
+		return
+	}
 	s.attachRateLimitWindows(token, dst)
 	attachPrincipalLimitStanding(r.Context(), dst)
 }

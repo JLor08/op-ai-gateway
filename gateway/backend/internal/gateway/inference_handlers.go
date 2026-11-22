@@ -455,10 +455,10 @@ func (s *Server) admitPrincipal(w http.ResponseWriter, r *http.Request, token au
 		if reading, ok := a.Standing.Blocking(LimitKind(a.Reason)); ok {
 			switch apiFlavor {
 			case inference.APIFlavorAnthropicMessages:
-				writeLimitBlocked(w, reading, a.At)
+				writeLimitBlocked(w, reading, a.At, token.SendUsageLimits)
 				return nil, true
 			case inference.APIFlavorOpenAIResponses:
-				writeCodexLimitBlocked(w, reading, a.At)
+				writeCodexLimitBlocked(w, reading, a.At, token.SendUsageLimits, token.CodexModelSwitchPrompt)
 				return nil, true
 			}
 		}

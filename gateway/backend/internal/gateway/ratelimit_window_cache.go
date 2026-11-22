@@ -147,6 +147,14 @@ func (c *rateLimitWindowCache) Forget(key, accountID string) {
 	}
 }
 
+// hasEntryFrom reports whether the principal's entry was observed from accountID.
+func (c *rateLimitWindowCache) hasEntryFrom(key, accountID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	return ok && e.accountID == accountID
+}
+
 // evictOldest removes the entry with the oldest observation. The caller holds c.mu.
 func (c *rateLimitWindowCache) evictOldest() {
 	var oldestKey string
@@ -231,15 +239,25 @@ func (e cachedRateLimitEntry) writeOpenWindows(dst http.Header, now time.Time) (
 // observeRateLimitWindows records the unified windows of a vendor-Anthropic response
 // for the caller, when the caller is entitled to see that account's figures. Other
 // providers and responses without the top-level status are ignored; the entitlement
-// lookup only runs when there is something to record. An unentitled caller records
-// nothing and, because the response proves the caller now reaches that account
-// without entitlement (a revoked opt-in or role), loses any entry cached from it.
+// lookup only runs when there is something to record or purge. A token without the
+// send_usage_limits opt-in (#420) records nothing, yet still purges its principal's
+// entry from that account once the principal is no longer entitled, so an opted-in
+// sibling token never keeps frozen windows; with no such entry it looks nothing up.
+// An unentitled caller records nothing and, because the response proves the caller
+// now reaches that account without entitlement (a revoked opt-in or role), loses any
+// entry cached from it.
 func (s *Server) observeRateLimitWindows(token auth.Token, target routing.Target, h http.Header) {
 	if s.rateLimitWindows == nil || target.Provider != routing.ProviderVendorAnthropic || h.Get(unifiedRateLimitPrefix+"status") == "" {
 		return
 	}
 	key, ok := principalKey(token)
 	if !ok {
+		return
+	}
+	if !token.SendUsageLimits {
+		if s.rateLimitWindows.hasEntryFrom(key, target.VendorAccountID) && !s.rateLimitFiguresEntitled(context.Background(), token, target) {
+			s.rateLimitWindows.Forget(key, target.VendorAccountID)
+		}
 		return
 	}
 	if !s.rateLimitFiguresEntitled(context.Background(), token, target) {
@@ -252,8 +270,9 @@ func (s *Server) observeRateLimitWindows(token auth.Token, target routing.Target
 // attachRateLimitWindows writes the caller's last observed subscription windows into
 // dst, the header set of a /v1/messages response answered by another provider. The
 // callers decide that the flavor is Anthropic Messages and the response a success.
+// It writes nothing for a token without send_usage_limits (#420).
 func (s *Server) attachRateLimitWindows(token auth.Token, dst http.Header) {
-	if s.rateLimitWindows == nil {
+	if !token.SendUsageLimits || s.rateLimitWindows == nil {
 		return
 	}
 	if key, ok := principalKey(token); ok {

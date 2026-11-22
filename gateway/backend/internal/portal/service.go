@@ -1269,6 +1269,14 @@ type TokenDTO struct {
 	// Code shape, so Claude Code shows the usage limits. Always emitted. It
 	// changes only through rotation (RotateTokenRequest).
 	ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
+	// SendUsageLimits opts the token into receiving the gateway's usage-limit
+	// headers in a coding client (#420). Plain opt-in flag, off by default and
+	// ungated; always emitted so a client reading a token and writing it back
+	// preserves it.
+	SendUsageLimits bool `json:"send_usage_limits"`
+	// CodexModelSwitchPrompt opts the token into the Codex CLI's model-switch
+	// popup (#420). Same shape as SendUsageLimits.
+	CodexModelSwitchPrompt bool `json:"codex_model_switch_prompt"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1346,6 +1354,12 @@ type CreateTokenRequest struct {
 	// ClaudeCodeUsageDisplay gives the new token's secret the Claude Code shape
 	// (see claudeCodeTokenSecret). Off when omitted.
 	ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
+	// SendUsageLimits opts the new token into the usage-limit headers (see
+	// TokenDTO). Off when omitted.
+	SendUsageLimits bool `json:"send_usage_limits"`
+	// CodexModelSwitchPrompt opts the new token into the Codex CLI's
+	// model-switch popup (see TokenDTO). Off when omitted.
+	CodexModelSwitchPrompt bool `json:"codex_model_switch_prompt"`
 }
 
 // RotateTokenRequest is the optional body of a token rotation.
@@ -1403,6 +1417,11 @@ type UpdateTokenRequest struct {
 	// different value is ErrTokenClaudeCodeUsageDisplayRequiresRotation (the
 	// secret has to change with it, see RotateTokenRequest).
 	ClaudeCodeUsageDisplay *bool `json:"claude_code_usage_display,omitempty"`
+	// SendUsageLimits: nil = keep the stored flag, a non-nil value replaces it.
+	SendUsageLimits *bool `json:"send_usage_limits,omitempty"`
+	// CodexModelSwitchPrompt: nil = keep the stored flag, a non-nil value
+	// replaces it.
+	CodexModelSwitchPrompt *bool `json:"codex_model_switch_prompt,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -2032,6 +2051,8 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
 		ClaudeCodeUsageDisplay:       req.ClaudeCodeUsageDisplay,
+		SendUsageLimits:              req.SendUsageLimits,
+		CodexModelSwitchPrompt:       req.CodexModelSwitchPrompt,
 	}
 	if req.ClaudeCodeUsageDisplay {
 		secret = claudeCodeTokenSecret(secret)
@@ -2149,6 +2170,12 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.DecisionsConfidenceNormalize != nil {
 		record.DecisionsConfidenceNormalize = *req.DecisionsConfidenceNormalize
+	}
+	if req.SendUsageLimits != nil {
+		record.SendUsageLimits = *req.SendUsageLimits
+	}
+	if req.CodexModelSwitchPrompt != nil {
+		record.CodexModelSwitchPrompt = *req.CodexModelSwitchPrompt
 	}
 	if req.ProjectID != nil {
 		projectID, err := s.assignTokenProject(ctx, owner.UserID, *req.ProjectID)
@@ -5939,6 +5966,8 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
+		SendUsageLimits:                record.SendUsageLimits,
+		CodexModelSwitchPrompt:         record.CodexModelSwitchPrompt,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
@@ -5978,6 +6007,8 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 		ClaudeCodeUsageDisplay:         record.ClaudeCodeUsageDisplay,
+		SendUsageLimits:                record.SendUsageLimits,
+		CodexModelSwitchPrompt:         record.CodexModelSwitchPrompt,
 	}
 }
 

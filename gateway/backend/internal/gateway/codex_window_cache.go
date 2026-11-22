@@ -208,7 +208,10 @@ func (c *rateLimitWindowCache) AttachCodex(key string, dst http.Header, now time
 
 // observeCodexRateLimitWindows records the Codex windows of a vendor-OpenAI response
 // for an entitled caller; an unentitled caller records nothing and loses any entry
-// cached from that account, as on Messages.
+// cached from that account, as on Messages. A token without the send_usage_limits
+// opt-in (#420) records nothing, yet still purges its principal's entry from that
+// account once the principal is no longer entitled; with no such entry it looks
+// nothing up.
 func (s *Server) observeCodexRateLimitWindows(token auth.Token, target routing.Target, h http.Header) {
 	if s.codexRateLimitWindows == nil || !routing.IsOpenAIVendorProvider(target.Provider) {
 		return
@@ -221,6 +224,12 @@ func (s *Server) observeCodexRateLimitWindows(token auth.Token, target routing.T
 	if !ok {
 		return
 	}
+	if !token.SendUsageLimits {
+		if s.codexRateLimitWindows.hasEntryFrom(key, target.VendorAccountID) && !s.rateLimitFiguresEntitled(context.Background(), token, target) {
+			s.codexRateLimitWindows.Forget(key, target.VendorAccountID)
+		}
+		return
+	}
 	if !s.rateLimitFiguresEntitled(context.Background(), token, target) {
 		s.codexRateLimitWindows.Forget(key, target.VendorAccountID)
 		return
@@ -229,9 +238,10 @@ func (s *Server) observeCodexRateLimitWindows(token auth.Token, target routing.T
 }
 
 // attachCodexRateLimitWindows writes the caller's last observed Codex windows into
-// dst, the header set of a /v1/responses success that carries none of its own.
+// dst, the header set of a /v1/responses success that carries none of its own. It
+// writes nothing for a token without send_usage_limits (#420).
 func (s *Server) attachCodexRateLimitWindows(token auth.Token, dst http.Header) {
-	if s.codexRateLimitWindows == nil {
+	if !token.SendUsageLimits || s.codexRateLimitWindows == nil {
 		return
 	}
 	if key, ok := principalKey(token); ok {

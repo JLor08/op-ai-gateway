@@ -318,6 +318,16 @@ keep the plain `opaigw_` secret. The shape only makes Claude Code look at the ra
 headers; what the gateway sends is described in [Claude Code usage-limit
 display](compatibility-and-inference.md#93-claude-code-usage-limit-display).
 
+The option is the "Claude Code token format" and is **not** what decides whether usage limits are
+sent. Two separate per-token switches do (issue #420, [ADR-110](../09-architecture-decisions.md#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it)): `send_usage_limits` and
+`codex_model_switch_prompt`, both default off. They are ordinary, ungated settings (any principal that may edit
+the token may change them) and need no rotation, since they do not shape the secret. A user token takes them on create and
+PATCH and always reads them back; a service token takes them on create and reads them back (editing is issue
+#421). Without `send_usage_limits` the token receives no `anthropic-ratelimit-unified-*` and no `x-codex-*`
+header on any path, only the status codes, `Retry-After`, `X-Should-Retry`, the block bodies and the Codex block's
+`x-codex-promo-message`. `codex_model_switch_prompt` counts only together with `send_usage_limits`. Claude Code needs the
+token format and `send_usage_limits`; Codex needs only the switch. Migration 112 switched `send_usage_limits` on for user tokens that already had the token format.
+
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 
 Portal chat runs as the logged-in **session** principal, but the operator may
@@ -1267,7 +1277,8 @@ that the header was present. Response headers are stored verbatim (a
 response never carries an inbound credential), with one exception: on the translate path a
 vendor account's `anthropic-ratelimit-unified-*` headers, its Codex `x-codex-*` rate-limit family and
 `anthropic-organization-id` are dropped from the captured upstream response headers unless the principal
-is entitled to that account's figures ([Claude Code usage-limit
+is entitled to that account's figures (capture redaction is entitlement-based and does not depend on the token's
+`send_usage_limits`) ([Claude Code usage-limit
 display](compatibility-and-inference.md#93-claude-code-usage-limit-display), [Codex usage-limit
 display](compatibility-and-inference.md#95-codex-usage-limit-display)). On the **translate** path —
 where the gateway rewrites a client request into a different upstream
