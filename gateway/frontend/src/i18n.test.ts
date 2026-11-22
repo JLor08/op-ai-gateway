@@ -4735,6 +4735,20 @@ describe('vllm_sr i18n keys', () => {
   });
 });
 
+describe('strata i18n keys', () => {
+  it('defines the application type note in de and en', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].applicationTypeStrataNote;
+      expect(typeof note).toBe('string');
+      expect(note.length).toBeGreaterThan(0);
+      expect(note).toContain('Niko1221/Strata');
+      expect(note).toContain('strata serve');
+      expect(note).toContain('/v1/responses');
+    }
+    expect(messages.en.applicationTypeStrataNote).not.toBe(messages.de.applicationTypeStrataNote);
+  });
+});
+
 describe('sglang i18n keys', () => {
   it('defines the type labels, notes and the warning in de and en', () => {
     const keys = [

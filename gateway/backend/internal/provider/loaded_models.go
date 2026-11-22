@@ -26,8 +26,40 @@ type LoadedModelLister interface {
 	LoadedModels(ctx context.Context, target routing.Target, statusPath, format string) ([]string, error)
 }
 
+// LoadedModelInfoLister is LoadedModelLister plus each loaded model's context
+// window, read from the SAME status document in the SAME request. Only the
+// "openai" format carries one today (see parseLoadedModelInfos); every other
+// format, and an entry without a size, yields ContextSize 0 (unknown). The
+// health loop prefers it over LoadedModelLister so an upstream whose only
+// readable route is its /v1/models listing (a Strata LAN share, which answers
+// /props with 404) still reports its context size without a second probe.
+type LoadedModelInfoLister interface {
+	// LoadedModelInfos is LoadedModels with sizes: one entry per loaded name,
+	// in LoadedModels' order. Only Name and ContextSize are ever set.
+	LoadedModelInfos(ctx context.Context, target routing.Target, statusPath, format string) ([]ModelInfo, error)
+}
+
 // fetchLoadedModels is the shared GET+parse used by every client's LoadedModels.
 func fetchLoadedModels(ctx context.Context, httpClient *http.Client, target routing.Target, statusPath, format string) ([]string, error) {
+	body, err := fetchLoadedModelsBody(ctx, httpClient, target, statusPath)
+	if err != nil || body == nil {
+		return nil, err
+	}
+	return parseLoadedModels(body, format), nil
+}
+
+// fetchLoadedModelInfos is the shared GET+parse used by LoadedModelInfos.
+func fetchLoadedModelInfos(ctx context.Context, httpClient *http.Client, target routing.Target, statusPath, format string) ([]ModelInfo, error) {
+	body, err := fetchLoadedModelsBody(ctx, httpClient, target, statusPath)
+	if err != nil || body == nil {
+		return nil, err
+	}
+	return parseLoadedModelInfos(body, format), nil
+}
+
+// fetchLoadedModelsBody GETs the status path (with the upstream credential)
+// and returns the raw body. A blank statusPath returns (nil, nil).
+func fetchLoadedModelsBody(ctx context.Context, httpClient *http.Client, target routing.Target, statusPath string) ([]byte, error) {
 	statusPath = strings.TrimSpace(statusPath)
 	if statusPath == "" {
 		return nil, nil
@@ -57,7 +89,7 @@ func fetchLoadedModels(ctx context.Context, httpClient *http.Client, target rout
 	if err != nil {
 		return nil, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	return parseLoadedModels(body, format), nil
+	return body, nil
 }
 
 // parseLoadedModels extracts loaded model names from a status response per format.
@@ -92,6 +124,71 @@ func parseLoadedModels(body []byte, format string) []string {
 		all = append(all, litellmLoadedModels(v)...)
 		return dedupNonEmpty(all)
 	}
+}
+
+// parseLoadedModelInfos is parseLoadedModels plus each name's context window.
+// The names, and their order, are exactly parseLoadedModels'. A size is read
+// only for the "openai" format, from the data[] entry the name came from:
+// context_length (Strata's /v1/models, the OpenRouter-style field), else
+// meta.n_ctx (the engine block Strata adds). vLLM's max_model_len is
+// deliberately not read here: a direct vLLM application has never taken its
+// context from this listing, and starting to would be a behavior change of its
+// own. Anything else, or a non-positive value, leaves ContextSize 0 (unknown).
+func parseLoadedModelInfos(body []byte, format string) []ModelInfo {
+	names := parseLoadedModels(body, format)
+	if len(names) == 0 {
+		return nil
+	}
+	sizes := map[string]int{}
+	if strings.ToLower(strings.TrimSpace(format)) == "openai" {
+		var v any
+		if err := json.Unmarshal(body, &v); err == nil {
+			sizes = openaiContextSizes(v)
+		}
+	}
+	out := make([]ModelInfo, 0, len(names))
+	for _, name := range names {
+		out = append(out, ModelInfo{Name: name, ContextSize: sizes[name]})
+	}
+	return out
+}
+
+// openaiContextSizes maps each {"data":[...]} entry's name (the same key
+// modelNamesFromArray reads) to its positive context_length, else its positive
+// meta.n_ctx. The first entry carrying a size wins for a repeated name.
+func openaiContextSizes(v any) map[string]int {
+	out := map[string]int{}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return out
+	}
+	arr, ok := obj["data"].([]any)
+	if !ok {
+		return out
+	}
+	for _, item := range arr {
+		it, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := modelNameOf(it)
+		if name == "" {
+			continue
+		}
+		if _, seen := out[name]; seen {
+			continue
+		}
+		size := intFromAny(it["context_length"])
+		if size == 0 {
+			if meta, ok := it["meta"].(map[string]any); ok {
+				size = intFromAny(meta["n_ctx"])
+			}
+		}
+		if size > 0 {
+			out[name] = size
+		}
+	}
+	return out
 }
 
 // openaiLoadedModels parses {"data":[{"id":...}]}.
@@ -196,15 +293,23 @@ func modelNamesFromArray(v any) []string {
 				out = append(out, strings.TrimSpace(it))
 			}
 		case map[string]any:
-			for _, key := range []string{"model", "id", "name"} {
-				if s, ok := it[key].(string); ok && strings.TrimSpace(s) != "" {
-					out = append(out, strings.TrimSpace(s))
-					break
-				}
+			if name := modelNameOf(it); name != "" {
+				out = append(out, name)
 			}
 		}
 	}
 	return out
+}
+
+// modelNameOf is an array item's model name: its first non-blank string among
+// "model", "id" and "name", trimmed; "" when it has none.
+func modelNameOf(it map[string]any) string {
+	for _, key := range []string{"model", "id", "name"} {
+		if s, ok := it[key].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 func dedupNonEmpty(in []string) []string {

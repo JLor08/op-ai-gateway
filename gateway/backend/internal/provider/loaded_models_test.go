@@ -108,3 +108,59 @@ func TestParseLoadedModelsSdcpp(t *testing.T) {
 		}
 	}
 }
+
+// TestParseLoadedModelInfosContextFromOpenAIListing pins that an OpenAI-shaped
+// loaded-models listing carries each model's context window: context_length
+// (Strata, OpenRouter style) first, else meta.n_ctx (Strata's engine block).
+// Other formats, and an entry without either key, report the name with no size.
+func TestParseLoadedModelInfosContextFromOpenAIListing(t *testing.T) {
+	cases := []struct {
+		name   string
+		body   string
+		format string
+		want   []ModelInfo
+	}{
+		{
+			"strata share body", `{"object":"list","data":[{"id":"unsloth-q8_0","owned_by":"strata","status":{"value":"loaded"},"architecture":{"input_modalities":["text","image"]},"context_length":262144}]}`, "openai",
+			[]ModelInfo{{Name: "unsloth-q8_0", ContextSize: 262144}},
+		},
+		{"meta.n_ctx fallback", `{"data":[{"id":"m","meta":{"n_ctx":32768}}]}`, "openai", []ModelInfo{{Name: "m", ContextSize: 32768}}},
+		{"context_length wins over meta.n_ctx", `{"data":[{"id":"m","context_length":8192,"meta":{"n_ctx":4096}}]}`, "openai", []ModelInfo{{Name: "m", ContextSize: 8192}}},
+		{"zero context_length falls back", `{"data":[{"id":"m","context_length":0,"meta":{"n_ctx":4096}}]}`, "openai", []ModelInfo{{Name: "m", ContextSize: 4096}}},
+		{"no size key", `{"data":[{"id":"a"},{"id":"b"}]}`, "openai", []ModelInfo{{Name: "a"}, {Name: "b"}}},
+		{"non-openai format reads no size", `{"running":[{"model":"x","context_length":4096}]}`, "llama_swap", []ModelInfo{{Name: "x"}}},
+		{"garbage", `not json`, "openai", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseLoadedModelInfos([]byte(tc.body), tc.format)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("parseLoadedModelInfos = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMultiplexerLoadedModelInfosFallsBackToNames pins the Multiplexer's
+// dispatch: a client with LoadedModelInfoLister answers with sizes, a client
+// with only LoadedModelLister answers with names and no sizes.
+func TestMultiplexerLoadedModelInfosFallsBackToNames(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m","context_length":4096}]}`))
+	}))
+	defer srv.Close()
+	mux := NewMultiplexer(map[string]Client{
+		routing.ProviderStrata: NewOpenAICompatibleClient(srv.Client()),
+		routing.ProviderOllama: NewOllamaClient(srv.Client()),
+	}, nil)
+
+	got, err := mux.LoadedModelInfos(context.Background(), routing.Target{Provider: routing.ProviderStrata, Endpoint: srv.URL}, "/v1/models", "openai")
+	if err != nil || !reflect.DeepEqual(got, []ModelInfo{{Name: "m", ContextSize: 4096}}) {
+		t.Fatalf("openai-compatible LoadedModelInfos = (%+v, %v), want [{m 4096}]", got, err)
+	}
+	got, err = mux.LoadedModelInfos(context.Background(), routing.Target{Provider: routing.ProviderOllama, Endpoint: srv.URL}, "/v1/models", "openai")
+	if err != nil || !reflect.DeepEqual(got, []ModelInfo{{Name: "m"}}) {
+		t.Fatalf("names-only LoadedModelInfos = (%+v, %v), want [{m 0}]", got, err)
+	}
+}

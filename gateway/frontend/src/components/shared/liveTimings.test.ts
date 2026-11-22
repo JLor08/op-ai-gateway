@@ -61,6 +61,7 @@ const applicationTypeKeys: Record<ApplicationType, true> = {
   stable_diffusion_cpp: true,
   audio_cpp: true,
   vllm_sr: true,
+  strata: true,
 };
 const allApplicationTypes = Object.keys(applicationTypeKeys) as ApplicationType[];
 

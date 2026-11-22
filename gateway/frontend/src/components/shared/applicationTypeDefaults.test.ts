@@ -272,7 +272,7 @@ describe('audio_cpp defaults', () => {
   // them.
   it('keeps the stock /v1/health path for every other type', () => {
     for (const [type, d] of Object.entries(applicationTypeDefaults)) {
-      if (type === 'audio_cpp' || type === 'vllm_sr') continue;
+      if (type === 'audio_cpp' || type === 'vllm_sr' || type === 'strata') continue;
       expect(d.healthCheckPath, type).toBe('/v1/health');
     }
   });
@@ -303,5 +303,36 @@ describe('vllm_sr defaults', () => {
     expect(patch.apiFlavors).toEqual(['decisions']);
     expect(patch.timeoutMs).toBe(600000);
     expect(patch.healthCheckPath).toBe('/v1/systemone/models');
+  });
+});
+
+// strata: an operator-run Strata (`strata serve`, or the desktop app's LAN
+// share). The share serves only /v1/models among the GET routes (/props,
+// /metrics and /health answer 404), so health and the loaded models both read
+// /v1/models, and the context window comes from that listing too.
+describe('strata defaults', () => {
+  it('reads health and loaded models from /v1/models and keeps the stock text pair', () => {
+    expect(applicationTypeDefaults.strata).toEqual({
+      port: 8080,
+      scheme: 'http',
+      responsesMode: 'passthrough',
+      messagesMode: 'passthrough',
+      loadedModelsPath: '/v1/models',
+      loadedModelsFormat: 'openai',
+      contextProbePath: '',
+      timeoutMs: applicationTypeDefaults.llama_cpp.timeoutMs,
+      healthCheckMode: 'health_path',
+      healthCheckPath: '/v1/models',
+      apiFlavors: ['openai', 'anthropic'],
+    });
+  });
+
+  it('migrates an untouched llama_cpp form to the strata paths on a type switch', () => {
+    const current = { ...applicationTypeDefaults.llama_cpp };
+    const patch = migrateTypeFields('llama_cpp', 'strata', current);
+    expect(patch.healthCheckPath).toBe('/v1/models');
+    expect(patch.loadedModelsPath).toBe('/v1/models');
+    expect(patch.loadedModelsFormat).toBe('openai');
+    expect(patch.contextProbePath).toBe('');
   });
 });
