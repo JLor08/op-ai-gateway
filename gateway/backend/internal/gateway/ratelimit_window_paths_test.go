@@ -171,6 +171,9 @@ func TestWindowsObservedFromVendorThenAttachedOnLocalPassthrough(t *testing.T) {
 	}
 	requireWindowsAttached(t, rec)
 
+	// The other principal opts in too, so the empty answer proves the per-principal
+	// keying of the cache and not the switch gate.
+	f.setSendUsageLimitsFor(t, vaOtherSecret, true)
 	other := f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, false)
 	if other.Code != http.StatusOK {
 		t.Fatalf("other principal status = %d, body = %s", other.Code, other.Body.String())
@@ -191,6 +194,7 @@ func TestWindowsAttachedOnTranslateStreamAndBuffered(t *testing.T) {
 			}
 			requireWindowsAttached(t, rec)
 
+			f.setSendUsageLimitsFor(t, vaOtherSecret, true) // isolation, not the switch gate, must explain the absence
 			requireNoUnified(t, f.post(t, vaOtherSecret, "/v1/messages", windowsLocalModel, stream))
 		})
 	}

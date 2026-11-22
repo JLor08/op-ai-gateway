@@ -150,6 +150,9 @@ func TestCodexWindowsObservedFromVendorThenAttachedOnLocalPassthrough(t *testing
 	}
 	requireCodexWindowsAttached(t, rec, "42.5")
 
+	// The other principal opts in too, so the empty answer proves the per-principal
+	// keying of the cache and not the switch gate.
+	f.setSendUsageLimitsFor(t, vaOtherSecret, true)
 	other := f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, false)
 	if other.Code != http.StatusOK {
 		t.Fatalf("other principal status = %d, body = %s", other.Code, other.Body.String())
@@ -170,6 +173,7 @@ func TestCodexWindowsAttachedOnTranslateStreamAndBuffered(t *testing.T) {
 			}
 			requireCodexWindowsAttached(t, rec, "42.5")
 
+			f.setSendUsageLimitsFor(t, vaOtherSecret, true) // isolation, not the switch gate, must explain the absence
 			requireNoCodex(t, f.post(t, vaOtherSecret, "/v1/responses", windowsLocalModel, stream))
 		})
 	}

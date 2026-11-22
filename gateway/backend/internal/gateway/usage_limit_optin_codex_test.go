@@ -254,7 +254,11 @@ func TestCodexModelSwitchPromptDropsCreditsFlag(t *testing.T) {
 		t.Fatalf("block credits flags changed: %v", h)
 	}
 	f.capPrincipal()
-	requireCodexStandingAttached(t, f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false))
+	rec := f.post(t, vaOwnerSecret, "/v1/responses", windowsLocalModel, false)
+	requireCodexStandingAttached(t, rec)
+	if got := rec.Result().Header.Get("X-Codex-Credits-Unlimited"); got != "false" {
+		t.Fatalf("standing credits-unlimited = %q, want false", got)
+	}
 }
 
 func TestCodexModelSwitchPromptWithoutSendIsMoot(t *testing.T) {
@@ -327,11 +331,11 @@ func TestWriteCodexLimitBlockedHeaderSets(t *testing.T) {
 			if rec.Code != http.StatusTooManyRequests {
 				t.Fatalf("status = %d", rec.Code)
 			}
-			if got := codexHeaderNames(rec.Header()); !reflect.DeepEqual(got, tc.want) {
+			if got := codexHeaderNames(rec.Result().Header); !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("x-codex-* = %v, want %v", got, tc.want)
 			}
-			if rec.Header().Get("Retry-After") != "21600" || rec.Header().Get("X-Should-Retry") != "false" {
-				t.Fatalf("retry headers = %v", rec.Header())
+			if rec.Result().Header.Get("Retry-After") != "21600" || rec.Result().Header.Get("X-Should-Retry") != "false" {
+				t.Fatalf("retry headers = %v", rec.Result().Header)
 			}
 			var body codexLimitBlockedBody
 			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
