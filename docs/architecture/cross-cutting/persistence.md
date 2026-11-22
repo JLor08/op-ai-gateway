@@ -173,7 +173,7 @@ Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 111 migrations in order, same as
+- **Only-pending.** A fresh install runs all 112 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -236,6 +236,15 @@ Rules that keep this safe over time:
   create insert and by `RotateUserTokenSecret`, which sets it in the same statement as the new
   hash and prefix because the flag decides the shape of the secret (the migration-40 rebuild
   test re-applies this column too).
+  Migration 112 (`token_usage_limit_switches`, #420) adds two more ungated opt-ins the same
+  way, `api_tokens.send_usage_limits` and `api_tokens.codex_model_switch_prompt` (each
+  `integer not null default 0`): they gate the usage-limit headers and the Codex CLI
+  model-switch popup per token. Unlike `claude_code_usage_display` they are written by
+  `UpdateTokenMetadata` and copied into `auth.Token` on every bearer path (the sqlite
+  `resolveBearer`, the memory directory, run-as). The migration backfills
+  `send_usage_limits` from `claude_code_usage_display` (an idempotent `update ... where`),
+  so a token that already shows the limits keeps showing them; service tokens set them on
+  create only. The migration-40 rebuild test re-applies both columns.
   Migration 107 (`application_decision_modes`) is the endpoint-mode migration 72's
   twin: two `text not null default ''` columns on both `applications` and
   `agent_runtime_specs`, each blank value then backfilled under a `where ... = ''` guard

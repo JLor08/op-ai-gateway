@@ -158,6 +158,8 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 		ClaudeModelAliases:             token.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
+		SendUsageLimits:                token.SendUsageLimits,
+		CodexModelSwitchPrompt:         token.CodexModelSwitchPrompt,
 	}, secret)
 	return nil
 }
@@ -218,6 +220,8 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			ClaudeModelAliases:             token.ClaudeModelAliases,
 			ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
 			DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
+			SendUsageLimits:                token.SendUsageLimits,
+			CodexModelSwitchPrompt:         token.CodexModelSwitchPrompt,
 		})
 	}
 	return nil
@@ -308,6 +312,8 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.ClaudeModelAliases = token.ClaudeModelAliases
 	existing.ClaudeEffortCompatibility = token.ClaudeEffortCompatibility
 	existing.DecisionsConfidenceNormalize = token.DecisionsConfidenceNormalize
+	existing.SendUsageLimits = token.SendUsageLimits
+	existing.CodexModelSwitchPrompt = token.CodexModelSwitchPrompt
 	m.tokens[token.ID] = existing
 	m.auth.UpdateToken(auth.Token{
 		ID:                 existing.ID,
@@ -339,6 +345,8 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		ClaudeModelAliases:             existing.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      existing.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   existing.DecisionsConfidenceNormalize,
+		SendUsageLimits:                existing.SendUsageLimits,
+		CodexModelSwitchPrompt:         existing.CodexModelSwitchPrompt,
 	})
 	return nil
 }

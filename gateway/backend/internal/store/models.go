@@ -200,6 +200,15 @@ type TokenRecord struct {
 	// rotation (RotateUserTokenSecret): UpdateTokenMetadata never writes it,
 	// because the secret has to change with it.
 	ClaudeCodeUsageDisplay bool
+	// SendUsageLimits is the opt-in (default false) that lets the gateway send
+	// its usage-limit headers to a coding client on this token (#420). Stored
+	// as api_tokens.send_usage_limits; ungated and editable through
+	// UpdateTokenMetadata.
+	SendUsageLimits bool
+	// CodexModelSwitchPrompt is the opt-in (default false) that lets the Codex
+	// CLI show its model-switch popup for this token (#420). Stored as
+	// api_tokens.codex_model_switch_prompt; ungated, like SendUsageLimits.
+	CodexModelSwitchPrompt bool
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored
