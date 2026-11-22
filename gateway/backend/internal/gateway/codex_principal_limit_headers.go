@@ -129,13 +129,18 @@ func codexGatewayLimitTakesOver(ctx context.Context, now time.Time) bool {
 // attachTranslatedCodexUsageLimits fills the client header set of a translated
 // /v1/responses success: the Codex windows last observed for the caller, then the
 // principal's own fullest limit unless those windows already put figures there.
+// When the gateway's own limit takes over (codexGatewayLimitTakesOver) the cached
+// windows are skipped and the standing is written instead.
 // A token without the send_usage_limits opt-in (#420) gets nothing.
 func (s *Server) attachTranslatedCodexUsageLimits(r *http.Request, token auth.Token, dst http.Header) {
 	if !token.SendUsageLimits {
 		return
 	}
-	s.attachCodexRateLimitWindows(token, dst)
-	attachCodexPrincipalLimitStanding(r.Context(), dst, time.Now(), token.CodexModelSwitchPrompt)
+	now := time.Now()
+	if !codexGatewayLimitTakesOver(r.Context(), now) {
+		s.attachCodexRateLimitWindows(token, dst)
+	}
+	attachCodexPrincipalLimitStanding(r.Context(), dst, now, token.CodexModelSwitchPrompt)
 }
 
 // writeCodexLimitBlocked answers a quota or budget denial on the Codex flavor: 429,
