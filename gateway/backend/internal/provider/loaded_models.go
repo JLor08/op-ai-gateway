@@ -26,16 +26,18 @@ type LoadedModelLister interface {
 	LoadedModels(ctx context.Context, target routing.Target, statusPath, format string) ([]string, error)
 }
 
-// LoadedModelInfoLister is LoadedModelLister plus each loaded model's context
-// window, read from the SAME status document in the SAME request. Only the
-// "openai" format carries one today (see parseLoadedModelInfos); every other
-// format, and an entry without a size, yields ContextSize 0 (unknown). The
+// LoadedModelInfoLister is LoadedModelLister plus what the SAME status document,
+// read in the SAME request, says about each loaded model: its context window
+// and a vision verdict. Only the "openai" format carries either today (see
+// parseLoadedModelInfos); every other format yields the names alone. The
 // health loop prefers it over LoadedModelLister so an upstream whose only
 // readable route is its /v1/models listing (a Strata LAN share, which answers
-// /props with 404) still reports its context size without a second probe.
+// /props with 404) still reports its context size and vision support without a
+// second probe.
 type LoadedModelInfoLister interface {
-	// LoadedModelInfos is LoadedModels with sizes: one entry per loaded name,
-	// in LoadedModels' order. Only Name and ContextSize are ever set.
+	// LoadedModelInfos is LoadedModels with details: one entry per loaded
+	// name, in LoadedModels' order. Only Name, ContextSize and Caps.Vision
+	// are ever set.
 	LoadedModelInfos(ctx context.Context, target routing.Target, statusPath, format string) ([]ModelInfo, error)
 }
 
@@ -126,38 +128,48 @@ func parseLoadedModels(body []byte, format string) []string {
 	}
 }
 
-// parseLoadedModelInfos is parseLoadedModels plus each name's context window.
-// The names, and their order, are exactly parseLoadedModels'. A size is read
-// only for the "openai" format, from the data[] entry the name came from:
-// context_length (Strata's /v1/models, the OpenRouter-style field), else
-// meta.n_ctx (the engine block Strata adds). vLLM's max_model_len is
-// deliberately not read here: a direct vLLM application has never taken its
-// context from this listing, and starting to would be a behavior change of its
-// own. Anything else, or a non-positive value, leaves ContextSize 0 (unknown).
+// parseLoadedModelInfos is parseLoadedModels plus what the same listing says
+// about each name. The names, and their order, are exactly parseLoadedModels'.
+// Only the "openai" format is read beyond the names, from the data[] entry the
+// name came from:
+//
+//   - ContextSize: context_length (Strata's /v1/models, the OpenRouter-style
+//     field), else meta.n_ctx (the engine block Strata adds). vLLM's
+//     max_model_len is deliberately not read. A non-positive value is 0
+//     (unknown).
+//   - Caps.Vision: "yes" when architecture.input_modalities lists "image";
+//     otherwise "" (no verdict), because nothing pins that list as
+//     exhaustive.
+//
+// Every other format, and an entry without those keys, yields the name alone.
+// The parse is generic; which application types RECORD these values is the
+// health loop's decision (recordListedModelInfos in cmd/gateway).
 func parseLoadedModelInfos(body []byte, format string) []ModelInfo {
 	names := parseLoadedModels(body, format)
 	if len(names) == 0 {
 		return nil
 	}
-	sizes := map[string]int{}
+	entries := map[string]ModelInfo{}
 	if strings.ToLower(strings.TrimSpace(format)) == "openai" {
 		var v any
 		if err := json.Unmarshal(body, &v); err == nil {
-			sizes = openaiContextSizes(v)
+			entries = openaiEntryInfos(v)
 		}
 	}
 	out := make([]ModelInfo, 0, len(names))
 	for _, name := range names {
-		out = append(out, ModelInfo{Name: name, ContextSize: sizes[name]})
+		info := entries[name]
+		info.Name = name
+		out = append(out, info)
 	}
 	return out
 }
 
-// openaiContextSizes maps each {"data":[...]} entry's name (the same key
-// modelNamesFromArray reads) to its positive context_length, else its positive
-// meta.n_ctx. The first entry carrying a size wins for a repeated name.
-func openaiContextSizes(v any) map[string]int {
-	out := map[string]int{}
+// openaiEntryInfos maps each {"data":[...]} entry's name (the same key
+// modelNamesFromArray reads) to its context size and vision verdict, as
+// parseLoadedModelInfos documents. The first entry for a repeated name wins.
+func openaiEntryInfos(v any) map[string]ModelInfo {
+	out := map[string]ModelInfo{}
 	obj, ok := v.(map[string]any)
 	if !ok {
 		return out
@@ -178,15 +190,23 @@ func openaiContextSizes(v any) map[string]int {
 		if _, seen := out[name]; seen {
 			continue
 		}
-		size := intFromAny(it["context_length"])
-		if size == 0 {
+		info := ModelInfo{ContextSize: intFromAny(it["context_length"])}
+		if info.ContextSize == 0 {
 			if meta, ok := it["meta"].(map[string]any); ok {
-				size = intFromAny(meta["n_ctx"])
+				info.ContextSize = intFromAny(meta["n_ctx"])
 			}
 		}
-		if size > 0 {
-			out[name] = size
+		if arch, ok := it["architecture"].(map[string]any); ok {
+			if mods, ok := arch["input_modalities"].([]any); ok {
+				for _, m := range mods {
+					if s, ok := m.(string); ok && strings.EqualFold(strings.TrimSpace(s), "image") {
+						info.Caps.Vision = routing.CapabilityYes
+						break
+					}
+				}
+			}
 		}
+		out[name] = info
 	}
 	return out
 }

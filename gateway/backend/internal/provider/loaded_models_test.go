@@ -113,6 +113,8 @@ func TestParseLoadedModelsSdcpp(t *testing.T) {
 // loaded-models listing carries each model's context window: context_length
 // (Strata, OpenRouter style) first, else meta.n_ctx (Strata's engine block).
 // Other formats, and an entry without either key, report the name with no size.
+// An architecture.input_modalities list naming "image" is a vision yes; any
+// other list, or none, is no verdict.
 func TestParseLoadedModelInfosContextFromOpenAIListing(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -122,8 +124,10 @@ func TestParseLoadedModelInfosContextFromOpenAIListing(t *testing.T) {
 	}{
 		{
 			"strata share body", `{"object":"list","data":[{"id":"unsloth-q8_0","owned_by":"strata","status":{"value":"loaded"},"architecture":{"input_modalities":["text","image"]},"context_length":262144}]}`, "openai",
-			[]ModelInfo{{Name: "unsloth-q8_0", ContextSize: 262144}},
+			[]ModelInfo{{Name: "unsloth-q8_0", ContextSize: 262144, Caps: Capabilities{Vision: "yes"}}},
 		},
+		{"text-only input_modalities is no verdict", `{"data":[{"id":"m","architecture":{"input_modalities":["text"]}}]}`, "openai", []ModelInfo{{Name: "m"}}},
+		{"non-openai format reads no modalities", `{"running":[{"model":"x","architecture":{"input_modalities":["image"]}}]}`, "llama_swap", []ModelInfo{{Name: "x"}}},
 		{"meta.n_ctx fallback", `{"data":[{"id":"m","meta":{"n_ctx":32768}}]}`, "openai", []ModelInfo{{Name: "m", ContextSize: 32768}}},
 		{"context_length wins over meta.n_ctx", `{"data":[{"id":"m","context_length":8192,"meta":{"n_ctx":4096}}]}`, "openai", []ModelInfo{{Name: "m", ContextSize: 8192}}},
 		{"zero context_length falls back", `{"data":[{"id":"m","context_length":0,"meta":{"n_ctx":4096}}]}`, "openai", []ModelInfo{{Name: "m", ContextSize: 4096}}},

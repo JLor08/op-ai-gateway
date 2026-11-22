@@ -2385,9 +2385,10 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 				// Attach the app's per-app upstream credential to the probe (fail-open).
 				token, _ := capture.OpenSecret(r.cipher, app.APIToken)
 				pctx := provider.WithUpstreamAuth(ctx, app.APITokenHeader, token)
-				// The size-aware listing when the prober has one: the same GET,
-				// plus each model's context window where the document carries
-				// one (an OpenAI /v1/models listing's context_length).
+				// The detail-aware listing when the prober has one: the same GET,
+				// plus each model's context window and vision verdict where the
+				// document carries them (recorded for strata only, see
+				// recordListedModelInfos).
 				list := func() ([]provider.ModelInfo, error) {
 					if hasInfoLister {
 						return infoLister.LoadedModelInfos(pctx, target, app.LoadedModelsPath, app.LoadedModelsFormat)
@@ -2422,7 +2423,7 @@ func (r *appHealthRunner) probeServer(ctx context.Context, server routing.AIServ
 					models = append(models, info.Name)
 				}
 				r.loaded.SetGatewayProbe(app.ID, models)
-				r.recordListedContextSizes(ctx, app, infos)
+				r.recordListedModelInfos(ctx, app, infos)
 			}(app)
 		}
 	}
@@ -2933,39 +2934,63 @@ func clampWakeInterval(seconds int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// recordListedContextSizes persists the context windows a loaded-models
-// listing reported (provider.LoadedModelInfoLister: an OpenAI /v1/models
-// body's context_length, else meta.n_ctx) onto the application's mappings,
-// matched by AppModelName, with the context-probe pass's rules: provenance
-// "probe", a locked mapping is left alone (the store guard enforces it too),
-// an unchanged or absurd value is not written. It is the fallback source: an
-// application with its own ContextProbePath takes its size from that probe
-// only, so two sources never alternate on one mapping. This is what gives a
-// Strata LAN share, whose only readable route is /v1/models, a context size.
-func (r *appHealthRunner) recordListedContextSizes(ctx context.Context, app routing.Application, infos []provider.ModelInfo) {
-	if strings.TrimSpace(app.ContextProbePath) != "" {
+// recordListedModelInfos persists what a strata application's loaded-models
+// listing (provider.LoadedModelInfoLister over its /v1/models) reported for
+// each model onto the mappings matched by AppModelName:
+//
+//   - the context window (context_length, else meta.n_ctx), with the
+//     context-probe pass's rules: provenance "probe", a locked mapping is left
+//     alone (the store guard enforces it too), an unchanged or absurd value is
+//     not written;
+//   - a vision yes (architecture.input_modalities lists "image") as a
+//     capability row of source strata_models, through writeCapabilityRows and
+//     so with its precedence and change-detection guards. Only a yes is ever
+//     reported; no modality list is no verdict.
+//
+// It records for routing.ProviderStrata only: the parse is generic, but every
+// other type's application behaves exactly as before, so a vllm-typed
+// application pointed at an upstream that happens to emit context_length
+// (another gateway instance does) keeps its operator-set size. And only for an
+// application without its own ContextProbePath, which is then the source for
+// both, so two sources never alternate on one mapping. This is what gives a
+// Strata LAN share, whose only readable route is /v1/models, a context size
+// and its image input.
+func (r *appHealthRunner) recordListedModelInfos(ctx context.Context, app routing.Application, infos []provider.ModelInfo) {
+	if app.Type != routing.ProviderStrata || strings.TrimSpace(app.ContextProbePath) != "" {
 		return
 	}
-	sizes := map[string]int{}
+	byName := map[string]provider.ModelInfo{}
 	for _, info := range infos {
-		if info.ContextSize > 0 && info.ContextSize <= maxProbedContextSize {
-			sizes[info.Name] = info.ContextSize
+		if info.ContextSize > maxProbedContextSize {
+			info.ContextSize = 0
+		}
+		if info.ContextSize > 0 || info.Caps.Vision == routing.CapabilityYes {
+			byName[info.Name] = info
 		}
 	}
-	if len(sizes) == 0 {
+	if len(byName) == 0 {
 		return
 	}
 	mappings, err := r.store.MappingsByApplication(ctx, app.ID)
 	if err != nil {
-		log.Printf("app health: mappings for app %s failed: %v (listed context sizes not recorded)", app.ID, err)
+		log.Printf("app health: mappings for app %s failed: %v (listed model info not recorded)", app.ID, err)
 		return
 	}
+	now := r.now()
 	for _, mp := range mappings {
-		size, ok := sizes[mp.AppModelName]
-		if !ok || mp.Status != routing.ServerStatusActive || mp.MetricsLocked || mp.ContextSize == size {
+		info, ok := byName[mp.AppModelName]
+		if !ok || mp.Status != routing.ServerStatusActive {
 			continue
 		}
-		_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, size, r.now())
+		if size := info.ContextSize; size > 0 && !mp.MetricsLocked && mp.ContextSize != size {
+			_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, size, now)
+		}
+		if info.Caps.Vision == routing.CapabilityYes {
+			r.writeCapabilityRows(ctx, mp, []routing.CapabilityRow{{
+				Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
+				Source: routing.CapabilitySourceStrataModels, CheckedAt: now,
+			}})
+		}
 	}
 }
 

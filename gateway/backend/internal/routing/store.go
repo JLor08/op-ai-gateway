@@ -2096,6 +2096,16 @@ const (
 // of any other task carries none, not even a no. It writes the speech,
 // transcription, transcription_streaming, speech_clone and speech_streaming
 // rows, and no other.
+//
+// CapabilitySourceStrataModels names the probe-rank source read from a Strata
+// application's own model listing, GET /v1/models: an entry whose
+// architecture.input_modalities lists "image" is a CapabilityVision yes. It
+// writes that one row, and only ever a yes: a listing without "image" (or
+// without the field) is no verdict, because nothing pins the modality list as
+// exhaustive. Its one producer is the gateway's health loop, for a strata
+// application without its own context probe path (recordListedModelInfos in
+// cmd/gateway). It ranks 1 through capabilitySourceRank's DEFAULT branch like
+// the sources above.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"
@@ -2104,6 +2114,7 @@ const (
 	CapabilitySourceLlamaCppTimings   = "llama_cpp_timings"
 	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
 	CapabilitySourceAudioCppModels    = "audiocpp_models"
+	CapabilitySourceStrataModels      = "strata_models"
 	CapabilitySourceSystemOneProbe    = "systemone_probe"
 	CapabilitySourceDecisionsProbe    = "decisions_probe"
 	CapabilitySourceLegacy            = "legacy"

@@ -29,6 +29,12 @@ const strataShareModelsBody = `{"object":"list","data":[{"id":"unsloth-q8_0","ow
 // /metrics, /health and /v1/status. It records every requested path.
 func strataShareServer(t *testing.T) (*httptest.Server, func() []string) {
 	t.Helper()
+	return strataShareServerWithBody(t, strataShareModelsBody)
+}
+
+// strataShareServerWithBody is strataShareServer answering /v1/models with body.
+func strataShareServerWithBody(t *testing.T, body string) (*httptest.Server, func() []string) {
+	t.Helper()
 	var mu sync.Mutex
 	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +50,7 @@ func strataShareServer(t *testing.T) (*httptest.Server, func() []string) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(strataShareModelsBody))
+		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(srv.Close)
 	return srv, func() []string {
@@ -127,6 +133,7 @@ func TestStrataShareListenerHealthy(t *testing.T) {
 	if mp.ContextSize != 262144 || mp.MetricsSource != "probe" {
 		t.Fatalf("mapping context = %d (source %q), want 262144 (probe)", mp.ContextSize, mp.MetricsSource)
 	}
+	st.assertCapability(t, "m1", routing.CapabilityVision, routing.CapabilityYes, routing.CapabilitySourceStrataModels)
 	for _, p := range requested() {
 		if p != "/v1/models" {
 			t.Fatalf("share was asked for %q; only /v1/models exists there (all requests: %v)", p, requested())
@@ -196,5 +203,55 @@ func TestListedContextSizeRules(t *testing.T) {
 				t.Fatalf("ContextSize = %d, want %d", mp.ContextSize, tc.want)
 			}
 		})
+	}
+}
+
+// runStrataShareCycle runs one health cycle for app against srv through the
+// real provider clients and returns the store.
+func runStrataShareCycle(t *testing.T, srv *httptest.Server, server routing.AIServer, app routing.Application) *fakeHealthStore {
+	t.Helper()
+	st := &fakeHealthStore{
+		servers: []routing.AIServer{server},
+		apps:    map[string][]routing.Application{"s1": {app}},
+		mappings: map[string][]routing.ModelMapping{
+			"a1": {{ID: "m1", ApplicationID: "a1", AppModelName: "unsloth-q8_0", Status: routing.ServerStatusActive, ContextSize: 4096}},
+		},
+	}
+	(&appHealthRunner{store: st, prober: providerClients(0, false, srv.Client()), syncer: nil, registry: gateway.NewAppHealthRegistry(nil), loaded: gateway.NewLoadedModelRegistry(), agents: nil, groups: nil, settings: st, probeTimeout: time.Second, cipher: nil, now: time.Now}).runOnce(context.Background(), &cycleState{lastProbed: map[string]time.Time{}, lastAvail: make(map[string]availWriteState)})
+	return st
+}
+
+// TestStrataTextOnlyListingRecordsNoVision pins that a text-only
+// input_modalities list is no vision verdict: nothing pins it as exhaustive.
+func TestStrataTextOnlyListingRecordsNoVision(t *testing.T) {
+	shrinkRetryGap(t)
+	srv, _ := strataShareServerWithBody(t, `{"object":"list","data":[{"id":"unsloth-q8_0","architecture":{"input_modalities":["text"]},"context_length":262144}]}`)
+	server, app := strataShareApp(t, srv)
+	st := runStrataShareCycle(t, srv, server, app)
+
+	if _, ok := st.capabilityOf("m1", routing.CapabilityVision); ok {
+		t.Fatalf("text-only listing wrote a vision verdict")
+	}
+	if mp, _ := st.mappingOf("m1"); mp.ContextSize != 262144 {
+		t.Fatalf("ContextSize = %d, want 262144", mp.ContextSize)
+	}
+}
+
+// TestListedModelInfosRecordedForStrataOnly pins that the listing's context
+// size and vision verdict are recorded for a strata application only: an
+// existing vllm-typed application whose /v1/models emits context_length and
+// input_modalities (another gateway instance does) keeps its mapping as it was.
+func TestListedModelInfosRecordedForStrataOnly(t *testing.T) {
+	shrinkRetryGap(t)
+	srv, _ := strataShareServer(t)
+	server, app := strataShareApp(t, srv)
+	app.Type = routing.ProviderVLLM
+	st := runStrataShareCycle(t, srv, server, app)
+
+	if mp, _ := st.mappingOf("m1"); mp.ContextSize != 4096 || mp.MetricsSource != "" {
+		t.Fatalf("vllm mapping = %d (source %q), want 4096 untouched", mp.ContextSize, mp.MetricsSource)
+	}
+	if st.ctxProbeSetCount() != 0 || st.capabilityWriteCount() != 0 {
+		t.Fatalf("vllm app wrote %d context and %d capability updates, want none", st.ctxProbeSetCount(), st.capabilityWriteCount())
 	}
 }
