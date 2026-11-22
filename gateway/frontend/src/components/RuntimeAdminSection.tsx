@@ -71,6 +71,7 @@ import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
 import { runtimeSpecTemplate } from './shared/runtimeSpecTemplate';
 import { strataSpecTemplate } from './shared/strataTemplate';
+import { importStrataRunConfig } from './shared/strataRunConfig';
 import {
   formSpecIsLlamaCpp,
   formSpecIsStableDiffusion,
@@ -91,7 +92,12 @@ import {
   systemOneModeOrDefault,
 } from './shared/decisionsModes';
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
-import { CONFIG_FILES_MAX, configFileIssues, type ConfigFileIssue } from './shared/configFiles';
+import {
+  CONFIG_FILES_MAX,
+  CONFIG_FILE_MAX_BYTES,
+  configFileIssues,
+  type ConfigFileIssue,
+} from './shared/configFiles';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { formatArgsText, formatEnvText, parseArgsText, parseEnvText } from './shared/specText';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
@@ -2843,6 +2849,11 @@ export function RuntimeAdminSection({
   // `config_files` clears the stored set, so this state is what keeps a save of
   // an unrelated field from deleting files that were set through the API.
   const [configFiles, setConfigFiles] = useState<ConfigFileRow[]>([]);
+  // The Strata "Import run config" panel (importStrataRunConfig).
+  const [strataImportOpen, setStrataImportOpen] = useState(false);
+  const [strataImportText, setStrataImportText] = useState('');
+  const [strataImportError, setStrataImportError] = useState('');
+  const [strataImportNotes, setStrataImportNotes] = useState<string[]>([]);
   // The cluster head configuration and the spec's device backend, bound from
   // the loaded spec and sent back by buildSpecBody for the same full-document
   // reason: a save without them turns a cluster head into a plain spec.
@@ -2956,6 +2967,10 @@ export function RuntimeAdminSection({
     setSpecDecisionsMode(defaultDecisionsMode);
     setSpecSystemOneMode(defaultSystemOneMode);
     setSpecType('');
+    setStrataImportOpen(false);
+    setStrataImportText('');
+    setStrataImportError('');
+    setStrataImportNotes([]);
     setSpecLiveTimings(undefined);
     setMetricsPath('');
     setContextProbePath('');
@@ -3013,6 +3028,10 @@ export function RuntimeAdminSection({
     setSpecDecisionsMode(decisionsModeOrDefault(spec.decisions_mode));
     setSpecSystemOneMode(systemOneModeOrDefault(spec.systemone_mode));
     setSpecType(spec.type);
+    setStrataImportOpen(false);
+    setStrataImportText('');
+    setStrataImportError('');
+    setStrataImportNotes([]);
     // `configured: false` means the mapping has no spec row, so what the
     // document carries are zero values, defaults and app-derived echoes
     // rather than stored choices -- that `false` is not an operator decision
@@ -3156,6 +3175,66 @@ export function RuntimeAdminSection({
         ? rows
         : [...rows, { rowKey: makeRowKey(), name: '', content: '' }],
     );
+  }
+  // Writes (or replaces) strata.json, the GPU rows in declared order (position
+  // 1 = main), the startup timeout, and the upstream model name when it is
+  // still empty. Nothing is touched when the text is refused.
+  function applyStrataImport() {
+    const result = importStrataRunConfig(strataImportText);
+    if (!result.ok) {
+      setStrataImportError(
+        result.error === 'invalid_json'
+          ? t.strataImportErrorInvalidJson
+          : result.error === 'missing_exe'
+            ? t.strataImportErrorMissingExe
+            : t.strataImportErrorMissingArgs,
+      );
+      setStrataImportNotes([]);
+      return;
+    }
+    if (new TextEncoder().encode(result.fileContent).length > CONFIG_FILE_MAX_BYTES) {
+      setStrataImportError(t.strataImportTooLarge);
+      setStrataImportNotes([]);
+      return;
+    }
+    const existing = configFiles.findIndex((r) => r.name === 'strata.json');
+    if (existing < 0 && configFiles.length >= CONFIG_FILES_MAX) {
+      setStrataImportError(t.strataImportNoFreeSlot);
+      setStrataImportNotes([]);
+      return;
+    }
+    setConfigFiles((rows) => {
+      const i = rows.findIndex((r) => r.name === 'strata.json');
+      return i >= 0
+        ? rows.map((r, j) => (j === i ? { ...r, content: result.fileContent } : r))
+        : [...rows, { rowKey: makeRowKey(), name: 'strata.json', content: result.fileContent }];
+    });
+    if (result.gpuOrder.length > 0) {
+      // Keep each surviving index's budgets; new indexes start at zero.
+      const byIndex = new Map(gpuRows.map((r) => [r.index, r]));
+      setGpuRows(
+        result.gpuOrder.map(
+          (index) =>
+            byIndex.get(index) ?? {
+              rowKey: makeRowKey(),
+              index,
+              vramEstimateMb: 0,
+              vramMeasuredMb: 0,
+            },
+        ),
+      );
+    }
+    setStartupTimeoutSeconds(result.startupTimeoutSeconds);
+    if (result.upstreamModel !== undefined && appName === '') setAppName(result.upstreamModel);
+    setStrataImportError('');
+    setStrataImportNotes([
+      t.strataImportDone,
+      ...result.warnings.map((w) =>
+        w === 'layer_split_positional' ? t.strataImportWarnLayerSplit : t.strataImportWarnApiKey,
+      ),
+    ]);
+    setStrataImportText('');
+    setStrataImportOpen(false);
   }
   function removeConfigFile(idx: number) {
     setConfigFiles((rows) => rows.filter((_, i) => i !== idx));
@@ -5355,7 +5434,63 @@ export function RuntimeAdminSection({
                 >
                   {t.runtimeSpecConfigFileAdd}
                 </Button>
+                {specType === 'strata' && (
+                  <Button
+                    type="button"
+                    variant="outlined"
+                    size="small"
+                    sx={{ ml: 1 }}
+                    onClick={() => setStrataImportOpen((o) => !o)}
+                  >
+                    {t.strataImportOpen}
+                  </Button>
+                )}
               </Box>
+              {specType === 'strata' && strataImportOpen && (
+                <Box sx={{ display: 'grid', gap: 1 }}>
+                  <Typography variant="caption" color="text.secondary">
+                    {t.strataImportHint}
+                  </Typography>
+                  <Field
+                    id="runtime-spec-strata-import"
+                    label={t.strataImportLabel}
+                    value={strataImportText}
+                    onChange={(e) => setStrataImportText(e.target.value)}
+                    multiline
+                    minRows={6}
+                    inputProps={{ spellCheck: false }}
+                    sx={{ '& textarea': { fontFamily: 'monospace' } }}
+                  />
+                  {strataImportError !== '' && <Alert severity="error">{strataImportError}</Alert>}
+                  <Box sx={{ display: 'flex', gap: 1 }}>
+                    <Button
+                      type="button"
+                      variant="contained"
+                      size="small"
+                      onClick={applyStrataImport}
+                    >
+                      {t.strataImportApply}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="small"
+                      color="secondary"
+                      onClick={() => {
+                        setStrataImportOpen(false);
+                        setStrataImportError('');
+                      }}
+                    >
+                      {t.strataImportCancel}
+                    </Button>
+                  </Box>
+                </Box>
+              )}
+              {specType === 'strata' &&
+                strataImportNotes.map((note, i) => (
+                  <Alert key={note} severity={i === 0 ? 'success' : 'warning'}>
+                    {note}
+                  </Alert>
+                ))}
             </Box>
             <Field
               id="runtime-spec-work-dir"

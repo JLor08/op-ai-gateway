@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import strataFixtureText from './shared/__fixtures__/strata-launch-q8_0.json?raw';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -13713,5 +13714,53 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
+  });
+});
+
+describe('RuntimeAdminSection strata run-config import', () => {
+  async function openImport() {
+    const view = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
+    return view;
+  }
+
+  it('offers the import only for strata', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByRole('button', { name: t.strataImportOpen })).not.toBeInTheDocument();
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.getByRole('button', { name: t.strataImportOpen })).toBeInTheDocument();
+  });
+
+  it('fills strata.json, the GPU rows 2,0,1, the timeout and the model name', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByLabelText(t.runtimeSpecConfigFileName)).toHaveValue('strata.json');
+    const content = screen.getByLabelText(t.runtimeSpecConfigFileContent) as HTMLTextAreaElement;
+    expect(JSON.parse(content.value).model_name).toBe('${MODEL}');
+    const indexes = [0, 1, 2].map(
+      (i) =>
+        (
+          screen.getByLabelText(`${t.runtimeSpecGpuIndex}`, {
+            selector: `#runtime-spec-gpu-index-${i}`,
+          }) as HTMLInputElement
+        ).value,
+    );
+    expect(indexes).toEqual(['2', '0', '1']);
+    expect(screen.getByLabelText(t.runtimeSpecStartupTimeout)).toHaveValue(1905);
+    expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('qwen3.8-flash-next-unsloth-q8_0');
+  });
+
+  it('shows an inline error and writes nothing for a bad paste', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), { target: { value: '{nope' } });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByText(t.strataImportErrorInvalidJson)).toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecConfigFileName)).not.toBeInTheDocument();
   });
 });

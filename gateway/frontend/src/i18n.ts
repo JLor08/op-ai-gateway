@@ -1621,6 +1621,22 @@ const de = {
   runtimeSpecConfigFileContent: 'Inhalt',
   runtimeSpecConfigFileAdd: 'Datei hinzufügen',
   runtimeSpecConfigFileRemove: 'Datei entfernen',
+  strataImportOpen: 'Run-Konfiguration importieren',
+  strataImportHint:
+    'Fügen Sie die JSON-Datei ein, die `strata launch` geschrieben hat (%LOCALAPPDATA%\\Strata\\launch\\<name>.json). Sie wird zur Konfigurationsdatei strata.json; GPU-Reihenfolge, Startup-Timeout und Modellname werden vorgeschlagen.',
+  strataImportLabel: 'Run-Konfiguration (JSON)',
+  strataImportApply: 'Importieren',
+  strataImportCancel: 'Abbrechen',
+  strataImportErrorInvalidJson: 'Das ist kein gültiges JSON-Objekt.',
+  strataImportErrorMissingExe: 'Das Feld "exe" fehlt.',
+  strataImportErrorMissingArgs: 'Das Feld "args" fehlt oder ist keine Liste.',
+  strataImportWarnLayerSplit:
+    'layer_split ist positionsabhängig: Eine andere GPU-Reihenfolge ändert seine Bedeutung.',
+  strataImportWarnApiKey:
+    'api_key wurde nicht übernommen: Der Schlüssel gehört in das Token der Spec, nicht in die Datei.',
+  strataImportDone: 'Importiert: strata.json, GPU-Reihenfolge und Startup-Timeout wurden gesetzt.',
+  strataImportTooLarge: 'Die importierte Datei überschreitet das Limit von 64 KiB.',
+  strataImportNoFreeSlot: 'Es ist kein Platz für eine weitere Konfigurationsdatei (Maximum 16).',
   runtimeSpecConfigFileNameBlank: 'Der Dateiname fehlt.',
   runtimeSpecConfigFileNameInvalid: String.raw`Der Name muss ein einzelner Dateiname sein: keine Pfadtrenner (/ \), kein „.“ oder „..“, kein Doppelpunkt, keine Steuerzeichen.`,
   runtimeSpecConfigFileNameDuplicate:
@@ -5687,6 +5703,21 @@ const en: PortalMessages = {
   runtimeSpecConfigFileContent: 'Content',
   runtimeSpecConfigFileAdd: 'Add file',
   runtimeSpecConfigFileRemove: 'Remove file',
+  strataImportOpen: 'Import run config',
+  strataImportHint:
+    'Paste the JSON file `strata launch` wrote (%LOCALAPPDATA%\\Strata\\launch\\<name>.json). It becomes the config file strata.json; the GPU order, startup timeout and model name are proposed.',
+  strataImportLabel: 'Run config (JSON)',
+  strataImportApply: 'Import',
+  strataImportCancel: 'Cancel',
+  strataImportErrorInvalidJson: 'This is not a valid JSON object.',
+  strataImportErrorMissingExe: 'The "exe" field is missing.',
+  strataImportErrorMissingArgs: 'The "args" field is missing or not a list.',
+  strataImportWarnLayerSplit: 'layer_split is positional: reordering the GPUs changes its meaning.',
+  strataImportWarnApiKey:
+    'api_key was not imported: the key belongs in the spec token, not in the file.',
+  strataImportDone: 'Imported: strata.json, the GPU order and the startup timeout were set.',
+  strataImportTooLarge: 'The imported file exceeds the 64 KiB limit.',
+  strataImportNoFreeSlot: 'There is no room for another config file (maximum 16).',
   runtimeSpecConfigFileNameBlank: 'The file name is missing.',
   runtimeSpecConfigFileNameInvalid: String.raw`The name must be a single file name: no path separators (/ \), no "." or "..", no colon, no control characters.`,
   runtimeSpecConfigFileNameDuplicate:
