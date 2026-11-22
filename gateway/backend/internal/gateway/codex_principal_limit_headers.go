@@ -90,11 +90,40 @@ func attachCodexPrincipalLimitStanding(ctx context.Context, dst http.Header, now
 	if hasCodexRateLimitHeader(dst) {
 		return
 	}
-	r, ok := limitStandingFrom(ctx).Fullest()
-	if !ok || !r.Reset.After(now) {
+	r, ok := codexPrincipalLimitReading(ctx, now)
+	if !ok {
 		return
 	}
 	writeCodexLimitStanding(dst, r, offerModelSwitch)
+}
+
+// codexGatewayTakeoverPercent is the written percent from which the gateway's own
+// limit replaces the cached subscription windows on a reply. 75 is the first step
+// at which the Codex CLI warns about a rate-limit window, so the gateway's limit is
+// visible from the moment Codex would start warning.
+const codexGatewayTakeoverPercent = 75
+
+// codexPrincipalLimitReading selects the reading the gateway describes to the Codex
+// CLI: the principal's fullest limit, only while its reset still lies after now. ok
+// is false when there is no describable standing (none, a failed reading, or a
+// reset that has passed). The standing writer and the takeover predicate share it so
+// both judge the same reading.
+func codexPrincipalLimitReading(ctx context.Context, now time.Time) (LimitReading, bool) {
+	r, ok := limitStandingFrom(ctx).Fullest()
+	if !ok || !r.Reset.After(now) {
+		return LimitReading{}, false
+	}
+	return r, true
+}
+
+// codexGatewayLimitTakesOver decides whether the cached subscription windows yield
+// to the gateway's own limit on a reply (ADR-109 amendment): true when the
+// principal's describable reading would be written at codexGatewayTakeoverPercent
+// or more. It compares the written (floored, clamped) percent, so it agrees with
+// what the CLI would show.
+func codexGatewayLimitTakesOver(ctx context.Context, now time.Time) bool {
+	r, ok := codexPrincipalLimitReading(ctx, now)
+	return ok && overageUtilizationCents(r.Utilization()) >= codexGatewayTakeoverPercent
 }
 
 // attachTranslatedCodexUsageLimits fills the client header set of a translated

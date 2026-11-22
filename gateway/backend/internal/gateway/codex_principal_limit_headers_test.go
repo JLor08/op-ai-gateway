@@ -228,3 +228,33 @@ func TestLimitRetryAfterSeconds(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexGatewayLimitTakesOver(t *testing.T) {
+	at := func(used, limitCap float64, reset time.Time) LimitReading {
+		r := codexTokenReading(used, limitCap)
+		r.Reset = reset
+		return r
+	}
+	requestQuota := LimitReading{Kind: LimitKindRequestQuota, Used: 80, Cap: 100, Period: "day", Reset: codexTestReset}
+	cases := []struct {
+		name string
+		ctx  context.Context
+		want bool
+	}{
+		{"74 percent", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(749, 1000)}), false},
+		{"75 percent", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(750, 1000)}), true},
+		{"clamped 99", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(1000, 1000)}), true},
+		{"fullest decides", withLimitStanding(context.Background(), LimitStanding{requestQuota, codexTokenReading(100, 1000)}), true},
+		{"no standing", context.Background(), false},
+		{"failed reading", withLimitStanding(context.Background(), LimitStanding{codexTokenReading(900, 1000), {Kind: LimitKindCostBudget, Failed: true}}), false},
+		{"reset equals now", withLimitStanding(context.Background(), LimitStanding{at(900, 1000, codexTestNow)}), false},
+		{"reset before now", withLimitStanding(context.Background(), LimitStanding{at(900, 1000, codexTestNow.Add(-time.Minute))}), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := codexGatewayLimitTakesOver(c.ctx, codexTestNow); got != c.want {
+				t.Errorf("codexGatewayLimitTakesOver = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
