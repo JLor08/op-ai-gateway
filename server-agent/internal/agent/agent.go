@@ -441,7 +441,13 @@ import (
 // WebSocket to a managed child's /v1/realtime and holds the spec admitted for
 // the session. This is the ONE bump for the whole branch; later commits on it
 // do not bump again.
-const Version = "0.20.1"
+//
+// 0.20.1 -> 0.21.0 is the single bump for Strata support (#424). MINOR:
+// agent.Features gains the runtime_gpu_main_last entry (the
+// ${HOST_GPU_IDS_MAIN_LAST} placeholder) and the runtime_process_tree_job
+// entry (process-tree job supervision). This is the ONE bump for the whole
+// branch; later commits on it do not bump again.
+const Version = "0.21.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

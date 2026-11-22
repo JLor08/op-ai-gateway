@@ -1608,7 +1608,7 @@ const de = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} funktioniert nur auf einem macOS-Host; der verbundene Agent läuft auf einem anderen Betriebssystem.',
   runtimeSpecEnvHint:
-    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. ${DEVICES}, ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen die GPU-Zeilen als Gerätenamen; ${RPC_SERVERS} und ${RPC_DEVICES} gibt es nur auf einem Cluster-Head. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
+    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. ${DEVICES}, ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen die GPU-Zeilen als Gerätenamen; ${RPC_SERVERS} und ${RPC_DEVICES} gibt es nur auf einem Cluster-Head. ${HOST_GPU_IDS_MAIN_LAST} nennt die Kartennummern des Hosts in deklarierter Reihenfolge, die zuerst eingetragene Karte (Hauptkarte) steht zuletzt. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
   runtimeSpecPlaceholderInvalid:
@@ -5690,7 +5690,7 @@ const en: PortalMessages = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} only works on a macOS host; the connected agent runs on a different operating system.',
   runtimeSpecEnvHint:
-    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. ${DEVICES}, ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name the GPU rows as device names; ${RPC_SERVERS} and ${RPC_DEVICES} exist only on a cluster head. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
+    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. ${DEVICES}, ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name the GPU rows as device names; ${RPC_SERVERS} and ${RPC_DEVICES} exist only on a cluster head. ${HOST_GPU_IDS_MAIN_LAST} lists the host's card numbers in declared order, with the first declared card (the main card) moved last. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
   runtimeSpecPlaceholderInvalid:

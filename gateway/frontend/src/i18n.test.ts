@@ -4822,6 +4822,15 @@ describe('strata runtime spec i18n keys', () => {
   });
 });
 
+describe('main-last GPU placeholder hint', () => {
+  it('names ${HOST_GPU_IDS_MAIN_LAST} in the env hint in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].runtimeSpecEnvHint).toContain('${HOST_GPU_IDS_MAIN_LAST}');
+    }
+    expect(messages.en.runtimeSpecEnvHint).not.toBe(messages.de.runtimeSpecEnvHint);
+  });
+});
+
 describe('realtime capability i18n keys', () => {
   it('has the form control, hint and chip keys in de and en; the labels match and the hint differs', () => {
     for (const key of [

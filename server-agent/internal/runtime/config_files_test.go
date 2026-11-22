@@ -46,6 +46,8 @@ func TestExpandConfigFileContentResolvesNonSecretTokens(t *testing.T) {
 		{"port", `port=${PORT}`, `port=8123`},
 		{"model", `id "${MODEL}"`, `id "model-spec-a"`},
 		{"host gpu ids", `ids=${HOST_GPU_IDS}`, `ids=3,1`},
+		{"host gpu ids main last", `ids=${HOST_GPU_IDS_MAIN_LAST}`, `ids=1,3`},
+		{"near miss main last", `ids=${HOST_GPU_IDS_MAIN_LAS}`, `ids=${HOST_GPU_IDS_MAIN_LAS}`},
 		{"cuda devices", `d=${CUDA_DEVICES}`, `d=CUDA3,CUDA1`},
 		{"vulkan devices", `d=${VULKAN_DEVICES}`, `d=Vulkan3,Vulkan1`},
 		{"metal devices", `d=${METAL_DEVICES}`, `d=MTL3,MTL1`},
@@ -119,6 +121,7 @@ func TestConfigFileContentMalformedPlaceholders(t *testing.T) {
 		{"port suffix", spec, `${PORT_1}`},
 		{"model without upstream model", noGPU, `${MODEL}`},
 		{"host gpu ids without gpus", noGPU, `${HOST_GPU_IDS}`},
+		{"host gpu ids main last without gpus", noGPU, `${HOST_GPU_IDS_MAIN_LAST}`},
 		{"cuda devices without gpus", noGPU, `${CUDA_DEVICES}`},
 	}
 	for _, tc := range cases {

@@ -394,6 +394,22 @@ var Features = []Feature{
 	//
 	// Since is 0.20.0: agent.Features gains an entry, so the rule is a MINOR bump.
 	{Name: FeatureRealtimeProxy, Since: "0.20.0"},
+
+	// runtime_gpu_main_last: the agent resolves ${HOST_GPU_IDS_MAIN_LAST} (the
+	// spec's host GPU indices with the first declared GPU moved last) in args,
+	// env and config-file content. The gateway sends a spec using it only to an
+	// agent declaring it.
+	//
+	// Since is 0.21.0: agent.Features gains an entry, so the rule is a MINOR bump.
+	{Name: FeatureRuntimeGPUMainLast, Since: "0.21.0"},
+
+	// runtime_process_tree_job: the agent can supervise a spec's whole process
+	// tree (a Windows Job Object) so a launcher that spawns the real server is
+	// stopped as one. Declared unconditionally on every OS, like
+	// runtime_exec_wsl; the gateway checks the agent's reported OS separately.
+	//
+	// Since is 0.21.0: agent.Features gains an entry, so the rule is a MINOR bump.
+	{Name: FeatureRuntimeProcessTreeJob, Since: "0.21.0"},
 }
 
 // FeatureRuntimeInstances names the runtime_instances feature (see its registry
@@ -415,6 +431,14 @@ const FeatureRuntimeExecWSL = "runtime_exec_wsl"
 // FeatureRealtimeProxy names the realtime_proxy feature (see its registry entry
 // above): the router serves GET /realtime/{model}, a WebSocket relay.
 const FeatureRealtimeProxy = "realtime_proxy"
+
+// FeatureRuntimeGPUMainLast names the runtime_gpu_main_last feature (see its
+// registry entry above): the ${HOST_GPU_IDS_MAIN_LAST} placeholder.
+const FeatureRuntimeGPUMainLast = "runtime_gpu_main_last"
+
+// FeatureRuntimeProcessTreeJob names the runtime_process_tree_job feature (see
+// its registry entry above): process-tree supervision of a spec's launcher.
+const FeatureRuntimeProcessTreeJob = "runtime_process_tree_job"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {
