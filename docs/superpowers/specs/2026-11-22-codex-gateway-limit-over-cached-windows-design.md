@@ -82,6 +82,11 @@ Decided details:
   caller still leaves room for the gateway's window, as today, at any utilization.
 - **Without a quota or budget** (empty standing), with a failed reading, or with a reset not after now, there is no
   takeover: the cache attaches as today. With the memory driver a configured principal reads 0 %, so no takeover there.
+- **A native 2xx without Codex headers from a vendor account** (normal for an API-key account, rare for a subscription)
+  is treated like a local reply: the takeover applies. Nothing from the vendor is replaced, so no anti-goal is touched.
+  *(designer's call, raised by the builder check)*
+- **Translate replies are never subscription replies:** an OpenAI subscription target on `openai_responses` is always
+  native passthrough (`vendorSubscriptionOpenAITarget`, `routing/resolver.go`), so every translate reply is a local one.
 - **Observation is unchanged.** Vendor responses keep feeding the cache; a takeover reply only skips the attach.
 - **Credits.** Unchanged rules: the gateway's window carries `x-codex-credits-has-credits: true` and
   `x-codex-credits-unlimited: false` unless the token has `codex_model_switch_prompt`. With that switch Codex may now show
@@ -180,6 +185,11 @@ Path tests (`codex_principal_limit_paths_test.go`, fixtures `newCodexWindowsFixt
   only…" bullet.
 - Risk row "The gateway's own-limit display in Codex rests on undocumented client behavior" (`11-risks-and-technical-debt.md`):
   the "no gateway warning while cached windows are in the future" sentence, plus the shared warning steps.
+- `docs/architecture/reference/api-surface.md` (the `/v1/responses` row: "on a success that carries no subscription
+  figures").
+- The ADR-109 amendment links the pull request; its number is added in a commit once the PR exists.
+- If the stub run (§9) contradicts §6, the docs describe what was observed; the decision goes back to the owner only if
+  the gateway's window or its warnings do not appear on takeover replies.
 - Any other mention found by grepping for the old rule (e.g. "only on responses that carry no subscription figure",
   "relayed or cached").
 
