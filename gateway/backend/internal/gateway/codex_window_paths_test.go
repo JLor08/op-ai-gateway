@@ -102,7 +102,11 @@ func newCodexWindowsFixture(t *testing.T, localResponsesMode routing.EndpointMod
 		}
 	}
 	enableVendorAccountsFlag(t, srv)
-	return &codexWindowsFixture{windowsFixture: &windowsFixture{srv: srv, prov: &cprov.windowsProvider}, cprov: cprov, routes: routes}
+	f := &codexWindowsFixture{windowsFixture: &windowsFixture{srv: srv, prov: &cprov.windowsProvider}, cprov: cprov, routes: routes}
+	// The owner's token opts into usage-limit signals (#420), as the scenarios of
+	// this file assume; usage_limit_optin_codex_test.go flips it off.
+	f.setSendUsageLimits(t, true)
+	return f
 }
 
 func (f *codexWindowsFixture) observeViaVendor(t *testing.T, secret string) {
@@ -224,7 +228,7 @@ func TestCodexWindowsNotObservedForNonEntitledAndForgottenOnRevocation(t *testin
 	if err := mf.routes.UpdateApplication(context.Background(), app); err != nil {
 		t.Fatalf("UpdateApplication: %v", err)
 	}
-	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_cw_member", UserID: "usr_va_b", Active: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
+	srv.Tokens.(*auth.TokenStore).AddPlainToken(auth.Token{ID: "tok_cw_member", UserID: "usr_va_b", Active: true, SendUsageLimits: true, Scopes: []string{"gateway:use"}, VendorAccess: auth.VendorAccess{Accounts: []auth.VendorAccessEntry{{AccountID: accountID}}}}, memberSecret)
 	cprov := &codexWindowsProvider{windowsProvider: windowsProvider{localStatus: http.StatusOK}, vendorStatus: http.StatusOK, vendorHdr: codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour)}
 	srv.Provider = cprov
 	f := &windowsFixture{srv: srv, prov: &cprov.windowsProvider}
@@ -288,7 +292,7 @@ func TestCodexWindowsObservedFrom429(t *testing.T) {
 func TestCodexWindowsNeedAPrincipal(t *testing.T) {
 	f := newCodexWindowsFixture(t, routing.EndpointModePassthrough)
 	target := routing.Target{Provider: routing.ProviderVendorOpenAISubscription}
-	f.srv.observeCodexRateLimitWindows(auth.Token{ID: "t"}, target, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
+	f.srv.observeCodexRateLimitWindows(auth.Token{ID: "t", SendUsageLimits: true}, target, codexWindowHeaders(time.Now(), time.Hour, 24*time.Hour))
 	if n := len(f.srv.codexRateLimitWindows.entries); n != 0 {
 		t.Fatalf("a token without a principal cached %d entries", n)
 	}

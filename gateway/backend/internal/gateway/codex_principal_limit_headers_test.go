@@ -25,7 +25,7 @@ func codexTokenReading(used, limitCap float64) LimitReading {
 
 func TestCodexLimitStandingHeaders(t *testing.T) {
 	h := http.Header{}
-	writeCodexLimitStanding(h, codexTokenReading(620, 1000))
+	writeCodexLimitStanding(h, codexTokenReading(620, 1000), false)
 	want := map[string]string{
 		"X-Codex-Primary-Used-Percent":   "62",
 		"X-Codex-Primary-Window-Minutes": "1440",
@@ -55,7 +55,7 @@ func TestCodexWindowMinutesPerPeriod(t *testing.T) {
 	h := http.Header{}
 	r := codexTokenReading(1, 10)
 	r.Period = "year"
-	writeCodexLimitStanding(h, r)
+	writeCodexLimitStanding(h, r, false)
 	if _, ok := h["X-Codex-Primary-Window-Minutes"]; ok {
 		t.Error("unknown period must write no window-minutes header")
 	}
@@ -67,7 +67,7 @@ func TestCodexLimitStandingClampsBelow100(t *testing.T) {
 		want           string
 	}{{1000, 1000, "99"}, {1500, 1000, "99"}, {0, 1000, "0"}, {29, 100, "29"}} {
 		h := http.Header{}
-		writeCodexLimitStanding(h, codexTokenReading(c.used, c.limitCap))
+		writeCodexLimitStanding(h, codexTokenReading(c.used, c.limitCap), false)
 		if got := h.Get("X-Codex-Primary-Used-Percent"); got != c.want {
 			t.Errorf("%v/%v: used percent = %q, want %q", c.used, c.limitCap, got, c.want)
 		}
@@ -114,7 +114,7 @@ func TestAttachCodexPrincipalLimitStanding(t *testing.T) {
 
 	t.Run("writes", func(t *testing.T) {
 		h := http.Header{}
-		attachCodexPrincipalLimitStanding(standing(codexTokenReading(620, 1000)), h, codexTestNow)
+		attachCodexPrincipalLimitStanding(standing(codexTokenReading(620, 1000)), h, codexTestNow, false)
 		if got := h.Get("X-Codex-Primary-Used-Percent"); got != "62" {
 			t.Errorf("used percent = %q, want 62", got)
 		}
@@ -135,7 +135,7 @@ func TestAttachCodexPrincipalLimitStanding(t *testing.T) {
 	for _, c := range noops {
 		t.Run(c.name, func(t *testing.T) {
 			before := c.dst.Clone()
-			attachCodexPrincipalLimitStanding(c.ctx, c.dst, codexTestNow)
+			attachCodexPrincipalLimitStanding(c.ctx, c.dst, codexTestNow, false)
 			if !reflect.DeepEqual(before, c.dst) {
 				t.Errorf("dst changed: %v -> %v", before, c.dst)
 			}
@@ -146,7 +146,7 @@ func TestAttachCodexPrincipalLimitStanding(t *testing.T) {
 func TestWriteCodexLimitBlocked(t *testing.T) {
 	r := codexTokenReading(1000, 1000)
 	rec := httptest.NewRecorder()
-	writeCodexLimitBlocked(rec, r, codexTestNow)
+	writeCodexLimitBlocked(rec, r, codexTestNow, true, false)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -184,7 +184,7 @@ func TestWriteCodexLimitBlocked(t *testing.T) {
 
 	t.Run("cost budget month", func(t *testing.T) {
 		rec := httptest.NewRecorder()
-		writeCodexLimitBlocked(rec, LimitReading{Kind: LimitKindCostBudget, Used: 5, Cap: 5, Period: "month", Reset: codexTestReset}, codexTestNow)
+		writeCodexLimitBlocked(rec, LimitReading{Kind: LimitKindCostBudget, Used: 5, Cap: 5, Period: "month", Reset: codexTestReset}, codexTestNow, true, false)
 		var b codexLimitBlockedBody
 		if err := json.Unmarshal(rec.Body.Bytes(), &b); err != nil {
 			t.Fatal(err)
@@ -201,7 +201,7 @@ func TestWriteCodexLimitBlocked(t *testing.T) {
 		rec := httptest.NewRecorder()
 		past := r
 		past.Reset = codexTestNow.Add(-time.Hour)
-		writeCodexLimitBlocked(rec, past, codexTestNow)
+		writeCodexLimitBlocked(rec, past, codexTestNow, true, false)
 		if got := rec.Header().Get("Retry-After"); got != "1" {
 			t.Errorf("Retry-After = %q, want 1", got)
 		}

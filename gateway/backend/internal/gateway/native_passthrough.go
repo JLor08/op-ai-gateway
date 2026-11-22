@@ -1168,10 +1168,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 			attachPrincipalLimitStanding(r.Context(), w.Header())
 		}
 	} else if rel.pfReq.APIFlavor == inference.APIFlavorOpenAIResponses {
-		// The Codex family is gated like the unified one: the lookup runs only when
-		// the upstream sent a family header. retry-after and x-should-retry always pass.
+		// The Codex family is gated like the unified one: it reaches the client only
+		// when the token opts in (send_usage_limits, #420) and, for vendor figures, is
+		// entitled; the lookup runs only when the upstream sent a family header.
+		// retry-after and x-should-retry always pass.
+		sendUsage := rel.token.SendUsageLimits
 		var gated func(string) bool
-		if hasCodexRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
+		if sendUsage && hasCodexRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
 			gated = isCodexRateLimitHeader
 		}
 		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
@@ -1179,15 +1182,15 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// model) carries the caller's last observed ones, so the Codex CLI keeps its
 		// usage display. Fresh upstream windows are never overlaid, and an error
 		// response keeps exactly what the upstream said.
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 && !hasCodexRateLimitHeader(resp.Header) {
+		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 && !hasCodexRateLimitHeader(resp.Header) {
 			s.attachCodexRateLimitWindows(rel.token, w.Header())
 		}
 		// A principal with quotas or budgets then has its own fullest limit written in
 		// the default x-codex family on any 2xx that carries no Codex figures yet
 		// (including a vendor family withheld from a non-entitled caller). It writes
 		// the client header set only.
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			attachCodexPrincipalLimitStanding(r.Context(), w.Header(), time.Now())
+		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			attachCodexPrincipalLimitStanding(r.Context(), w.Header(), time.Now(), rel.token.CodexModelSwitchPrompt)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)

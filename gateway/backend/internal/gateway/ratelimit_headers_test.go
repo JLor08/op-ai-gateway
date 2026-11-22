@@ -517,7 +517,7 @@ func TestNativeResponsesReselectionDropsFirstAttemptHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(rlMessagesBody))
 	rec := httptest.NewRecorder()
 	nr := nativeRelay{
-		token:    auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true},
+		token:    auth.Token{ID: "tok_dev", UserID: "usr_dev", Active: true, SendUsageLimits: true},
 		target:   lost,
 		path:     "/v1/responses",
 		raw:      []byte(rlMessagesBody),

@@ -208,9 +208,10 @@ func (c *rateLimitWindowCache) AttachCodex(key string, dst http.Header, now time
 
 // observeCodexRateLimitWindows records the Codex windows of a vendor-OpenAI response
 // for an entitled caller; an unentitled caller records nothing and loses any entry
-// cached from that account, as on Messages.
+// cached from that account, as on Messages. A token without the send_usage_limits
+// opt-in (#420) records nothing.
 func (s *Server) observeCodexRateLimitWindows(token auth.Token, target routing.Target, h http.Header) {
-	if s.codexRateLimitWindows == nil || !routing.IsOpenAIVendorProvider(target.Provider) {
+	if !token.SendUsageLimits || s.codexRateLimitWindows == nil || !routing.IsOpenAIVendorProvider(target.Provider) {
 		return
 	}
 	windows, names, fresh := parseCodexWindows(h)
@@ -231,7 +232,7 @@ func (s *Server) observeCodexRateLimitWindows(token auth.Token, target routing.T
 // attachCodexRateLimitWindows writes the caller's last observed Codex windows into
 // dst, the header set of a /v1/responses success that carries none of its own.
 func (s *Server) attachCodexRateLimitWindows(token auth.Token, dst http.Header) {
-	if s.codexRateLimitWindows == nil {
+	if !token.SendUsageLimits || s.codexRateLimitWindows == nil {
 		return
 	}
 	if key, ok := principalKey(token); ok {
