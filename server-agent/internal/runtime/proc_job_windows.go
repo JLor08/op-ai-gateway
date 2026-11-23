@@ -127,9 +127,21 @@ func startInJob(cmd *exec.Cmd) (*jobControl, error) {
 	fail := func(step string, err error) (*jobControl, error) {
 		// TerminateProcess works on a suspended process; the reap releases
 		// the pipes os/exec opened, since no caller will Wait on this cmd.
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+		// The reap blocks only after a kill that succeeded: a failed kill can
+		// leave the child suspended forever, and a synchronous Wait on it
+		// would block the owner goroutine, so that reap runs in the
+		// background instead (it ends, and releases the pipes, if the child
+		// ever does). The job handle is closed either way; once the child is
+		// assigned, that close kills it too (kill-on-close).
+		killErr := cmd.Process.Kill()
 		_ = windows.CloseHandle(job)
+		if killErr == nil {
+			_ = cmd.Wait()
+		} else {
+			slog.Warn("runtime: killing a job child after a failed start failed; reaping it in the background",
+				"pid", pid, "step", step, "error", killErr)
+			go func() { _ = cmd.Wait() }()
+		}
 		return nil, fmt.Errorf("runtime: process_tree job: %s: %w", step, err)
 	}
 
