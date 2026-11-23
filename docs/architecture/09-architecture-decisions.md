@@ -13329,7 +13329,7 @@ facts were measured against a running desktop app.
 - **The application type works against both upstream shapes.** Defaults: port 8080, flavors `openai` and `anthropic`,
   `responses_mode` and `messages_mode` both `passthrough` (Claude Code and Codex speak Strata's native routes), health check
   `health_path` with the path `/v1/models` and loaded models `/v1/models` in the `openai` format (the one route both shapes
-  serve; the application token goes out as `Authorization: Bearer` on every probe, which needed no change), no context
+  serve; the application token goes out in the application's token header, `Authorization: Bearer` by default, on every probe, which needed no change), no context
   probe path, `timeout_ms` 30000 like `llama_cpp`. `/props` and `/metrics` are never requested for it, so the share's 404s
   are not errors.
 - **Context and vision come from `/v1/models`, for `strata` only.** The provider parses `context_length`, else
@@ -13412,8 +13412,8 @@ facts were measured against a running desktop app.
   "Terminate batch job" prompt on Ctrl-Break is the open question; the kill still ends the tree either way).
 - **The gateway refuses a `job` save it knows cannot be honoured.** An operator's spec PUT with `job` is refused with 400
   `runtime_spec.process_tree_unsupported` when the server's reported OS is not Windows, or its agent has declared its
-  features since the gateway started and `runtime_process_tree_job` is not among them. When neither is known yet the save
-  succeeds and the runtime warnings carry `process_tree_agent_unknown`. Silently running a job spec as `direct` would leave
+  features since the gateway started and `runtime_process_tree_job` is not among them. When either fact is still unknown and
+  neither known fact refuses, the save succeeds and the runtime warnings carry `process_tree_agent_unknown`. Silently running a job spec as `direct` would leave
   the engine alive on stop.
 - **Agent `0.20.1` → `0.21.0`, MINOR, one bump for the branch.** Two flags on the agent's list only, both `Since: "0.21.0"`:
   `runtime_gpu_main_last` (resolves the new placeholder; the portal warns when a spec uses it and the agent lacks the flag)

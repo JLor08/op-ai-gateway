@@ -420,8 +420,8 @@ field still holds the previous type's default:
 | `context_probe_path` | empty — the context comes from the listing (below) |
 
 **The API token is required on the share and recommended always.** `/v1/models` and the
-inference routes need Strata's key, which the application's token supplies as
-`Authorization: Bearer` on the health probe, the loaded-models pass and discovery alike, and a
+inference routes need Strata's key, which the application's token supplies in the application's token header
+(`Authorization: Bearer` by default) on the health probe, the loaded-models pass and discovery alike, and a
 keyless Strata answers 403 to a non-IP `Host` header. `/props` and `/metrics` are never
 requested for the type, so the share's 404s on them are no errors.
 

@@ -1138,7 +1138,7 @@ checked after the execution mode, so older refusals keep their answers. An opera
 write is refused with `runtime_spec.process_tree_unsupported` (400) when the server's
 reported OS is not `windows`, or its agent has declared its features since the gateway
 started without `runtime_process_tree_job`; this is the last check of the operator path.
-When neither fact is known yet the save succeeds and the warnings endpoint reports
+When either fact is still unknown and neither known fact refuses, the save succeeds and the warnings endpoint reports
 `process_tree_agent_unknown`. A `wsl` spec may store `job`; it has no effect there.
 The pushed agent document carries `process_tree` only for a `job` spec (absent means
 `direct`), and carries `api_token_header` beside a non-empty `api_token`: the effective
