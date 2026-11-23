@@ -841,6 +841,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// merged with the target's own (anthropicPassthroughHeaderOverrides is nil
 	// everywhere else, which leaves the call exactly as upstreamAuthCtx builds it).
 	ctx = s.upstreamAuthCtxWithHeaders(ctx, rel.target, anthropicPassthroughHeaderOverrides(rel.target, r.Header))
+	// The send timestamp opens the time-to-first-content window of the
+	// gateway-measured prompt rate (usageScanner.setUpstreamSentAt, #426).
+	upstreamSentAt := time.Now()
 	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody, relayContentType)
 	if err != nil {
 		// Pre-response failure: nothing written to the client yet, so return a JSON error.
@@ -1236,7 +1239,8 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// above instead).
 	imgCounter := newImagesDataCounter(rel.pfReq.APIFlavor)
 	var respBuf bytes.Buffer
-	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress, rel.target.VendorAccountID != "")
+	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress)
+	scanner.setUpstreamSentAt(upstreamSentAt)
 	// The transcription endpoint is the one openai_audio endpoint that streams a
 	// 2xx through here, and the only one with a scan of its own: it reads the event
 	// stream for the completion that bills it and the transcript that is captured

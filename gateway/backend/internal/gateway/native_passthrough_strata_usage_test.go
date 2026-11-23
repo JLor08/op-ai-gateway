@@ -236,15 +236,17 @@ func TestStrataResponsesBufferedRecordsTopLevelTimings(t *testing.T) {
 	}
 }
 
-// Strata's /v1/messages carries no `timings` upstream, so a Claude Code request
-// to Strata records no tokens per second: the documented gap of §4.7a (a
-// gateway-measured rate for it is a follow-up). Pinned so a change is noticed.
-func TestStrataMessagesRecordsNoRates(t *testing.T) {
+// Strata's /v1/messages carries no `timings` upstream. A BUFFERED answer has no
+// first-content frame distinct from its end, so neither the gateway generation
+// rate nor the gateway-measured prompt rate (#426) can be derived for it: the
+// row records 0/0. A streamed answer is rated by the gateway
+// (TestPassthroughAnthropicGatewayPromptRateCountsFreshAndCacheCreation).
+func TestStrataBufferedMessagesRecordsNoRates(t *testing.T) {
 	body := `{"id":"msg_1","type":"message","role":"assistant","model":"strata-model","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":` + strataAnthropicUsage + `}`
 	srv := newStrataTestServer(t, strataUpstream(t, "application/json", body).URL)
 	postStrata(t, srv, "/v1/messages", `{"model":"strata-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`)
 	ev := lastUsageEvent(t, srv)
 	if ev.PromptPerSecond != 0 || ev.TokensPerSecond != 0 {
-		t.Fatalf("recorded prompt/generation tokens per second = %v/%v, want 0/0 (no timings upstream)", ev.PromptPerSecond, ev.TokensPerSecond)
+		t.Fatalf("recorded prompt/generation tokens per second = %v/%v, want 0/0 (no timings upstream, and a buffered body has no window)", ev.PromptPerSecond, ev.TokensPerSecond)
 	}
 }

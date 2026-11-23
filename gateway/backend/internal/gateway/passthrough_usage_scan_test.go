@@ -214,7 +214,7 @@ func TestMergeResponsesUsagePredictedNLandsInTheLiveFieldOnly(t *testing.T) {
 // a whole-request window (or mistaking message_start for content) would yield.
 func TestPassthroughAnthropicRateUsesGenerationWindow(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
 	s.feed([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"), base.Add(time.Second))
@@ -235,7 +235,7 @@ func TestPassthroughAnthropicRateUsesGenerationWindow(t *testing.T) {
 // token count and elapsed time both exist.
 func TestPassthroughAnthropicFallbackNeedsAContentFrame(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
 	s.feed([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n"), base.Add(3*time.Second))
@@ -260,7 +260,7 @@ func TestPassthroughAnthropicFallbackFloorsTheGenerationWindow(t *testing.T) {
 	messageDelta := []byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n")
 
 	t.Run("just under the floor is suppressed", func(t *testing.T) {
-		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil, false)
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 		s.feed(messageStart, base)
 		s.feed(contentDelta, base) // first content frame at t+0
 		s.feed(messageDelta, base.Add(49*time.Millisecond))
@@ -275,7 +275,7 @@ func TestPassthroughAnthropicFallbackFloorsTheGenerationWindow(t *testing.T) {
 	})
 
 	t.Run("just over the floor is honored exactly", func(t *testing.T) {
-		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil, false)
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 		s.feed(messageStart, base)
 		s.feed(contentDelta, base) // first content frame at t+0
 		s.feed(messageDelta, base.Add(51*time.Millisecond))
@@ -317,7 +317,7 @@ func responsesVendorStreamFrames(outputTokens int) (created, reasoning, text, co
 func TestPassthroughVendorResponsesRateWindowStartsAtTheFirstReasoningDelta(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	created, reasoning, text, completed := responsesVendorStreamFrames(40)
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 
 	s.feed(created, base)
 	s.feed(reasoning, base.Add(time.Second))
@@ -339,7 +339,7 @@ func TestPassthroughVendorResponsesRateWindowStartsAtTheFirstReasoningDelta(t *t
 func TestPassthroughVendorResponsesRateWithoutReasoningUsesTheFirstTextDelta(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	created, _, text, completed := responsesVendorStreamFrames(40)
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 
 	s.feed(created, base)
 	s.feed(text, base.Add(time.Second))
@@ -350,16 +350,15 @@ func TestPassthroughVendorResponsesRateWithoutReasoningUsesTheFirstTextDelta(t *
 	}
 }
 
-// TestPassthroughSelfHostedResponsesDerivesNoGatewayRate pins the vendor gate: the
-// SAME stream, on a self-hosted (non-vendor) target, gets NO gateway-derived
-// substitute. For a self-hosted Responses upstream a missing `timings` means "the
-// server did not say", and a gateway-side figure over the whole generation window
-// is a different quantity from llama.cpp's own predicted_per_second -- it would
-// pollute the speed histogram and, through the throughput EWMA, routing.
-func TestPassthroughSelfHostedResponsesDerivesNoGatewayRate(t *testing.T) {
+// TestPassthroughResponsesRateDoesNotDependOnTheTarget: the scanner no longer
+// knows whether the target is a vendor or a self-hosted server (#426). The same
+// stream without `timings` yields the same derived 10.0 t/s either way -- a
+// self-hosted upstream that sends no `timings` (Strata's `strata serve`) is rated
+// exactly as the Anthropic path always rated it.
+func TestPassthroughResponsesRateDoesNotDependOnTheTarget(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	created, reasoning, text, completed := responsesVendorStreamFrames(40)
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 
 	s.feed(created, base)
 	s.feed(reasoning, base.Add(time.Second))
@@ -367,8 +366,8 @@ func TestPassthroughSelfHostedResponsesDerivesNoGatewayRate(t *testing.T) {
 	s.feed(completed, base.Add(5*time.Second))
 
 	u := s.usage()
-	if u.TokensPerSecond != 0 {
-		t.Fatalf("TokensPerSecond = %v, want 0 (a self-hosted Responses stream without upstream timings stays unrated)", u.TokensPerSecond)
+	if u.TokensPerSecond != 10.0 {
+		t.Fatalf("TokensPerSecond = %v, want 10.0 (40 tokens over the 4s window, the same figure a vendor target gets)", u.TokensPerSecond)
 	}
 	if u.OutputTokens != 40 {
 		t.Fatalf("OutputTokens = %d, want 40 (the count itself is unaffected)", u.OutputTokens)
@@ -377,13 +376,12 @@ func TestPassthroughSelfHostedResponsesDerivesNoGatewayRate(t *testing.T) {
 
 // TestPassthroughVendorResponsesNeverOverwritesAnUpstreamRate: a rate the
 // upstream measured and reported (llama.cpp's timings on response.completed) is a
-// measurement and is never replaced by the gateway's estimate, even when the
-// target is flagged vendor.
+// measurement and is never replaced by the gateway's estimate.
 func TestPassthroughVendorResponsesNeverOverwritesAnUpstreamRate(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	created, reasoning, text, _ := responsesVendorStreamFrames(40)
 	completed := []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_v\",\"usage\":{\"input_tokens\":8,\"output_tokens\":40,\"total_tokens\":48}},\"timings\":{\"prompt_per_second\":120.5,\"predicted_per_second\":38.25}}\n\n")
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 
 	s.feed(created, base)
 	s.feed(reasoning, base.Add(time.Second))
@@ -402,7 +400,7 @@ func TestPassthroughVendorResponsesNeverOverwritesAnUpstreamRate(t *testing.T) {
 // whole-request window would produce a rate here.
 func TestPassthroughVendorResponsesBufferedBodyStaysUnrated(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 
 	s.feed([]byte(`{"id":"r","object":"response","usage":{"input_tokens":5,"output_tokens":9,"total_tokens":14}}`), base)
 	s.finish(base.Add(time.Second))
@@ -425,7 +423,7 @@ func TestPassthroughVendorResponsesRateKeepsTheSameGuards(t *testing.T) {
 	created, reasoning, text, completed := responsesVendorStreamFrames(40)
 
 	t.Run("window just under the floor is suppressed", func(t *testing.T) {
-		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 		s.feed(created, base)
 		s.feed(reasoning, base)
 		s.feed(text, base)
@@ -436,7 +434,7 @@ func TestPassthroughVendorResponsesRateKeepsTheSameGuards(t *testing.T) {
 	})
 
 	t.Run("window just over the floor is honored exactly", func(t *testing.T) {
-		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 		s.feed(created, base)
 		s.feed(reasoning, base)
 		s.feed(text, base)
@@ -447,7 +445,7 @@ func TestPassthroughVendorResponsesRateKeepsTheSameGuards(t *testing.T) {
 	})
 
 	t.Run("no content frame, no rate", func(t *testing.T) {
-		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 		s.feed(created, base)
 		s.feed(completed, base.Add(3*time.Second))
 		if got := s.usage().TokensPerSecond; got != 0 {
@@ -458,7 +456,7 @@ func TestPassthroughVendorResponsesRateKeepsTheSameGuards(t *testing.T) {
 	t.Run("no terminal usage frame, no rate", func(t *testing.T) {
 		// A stream cut off after its deltas: no response.completed, so no
 		// authoritative count -- nothing to divide.
-		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 		s.feed(created, base)
 		s.feed(reasoning, base.Add(time.Second))
 		s.feed(text, base.Add(3*time.Second))
@@ -469,7 +467,7 @@ func TestPassthroughVendorResponsesRateKeepsTheSameGuards(t *testing.T) {
 
 	t.Run("a zero output count, no rate", func(t *testing.T) {
 		_, _, _, zero := responsesVendorStreamFrames(0)
-		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, true)
+		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 		s.feed(created, base)
 		s.feed(text, base.Add(time.Second))
 		s.feed(zero, base.Add(3*time.Second))
@@ -484,7 +482,7 @@ func TestPassthroughVendorResponsesRateKeepsTheSameGuards(t *testing.T) {
 // rather than retained and grown further, so a pathological or hostile
 // upstream cannot make the gateway allocate without limit while scanning.
 func TestUsageScannerCarryBoundDropsOnPathologicalLine(t *testing.T) {
-	s := newUsageScanner("openai_responses", 16, nil, false)
+	s := newUsageScanner("openai_responses", 16, nil)
 	s.feed([]byte("0123456789"), time.Now()) // 10 bytes, within bound
 	if len(s.carry) != 10 {
 		t.Fatalf("carry = %d bytes after first feed, want 10", len(s.carry))
@@ -500,7 +498,7 @@ func TestUsageScannerCarryBoundDropsOnPathologicalLine(t *testing.T) {
 // a body is typically ONE JSON object with no embedded newline, so feed alone
 // (which only acts on complete '\n'-terminated lines) would never see it.
 func TestUsageScannerFinishRecoversUnterminatedFinalLine(t *testing.T) {
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 	body := []byte(`{"id":"r","usage":{"input_tokens":5,"output_tokens":9}}`) // no trailing newline
 
 	s.feed(body, time.Now())
@@ -545,7 +543,7 @@ func TestUsageScannerBufferedBodyUsageSurvivesPrettyPrinting(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, false)
+			s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 			now := time.Now()
 			s.feed([]byte(tc.body), now)
 			s.finish(now)
@@ -616,7 +614,7 @@ func TestUsageScannerBufferedBodyOverCapStillYieldsUsage(t *testing.T) {
 			if len(body) <= 2*capBytes {
 				t.Fatalf("test body is %d bytes, must exceed 2*cap=%d to exercise the truncated path", len(body), 2*capBytes)
 			}
-			s := newUsageScanner(tc.apiFlavor, capBytes, nil, false)
+			s := newUsageScanner(tc.apiFlavor, capBytes, nil)
 			now := time.Now()
 			for off := 0; off < len(body); off += 40 {
 				end := off + 40
@@ -735,7 +733,7 @@ func TestBufferedTailUsageBoundsHostileInput(t *testing.T) {
 // each fragment in isolation, then max-merged across fragments) would yield
 // max(8+1, 0+40) = 40, not the true 48.
 func TestUsageScannerTotalTokensAcrossSplitFrames(t *testing.T) {
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 	now := time.Now()
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), now)
 	s.feed([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n"), now)
@@ -788,7 +786,7 @@ func TestIsContentFrame(t *testing.T) {
 // rate.
 func TestPassthroughAnthropicFallbackNeedsAnAuthoritativeTerminalUsageFrame(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 
 	s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
 	s.feed([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"), base.Add(time.Second))
@@ -1041,7 +1039,7 @@ func TestPublishProgressStampsOnlyTheFirstContentFrame(t *testing.T) {
 	contentDelta := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")
 
 	prog := &requestProgress{}
-	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, prog, false)
+	s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, prog)
 
 	s.feed(messageStart, base)
 	if got := prog.firstTokenUnixNano.Load(); got != 0 {
@@ -1099,7 +1097,7 @@ func TestScanKeepsEachFrameSeparateWithinOnePayload(t *testing.T) {
 			`data: {"type":"response.output_text.delta","delta":" there","timings":{"prompt_per_second":140.0,"predicted_per_second":38.25}}` + "\n\n")
 
 	prog := &requestProgress{}
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, prog, false)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, prog)
 	s.feed(payload, at)
 
 	if got := prog.upstreamTPSMilli.Load(); got != 38250 {
@@ -1268,7 +1266,7 @@ func TestUsageScannerResponsesTerminalRateSurvivesLaterFramesAndTheLoopsFrequenc
 		{"a live counter attached: scan's loop keeps running for every frame", &requestProgress{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, tc.prog, false)
+			s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, tc.prog)
 			s.feed(partialPeak, base)
 			s.feed(terminal, base.Add(time.Second))
 			s.feed(trailing, base.Add(2*time.Second))
@@ -1314,7 +1312,7 @@ func TestUsageScannerTerminalRateGateLeavesCountsAndDraftTokensOnTheRunningMax(t
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	t.Run("responses: draft_n keeps its max when the terminal frame omits it", func(t *testing.T) {
-		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, false)
+		s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 		s.feed([]byte("event: response.output_text.delta\n"+
 			`data: {"type":"response.output_text.delta","delta":"hi","timings":{"predicted_per_second":42.5,"draft_n":9}}`+"\n\n"), base)
 		s.feed([]byte("event: response.output_text.delta\n"+
@@ -1332,7 +1330,7 @@ func TestUsageScannerTerminalRateGateLeavesCountsAndDraftTokensOnTheRunningMax(t
 	})
 
 	t.Run("anthropic: a second message_delta still raises the count and the derived rate", func(t *testing.T) {
-		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil, false)
+		s := newUsageScanner("anthropic_messages", defaultCaptureMaxBytes, nil)
 		s.feed([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"), base)
 		s.feed([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n"), base)
 		s.feed([]byte("event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\n"), base.Add(time.Second))
@@ -1389,7 +1387,7 @@ func TestUsageScannerTerminalRateGateLeavesCountsAndDraftTokensOnTheRunningMax(t
 // the last real figure standing — takeLastNonZeroF — instead of erasing it.
 func TestUsageScannerResponsesCutOffStreamRecordsTheLastRateNotThePeak(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 	s.feed([]byte("event: response.output_text.delta\n"+
 		`data: {"type":"response.output_text.delta","delta":"hi","timings":{"prompt_per_second":150.0,"predicted_per_second":50.0}}`+"\n\n"), base)
 	s.feed([]byte("event: response.output_text.delta\n"+
@@ -1426,7 +1424,7 @@ func TestUsageScannerResponsesCutOffStreamRecordsTheLastRateNotThePeak(t *testin
 // is: the rule has to hold structurally, not by luck of arrival order.
 func TestUsageScannerRateSubstitutionNeverZeroesTheAccumulatorsFigure(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil, false)
+	s := newUsageScanner("openai_responses", defaultCaptureMaxBytes, nil)
 	s.feed([]byte("event: response.completed\n"+
 		`data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":40,"total_tokens":48}}}`+"\n\n"), base)
 	s.feed([]byte("event: response.output_text.delta\n"+
@@ -1450,12 +1448,12 @@ func TestUsageScannerRateSubstitutionNeverZeroesTheAccumulatorsFigure(t *testing
 // retention (up to 2×capBytes of audio per in-flight request) only to find that
 // out. The nil scanner is the same nil-safe no-op the images test below pins.
 func TestNewUsageScannerSkipsSpeech(t *testing.T) {
-	if s := newUsageScanner(apiFlavorSpeech, defaultCaptureMaxBytes, nil, false); s != nil {
+	if s := newUsageScanner(apiFlavorSpeech, defaultCaptureMaxBytes, nil); s != nil {
 		t.Fatalf("newUsageScanner(%q) = %+v, want nil -- a binary audio body has no chat usage to scan", apiFlavorSpeech, s)
 	}
 	// Skipping speech must not disturb the flavors that do scan.
 	for _, flavor := range []string{"openai", "openai_responses", "anthropic_messages"} {
-		if newUsageScanner(flavor, defaultCaptureMaxBytes, nil, false) == nil {
+		if newUsageScanner(flavor, defaultCaptureMaxBytes, nil) == nil {
 			t.Fatalf("newUsageScanner(%q) = nil, want a scanner", flavor)
 		}
 	}
@@ -1479,12 +1477,12 @@ func TestNewUsageScannerSkipsSpeech(t *testing.T) {
 // bodies in the system. The count that IS wanted from those bytes comes from
 // imagesDataCounter, whose carry is small and bounded.
 func TestNewUsageScannerSkipsImages(t *testing.T) {
-	if s := newUsageScanner(apiFlavorImages, defaultCaptureMaxBytes, nil, false); s != nil {
+	if s := newUsageScanner(apiFlavorImages, defaultCaptureMaxBytes, nil); s != nil {
 		t.Fatalf("newUsageScanner(%q) = %+v, want nil -- the scan is a guaranteed no-op for images and retains the body to prove it", apiFlavorImages, s)
 	}
 	// The contrast: the two flavors the merge does have cases for still get one.
 	for _, flavor := range []string{"openai_responses", "anthropic_messages"} {
-		if newUsageScanner(flavor, defaultCaptureMaxBytes, nil, false) == nil {
+		if newUsageScanner(flavor, defaultCaptureMaxBytes, nil) == nil {
 			t.Fatalf("newUsageScanner(%q) = nil, want a scanner", flavor)
 		}
 	}

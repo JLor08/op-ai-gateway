@@ -867,10 +867,18 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// application opted in, EWMA-update the mapping's throughput from this sample.
 	// Best-effort (the store guards metrics_locked + skips non-positive samples);
 	// a failure is Debug-logged, never propagated, never faults the served response.
+	//
+	// A gateway-measured prompt rate (PromptPerSecondGatewayMeasured, #426) is
+	// analytics-only: it stays on the usage row above but is not a routing sample,
+	// so the EWMA gets 0 for it, which the store treats as "no sample".
+	promptSample := resp.Usage.PromptPerSecond
+	if resp.Usage.PromptPerSecondGatewayMeasured {
+		promptSample = 0
+	}
 	if status == "success" && target.OpportunisticMetrics && target.RouteID != "" &&
-		(resp.Usage.TokensPerSecond > 0 || resp.Usage.PromptPerSecond > 0) {
+		(resp.Usage.TokensPerSecond > 0 || promptSample > 0) {
 		if err := s.Routes.UpdateMappingOpportunisticMetrics(context.Background(), target.RouteID,
-			resp.Usage.TokensPerSecond, resp.Usage.PromptPerSecond, opportunisticEWMAAlpha, time.Now().UTC()); err != nil {
+			resp.Usage.TokensPerSecond, promptSample, opportunisticEWMAAlpha, time.Now().UTC()); err != nil {
 			slog.Debug("opportunistic metrics update failed", "mapping", target.RouteID, "err", err)
 		}
 	}
