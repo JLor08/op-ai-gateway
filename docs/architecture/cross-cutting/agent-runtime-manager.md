@@ -3446,7 +3446,12 @@ The accepted trade-off is therefore **scoped, not blanket**:
 - **After commit:** a later failure can only be a terminal SSE frame
   `data: {"error":{"code":…,"message":…}}` carrying the same stable code — the
   shape the gateway's own translate path already uses for mid-stream failures.
-  What is genuinely lost is the child's real response headers.
+  What is genuinely lost is the child's real response headers. On the
+  gateway's native passthrough an Anthropic Messages or Responses client cannot
+  read that frame, so the gateway translates it into the client flavor's own
+  error event (`event: error`, and for Responses also `response.failed`) and
+  records the request as failed under the agent's code ([API Compatibility &
+  Inference §7.3](compatibility-and-inference.md#73-an-agents-in-stream-failure-on-the-native-passthrough)).
 
 Four properties of the proxy paths are each one edit from a leaked request slot
 or a pinned model process:

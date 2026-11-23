@@ -3290,6 +3290,68 @@ is not the loop's own
 ([Agent-Managed Model Runtime
 §11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)).
 
+### 7.3 An agent's in-stream failure on the native passthrough
+
+A streamed request to an agent-managed (`server_agent`) target can fail after the
+agent's router has already committed `200` and SSE headers, for example a start
+that dies while the router sends `: keepalive` heartbeats. The router then ends the
+stream with one terminal frame,
+`data: {"error":{"code":"runtime.<…>","message":"…"}}`, with no `event:` line and
+no `type` ([Agent-Managed Model Runtime
+§4.4](agent-runtime-manager.md#44-streaming-heartbeats-and-the-lazy-200)). Relayed
+verbatim, that frame is no event an Anthropic or Responses client knows: Claude Code
+saw a stream without `message_start`, and Codex saw a stream closed before
+`response.completed` and dropped the agent's message.
+
+The native passthrough relay therefore translates it, for a streamed
+`anthropic_messages` or `openai_responses` request to a `server_agent` target only
+(`agentStreamErrorFilter`, `internal/gateway/agent_stream_error.go`):
+
+| Flavor | What the client gets in place of the agent's frame |
+|---|---|
+| Anthropic Messages | `event: error` with `{"type":"error","error":{"type":<t>,"message":"<code>: <agent message>"}}`; `<t>` is `overloaded_error` for `runtime.admission_blocked`, `runtime.instance_busy`, `runtime.instance_no_capacity`, `runtime.cluster_not_ready`, `runtime.cluster_member_unreachable` and `runtime.start_timeout`, `api_error` for every other code |
+| Responses | `event: error` with `{"type":"error","code":<code>,"message":<agent message>,"param":null,"sequence_number":…}`, then `event: response.failed` shaped like the translate path's own (`status: "failed"`, `error: {code, message}` with the agent's code). Its `response.id` is the one from a relayed `response.created`, else `resp_<gateway request id>`. The `response.failed` is sent without a prior `response.created` too, because Codex ignores a bare `error` event and reads only `response.failed` |
+
+Chat Completions never takes the native passthrough, and OpenAI's own chat stream
+error already has the agent's `data: {"error":…}` shape.
+
+Only the agent's exact shape is recognized: one `data:` line whose JSON is an object
+with the single key `error`, holding exactly a string `code` that begins `runtime.`
+and a string `message`. A model server's own error frame, which carries no
+`runtime.` code, passes unchanged, and so does every frame from a target that is not
+agent-managed. Every other byte, the `: keepalive` comments included, is relayed
+unchanged and as soon as it arrives. The one exception is an event that opens like
+`data: {"error":`: it is held until it ends (at most 64 KiB) and is then written
+whole.
+
+`runtime.upstream_gone` also carries a non-2xx the child itself answered after the
+router had committed `200`, such as a model server's `400` for an over-long context.
+It becomes `api_error`, so an Anthropic client may retry without streaming where it
+would otherwise have seen an invalid-request error. That is no worse than before:
+the verbatim frame was not readable as an error either.
+
+A captured response (`respBuf`) holds the bytes the client received, so it shows the
+translated error event, not the agent's raw frame.
+
+The usage row records the request as failed: status `error`, the agent's code as the
+error code, `http_status` the `200` that was on the wire, and no tokens. An idle
+timeout, a client disconnect or a copy error that ends the same stream keeps its own
+code.
+
+What the clients do with the translated event (verified against Claude Code 2.1.311
+and Codex 0.137.0 through a gateway relaying a loopback agent stub):
+
+- **Claude Code**, with `api_error`, logs
+  `Error streaming, falling back to non-streaming mode: <the error event>` and retries
+  the turn without streaming at once. With `overloaded_error` it first retries the
+  stream twice ("Mid-stream 529 before content — retrying streaming") and then falls
+  back. Without the translation it fell back the same way, logging only
+  `Stream completed without receiving message_start event`, so the agent's code
+  and message never reached its log.
+- **Codex** reports `stream disconnected before completion: <agent message>` and
+  reconnects up to five times, as for any retryable failure. Without the translation
+  it reported `stream closed before response.completed`.
+
 ## 8. Provider clients
 
 | Client | `internal/provider/*.go` | `Complete` | `CompleteStream` | `NativeProxyClient` | `ModelLister` |

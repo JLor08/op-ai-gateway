@@ -1255,12 +1255,23 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	if transcriptScan != nil || speechScan != nil {
 		teeBuf = nil
 	}
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan, speechWav: speechTally}
+	// A streamed relay to an agent-managed target gets the filter that turns the
+	// agent's terminal error frame into the client flavor's error event (nil, and
+	// so inert, for every other relay); see agentStreamErrorFilter.
+	agentErrors := newAgentStreamErrorFilter(rel.target, rel.pfReq.APIFlavor, rel.pfReq.Stream, id)
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan, speechWav: speechTally, agentErrors: agentErrors}
 	// relayBody is resp.Body for every relay but the pcm strip, which already consumed the
 	// WAV header above and hands the copier only the data chunk (io.LimitReader).
 	copyErr := copier.run(relayBody)
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, rel.pfReq, serverName, idledOut.Load(), copyErr, start)
+	// The agent ended an otherwise clean stream with its terminal error frame: the
+	// request failed, under the agent's own code, though the wire status stays the
+	// 200 the agent had already committed.
+	if failure := agentErrors.recordedFailure(); failure != nil && status == "success" {
+		status, errorCode = "error", failure.code
+		slog.Warn("inference native passthrough agent stream failure", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "server", serverName, "code", failure.code, "message", failure.message)
+	}
 
 	usg := scanner.usage()
 	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), Endpoint: rel.endpoint}
@@ -1526,6 +1537,10 @@ type nativeCopier struct {
 	// speechWav measures a one-shot speech body for billing when the upstream sends no
 	// duration header (nil for every other relay).
 	speechWav *speechWavTally
+	// agentErrors translates an agent-managed target's terminal error frame into
+	// the client flavor's error event (nil for every other relay); run passes each
+	// upstream chunk through it before writeChunk.
+	agentErrors *agentStreamErrorFilter
 	// written counts every body byte the client's writer took, past the capture
 	// cap too (respBuf stops growing there), so a capture that does not store the
 	// body can still say how large it was.
@@ -1539,7 +1554,9 @@ type nativeCopier struct {
 // terminates before the read error is inspected); the one thing it adds is that end
 // frame, written at a clean EOF and only for an sglang-omni speech event stream that
 // asks for it (speechStreamScan.endFrame), so every other relay's bytes are exactly
-// what proxyNative relayed before. The deferred
+// what proxyNative relayed before -- apart from a streamed relay to an agent-managed
+// target, whose chunks pass through its agentStreamErrorFilter (relayChunk) and whose
+// agent terminal error frame becomes the client flavor's error event. The deferred
 // scanner.finish call runs exactly once no matter how run() returns, so the
 // final frame — which, for a buffered non-streaming response, normally never
 // gets its own trailing newline — is still scanned; see usageScanner.finish.
@@ -1553,11 +1570,18 @@ func (c *nativeCopier) run(body io.Reader) error {
 	for {
 		n, readErr := body.Read(buf)
 		if n > 0 {
-			if writeErr := c.writeChunk(buf[:n]); writeErr != nil {
+			if writeErr := c.relayChunk(buf[:n]); writeErr != nil {
 				return writeErr
 			}
 		}
 		if readErr != nil {
+			// A partial event the agent filter still holds when the body ends is
+			// relayed as it stands, as the bytes before a read error always were.
+			if held := c.agentErrors.flush(); len(held) > 0 {
+				if writeErr := c.writeChunk(held); writeErr != nil {
+					return writeErr
+				}
+			}
 			if readErr != io.EOF {
 				return readErr
 			}
@@ -1573,6 +1597,23 @@ func (c *nativeCopier) run(body io.Reader) error {
 			return nil
 		}
 	}
+}
+
+// relayChunk forwards one upstream chunk: straight to writeChunk, or, on a relay
+// with an agent error filter, the bytes the filter releases. A chunk the filter
+// holds whole still counts as upstream activity for the idle watchdog.
+func (c *nativeCopier) relayChunk(chunk []byte) error {
+	if c.agentErrors == nil {
+		return c.writeChunk(chunk)
+	}
+	out := c.agentErrors.push(chunk)
+	if len(out) == 0 {
+		if c.watchdog != nil {
+			c.watchdog.Reset(c.idle)
+		}
+		return nil
+	}
+	return c.writeChunk(out)
 }
 
 // writeChunk forwards one chunk to the client -- an upstream chunk, or the end frame
