@@ -299,7 +299,8 @@ templating still works.
 |---|---|---|
 | `${PORT}` | the port the agent assigned this process | — |
 | `${MODEL}` | the spec's `upstream_model` — the **application-side** model name (the mapping's *app model name*), i.e. what the model server itself calls the model | hard error if `upstream_model` is empty |
-| `${HOST_GPU_IDS}` | the spec's own GPU indices **as this host numbers them**, ascending and comma-separated (`2,5`) | hard error if the spec declares no GPUs |
+| `${HOST_GPU_IDS}` | the spec's own GPU indices **as this host numbers them**, in the order the spec declares them, deduplicated and comma-separated (`2,5`) | hard error if the spec declares no GPUs |
+| `${HOST_GPU_IDS_MAIN_LAST}` | the same list with the **first** declared GPU (the main card) moved to the end (`2,0,1` → `0,1,2`), for an engine that wants its main card last — Strata's `--gpu` (agent 0.21.0 and later) | hard error if the spec declares no GPUs |
 | `${CONFIG_DIR}` | the absolute per-spec directory the agent writes the spec's config files into, `<config_files_dir>/<spec-id>` — see [Config files](#config-files-for-a-managed-process) | — (a plain path; always resolves) |
 | `${AGENT_ENV:NAME}` | `NAME` from the **agent's own** process environment | hard error naming the variable; never a silent empty value |
 
@@ -325,8 +326,8 @@ the exact forms (`${PORTX}`, `${port}`, `${AGENT_ENV:}`). `${MODEL}` and
 `${MODELS_DIR}`, `${MODEL_ID}` and `${GPU_IDS_FILE}` are plausible things to
 pass through, so only the exact spellings are substituted — the cost being that
 `${MDOEL}`, `${model}` or the shorter `${GPU_IDS}` reaches the child as literal
-text instead of erroring. `${CONFIG_DIR}` follows the same exact-match rule, so
-`${CONFIG_DIR_X}` is passed through.
+text instead of erroring. `${CONFIG_DIR}` and `${HOST_GPU_IDS_MAIN_LAST}` follow the
+same exact-match rule, so `${CONFIG_DIR_X}` is passed through.
 
 #### Config files for a managed process
 
@@ -340,7 +341,8 @@ which may not be writable — and the spec's `args` point the server at them:
 `["--config", "${CONFIG_DIR}/server.json"]`. Each file is rewritten on every
 launch, atomically, with mode `0600`.
 
-A file's content may use `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`, the three
+A file's content may use `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`,
+`${HOST_GPU_IDS_MAIN_LAST}`, the three
 `*_DEVICES` lists and `${CONFIG_DIR}`, so a model id written as `${MODEL}` always
 matches the spec. **It may never use `${API_TOKEN}` or `${AGENT_ENV:…}`**: a secret
 is not written to disk, and the spec is refused (gateway) or reported
@@ -637,6 +639,49 @@ as the agent's account. Use a **dedicated distro** for the models and set
 `[interop]` `enabled=false` in its `/etc/wsl.conf`. If no WSL spec uses config
 files (`${CONFIG_DIR}` resolves to the agent's directory under `/mnt/<drive>`),
 you can also turn the drive mounts off with `[automount]` `enabled=false`.
+
+#### Strata on Windows
+
+The portal's **Strata** spec type launches `strata serve` from the Strata Terminal
+install. On the agent's side it needs:
+
+- **The agent runs under the Windows account that installed Strata.** The install
+  lives under that user's `%LOCALAPPDATA%`, and the run config's `component:`
+  references resolve per user. An agent under LocalSystem or another account is not
+  supported for Strata (a service runs as LocalSystem unless you set its log-on
+  account; with NSSM, set it on the *Log on* tab).
+- **The absolute path of `strata.cmd` in `runtime_allowed_binaries`**, exactly as the
+  spec's binary field names it:
+
+  ```json
+  "runtime_allowed_binaries": [
+    "C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd"
+  ]
+  ```
+
+- **Agent 0.21.0 or later**, for `${HOST_GPU_IDS_MAIN_LAST}` (the template's `--gpu`
+  value: the first GPU row is the main card, and Strata wants it last) and for the
+  process tree below.
+
+The template sets **`process_tree: job`**: the agent starts `strata.cmd` suspended
+inside a Windows job object and resumes it once assigned, so Strata's `python.exe`
+and engine processes are all in the job. A stop sends Ctrl-Break to the tree (Strata
+drains and quits its engine), and after the 5 s kill grace the whole job is
+terminated; RAM and per-GPU VRAM are measured over every process in the job. If the
+launcher exits, anything it left behind is killed at once, and if the agent itself
+dies, Windows ends the whole job with it. A spec left at `direct` (the default) is
+stopped by killing the launcher alone, which leaves the engine running, so keep `job`
+for Strata. **This mode is verified on hardware: pending**; if `strata.cmd` turns out
+to misbehave under the agent, the fallback is the bundled
+`…\terminal\current\python\python.exe` as the binary with
+`…\terminal\current\strata.py` as its first argument.
+
+The key goes in the spec's environment as `STRATA_API_KEY=${API_TOKEN}`, never in
+the run config file; the agent's own probes of the child (metrics, context,
+capabilities) send it too. Leave **visible devices off**: `--gpu` takes the host's
+card numbers. Strata's own engine wait defaults to 900 s, so the template's startup
+timeout is 960 s; raise the parent `server_agent` application's timeout to at least
+960000 ms, or the portal warns that a cold start can be cut short.
 
 ## Build & run
 
