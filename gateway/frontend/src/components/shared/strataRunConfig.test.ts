@@ -100,6 +100,26 @@ describe('importStrataRunConfig', () => {
     expect(r.warnings).toContain('api_key_dropped');
   });
 
+  it('drops an api_key at any depth, in any case and of any type, with a warning', () => {
+    const nested = ok(
+      run((o) => {
+        o.vision = { ...(o.vision as object), api_key: 'secret-nested' };
+        o.extra = [{ Api_Key: 12345 }];
+      }),
+    );
+    expect(nested.fileContent.toLowerCase()).not.toContain('api_key');
+    expect(nested.fileContent).not.toContain('secret-nested');
+    expect(nested.fileContent).not.toContain('12345');
+    expect(nested.warnings).toContain('api_key_dropped');
+    expect(JSON.parse(nested.fileContent)).toHaveProperty('vision');
+
+    const numeric = ok(run((o) => (o.API_KEY = 42)));
+    expect(numeric.fileContent.toLowerCase()).not.toContain('api_key');
+    expect(numeric.warnings).toContain('api_key_dropped');
+
+    expect(ok(importStrataRunConfig(fixtureText)).warnings).not.toContain('api_key_dropped');
+  });
+
   it('warns on a positional layer_split', () => {
     const r = ok(run((o) => (o.layer_split = '24')));
     expect(r.warnings).toContain('layer_split_positional');

@@ -19,7 +19,10 @@ func TestStrataPassthroughMediaRefused(t *testing.T) {
 		refused bool
 	}{
 		{"anthropic base64", msg(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0="}}`), false},
-		{"anthropic base64 beside a stray path", msg(`{"type":"image","source":{"type":"base64","data":"x","path":"/etc/passwd"}}`), false},
+		{"anthropic base64 beside a stray path", msg(`{"type":"image","source":{"type":"base64","data":"x","path":"/etc/passwd"}}`), true},
+		{"anthropic base64 beside a file url", msg(`{"type":"image","source":{"type":"base64","data":"x","url":"file:///etc/passwd"}}`), true},
+		{"anthropic base64 beside a non-string url", msg(`{"type":"image","source":{"type":"base64","data":"x","url":7}}`), true},
+		{"anthropic base64 beside an https url", msg(`{"type":"image","source":{"type":"base64","data":"x","url":"https://example.test/a.png"}}`), false},
 		{"anthropic https url", msg(`{"type":"image","source":{"type":"url","url":"https://images.example.test/x.png"}}`), false},
 		{"anthropic http url", msg(`{"type":"image","source":{"type":"url","url":"http://images.example.test/x.png"}}`), false},
 		{"anthropic data url", msg(`{"type":"image","source":{"type":"url","url":"data:image/png;base64,iVBORw0="}}`), false},

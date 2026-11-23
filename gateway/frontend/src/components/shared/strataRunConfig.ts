@@ -18,7 +18,8 @@ export type StrataImport =
   | { ok: false; error: 'invalid_json' | 'missing_exe' | 'missing_args' };
 
 // Launcher bookkeeping that must not reach the file. `engine_ready_s` is NOT
-// here: it is Strata's own engine-wait ceiling and stays in the file.
+// here: it is Strata's own engine-wait ceiling and stays in the file. An
+// `api_key` is dropped separately, at any depth (withoutApiKeys).
 const DROPPED_KEYS = new Set([
   'args_written',
   'port',
@@ -29,7 +30,6 @@ const DROPPED_KEYS = new Set([
   'gpu_roles',
   'gpu_cards',
   'gpu_order',
-  'api_key',
 ]);
 
 // Strata waits up to 900 s for its engine by default; the agent must outlast
@@ -37,6 +37,28 @@ const DROPPED_KEYS = new Set([
 // clamp is a floor at 1.
 const STARTUP_BASE_SECONDS = 900;
 const STARTUP_MARGIN_SECONDS = 60;
+
+function isApiKeyName(k: string): boolean {
+  return k.toLowerCase() === 'api_key';
+}
+
+// withoutApiKeys copies v with every key named api_key (any case) removed at
+// any depth -- a run config may nest one, e.g. inside `vision` -- whatever its
+// value, and counts the removals in dropped.count. A secret never reaches the
+// stored config file (the spec's API token carries it instead).
+function withoutApiKeys(v: unknown, dropped: { count: number }): unknown {
+  if (Array.isArray(v)) return v.map((e) => withoutApiKeys(e, dropped));
+  if (v === null || typeof v !== 'object') return v;
+  const out: Record<string, unknown> = {};
+  for (const [k, e] of Object.entries(v as Record<string, unknown>)) {
+    if (isApiKeyName(k)) {
+      dropped.count++;
+      continue;
+    }
+    out[k] = withoutApiKeys(e, dropped);
+  }
+  return out;
+}
 
 function isIndex(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0;
@@ -79,12 +101,12 @@ export function importStrataRunConfig(text: string): StrataImport {
   if (!Array.isArray(src.args)) return { ok: false, error: 'missing_args' };
 
   const warnings: ('layer_split_positional' | 'api_key_dropped')[] = [];
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(src)) {
-    if (DROPPED_KEYS.has(k) || k.startsWith('ui_')) continue;
-    out[k] = v;
+  const dropped = { count: 0 };
+  const out = withoutApiKeys(src, dropped) as Record<string, unknown>;
+  for (const k of Object.keys(out)) {
+    if (DROPPED_KEYS.has(k) || k.startsWith('ui_')) delete out[k];
   }
-  if (typeof src.api_key === 'string' && src.api_key !== '') warnings.push('api_key_dropped');
+  if (dropped.count > 0) warnings.push('api_key_dropped');
   const ls = src.layer_split;
   if (ls !== undefined && ls !== 'auto' && ls !== null && ls !== '') {
     warnings.push('layer_split_positional');

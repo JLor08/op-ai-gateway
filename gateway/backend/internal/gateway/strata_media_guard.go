@@ -34,8 +34,10 @@ func strataImageRefAllowed(s string) bool {
 //
 // The walk visits every object at any depth, so blocks inside tool_result content and
 // Responses function-call outputs are covered. A block is allowed only with
-// source.type "base64" or a reference that strataImageRefAllowed accepts; a url or
-// path source that carries no usable string is refused too. Malformed JSON is not
+// source.type "base64" or a reference that strataImageRefAllowed accepts, and a
+// url or path key present on the source must pass strataImageRefAllowed whatever
+// source.type says (a base64 source included); a url or path source that carries
+// no usable string is refused too. Malformed JSON is not
 // refused here (false): the relay's existing handling owns it.
 func strataPassthroughMediaRefused(raw []byte) bool {
 	var doc any
@@ -75,10 +77,13 @@ func strataBlockRefused(m map[string]any) bool {
 		case string:
 			return !strataImageRefAllowed(src)
 		case map[string]any:
+			// url and path are checked whenever present, whatever source.type
+			// says. Strata's _image_source (terminal/serve/frontend.py) today
+			// returns a data: URL for source.type "base64" and only otherwise
+			// reads source.url, then source.path; a base64 source carrying a
+			// reference is refused anyway, so a later Strata that reads the
+			// reference first cannot be steered to a host file through it.
 			st, _ := src["type"].(string)
-			if st == "base64" {
-				return false
-			}
 			refused := false
 			for _, key := range []string{"url", "path"} {
 				if val, present := src[key]; present {

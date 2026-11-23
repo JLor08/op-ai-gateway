@@ -89,10 +89,10 @@ const defaultPrometheusMetricsPath = "/metrics"
 // so an omni name never detects as sglang), sglang, vllm,
 // llama-server/llama_cpp/llama.cpp,
 // text-generation-launcher/tgi, sd-server/stable-diffusion,
-// audiocpp_server/audio.cpp, ollama, strata (the strata.cmd Windows launcher,
-// the POSIX strata, and the strata.exe / strata-vision.exe engines; last, so
-// it shadows no other row) -- in the order below (first match wins),
-// and falls back to RuntimeSpecTypeCustom when nothing matches.
+// audiocpp_server/audio.cpp, ollama -- in the order below (first match wins),
+// then strata, which unlike the rows above is no substring but an exact name
+// (isStrataBinaryName; last, so it shadows no other row), and falls back to
+// RuntimeSpecTypeCustom when nothing matches.
 func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 	name := strings.ToLower(filepath.Base(binary))
 
@@ -118,11 +118,31 @@ func DetectRuntimeSpecType(binary string) RuntimeSpecType {
 		return RuntimeSpecTypeAudioCpp
 	case strings.Contains(name, "ollama"):
 		return RuntimeSpecTypeOllama
-	case strings.Contains(name, "strata"):
+	case isStrataBinaryName(name):
 		return RuntimeSpecTypeStrata
 	default:
 		return RuntimeSpecTypeCustom
 	}
+}
+
+// isStrataBinaryName reports whether the lower-cased base name names a Strata
+// binary: the POSIX launcher strata, the Windows launcher strata.cmd, the
+// engine strata.exe, or an engine helper strata-<name> / strata-<name>.exe
+// (strata-vision.exe). It matches the name exactly rather than as a substring,
+// so a tool that merely contains the word (mystrata-tool, stratagem) stays
+// custom. A Windows path is cut at its last backslash too: filepath.Base on a
+// non-Windows gateway splits at "/" only.
+func isStrataBinaryName(name string) bool {
+	if i := strings.LastIndexByte(name, '\\'); i >= 0 {
+		name = name[i+1:]
+	}
+	switch name {
+	case "strata", "strata.cmd", "strata.exe":
+		return true
+	}
+	stem, ok := strings.CutPrefix(name, "strata-")
+	stem = strings.TrimSuffix(stem, ".exe")
+	return ok && stem != "" && !strings.Contains(stem, ".")
 }
 
 // EffectiveRuntimeSpecType resolves the RuntimeSpecType that governs a given

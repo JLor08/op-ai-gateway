@@ -358,7 +358,9 @@ func TestEffectiveRuntimeSpecTypeSGLangServeModelTypeOmni(t *testing.T) {
 
 // TestDetectRuntimeSpecTypeStrata pins Strata's three launch names: the
 // Windows launcher strata.cmd, the POSIX strata, and the engine binaries
-// strata.exe / strata-vision.exe.
+// strata.exe / strata-vision.exe (any strata-<name> helper). The name is
+// matched exactly, not as a substring: a tool that merely contains the word
+// (mystrata-tool, stratagem), or sits in a strata directory, stays custom.
 func TestDetectRuntimeSpecTypeStrata(t *testing.T) {
 	for _, tc := range []struct {
 		binary string
@@ -368,6 +370,14 @@ func TestDetectRuntimeSpecTypeStrata(t *testing.T) {
 		{"/home/u/.local/bin/strata", RuntimeSpecTypeStrata},
 		{"strata-vision.exe", RuntimeSpecTypeStrata},
 		{"STRATA.EXE", RuntimeSpecTypeStrata},
+		{`C:\strata\bin\Strata-Vision.EXE`, RuntimeSpecTypeStrata},
+		{"/opt/strata/strata-engine", RuntimeSpecTypeStrata},
+		{"mystrata-tool", RuntimeSpecTypeCustom},
+		{"stratagem", RuntimeSpecTypeCustom},
+		{"/opt/strata/bin/run-server", RuntimeSpecTypeCustom},
+		{"strata-", RuntimeSpecTypeCustom},
+		{"strata-vision.sh", RuntimeSpecTypeCustom},
+		{"strata.bat", RuntimeSpecTypeCustom},
 		{"python.exe", RuntimeSpecTypeCustom},
 		{"/opt/vllm/bin/vllm", RuntimeSpecTypeVLLM},
 		{"llama-server", RuntimeSpecTypeLlamaCpp},

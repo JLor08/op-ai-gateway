@@ -206,9 +206,12 @@ application and template keep `responses_mode` and `messages_mode` at `passthrou
 body is checked as well, before it is relayed (`strataPassthroughMediaRefused`, called from
 `relayPassthroughTarget`): a recursive walk over every object at any depth (so blocks inside
 `tool_result` content and Responses function-call outputs are covered) refuses an Anthropic
-`image` or `document` block whose `source` is not `base64` and names a reference that fails the
-rule (`source.url`, `source.path` or a string source; a `url`/`path` source without either key
-is refused too), and an `input_image` or `image_url` part whose `image_url` (a string or
+`image` or `document` block whose `source` names a reference that fails the rule
+(`source.url`, `source.path` or a string source; a `url`/`path` source without either key is
+refused too). The `url` and `path` keys are checked whenever present, a `base64` source
+included: Strata's `_image_source` reads only the data of a `base64` source today, but a stray
+reference beside it is refused so a later Strata that reads it first cannot reach a host file.
+It also refuses an `input_image` or `image_url` part whose `image_url` (a string or
 `{"url": …}`) fails it. Malformed JSON is left to the relay's own handling. Either refusal is
 **400 `chat.media_url_unsupported`**, logged at Warn and recorded as a usage row with no upstream
 call. `/v1/messages/count_tokens` is counted locally and never relayed, so it needs no scan.
