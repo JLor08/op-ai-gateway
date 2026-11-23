@@ -192,6 +192,32 @@ and inline images only. Not guarded: a spec whose type is misdeclared (an explic
 an sglang-omni server, and a raw Responses or Messages passthrough to an `sglang` target (switching those modes to translate
 closes it). Every other target is unchanged.
 
+**No host paths for Strata, on the translate path and in the raw passthrough body
+([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).** Strata
+(`Niko1221/Strata@c6f6427`) resolves an image reference in `Vision.load`: `data:` is decoded,
+`http://`/`https://` is fetched, and anything else is read as a path on the model host
+(`file://` stripped first), all with case-sensitive `startswith` checks; its only guard
+concerns a browser `Origin`, which a gateway request never carries. So for a target whose
+effective kind is `strata` — a `strata` application or a `server_agent` spec of type `strata`
+(`Target.EffectiveKind`) — every image reference must start with lowercase `data:`, `http://`
+or `https://` (`strataImageRefAllowed`; `HTTP://x` would land in Strata's path branch, so it is
+refused). On the translate path `mediaURLsRefused` checks it, as for `sglang`. Because a Strata
+application and template keep `responses_mode` and `messages_mode` at `passthrough`, the raw
+body is checked as well, before it is relayed (`strataPassthroughMediaRefused`, called from
+`relayPassthroughTarget`): a recursive walk over every object at any depth (so blocks inside
+`tool_result` content and Responses function-call outputs are covered) refuses an Anthropic
+`image` or `document` block whose `source` names a reference that fails the rule
+(`source.url`, `source.path` or a string source; a `url`/`path` source without either key is
+refused too). The `url` and `path` keys are checked whenever present, a `base64` source
+included: Strata's `_image_source` reads only the data of a `base64` source today, but a stray
+reference beside it is refused so a later Strata that reads it first cannot reach a host file.
+It also refuses an `input_image` or `image_url` part whose `image_url` (a string or
+`{"url": …}`) fails it. Malformed JSON is left to the relay's own handling. Either refusal is
+**400 `chat.media_url_unsupported`**, logged at Warn and recorded as a usage row with no upstream
+call. `/v1/messages/count_tokens` is counted locally and never relayed, so it needs no scan.
+**http(s) stays allowed**: Strata fetches the URL from the model host, the same accepted
+posture as SGLang and vLLM, because blocking it breaks ordinary vision use.
+
 ### 3.2 OpenAI Responses — Codex continuity
 
 `compat.ParseOpenAIResponses` accepts both the simple string `input` and the
@@ -1940,7 +1966,7 @@ for `EffectiveDecisionsRoute`; a blank mode behaves as `auto`):
 | `translate` | translate: the OpenAI Decisions body goes to the upstream's `/v1/decisions` | `decision_openai: yes` on a passthrough-capable kind | `404 routing.model_not_capable` |
 | `auto` (or blank) | **passthrough** when `decision: yes`, else **translate** when `decision_openai: yes` on a capable kind | either | `404 routing.model_not_capable` |
 
-`routing.DecisionsPassthroughCapableKind` (false for `llama_cpp` and `vllm_sr`, §3.10 item 11) is the
+`routing.DecisionsPassthroughCapableKind` (false for `llama_cpp`, `vllm_sr` and `strata`, §3.10 item 11) is the
 "has an OpenAI `/v1/decisions`" test, so for those two kinds a `decision_openai` verdict is ignored (a stale or manual `yes`
 never sends a translated body to an upstream that cannot parse it). `translate` is therefore **refused at save** for them:
 `400 application.systemone_translate_unsupported` (the request set `systemone_mode`, on create or on an update
@@ -2100,7 +2126,7 @@ places, because the mode and the verdicts are only known together after the reso
 - **After the resolve.** `resolveDecisionsTarget` applies the flavor half
   (`targetServesFlavor`, else `404 routing.no_model_route`), and `decisionsRoute` hands the
   target's effective `decisions_mode` and the mapping's two verdicts to
-  `routing.EffectiveDecisionsRoute` (with the effective kind: for `llama_cpp` and `vllm_sr`, which have no native `/v1/decisions` route, a `decision_openai` verdict is ignored, so `auto` translates and a stale forced `passthrough` is `404 routing.model_not_capable`):
+  `routing.EffectiveDecisionsRoute` (with the effective kind: for `llama_cpp`, `vllm_sr` and `strata`, which have no native `/v1/decisions` route, a `decision_openai` verdict is ignored, so `auto` translates and a stale forced `passthrough` is `404 routing.model_not_capable`):
 
 | Effective mode | Route taken | Needs | Without it |
 |---|---|---|---|
@@ -2535,6 +2561,16 @@ route, and a raw body would bypass the media guard (§3.1). The portal's
 through the API and a row stored before the type existed keep the stock
 passthrough ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
 
+**`strata` keeps its passthrough, and the raw body is scanned instead.** A target of
+effective kind `strata` serves both native routes, so `endpointModeFor` does not coerce it;
+`relayPassthroughTarget` scans the raw body for image references Strata would read from the
+model host and refuses such a body before `proxyNative` (§3.1,
+[ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)). Strata's
+Anthropic usage (`input_tokens: 1`, the prompt in the cache fields) is recorded by the
+unchanged passthrough scan as the disjoint split (input 1, the cache reads as cached, the cache
+writes as cache write); `/v1/messages` carries no `timings`, so such a request records no
+tokens per second, while chat completions and `/v1/responses` do.
+
 **Where the effective mode lives.** An ordinary application carries
 `ResponsesMode`/`MessagesMode` directly on `routing.Application`
 (`internal/routing/store.go`). A `server_agent` application's **resolved
@@ -2925,7 +2961,7 @@ row routes as it did in Phase 1; a `server_agent` candidate is judged after the 
 | Mode | `decisions_mode` (`/v1/decisions`) | `systemone_mode` (`/v1/systemone`) |
 |---|---|---|
 | `auto` | passthrough when the mapping has `decision_openai: yes`, else translate to System One | passthrough when the mapping has `decision: yes`, else translate to OpenAI Decisions when it has `decision_openai: yes` on a passthrough-capable kind |
-| `translate` | always translate to System One; needs `decision: yes` | always translate to the upstream's `/v1/decisions`; needs `decision_openai: yes` on a passthrough-capable kind; **refused at save** for `llama_cpp` and `vllm_sr` |
+| `translate` | always translate to System One; needs `decision: yes` | always translate to the upstream's `/v1/decisions`; needs `decision_openai: yes` on a passthrough-capable kind; **refused at save** for `llama_cpp`, `vllm_sr` and `strata` |
 | `passthrough` | always pass through to the upstream's `/v1/decisions`; needs `decision_openai: yes` | always pass through to the upstream's `/v1/systemone`, the Phase 1 relay; needs `decision: yes` |
 | `disabled` | not served | not served |
 
@@ -2950,9 +2986,9 @@ the listing has none; `GET /v1/systemone/models` and the portal's `systemone_rou
 cannot call it" case `UnknownModelRedirectBlocked` redirects. A forced mode whose verdict the mapping lacks is `404
 routing.model_not_capable` after the resolve (no re-selection), and `routing.EffectiveDecisionsRoute`
 is the one function that maps the effective kind, mode and verdicts to a route (for a kind without a native
-`/v1/decisions` route, `llama_cpp` and `vllm_sr`, a `decision_openai` verdict is ignored, so `auto`
+`/v1/decisions` route, `llama_cpp`, `vllm_sr` and `strata`, a `decision_openai` verdict is ignored, so `auto`
 translates and a stale forced `passthrough` is `404 routing.model_not_capable`, §3.10 item 11).
-`passthrough` is **refused at save for `llama_cpp`** (no `/v1/decisions` route) **and for `vllm_sr`** (its `/v1/decisions` is the System One alias, §3.10 item 11):
+`passthrough` is **refused at save for `llama_cpp`** (no `/v1/decisions` route) **and for `vllm_sr`** (its `/v1/decisions` is the System One alias, §3.10 item 11) **and for `strata`** (no `/v1/decisions` route either, [ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)):
 `application.decisions_passthrough_unsupported` (400, the request supplied the type),
 `application.decisions_passthrough_conflict` (409, an update that sends no `type` and
 collides with the stored one) and `runtime_spec.decisions_passthrough_unsupported` (400,
@@ -2961,7 +2997,7 @@ the spec's effective type). **`systemone_mode: translate` is refused for the sam
 `application.systemone_translate_unsupported` (400), `application.systemone_translate_conflict` (409)
 and `runtime_spec.systemone_translate_unsupported` (400), by the same rules. A save that sends **both** an incapable `decisions_mode`
 (`passthrough`) and an incapable `systemone_mode` (`translate`) for such a kind is refused once, with one message that names both modes; the HTTP status and
-code are the decisions refusal's (the error matches both sentinels, and the mapping reads the decisions row first). An application **retyped** to `llama_cpp` or `vllm_sr` with a stored
+code are the decisions refusal's (the error matches both sentinels, and the mapping reads the decisions row first). An application **retyped** to `llama_cpp`, `vllm_sr` or `strata` with a stored
 `passthrough` (decisions) or `translate` (System One) is reset to `auto` rather than refused (the "clear when the type cannot carry
 it" rule `responses_live_timings_enabled` follows). An unrecognized mode is
 `application.endpoint_mode_invalid` / `runtime_spec.endpoint_mode_invalid`, for either field. API shapes are in [HTTP API
@@ -3294,7 +3330,7 @@ The mock, Ollama and OpenAI-compatible clients also implement `Prober` (reachabi
 routing/capacity subsystems — out of this chapter's scope; see [Routing & Model
 Selection](routing-and-model-selection.md). One `OpenAICompatibleClient`
 instance is shared across vLLM, llama.cpp, llama-swap, LiteLLM, `server_agent`,
-`stable_diffusion_cpp`, `audio_cpp` and `vllm_sr` (`cmd/gateway/main.go`) since they all speak the
+`stable_diffusion_cpp`, `audio_cpp`, `vllm_sr` and `strata` (`cmd/gateway/main.go`) since they all speak the
 same OpenAI HTTP dialect; only Ollama gets its own client for its distinct
 `/api/chat` NDJSON shape. `stable_diffusion_cpp` cannot borrow the Ollama client
 instead: that client does not implement `NativeProxyClient`, and the images

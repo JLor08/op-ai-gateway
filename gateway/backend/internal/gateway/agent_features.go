@@ -247,6 +247,29 @@ const RuntimeRoleEvictionFeature = "runtime_role_eviction"
 // pins this side).
 const RuntimeExecWSLFeature = portal.AgentFeatureRuntimeExecWSL
 
+// RuntimeGPUMainLastFeature is the agent-declared capability meaning: this agent
+// resolves ${HOST_GPU_IDS_MAIN_LAST} (the spec's host GPU indices with the first
+// declared GPU moved last) in args, env and config-file content. Agent-only, so
+// it is not on gatewayAgentFeatures. The gateway gates nothing on it: a spec
+// using the placeholder is pushed to any agent, and the portal warns when the
+// connected agent does not declare it, because an older agent would pass the
+// token through literally. The agent names the identical string in
+// server-agent/internal/agent/features.go (the module cannot import this one);
+// TestStrataFeatureNames pins this side.
+const RuntimeGPUMainLastFeature = "runtime_gpu_main_last"
+
+// RuntimeProcessTreeJobFeature is the agent-declared capability meaning: this
+// agent can supervise a spec's whole process tree as one unit (a Windows Job
+// Object). The agent declares it on every OS, like runtime_exec_wsl, so the
+// gateway also checks the agent's reported OS before relying on it. Agent-only,
+// not on gatewayAgentFeatures. The push gates nothing on it; the portal's
+// operator write refuses a move into job for an agent known to lack it, and
+// RuntimeWarnings reports an agent that lacks it or cannot be judged yet
+// (portal.checkProcessTreeSupported). The agent names the identical
+// string in server-agent/internal/agent/features.go; TestStrataFeatureNames pins
+// this side.
+const RuntimeProcessTreeJobFeature = portal.AgentFeatureRuntimeProcessTreeJob
+
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
 // route an image EDIT (POST /v1/images/edits, which is multipart) or an audio

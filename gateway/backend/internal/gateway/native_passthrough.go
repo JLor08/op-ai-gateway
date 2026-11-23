@@ -460,6 +460,15 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 	}
 	switch mode {
 	case routing.EndpointModePassthrough:
+		// The raw body reaches the upstream unexamined, so a strata target's image
+		// references are checked here (the translate path's guard never runs).
+		if isStrataTarget(target) && strataPassthroughMediaRefused(raw) {
+			slog.Warn("native passthrough rejected: image reference this target would resolve on the model host",
+				"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
+				"server", s.serverName(target.ServerID), "route_id", target.RouteID)
+			s.failPassthrough(w, r, pr, start, target, errMediaPathUnsupported)
+			return true
+		}
 		s.proxyNative(w, r, nativeRelay{
 			token:    *token,
 			target:   target,

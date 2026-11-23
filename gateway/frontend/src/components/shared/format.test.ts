@@ -194,6 +194,30 @@ describe('formatPortalError', () => {
     expect(errorLabelByCode['mapping.audio_metrics_invalid']).toBeUndefined();
   });
 
+  // #424: the two process_tree refusals render localized labels, and the
+  // unsupported one names its cause (agent OS / version / capability).
+  it.each([
+    ['runtime_spec.process_tree_invalid', 'errorRuntimeSpecProcessTreeInvalid'],
+    ['runtime_spec.process_tree_unsupported', 'errorRuntimeSpecProcessTreeUnsupported'],
+  ] as const)('labels %s in both locales', (code, key) => {
+    const err = new PortalApiError(400, code, 'raw english');
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale][key];
+      expect(label.length).toBeGreaterThan(0);
+      expect(formatPortalError(err, messages[locale])).toBe(`${code}: ${label}`);
+    }
+    expect(messages.de[key]).not.toBe(messages.en[key]);
+  });
+
+  it('explains the unsupported cause: Windows, 0.21.0, runtime_process_tree_job', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale].errorRuntimeSpecProcessTreeUnsupported;
+      expect(label).toContain('Windows');
+      expect(label).toContain('0.21.0');
+      expect(label).toContain('runtime_process_tree_job');
+    }
+  });
+
   // #257: the gateway's refusal of a runtime spec's config_files (a bad or
   // repeated name, too many or too large files, a secret placeholder in the
   // content). The server's own message names the file, but a mapped code

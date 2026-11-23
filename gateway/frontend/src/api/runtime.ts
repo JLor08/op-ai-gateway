@@ -221,6 +221,13 @@ export interface RuntimeSpec {
   // the agent has no default distro. Empty for a native spec, which stores
   // none.
   wsl_distro?: string;
+  // How a native spec's child process tree is managed: 'direct' (a plain child
+  // process; also what an empty or missing value means) or 'job' (a Windows
+  // job object that stops the whole tree). The PUT replaces the whole spec, so
+  // every save must send it back. Refused with 400
+  // runtime_spec.process_tree_unsupported unless the spec's agent is on Windows
+  // with the runtime_process_tree_job capability (agent 0.21.0+).
+  process_tree?: 'direct' | 'job';
   gpus: RuntimeSpecGPU[];
   // This spec's resident HOST RAM demand, in MB. RAM is host-scoped, so both
   // numbers are single scalars on the spec -- not per-GPU rows like `gpus`
@@ -314,7 +321,7 @@ export interface RuntimeSpec {
   responses_live_timings_enabled: boolean;
   // Type is the explicit runtime-server kind ("" | "vllm" | "llama_cpp" |
   // "tgi" | "ollama" | "stable_diffusion_cpp" | "audio_cpp" | "vllm_sr" |
-  // "sglang" | "sglang_omni" | "custom"); "" means auto-detect from `binary`
+  // "sglang" | "sglang_omni" | "strata" | "custom"); "" means auto-detect from `binary`
   // (and, for an sglang binary, its args) -- `effective_type` below is what
   // that resolves to. Mirrors the Go RuntimeSpecDTO.Type /
   // routing.RuntimeSpec.Type.
@@ -329,6 +336,7 @@ export interface RuntimeSpec {
     | 'vllm_sr'
     | 'sglang'
     | 'sglang_omni'
+    | 'strata'
     | 'custom';
   // metrics_path / context_probe_path are the operator's raw overrides ("" =
   // use the type's default); see `resolved_metrics_path` /

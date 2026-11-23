@@ -35,6 +35,11 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 	if spec.ExecutionMode == "" {
 		spec.ExecutionMode = routing.ExecutionModeNative
 	}
+	// The same for process_tree (migration 113): NOT NULL with a 'direct'
+	// default an explicit "" insert would bypass.
+	if spec.ProcessTree == "" {
+		spec.ProcessTree = routing.ProcessTreeDirect
+	}
 	_, err = s.exec(ctx, `
 		insert into agent_runtime_specs (
 			id, mapping_id, enabled, binary_path, args, env, config_files, work_dir, listen_port,
@@ -46,9 +51,9 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			ram_estimate_mb, ram_measured_mb,
 			replicable, min_instances, max_instances, instance_parallelism, startup_measured_ms,
 			cluster_enabled, member_mode, cluster_network, rpc_transport, lan_exposure_ack, device_backend,
-			execution_mode, wsl_distro,
+			execution_mode, wsl_distro, process_tree,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env,
@@ -83,6 +88,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			device_backend = excluded.device_backend,
 			execution_mode = excluded.execution_mode,
 			wsl_distro = excluded.wsl_distro,
+			process_tree = excluded.process_tree,
 			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
 		spec.ConfigFiles, spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
@@ -95,7 +101,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 		spec.RAMEstimateMB, spec.RAMMeasuredMB,
 		spec.Replicable, spec.MinInstances, spec.MaxInstances, spec.InstanceParallelism, spec.StartupMeasuredMS,
 		spec.ClusterEnabled, spec.MemberMode, spec.ClusterNetwork, spec.RPCTransport, spec.LANExposureAck, spec.DeviceBackend,
-		spec.ExecutionMode, spec.WSLDistro,
+		spec.ExecutionMode, spec.WSLDistro, spec.ProcessTree,
 		spec.CreatedAt, spec.UpdatedAt,
 	)
 	if err != nil {
@@ -121,7 +127,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config
 	ram_estimate_mb, ram_measured_mb,
 	replicable, min_instances, max_instances, instance_parallelism, startup_measured_ms,
 	cluster_enabled, member_mode, cluster_network, rpc_transport, lan_exposure_ack, device_backend,
-	execution_mode, wsl_distro,
+	execution_mode, wsl_distro, process_tree,
 	created_at, updated_at`
 
 // runtimeSpecColsPrefixed is runtimeSpecCols qualified with the `s` alias, for
@@ -137,7 +143,7 @@ const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s
 	s.ram_estimate_mb, s.ram_measured_mb,
 	s.replicable, s.min_instances, s.max_instances, s.instance_parallelism, s.startup_measured_ms,
 	s.cluster_enabled, s.member_mode, s.cluster_network, s.rpc_transport, s.lan_exposure_ack, s.device_backend,
-	s.execution_mode, s.wsl_distro,
+	s.execution_mode, s.wsl_distro, s.process_tree,
 	s.created_at, s.updated_at`
 
 func (s *SQLiteStore) RuntimeSpecByMapping(ctx context.Context, mappingID string) (routing.RuntimeSpec, bool, error) {
@@ -498,7 +504,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 		&spec.RAMEstimateMB, &spec.RAMMeasuredMB,
 		&replicable, &spec.MinInstances, &spec.MaxInstances, &spec.InstanceParallelism, &spec.StartupMeasuredMS,
 		&clusterEnabled, &spec.MemberMode, &spec.ClusterNetwork, &spec.RPCTransport, &lanExposureAck, &spec.DeviceBackend,
-		&spec.ExecutionMode, &spec.WSLDistro,
+		&spec.ExecutionMode, &spec.WSLDistro, &spec.ProcessTree,
 		&spec.CreatedAt, &spec.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.RuntimeSpec{}, ErrNotFound

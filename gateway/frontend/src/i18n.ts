@@ -995,6 +995,8 @@ const de = {
     'audio.cpp bedient nur Sprachsynthese-Anfragen. Das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Synthese deutlich länger dauern kann als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_audio“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird. Der Health-Check-Modus bleibt bei „Health-Pfad prüfen“, aber der Health-Pfad ist standardmäßig /health statt /v1/health, weil der Server /health beantwortet und /v1/health mit 404.',
   applicationTypeVllmSrNote:
     'vLLM Semantic Router wird hier nur im Engine-Modus unterstützt (vllm-sr serve <Modell> --engine); der Router-Modus wird nicht unterstützt. Jedes Modell muss am Listener freigegeben sein (listeners[].apis.systemone.models), und die api_keys des Listeners müssen auf den API-Schlüssel dieser Anwendung gesetzt sein. Der Listener beantwortet eine Anfrage, die länger als 30 s läuft, mit 504, sofern der Client nicht options.deadline_ms sendet. Die Gesundheit wird über /v1/systemone/models geprüft, weil /health am Verwaltungsport des Containers liegt. Der Standard-Port ist 8899, das Timeout 10 Minuten, die API-Variante nur „decisions“; Decisions-Durchreichen wird nicht angeboten. Ein nicht freigegebenes Modell beantwortet der Listener mit 404 systemone_not_published, was die Prüfung als „decision: no“ festhält; wird das Modell später freigegeben, das Urteil im Portal löschen (oder das Gateway neu starten), damit es erneut geprüft wird.',
+  applicationTypeStrataNote:
+    'Strata (Niko1221/Strata). Funktioniert mit `strata serve` und mit der LAN-Freigabe der Desktop-App (App-Port + 1). Den Strata-API-Schlüssel als Token dieser Anwendung setzen – die Freigabe verlangt ihn, und ein Strata ohne Schlüssel lehnt Hostnamen ab. Ein Modell pro Strata-Prozess. Ältere Strata-Versionen beantworten /v1/responses mit 404: dann den Responses-Modus auf „Umwandlung“ stellen.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -1281,6 +1283,7 @@ const de = {
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeSglang: 'SGLang',
   runtimeSpecTypeSglangOmni: 'sglang-omni',
+  runtimeSpecTypeStrata: 'Strata',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Benutzerdefiniert',
   runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
@@ -1555,6 +1558,10 @@ const de = {
   runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
   runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
   runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowStrataBackend: 'Strata (`strata serve`)',
+  runtimeSpecApiTokenRowStrataEnv: 'STRATA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataClient: 'Authorization: Bearer (oder x-api-key)',
   runtimeSpecApiTokenArgsLeakWarning:
     'Der Token steht damit als Klartext in der Prozessliste (ps aux, /proc/<pid>/cmdline) und unter Umständen in den Startprotokollen des Modellservers selbst — verwende stattdessen die Umgebungsvariable (Env).',
   runtimeSpecApiTokenBackendBanner:
@@ -1601,7 +1608,7 @@ const de = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} funktioniert nur auf einem macOS-Host; der verbundene Agent läuft auf einem anderen Betriebssystem.',
   runtimeSpecEnvHint:
-    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. ${DEVICES}, ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen die GPU-Zeilen als Gerätenamen; ${RPC_SERVERS} und ${RPC_DEVICES} gibt es nur auf einem Cluster-Head. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
+    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. ${DEVICES}, ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen die GPU-Zeilen als Gerätenamen; ${RPC_SERVERS} und ${RPC_DEVICES} gibt es nur auf einem Cluster-Head. ${HOST_GPU_IDS_MAIN_LAST} nennt die Kartennummern des Hosts in deklarierter Reihenfolge, die zuerst eingetragene Karte (Hauptkarte) steht zuletzt. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
   runtimeSpecPlaceholderInvalid:
@@ -1614,6 +1621,22 @@ const de = {
   runtimeSpecConfigFileContent: 'Inhalt',
   runtimeSpecConfigFileAdd: 'Datei hinzufügen',
   runtimeSpecConfigFileRemove: 'Datei entfernen',
+  strataImportOpen: 'Run-Konfiguration importieren',
+  strataImportHint:
+    'Fügen Sie die JSON-Datei ein, die `strata launch` geschrieben hat (%LOCALAPPDATA%\\Strata\\launch\\<name>.json). Sie wird zur Konfigurationsdatei strata.json; GPU-Reihenfolge, Startup-Timeout und Modellname werden vorgeschlagen.',
+  strataImportLabel: 'Run-Konfiguration (JSON)',
+  strataImportApply: 'Importieren',
+  strataImportCancel: 'Abbrechen',
+  strataImportErrorInvalidJson: 'Das ist kein gültiges JSON-Objekt.',
+  strataImportErrorMissingExe: 'Das Feld "exe" fehlt.',
+  strataImportErrorMissingArgs: 'Das Feld "args" fehlt oder ist keine Liste.',
+  strataImportWarnLayerSplit:
+    'layer_split ist positionsabhängig: Eine andere GPU-Reihenfolge ändert seine Bedeutung.',
+  strataImportWarnApiKey:
+    'api_key wurde nicht übernommen: Der Schlüssel gehört in das Token der Spec, nicht in die Datei.',
+  strataImportDone: 'Importiert: strata.json, GPU-Reihenfolge und Startup-Timeout wurden gesetzt.',
+  strataImportTooLarge: 'Die importierte Datei überschreitet das Limit von 64 KiB.',
+  strataImportNoFreeSlot: 'Es ist kein Platz für eine weitere Konfigurationsdatei (Maximum 16).',
   runtimeSpecConfigFileNameBlank: 'Der Dateiname fehlt.',
   runtimeSpecConfigFileNameInvalid: String.raw`Der Name muss ein einzelner Dateiname sein: keine Pfadtrenner (/ \), kein „.“ oder „..“, kein Doppelpunkt, keine Steuerzeichen.`,
   runtimeSpecConfigFileNameDuplicate:
@@ -1638,6 +1661,8 @@ const de = {
     'SGLang bedient Chat über /v1/chat/completions. Startvorlage: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Auf einer geteilten Karte --mem-fraction-static setzen, denn der automatische Standard belegt den Großteil des Speichers. Mit --api-key bleiben /health und /metrics offen, /v1/models verlangt dann aber den Schlüssel, sodass die Kontextabfrage nichts liest. Chat-Bilder nimmt das Gateway nur als data:-, http://- oder https://-URL an, einen Pfad auf dem Modell-Host lehnt es ab. Steht Codex (Responses-API) oder Claude Code (Anthropic Messages) auf „Durchreichen“, prüft das Gateway diese Anfragen (/v1/responses, /v1/messages) nicht; mit „Umwandlung“ gilt die Prüfung auch für sie. Unter Windows im WSL-Ausführungsmodus starten. Bei einer reinen Wheel-Installation (uv-venv ohne CUDA-Toolkit) in env CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 und LIBRARY_PATH=/usr/lib/wsl/lib setzen, build-essential und ninja-build in der Distribution installieren (PATH ist reserviert, das ninja der venv wird nicht gefunden) und die CUDA-Hinweise aus sgl-project/sglang#49209 befolgen. env-Werte expandiert keine Shell: absolute Pfade angeben.',
   runtimeSpecTypeSglangOmniNote:
     'sglang-omni bedient Chat, Sprachsynthese und Transkription. Startvorlage: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. --host 127.0.0.1 beibehalten: sglang-omni prüft keine Anmeldung und lauscht standardmäßig auf 0.0.0.0. Sprache und Transkription brauchen manuelle Fähigkeitsurteile, und an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein. Stimmreferenzen und Chat-Bilder werden nur inline als data:-URL angenommen, eine Bildbearbeitung nur mit hochgeladener Quelldatei. Audio im Chat (input_audio, modalities/audio) reicht das Gateway nicht weiter: Den Chat von sglang-omni erreichen nur Text und Inline-Bilder. Für /v1/realtime --enable-realtime anhängen und das Fähigkeitsurteil „realtime“ auf Ja setzen. Unter Windows im WSL-Ausführungsmodus starten. Bei einer reinen Wheel-Installation (uv-venv ohne CUDA-Toolkit) in env CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 und LIBRARY_PATH=/usr/lib/wsl/lib setzen, build-essential und ninja-build in der Distribution installieren (PATH ist reserviert, das ninja der venv wird nicht gefunden) und die CUDA-Hinweise aus sgl-project/sglang#49209 befolgen. env-Werte expandiert keine Shell: absolute Pfade angeben.',
+  runtimeSpecTypeStrataNote:
+    'Strata (`strata serve`) bedient Chat über die OpenAI- und die Anthropic-API. Bei einer neuen Spezifikation setzt diese Auswahl die Startvorlage ein: serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --gpu ${HOST_GPU_IDS_MAIN_LAST} --output jsonl --shutdown-timeout 3, dazu STRATA_API_KEY=${API_TOKEN} in env. --host 127.0.0.1 beibehalten: Der Agent erreicht den Server über Loopback. Als Programm den absoluten Pfad von strata.cmd eintragen (C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd) und ihn auf dem Agent in runtime_allowed_binaries aufnehmen. Die Laufkonfiguration als Konfigurationsdatei strata.json hinterlegen, ohne api_key – der Schlüssel kommt aus env. Sichtbare Geräte ausgeschaltet lassen: --gpu erwartet die Kartennummern des Hosts, die Hauptkarte zuletzt. Der Start-Timeout beträgt 960 s und liegt damit über der Zeit, die Strata selbst auf die Engine wartet (900 s); den Timeout der übergeordneten server_agent-Anwendung auf mindestens 960000 ms setzen, sonst warnt das Portal, dass ein Kaltstart abgebrochen wird. Chat-Bilder nimmt das Gateway nur als data:-, http://- oder https://-URL an.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -2419,6 +2444,20 @@ const de = {
   runtimeExecutionWSL: 'WSL2',
   runtimeStatusVRAMFromVM: 'VRAM der WSL-VM zugerechnet',
   errorRuntimeSpecExecutionModeInvalid: 'Die Ausführung muss nativ oder WSL sein.',
+  runtimeSpecProcessTree: 'Prozessbaum',
+  runtimeSpecProcessTreeDirect: 'Direkt (einzelner Prozess)',
+  runtimeSpecProcessTreeJob: 'Windows-Job (gesamter Prozessbaum)',
+  runtimeSpecProcessTreeHint:
+    'Nur Windows: Im Job-Modus startet der Agent das Programm in einem Windows-Job-Objekt und beendet beim Stoppen den gesamten Prozessbaum (z. B. strata.cmd samt Kindprozessen); RAM und VRAM werden dem ganzen Baum zugerechnet. Unter Linux und macOS hat die Einstellung keine Wirkung. Erfordert Agent 0.21.0 oder neuer.',
+  runtimeSpecAgentNoGpuMainLast:
+    'Der verbundene Agent meldet „runtime_gpu_main_last“ nicht: Er ersetzt ${HOST_GPU_IDS_MAIN_LAST} nicht, der Platzhalter bleibt wörtlich stehen.',
+  runtimeProcessTreeAgentUnsupportedWarning:
+    'Mindestens eine Spezifikation nutzt den Windows-Job-Prozessbaum, aber der Agent dieses Servers unterstützt ihn nicht (er läuft nicht unter Windows oder meldet die Fähigkeit „runtime_process_tree_job“ nicht). Er startet die Spezifikation direkt, sodass beim Stoppen Kindprozesse der Engine weiterlaufen können. Aktualisiere den Agenten oder stelle den Prozessbaum auf „direct“.',
+  runtimeProcessTreeAgentUnknownWarning:
+    'Mindestens eine Spezifikation nutzt den Windows-Job-Prozessbaum, aber für den Agenten dieses Servers liegen noch keine Fähigkeiten vor (er hat noch nichts gemeldet). Ob er den Job-Modus unterstützt, lässt sich erst nach seinem ersten Bericht prüfen.',
+  errorRuntimeSpecProcessTreeInvalid: 'Der Prozessbaum-Modus muss „direct“ oder „job“ sein.',
+  errorRuntimeSpecProcessTreeUnsupported:
+    'Der Job-Prozessbaum wird vom Agenten dieser Spezifikation nicht unterstützt: Der Agent läuft nicht unter Windows, seine Version ist älter als 0.21.0 oder er meldet die Fähigkeit „runtime_process_tree_job“ nicht. Eine bereits als Job gespeicherte Spezifikation lässt sich weiterhin speichern; nur der Wechsel in den Job-Modus wird abgelehnt.',
   errorRuntimeSpecWSLDistroInvalid: 'Der Name der WSL-Distribution ist ungültig.',
   errorRuntimeSpecWSLPathNotLinux:
     'Im WSL-Modus müssen Programmpfad und Arbeitsverzeichnis absolute Linux-Pfade sein.',
@@ -5095,6 +5134,8 @@ const en: PortalMessages = {
     'audio.cpp serves speech synthesis requests only. The timeout defaults to 10 minutes instead of 30 seconds, because a synthesis can take far longer than a text reply; and the API flavor defaults to "openai_audio" only, instead of openai/anthropic, so this server is never offered as a text candidate. The health check mode stays at "Check health path", but the health path defaults to /health instead of /v1/health, because the server answers /health and returns 404 for /v1/health.',
   applicationTypeVllmSrNote:
     'vLLM Semantic Router is supported here in Engine mode only (vllm-sr serve <model> --engine); Router mode is not supported. Grant each model on the listener (listeners[].apis.systemone.models), and set the listener api_keys to this application\'s API key. The listener answers a request that runs longer than 30 s with 504 unless the client sends options.deadline_ms. Health is checked via /v1/systemone/models, because /health is on the container\'s management port. The default port is 8899, the timeout 10 minutes, and the API flavor only "decisions"; decisions passthrough is not offered. The listener answers a model it does not grant with 404 systemone_not_published, which the probe records as "decision: no"; if you grant the model later, clear the verdict in the portal (or restart the gateway) so it is probed again.',
+  applicationTypeStrataNote:
+    "Strata (Niko1221/Strata). Works with `strata serve` and with the desktop app's LAN share (app port + 1). Set the Strata API key as the application token — the share requires it, and a keyless Strata refuses host names. One model per Strata process. Older Strata releases answer 404 on /v1/responses: set the Responses mode to translate.",
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',
@@ -5366,6 +5407,7 @@ const en: PortalMessages = {
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeSglang: 'SGLang',
   runtimeSpecTypeSglangOmni: 'sglang-omni',
+  runtimeSpecTypeStrata: 'Strata',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Custom',
   runtimeSpecMetricsPath: 'Metrics path (override)',
@@ -5620,6 +5662,10 @@ const en: PortalMessages = {
   runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
   runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
   runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowStrataBackend: 'Strata (`strata serve`)',
+  runtimeSpecApiTokenRowStrataEnv: 'STRATA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataClient: 'Authorization: Bearer (or x-api-key)',
   runtimeSpecApiTokenArgsLeakWarning:
     "This puts the token in plaintext in the process listing (ps aux, /proc/<pid>/cmdline) and possibly in the model server's own startup logs — use the environment variable (Env) instead.",
   runtimeSpecApiTokenBackendBanner:
@@ -5658,7 +5704,7 @@ const en: PortalMessages = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} only works on a macOS host; the connected agent runs on a different operating system.',
   runtimeSpecEnvHint:
-    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. ${DEVICES}, ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name the GPU rows as device names; ${RPC_SERVERS} and ${RPC_DEVICES} exist only on a cluster head. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
+    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. ${DEVICES}, ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name the GPU rows as device names; ${RPC_SERVERS} and ${RPC_DEVICES} exist only on a cluster head. ${HOST_GPU_IDS_MAIN_LAST} lists the host's card numbers in declared order, with the first declared card (the main card) moved last. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
   runtimeSpecPlaceholderInvalid:
@@ -5671,6 +5717,21 @@ const en: PortalMessages = {
   runtimeSpecConfigFileContent: 'Content',
   runtimeSpecConfigFileAdd: 'Add file',
   runtimeSpecConfigFileRemove: 'Remove file',
+  strataImportOpen: 'Import run config',
+  strataImportHint:
+    'Paste the JSON file `strata launch` wrote (%LOCALAPPDATA%\\Strata\\launch\\<name>.json). It becomes the config file strata.json; the GPU order, startup timeout and model name are proposed.',
+  strataImportLabel: 'Run config (JSON)',
+  strataImportApply: 'Import',
+  strataImportCancel: 'Cancel',
+  strataImportErrorInvalidJson: 'This is not a valid JSON object.',
+  strataImportErrorMissingExe: 'The "exe" field is missing.',
+  strataImportErrorMissingArgs: 'The "args" field is missing or not a list.',
+  strataImportWarnLayerSplit: 'layer_split is positional: reordering the GPUs changes its meaning.',
+  strataImportWarnApiKey:
+    'api_key was not imported: the key belongs in the spec token, not in the file.',
+  strataImportDone: 'Imported: strata.json, the GPU order and the startup timeout were set.',
+  strataImportTooLarge: 'The imported file exceeds the 64 KiB limit.',
+  strataImportNoFreeSlot: 'There is no room for another config file (maximum 16).',
   runtimeSpecConfigFileNameBlank: 'The file name is missing.',
   runtimeSpecConfigFileNameInvalid: String.raw`The name must be a single file name: no path separators (/ \), no "." or "..", no colon, no control characters.`,
   runtimeSpecConfigFileNameDuplicate:
@@ -5695,6 +5756,8 @@ const en: PortalMessages = {
     "SGLang serves chat over /v1/chat/completions. Launch template: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Set --mem-fraction-static when the card is shared, because the automatic default takes most of it. With --api-key, /health and /metrics stay open, but /v1/models then needs the key, so the context probe reads nothing. The gateway accepts chat images only as data:, http:// or https:// URLs and refuses a path on the model host. While Codex (Responses API) or Claude Code (Anthropic Messages) is set to Pass-through, the gateway does not check those requests (/v1/responses, /v1/messages); with Translate the check covers them too. On Windows, run it in the WSL execution mode. For a wheel-only install (a uv venv without the CUDA toolkit), set CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 and LIBRARY_PATH=/usr/lib/wsl/lib in env, install build-essential and ninja-build in the distro (PATH is reserved, so the venv's ninja is not found) and apply the CUDA fixes from sgl-project/sglang#49209. No shell expands env values: use absolute paths.",
   runtimeSpecTypeSglangOmniNote:
     'sglang-omni serves chat, speech and transcription. Launch template: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. Keep --host 127.0.0.1: sglang-omni authenticates nothing and listens on 0.0.0.0 by default. Speech and transcription need manual capability verdicts, and the parent server_agent application needs "openai_audio (speech synthesis)" ticked too. Voice references and chat images are accepted only inline, as data: URLs, and an image edit only with an uploaded source file. The gateway does not relay chat audio (input_audio, modalities/audio): only text and inline images reach sglang-omni chat. For /v1/realtime, add --enable-realtime and set the realtime capability verdict to yes. On Windows, run it in the WSL execution mode. For a wheel-only install (a uv venv without the CUDA toolkit), set CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 and LIBRARY_PATH=/usr/lib/wsl/lib in env, install build-essential and ninja-build in the distro (PATH is reserved, so the venv\'s ninja is not found) and apply the CUDA fixes from sgl-project/sglang#49209. No shell expands env values: use absolute paths.',
+  runtimeSpecTypeStrataNote:
+    "Strata (`strata serve`) serves chat over the OpenAI and the Anthropic API. On a new spec, choosing this type fills in the launch template: serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --gpu ${HOST_GPU_IDS_MAIN_LAST} --output jsonl --shutdown-timeout 3, with STRATA_API_KEY=${API_TOKEN} in env. Keep --host 127.0.0.1: the agent reaches the server on loopback. As the binary, enter the absolute path of strata.cmd (C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd) and add it to runtime_allowed_binaries on the agent. Put the run config into the config file strata.json, without api_key: the key comes from env. Leave the visible devices off: --gpu takes the host's card numbers, the main card last. The startup timeout is 960 s, above Strata's own engine wait of 900 s; set the parent server_agent application's timeout to at least 960000 ms, or the portal warns that a cold start is cut short. The gateway accepts chat images only as data:, http:// or https:// URLs.",
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:
@@ -6404,6 +6467,20 @@ const en: PortalMessages = {
   runtimeExecutionWSL: 'WSL2',
   runtimeStatusVRAMFromVM: 'VRAM attributed from the WSL VM',
   errorRuntimeSpecExecutionModeInvalid: 'The execution mode must be native or WSL.',
+  runtimeSpecProcessTree: 'Process tree',
+  runtimeSpecProcessTreeDirect: 'Direct (single process)',
+  runtimeSpecProcessTreeJob: 'Windows job (whole process tree)',
+  runtimeSpecProcessTreeHint:
+    'Windows only: in job mode the agent starts the program inside a Windows job object and stops the whole process tree (e.g. strata.cmd and its children); RAM and VRAM are attributed to the whole tree. Has no effect on Linux and macOS. Requires agent 0.21.0 or newer.',
+  runtimeSpecAgentNoGpuMainLast:
+    'The connected agent does not report "runtime_gpu_main_last": it does not expand ${HOST_GPU_IDS_MAIN_LAST}, so the placeholder stays literal.',
+  runtimeProcessTreeAgentUnsupportedWarning:
+    'At least one spec uses the Windows job process tree, but this server\'s agent does not support it (it is not running on Windows or does not report the "runtime_process_tree_job" capability). It starts the spec directly, so child processes of the engine can outlive a stop. Update the agent or set the process tree to "direct".',
+  runtimeProcessTreeAgentUnknownWarning:
+    "At least one spec uses the Windows job process tree, but no capabilities are known yet for this server's agent (it has not reported). Whether it supports job mode can only be checked after its first report.",
+  errorRuntimeSpecProcessTreeInvalid: 'The process tree mode must be "direct" or "job".',
+  errorRuntimeSpecProcessTreeUnsupported:
+    'This spec\'s agent does not support the job process tree: the agent is not running on Windows, its version is older than 0.21.0, or it does not report the "runtime_process_tree_job" capability. A spec already stored as job can still be saved; only the switch into job mode is refused.',
   errorRuntimeSpecWSLDistroInvalid: 'The WSL distro name is invalid.',
   errorRuntimeSpecWSLPathNotLinux:
     'In WSL mode the binary path and working directory must be absolute Linux paths.',

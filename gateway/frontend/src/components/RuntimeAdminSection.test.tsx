@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import strataFixtureText from './shared/__fixtures__/strata-launch-q8_0.json?raw';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -175,6 +176,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     execution_mode: 'native',
+    process_tree: 'direct',
     wsl_distro: '',
     gpus: [],
     ram_estimate_mb: 0,
@@ -1494,6 +1496,119 @@ describe('RuntimeAdminSection sglang launch-spec kinds', () => {
     expect(messages.en.runtimeNoAudioOnSglangOmniWarning).not.toBe(
       messages.de.runtimeNoAudioOnSglangOmniWarning,
     );
+  });
+});
+
+describe('RuntimeAdminSection strata launch-spec kind', () => {
+  it('offers strata and shows its note as the type description, and only for it', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByText(t.runtimeSpecTypeStrataNote)).not.toBeInTheDocument();
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.getByRole('combobox', { name: t.runtimeSpecType })).toHaveAccessibleDescription(
+      t.runtimeSpecTypeStrataNote,
+    );
+    expect(screen.getByLabelText(t.runtimeSpecBinary)).toHaveAttribute(
+      'placeholder',
+      '%LOCALAPPDATA%\\Strata\\terminal\\current\\bin\\strata.cmd',
+    );
+    await pickFlavorFormType(t.runtimeSpecTypeLlamaCpp);
+    expect(screen.queryByText(t.runtimeSpecTypeStrataNote)).not.toBeInTheDocument();
+  });
+
+  it('prefills exactly the template on a new spec and sends it', async () => {
+    const { putSpecs } = renderSection({
+      application: {
+        ...application,
+        api_flavors: ['openai', 'anthropic'],
+        responses_mode: 'translate',
+        messages_mode: 'translate',
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: {
+        value: 'C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd',
+      },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(flavorBoxes().openai).toBeChecked();
+    expect(flavorBoxes().anthropic).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    const body = putSpecs[0].body;
+    expect(body.type).toBe('strata');
+    expect(body.args).toEqual([
+      'serve',
+      '--config',
+      '${CONFIG_DIR}/strata.json',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      '${PORT}',
+      '--gpu',
+      '${HOST_GPU_IDS_MAIN_LAST}',
+      '--output',
+      'jsonl',
+      '--shutdown-timeout',
+      '3',
+    ]);
+    expect(body.env).toEqual({ STRATA_API_KEY: '${API_TOKEN}' });
+    expect(body.set_visible_devices).toBe(false);
+    expect(body.startup_timeout_seconds).toBe(960);
+    expect(body.api_flavors).toEqual(['openai', 'anthropic']);
+    expect(body.responses_mode).toBe('passthrough');
+    expect(body.messages_mode).toBe('passthrough');
+    // Scheduling stays the stock create defaults: not pinned, on demand.
+    expect(body.pinned).toBe(false);
+    expect(body.idle_timeout_seconds).toBe(0);
+    expect(body.admission_wait_timeout_seconds).toBe(0);
+  });
+
+  it('keeps args and env the operator already typed', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/opt/strata/bin/strata' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecArgs), {
+      target: { value: 'serve\n--port\n${PORT}' },
+    });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecEnv), {
+      target: { value: 'STRATA_API_KEY=${API_TOKEN}\nFOO=bar' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.args).toEqual(['serve', '--port', '${PORT}']);
+    expect(putSpecs[0].body.env).toEqual({ STRATA_API_KEY: '${API_TOKEN}', FOO: 'bar' });
+    expect(putSpecs[0].body.startup_timeout_seconds).toBe(960);
+  });
+
+  it('does not prefill an existing spec switched to strata', async () => {
+    const { putSpecs } = await openFlavorSpecEdit({
+      binary: '/opt/strata/bin/strata',
+      args: [],
+      env: {},
+      type: 'llama_cpp',
+      startup_timeout_seconds: 180,
+      api_flavors: ['openai'],
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.type).toBe('strata');
+    expect(putSpecs[0].body.args).toEqual([]);
+    expect(putSpecs[0].body.env).toEqual({});
+    expect(putSpecs[0].body.startup_timeout_seconds).toBe(180);
+    expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
+  });
+
+  it('lists the Strata row in the API-token backend table', async () => {
+    await openApiTokenSpecEdit({ api_token_mode: 'set' });
+    expect(screen.getByText(t.runtimeSpecApiTokenRowStrataEnv)).toBeInTheDocument();
   });
 });
 
@@ -3994,6 +4109,7 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // reset a wsl spec to native on a Start/Stop/Pin click.
     execution_mode: spec.execution_mode,
     wsl_distro: spec.wsl_distro,
+    process_tree: spec.process_tree,
     api_token_mode: spec.api_token_mode,
     api_token_header_source: spec.api_token_header_source,
     api_token_header: spec.api_token_header,
@@ -10093,7 +10209,7 @@ describe('RuntimeAdminSection API-token backend hints', () => {
     expect(screen.getByText(t.runtimeSpecApiTokenRowLlamaCppEnv)).toBeInTheDocument();
     expect(screen.getByText(t.runtimeSpecApiTokenRowTgiEnv)).toBeInTheDocument();
     // Args column is marked readable -- the whole point of the warning below.
-    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark)).toHaveLength(3);
+    expect(screen.getAllByText(t.runtimeSpecApiTokenArgsReadableMark)).toHaveLength(4);
   });
 
   it('shows the loud Args-leak warning only while ${API_TOKEN} sits in the Args field', async () => {
@@ -13600,5 +13716,200 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
+  });
+});
+
+describe('RuntimeAdminSection process_tree control (#424)', () => {
+  const processTreeSelect = () => screen.getByRole('combobox', { name: t.runtimeSpecProcessTree });
+
+  async function openEdit(spec: Partial<RuntimeSpec>, report?: RuntimeReport) {
+    const binaryLabel =
+      spec.execution_mode === 'wsl' ? t.runtimeSpecBinaryLinux : t.runtimeSpecBinary;
+    const rendered = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          ...spec,
+        }),
+      },
+      ...(report ? { report } : {}),
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(binaryLabel);
+    return rendered;
+  }
+
+  it('shows the Windows-only control for a native spec, defaulting to direct', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeDirect);
+    expect(screen.getByText(t.runtimeSpecProcessTreeHint)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('direct');
+  });
+
+  it('is hidden for a wsl spec and sends direct', async () => {
+    const { putSpecs } = await openEdit({
+      execution_mode: 'wsl',
+      wsl_distro: 'Ubuntu-24.04',
+      process_tree: 'direct',
+    });
+    expect(screen.queryByRole('combobox', { name: t.runtimeSpecProcessTree })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('direct');
+  });
+
+  it('loads a stored job value and sends it unchanged on save', async () => {
+    const { putSpecs } = await openEdit({ process_tree: 'job' });
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeJob);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('job');
+  });
+
+  it('treats a missing stored value as direct', async () => {
+    const { putSpecs } = await openEdit({ process_tree: undefined });
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeDirect);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('direct');
+  });
+
+  it('the strata template on a new spec selects job', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: 'C:\\strata.cmd' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeJob);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('job');
+  });
+
+  it('labels the process_tree_agent_unknown warning', async () => {
+    renderSection({ warnings: ['process_tree_agent_unknown'] });
+    expect(await screen.findByText(t.runtimeProcessTreeAgentUnknownWarning)).toBeInTheDocument();
+    expect(screen.queryByText('process_tree_agent_unknown')).not.toBeInTheDocument();
+  });
+
+  it('labels the process_tree_agent_unsupported warning', async () => {
+    renderSection({ warnings: ['process_tree_agent_unsupported'] });
+    expect(
+      await screen.findByText(t.runtimeProcessTreeAgentUnsupportedWarning),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('process_tree_agent_unsupported')).not.toBeInTheDocument();
+  });
+
+  describe('${HOST_GPU_IDS_MAIN_LAST} agent warning', () => {
+    const oldAgent = () =>
+      makeReport({ agent_version: '0.20.0', agent_features: ['runtime_manager'] });
+    const newAgent = () =>
+      makeReport({
+        agent_version: '0.21.0',
+        agent_features: ['runtime_manager', 'runtime_gpu_main_last'],
+      });
+    const settle = async () => {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    };
+
+    it('warns when args use the placeholder and the agent lacks runtime_gpu_main_last', async () => {
+      await openEdit({ args: ['--gpu', '${HOST_GPU_IDS_MAIN_LAST}'] }, oldAgent());
+      expect(
+        await screen.findByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).toHaveTextContent('0.20.0');
+    });
+
+    it('warns for the placeholder in env or a config file too', async () => {
+      await openEdit({ env: { GPUS: '${HOST_GPU_IDS_MAIN_LAST}' } }, oldAgent());
+      expect(
+        await screen.findByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).toBeInTheDocument();
+      cleanup();
+      await openEdit(
+        { config_files: [{ name: 'a.json', content: '{"g":"${HOST_GPU_IDS_MAIN_LAST}"}' }] },
+        oldAgent(),
+      );
+      expect(
+        await screen.findByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).toBeInTheDocument();
+    });
+
+    it('stays quiet when the agent declares it, or the placeholder is unused', async () => {
+      await openEdit({ args: ['--gpu', '${HOST_GPU_IDS_MAIN_LAST}'] }, newAgent());
+      await settle();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).not.toBeInTheDocument();
+      cleanup();
+      await openEdit({ args: ['serve'] }, oldAgent());
+      await settle();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+  });
+});
+
+describe('RuntimeAdminSection strata run-config import', () => {
+  async function openImport() {
+    const view = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
+    return view;
+  }
+
+  it('offers the import only for strata', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    expect(screen.queryByRole('button', { name: t.strataImportOpen })).not.toBeInTheDocument();
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.getByRole('button', { name: t.strataImportOpen })).toBeInTheDocument();
+  });
+
+  it('fills strata.json, the GPU rows 2,0,1, the timeout and the model name', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByLabelText(t.runtimeSpecConfigFileName)).toHaveValue('strata.json');
+    const content = screen.getByLabelText(t.runtimeSpecConfigFileContent) as HTMLTextAreaElement;
+    expect(JSON.parse(content.value).model_name).toBe('${MODEL}');
+    const indexes = [0, 1, 2].map(
+      (i) =>
+        (
+          screen.getByLabelText(`${t.runtimeSpecGpuIndex}`, {
+            selector: `#runtime-spec-gpu-index-${i}`,
+          }) as HTMLInputElement
+        ).value,
+    );
+    expect(indexes).toEqual(['2', '0', '1']);
+    expect(screen.getByLabelText(t.runtimeSpecStartupTimeout)).toHaveValue(1905);
+    expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('qwen3.8-flash-next-unsloth-q8_0');
+  });
+
+  it('shows an inline error and writes nothing for a bad paste', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), { target: { value: '{nope' } });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByText(t.strataImportErrorInvalidJson)).toBeInTheDocument();
+    expect(screen.queryByLabelText(t.runtimeSpecConfigFileName)).not.toBeInTheDocument();
   });
 });

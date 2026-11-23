@@ -3830,6 +3830,8 @@ func viewRuntimeType(view mappingView, idx runtimeSpecIndex) routing.RuntimeSpec
 		return routing.RuntimeSpecTypeAudioCpp
 	case routing.ProviderVllmSR:
 		return routing.RuntimeSpecTypeVllmSR
+	case routing.ProviderStrata:
+		return routing.RuntimeSpecTypeStrata
 	}
 	return ""
 }

@@ -50,6 +50,14 @@ const (
 	// that one names the kind of an agent-launched vllm-srun worker on a
 	// server_agent application.
 	ProviderVllmSR = "vllm_sr"
+	// ProviderStrata is an operator-run Strata server (a llama.cpp-style local
+	// LLM server that speaks the OpenAI and Anthropic dialects). It shares the
+	// OpenAI-compatible provider client. The string equals
+	// RuntimeSpecTypeStrata, but it is a different namespace: that one names
+	// the kind of an agent-launched Strata runtime spec on a server_agent
+	// application. Upstream pin: Niko1221/Strata@c6f6427 (release 0.2.17,
+	// engine 0.1.63).
+	ProviderStrata = "strata"
 	// ProviderVendorOpenAI and ProviderVendorAnthropic are the provider kinds of
 	// a vendor-account target: inference served by a hosted vendor API
 	// (api.openai.com / api.anthropic.com) instead of an on-prem application.
@@ -2088,6 +2096,16 @@ const (
 // of any other task carries none, not even a no. It writes the speech,
 // transcription, transcription_streaming, speech_clone and speech_streaming
 // rows, and no other.
+//
+// CapabilitySourceStrataModels names the probe-rank source read from a Strata
+// application's own model listing, GET /v1/models: an entry whose
+// architecture.input_modalities lists "image" is a CapabilityVision yes. It
+// writes that one row, and only ever a yes: a listing without "image" (or
+// without the field) is no verdict, because nothing pins the modality list as
+// exhaustive. Its one producer is the gateway's health loop, for a strata
+// application without its own context probe path (recordListedModelInfos in
+// cmd/gateway). It ranks 1 through capabilitySourceRank's DEFAULT branch like
+// the sources above.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"
@@ -2096,6 +2114,7 @@ const (
 	CapabilitySourceLlamaCppTimings   = "llama_cpp_timings"
 	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
 	CapabilitySourceAudioCppModels    = "audiocpp_models"
+	CapabilitySourceStrataModels      = "strata_models"
 	CapabilitySourceSystemOneProbe    = "systemone_probe"
 	CapabilitySourceDecisionsProbe    = "decisions_probe"
 	CapabilitySourceLegacy            = "legacy"
@@ -3116,6 +3135,11 @@ type RuntimeSpec struct {
 	// WSLDistro is the WSL distro a "wsl" spec runs in; always "" for native
 	// (migration 109).
 	WSLDistro string
+	// ProcessTree is how the agent supervises a native spec's process tree on
+	// Windows: "direct" (the default and every pre-feature row) or "job" (a
+	// Windows Job Object; migration 113). "" reads as direct to in-memory
+	// callers that never set it.
+	ProcessTree ProcessTree
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;

@@ -1734,6 +1734,8 @@ func normalizeApplicationType(raw string) (string, error) {
 		return routing.ProviderAudioCpp, nil
 	case routing.ProviderVllmSR:
 		return routing.ProviderVllmSR, nil
+	case routing.ProviderStrata:
+		return routing.ProviderStrata, nil
 	default:
 		return "", ErrApplicationTypeInvalid
 	}

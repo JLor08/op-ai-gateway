@@ -1593,3 +1593,43 @@ func TestExtractContext_SGLangFallsBackToTheBestEffortScan(t *testing.T) {
 		t.Error("extractContext(vllm) fell back to the scan, want its strict reading")
 	}
 }
+
+// A strata child serves llama.cpp's /props shape on `strata serve`
+// (default_generation_settings.n_ctx), its default context probe path.
+func TestExtractContext_StrataReadsPropsNCtx(t *testing.T) {
+	var v any
+	if err := json.Unmarshal([]byte(`{"default_generation_settings":{"n_ctx":262144},"total_slots":1}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := extractContext("strata", v); !ok || n != 262144 {
+		t.Errorf("extractContext(strata) = %d, %v; want 262144, true", n, ok)
+	}
+	// default_generation_settings.n_ctx wins over an n_ctx elsewhere in the body,
+	// even one the best-effort scan would visit first (its keys sort earlier).
+	var withOther any
+	if err := json.Unmarshal([]byte(`{"adapters":[{"n_ctx":4096}],"default_generation_settings":{"n_ctx":262144}}`), &withOther); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := extractContext("strata", withOther); !ok || n != 262144 {
+		t.Errorf("extractContext(strata) with another n_ctx = %d, %v; want 262144, true", n, ok)
+	}
+}
+
+// Without /props' shape a strata body falls back to the best-effort scan, so a
+// context probe override at /v1/models (newer Strata releases list
+// context_length there) still reads a value; llama_cpp keeps its strict reading.
+func TestExtractContext_StrataFallsBackToTheBestEffortScan(t *testing.T) {
+	var v any
+	if err := json.Unmarshal([]byte(`{"object":"list","data":[{"id":"m","context_length":131072}]}`), &v); err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := extractContext("strata", v); !ok || n != 131072 {
+		t.Errorf("extractContext(strata) = %d, %v; want 131072, true", n, ok)
+	}
+	if _, ok := extractContext("llama_cpp", v); ok {
+		t.Error("extractContext(llama_cpp) fell back to the scan, want its strict reading")
+	}
+	if _, ok := extractContext("strata", map[string]any{"data": []any{}}); ok {
+		t.Error("extractContext(strata) on a body without a context = ok, want false")
+	}
+}

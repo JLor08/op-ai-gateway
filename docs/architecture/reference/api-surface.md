@@ -58,7 +58,7 @@ Client-facing, OpenAI/Anthropic/Codex/Claude-Code-compatible completion, image-g
 
 | Path(s) | Method | Auth | Purpose |
 |---|---|---|---|
-| `/v1/chat/completions`, `/openai/v1/chat/completions` | POST | Session-or-bearer, `gateway:use`\|`llm:invoke` | OpenAI-compatible chat completions (streaming supported). **Inline media for sglang-omni, no host paths for SGLang:** when the resolved target is an agent-launched `sglang_omni` runtime spec, every `image_url.url` must be an inline `data:` URL; when it is an `sglang` spec, a `data:`, `http://` or `https://` URL (the scheme case-insensitive). Otherwise the request is refused with 400 `chat.media_url_unsupported` after routing (the message names the field, never the value; logged at Warn, recorded as a usage row without an upstream call), because sglang-omni reads a bare path from the model host and fetches any URL, and SGLang reads a `/` or `file://` reference from its host. The same refusal covers the translated `/v1/responses` and `/v1/messages` paths, and for an `sglang_omni` target a `passthrough` mode of either is served as translate, so neither reaches it raw (a Responses translation keeps text only). A raw passthrough to an `sglang` target is not checked. Other targets are unchanged. |
+| `/v1/chat/completions`, `/openai/v1/chat/completions` | POST | Session-or-bearer, `gateway:use`\|`llm:invoke` | OpenAI-compatible chat completions (streaming supported). **Inline media for sglang-omni, no host paths for SGLang:** when the resolved target is an agent-launched `sglang_omni` runtime spec, every `image_url.url` must be an inline `data:` URL; when it is an `sglang` spec, a `data:`, `http://` or `https://` URL (the scheme case-insensitive). Otherwise the request is refused with 400 `chat.media_url_unsupported` after routing (the message names the field, never the value; logged at Warn, recorded as a usage row without an upstream call), because sglang-omni reads a bare path from the model host and fetches any URL, and SGLang reads a `/` or `file://` reference from its host. The same refusal covers the translated `/v1/responses` and `/v1/messages` paths, and for an `sglang_omni` target a `passthrough` mode of either is served as translate, so neither reaches it raw (a Responses translation keeps text only). A raw passthrough to an `sglang` target is not checked. **No host paths for Strata:** for a `strata` application or spec, every image reference must start with lowercase `data:`, `http://` or `https://`, on the translate path and, because Strata keeps both coding-agent modes at `passthrough`, in the raw `/v1/messages` and `/v1/responses` body too (Anthropic `image`/`document` sources and `input_image`/`image_url` parts at any depth), else the same 400 ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)). Other targets are unchanged. |
 | `/v1/responses`, `/openai/v1/responses` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | OpenAI Responses API (Codex); native passthrough when the target app supports it, or when the target is an OpenAI vendor account the calling token may use (the caller's own, or one shared with the caller; per-token opt-in, [§11](../cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access)), subscription or api-key ([External Vendor Accounts §4.2](../cross-cutting/external-vendor-accounts.md#42-openai)). On the passthrough, `retry-after` and `x-should-retry` are relayed and the Codex `x-codex-*` usage-limit family only to a caller entitled to the account's figures whose token has `send_usage_limits` ([ADR-110](../09-architecture-decisions.md#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it)); a success from a target with no windows of its own carries the caller's last ones, unless the principal's own limit is at 75 % or more and takes over ([API Compatibility & Inference §9.5](../cross-cutting/compatibility-and-inference.md#95-codex-usage-limit-display)). **Refusals** include the principal's quota or cost-budget denial, which here is a `429` with a Codex `usage_limit_reached` body (`code` `limit.request_quota_exceeded`, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, plus `resets_at`), `Retry-After`, `X-Should-Retry: false`, `x-codex-promo-message` and, only for a token with `send_usage_limits`, the default `x-codex` window at 100 % (and without `codex_model_switch_prompt`, the credits flags); a principal with a quota or budget also gets its fullest limit in the default `x-codex` family on a success that carries no fresh subscription figures, and from 75 % of that limit instead of cached ones (token with `send_usage_limits` only) ([API Compatibility & Inference §9.6](../cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits)) |
 | `/v1/messages`, `/anthropic/v1/messages` | POST | Bearer-only, `gateway:use`\|`llm:invoke` | Anthropic Messages API (Claude Code); native passthrough when the target app supports it, or when the target is an Anthropic vendor account the calling token may use (the caller's own, or one shared with the caller; per-token opt-in, [§11](../cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access)), **api-key or subscription** ([External Vendor Accounts §4.1](../cross-cutting/external-vendor-accounts.md#41-anthropic); a subscription account has the Claude-Code system block injected first, the client's `anthropic-beta` is forwarded verbatim on either, and an `openai_*` request to either account still translates) — the only path where Anthropic streaming works end-to-end. **Refusals** include the principal's quota or cost-budget denial, which here is a `429` with a `billing_error` body (`limit.request_quota_exceeded`, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`), `Retry-After` and `X-Should-Retry: false` (plus the unified usage headers, only for a token with `send_usage_limits`); a principal with a quota or budget also gets the overage-window usage headers on a success, for such a token ([API Compatibility & Inference §9.4](../cross-cutting/compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits)) |
 | `/v1/images/generations`, `/openai/v1/images/generations` | POST | Bearer-or-loopback, `gateway:use`\|`llm:invoke` | OpenAI-compatible image generation, relayed to a natively image-shaped upstream (`sd-server`). No translate path: only an application declaring `openai_images` is a candidate (otherwise 404 `routing.no_model_route`, also the answer when a resolved agent-launched child's spec excludes the flavor), and a mapping without an `image` capability verdict of `yes` is refused with 404 `routing.model_not_capable`. Non-streaming only — a `stream: true` is refused with 400 `images.stream_unsupported`, and `response_format` must be `b64_json` or absent. Metered in images, not tokens |
@@ -544,7 +544,7 @@ Three vocabularies on `ApplicationDTO`/`CreateApplicationRequest`/
 `UpdateApplicationRequest`:
 
 - **`type`**: `ollama` | `vllm` | `llama_cpp` | `llama_swap` | `litellm` |
-  `server_agent` | `stable_diffusion_cpp` | `audio_cpp` | `vllm_sr`. Anything else is refused as
+  `server_agent` | `stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `strata`. Anything else is refused as
   `application.type_invalid` (400). `stable_diffusion_cpp` is an external
   stable-diffusion.cpp `sd-server`; its model discovery reads
   `/sdapi/v1/sd-models`, derived from the type, and its backend `timeout_ms`
@@ -567,6 +567,14 @@ Three vocabularies on `ApplicationDTO`/`CreateApplicationRequest`/
   mode with the path `/v1/systemone/models`, because the router's `/health` is on a
   management port the gateway cannot reach
   ([ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)).
+  `strata` is an operator-run Strata (`strata serve` or the desktop app's LAN share; the same
+  string as the agent-launched kind below). Its backend `timeout_ms` default is the stock 30000;
+  the form fills in port 8080, `["openai","anthropic"]`, both coding-agent modes `passthrough`,
+  loaded models `/v1/models` (`openai`) and the `health_path` mode with the path `/v1/models`,
+  the one route both shapes serve. The application token is Strata's key. The gateway's health
+  loop reads the context size and an image-input verdict from that listing for this type only
+  ([Routing & Model Selection §1](../cross-cutting/routing-and-model-selection.md#1-data-model),
+  [ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)), and `decisions_mode: passthrough` is refused for it.
 - **`api_flavors`**: a subset of `["openai","anthropic","openai_images","openai_audio","decisions"]`, the
   coarse flavors a request is matched against. On **create** an absent or
   empty list becomes exactly `["openai","anthropic"]`. On **update** an absent
@@ -686,7 +694,7 @@ semantics.
 | `/api/portal/mappings/{id}/probe-vram` | POST | mapping (`AuthorizeBenchmarkScope`, **not** the mapping write rule above) | The **VRAM benchmark**: force-stop every managed spec on the server (*the target included*), load this one model, and report its VRAM. `202` + the initial `BenchmarkStatus`; the result arrives on the benchmark status poll / SSE as `results[].vram`. Reserves the server like any benchmark (`409 benchmark.already_running`, checked before the refusals below, and `409 benchmark.server_in_use`). See the seven refusals below and [§11.6](../cross-cutting/agent-runtime-manager.md#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs) |
 | `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's co-residency document, `{"mode":"opt_out"\|"opt_in","pairs":[{"a","b","verdict":"allow"\|"forbid"}]}`: its per-server **mode** (what a pair with no entry means, default `opt_out`) and the complete set of its **explicit** pair verdicts, each canonical (`a < b`). `pairs` is always a non-nil array; the effective allowed-pair list the agent receives is derived from both and is not part of this document ([ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)). The PUT is a full replace of the explicit pairs; an empty or absent `mode` leaves the stored mode unchanged, an empty `verdict` is an `allow`, and `400` `runtime_coresidency.mode_invalid` / `runtime_coresidency.pair_invalid` reject an unknown mode / a bad pair or verdict |
 | `/api/portal/applications/{id}/runtime/cluster-candidates?mode=automatic\|manual&binary=<path>` | GET | application | The mapping-scoped listing above for a cluster head that is not stored yet: a new runtime spec on the application, whose first write stores the spec and its members together. Same answer and refusals (an application the caller may not manage is `404 application.not_found`); the head server is the application's, the head binary is `binary` alone (no stored spec), and a member spec any head uses is not offered |
-| `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout`, `binary_path_os_mismatch`, `api_flavors_not_on_application` and `api_flavors_text_on_stable_diffusion` ([Agent-Managed Model Runtime §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows)) |
+| `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout`, `binary_path_os_mismatch`, `api_flavors_not_on_application`, `api_flavors_text_on_stable_diffusion`, `api_flavors_text_on_vllm_sr`, `api_flavors_no_audio_on_sglang_omni`, `process_tree_agent_unknown` and `process_tree_agent_unsupported` ([Agent-Managed Model Runtime §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows)) |
 | `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
 | `/api/portal/servers/{id}/runtime/report` | GET | server | The file-mode agent's reported effective configuration |
 | `/api/portal/servers/{id}/runtime/events` | GET (SSE) | server | Live per-spec runtime status (`GetServer` ownership check runs **before the first stream byte**). An RPC cluster member's row (`kind: "rpc_server"`) carries `display_name`, resolved for the reader from the stored membership: `RPC (<head's gateway model name>)(<head server's name>)`. The member's own server is the one being viewed, so the name says which head it serves. A head the reader may not see (its mapping is beyond the reader's rights) and a head whose spec or mapping is gone show as `RPC (—)`, naming neither model nor server, and a manual member spec no head uses shows as `RPC (<binary's file name>)`. The row also carries the name's parts, `head_model` and `head_server`, so a client can sort and filter by them; both are absent whenever the name names no head. `spec_id` stays the member's identity. Each stream looks the names up when its set of members changes and on the first frame 15 s or more after the last lookup, so a renamed model or head server shows on that frame. A failed lookup is retried after 5 s; until then the names already known stay, but never longer than 15 s after the last successful lookup, and a refusal of the server (the reader lost its rights) drops them at once |
@@ -1027,6 +1035,7 @@ sentinel is a breaking API change that must be applied in both places):
 | `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
 | `runtime_spec.execution_mode_invalid`, `.wsl_distro_invalid`, `.wsl_path_not_linux`, `.wsl_cluster_unsupported` | 400 — the execution mode (#381): an `execution_mode` other than `native`/`wsl` (`""` stores `native`); for `wsl`, a `wsl_distro` that is empty or not a plain name (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), a `binary` or non-empty `work_dir` that is not a Linux absolute path (no leading `/`), and a spec that is an RPC cluster head (`cluster_enabled`). Checked in that order, as the last of the request's own shape checks |
+| `runtime_spec.process_tree_invalid`, `runtime_spec.process_tree_unsupported` | 400 — the process-tree mode (#424): a `process_tree` other than `direct`/`job` (`""` stores `direct`); a write that moves a spec into `job` (a new spec, or one not stored as `job`) for a server whose reported OS is not `windows` or whose agent declared its features without `runtime_process_tree_job` (operator path only, checked last; a re-save of a spec already stored as `job` is not refused) |
 | `runtime_spec.instances_invalid`, `runtime_spec.instances_need_ephemeral_port` | 400 — the instance settings (#340): `min_instances` or `max_instances` above 64 (`MaxInstanceIndex` + 1; `instance_parallelism` has no upper bound), or `min_instances` above a set `max_instances`; `replicable` with a fixed `listen_port`. A negative `min_instances`, `max_instances` or `instance_parallelism` is `runtime_spec.tuning_invalid` |
 | `runtime_coresidency.pair_invalid`, `runtime_coresidency.mode_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
@@ -1117,6 +1126,29 @@ rule above, which a Linux path does); and the spec may not be an RPC cluster hea
 `runtime_spec.execution_mode_invalid`. A `wsl` spec saved for a server whose
 agent does not declare `runtime_exec_wsl` is stored, but not pushed (below).
 
+`RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `process_tree` (#424, migration 113,
+[Agent-Managed Model Runtime
+§3.9](../cross-cutting/agent-runtime-manager.md#39-the-windows-process-tree-process_tree),
+[ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)): `direct` (the
+default) or `job`, the opt-in Windows job-object tree for a native spec. The GET never
+answers `""` (a stored `""` reads as `direct`); on the PUT an omitted or `""` value stores
+`direct`, and the field is part of the full-document replace, so a client that omits it
+resets a job spec to `direct`. Any other value is `runtime_spec.process_tree_invalid` (400),
+checked after the execution mode, so older refusals keep their answers. An operator's write
+that moves a spec into `job` (a new spec, or one not stored as `job`) is refused with
+`runtime_spec.process_tree_unsupported` (400) when the server's reported OS is not
+`windows`, or its agent has declared its features since the gateway started without
+`runtime_process_tree_job`; this is the last check of the operator path. When either fact
+is still unknown and neither known fact refuses, the save succeeds and the warnings
+endpoint reports `process_tree_agent_unknown`. A re-save of a spec already stored as `job`
+(the portal's override buttons re-send the whole spec) is never refused; on an agent known
+to lack support the warnings endpoint reports `process_tree_agent_unsupported`. A `wsl` spec may store `job`; it has no effect there.
+The pushed agent document carries `process_tree` only for a `job` spec (absent means
+`direct`), and carries `api_token_header` beside a non-empty `api_token`: the effective
+header name the agent's own child probes use for the token (empty means `Authorization:
+Bearer`; [Agent-Managed Model Runtime
+§3.2](../cross-cutting/agent-runtime-manager.md#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)).
+
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `visible_devices_mode`
 (`"env"` | `"args"`, empty on the request defaults to `"env"` in
 `validateRuntimeSpecRequest`, and the GET always echoes the resolved value,
@@ -1148,7 +1180,7 @@ than refusing it. See
 
 `RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `type` (`""` | `"vllm"` |
 `"llama_cpp"` | `"tgi"` | `"ollama"` | `"stable_diffusion_cpp"` | `"audio_cpp"` |
-`"vllm_sr"` | `"sglang"` | `"sglang_omni"` | `"custom"`, empty = auto-detect from `binary`) and the operator's own raw
+`"vllm_sr"` | `"sglang"` | `"sglang_omni"` | `"strata"` | `"custom"`, empty = auto-detect from `binary`) and the operator's own raw
 `metrics_path`/`context_probe_path` overrides (empty = use the resolved type's own default). The **GET**
 response additionally echoes three **read-only** fields —
 `effective_type`, `resolved_metrics_path`, `resolved_context_probe_path` —
@@ -1166,7 +1198,7 @@ write-back, and **never accepted on a write** (`PutRuntimeSpecRequest` has no su
 member and a stale client that sends one has it ignored). It is derived on every
 read and stored nowhere, so a verdict change moves it; the co-residency editor
 groups by it. `runtime_spec.type_invalid` (400) rejects a `type` that is neither empty
-(auto-detect) nor one of the seven named kinds above, checked before any
+(auto-detect) nor one of the eleven named kinds above, checked before any
 mutation like every other spec validation rule. See [Agent-Managed Model
 Runtime
 §3.4](../cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation).
@@ -1441,12 +1473,12 @@ notes:
   `auto` / `auto`, not the parent application's values.
 - **`passthrough` is refused for `llama_cpp`** (no `/v1/decisions` route) **and for `vllm_sr`** (its `/v1/decisions` is the System One alias, [ADR-099](../09-architecture-decisions.md#adr-099--vllm-semantic-router-an-engine-mode-application-type-and-an-agent-launched-vllm-srun-runtime-spec-type-the-gateway-warns-on-an-unsupported-api_version-and-never-refuses-phase-3-of-373)): on an
   application create, or an update that sends `type`, as `application.decisions_passthrough_unsupported`
-  (400); on an update that sends **no** `type` while the **stored** type is `llama_cpp` or `vllm_sr`, as
+  (400); on an update that sends **no** `type` while the **stored** type is `llama_cpp`, `vllm_sr` or `strata`, as
   `application.decisions_passthrough_conflict` (409, the live-timings rule); on a spec PUT
-  whose **effective** type is `llama_cpp` or `vllm_sr`, as `runtime_spec.decisions_passthrough_unsupported`
-  (400). The route itself also follows the effective kind: for `llama_cpp` and `vllm_sr` a `decision_openai` verdict is ignored (`auto` translates; a stale forced `passthrough` is `404 routing.model_not_capable`), and the mapping DTO's `decisions_route` reads the same function. Other types are not guarded here; the probe, not the save, decides per model whether a
+  whose **effective** type is `llama_cpp`, `vllm_sr` or `strata`, as `runtime_spec.decisions_passthrough_unsupported`
+  (400). The route itself also follows the effective kind: for `llama_cpp`, `vllm_sr` and `strata` a `decision_openai` verdict is ignored (`auto` translates; a stale forced `passthrough` is `404 routing.model_not_capable`), and the mapping DTO's `decisions_route` reads the same function. Other types are not guarded here; the probe, not the save, decides per model whether a
   server answers natively. A stored `passthrough` on an application that is **retyped** to
-  `llama_cpp` or `vllm_sr` without a new `decisions_mode` is reset to `auto`, not refused.
+  `llama_cpp`, `vllm_sr` or `strata` without a new `decisions_mode` is reset to `auto`, not refused.
 - **`systemone_mode: translate` is refused for the same two types**, because they have no OpenAI
   `/v1/decisions` to translate to: `application.systemone_translate_unsupported` (400, on a create or an
   update that sends `type`), `application.systemone_translate_conflict` (409, the stored type) and
@@ -1458,7 +1490,7 @@ notes:
   `application.decisions_passthrough_conflict` 409, `runtime_spec.decisions_passthrough_unsupported` 400).
 - **The mapping DTO** carries `decisions_route` and `systemone_route` (above) and the model DTO `decision_openai`;
   the portal's application and runtime-spec forms offer both selects (`passthrough` is not
-  offered for `llama_cpp` or `vllm_sr` types, nor `translate` on the System One select, and both selects are disabled while the `decisions` flavor is
+  offered for `llama_cpp`, `vllm_sr` or `strata` types, nor `translate` on the System One select, and both selects are disabled while the `decisions` flavor is
   unticked), the mapping form offers a `decision_openai` verdict select (`yes` or unknown;
   `no` is reserved for the probe) and shows the route.
 
@@ -1467,12 +1499,12 @@ notes:
 | `decisions.endpoint_disabled` | 404 | an inference request to `/v1/decisions` resolved to a target whose effective `decisions_mode` is `disabled`; never returned by a portal write |
 | `systemone.endpoint_disabled` | 404 | the `/v1/systemone` analogue, for a resolved `server_agent` spec with `systemone_mode: disabled` |
 | `systemone.refused` | 422 | the translate route's OpenAI Decisions upstream refused one or more questions; the error object's `type` is `refusal` (other decision errors keep `upstream_error`) |
-| `application.decisions_passthrough_unsupported` | 400 | `decisions_mode: passthrough` with a `llama_cpp` or `vllm_sr` type the request itself supplied (create, or update that sends `type`) |
-| `application.decisions_passthrough_conflict` | 409 | the same refusal where the `llama_cpp` or `vllm_sr` type is the stored one and the update sends no `type` |
-| `runtime_spec.decisions_passthrough_unsupported` | 400 | a spec PUT with `decisions_mode: passthrough` whose effective type is `llama_cpp` or `vllm_sr` |
-| `application.systemone_translate_unsupported` | 400 | `systemone_mode: translate` with a `llama_cpp` or `vllm_sr` type the request itself supplied (create, or update that sends `type`) |
-| `application.systemone_translate_conflict` | 409 | the same refusal where the `llama_cpp` or `vllm_sr` type is the stored one and the update sends no `type` |
-| `runtime_spec.systemone_translate_unsupported` | 400 | a spec PUT with `systemone_mode: translate` whose effective type is `llama_cpp` or `vllm_sr` |
+| `application.decisions_passthrough_unsupported` | 400 | `decisions_mode: passthrough` with a `llama_cpp`, `vllm_sr` or `strata` type the request itself supplied (create, or update that sends `type`) |
+| `application.decisions_passthrough_conflict` | 409 | the same refusal where the `llama_cpp`, `vllm_sr` or `strata` type is the stored one and the update sends no `type` |
+| `runtime_spec.decisions_passthrough_unsupported` | 400 | a spec PUT with `decisions_mode: passthrough` whose effective type is `llama_cpp`, `vllm_sr` or `strata` |
+| `application.systemone_translate_unsupported` | 400 | `systemone_mode: translate` with a `llama_cpp`, `vllm_sr` or `strata` type the request itself supplied (create, or update that sends `type`) |
+| `application.systemone_translate_conflict` | 409 | the same refusal where the `llama_cpp`, `vllm_sr` or `strata` type is the stored one and the update sends no `type` |
+| `runtime_spec.systemone_translate_unsupported` | 400 | a spec PUT with `systemone_mode: translate` whose effective type is `llama_cpp`, `vllm_sr` or `strata` |
 
 The request-side codes of `/v1/decisions` (`decisions.model_required`, `decisions.questions_required`,
 `decisions.stream_unsupported`, `decisions.input_unsupported`, `decisions.question_invalid`,

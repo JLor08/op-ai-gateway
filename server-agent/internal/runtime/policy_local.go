@@ -318,6 +318,33 @@ func hostGPUIDs(spec Spec) string {
 	return strings.Join(parts, ",")
 }
 
+// hostGPUIDsMainLast renders gpus (already ordered and deduplicated, as
+// gpuIndices returns them) as a comma-separated list with the FIRST declared
+// index moved to the END: [2,0,1] -> "0,1,2". The first declared GPU is the
+// operator's main card; tools that treat the last listed device as the main one
+// (Strata) need it there while the rest keep their declared order. Empty string
+// for an empty list. Defensive dedup (first wins) keeps it safe for a caller
+// that passes a raw list.
+func hostGPUIDsMainLast(gpus []int) string {
+	seen := make(map[int]bool, len(gpus))
+	uniq := make([]int, 0, len(gpus))
+	for _, g := range gpus {
+		if seen[g] {
+			continue
+		}
+		seen[g] = true
+		uniq = append(uniq, g)
+	}
+	if len(uniq) > 1 {
+		uniq = append(uniq[1:], uniq[0])
+	}
+	parts := make([]string, len(uniq))
+	for i, idx := range uniq {
+		parts[i] = strconv.Itoa(idx)
+	}
+	return strings.Join(parts, ",")
+}
+
 // deviceList renders the ordered/deduped host indices (gpuIndices) as
 // backend-prefixed llama.cpp --device names -- "CUDA3,CUDA2" for prefix
 // "CUDA", "Vulkan3,Vulkan2" for "Vulkan", "MTL3,MTL2" for "MTL". It is the
@@ -1050,8 +1077,8 @@ var deviceBackendByToken = map[string]string{
 
 // resolveNonSecretToken resolves inner -- the text between "${" and "}" -- when
 // it is one of the exact-match, NON-secret placeholders: ${PORT}, ${MODEL},
-// ${HOST_GPU_IDS}, ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} and
-// ${CONFIG_DIR}. handled reports whether inner was one of them; err is non-nil
+// ${HOST_GPU_IDS}, ${HOST_GPU_IDS_MAIN_LAST}, ${CUDA_DEVICES},
+// ${VULKAN_DEVICES}, ${METAL_DEVICES} and ${CONFIG_DIR}. handled reports whether inner was one of them; err is non-nil
 // only when handled (the token exists but cannot be resolved for this spec).
 // gpuIDs is hostGPUIDs(spec), hoisted by the caller so it is computed once per
 // expansion rather than once per match.
@@ -1086,6 +1113,15 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 			return "", true, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
 		}
 		return gpuIDs, true, nil
+	}
+
+	// EXACT match only, sibling of ${HOST_GPU_IDS}: the same host indices with
+	// the first declared (main) GPU moved last. Same empty-list refusal.
+	if inner == "HOST_GPU_IDS_MAIN_LAST" {
+		if gpuIDs == "" {
+			return "", true, fmt.Errorf("${HOST_GPU_IDS_MAIN_LAST} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
+		}
+		return hostGPUIDsMainLast(gpuIndices(spec)), true, nil
 	}
 
 	// The three llama.cpp --device placeholders, exact-match siblings of

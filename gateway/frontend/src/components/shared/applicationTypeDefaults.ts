@@ -237,6 +237,27 @@ export const applicationTypeDefaults: Record<ApplicationType, TypeDefaults> = {
     healthCheckPath: '/v1/systemone/models',
     apiFlavors: ['decisions'],
   },
+  // Strata (operator-run): `strata serve` or the desktop app's LAN share. The
+  // share answers GET /v1/models only (with the API key; 401 without) and 404s
+  // /props, /metrics, /health and /v1/health, so the health probe and the
+  // loaded-models listing both read /v1/models (format 'openai'), and the
+  // context probe stays empty: the gateway takes the context window from the
+  // same listing (context_length, else meta.n_ctx). Both coding-agent
+  // endpoints are served natively, as llama_cpp's are. Port 8080 is
+  // `strata serve`'s; a desktop share listens on the app port + 1.
+  strata: {
+    port: 8080,
+    scheme: 'http',
+    responsesMode: 'passthrough',
+    messagesMode: 'passthrough',
+    loadedModelsPath: '/v1/models',
+    loadedModelsFormat: 'openai',
+    contextProbePath: '',
+    timeoutMs: 30000,
+    healthCheckMode: 'health_path',
+    healthCheckPath: '/v1/models',
+    apiFlavors: ['openai', 'anthropic'],
+  },
 };
 
 // Value equality across the union of field types this contract carries.

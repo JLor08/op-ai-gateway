@@ -87,9 +87,9 @@ func TestLiveProgressUpstreamsCoverEveryRoutingCapableKind(t *testing.T) {
 			kind, routing.ProviderVLLM)
 	}
 
-	// Every value in BOTH kind vocabularies, including the six that spell
+	// Every value in BOTH kind vocabularies, including the seven that spell
 	// themselves the same in each ("vllm", "llama_cpp", "ollama",
-	// "stable_diffusion_cpp", "audio_cpp", "vllm_sr"), plus the empty spec type that means
+	// "stable_diffusion_cpp", "audio_cpp", "vllm_sr", "strata"), plus the empty spec type that means
 	// "auto-detect from the binary" and is a legitimate stored value. Listed
 	// rather than derived: neither vocabulary exposes an enumeration
 	// (portal.normalizeApplicationType and portal.validRuntimeSpecType are
@@ -98,6 +98,7 @@ func TestLiveProgressUpstreamsCoverEveryRoutingCapableKind(t *testing.T) {
 		routing.ProviderMock, routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP,
 		routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent,
 		routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp, routing.ProviderVllmSR,
+		routing.ProviderStrata, string(routing.RuntimeSpecTypeStrata),
 		string(routing.RuntimeSpecTypeVLLM), string(routing.RuntimeSpecTypeLlamaCpp),
 		string(routing.RuntimeSpecTypeTGI), string(routing.RuntimeSpecTypeOllama),
 		string(routing.RuntimeSpecTypeStableDiffusionCpp), string(routing.RuntimeSpecTypeAudioCpp),

@@ -1431,6 +1431,38 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`ApplicationSection strata type [${locale}]`, () => {
+    it('offers strata and prefills its defaults with the note as the type description', async () => {
+      const { created } = renderSection();
+      openCreate();
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.applicationType }));
+      expect(await screen.findByRole('option', { name: 'strata' })).toBeInTheDocument();
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+      await selectType('strata');
+      expect(screen.getByRole('checkbox', { name: 'openai' })).toBeChecked();
+      expect(screen.getByRole('checkbox', { name: 'anthropic' })).toBeChecked();
+      expect((screen.getByLabelText(t.applicationPort) as HTMLInputElement).value).toBe('8080');
+      expect((screen.getByLabelText(t.applicationTimeout) as HTMLInputElement).value).toBe('30000');
+      expect((screen.getByLabelText(t.applicationHealthPath) as HTMLInputElement).value).toBe(
+        '/v1/models',
+      );
+      expect(screen.getByRole('combobox', { name: t.applicationType })).toHaveAccessibleDescription(
+        t.applicationTypeStrataNote,
+      );
+      fireEvent.click(screen.getByRole('button', { name: t.applicationCreate }));
+      await waitFor(() => expect(created).toHaveLength(1));
+      expect(created[0].type).toBe('strata');
+      expect(created[0].api_flavors).toEqual(['openai', 'anthropic']);
+      expect(created[0].responses_mode).toBe('passthrough');
+      expect(created[0].messages_mode).toBe('passthrough');
+      expect(created[0].timeout_ms).toBe(30000);
+      expect(created[0].health_check_path).toBe('/v1/models');
+      expect(created[0].loaded_models_path).toBe('/v1/models');
+      expect(created[0].loaded_models_format).toBe('openai');
+      expect(created[0].context_probe_path ?? '').toBe('');
+    });
+  });
+
   // openai_images is the third flavor checkbox: opt-in, never ticked by
   // default, so an operator can add it to any application -- a server_agent
   // one included, whose agent-launched image child needs it for candidacy.
@@ -2029,6 +2061,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       stable_diffusion_cpp: true,
       audio_cpp: true,
       vllm_sr: true,
+      strata: true,
     };
     const allTypes = Object.keys(typeKeys) as ApplicationType[];
     const refusedTypes = allTypes.filter((type) => type !== 'server_agent');

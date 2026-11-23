@@ -153,14 +153,30 @@ const codeMediaURLUnsupported = "chat.media_url_unsupported"
 //     get_image_bytes); no gateway client has a reason to name a model-host path. An
 //     http(s) URL stays allowed, as it is for vLLM: blocking it would break the
 //     ordinary vision-model use.
+//   - strata (Niko1221/Strata c6f6427): a data:, http:// or https:// URL is relayed,
+//     the prefixes matched LOWERCASE only (strataImageRefAllowed), and everything else
+//     is refused (errMediaPathUnsupported). Strata's Vision.load
+//     (terminal/serve/server.py, ~3191-3209) strips "file://" and reads the path from
+//     the model host, as it does a bare path, and decides with case-sensitive
+//     startswith checks, so "HTTP://x" or "FILE://..." would land in that local-path
+//     branch. Its only guard (_no_local_images) concerns a browser Origin, which a
+//     gateway request never carries. The image sources come from frontend.py,
+//     _image_source (OpenAI image_url, Responses input_image, Anthropic base64 or
+//     source.url / source.path). The target is a strata application or a server_agent
+//     spec of type strata (Target.EffectiveKind covers both). Strata's default
+//     passthrough for /v1/messages and /v1/responses never reaches this function; the
+//     raw body is scanned instead (strataPassthroughMediaRefused, called from
+//     relayPassthroughTarget).
 func mediaURLsRefused(target routing.Target, req inference.Request) error {
 	var allowed func(string) bool
 	var refusal error
-	switch target.LiveProgressSpecType {
+	switch target.EffectiveKind() {
 	case string(routing.RuntimeSpecTypeSGLangOmni):
 		allowed, refusal = isDataURL, errMediaURLUnsupported
 	case string(routing.RuntimeSpecTypeSGLang):
 		allowed, refusal = isDataOrHTTPURL, errMediaPathUnsupported
+	case string(routing.RuntimeSpecTypeStrata):
+		allowed, refusal = strataImageRefAllowed, errMediaPathUnsupported
 	default:
 		return nil
 	}

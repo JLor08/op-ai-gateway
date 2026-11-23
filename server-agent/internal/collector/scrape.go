@@ -174,15 +174,33 @@ func promQuotedValue(s string) (value, tail string, ok bool) {
 type promScraper struct {
 	url    string
 	client *http.Client
+	auth   probeAuth
+	authed bool
 }
 
-// NewScraper returns a Scraper that GETs url. A nil client defaults to
-// http.DefaultClient.
+// NewScraper returns a Scraper that GETs url with no credential. A nil client
+// defaults to http.DefaultClient.
 func NewScraper(url string, client *http.Client) Scraper {
+	return NewPromScraper(url, client, "", "")
+}
+
+// NewPromScraper is NewScraper with a credential: when authHeader and
+// authValue are both non-empty every scrape sends "authHeader: authValue"
+// (the agent passes the spec's token in its effective header, so a keyed
+// child such as Strata or an api-key'd llama-server answers instead of 401).
+// An empty header or value sends no credential, exactly as NewScraper. url is
+// used verbatim, so a query string in the metrics path (Strata's
+// /metrics?format=prometheus) survives. A nil client defaults to
+// http.DefaultClient.
+func NewPromScraper(url string, client *http.Client, authHeader, authValue string) *promScraper {
 	if client == nil {
 		client = http.DefaultClient
 	}
-	return &promScraper{url: url, client: client}
+	s := &promScraper{url: url, client: client}
+	if authHeader != "" && authValue != "" {
+		s.auth, s.authed = probeAuth{header: authHeader, value: authValue}, true
+	}
+	return s
 }
 
 // Scrape fetches the /metrics body and returns the active/queued request counts
@@ -194,7 +212,7 @@ func (s *promScraper) Scrape(ctx context.Context) (active int, queue int, err er
 	if err != nil {
 		return 0, 0, err
 	}
-	resp, err := s.client.Do(req)
+	resp, err := doProbe(s.client, req, s.auth, s.authed)
 	if err != nil {
 		return 0, 0, err
 	}

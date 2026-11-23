@@ -2825,6 +2825,11 @@ func (m *MemoryStore) UpsertRuntimeSpec(_ context.Context, spec RuntimeSpec) err
 		return storeerr.ErrNotFound
 	}
 	spec = copyRuntimeSpec(spec)
+	// Mirrors the SQL upsert's defaulting: process_tree is NOT NULL with a
+	// 'direct' default (migration 113), so an unset field stores direct.
+	if spec.ProcessTree == "" {
+		spec.ProcessTree = ProcessTreeDirect
+	}
 	for existingID, existing := range m.runtimeSpecs {
 		if existing.MappingID == spec.MappingID {
 			spec.ID = existingID

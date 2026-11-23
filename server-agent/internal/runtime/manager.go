@@ -361,6 +361,14 @@ type ManagerOptions struct {
 	// scope signals, the orphan sweep). nil, the production case, is
 	// execWSLRunner; a test injects one to observe or fail single calls.
 	WSLRunner wslRunner
+	// ProcessTrees registers a generation whose control can list its process
+	// tree -- the Windows job of a process_tree "job" spec (#424) -- so the
+	// RAM and VRAM measurers charge every process in the tree to the
+	// generation's root pid. It returns the unregister, which the manager
+	// calls at the reap. main.go wires collector.RegisterProcessTree, the
+	// measurers' own registry, the way it wires the measurers themselves; nil
+	// registers nothing, and every pid is measured as its own.
+	ProcessTrees func(root int, members func() []int) (unregister func())
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -497,6 +505,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		wslRunner:           run,
 		wslNonce:            newWSLNonce(),
 		wslRAMReserveMB:     max(0, opts.WSLRAMReserveMB),
+		processTrees:        opts.ProcessTrees,
 		specs:               make(map[string]*specState),
 		allowedPairs:        map[[2]string]bool{},
 		logs:                m.logs,
@@ -1297,6 +1306,10 @@ type runningProc struct {
 	// generation, so it identifies exactly this process inside the distro.
 	wslUnit   string
 	wslDistro string
+	// unregisterTree ends this generation's process-tree registration with
+	// the collector (#424): set at start for a control that lists its tree
+	// (procTreeLister), called by waitForExit at the reap. nil otherwise.
+	unregisterTree func()
 }
 
 // control is p.ctl, or the native control for a runningProc built without one.
@@ -1597,6 +1610,8 @@ type owner struct {
 	m      *Manager
 	policy LocalPolicy
 	getenv func(string) string
+	// processTrees is ManagerOptions.ProcessTrees, fixed at construction.
+	processTrees func(root int, members func() []int) (unregister func())
 	// gpuVendor is fixed for the process lifetime (the host's hardware does
 	// not change under a running agent), so it is a plain field read by the
 	// owner goroutine and never written after construction.
@@ -2303,6 +2318,7 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Type = ""                       // reported for probes, read live
 		s.MetricsPath = ""                // "
 		s.ContextProbePath = ""           // "
+		s.APITokenHeader = ""             // the agent's own child probes, read live
 		// RAMMB is the host-RAM admission DEMAND, the spec-level twin of
 		// SpecGPU.VRAMMB below: consumed only by admission arithmetic, never
 		// baked into the child. The gateway pushes max(measured, estimate), and
@@ -2331,6 +2347,13 @@ func sameLaunchShape(a, b Spec) bool {
 		// accepts it as such), so it is normalised the same way.
 		if s.Execution != nil && (s.Execution.Mode == ExecutionModeNative || s.Execution.Mode == "") {
 			s.Execution = nil
+		}
+		// ProcessTree stays in the comparison too (#424): job mode decides how
+		// the child is created on Windows (suspended, in a job, with a console
+		// of its own), so a direct<->job edit relaunches. Only the spelling is
+		// normalised, like Execution's: absent and "direct" are one launch.
+		if s.ProcessTree == ProcessTreeDirect {
+			s.ProcessTree = ""
 		}
 		// Kind, DeviceBackend, Cluster and RPC stay in the comparison: they
 		// decide what is exec'd and how (a member's bind and port, a head's
@@ -4821,7 +4844,18 @@ func (o *owner) startProcess(st *specState) {
 		vmBaseline, baselineOK = o.readVMVRAM()
 	}
 
-	if err := cmd.Start(); err != nil {
+	// A native spec starts through startNativeProc, which also picks the
+	// control that signals it: the process group everywhere, a kill-on-close
+	// job object for process_tree "job" on Windows (#424). A wsl spec's wsl.exe
+	// is started as before; its control is the scope below.
+	var nativeCtl procControl
+	var startErr error
+	if spec.IsWSL() {
+		startErr = cmd.Start()
+	} else {
+		nativeCtl, startErr = startNativeProc(cmd, spec)
+	}
+	if err := startErr; err != nil {
 		// The command is retained even though nothing ran: a spec whose exec
 		// fails prints nothing at all, so this is the only thing an operator
 		// opening the log view can be shown -- and "the binary/work_dir it
@@ -4864,7 +4898,10 @@ func (o *owner) startProcess(st *specState) {
 			specID: spec.ID,
 		}
 	} else {
-		proc.ctl = nativeControl{cmd: cmd}
+		proc.ctl = nativeCtl
+		if l, ok := nativeCtl.(procTreeLister); ok && o.processTrees != nil {
+			proc.unregisterTree = o.processTrees(proc.pid, l.pids)
+		}
 	}
 	if wslUnit != "" {
 		o.beginWSLVRAM(proc, spec, vramWindow, vmBaseline, baselineOK)
@@ -4903,6 +4940,19 @@ func (o *owner) startProcess(st *specState) {
 func (o *owner) waitForExit(proc *runningProc) {
 	defer o.m.wg.Done()
 	err := proc.cmd.Wait()
+	// A control that holds an OS resource for its generation's lifetime (the
+	// Windows job object, #424) gives it back now that the process is reaped;
+	// for a job that also ends any descendant still left in it (kill-on-close).
+	if c, ok := proc.control().(procCloser); ok {
+		if cerr := c.close(); cerr != nil {
+			slog.Debug("runtime: releasing the process control failed", "spec", proc.specID, "pid", proc.pid, "error", cerr)
+		}
+	}
+	// The tree is gone with its job; its processes are measured as their
+	// own again (none is left to measure).
+	if proc.unregisterTree != nil {
+		proc.unregisterTree()
+	}
 	close(proc.exited)
 	o.m.postCmd(cmdChildExited{proc: proc, exitErr: err})
 }
@@ -6238,6 +6288,8 @@ func (o *owner) snapshotStatus() []Status {
 			Type:             st.spec.Type,
 			MetricsPath:      st.spec.MetricsPath,
 			ContextProbePath: st.spec.ContextProbePath,
+			APIToken:         st.spec.APIToken,
+			APITokenHeader:   st.spec.APITokenHeader,
 			Kind:             st.spec.Kind,
 		}
 		if st.measuredVRAM != nil {

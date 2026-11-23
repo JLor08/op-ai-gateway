@@ -647,7 +647,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -703,7 +703,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -872,7 +872,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1083,7 +1083,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1298,7 +1298,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-112-migrations),
+[§4](reference/data-model.md#4-migration-history-113-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1524,7 +1524,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-112-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-113-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1671,7 +1671,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-112-migrations),
+[§4](reference/data-model.md#4-migration-history-113-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3642,7 +3642,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-112-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-113-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3866,7 +3866,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-112-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-113-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4898,7 +4898,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5024,7 +5024,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-112-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5167,7 +5167,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-112-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-113-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7681,7 +7681,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-112-migrations),
+[Data Model](reference/data-model.md#4-migration-history-113-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7904,7 +7904,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-112-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-113-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8045,7 +8045,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-112-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-113-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8309,7 +8309,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-112-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-113-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -12165,7 +12165,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-112-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-113-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -13278,3 +13278,195 @@ types of blocks, and the ServerAgent.
 - → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
   [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
   [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).
+
+## ADR-111 — Strata: one type string for an application and a runtime spec, a main-last GPU placeholder and an opt-in Windows job-object process tree
+
+**Context.** [Strata](https://github.com/Niko1221/Strata) (MIT) is a local inference engine for Qwen-family models with
+OpenAI- and Anthropic-compatible APIs. The goal was to let Claude Code and Codex, with a gateway token, use a Strata model
+through the gateway with routing, usage accounting and correct RAM and per-GPU VRAM figures, like every other backend, in two
+shapes: an operator-run Strata registered by URL, and a `strata serve` the agent launches itself on a Windows NVIDIA multi-GPU
+host. The facts below were read off `Niko1221/Strata@c6f6427` (release 0.2.17, Control and engine 0.1.63); the LAN-share
+facts were measured against a running desktop app.
+
+- **Two upstream shapes.** `strata serve --config <json> --host H --port P --output jsonl [--shutdown-timeout S] [--gpu LIST]`
+  runs the full route set in the foreground and binds its socket only once the engine is ready. The desktop app's LAN share
+  (the app port + 1) serves only `/v1/models`, `/v1/chat/completions`, `/v1/messages` and `/v1/responses`; everything else
+  is 404 there.
+- **Auth.** `GET /health` needs no key (`{"status":"ok","service":"strata",…}`, `strata serve` only); `/v1/models` and the
+  inference routes need it (`--api-key`, `STRATA_API_KEY` or the config's `api_key`; the client sends `Authorization:
+  Bearer` or `x-api-key`). A keyless Strata answers 403 to a request whose `Host` is not an IP literal.
+- **One model per process.** `/v1/models` lists one model whose id is the config's `model_name`; newer releases add
+  `context_length`, a `meta.n_ctx` engine block and `architecture.input_modalities`. The request's `model` is ignored.
+- **Telemetry.** `/props` (llama.cpp shape), `/metrics` (JSON unless asked for Prometheus with `?format=prometheus` or an
+  `Accept` of `text/plain`/openmetrics; the Prometheus body uses llama.cpp's metric names plus `strata:*` counters),
+  `/v1/telemetry`, `/slots` and `/v1/status` (the engine version) exist on `strata serve` only, and need the key.
+- **GPU order.** The engine's stage order puts the **main** card **last** (`"gpu": [helper…, main]`); `"gpu_order":
+  "as_given"` turns Strata's speed reordering off, and a hand-set `gpu`/`--gpu` wins over `gpu_roles`. `--gpu` takes
+  nvidia-smi (host) card numbers.
+- **The run config is not ours to build.** `strata launch` writes a JSON run config (engine paths, context, KV, vision,
+  `layer_split`, `vram_reserve_mib`, `engine_ready_s`). `engine_ready_s` is not a measured load time: it is Strata's own
+  ceiling for waiting on the engine, 900 s by default.
+- **Windows process shape.** The Terminal installs `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd`, which runs the
+  bundled `python.exe` on `strata.py`; the engine runs as a grandchild in Strata's own kill-on-close job object, holds nearly
+  all of the VRAM and RAM, and stops gracefully on Ctrl-Break (drain, then engine quit). The agent's Windows stop was
+  kill-only and reached the root process alone; its RAM figure was the root PID's private working set, and its VRAM rows
+  were per PID.
+- **Media.** `Vision.load` turns `data:` into bytes, fetches `http://`/`https://`, and otherwise reads the reference as a path
+  on the model host (`file://` stripped first), with case-sensitive `startswith` checks. Its only guard
+  (`_no_local_images`) concerns a browser `Origin`, which a gateway request never carries.
+- **Usage.** Anthropic usage reports `input_tokens: 1` and the prompt in the cache fields. `/v1/messages` carries no
+  llama.cpp-style `timings`; chat completions and `/v1/responses` do.
+
+**Decision.**
+
+- **One string, `strata`, for both namespaces.** `routing.ProviderStrata` (application type) and
+  `routing.RuntimeSpecTypeStrata` (runtime spec type) are the same string, as for `llama_cpp`, so the kind checks keyed on
+  `Target.EffectiveKind` cover a static application and an agent-launched spec with one comparison. The application
+  dispatches to the shared OpenAI-compatible client (`providerClients`), `viewRuntimeType` maps it to the spec kind, and
+  `routing.DeriveRole` falls back to chat for it. Strata serves no `/v1/decisions`, so it joins `llama_cpp` and `vllm_sr` in
+  `routing.DecisionsPassthroughCapableKind` (`decisions_mode: passthrough` and `systemone_mode: translate` are refused at
+  save). Live timings stay off until measured. Types are plain text columns, so the type itself needs no migration.
+- **The application type works against both upstream shapes.** Defaults: port 8080, flavors `openai` and `anthropic`,
+  `responses_mode` and `messages_mode` both `passthrough` (Claude Code and Codex speak Strata's native routes), health check
+  `health_path` with the path `/v1/models` and loaded models `/v1/models` in the `openai` format (the one route both shapes
+  serve; the application token goes out in the application's token header, `Authorization: Bearer` by default, on every probe, which needed no change), no context
+  probe path, `timeout_ms` 30000 like `llama_cpp`. `/props` and `/metrics` are never requested for it, so the share's 404s
+  are not errors.
+- **Context and vision come from `/v1/models`, for `strata` only.** The provider parses `context_length`, else
+  `meta.n_ctx`, and an `architecture.input_modalities` that lists `image` from an `openai`-format listing
+  (`provider.LoadedModelInfoLister`, generic plumbing). The health loop's loaded pass records them
+  (`recordListedModelInfos`) only for an application of type `strata` without its own `context_probe_path`, so no other
+  type's behaviour changes: the context through `UpdateMappingContextProbe` (source `probe`, the lock and the size cap
+  apply), vision as `yes` under the new probe-rank source `strata_models`. A listing without `image` writes no verdict,
+  never a `no`, because nothing pins the list as exhaustive.
+- **The spec type launches `strata serve`.** Detection matches the binary's basename exactly (`strata`, `strata.cmd`,
+  `strata.exe`, or a `strata-<name>[.exe]` engine helper; case-insensitive), checked last, so it shadows no existing row
+  and a name that merely contains the word stays `custom`. Probe paths: metrics `/metrics?format=prometheus` (the existing running/queued parser
+  reads llama.cpp's names) and context `/props` (`default_generation_settings.n_ctx`, the llama.cpp extractor); the agent's
+  `/props` capability probe runs as for llama.cpp, and the router's `/upstream/{model}/props` context probe is kept. The
+  health path is `/health`, which answers without a key. The portal template, filled into a new spec when the type is
+  chosen: binary hint `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd` (the operator enters and allowlists the
+  absolute path), args `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --gpu
+  ${HOST_GPU_IDS_MAIN_LAST} --output jsonl --shutdown-timeout 3`, env `STRATA_API_KEY=${API_TOKEN}` (masked in the reported
+  command, never in a file), `set_visible_devices` off (renumbering would break `--gpu`), startup timeout 960 s, flavors and
+  modes as the application type, `process_tree` `job`. `--host 127.0.0.1` because the agent reaches every child on loopback,
+  as the other templates do.
+- **The run config is imported, not rebuilt.** The Strata spec form's "Import run config" takes the pasted `strata launch`
+  JSON and writes it as the config file `strata.json`: it keeps every key except launcher bookkeeping (`args_written`,
+  `port`, `host`, `open_browser`, `gpus_asked`, `gpu`, `gpu_roles`, `gpu_cards`, `gpu_order`, every `ui_*` key and
+  `api_key`), keeps `engine_ready_s`, sets `model_name` to `${MODEL}` and `gpu_order` to `as_given`, proposes the GPU rows
+  (main first, from `gpu_roles`, else from the legacy `gpu` list rotated so its last entry comes first), proposes the
+  startup timeout `max(engine_ready_s, 900) + 60` and fills an empty upstream model name. It refuses a body that is no JSON
+  object or lacks `exe` or an `args` list, warns on a dropped `api_key` and on a positional `layer_split` (reordering GPUs
+  changes its meaning), and respects the 16-file and 64 KiB limits. It is a pure frontend transform; the stored file is an
+  ordinary config file afterwards.
+- **`${HOST_GPU_IDS_MAIN_LAST}`** is a new exact-match, non-secret placeholder, a sibling of `${HOST_GPU_IDS}`: the spec's
+  declared, deduplicated host indices with the first (the main card) moved last (`2,0,1` → `0,1,2`; one GPU is itself),
+  allowed in args, env and config-file content, a hard `not_permitted` error on a spec without GPUs. The name is generic, not
+  Strata's: it says what it renders. GPU roles are therefore the operator's row order: **position 1 is main, the rest are
+  helpers.**
+- **Host paths are refused for a Strata target, on both paths.** On the translate path `mediaURLsRefused` accepts only an
+  image reference that starts with lowercase `data:`, `http://` or `https://` (Strata's own checks are case-sensitive, so
+  `HTTP://x` would reach its path branch). Because Strata's default modes are passthrough, the raw `/v1/messages` and
+  `/v1/responses` body is scanned too, before it is relayed (`strataPassthroughMediaRefused`, from
+  `relayPassthroughTarget`): every Anthropic `image`/`document` block at any depth (a `base64` source passes; any
+  `source.url`, `source.path` or string source is checked, and a `url`/`path` source with no reference is refused) and every
+  `input_image`/`image_url` part. A refusal is 400 `chat.media_url_unsupported`, logged at Warn, with a usage row and no
+  upstream call. Malformed JSON is left to the relay's own handling. **http(s) stays allowed**, as for SGLang and vLLM:
+  Strata fetches the URL from the model host, so a key holder can make that host fetch a URL it can reach. That is the
+  accepted posture of every vision backend here; blocking it breaks ordinary vision use.
+- **Usage needs no code change, and is pinned.** The passthrough scan already folds Anthropic's cache buckets in; the
+  recorded split is disjoint (`input + cached + cache_write + output = total`), so Strata's `input_tokens: 1` with 53 cache
+  reads and 4 cache writes records input 1, cached 53, cache write 4. Chat completions (buffered and streamed) and a
+  buffered `/v1/responses` record prompt and generation tokens per second from `timings`; `/v1/messages` records none, a
+  documented gap.
+- **The agent authenticates its own child probes.** A keyed child (Strata, or a llama-server with `--api-key`) answers 401
+  on everything but its health path, so the agent's metrics scrape, context probe and `/props`-shaped capability probes read
+  nothing from it. The gateway now pushes `api_token_header` beside a non-empty `api_token` (the effective header from
+  `routing.SpecUpstreamAuth`; empty means `Authorization: Bearer`), and the agent attaches the credential to those probes
+  (`collector.NewPromScraper`, `collector.WithProbeAuth`). An authenticated probe follows no redirect; the token is never
+  logged, never in a reported URL, and held in memory only. A token-less spec's document and probes are unchanged.
+- **`process_tree`: an opt-in Windows job-object mode.** A runtime spec gets `process_tree`, `direct` (default, unchanged
+  behaviour) or `job` (migration 113, `text not null default 'direct'`; 400 `runtime_spec.process_tree_invalid` for any
+  other value). The push carries `process_tree: "job"` and omits it for `direct`, so existing documents and ETags are
+  byte-identical, and the field is launch-affecting. For a **native** spec on **Windows** with `job`, the agent:
+  - creates a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, starts the child `CREATE_SUSPENDED |
+    CREATE_NEW_PROCESS_GROUP` (plus a hidden console of its own when the agent has none, as a service), assigns it to the job
+    and only then resumes it, so no grandchild escapes; Strata's own job nests inside it (Windows 8 and later);
+  - stops it gracefully with `CTRL_BREAK_EVENT` to the child's group (directly on a shared console, else by briefly
+    attaching to the child's console with its own Ctrl handling disabled), waiting at most 1 s for the delivery; a failed or
+    hung delivery is logged and falls straight through to the kill;
+  - kills with `TerminateJobObject`, the whole tree, after the unchanged 5 s kill grace (the 10 s drain grace before the
+    stop signal is unchanged too, which is why the template passes `--shutdown-timeout 3`);
+  - closes the job handle as soon as the root exits and again at reap, so leftover descendants die at once, with no grace,
+    and a grandchild holding the stdout pipe cannot keep the reap open. Because the agent holds the only handle, the tree also
+    dies when the agent process dies;
+  - measures the tree: a registry of managed trees (`collector.RegisterProcessTree`, injected through
+    `ManagerOptions.ProcessTrees` so the runtime package does not import the collector) charges the root the summed private
+    working set of the job's processes, and rewrites PDH per-process GPU memory rows of tree members to the root before
+    the per-GPU sum. A PID in no managed tree keeps per-PID attribution.
+
+  `direct`, every non-Windows platform and every `wsl` spec (stored `job` is inert there; the portal hides the control) are
+  unchanged. **Verified on hardware: pending** — the mechanics are compiled and vetted for Windows and covered by
+  Windows-tagged tests that CI cannot run; the owner's Windows acceptance decides, among other things, whether the template
+  keeps `strata.cmd` as the binary or switches to the bundled `python.exe` with `strata.py` as the first argument (cmd.exe's
+  "Terminate batch job" prompt on Ctrl-Break is the open question; the kill still ends the tree either way).
+- **The gateway refuses a move into `job` it knows cannot be honoured.** An operator's spec PUT that moves a spec into
+  `job` (a new spec, or one not stored as `job`) is refused with 400 `runtime_spec.process_tree_unsupported` when the
+  server's reported OS is not Windows, or its agent has declared its features since the gateway started and
+  `runtime_process_tree_job` is not among them. When either fact is still unknown and neither known fact refuses, the save
+  succeeds and the runtime warnings carry `process_tree_agent_unknown`. Silently running a job spec as `direct` would leave
+  the engine alive on stop. A re-save of a spec already stored as `job` is not refused: the portal's Stop/Start/Pin/Clear
+  overrides re-send the whole spec, and refusing them would lock the operator out. On an agent known to lack support such
+  a spec draws the runtime warning `process_tree_agent_unsupported` instead; there is no push-time withhold.
+- **Agent `0.20.1` → `0.21.0`, MINOR, one bump for the branch.** Two flags on the agent's list only, both `Since: "0.21.0"`:
+  `runtime_gpu_main_last` (resolves the new placeholder; the portal warns when a spec uses it and the agent lacks the flag)
+  and `runtime_process_tree_job` (honours `job`). The latter is declared on every OS, as `runtime_exec_wsl` is, because the
+  features registry has no per-OS mechanism; the gateway checks the reported OS separately. The authenticated child probes
+  and the Strata context extractor need no flag.
+- **The 960 s startup timeout stays, and its warning is truthful.** 960 s is `max(engine_ready_s, 900) + 60` for the default
+  engine wait, so the agent never gives up before Strata does. Against the default `server_agent` `timeout_ms` of 600000 it
+  raises `timeout_ms_below_startup_timeout`, correctly: a cold start longer than 600 s would be cut short. The spec type note
+  tells the operator to raise the parent application's timeout to at least 960000 ms.
+- **The supported Windows setup is the agent running under the account that installed Strata.** `%LOCALAPPDATA%`-relative
+  installs and the run config's `component:` references resolve per user, so an agent under LocalSystem or another account
+  is unsupported for Strata. Ctrl-Break delivery still cannot hang there: it falls back to the job kill.
+
+**Rejected:**
+
+- **Two type strings** (`strata` and `strata_serve`). Several kind checks compare one string across both namespaces; a second
+  name would have to be added to each.
+- **Coercing passthrough to translate for Strata** (the `sglang_omni` route). Claude Code and Codex should reach Strata's native
+  routes; scanning the raw body closes the bypass without losing them. The cost is a scan miss on a field nobody foresaw,
+  mitigated by checking every image source field at any depth.
+- **Recording `/v1/models` context for every type.** It would change existing applications whose listings start carrying
+  `context_length`. Gated on `strata`; widening later is easy.
+- **A 600 s template timeout, or a higher global `server_agent` default.** The first undercuts Strata's own engine wait; the
+  second changes every existing application.
+- **A push-time withhold of `job` specs** from an agent that lacks the flag (as for `wsl`). The save refusal covers the normal
+  path; after an agent downgrade a stored job spec runs `direct` until it is saved again, which the portal's refusal message
+  names.
+- **A longer stop grace for job mode.** In-flight requests are drained by the agent before the signal; the engine's own unmap
+  may be cut short by the job kill, which frees the VRAM immediately.
+- **Job mode by default.** It changes stop and agent-crash behaviour for every Windows spec; the operator opts in per spec.
+- **Blocking http(s) image URLs.** As for SGLang and vLLM: it breaks ordinary use, and the model host fetching a URL is the
+  accepted posture.
+
+**Consequence:**
+
+- A Strata model is reachable through the gateway from Claude Code, Codex and the OpenAI and Anthropic APIs, as a static
+  application (`strata serve` or the desktop share) or as an agent-launched spec, with context and vision verdicts where the
+  listing states them.
+- A client sending a host path or `file://` image reference to a Strata target gets a 400. A Strata target still fetches any
+  http(s) URL it is given.
+- Claude Code requests to Strata record no tokens per second (`/v1/messages` has no `timings`). Strata's `/v1/telemetry`,
+  `/slots`, `/v1/status` and the `strata:*` counters are reachable with the spec token but not read yet; what the portal
+  shows from them is a follow-up.
+- On Windows, a `job` spec's stop reaches the whole tree, its RAM and per-GPU VRAM cover the whole tree, and its tree dies with
+  the agent. A `direct` spec is unchanged: kill-only, root process only, children outlive an agent crash.
+- An older Strata answers 404 on `/v1/responses`; the application type note says to set `responses_mode` to `translate`
+  then.
+- → [Agent-Managed Model Runtime §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+  [§3.9](cross-cutting/agent-runtime-manager.md#39-the-windows-process-tree-process_tree),
+  [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
+  [Compatibility & Inference §3.1](cross-cutting/compatibility-and-inference.md#31-openai-chat-completions).

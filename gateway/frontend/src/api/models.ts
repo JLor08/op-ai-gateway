@@ -19,6 +19,9 @@ import { type Fetcher, request, subscribeSSE } from './transport';
 // 'vllm_sr': an operator-run vLLM Semantic Router (Engine mode); it serves
 // POST /v1/systemone only, so the form defaults to the 'decisions' flavor, and
 // its models and health are read from GET /v1/systemone/models.
+// 'strata': an operator-run Strata (`strata serve`, or the desktop app's LAN
+// share, which serves only /v1/models among its GET routes), so health, the
+// loaded models and the context window are all read from GET /v1/models.
 export type ApplicationType =
   | 'ollama'
   | 'vllm'
@@ -28,7 +31,8 @@ export type ApplicationType =
   | 'server_agent'
   | 'stable_diffusion_cpp'
   | 'audio_cpp'
-  | 'vllm_sr';
+  | 'vllm_sr'
+  | 'strata';
 export type ApplicationScheme = 'http' | 'https';
 export type ApplicationStatus = 'active' | 'disabled';
 

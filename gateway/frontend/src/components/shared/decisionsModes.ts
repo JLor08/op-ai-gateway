@@ -26,12 +26,12 @@ export function systemOneModeOrDefault(mode: SystemOneMode | '' | undefined): Sy
  * unsupported / runtime_spec.decisions_passthrough_unsupported): llama.cpp
  * never answers OpenAI Decisions natively, so passthrough is refused for the
  * llama_cpp type; vllm_sr answers only /v1/systemone, so it is refused there
- * too. Every other kind, "" (auto-detect) included, may pass
+ * too, and strata has no /v1/decisions, so it is refused as well. Every other kind, "" (auto-detect) included, may pass
  * through: under Auto the form cannot know the detected kind, and the backend
  * decides.
  */
 export function decisionsPassthroughOffered(kind: string): boolean {
-  return kind !== 'llama_cpp' && kind !== 'vllm_sr';
+  return kind !== 'llama_cpp' && kind !== 'vllm_sr' && kind !== 'strata';
 }
 
 /**
@@ -48,12 +48,12 @@ export function decisionsModeForKind(mode: DecisionsMode, kind: string): Decisio
  * Whether systemone_mode "translate" can be chosen for a server kind. A
  * HAND-COPY of the backend's refusal (application.systemone_translate_
  * unsupported / runtime_spec.systemone_translate_unsupported): llama.cpp
- * answers neither endpoint natively and vllm_sr is System One itself, so
- * translation to OpenAI Decisions is refused for both. Every other kind, ""
+ * and strata answer neither endpoint natively and vllm_sr is System One
+ * itself, so translation to OpenAI Decisions is refused for all three. Every other kind, ""
  * (auto-detect) included, may translate; the backend decides.
  */
 export function systemOneTranslateOffered(kind: string): boolean {
-  return kind !== 'llama_cpp' && kind !== 'vllm_sr';
+  return kind !== 'llama_cpp' && kind !== 'vllm_sr' && kind !== 'strata';
 }
 
 /**

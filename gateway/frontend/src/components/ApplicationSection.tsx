@@ -64,6 +64,7 @@ const applicationTypeOptions: ApplicationType[] = [
   'stable_diffusion_cpp',
   'audio_cpp',
   'vllm_sr',
+  'strata',
 ];
 const applicationSchemeOptions: ApplicationScheme[] = ['http', 'https'];
 // Seeds a fresh create form's flavor checkboxes (openCreate always starts
@@ -798,13 +799,16 @@ export function ApplicationSection({
     // same slot is what gets it announced with the field (aria-describedby),
     // as the launch-spec form's type note is. audio_cpp's three diverging
     // defaults (API flavors, timeout, health path) are explained the same way,
-    // and so are vllm_sr's (port, timeout, API flavor).
+    // and so are vllm_sr's (port, timeout, API flavor). strata's note says
+    // what the operator must set by hand (the API key) and why its paths are
+    // /v1/models.
     const typeDescriptions = [
       managedRuntimeOnlyCreate ? t.applicationTypeManagedRuntimeOnly : undefined,
       serverAgentTaken ? t.applicationTypeServerAgentTaken : undefined,
       type === 'stable_diffusion_cpp' ? t.applicationTypeStableDiffusionCppNote : undefined,
       type === 'audio_cpp' ? t.applicationTypeAudioCppNote : undefined,
       type === 'vllm_sr' ? t.applicationTypeVllmSrNote : undefined,
+      type === 'strata' ? t.applicationTypeStrataNote : undefined,
     ].filter((reason): reason is string => reason !== undefined);
     // The scheme is the GATEWAY's field only while the application actually
     // takes part in the proxy on a server that runs one. In every other case --

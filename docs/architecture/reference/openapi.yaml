@@ -66,7 +66,10 @@ paths:
         Against an agent-launched `sglang_omni` target every `image_url.url`
         must be an inline `data:` URL, and against an `sglang` target a
         `data:`, `http://` or `https://` URL, else 400
-        `chat.media_url_unsupported`.
+        `chat.media_url_unsupported`. Against a `strata` target (application
+        or spec) the same rule applies with the prefixes matched lowercase
+        only, and the raw `/v1/messages` and `/v1/responses` passthrough body
+        is scanned for image references as well.
       security: [{ bearerAuth: [] }, { sessionCookie: [], csrfHeader: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:

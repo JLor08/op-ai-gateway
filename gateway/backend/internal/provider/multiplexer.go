@@ -322,6 +322,51 @@ func (m *Multiplexer) dispatchLoadedModels(ctx context.Context, target routing.T
 	return nil, nil
 }
 
+// LoadedModelInfos routes the loaded-model probe like LoadedModels, asking
+// for context sizes too: a client implementing LoadedModelInfoLister answers
+// with them, any other LoadedModelLister answers with names only (ContextSize
+// 0), and no lister at all yields (nil, nil), as LoadedModels does.
+func (m *Multiplexer) LoadedModelInfos(ctx context.Context, target routing.Target, statusPath, format string) ([]ModelInfo, error) {
+	ctx, span := tracing.Start(ctx, "provider.LoadedModelInfos")
+	defer span.End()
+	res, err := m.dispatchLoadedModelInfos(ctx, target, statusPath, format)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	return res, err
+}
+
+func (m *Multiplexer) dispatchLoadedModelInfos(ctx context.Context, target routing.Target, statusPath, format string) ([]ModelInfo, error) {
+	if m == nil {
+		return nil, ErrUnavailable
+	}
+	// The same client choice as dispatchLoadedModels: the provider's client
+	// when it lists loaded models, else the fallback's.
+	var lister LoadedModelLister
+	if client, ok := m.clients[strings.TrimSpace(target.Provider)]; ok {
+		lister, _ = client.(LoadedModelLister)
+	}
+	if lister == nil {
+		lister, _ = m.fallback.(LoadedModelLister)
+	}
+	if lister == nil {
+		return nil, nil
+	}
+	if infos, ok := lister.(LoadedModelInfoLister); ok {
+		return infos.LoadedModelInfos(ctx, target, statusPath, format)
+	}
+	names, err := lister.LoadedModels(ctx, target, statusPath, format)
+	if err != nil || names == nil {
+		return nil, err
+	}
+	out := make([]ModelInfo, 0, len(names))
+	for _, name := range names {
+		out = append(out, ModelInfo{Name: name})
+	}
+	return out, nil
+}
+
 // UnloadModel routes the best-effort model-unload to the provider's client (like
 // LoadedModels). A client that does not implement ModelUnloader yields (false, nil):
 // unloading is simply unsupported there, not an error.
