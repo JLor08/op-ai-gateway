@@ -1092,8 +1092,10 @@ wav, mp3, flac and pcm, with voice cloning through `ref_audio`. Their facts, eac
 application type ([Routing & Model Selection §1](routing-and-model-selection.md#1-data-model)).
 Its facts, each from the code:
 
-- **Detection** matches the substring `strata` in the binary's basename (`strata.cmd`,
-  `strata.exe`, `strata-vision.exe`), checked after every other row. A spec whose binary is
+- **Detection** matches the binary's basename exactly, case-insensitively: `strata`,
+  `strata.cmd`, `strata.exe`, or an engine helper `strata-<name>` / `strata-<name>.exe`
+  (`strata-vision.exe`), checked after every other row. A name that merely contains the
+  word (`mystrata-tool`, `stratagem`) stays `custom`. A spec whose binary is
   the bundled `python.exe` needs an explicit `type`.
 - **Probe paths.** Metrics `/metrics?format=prometheus`, used verbatim, query included;
   context `/props`, read by the llama.cpp extractor (`default_generation_settings.n_ctx`
@@ -1649,8 +1651,9 @@ Shortened, with the paths redacted, the stored content looks like this:
 upstream model, and the card order comes from the command line
 (`--gpu ${HOST_GPU_IDS_MAIN_LAST}`), not from the file: the import drops `gpu`,
 `gpu_roles`, `gpu_cards` and `gpu_order` and sets `"gpu_order": "as_given"`. The key is
-never in the file; it travels as `STRATA_API_KEY=${API_TOKEN}` in `env`, and an `api_key`
-in the pasted JSON is dropped with a notice. For this file the import proposes a
+never in the file; it travels as `STRATA_API_KEY=${API_TOKEN}` in `env`, and every key named
+`api_key` (any case, at any depth, e.g. inside `vision`, whatever its value) in the pasted
+JSON is dropped with a notice. For this file the import proposes a
 startup timeout of `max(1845, 900) + 60` = 1905 s.
 
 **Names, counts and sizes.** The gateway's runtime-spec PUT refuses a list
@@ -2990,16 +2993,21 @@ own process group (§3.1), and a `wsl` spec keeps its systemd scope (§3.8): a s
 
 **Negotiation.** The agent declares `runtime_process_tree_job` (§7, `Since:
 "0.21.0"`) on every OS, because the features registry has no per-OS mechanism, so the
-flag alone proves nothing. An operator's spec PUT with `job` is refused with 400
+flag alone proves nothing. An operator's spec PUT that **moves** a spec into `job` (a
+new spec, or a stored one whose value is not `job`) is refused with 400
 `runtime_spec.process_tree_unsupported` when the gateway knows the agent cannot honour
 it: the server's reported OS (stored telemetry) is not `windows`, or the agent has
 declared its features since the gateway started and the flag is not among them. When
-either fact is still unknown the save succeeds and the runtime warnings carry
-`process_tree_agent_unknown` (§11.5). The check runs last among the operator path's
-refusals, so an otherwise invalid body keeps its older answer; a benchmark writer
-re-saves the stored value unchecked. There is no push-time withhold: after an agent
-downgrade a stored job spec runs `direct` until it is saved again, and that save is
-refused.
+either fact is still unknown and neither known fact refuses, the save succeeds and the
+runtime warnings carry `process_tree_agent_unknown` (§11.5). A re-save of a spec
+already stored as `job` is not refused, whatever the agent: the portal's
+Stop/Start/Pin/Clear overrides re-send the whole spec, and refusing them would lock the
+operator out of the spec. Such a spec on an agent known to lack support draws
+`process_tree_agent_unsupported` (§11.5) instead. The check runs last among the
+operator path's refusals, so an otherwise invalid body keeps its older answer; a
+benchmark writer re-saves the stored value unchecked. There is no push-time withhold:
+after an agent downgrade a stored job spec runs `direct`, and the warning says so until
+the operator switches it to `direct` or updates the agent.
 
 **Start.** `startInJob` creates a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
 first (so a creation failure leaves no process behind), starts the child with
@@ -8317,8 +8325,9 @@ needs the absolute path. The API-token reference table gains a Strata row
   sends `direct`. The override-action body spreads the stored spec, so it carries the
   field. Both refusals, `runtime_spec.process_tree_invalid` and
   `runtime_spec.process_tree_unsupported`, map to localized messages; the latter names the
-  three causes (the agent is not on Windows, is older than 0.21.0, or lacks the capability,
-  also on a re-save after an agent downgrade).
+  three causes (the agent is not on Windows, is older than 0.21.0, or lacks the capability)
+  and says that a spec already stored as job can still be saved — only the switch into
+  job is refused.
 - **`${HOST_GPU_IDS_MAIN_LAST}` against an older agent** draws a non-blocking warning, with
   the agent's reported version, once the agent's features have loaded and args, env or a
   config file use the token while `runtime_gpu_main_last` is missing — the same shape as the
@@ -8463,7 +8472,7 @@ been read, an agent that has not declared `runtime_config_files` draws a
 non-blocking warning with its reported version ([§7](#7-feature-negotiation)).
 
 A per-application warnings endpoint returns opaque string codes and today emits
-seven. All are pure derivations with no store write, reloaded after every spec
+eight. All are pure derivations with no store write, reloaded after every spec
 save or delete. An unmapped future code renders its raw wire string rather than
 a wrong label — the forward-compatibility convention applied to **every** opaque
 wire enum on this screen, runtime states included.
@@ -8547,7 +8556,16 @@ the server's agent has not yet reported enough to tell whether it honours job mo
 save was allowed, because the refusal (`runtime_spec.process_tree_unsupported`, §3.9) needs
 evidence; an agent that turns out not to honour it would run the spec `direct`. It counts
 disabled specs, like the OS-mismatch advisory, and reads nothing when no spec uses `job`
-(`anyJobSpecOnUnknownAgent`).
+(`jobSpecAgentSupport`).
+
+**`process_tree_agent_unsupported`** — a spec of the application is stored with
+`process_tree: job`, and the server's agent is known not to honour it: its reported OS is
+not Windows, or it declared its features without `runtime_process_tree_job`. The spec
+reached the store before the agent reported, or before the agent was downgraded or
+replaced; a re-save that keeps it `job` is not refused (§3.9), so the override buttons keep
+working, and this warning says that the agent runs the spec `direct`, leaving the engine's
+descendants alive on stop. It counts disabled specs and shares `jobSpecAgentSupport` with
+`process_tree_agent_unknown`; the two never appear together.
 
 **Co-residency editor.** The tab shows the application's co-residency document,
 `{mode, pairs:[{a, b, verdict}]}` ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)),
