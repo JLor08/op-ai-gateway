@@ -13381,7 +13381,7 @@ facts were measured against a running desktop app.
   upstream call. Malformed JSON is left to the relay's own handling. **http(s) stays allowed**, as for SGLang and vLLM:
   Strata fetches the URL from the model host, so a key holder can make that host fetch a URL it can reach. That is the
   accepted posture of every vision backend here; blocking it breaks ordinary vision use.
-- **Usage needs no code change, and is pinned.** The passthrough scan already folds Anthropic's cache buckets in; the
+- **Token counts need no code change, and are pinned.** The passthrough scan already folds Anthropic's cache buckets in; the
   recorded split is disjoint (`input + cached + cache_write + output = total`), so Strata's `input_tokens: 1` with 53 cache
   reads and 4 cache writes records input 1, cached 53, cache write 4. Chat completions (buffered and streamed) and a
   buffered `/v1/responses` that carries `timings` record prompt and generation tokens per second from them.
@@ -13390,11 +13390,14 @@ facts were measured against a running desktop app.
   from the first content frame to the last byte. It was already derived for Anthropic, and for Responses on vendor targets
   only; the vendor gate is gone, so a Codex request to `strata serve` is rated like a Claude Code one. The prompt rate is
   new: the processed prompt tokens (fresh input plus cache creation, cache reads excluded) over the time from the upstream
-  send (`proxyNative` stamps it right before the round trip) to the first content frame, floored at 50 ms. It includes
-  network and queueing, so it under-states prefill speed under load. Upstream `timings` always win, Chat Completions is
-  unchanged, and a buffered response derives neither rate. Both rates feed an opted-in mapping's opportunistic EWMA
-  (`GenTokensPerSecond`, `PromptTokensPerSecond`) as the derived Anthropic generation rate already did; the usage row has
-  no rate-source field ([Telemetry §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
+  send (`proxyNative` stamps it right before the round trip) to the first content frame, floored at 50 ms and at 256
+  processed tokens. It is time-to-first-token based and includes network and queueing, so it errs low when the upstream
+  reports its cache reads; an upstream that reuses a prefix cache without reporting it (vLLM without
+  `--enable-prompt-tokens-details`, llama.cpp slot reuse) makes it read high. It is therefore analytics-only: recorded on the
+  usage row, never fed into the mapping's `PromptTokensPerSecond` EWMA. Upstream `timings` always win, Chat Completions is
+  unchanged, and a buffered response derives neither rate. The derived generation rate feeds an opted-in mapping's
+  `GenTokensPerSecond` EWMA as the derived Anthropic generation rate already did
+  ([Telemetry §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
   Rejected: deriving only for a `strata` target (the same gap exists for any self-hosted Responses upstream without
   `timings`), and waiting for Strata to attach `timings` upstream (still worth asking; an upstream figure would then win
   unchanged).
@@ -13475,7 +13478,8 @@ facts were measured against a running desktop app.
 - A client sending a host path or `file://` image reference to a Strata target gets a 400. A Strata target still fetches any
   http(s) URL it is given.
 - Streamed Claude Code and Codex requests to Strata record gateway-measured generation and prompt tokens per second; the
-  prompt figure is time-to-first-token based and conservative. Buffered ones record none. Strata's `/v1/telemetry`,
+  prompt figure is time-to-first-token based, needs 256 processed tokens (a turn served mostly from Strata's cache records
+  none) and is analytics-only. Buffered ones record none. Strata's `/v1/telemetry`,
   `/slots`, `/v1/status` and the `strata:*` counters are reachable with the spec token but not read yet; what the portal
   shows from them is a follow-up.
 - On Windows, a `job` spec's stop reaches the whole tree, its RAM and per-GPU VRAM cover the whole tree, and its tree dies with

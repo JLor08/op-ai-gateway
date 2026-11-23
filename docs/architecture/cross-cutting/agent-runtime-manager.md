@@ -1167,8 +1167,9 @@ The desktop app's LAN share (the app port + 1) serves only `/v1/models`,
 Per-request rates come from the `timings` object of chat completions. `strata serve`'s
 `/v1/messages` and `/v1/responses` carry none, so for a streamed Claude Code or Codex request
 the gateway measures both rates itself (#426): generation over the first-content-to-end window,
-prompt over the time to first content, which includes queueing and so errs low
-([Telemetry §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+prompt over the time to first content. The prompt figure needs 256 processed tokens, is
+analytics-only and never feeds routing: it errs low when the upstream reports its cache reads
+and reads high when an upstream reuses a prefix cache without reporting it ([Telemetry §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
 A buffered `/v1/messages` or `/v1/responses` records none. Candidate follow-ups: host tokens/s
 gauges, speculative-draft acceptance, conversation-cache hits, the engine version in the agent
 panel.
@@ -10762,7 +10763,8 @@ operator meets first:
 - **Strata leaves three gaps** ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
   `/v1/messages` and `/v1/responses` carry no `timings`, so a Claude Code or Codex request
   to Strata records only gateway-measured tokens per second (none when buffered; the
-  prompt rate is time-to-first-token based and errs low); Strata's richer telemetry (`/v1/telemetry`, `/slots`,
+  prompt rate is time-to-first-token based, analytics-only and absent below 256 processed
+  tokens); Strata's richer telemetry (`/v1/telemetry`, `/slots`,
   `/v1/status`, the `strata:*` counters) is reachable but not read; and a Strata target
   still fetches any http(s) image URL it is given, from the model host, as SGLang and
   vLLM targets do.

@@ -157,6 +157,12 @@ type usageScanner struct {
 	progress *requestProgress
 }
 
+// minGatewayPromptRateTokens is the fewest processed prompt tokens usage()
+// derives a gateway-measured prompt rate from (#426). Below it the time to first
+// content is mostly fixed latency (network, scheduling, the first decode step),
+// not prefill, and the quotient says little about prompt throughput.
+const minGatewayPromptRateTokens = 256
+
 // newUsageScanner returns a scanner for one native-passthrough response, or NIL
 // for a flavor this scanner can extract nothing from.
 // capBytes should be the same budget the capture tee uses (see usageScanner's
@@ -806,17 +812,23 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 // in) and input_tokens minus input_tokens_details.cached_tokens for Responses —
 // divided by the time to first content: upstreamSentAt (proxyNative's send
 // timestamp) to the first content frame. It needs a send timestamp, a content
-// frame, the authoritative terminal frame, a positive processed count and a
-// window of at least minGatewayRateWindow. The window includes network and any
-// upstream queueing, so under load the figure UNDER-states the prefill speed;
-// it is conservative, never inflated. A buffered body has no first-content
-// timestamp distinct from its end and derives none.
+// frame, the authoritative terminal frame, at least minGatewayPromptRateTokens
+// processed tokens and a window of at least minGatewayRateWindow. A buffered
+// body has no first-content timestamp distinct from its end and derives none.
 //
-// Both derived rates feed the same places an upstream rate does — the usage
-// row, and through recordUsage the mapping's opportunistic throughput EWMA
-// (GenTokensPerSecond / PromptTokensPerSecond) the scorer and a model group's
+// The window includes network and any upstream queueing, so the figure errs
+// low WHEN the upstream reports its cache reads. An upstream that reuses a
+// prefix cache without reporting it (vLLM without
+// --enable-prompt-tokens-details, llama.cpp slot reuse) makes it read HIGH: the
+// count includes tokens that were never processed. That is why it is marked
+// (PromptPerSecondGatewayMeasured) and kept analytics-only: recordUsage writes
+// it to the usage row but never into the mapping's PromptTokensPerSecond EWMA.
+//
+// The derived GENERATION rate, by contrast, feeds the same places an upstream
+// rate does — the usage row, and through recordUsage the mapping's
+// opportunistic GenTokensPerSecond EWMA the scorer and a model group's
 // MinTokensPerSecond gate read — exactly as the derived Anthropic generation
-// rate always has. The usage row carries no rate-source field.
+// rate always has.
 func (s *usageScanner) usage() inference.Usage {
 	if s == nil {
 		return inference.Usage{}
@@ -853,8 +865,9 @@ func (s *usageScanner) usage() inference.Usage {
 	if s.derivesGatewayRate() && u.PromptPerSecond == 0 && s.haveFirstContent && s.haveTerminalUsage &&
 		!s.upstreamSentAt.IsZero() {
 		processed := u.InputTokens - u.CachedTokens
-		if ttft := s.firstContentAt.Sub(s.upstreamSentAt); processed > 0 && ttft >= minGatewayRateWindow {
+		if ttft := s.firstContentAt.Sub(s.upstreamSentAt); processed >= minGatewayPromptRateTokens && ttft >= minGatewayRateWindow {
 			u.PromptPerSecond = float64(processed) / ttft.Seconds()
+			u.PromptPerSecondGatewayMeasured = true
 		}
 	}
 	return u

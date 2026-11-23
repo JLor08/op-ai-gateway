@@ -159,6 +159,14 @@ type Usage struct {
 	// usage.Event field by field and has no member for it, and the client-facing
 	// bodies compat builds carry usage structs of their own.
 	LiveOutputTokens int `json:"-"`
+	// PromptPerSecondGatewayMeasured marks a PromptPerSecond the gateway derived
+	// itself (usageScanner.usage: processed prompt tokens over the time to first
+	// content, #426) rather than one the upstream reported. Such a figure is
+	// recorded on the usage row for analytics and never fed into the mapping's
+	// PromptTokensPerSecond EWMA (recordUsage): it includes queueing and network,
+	// and an upstream that reuses a prefix cache without reporting it makes it
+	// read high. Not serialized.
+	PromptPerSecondGatewayMeasured bool `json:"-"`
 }
 
 type Error struct {

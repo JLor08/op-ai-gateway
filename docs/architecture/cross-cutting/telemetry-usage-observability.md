@@ -717,8 +717,10 @@ Activity renders it as never measured. Two things make it readable:
   (`Target.OpportunisticMetrics`), which no vendor target carries. So a gateway
   estimate on a vendor row can never become a routing input (see "a recorded rate
   is a routing input" in §8.4.3). A **self-hosted** passthrough row is different
-  since #426: its derived generation and prompt rates feed the EWMA of an opted-in
-  application exactly as the derived Anthropic generation rate always has.
+  since #426: its derived generation rate feeds the EWMA of an opted-in
+  application exactly as the derived Anthropic generation rate always has; the
+  gateway-measured prompt rate is recorded on the row but never feeds the EWMA
+  (§8.4.3).
 - **Verify-live caveat: Responses clients that do not ask for a reasoning
   summary.** The OpenAI platform and the Codex backend stream a reasoning model's
   reasoning only as `response.reasoning_summary_text.delta`, and only when the
@@ -2882,12 +2884,23 @@ Claude Code turn `1 + 25` of `1 + 25 + 20855`), `input_tokens` minus
 no prefill. The window opens at `upstreamSentAt`, which `proxyNative` stamps
 immediately before the upstream round trip (`setUpstreamSentAt`, vendor and
 self-hosted alike), and closes at the first content frame. It needs a send
-timestamp, a content frame, the authoritative terminal frame, a positive
-processed count and the same 50 ms `minGatewayRateWindow` floor; a buffered body
-has no first-content stamp distinct from its end and stays `0`. The figure
-includes network and any upstream queueing, so under load it **under-states**
-prefill speed: it is conservative, never inflated. An upstream
-`prompt_per_second` always wins.
+timestamp, a content frame, the authoritative terminal frame, at least
+`minGatewayPromptRateTokens` (256) processed tokens — below that the time to
+first content is mostly fixed latency, not prefill — and the same 50 ms
+`minGatewayRateWindow` floor; a buffered body has no first-content stamp distinct
+from its end and stays `0`. An upstream `prompt_per_second` always wins.
+
+The figure is time-to-first-token based and includes network and any upstream
+queueing, so it errs **low** when the upstream reports its cache reads. An
+upstream that reuses a prefix cache **without** reporting it (vLLM without
+`--enable-prompt-tokens-details`, llama.cpp slot reuse) makes it read **high**:
+the count then includes tokens that were never processed. That is why it is
+**analytics-only**: the scanner marks it (`Usage.PromptPerSecondGatewayMeasured`,
+not serialized), `recordUsage` writes it to the usage row (Activity, Stats)
+and passes a prompt sample of `0` — "no sample" to the store — to
+`UpdateMappingOpportunisticMetrics`, so it never reaches `PromptTokensPerSecond`
+or the scorer's prompt bonus. An upstream-reported prompt rate feeds the EWMA as
+before.
 
 The gate is not cosmetic, because a **recorded rate is a routing input**. Where
 the serving application has opportunistic metrics enabled, `recordUsage` feeds
@@ -2905,13 +2918,12 @@ diluted it back out. A vendor Responses derivation does not widen that surface:
 the EWMA feed needs the serving application's opportunistic-metrics opt-in
 (`Target.OpportunisticMetrics`), which no vendor target carries, so a derived
 vendor rate is stored and displayed but never blended into routing. A
-self-hosted one does (#426): the derived Responses generation rate and the
-gateway-measured prompt rate of both flavors reach `GenTokensPerSecond` /
-`PromptTokensPerSecond` of an opted-in mapping exactly as the derived Anthropic
-generation rate always has. The usage row carries no rate-source field
-(`tokens_per_second_source` exists only on the live running-connections row), so
-a derived figure is not marked as such in the EWMA; because the TTFT-based
-prompt rate includes queueing, it errs low rather than high.
+self-hosted one does (#426): the derived Responses generation rate reaches
+`GenTokensPerSecond` of an opted-in mapping exactly as the derived Anthropic
+generation rate always has. The gateway-measured prompt rate does not: it is
+analytics-only (above), so `PromptTokensPerSecond` stays fed by upstream-reported
+rates and benchmarks alone. The usage row carries no rate-source column
+(`tokens_per_second_source` exists only on the live running-connections row).
 
 **The benchmark runner's own copy of this floor (`benchmark_runner.go`'s
 `streamOnce`) matters MORE than either of the two above, because its result
