@@ -361,6 +361,14 @@ type ManagerOptions struct {
 	// scope signals, the orphan sweep). nil, the production case, is
 	// execWSLRunner; a test injects one to observe or fail single calls.
 	WSLRunner wslRunner
+	// ProcessTrees registers a generation whose control can list its process
+	// tree -- the Windows job of a process_tree "job" spec (#424) -- so the
+	// RAM and VRAM measurers charge every process in the tree to the
+	// generation's root pid. It returns the unregister, which the manager
+	// calls at the reap. main.go wires collector.RegisterProcessTree, the
+	// measurers' own registry, the way it wires the measurers themselves; nil
+	// registers nothing, and every pid is measured as its own.
+	ProcessTrees func(root int, members func() []int) (unregister func())
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -497,6 +505,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		wslRunner:           run,
 		wslNonce:            newWSLNonce(),
 		wslRAMReserveMB:     max(0, opts.WSLRAMReserveMB),
+		processTrees:        opts.ProcessTrees,
 		specs:               make(map[string]*specState),
 		allowedPairs:        map[[2]string]bool{},
 		logs:                m.logs,
@@ -1297,6 +1306,10 @@ type runningProc struct {
 	// generation, so it identifies exactly this process inside the distro.
 	wslUnit   string
 	wslDistro string
+	// unregisterTree ends this generation's process-tree registration with
+	// the collector (#424): set at start for a control that lists its tree
+	// (procTreeLister), called by waitForExit at the reap. nil otherwise.
+	unregisterTree func()
 }
 
 // control is p.ctl, or the native control for a runningProc built without one.
@@ -1597,6 +1610,8 @@ type owner struct {
 	m      *Manager
 	policy LocalPolicy
 	getenv func(string) string
+	// processTrees is ManagerOptions.ProcessTrees, fixed at construction.
+	processTrees func(root int, members func() []int) (unregister func())
 	// gpuVendor is fixed for the process lifetime (the host's hardware does
 	// not change under a running agent), so it is a plain field read by the
 	// owner goroutine and never written after construction.
@@ -4884,6 +4899,9 @@ func (o *owner) startProcess(st *specState) {
 		}
 	} else {
 		proc.ctl = nativeCtl
+		if l, ok := nativeCtl.(procTreeLister); ok && o.processTrees != nil {
+			proc.unregisterTree = o.processTrees(proc.pid, l.pids)
+		}
 	}
 	if wslUnit != "" {
 		o.beginWSLVRAM(proc, spec, vramWindow, vmBaseline, baselineOK)
@@ -4929,6 +4947,11 @@ func (o *owner) waitForExit(proc *runningProc) {
 		if cerr := c.close(); cerr != nil {
 			slog.Debug("runtime: releasing the process control failed", "spec", proc.specID, "pid", proc.pid, "error", cerr)
 		}
+	}
+	// The tree is gone with its job; its processes are measured as their
+	// own again (none is left to measure).
+	if proc.unregisterTree != nil {
+		proc.unregisterTree()
 	}
 	close(proc.exited)
 	o.m.postCmd(cmdChildExited{proc: proc, exitErr: err})

@@ -229,6 +229,10 @@ func main() {
 		// admitted against. Operator-owned (OP_AGENT_WSL_RAM_RESERVE_MB,
 		// default 1024), never gateway-supplied.
 		WSLRAMReserveMB: cfg.WSLRAMReserveMB,
+		// A process_tree "job" generation's tree (#424, Windows) is
+		// registered with the measurers' registry, so its RAM and per-GPU
+		// VRAM are charged to the root pid the manager asks about.
+		ProcessTrees: collector.RegisterProcessTree,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()

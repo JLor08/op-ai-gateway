@@ -41,6 +41,16 @@ type procCloser interface {
 	close() error
 }
 
+// procTreeLister is a procControl whose generation is a process tree the
+// agent can enumerate -- the Windows job object of a process_tree "job" spec
+// (#424). startProcess registers it through ManagerOptions.ProcessTrees (the
+// collector's registry), so the RAM and VRAM measurers charge every process in
+// the tree to the generation's root; waitForExit unregisters it at the reap. pids must be
+// safe to call concurrently with close and after it (it then lists nothing).
+type procTreeLister interface {
+	pids() []int
+}
+
 // nativeControl signals the process group the agent exec'd itself, on the
 // owner goroutine: exactly what terminateNow and handleKillGraceExpired did
 // before a second kind of process existed.

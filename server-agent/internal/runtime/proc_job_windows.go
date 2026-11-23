@@ -88,6 +88,13 @@ type jobControl struct {
 	ctrlBreak func(pid int) error
 }
 
+// startProcess and waitForExit find a job generation's close and pids through
+// these interfaces; a signature drift would silently skip both.
+var (
+	_ procCloser     = (*jobControl)(nil)
+	_ procTreeLister = (*jobControl)(nil)
+)
+
 // startInJob starts cmd suspended, in a new process group and -- when the
 // agent has no console of its own (a service) -- in a hidden console of its
 // own, so Ctrl-Break has a console to travel through; stdio stays redirected
