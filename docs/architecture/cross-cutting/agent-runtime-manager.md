@@ -1164,11 +1164,14 @@ reachable; which of them the portal shows is a follow-up.
 
 The desktop app's LAN share (the app port + 1) serves only `/v1/models`,
 `/v1/chat/completions`, `/v1/messages` and `/v1/responses` and none of the endpoints above.
-Per-request rates come from the `timings` object of chat completions and `/v1/responses`;
-`/v1/messages` carries none, so a Claude Code request to Strata records no tokens per second
-(a documented gap). Candidate follow-ups: host tokens/s gauges, speculative-draft acceptance,
-conversation-cache hits, the engine version in the agent panel, a gateway-measured rate for
-`/v1/messages`.
+Per-request rates come from the `timings` object of chat completions. `strata serve`'s
+`/v1/messages` and `/v1/responses` carry none, so for a streamed Claude Code or Codex request
+the gateway measures both rates itself (#426): generation over the first-content-to-end window,
+prompt over the time to first content, which includes queueing and so errs low
+([Telemetry §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+A buffered `/v1/messages` or `/v1/responses` records none. Candidate follow-ups: host tokens/s
+gauges, speculative-draft acceptance, conversation-cache hits, the engine version in the agent
+panel.
 
 **`ollama` is the one row whose verb is not `GET`, and having it wrong made
 that probe unsatisfiable for as long as it existed (issue #54, fixed).**
@@ -10757,8 +10760,9 @@ operator meets first:
   reason). Cross-compile locally with
   `GOOS=windows GOARCH={amd64,arm64} go vet ./...` before changing it.
 - **Strata leaves three gaps** ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
-  `/v1/messages` carries no `timings`, so a Claude Code request to Strata records no
-  tokens per second; Strata's richer telemetry (`/v1/telemetry`, `/slots`,
+  `/v1/messages` and `/v1/responses` carry no `timings`, so a Claude Code or Codex request
+  to Strata records only gateway-measured tokens per second (none when buffered; the
+  prompt rate is time-to-first-token based and errs low); Strata's richer telemetry (`/v1/telemetry`, `/slots`,
   `/v1/status`, the `strata:*` counters) is reachable but not read; and a Strata target
   still fetches any http(s) image URL it is given, from the model host, as SGLang and
   vLLM targets do.

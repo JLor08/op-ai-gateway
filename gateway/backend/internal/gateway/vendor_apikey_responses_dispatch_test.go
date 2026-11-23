@@ -272,11 +272,11 @@ func TestOpenAIAPIKeyResponsesPassthroughRecordsTheDerivedRateOnTheUsageRow(t *t
 	}
 }
 
-// TestSelfHostedResponsesPassthroughRecordsNoDerivedRate is the negative control
+// TestSelfHostedResponsesPassthroughRecordsDerivedRate is the parity check
 // through the same proxyNative wiring: a self-hosted (non-vendor) target relaying
-// the same paced stream with no `timings` records rate 0 -- the vendor flag the
-// scanner is built with must be false there.
-func TestSelfHostedResponsesPassthroughRecordsNoDerivedRate(t *testing.T) {
+// the same paced stream with no `timings` records a gateway-derived rate too, as
+// a vendor target does (#426; before it, a self-hosted row stayed 0).
+func TestSelfHostedResponsesPassthroughRecordsDerivedRate(t *testing.T) {
 	prov := pacedNativeProxyProvider{
 		pieces: []string{
 			"event: response.reasoning_summary_text.delta\n" + `data: {"type":"response.reasoning_summary_text.delta","delta":"hm"}` + "\n\n",
@@ -302,7 +302,7 @@ func TestSelfHostedResponsesPassthroughRecordsNoDerivedRate(t *testing.T) {
 	if events[0].OutputTokens != 6 {
 		t.Fatalf("recorded OutputTokens = %d, want 6", events[0].OutputTokens)
 	}
-	if events[0].TokensPerSecond != 0 {
-		t.Fatalf("recorded TokensPerSecond = %v, want 0 (a self-hosted Responses stream without upstream timings stays unrated)", events[0].TokensPerSecond)
+	if events[0].TokensPerSecond <= 0 {
+		t.Fatalf("recorded TokensPerSecond = %v, want > 0 (a self-hosted Responses stream without upstream timings gets the gateway-derived rate)", events[0].TokensPerSecond)
 	}
 }

@@ -13315,8 +13315,9 @@ facts were measured against a running desktop app.
 - **Media.** `Vision.load` turns `data:` into bytes, fetches `http://`/`https://`, and otherwise reads the reference as a path
   on the model host (`file://` stripped first), with case-sensitive `startswith` checks. Its only guard
   (`_no_local_images`) concerns a browser `Origin`, which a gateway request never carries.
-- **Usage.** Anthropic usage reports `input_tokens: 1` and the prompt in the cache fields. `/v1/messages` carries no
-  llama.cpp-style `timings`; chat completions and `/v1/responses` do.
+- **Usage.** Anthropic usage reports `input_tokens: 1` and the prompt in the cache fields. Only chat completions carry
+  llama.cpp-style `timings`. `strata serve`'s `/v1/messages` and `/v1/responses` carry none, streamed or buffered (the
+  desktop app's LAN-share listener adds top-level `timings` to a buffered `/v1/responses` body).
 
 **Decision.**
 
@@ -13383,8 +13384,20 @@ facts were measured against a running desktop app.
 - **Usage needs no code change, and is pinned.** The passthrough scan already folds Anthropic's cache buckets in; the
   recorded split is disjoint (`input + cached + cache_write + output = total`), so Strata's `input_tokens: 1` with 53 cache
   reads and 4 cache writes records input 1, cached 53, cache write 4. Chat completions (buffered and streamed) and a
-  buffered `/v1/responses` record prompt and generation tokens per second from `timings`; `/v1/messages` records none, a
-  documented gap.
+  buffered `/v1/responses` that carries `timings` record prompt and generation tokens per second from them.
+- **Tokens per second without `timings` are gateway-measured (#426).** For a streamed `/v1/messages` and `/v1/responses`
+  whose frames report no rate, the passthrough scan derives both. The generation rate is the output tokens over the window
+  from the first content frame to the last byte. It was already derived for Anthropic, and for Responses on vendor targets
+  only; the vendor gate is gone, so a Codex request to `strata serve` is rated like a Claude Code one. The prompt rate is
+  new: the processed prompt tokens (fresh input plus cache creation, cache reads excluded) over the time from the upstream
+  send (`proxyNative` stamps it right before the round trip) to the first content frame, floored at 50 ms. It includes
+  network and queueing, so it under-states prefill speed under load. Upstream `timings` always win, Chat Completions is
+  unchanged, and a buffered response derives neither rate. Both rates feed an opted-in mapping's opportunistic EWMA
+  (`GenTokensPerSecond`, `PromptTokensPerSecond`) as the derived Anthropic generation rate already did; the usage row has
+  no rate-source field ([Telemetry §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
+  Rejected: deriving only for a `strata` target (the same gap exists for any self-hosted Responses upstream without
+  `timings`), and waiting for Strata to attach `timings` upstream (still worth asking; an upstream figure would then win
+  unchanged).
 - **The agent authenticates its own child probes.** A keyed child (Strata, or a llama-server with `--api-key`) answers 401
   on everything but its health path, so the agent's metrics scrape, context probe and `/props`-shaped capability probes read
   nothing from it. The gateway now pushes `api_token_header` beside a non-empty `api_token` (the effective header from
@@ -13461,7 +13474,8 @@ facts were measured against a running desktop app.
   listing states them.
 - A client sending a host path or `file://` image reference to a Strata target gets a 400. A Strata target still fetches any
   http(s) URL it is given.
-- Claude Code requests to Strata record no tokens per second (`/v1/messages` has no `timings`). Strata's `/v1/telemetry`,
+- Streamed Claude Code and Codex requests to Strata record gateway-measured generation and prompt tokens per second; the
+  prompt figure is time-to-first-token based and conservative. Buffered ones record none. Strata's `/v1/telemetry`,
   `/slots`, `/v1/status` and the `strata:*` counters are reachable with the spec token but not read yet; what the portal
   shows from them is a follow-up.
 - On Windows, a `job` spec's stop reaches the whole tree, its RAM and per-GPU VRAM cover the whole tree, and its tree dies with
