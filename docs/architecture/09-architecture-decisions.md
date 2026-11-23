@@ -13288,7 +13288,7 @@ shapes: an operator-run Strata registered by URL, and a `strata serve` the agent
 host. The facts below were read off `Niko1221/Strata@c6f6427` (release 0.2.17, Control and engine 0.1.63); the LAN-share
 facts were measured against a running desktop app.
 
-- **Two upstream shapes.** `strata serve --config <json> --host H --port P --output jsonl [--shutdown-timeout S] [--gpu LIST]`
+- **Two upstream shapes.** `strata serve --config <json> --host H --port P --output jsonl [--shutdown-timeout S]`
   runs the full route set in the foreground and binds its socket only once the engine is ready. The desktop app's LAN share
   (the app port + 1) serves only `/v1/models`, `/v1/chat/completions`, `/v1/messages` and `/v1/responses`; everything else
   is 404 there.
@@ -13301,8 +13301,9 @@ facts were measured against a running desktop app.
   `Accept` of `text/plain`/openmetrics; the Prometheus body uses llama.cpp's metric names plus `strata:*` counters),
   `/v1/telemetry`, `/slots` and `/v1/status` (the engine version) exist on `strata serve` only, and need the key.
 - **GPU order.** The engine's stage order puts the **main** card **last** (`"gpu": [helper…, main]`); `"gpu_order":
-  "as_given"` turns Strata's speed reordering off, and a hand-set `gpu`/`--gpu` wins over `gpu_roles`. `--gpu` takes
-  nvidia-smi (host) card numbers.
+  "as_given"` turns Strata's speed reordering off, and a hand-set `gpu` wins over `gpu_roles`. `gpu` takes
+  nvidia-smi (host) card numbers, as a list or a comma-separated string (`"0,1,2"` reads like `[0,1,2]`). `strata serve` has
+  **no `--gpu` flag** (only Strata's internal `serve/server.py` has one): the card list can only live in the config file.
 - **The run config is not ours to build.** `strata launch` writes a JSON run config (engine paths, context, KV, vision,
   `layer_split`, `vram_reserve_mib`, `engine_ready_s`). `engine_ready_s` is not a measured load time: it is Strata's own
   ceiling for waiting on the engine, 900 s by default.
@@ -13346,11 +13347,11 @@ facts were measured against a running desktop app.
   `/props` capability probe runs as for llama.cpp, and the router's `/upstream/{model}/props` context probe is kept. The
   health path is `/health`, which answers without a key. The portal template, filled into a new spec when the type is
   chosen: binary hint `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd` (the operator enters and allowlists the
-  absolute path), args `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --gpu
-  ${HOST_GPU_IDS_MAIN_LAST} --output jsonl --shutdown-timeout 3`, env `STRATA_API_KEY=${API_TOKEN}` (masked in the reported
-  command, never in a file), `set_visible_devices` off (renumbering would break `--gpu`), startup timeout 960 s, flavors and
+  absolute path), args `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl
+  --shutdown-timeout 3`, env `STRATA_API_KEY=${API_TOKEN}` (masked in the reported
+  command, never in a file), `set_visible_devices` off (renumbering would break the config's `gpu`, which takes host numbers), startup timeout 960 s, flavors and
   modes as the application type, `process_tree` `job`. `--host 127.0.0.1` because the agent reaches every child on loopback,
-  as the other templates do.
+  as the other templates do. **Correction (found on hardware, 2026-11-23):** the original template passed `--gpu ${HOST_GPU_IDS_MAIN_LAST}`, which `strata serve` rejects (exit 2, "unrecognized arguments"); the card list now lives in the config file as `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"`, written by the run-config import.
 - **The run config is imported, not rebuilt.** The Strata spec form's "Import run config" takes the pasted `strata launch`
   JSON and writes it as the config file `strata.json`: it keeps every key except launcher bookkeeping (`args_written`,
   `port`, `host`, `open_browser`, `gpus_asked`, `gpu`, `gpu_roles`, `gpu_cards`, `gpu_order`, every `ui_*` key and
@@ -13407,10 +13408,7 @@ facts were measured against a running desktop app.
     the per-GPU sum. A PID in no managed tree keeps per-PID attribution.
 
   `direct`, every non-Windows platform and every `wsl` spec (stored `job` is inert there; the portal hides the control) are
-  unchanged. **Verified on hardware: pending** — the mechanics are compiled and vetted for Windows and covered by
-  Windows-tagged tests that CI cannot run; the owner's Windows acceptance decides, among other things, whether the template
-  keeps `strata.cmd` as the binary or switches to the bundled `python.exe` with `strata.py` as the first argument (cmd.exe's
-  "Terminate batch job" prompt on Ctrl-Break is the open question; the kill still ends the tree either way).
+  unchanged. **Verified on hardware (2026-11-23):** the job-mode start (suspended start, job, resume) works with `strata.cmd` as the binary; `${HOST_GPU_IDS_MAIN_LAST}` resolved to `0,1,2` for GPUs declared `2,0,1` and Strata logged a layer split across GPUs `[0, 1, 2]` (main card last); ready in 38 s; the live log shows the server's output including its JSONL `starting`/`ready` events; the agent's authenticated metrics and context probes both succeeded (context 262144); per-GPU VRAM is attributed over the whole tree (the engine is a grandchild, so per-root attribution would read about 0); a chat completion through the gateway answered. **Still pending:** graceful stop through Ctrl-Break and no leftover processes, the RAM figure against Task Manager, Claude Code and Codex round trips, the Windows-tagged unit tests, the console-less (service) agent path, and cmd.exe's "Terminate batch job" behaviour. Whether the template needs a fallback to the bundled `python.exe` with `strata.py` as the first argument depends on the pending stop behaviour; the template keeps `strata.cmd` because it starts correctly in job mode.
 - **The gateway refuses a move into `job` it knows cannot be honoured.** An operator's spec PUT that moves a spec into
   `job` (a new spec, or one not stored as `job`) is refused with 400 `runtime_spec.process_tree_unsupported` when the
   server's reported OS is not Windows, or its agent has declared its features since the gateway started and

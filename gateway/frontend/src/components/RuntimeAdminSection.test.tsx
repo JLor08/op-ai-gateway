@@ -1547,8 +1547,6 @@ describe('RuntimeAdminSection strata launch-spec kind', () => {
       '127.0.0.1',
       '--port',
       '${PORT}',
-      '--gpu',
-      '${HOST_GPU_IDS_MAIN_LAST}',
       '--output',
       'jsonl',
       '--shutdown-timeout',

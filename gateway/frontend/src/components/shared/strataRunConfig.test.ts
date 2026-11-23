@@ -28,7 +28,6 @@ describe('importStrataRunConfig', () => {
       'host',
       'open_browser',
       'gpus_asked',
-      'gpu',
       'gpu_roles',
       'gpu_cards',
       'api_key',
@@ -60,6 +59,8 @@ describe('importStrataRunConfig', () => {
     const file = JSON.parse(r.fileContent) as Record<string, unknown>;
     expect(file.model_name).toBe('${MODEL}');
     expect(file.gpu_order).toBe('as_given');
+    // strata serve has no --gpu flag: the main-last card list lives in the file.
+    expect(file.gpu).toBe('${HOST_GPU_IDS_MAIN_LAST}');
     expect(r.fileContent).toBe(JSON.stringify(file, null, 2));
     expect(r.upstreamModel).toBe('qwen3.8-flash-next-unsloth-q8_0');
     expect(r.warnings).toEqual([]);
@@ -86,6 +87,23 @@ describe('importStrataRunConfig', () => {
       }),
     );
     expect(r.gpuOrder).toEqual([1]);
+  });
+
+  it('replaces the source card list with the main-last placeholder', () => {
+    const r = ok(run(() => {}));
+    expect(JSON.parse(r.fileContent).gpu).toBe('${HOST_GPU_IDS_MAIN_LAST}');
+    expect(r.fileContent).not.toContain('"gpu": [');
+  });
+
+  it('writes no gpu key when the source names no cards', () => {
+    const r = ok(
+      run((o) => {
+        delete o.gpu_roles;
+        delete o.gpu;
+      }),
+    );
+    expect(r.gpuOrder).toEqual([]);
+    expect(JSON.parse(r.fileContent)).not.toHaveProperty('gpu');
   });
 
   it('proposes max(engine_ready_s, 900) + 60 as the startup timeout', () => {

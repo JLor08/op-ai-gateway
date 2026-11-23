@@ -114,6 +114,13 @@ export function importStrataRunConfig(text: string): StrataImport {
     warnings.push('layer_split_positional');
   }
   out.model_name = '${MODEL}';
+  // `strata serve` has no --gpu flag, so the card list goes into the file. A
+  // comma-separated string is valid JSON before the agent expands the
+  // placeholder, and Strata reads "0,1,2" like [0, 1, 2]
+  // (serve/server_parts/engines.py _gpu_numbers). Only when the source named
+  // cards: the placeholder is a hard error on a spec with no GPUs.
+  const gpuOrder = gpuOrderOf(src);
+  if (gpuOrder.length > 0) out.gpu = '${HOST_GPU_IDS_MAIN_LAST}';
   out.gpu_order = 'as_given';
 
   const ready = typeof src.engine_ready_s === 'number' ? src.engine_ready_s : 0;
@@ -126,7 +133,7 @@ export function importStrataRunConfig(text: string): StrataImport {
   return {
     ok: true,
     fileContent: JSON.stringify(out, null, 2),
-    gpuOrder: gpuOrderOf(src),
+    gpuOrder,
     startupTimeoutSeconds,
     ...(upstreamModel === undefined ? {} : { upstreamModel }),
     warnings,
