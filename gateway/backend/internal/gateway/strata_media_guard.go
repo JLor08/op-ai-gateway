@@ -77,34 +77,38 @@ func strataBlockRefused(m map[string]any) bool {
 		case string:
 			return !strataImageRefAllowed(src)
 		case map[string]any:
-			// url and path are checked whenever present, whatever source.type
-			// says. Strata's _image_source (terminal/serve/frontend.py) today
-			// returns a data: URL for source.type "base64" and only otherwise
-			// reads source.url, then source.path; a base64 source carrying a
-			// reference is refused anyway, so a later Strata that reads the
-			// reference first cannot be steered to a host file through it.
-			st, _ := src["type"].(string)
-			refused := false
-			for _, key := range []string{"url", "path"} {
-				if val, present := src[key]; present {
-					if s, ok := val.(string); !ok || !strataImageRefAllowed(s) {
-						refused = true
-					}
-				}
-			}
-			// A url or path source with no reference at all names nothing safe.
-			if st == "url" || st == "path" {
-				_, hasURL := src["url"]
-				_, hasPath := src["path"]
-				refused = refused || (!hasURL && !hasPath)
-			}
-			return refused
+			return strataSourceMapRefused(src)
 		case nil:
 			// An image block without a source: the url/path keys may sit on the block (Strata reads "image_url" too).
 		}
 		return strataImageURLFieldRefused(m)
 	case "input_image", "image_url":
 		return strataImageURLFieldRefused(m)
+	}
+	return false
+}
+
+// strataSourceMapRefused checks an image block's source object.
+//
+// url and path are checked whenever present, whatever source.type says.
+// Strata's _image_source (terminal/serve/frontend.py) today returns a data: URL
+// for source.type "base64" and only otherwise reads source.url, then
+// source.path; a base64 source carrying a reference is refused anyway, so a
+// later Strata that reads the reference first cannot be steered to a host file
+// through it. A url or path source with no reference at all names nothing safe.
+func strataSourceMapRefused(src map[string]any) bool {
+	for _, key := range []string{"url", "path"} {
+		if val, present := src[key]; present {
+			if s, ok := val.(string); !ok || !strataImageRefAllowed(s) {
+				return true
+			}
+		}
+	}
+	st, _ := src["type"].(string)
+	if st == "url" || st == "path" {
+		_, hasURL := src["url"]
+		_, hasPath := src["path"]
+		return !hasURL && !hasPath
 	}
 	return false
 }

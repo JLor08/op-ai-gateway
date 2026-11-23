@@ -3189,13 +3189,10 @@ export function RuntimeAdminSection({
   function applyStrataImport() {
     const result = importStrataRunConfig(strataImportText);
     if (!result.ok) {
-      setStrataImportError(
-        result.error === 'invalid_json'
-          ? t.strataImportErrorInvalidJson
-          : result.error === 'missing_exe'
-            ? t.strataImportErrorMissingExe
-            : t.strataImportErrorMissingArgs,
-      );
+      let message = t.strataImportErrorMissingArgs;
+      if (result.error === 'invalid_json') message = t.strataImportErrorInvalidJson;
+      else if (result.error === 'missing_exe') message = t.strataImportErrorMissingExe;
+      setStrataImportError(message);
       setStrataImportNotes([]);
       return;
     }

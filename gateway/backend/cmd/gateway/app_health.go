@@ -2959,15 +2959,7 @@ func (r *appHealthRunner) recordListedModelInfos(ctx context.Context, app routin
 	if app.Type != routing.ProviderStrata || strings.TrimSpace(app.ContextProbePath) != "" {
 		return
 	}
-	byName := map[string]provider.ModelInfo{}
-	for _, info := range infos {
-		if info.ContextSize > maxProbedContextSize {
-			info.ContextSize = 0
-		}
-		if info.ContextSize > 0 || info.Caps.Vision == routing.CapabilityYes {
-			byName[info.Name] = info
-		}
-	}
+	byName := listedInfosByName(infos)
 	if len(byName) == 0 {
 		return
 	}
@@ -2982,15 +2974,35 @@ func (r *appHealthRunner) recordListedModelInfos(ctx context.Context, app routin
 		if !ok || mp.Status != routing.ServerStatusActive {
 			continue
 		}
-		if size := info.ContextSize; size > 0 && !mp.MetricsLocked && mp.ContextSize != size {
-			_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, size, now)
+		r.recordListedModelInfo(ctx, mp, info, now)
+	}
+}
+
+// listedInfosByName indexes the listed infos that carry a usable context size
+// or a vision yes, dropping absurd context sizes.
+func listedInfosByName(infos []provider.ModelInfo) map[string]provider.ModelInfo {
+	byName := map[string]provider.ModelInfo{}
+	for _, info := range infos {
+		if info.ContextSize > maxProbedContextSize {
+			info.ContextSize = 0
 		}
-		if info.Caps.Vision == routing.CapabilityYes {
-			r.writeCapabilityRows(ctx, mp, []routing.CapabilityRow{{
-				Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
-				Source: routing.CapabilitySourceStrataModels, CheckedAt: now,
-			}})
+		if info.ContextSize > 0 || info.Caps.Vision == routing.CapabilityYes {
+			byName[info.Name] = info
 		}
+	}
+	return byName
+}
+
+// recordListedModelInfo writes one mapping's listed context size and vision yes.
+func (r *appHealthRunner) recordListedModelInfo(ctx context.Context, mp routing.ModelMapping, info provider.ModelInfo, now time.Time) {
+	if size := info.ContextSize; size > 0 && !mp.MetricsLocked && mp.ContextSize != size {
+		_ = r.store.UpdateMappingContextProbe(ctx, mp.ID, size, now)
+	}
+	if info.Caps.Vision == routing.CapabilityYes {
+		r.writeCapabilityRows(ctx, mp, []routing.CapabilityRow{{
+			Capability: routing.CapabilityVision, Verdict: routing.CapabilityYes,
+			Source: routing.CapabilitySourceStrataModels, CheckedAt: now,
+		}})
 	}
 }
 

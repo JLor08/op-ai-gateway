@@ -99,15 +99,7 @@ func snapshotProcessTrees() processTreeSnapshot {
 		snap.root[root] = root
 	}
 	for root, pids := range listed {
-		for _, pid := range pids {
-			if pid <= 0 {
-				continue
-			}
-			if cur, ok := snap.root[pid]; ok && (cur == pid || cur <= root) {
-				continue
-			}
-			snap.root[pid] = root
-		}
+		snap.claim(root, pids)
 	}
 	for pid, root := range snap.root {
 		if pid != root {
@@ -118,6 +110,20 @@ func snapshotProcessTrees() processTreeSnapshot {
 		snap.members[root] = append([]int{root}, snap.members[root]...)
 	}
 	return snap
+}
+
+// claim assigns pids to root unless another tree holds them: a root keeps
+// itself, and a contested PID goes to the smaller root.
+func (s processTreeSnapshot) claim(root int, pids []int) {
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		if cur, ok := s.root[pid]; ok && (cur == pid || cur <= root) {
+			continue
+		}
+		s.root[pid] = root
+	}
 }
 
 // rootOf reports the registered tree pid belongs to.

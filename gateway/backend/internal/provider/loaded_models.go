@@ -190,25 +190,35 @@ func openaiEntryInfos(v any) map[string]ModelInfo {
 		if _, seen := out[name]; seen {
 			continue
 		}
-		info := ModelInfo{ContextSize: intFromAny(it["context_length"])}
-		if info.ContextSize == 0 {
-			if meta, ok := it["meta"].(map[string]any); ok {
-				info.ContextSize = intFromAny(meta["n_ctx"])
-			}
-		}
-		if arch, ok := it["architecture"].(map[string]any); ok {
-			if mods, ok := arch["input_modalities"].([]any); ok {
-				for _, m := range mods {
-					if s, ok := m.(string); ok && strings.EqualFold(strings.TrimSpace(s), "image") {
-						info.Caps.Vision = routing.CapabilityYes
-						break
-					}
-				}
-			}
-		}
-		out[name] = info
+		out[name] = openaiEntryInfo(it)
 	}
 	return out
+}
+
+// openaiEntryInfo reads one entry's context size and vision verdict.
+func openaiEntryInfo(it map[string]any) ModelInfo {
+	info := ModelInfo{ContextSize: intFromAny(it["context_length"])}
+	if info.ContextSize == 0 {
+		if meta, ok := it["meta"].(map[string]any); ok {
+			info.ContextSize = intFromAny(meta["n_ctx"])
+		}
+	}
+	if arch, ok := it["architecture"].(map[string]any); ok {
+		if mods, ok := arch["input_modalities"].([]any); ok && listsImageModality(mods) {
+			info.Caps.Vision = routing.CapabilityYes
+		}
+	}
+	return info
+}
+
+// listsImageModality reports whether a modality list names "image".
+func listsImageModality(mods []any) bool {
+	for _, m := range mods {
+		if s, ok := m.(string); ok && strings.EqualFold(strings.TrimSpace(s), "image") {
+			return true
+		}
+	}
+	return false
 }
 
 // openaiLoadedModels parses {"data":[{"id":...}]}.

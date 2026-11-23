@@ -77,9 +77,11 @@ function gpuOrderOf(o: Record<string, unknown>): number[] {
     ];
   } else {
     const gpu = o.gpu;
-    const list = Array.isArray(gpu) ? gpu.filter(isIndex) : isIndex(gpu) ? [gpu] : [];
+    let list: number[] = [];
+    if (Array.isArray(gpu)) list = gpu.filter(isIndex);
+    else if (isIndex(gpu)) list = [gpu];
     // The engine's main card is the list's last entry; position 1 is main.
-    order = list.length > 0 ? [list[list.length - 1], ...list.slice(0, -1)] : [];
+    order = list.length > 0 ? [list.at(-1) as number, ...list.slice(0, -1)] : [];
   }
   return [...new Set(order)];
 }

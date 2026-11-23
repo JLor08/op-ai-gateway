@@ -43,7 +43,7 @@ export type RuntimeSpecDraft = {
  */
 export function strataSpecTemplate(): RuntimeSpecDraft {
   return {
-    binaryHint: '%LOCALAPPDATA%\\Strata\\terminal\\current\\bin\\strata.cmd',
+    binaryHint: String.raw`%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd`,
     args: [
       'serve',
       '--config',
