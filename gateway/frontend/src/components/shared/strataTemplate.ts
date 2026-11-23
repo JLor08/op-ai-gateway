@@ -15,6 +15,7 @@ export type RuntimeSpecDraft = {
   args: string[];
   env: Record<string, string>;
   setVisibleDevices: boolean;
+  visibleDevicesMode: 'env' | 'args';
   startupTimeoutSeconds: number;
   healthPath: string;
   flavors: string[];
@@ -36,8 +37,12 @@ export type RuntimeSpecDraft = {
  *   `serve/server.py` does). The card list lives in the config file as
  *   `"gpu": [${HOST_GPU_IDS_MAIN_LAST}]`, which the run-config import writes
  *   and the agent resolves. Strata takes host (nvidia-smi) card numbers with
- *   the main card last, so the visible-devices option stays off; renumbering
- *   the cards would break the list.
+ *   the main card last.
+ * - Visible devices ON in args mode: the agent injects no
+ *   CUDA_VISIBLE_DEVICES (which would renumber the cards and break the
+ *   host-numbered list); the config's `gpu` list is what restricts Strata to
+ *   the spec's cards, and the backend accepts that placeholder in a config
+ *   file as args-mode enforcement.
  * - `STRATA_API_KEY=${API_TOKEN}`: the key travels in the environment, never in
  *   argv or the config file.
  * - 960 s startup: Strata waits up to 900 s for its engine by default, so the
@@ -60,7 +65,8 @@ export function strataSpecTemplate(): RuntimeSpecDraft {
       '3',
     ],
     env: { STRATA_API_KEY: '${API_TOKEN}' },
-    setVisibleDevices: false,
+    setVisibleDevices: true,
+    visibleDevicesMode: 'args',
     startupTimeoutSeconds: 960,
     healthPath: '/health',
     flavors: ['openai', 'anthropic'],

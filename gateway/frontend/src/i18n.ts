@@ -1501,9 +1501,9 @@ const de = {
     'Ohne diese Option sind die GPU-Zeilen unten nur eine Angabe: Sie steuern die Zulassungs-Rechnung und die VRAM-Messung, hindern den Prozess aber nicht daran, auf einer anderen Karte zu landen – die Buchhaltung ist dann falsch, ohne dass irgendetwas warnt. Aktiviert setzt der Agent die zur erkannten Hardware passende Variable (CUDA_VISIBLE_DEVICES bei NVIDIA, ROCR_VISIBLE_DEVICES bei AMD; bei Apple oder ohne erkannte GPU nichts) auf genau diese Indizes. Wichtig: Der Kindprozess nummeriert danach ab 0 – bei den Karten 3 und 4 sieht er die Geräte 0 und 1. Argumente, die eine Gerätenummer nennen (--main-gpu, --tensor-split), beziehen sich ab dann auf diese Nummerierung, die GPU-Zeilen hier dagegen weiterhin auf die des Hosts.',
   runtimeSpecVisibleDevicesMode: 'Sichtbarkeit erzwingen über',
   runtimeSpecVisibleDevicesModeEnv: 'Umgebungsvariable',
-  runtimeSpecVisibleDevicesModeArgs: 'Argumente (--device)',
+  runtimeSpecVisibleDevicesModeArgs: 'Per Argument oder Config-Datei',
   runtimeSpecVisibleDevicesModeArgsHint:
-    'Im Argument-Modus setzt der Agent keine Sichtbarkeits-Variable. Schreiben Sie stattdessen einen Geräte-Platzhalter in die Argumente – je nach llama.cpp-Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}, oder das allgemeine ${DEVICES}, das mit dem Geräte-Backend der Spezifikation gerendert wird (auf einem Cluster-Head die RPC-Geräte zuerst). Der Platzhalter wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3); mindestens einer der vier muss vorhanden sein. ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen nur das erste Gerät (für -mmdev) und zählen hier nicht.',
+    'In diesem Modus setzt der Agent keine Sichtbarkeits-Variable; die Spezifikation selbst schränkt die Karten ein. Schreiben Sie dazu einen Geräte-Platzhalter in die Argumente oder in eine Config-Datei – für llama.cpp je nach Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}, oder das allgemeine ${DEVICES}, das mit dem Geräte-Backend der Spezifikation gerendert wird (auf einem Cluster-Head die RPC-Geräte zuerst); es wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3). Für einen Server, der seine Kartenliste selbst nimmt (etwa Strata mit "gpu" in der Config-Datei), zählen auch ${HOST_GPU_IDS} und ${HOST_GPU_IDS_MAIN_LAST} (Host-Nummerierung). Mindestens einer dieser Platzhalter muss vorhanden sein. ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen nur das erste Gerät (für -mmdev) und zählen hier nicht.',
   // Runtime-Spec API Token: the MODE controls only -- the header-source
   // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API-Token-Modus',
@@ -2265,7 +2265,7 @@ const de = {
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Für „GPU-Zuweisung erzwingen“ wird mindestens eine GPU-Zeile benötigt: Ein leerer Sichtbarkeitswert bedeutet nicht „keine Einschränkung“, sondern dass der Prozess gar keine GPU sieht.',
   errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
-    'Im Argument-Modus von „GPU-Zuweisung erzwingen“ muss ein Geräte-Platzhalter in den Argumenten stehen: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} oder ${DEVICES}. Sonst setzt der Agent nichts und die Auswahl geht verloren.',
+    'Im Modus „Per Argument oder Config-Datei“ von „GPU-Zuweisung erzwingen“ muss ein Geräte-Platzhalter in den Argumenten oder einer Config-Datei stehen: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES}, ${DEVICES}, ${HOST_GPU_IDS} oder ${HOST_GPU_IDS_MAIN_LAST}. Sonst setzt der Agent nichts und die Auswahl geht verloren.',
   errorRuntimeSpecVisibleDevicesConflict:
     'Diese Variable ist bereits von Hand gesetzt. „GPU-Zuweisung erzwingen“ und ein eigener Eintrag sind zwei Quellen für denselben Wert – bitte eines von beidem entfernen.',
   errorRuntimeSpecApplicationNotServerAgent:
@@ -5606,9 +5606,9 @@ const en: PortalMessages = {
     "Without this, the GPU rows below are only a declaration: they drive the admission arithmetic and the VRAM measurement, but nothing stops the process from landing on a different card — after which the accounting is wrong and nothing warns. Switched on, the agent sets the variable its detected hardware uses (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on Apple or a host with no recognised GPU) to exactly these indices. Note that the child then renumbers from 0 — given cards 3 and 4 it sees devices 0 and 1 — so any argument naming a device number (--main-gpu, --tensor-split) refers to that numbering from then on, while the GPU rows here stay in the host's.",
   runtimeSpecVisibleDevicesMode: 'Enforce visibility via',
   runtimeSpecVisibleDevicesModeEnv: 'Environment variable',
-  runtimeSpecVisibleDevicesModeArgs: 'Arguments (--device)',
+  runtimeSpecVisibleDevicesModeArgs: 'Via args or config file',
   runtimeSpecVisibleDevicesModeArgsHint:
-    'In arguments mode the agent sets no visibility variable. Instead write a device placeholder into the args — ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your llama.cpp build, or the generic ${DEVICES}, rendered with the device backend of the spec (on a cluster head the RPC devices first). It expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3); at least one of the four must be present. ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name only the first device (for -mmdev) and do not count here.',
+    'In this mode the agent sets no visibility variable; the spec itself restricts the cards. Write a device placeholder into the args or into a config file — for llama.cpp ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your build, or the generic ${DEVICES}, rendered with the device backend of the spec (on a cluster head the RPC devices first); it expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3). For a server that takes its card list itself (such as Strata with "gpu" in its config file), ${HOST_GPU_IDS} and ${HOST_GPU_IDS_MAIN_LAST} (host numbering) count too. At least one of these placeholders must be present. ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name only the first device (for -mmdev) and do not count here.',
   // Runtime-Spec API Token: the MODE controls only -- the header-source
   // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API token mode',
@@ -6303,7 +6303,7 @@ const en: PortalMessages = {
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Enforcing GPU assignment needs at least one GPU row: an empty visibility value does not mean "no restriction", it means the process sees no GPU at all.',
   errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
-    'In arguments mode, enforcing GPU assignment needs a device placeholder in the args: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} or ${DEVICES}. Otherwise the agent sets nothing and the selection is lost.',
+    'In the "Via args or config file" mode, enforcing GPU assignment needs a device placeholder in the args or a config file: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES}, ${DEVICES}, ${HOST_GPU_IDS} or ${HOST_GPU_IDS_MAIN_LAST}. Otherwise the agent sets nothing and the selection is lost.',
   errorRuntimeSpecVisibleDevicesConflict:
     'This variable is already set by hand. Enforcing GPU assignment and your own entry are two sources for one value — remove one of them.',
   errorRuntimeSpecApplicationNotServerAgent: 'Runtime specs require a server_agent application',

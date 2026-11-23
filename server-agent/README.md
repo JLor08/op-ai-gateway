@@ -675,8 +675,11 @@ for Strata. **Verified on hardware (2026-11-23):** the job-mode start with `stra
 
 The key goes in the spec's environment as `STRATA_API_KEY=${API_TOKEN}`, never in
 the run config file; the agent's own probes of the child (metrics, context,
-capabilities) send it too. Leave **visible devices off**: the run config's `gpu` takes the host's
-card numbers. Strata's own engine wait defaults to 900 s, so the template's startup
+capabilities) send it too. The template turns **visible devices on in args mode**
+("Via args or config file"): the agent then sets no `CUDA_VISIBLE_DEVICES` (which
+would renumber the cards from 0), and the run config's `gpu` list, in the host's card
+numbers, is what restricts Strata to the spec's cards. Never switch the mode to
+`env` for Strata. Strata's own engine wait defaults to 900 s, so the template's startup
 timeout is 960 s; raise the parent `server_agent` application's timeout to at least
 960000 ms, or the portal warns that a cold start can be cut short.
 

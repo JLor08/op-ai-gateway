@@ -745,16 +745,27 @@ the option is on:
 | Mode | Behavior |
 |---|---|
 | `env` (default) | The agent injects the vendor variable from the table above, exactly as before this field existed. |
-| `args` | The agent injects **no** visibility variable at all. The operator instead places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, or the generic `${DEVICES}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)), in the spec's own `args` — `["--device", "${CUDA_DEVICES}"]` for llama.cpp. |
+| `args` | The agent injects **no** visibility variable at all. The spec itself carries the restriction: the operator places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, the generic `${DEVICES}`, or one of the host-numbered card lists `${HOST_GPU_IDS}`/`${HOST_GPU_IDS_MAIN_LAST}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) in the spec's own `args` **or in a config file's content** — `["--device", "${CUDA_DEVICES}"]` for llama.cpp, `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` in Strata's `strata.json`. The portal labels this mode "Via args or config file"; the stored value stays `args`. |
 
 `args` mode exists because a visibility variable hides every other card from
 the whole child process, while llama.cpp's own `--device` flag is
 finer-grained; it is a second lever beside the variable, not a replacement for
 it, which is why `env` stays the default and every pre-existing spec keeps its
-old behaviour untouched. An **`args`-mode spec must carry one of the three
-placeholders, or `${DEVICES}`, somewhere in `args`** (the `${…_FIRST_DEVICE}` and
+old behaviour untouched. An **`args`-mode spec must carry one of the six
+card-list placeholders — the three `${…_DEVICES}` lists, `${DEVICES}`,
+`${HOST_GPU_IDS}` or `${HOST_GPU_IDS_MAIN_LAST}` — somewhere in `args` or in a
+config file's content** (the `${…_FIRST_DEVICE}` and
 `${FIRST_LOCAL_DEVICE}` tokens alone do not count: they name one device and
-restrict nothing). Turning the option on, selecting `args`,
+restrict nothing). The two host-numbered lists count because they name the
+spec's full card set for a model server that takes its card list itself and
+numbers cards like the host: such a server must not get a visibility variable
+(it would renumber the cards from 0 and break the host-numbered list), so
+`args` mode is the only enforcement that fits it, and the config file is
+where that list lives (the Strata launch shape in
+[§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+Existing specs are unchanged: no default moved, and the rule only widened. The check is a
+substring match over `args` and every config file's content; it does not
+parse the file. Turning the option on, selecting `args`,
 and never mentioning a placeholder would have the agent inject nothing *and*
 the args say nothing, silently leaving every card visible to the child — the
 exact failure trap 1 below exists to prevent, reached through the other door.
@@ -1111,8 +1122,11 @@ Its facts, each from the code:
   `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd` (the field takes the absolute
   path, `C:\Users\<user>\AppData\Local\…`, which must be in `runtime_allowed_binaries`), args
   `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl --shutdown-timeout 3` (`strata serve` has no `--gpu` flag; the card list is in the config file),
-  env `STRATA_API_KEY=${API_TOKEN}`, `set_visible_devices` off (Strata numbers cards like
-  nvidia-smi, and the config's `gpu` takes host numbers), startup timeout 960 s, health path `/health`,
+  env `STRATA_API_KEY=${API_TOKEN}`, `set_visible_devices` **on in `args` mode** (§3.3:
+  the agent injects no `CUDA_VISIBLE_DEVICES`, which would renumber the cards from 0; the
+  config's host-numbered `gpu` list is the enforcement, and its
+  `${HOST_GPU_IDS_MAIN_LAST}` satisfies the args-mode placeholder rule — so a Strata spec
+  saves only once it has a GPU row and the imported `strata.json`), startup timeout 960 s, health path `/health`,
   flavors `openai` and `anthropic`, `responses_mode` and `messages_mode` `passthrough`,
   `process_tree` `job` ([§3.9](#39-the-windows-process-tree-process_tree)). The run config
   itself is the config file `strata.json` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)),

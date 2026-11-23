@@ -13349,7 +13349,11 @@ facts were measured against a running desktop app.
   chosen: binary hint `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd` (the operator enters and allowlists the
   absolute path), args `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl
   --shutdown-timeout 3`, env `STRATA_API_KEY=${API_TOKEN}` (masked in the reported
-  command, never in a file), `set_visible_devices` off (renumbering would break the config's `gpu`, which takes host numbers), startup timeout 960 s, flavors and
+  command, never in a file), `set_visible_devices` **on in `args` mode** (a visibility variable would renumber the cards
+  and break the config's host-numbered `gpu`; in `args` mode the agent injects none, and the config's
+  `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` is the enforcement — the args-mode placeholder rule of ADR-034 now accepts the
+  card-list placeholder in a config file's content and counts `${HOST_GPU_IDS}`/`${HOST_GPU_IDS_MAIN_LAST}` as card
+  lists; no new mode value, since an agent degrades an unknown mode to `env`), startup timeout 960 s, flavors and
   modes as the application type, `process_tree` `job`. `--host 127.0.0.1` because the agent reaches every child on loopback,
   as the other templates do. **Correction (found on hardware, 2026-11-23):** the original template passed `--gpu ${HOST_GPU_IDS_MAIN_LAST}`, which `strata serve` rejects (exit 2, "unrecognized arguments"); the card list now lives in the config file as `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"`, written by the run-config import.
 - **The run config is imported, not rebuilt.** The Strata spec form's "Import run config" takes the pasted `strata launch`

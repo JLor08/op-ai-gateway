@@ -1499,6 +1499,20 @@ describe('RuntimeAdminSection sglang launch-spec kinds', () => {
   });
 });
 
+// The Strata template turns the visible-devices option on in args mode, so a
+// Strata spec saves only with a GPU row and a config file carrying the card
+// list -- what the run-config import writes. Adds both by hand.
+function addStrataCardAndRunConfig() {
+  fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+  fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecConfigFileAdd }));
+  fireEvent.change(screen.getByLabelText(t.runtimeSpecConfigFileName), {
+    target: { value: 'strata.json' },
+  });
+  fireEvent.change(screen.getByLabelText(t.runtimeSpecConfigFileContent), {
+    target: { value: '{"gpu": "${HOST_GPU_IDS_MAIN_LAST}"}' },
+  });
+}
+
 describe('RuntimeAdminSection strata launch-spec kind', () => {
   it('offers strata and shows its note as the type description, and only for it', async () => {
     renderSection();
@@ -1535,6 +1549,11 @@ describe('RuntimeAdminSection strata launch-spec kind', () => {
     await pickFlavorFormType(t.runtimeSpecTypeStrata);
     expect(flavorBoxes().openai).toBeChecked();
     expect(flavorBoxes().anthropic).toBeChecked();
+    expect(screen.getByLabelText(t.runtimeSpecSetVisibleDevices)).toBeChecked();
+    expect(
+      screen.getByRole('combobox', { name: t.runtimeSpecVisibleDevicesMode }),
+    ).toHaveTextContent(t.runtimeSpecVisibleDevicesModeArgs);
+    addStrataCardAndRunConfig();
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     const body = putSpecs[0].body;
@@ -1553,7 +1572,10 @@ describe('RuntimeAdminSection strata launch-spec kind', () => {
       '3',
     ]);
     expect(body.env).toEqual({ STRATA_API_KEY: '${API_TOKEN}' });
-    expect(body.set_visible_devices).toBe(false);
+    // Enforced in args mode: the agent injects no CUDA_VISIBLE_DEVICES (which
+    // would renumber the cards); the config's host-numbered gpu list restricts.
+    expect(body.set_visible_devices).toBe(true);
+    expect(body.visible_devices_mode).toBe('args');
     expect(body.startup_timeout_seconds).toBe(960);
     expect(body.api_flavors).toEqual(['openai', 'anthropic']);
     expect(body.responses_mode).toBe('passthrough');
@@ -1578,6 +1600,7 @@ describe('RuntimeAdminSection strata launch-spec kind', () => {
       target: { value: 'STRATA_API_KEY=${API_TOKEN}\nFOO=bar' },
     });
     await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    addStrataCardAndRunConfig();
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.args).toEqual(['serve', '--port', '${PORT}']);
@@ -8653,6 +8676,61 @@ describe('RuntimeAdminSection visibility mode', () => {
     expect(putSpecs[0].body.visible_devices_mode).toBe('args');
   });
 
+  function argsModeSpec(args: string[], content: string) {
+    return makeSpec({
+      configured: true,
+      id: 'spec_1',
+      mapping_id: 'map_1',
+      binary: '/opt/strata/strata.cmd',
+      set_visible_devices: true,
+      visible_devices_mode: 'args',
+      args,
+      config_files: [{ name: 'strata.json', content }],
+      gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+    });
+  }
+
+  it('accepts args mode with the card list only in a config file', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: argsModeSpec(['serve'], '{"gpu": "${HOST_GPU_IDS_MAIN_LAST}"}'),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.visible_devices_mode).toBe('args');
+  });
+
+  it('accepts args mode with ${HOST_GPU_IDS} in args', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: argsModeSpec(['--gpus', '${HOST_GPU_IDS}'], '{}') },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+  });
+
+  it('refuses args mode with only a single-device token before calling the API', async () => {
+    const { putSpecs } = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: argsModeSpec(['--device', '${CUDA_FIRST_DEVICE}'], '{"gpu": "0,1"}'),
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(
+      await screen.findByText(t.errorRuntimeSpecVisibleDevicesArgsNoPlaceholder),
+    ).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
   it('hides the mode select when set_visible_devices is off', async () => {
     renderSection({
       mappings: [makeMapping({ id: 'map_1' })],
@@ -13793,6 +13871,7 @@ describe('RuntimeAdminSection process_tree control (#424)', () => {
     });
     await pickFlavorFormType(t.runtimeSpecTypeStrata);
     expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeJob);
+    addStrataCardAndRunConfig();
     fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.process_tree).toBe('job');

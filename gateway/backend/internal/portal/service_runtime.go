@@ -105,8 +105,10 @@ var (
 	ErrRuntimeSpecVisibleDevicesModeInvalid = errors.New("runtime_spec.visible_devices_mode_invalid")
 	// ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder rejects set_visible_devices
 	// in args mode when none of the device-list placeholders
-	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES}) appears in args: the
-	// agent would inject no visibility and the selection would be lost. HTTP 400.
+	// (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES}/
+	// ${HOST_GPU_IDS}/${HOST_GPU_IDS_MAIN_LAST}) appears in args or in a config
+	// file's content: the agent would inject no visibility and the selection
+	// would be lost. HTTP 400.
 	ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder = errors.New("runtime_spec.visible_devices_args_no_placeholder")
 	// ErrRuntimeSpecAPITokenModeInvalid rejects an api_token_mode that is not
 	// one of off/set/random/app. HTTP 400.
@@ -2003,24 +2005,38 @@ var runtimeSpecVisibleDevicesVars = []string{
 	"HIP_VISIBLE_DEVICES",
 }
 
-// runtimeSpecDevicePlaceholders are the llama.cpp --device placeholders the
-// agent expands that name every local GPU of the spec (mirrors the agent's
-// own token set in policy_local.go): the three per-backend lists and the
-// generic ${DEVICES}. In args mode at least one must appear in the spec's
-// args, else the selection would silently vanish. The single-device tokens
-// (${FIRST_LOCAL_DEVICE}, ${CUDA_FIRST_DEVICE}, ...) do not count: they do
-// not restrict offloading to the selected GPUs.
+// runtimeSpecDevicePlaceholders are the placeholders the agent expands that
+// name every local GPU of the spec: the three llama.cpp --device lists and the
+// generic ${DEVICES} (mirrors the agent's own token set in policy_local.go),
+// plus the two host-numbered lists ${HOST_GPU_IDS} and
+// ${HOST_GPU_IDS_MAIN_LAST} (the same card set, in the host's numbering, for
+// a model server that takes its GPU list itself -- Strata's run config
+// carries "gpu": "${HOST_GPU_IDS_MAIN_LAST}"). In args mode at least one must
+// appear in the spec's args or in a config file's content, else the agent
+// injects nothing and the selection would silently vanish. The single-device
+// tokens (${FIRST_LOCAL_DEVICE}, ${CUDA_FIRST_DEVICE}, ...) do not count: they
+// do not restrict the server to the selected GPUs.
 var runtimeSpecDevicePlaceholders = []string{
 	"${CUDA_DEVICES}",
 	"${VULKAN_DEVICES}",
 	"${METAL_DEVICES}",
 	placeholderDevices,
+	"${HOST_GPU_IDS}",
+	"${HOST_GPU_IDS_MAIN_LAST}",
 }
 
-func argsHaveDevicePlaceholder(args []string) bool {
-	for _, a := range args {
+// specCarriesDevicePlaceholder reports whether args or any config file's
+// content contains one of runtimeSpecDevicePlaceholders -- the args-mode
+// condition that the spec itself restricts the server to its GPUs.
+func specCarriesDevicePlaceholder(args []string, files []ConfigFileDTO) bool {
+	texts := make([]string, 0, len(args)+len(files))
+	texts = append(texts, args...)
+	for _, f := range files {
+		texts = append(texts, f.Content)
+	}
+	for _, t := range texts {
 		for _, ph := range runtimeSpecDevicePlaceholders {
-			if strings.Contains(a, ph) {
+			if strings.Contains(t, ph) {
 				return true
 			}
 		}
@@ -2043,7 +2059,7 @@ func validVisibleDevicesMode(raw string) (routing.VisibleDevicesMode, bool) {
 // validateRuntimeSpecVisibleDevices validates visible_devices_mode (always,
 // regardless of the flag) and, when set_visible_devices is on, enforces the
 // combinations it may not be saved in: an env conflict, an empty GPU list, or
-// (in args mode) args with no device placeholder. The flag-gated traps are
+// (in args mode) neither args nor a config file with a device-list placeholder. The flag-gated traps are
 // ALSO refused by the agent at launch, and that duplication is deliberate in
 // both directions:
 //
@@ -2086,9 +2102,10 @@ func validateRuntimeSpecVisibleDevices(req PutRuntimeSpecRequest) error {
 	if len(req.GPUs) == 0 {
 		return ErrRuntimeSpecVisibleDevicesNoGPUs
 	}
-	// args mode: at least one device placeholder must be present, else the
-	// agent injects nothing and the selection is silently lost.
-	if mode == routing.VisibleDevicesModeArgs && !argsHaveDevicePlaceholder(req.Args) {
+	// args mode: at least one device-list placeholder must be present in args
+	// or a config file, else the agent injects nothing and the selection is
+	// silently lost.
+	if mode == routing.VisibleDevicesModeArgs && !specCarriesDevicePlaceholder(req.Args, req.ConfigFiles) {
 		return ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder
 	}
 	return nil
