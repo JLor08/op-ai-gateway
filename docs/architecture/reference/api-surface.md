@@ -1166,8 +1166,10 @@ when the option is on while `env` already sets one of
 changes what the agent injects, never whether a hand-set entry may coexist
 with the option); and
 `runtime_spec.visible_devices_args_no_placeholder` when the option is on,
-`visible_devices_mode` is `args`, and `args` contains none of
-`${CUDA_DEVICES}` / `${VULKAN_DEVICES}` / `${METAL_DEVICES}`. All four rules
+`visible_devices_mode` is `args`, and neither `args` nor any config file's
+content contains one of `${CUDA_DEVICES}` / `${VULKAN_DEVICES}` /
+`${METAL_DEVICES}` / `${DEVICES}` / `${HOST_GPU_IDS}` /
+`${HOST_GPU_IDS_MAIN_LAST}`. All four rules
 are **vendor-independent** — this gateway cannot know the target host's
 hardware. Of the four, only the two that predate the mode split — the
 empty-`gpus` refusal and the hand-set conflict — are re-enforced by the agent

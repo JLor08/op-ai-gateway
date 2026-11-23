@@ -2841,6 +2841,54 @@ func TestPutRuntimeSpecVisibleDevicesModeValidation(t *testing.T) {
 		})
 	}
 
+	// The host-numbered full-set tokens count too, in args AND in a config
+	// file's content (Strata's strata.json carries
+	// "gpu": "${HOST_GPU_IDS_MAIN_LAST}"): args mode injects no visibility
+	// variable, so the spec itself must carry the restriction somewhere.
+	t.Run("accepts ${HOST_GPU_IDS} in args", func(t *testing.T) {
+		r := base()
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"--gpus", "${HOST_GPU_IDS}"}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+			t.Fatalf("args mode with ${HOST_GPU_IDS} in args must save: %v", err)
+		}
+	})
+	t.Run("accepts ${HOST_GPU_IDS_MAIN_LAST} only in a config file", func(t *testing.T) {
+		r := base()
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"serve", "--config", "${CONFIG_DIR}/strata.json"}
+		r.ConfigFiles = []ConfigFileDTO{{Name: "strata.json", Content: `{"gpu": "${HOST_GPU_IDS_MAIN_LAST}"}`}}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+			t.Fatalf("args mode with the placeholder in a config file must save: %v", err)
+		}
+	})
+	t.Run("a single-device token does not count", func(t *testing.T) {
+		r := base()
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"--device", "${CUDA_FIRST_DEVICE}"}
+		r.ConfigFiles = []ConfigFileDTO{{Name: "a.json", Content: `{"gpu": "${CUDA_FIRST_DEVICE}"}`}}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); !errors.Is(err, ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder) {
+			t.Fatalf("err = %v, want ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder", err)
+		}
+	})
+	t.Run("no placeholder in args or config files is refused", func(t *testing.T) {
+		r := base()
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeArgs)
+		r.Args = []string{"serve"}
+		r.ConfigFiles = []ConfigFileDTO{{Name: "a.json", Content: `{"gpu": "0,1"}`}}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); !errors.Is(err, ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder) {
+			t.Fatalf("err = %v, want ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder", err)
+		}
+	})
+	t.Run("env mode ignores placeholders", func(t *testing.T) {
+		r := base()
+		r.VisibleDevicesMode = string(routing.VisibleDevicesModeEnv)
+		r.Args = []string{"serve"}
+		if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, r); err != nil {
+			t.Fatalf("env mode without a placeholder must save: %v", err)
+		}
+	})
+
 	// The conflict trap still fires in args mode (a hand-set CUDA_VISIBLE_DEVICES
 	// remaps the CUDA namespace and would break --device numbering).
 	t.Run("conflict trap holds in args mode", func(t *testing.T) {

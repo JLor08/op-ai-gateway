@@ -205,8 +205,9 @@ export interface RuntimeSpec {
   // on together with one of those variables hand-set in `env`.
   set_visible_devices: boolean;
   // env: agent injects the visibility env var (today's behaviour, order-
-  // preserving). args: agent injects nothing; the operator writes a
-  // ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholder into args.
+  // preserving). args: agent injects nothing; the operator writes a card-list
+  // placeholder (${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES}/
+  // ${HOST_GPU_IDS}/${HOST_GPU_IDS_MAIN_LAST}) into args or a config file.
   // Only meaningful when set_visible_devices is on; default 'env'. Mirrors the
   // Go RuntimeSpecDTO.visible_devices_mode.
   visible_devices_mode: 'env' | 'args';

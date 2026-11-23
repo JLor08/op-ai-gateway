@@ -1159,8 +1159,23 @@ const visibleDevicesOwnedVars = [
   'HIP_VISIBLE_DEVICES',
 ];
 
+// The placeholders that name every card of the spec (mirrors the backend's
+// runtimeSpecDevicePlaceholders): the llama.cpp --device lists, the generic
+// ${DEVICES}, and the host-numbered ${HOST_GPU_IDS}/${HOST_GPU_IDS_MAIN_LAST}
+// for a server that takes its card list itself (Strata's run config). In args
+// mode one must appear in args or in a config file. The single-device tokens
+// (${FIRST_LOCAL_DEVICE}, ${CUDA_FIRST_DEVICE}, ...) do not count.
+const visibleDevicesListPlaceholders = [
+  '${CUDA_DEVICES}',
+  '${VULKAN_DEVICES}',
+  '${METAL_DEVICES}',
+  '${DEVICES}',
+  '${HOST_GPU_IDS}',
+  '${HOST_GPU_IDS_MAIN_LAST}',
+];
+
 /**
- * The two combinations `set_visible_devices` may not be saved in, checked
+ * The three combinations `set_visible_devices` may not be saved in, checked
  * before the round trip so the operator reads a message in the form instead of
  * a backend error code.
  *
@@ -1175,9 +1190,14 @@ const visibleDevicesOwnedVars = [
  *  - An empty GPU list would make the agent emit `CUDA_VISIBLE_DEVICES=`, and an
  *    EMPTY visibility value does not mean "no restriction" -- it means NOTHING
  *    is visible.
+ *  - In args mode the agent injects nothing, so the spec itself must carry a
+ *    card-list placeholder, in args or in a config file's content; without one
+ *    the selection is silently lost.
  */
 function validateVisibleDevices(
   on: boolean,
+  mode: 'env' | 'args',
+  specTexts: string[],
   env: Record<string, string>,
   gpuCount: number,
   t: Translation,
@@ -1189,6 +1209,12 @@ function validateVisibleDevices(
     }
   }
   if (gpuCount === 0) return t.errorRuntimeSpecVisibleDevicesNoGpus;
+  if (
+    mode === 'args' &&
+    !specTexts.some((text) => visibleDevicesListPlaceholders.some((ph) => text.includes(ph)))
+  ) {
+    return t.errorRuntimeSpecVisibleDevicesArgsNoPlaceholder;
+  }
   return undefined;
 }
 
@@ -3634,6 +3660,7 @@ export function RuntimeAdminSection({
     if (envText === '') setEnvText(formatEnvText(template.env));
     if (startupTimeoutSeconds === 180) setStartupTimeoutSeconds(template.startupTimeoutSeconds);
     setSetVisibleDevices(template.setVisibleDevices);
+    setVisibleDevicesMode(template.visibleDevicesMode);
     setSpecApiFlavors(template.flavors);
     setSpecResponsesMode(template.responsesMode);
     setSpecMessagesMode(template.messagesMode);
@@ -3666,6 +3693,8 @@ export function RuntimeAdminSection({
     }
     const visibleDevicesError = validateVisibleDevices(
       setVisibleDevices,
+      visibleDevicesMode,
+      [...args, ...configFiles.map((r) => r.content)],
       parsedEnv.env,
       gpuRows.length,
       t,
@@ -3777,6 +3806,8 @@ export function RuntimeAdminSection({
     }
     const visibleDevicesError = validateVisibleDevices(
       setVisibleDevices,
+      visibleDevicesMode,
+      [...args, ...configFiles.map((r) => r.content)],
       parsedEnv.env,
       gpuRows.length,
       t,

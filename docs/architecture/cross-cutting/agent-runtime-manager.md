@@ -297,7 +297,7 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   same declared, deduplicated host index list with the **first** entry (the main
   card) moved to the **end** (`2,0,1` declared → `"0,1,2"`; one GPU renders
   itself). It exists for an engine that takes host card numbers with its main card
-  last — Strata's `--gpu`, whose stage order is `[helper…, main]`
+  last — Strata's config `gpu` (`"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` in `strata.json`), whose stage order is `[helper…, main]`
   ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)) — while the
   operator keeps the portal convention that the first GPU row is the main one. The
   same empty-set refusal as `${HOST_GPU_IDS}`, on the same reasoning. It is
@@ -745,16 +745,27 @@ the option is on:
 | Mode | Behavior |
 |---|---|
 | `env` (default) | The agent injects the vendor variable from the table above, exactly as before this field existed. |
-| `args` | The agent injects **no** visibility variable at all. The operator instead places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, or the generic `${DEVICES}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)), in the spec's own `args` — `["--device", "${CUDA_DEVICES}"]` for llama.cpp. |
+| `args` | The agent injects **no** visibility variable at all. The spec itself carries the restriction: the operator places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, the generic `${DEVICES}`, or one of the host-numbered card lists `${HOST_GPU_IDS}`/`${HOST_GPU_IDS_MAIN_LAST}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) in the spec's own `args` **or in a config file's content** — `["--device", "${CUDA_DEVICES}"]` for llama.cpp, `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` in Strata's `strata.json`. The portal labels this mode "Via args or config file"; the stored value stays `args`. |
 
 `args` mode exists because a visibility variable hides every other card from
 the whole child process, while llama.cpp's own `--device` flag is
 finer-grained; it is a second lever beside the variable, not a replacement for
 it, which is why `env` stays the default and every pre-existing spec keeps its
-old behaviour untouched. An **`args`-mode spec must carry one of the three
-placeholders, or `${DEVICES}`, somewhere in `args`** (the `${…_FIRST_DEVICE}` and
+old behaviour untouched. An **`args`-mode spec must carry one of the six
+card-list placeholders — the three `${…_DEVICES}` lists, `${DEVICES}`,
+`${HOST_GPU_IDS}` or `${HOST_GPU_IDS_MAIN_LAST}` — somewhere in `args` or in a
+config file's content** (the `${…_FIRST_DEVICE}` and
 `${FIRST_LOCAL_DEVICE}` tokens alone do not count: they name one device and
-restrict nothing). Turning the option on, selecting `args`,
+restrict nothing). The two host-numbered lists count because they name the
+spec's full card set for a model server that takes its card list itself and
+numbers cards like the host: such a server must not get a visibility variable
+(it would renumber the cards from 0 and break the host-numbered list), so
+`args` mode is the only enforcement that fits it, and the config file is
+where that list lives (the Strata launch shape in
+[§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+Existing specs are unchanged: no default moved, and the rule only widened. The check is a
+substring match over `args` and every config file's content; it does not
+parse the file. Turning the option on, selecting `args`,
 and never mentioning a placeholder would have the agent inject nothing *and*
 the args say nothing, silently leaving every card visible to the child — the
 exact failure trap 1 below exists to prevent, reached through the other door.
@@ -1110,23 +1121,20 @@ Its facts, each from the code:
   edited stored spec is never prefilled): binary hint
   `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd` (the field takes the absolute
   path, `C:\Users\<user>\AppData\Local\…`, which must be in `runtime_allowed_binaries`), args
-  `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --gpu ${HOST_GPU_IDS_MAIN_LAST} --output jsonl --shutdown-timeout 3`,
-  env `STRATA_API_KEY=${API_TOKEN}`, `set_visible_devices` off (Strata numbers cards like
-  nvidia-smi, and `--gpu` takes host numbers), startup timeout 960 s, health path `/health`,
+  `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl --shutdown-timeout 3` (`strata serve` has no `--gpu` flag; the card list is in the config file),
+  env `STRATA_API_KEY=${API_TOKEN}`, `set_visible_devices` **on in `args` mode** (§3.3:
+  the agent injects no `CUDA_VISIBLE_DEVICES`, which would renumber the cards from 0; the
+  config's host-numbered `gpu` list is the enforcement, and its
+  `${HOST_GPU_IDS_MAIN_LAST}` satisfies the args-mode placeholder rule — so a Strata spec
+  saves only once it has a GPU row and the imported `strata.json`), startup timeout 960 s, health path `/health`,
   flavors `openai` and `anthropic`, `responses_mode` and `messages_mode` `passthrough`,
   `process_tree` `job` ([§3.9](#39-the-windows-process-tree-process_tree)). The run config
   itself is the config file `strata.json` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)),
   imported from `strata launch` ([§11.5](#115-what-each-remaining-tab-shows)). `--shutdown-timeout 3`
   because the agent drains in-flight requests itself before it signals (§6), so Strata's own
-  second drain is redundant. **Which binary the template documents is verified on hardware:
-  pending** — if `strata.cmd` misbehaves under the agent (cmd.exe's "Terminate batch job" on
-  Ctrl-Break), the fallback is the bundled `…\terminal\current\python\python.exe` with
-  `…\terminal\current\strata.py` as the first argument and `PYTHONUTF8=1`,
-  `PYTHONNOUSERSITE=1` in env.
+  second drain is redundant. **Which binary the template documents:** `strata.cmd` starts correctly in job mode and stops cleanly through Ctrl-Break (both verified on hardware, 2026-11-23, see §3.9); cmd.exe's "Terminate batch job" prompt only adds a cosmetic log line and a root exit code of -1, so the bundled `python.exe` fallback is not needed.
 - **GPU roles are the row order.** The first GPU row is main, the rest helpers;
-  `${HOST_GPU_IDS_MAIN_LAST}` moves the main card last for Strata's stage order, and the
-  imported config's `"gpu_order": "as_given"` stops Strata reordering them. A `gpu` or
-  `--gpu` set by hand wins over `gpu_roles` upstream, so the file carries neither.
+  the imported config's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` moves the main card last for Strata's stage order (a comma-separated string, valid JSON before expansion; Strata reads `"0,1,2"` like `[0,1,2]`), and `"gpu_order": "as_given"` stops Strata reordering them. A `gpu` set by hand wins over `gpu_roles` upstream, so the file carries no `gpu_roles`.
 - **The startup timeout is 960 s**, `max(engine_ready_s, 900) + 60` for Strata's default
   engine wait of 900 s, so the agent never gives up before Strata does. `engine_ready_s`
   is that ceiling, not a load time (a real load took one to two minutes). Against the
@@ -1648,9 +1656,8 @@ Shortened, with the paths redacted, the stored content looks like this:
 ```
 
 `model_name` is `${MODEL}`, so the id Strata lists can never drift from the mapping's
-upstream model, and the card order comes from the command line
-(`--gpu ${HOST_GPU_IDS_MAIN_LAST}`), not from the file: the import drops `gpu`,
-`gpu_roles`, `gpu_cards` and `gpu_order` and sets `"gpu_order": "as_given"`. The key is
+upstream model, and the card order is the file's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` (`strata serve` has no `--gpu` flag): the import drops the source's `gpu`,
+`gpu_roles`, `gpu_cards` and `gpu_order`, writes that `gpu` (none when the source named no cards) and sets `"gpu_order": "as_given"`. The key is
 never in the file; it travels as `STRATA_API_KEY=${API_TOKEN}` in `env`, and every key named
 `api_key` (any case, at any depth, e.g. inside `vision`, whatever its value) in the pasted
 JSON is dropped with a notice. For this file the import proposes a
@@ -2973,10 +2980,7 @@ Strata's `strata.cmd` runs `python.exe`, whose engine grandchild holds nearly al
 the model's VRAM and RAM, so a stop left the engine running and the measurement
 charged the managed root almost nothing. A spec can therefore opt into a **job
 object** ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).
-**Verified on hardware: pending** — everything below is compiled and vetted for
-Windows (`GOOS=windows go vet`, `golangci-lint`) and covered by Windows-tagged tests
-(`proc_job_windows_test.go`) that CI cannot run (§13); the owner's Windows acceptance
-confirms or corrects it.
+**Verified on hardware (2026-11-23):** the job-mode start (suspended start, job, resume) works with `strata.cmd` as the binary; `${HOST_GPU_IDS_MAIN_LAST}` resolved to `0,1,2` for GPUs declared `2,0,1` and Strata logged a layer split across GPUs `[0, 1, 2]` (main card last); ready in 38 s; the live log shows the server's output including its JSONL `starting`/`ready` events; the agent's authenticated metrics and context probes both succeeded (context 262144); per-GPU VRAM is attributed over the whole tree (the engine is a grandchild, so per-root attribution would read about 0); a chat completion through the gateway answered. **Stop verified on hardware (2026-11-23, agent 0.21.0, 3 GPUs):** the portal's stop delivered Ctrl-Break and Strata logged `stopping` (`reason: "sigbreak"`), `draining` (0 pending, 3 s deadline) and `stopped` (`drained: true`, `cancelled_requests: 0`, `exit_code: 0`) about 2.7 s after the stop, inside the 5 s kill grace; cmd.exe then printed its localized "Terminate batch job (Y/N)?" prompt to the live log and the root exited about 0.1 s later with exit code -1, and the spec state became `stopped` (intentional stop, restarts 0). The prompt does not block the stop; its only side effects are a cosmetic log line and a root exit code of -1 instead of 0. VRAM was freed on all three GPUs within about 2 s (host totals 24.5/32.9/33.3 GB to 0.3/0.0/0.0 GB) and host RAM in use fell from 22.1 to 10.6 GB, so the engine and vision processes ended; leftover non-GPU processes (cmd.exe, python.exe) were not inspected in Task Manager. `strata.cmd` stays the documented binary and the `python.exe` fallback is not needed. **Known RAM under-count:** the spec's measured RAM (private working set summed over the job) read 7.7 GB while host RAM in use fell by about 11.5 GB at stop; pages that are not private working set (locked or mapped model pages, the file cache, driver allocations) are not counted. **Still pending:** the RAM figure against Task Manager beyond the above, Claude Code and Codex round trips, the Windows-tagged unit tests and the console-less (service) agent path. Everything else below is compiled and vetted for Windows (`GOOS=windows go vet`, `golangci-lint`); the Windows-tagged tests (`proc_job_windows_test.go`) are ones CI cannot run (§13).
 
 **The field.** `process_tree` is `direct` (the default, today's behaviour) or `job`
 (migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-113-migrations)).

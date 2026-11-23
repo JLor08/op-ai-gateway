@@ -16,15 +16,14 @@ describe('strataSpecTemplate', () => {
         '127.0.0.1',
         '--port',
         '${PORT}',
-        '--gpu',
-        '${HOST_GPU_IDS_MAIN_LAST}',
         '--output',
         'jsonl',
         '--shutdown-timeout',
         '3',
       ],
       env: { STRATA_API_KEY: '${API_TOKEN}' },
-      setVisibleDevices: false,
+      setVisibleDevices: true,
+      visibleDevicesMode: 'args',
       startupTimeoutSeconds: 960,
       healthPath: '/health',
       flavors: ['openai', 'anthropic'],
@@ -40,5 +39,8 @@ describe('strataSpecTemplate', () => {
     first.env.EXTRA = 'x';
     expect(strataSpecTemplate().args).not.toContain('--lazy');
     expect(strataSpecTemplate().env).toEqual({ STRATA_API_KEY: '${API_TOKEN}' });
+  });
+  it('passes no --gpu flag: strata serve has none, the card list is in the config file', () => {
+    expect(strataSpecTemplate().args).not.toContain('--gpu');
   });
 });
