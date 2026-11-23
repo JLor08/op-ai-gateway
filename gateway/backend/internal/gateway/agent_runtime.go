@@ -446,6 +446,9 @@ type agentRuntimeReportSpec struct {
 	// a native spec like the DTO's. It carries a mode and a distro name, no
 	// secret, so a file-mode agent's report keeps it.
 	Execution *portal.AgentExecutionDTO `json:"execution,omitempty"`
+	// ProcessTree is "job" for a Windows Job Object spec
+	// (AgentRuntimeSpecDTO's), omitted for direct like the DTO's. Not a secret.
+	ProcessTree string `json:"process_tree,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

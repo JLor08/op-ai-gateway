@@ -203,6 +203,15 @@ var (
 	// cluster head: the cluster plumbing addresses members by host network
 	// endpoints a distro's NAT does not expose. HTTP 400.
 	ErrRuntimeSpecWSLClusterUnsupported = errors.New("runtime_spec.wsl_cluster_unsupported")
+	// ErrRuntimeSpecProcessTreeInvalid rejects a process_tree outside
+	// "direct"/"job" ("" stores direct). HTTP 400.
+	ErrRuntimeSpecProcessTreeInvalid = errors.New("runtime_spec.process_tree_invalid")
+	// ErrRuntimeSpecProcessTreeUnsupported refuses an operator's job write when
+	// the gateway knows the spec's agent cannot honour it: its reported OS is
+	// not Windows, or it declared its features without
+	// AgentFeatureRuntimeProcessTreeJob. Silently running such a spec direct
+	// would leave the engine's descendants alive on stop. HTTP 400.
+	ErrRuntimeSpecProcessTreeUnsupported = errors.New("runtime_spec.process_tree_unsupported")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -632,6 +641,10 @@ type RuntimeSpecDTO struct {
 	// distro a wsl spec runs in, "" for native.
 	ExecutionMode string `json:"execution_mode"`
 	WSLDistro     string `json:"wsl_distro"`
+	// ProcessTree is how the agent supervises the spec's process tree on a
+	// Windows host: "direct" or "job"; never "" on the wire (a stored "" reads
+	// as "direct"). Inert on other OSes.
+	ProcessTree string `json:"process_tree"`
 	// ClusterEnabled makes the spec a llama.cpp RPC cluster head; MemberMode,
 	// ClusterNetwork, RPCTransport, LANExposureAck and ClusterMembers are its
 	// cluster configuration (see PutRuntimeSpecRequest). MemberMode is never
@@ -781,6 +794,10 @@ type PutRuntimeSpecRequest struct {
 	// required for "wsl" and stored "" for native whatever the request carried.
 	ExecutionMode string `json:"execution_mode"`
 	WSLDistro     string `json:"wsl_distro"`
+	// ProcessTree: see RuntimeSpecDTO; "" stores "direct". An operator's "job"
+	// is refused for an agent known not to honour it
+	// (ErrRuntimeSpecProcessTreeUnsupported).
+	ProcessTree string `json:"process_tree"`
 	// ClusterEnabled turns the spec into a llama.cpp RPC cluster head with the
 	// members in ClusterMembers, in that order (the --rpc order, and so the
 	// order of the head's RPC<n> devices). MemberMode is "automatic" (""
@@ -846,6 +863,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			Role:                     role,
 			DeviceBackend:            deviceBackendAuto,
 			ExecutionMode:            string(routing.ExecutionModeNative),
+			ProcessTree:              string(routing.ProcessTreeDirect),
 			MemberMode:               memberModeAutomatic,
 			ClusterMembers:           []ClusterMemberDTO{},
 			ClusterWarnings:          []string{},
@@ -1162,7 +1180,91 @@ func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app rou
 		return clusterPlan{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
 			ErrClusterHeadBinaryVersionUnknown, fields.binary)
 	}
+	// The process-tree check is the newest refusal and so runs last.
+	if fields.processTree == routing.ProcessTreeJob {
+		if err := s.checkProcessTreeSupported(ctx, app.ServerID); err != nil {
+			return clusterPlan{}, err
+		}
+	}
 	return plan, nil
+}
+
+// processTreeSupport is what the gateway knows about whether a server's agent
+// honours process_tree "job".
+type processTreeSupport int
+
+const (
+	// processTreeSupportUnknown: the agent has not reported its OS, or has
+	// not declared its features since this gateway started, and nothing it
+	// did report rules job out.
+	processTreeSupportUnknown processTreeSupport = iota
+	// processTreeSupported: a Windows agent that declares
+	// AgentFeatureRuntimeProcessTreeJob.
+	processTreeSupported
+	// processTreeUnsupported: the agent reported a non-Windows OS, or
+	// declared its features without the flag.
+	processTreeUnsupported
+)
+
+// agentProcessTreeSupport reads serverID's reported OS (the stored telemetry
+// row, which survives a gateway restart) and its declared features (the
+// in-memory registry, which does not). Either fact alone can rule job out:
+// the flag is declared on every OS, so a non-Windows OS refuses whatever the
+// features say, and a declared set without the flag refuses whatever the OS
+// is. Job is supported only when both are known and both say yes. A nil
+// feature reader counts as declaring the flag (agentRunsWSL's reading), so a
+// reader-less service is decided by the OS alone.
+func (s *Service) agentProcessTreeSupport(ctx context.Context, serverID string) (processTreeSupport, error) {
+	telemetry, reported, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil {
+		return processTreeSupportUnknown, err
+	}
+	reportedOS := ""
+	if reported {
+		reportedOS = strings.ToLower(strings.TrimSpace(telemetry.OS))
+	}
+	if reportedOS != "" && reportedOS != "windows" {
+		return processTreeUnsupported, nil
+	}
+	featuresKnown, hasFlag := true, true
+	if s.agentFeatures != nil {
+		featuresKnown = s.agentFeatures.Known(serverID)
+		hasFlag = s.agentFeatures.Has(serverID, AgentFeatureRuntimeProcessTreeJob)
+	}
+	if featuresKnown && !hasFlag {
+		return processTreeUnsupported, nil
+	}
+	if reportedOS == "" || !featuresKnown {
+		return processTreeSupportUnknown, nil
+	}
+	return processTreeSupported, nil
+}
+
+// checkProcessTreeSupported refuses an operator's job write for an agent the
+// gateway knows cannot honour it (ErrRuntimeSpecProcessTreeUnsupported): an
+// older agent ignores the field and runs the spec direct, which leaves the
+// engine's descendants alive on stop. An agent that cannot be judged yet does
+// not block the save; RuntimeWarnings reports it as
+// runtimeProcessTreeAgentUnknownWarning until it has reported. Only the
+// operator path checks: a benchmark writer re-saves a stored spec as it was.
+func (s *Service) checkProcessTreeSupported(ctx context.Context, serverID string) error {
+	support, err := s.agentProcessTreeSupport(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if support == processTreeUnsupported {
+		return ErrRuntimeSpecProcessTreeUnsupported
+	}
+	return nil
+}
+
+// normalizeProcessTree reads a stored "" (a row never written with the
+// column) as direct.
+func normalizeProcessTree(p routing.ProcessTree) routing.ProcessTree {
+	if p == "" {
+		return routing.ProcessTreeDirect
+	}
+	return p
 }
 
 // storeRuntimeSpec stores spec, its GPU rows and, when plan writes them, its
@@ -1234,6 +1336,7 @@ type runtimeSpecFields struct {
 	rpcTransport       string
 	executionMode      routing.ExecutionMode
 	wslDistro          string
+	processTree        routing.ProcessTree
 }
 
 // validateRuntimeSpecRequest runs every request validation of a runtime-spec
@@ -1399,6 +1502,11 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	// that was already invalid for a shipped reason.
 	if f.executionMode, f.wslDistro, err = validateRuntimeSpecExecution(req); err != nil {
 		return runtimeSpecFields{}, err
+	}
+	// process_tree is newer still, so it runs after the execution mode.
+	var ok bool
+	if f.processTree, ok = routing.NormalizeProcessTree(req.ProcessTree); !ok {
+		return runtimeSpecFields{}, ErrRuntimeSpecProcessTreeInvalid
 	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
 	if f.healthPath == "" {
@@ -1741,6 +1849,7 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		ContextProbePath:            f.contextProbePath,
 		ExecutionMode:               f.executionMode,
 		WSLDistro:                   f.wslDistro,
+		ProcessTree:                 f.processTree,
 		CreatedAt:                   now,
 		UpdatedAt:                   now,
 	}
@@ -2329,6 +2438,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		DeviceBackend:               normalizeDeviceBackend(spec.DeviceBackend),
 		ExecutionMode:               string(normalizeExecutionMode(spec.ExecutionMode)),
 		WSLDistro:                   spec.WSLDistro,
+		ProcessTree:                 string(normalizeProcessTree(spec.ProcessTree)),
 		ClusterEnabled:              spec.ClusterEnabled,
 		MemberMode:                  normalizeMemberMode(spec.MemberMode),
 		ClusterNetwork:              spec.ClusterNetwork,
@@ -2726,6 +2836,14 @@ const runtimeTextOnVllmSRWarning = "api_flavors_text_on_vllm_sr"
 // Advisory, like the vllm_sr warning.
 const runtimeNoAudioOnSGLangOmniWarning = "api_flavors_no_audio_on_sglang_omni"
 
+// runtimeProcessTreeAgentUnknownWarning: a runtime spec of the application has
+// process_tree "job", and the server's agent has not yet reported enough
+// (its OS, or its declared features since this gateway started) to tell
+// whether it honours job mode. The save was allowed (the refusal needs
+// evidence); an agent that turns out not to honour it would run the spec
+// direct.
+const runtimeProcessTreeAgentUnknownWarning = "process_tree_agent_unknown"
+
 // RuntimeWarnings is a pure derivation (no store write) of operator-facing
 // warnings about appID's current runtime configuration. authorizeApplication
 // gates it (404-no-leak). Always a non-nil slice, even when empty.
@@ -2770,7 +2888,30 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 	if anySGLangOmniSpecLacksAudioFlavor(app, specs) {
 		warnings = append(warnings, runtimeNoAudioOnSGLangOmniWarning)
 	}
+	processTreeUnknown, err := s.anyJobSpecOnUnknownAgent(ctx, server.ID, specs)
+	if err != nil {
+		return nil, err
+	}
+	if processTreeUnknown {
+		warnings = append(warnings, runtimeProcessTreeAgentUnknownWarning)
+	}
 	return warnings, nil
+}
+
+// anyJobSpecOnUnknownAgent backs runtimeProcessTreeAgentUnknownWarning: it
+// reports whether any of specs has process_tree "job" while serverID's agent
+// cannot yet be judged (agentProcessTreeSupport). Like the OS-mismatch
+// advisory it does not skip disabled specs, and it reads nothing when no spec
+// uses job.
+func (s *Service) anyJobSpecOnUnknownAgent(ctx context.Context, serverID string, specs []routing.RuntimeSpec) (bool, error) {
+	if !slices.ContainsFunc(specs, func(spec routing.RuntimeSpec) bool { return spec.ProcessTree == routing.ProcessTreeJob }) {
+		return false, nil
+	}
+	support, err := s.agentProcessTreeSupport(ctx, serverID)
+	if err != nil {
+		return false, err
+	}
+	return support == processTreeSupportUnknown, nil
 }
 
 // anySpecBinaryContradictsReportedOS backs runtimeBinaryPathOSMismatchWarning:
@@ -3287,6 +3428,11 @@ type AgentRuntimeSpecDTO struct {
 	// only to an agent that declares runtime_exec_wsl (an older agent would
 	// ignore the unknown block and run the Linux binary path natively).
 	Execution *AgentExecutionDTO `json:"execution,omitempty"`
+	// ProcessTree is "job" for a spec the agent supervises as a Windows Job
+	// Object. It is "" -- and the key absent -- for a direct spec, so a direct
+	// spec's document (ETag included) is the one it was before the field
+	// existed; the agent reads an absent key as direct.
+	ProcessTree string `json:"process_tree,omitempty"`
 }
 
 // AgentExecutionDTO is the execution block of a pushed spec: the mode, and the
@@ -3805,6 +3951,9 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 			WSL:  &AgentWSLExecutionDTO{Distro: spec.WSLDistro},
 		}
 	}
+	if spec.ProcessTree == routing.ProcessTreeJob {
+		dto.ProcessTree = string(routing.ProcessTreeJob)
+	}
 	return dto, nil
 }
 
@@ -3901,6 +4050,14 @@ const AgentFeatureRuntimeInstances = "runtime_instances"
 // constant as this one so the document built here and the declaration the
 // ingest records cannot drift apart.
 const AgentFeatureRuntimeExecWSL = "runtime_exec_wsl"
+
+// AgentFeatureRuntimeProcessTreeJob is the feature an agent declares when it
+// honours process_tree "job" (a Windows Job Object around the child's tree).
+// Agent-only: the gateway never declares it. The agent declares it on every
+// OS, so the operator-write check (checkProcessTreeSupported) reads the
+// agent's reported OS as well. The module's one spelling of the name; the
+// gateway package defines its own constant as this one.
+const AgentFeatureRuntimeProcessTreeJob = "runtime_process_tree_job"
 
 // agentRunsWSL reports whether serverID's agent declares
 // AgentFeatureRuntimeExecWSL, and whether this gateway knows its declaration.

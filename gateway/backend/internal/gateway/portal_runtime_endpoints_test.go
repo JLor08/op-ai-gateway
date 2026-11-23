@@ -210,6 +210,53 @@ func TestHandlePortalMappingRuntimeSpecPutStrataTypeAccepted(t *testing.T) {
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutProcessTreeErrors pins the WIRE contract
+// of the two process_tree refusals: a value outside direct/job answers 400
+// runtime_spec.process_tree_invalid, and job for an agent whose reported OS is
+// not Windows answers 400 runtime_spec.process_tree_unsupported. direct on the
+// same agent is saved and echoed.
+func TestHandlePortalMappingRuntimeSpecPutProcessTreeErrors(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	if err := srv.Routes.UpsertTelemetry(context.Background(), routing.ServerTelemetry{
+		ServerID: "srv_runtime_spec", ReportedAt: now, AgentVersion: "0.21.0", OS: "linux", Arch: "amd64",
+		ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	cases := []struct {
+		value      string
+		wantStatus int
+		wantCode   string
+	}{
+		{"bogus", http.StatusBadRequest, "runtime_spec.process_tree_invalid"},
+		{"job", http.StatusBadRequest, "runtime_spec.process_tree_unsupported"},
+		{"direct", http.StatusOK, ""},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		body := `{"binary":"/usr/local/bin/llama-server","process_tree":"` + tc.value + `"}`
+		srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+		if rec.Code != tc.wantStatus {
+			t.Fatalf("%s: status = %d, want %d, body = %s", tc.value, rec.Code, tc.wantStatus, rec.Body.String())
+		}
+		if tc.wantCode != "" {
+			if !strings.Contains(rec.Body.String(), `"`+tc.wantCode+`"`) {
+				t.Fatalf("%s: body = %s, want code %s", tc.value, rec.Body.String(), tc.wantCode)
+			}
+			continue
+		}
+		var saved portal.RuntimeSpecDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &saved); err != nil {
+			t.Fatalf("unmarshal %s: %v", rec.Body.String(), err)
+		}
+		if saved.ProcessTree != tc.value {
+			t.Fatalf("%s: echoed process_tree %q", tc.value, saved.ProcessTree)
+		}
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400 pins the WIRE
 // contract of portal.ErrRuntimeSpecConfigFilesInvalid (#257): 400 with its own
 // code, a message that names the offending file and rule, and no echo of the

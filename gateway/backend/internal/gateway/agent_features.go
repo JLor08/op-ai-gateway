@@ -264,7 +264,7 @@ const RuntimeGPUMainLastFeature = "runtime_gpu_main_last"
 // not on gatewayAgentFeatures; read fail-closed. The agent names the identical
 // string in server-agent/internal/agent/features.go; TestStrataFeatureNames pins
 // this side.
-const RuntimeProcessTreeJobFeature = "runtime_process_tree_job"
+const RuntimeProcessTreeJobFeature = portal.AgentFeatureRuntimeProcessTreeJob
 
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can

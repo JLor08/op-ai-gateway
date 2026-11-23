@@ -141,6 +141,12 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 			routing.ExecutionModeWSL, routing.ExecutionModeNative, routing.ExecutionModeWSL,
 		}
 		wslDistros := [runtimeSpecParityRows]string{"Ubuntu-24.04", "Debian-12", "Alpine.3_19"}
+		// process_tree has two values only: the rows alternate, and two of the
+		// three carry job (not the 'direct' default), so a column the writer or
+		// a reader omits reads back wrong on those rows.
+		processTrees := [runtimeSpecParityRows]routing.ProcessTree{
+			routing.ProcessTreeJob, routing.ProcessTreeDirect, routing.ProcessTreeJob,
+		}
 
 		want := make([]routing.RuntimeSpec, 0, runtimeSpecParityRows)
 		for i := 0; i < runtimeSpecParityRows; i++ {
@@ -192,6 +198,7 @@ func TestConformanceRuntimeSpecReadersAgreeOnEveryColumn(t *testing.T) {
 				DeviceBackend:               deviceBackends[i],
 				ExecutionMode:               executionModes[i],
 				WSLDistro:                   wslDistros[i],
+				ProcessTree:                 processTrees[i],
 				APIFlavors:                  apiFlavors[i],
 				ResponsesMode:               responsesModes[i],
 				MessagesMode:                messagesModes[i],
@@ -292,7 +299,7 @@ func TestAgentRuntimeSpecsSchemaColumnsAllCovered(t *testing.T) {
 				"admin_state", "admission_wait_timeout_seconds", "api_flavors", "api_token",
 				"api_token_header", "api_token_header_source", "decisions_mode", "systemone_mode", "api_token_mode", "args", "binary_path",
 				"cluster_network", "config_files", "context_probe_path", "created_at", "env", "health_path", "health_timeout_seconds",
-				"device_backend", "execution_mode", "wsl_distro", "id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
+				"device_backend", "execution_mode", "wsl_distro", "process_tree", "id", "idle_timeout_seconds", "instance_parallelism", "listen_port", "mapping_id",
 				"max_instances", "member_mode", "messages_mode", "metrics_path", "min_instances", "ram_estimate_mb",
 				"ram_measured_mb", "responses_mode", "rpc_transport", "startup_measured_ms", "startup_timeout_seconds",
 				"type", "updated_at", "visible_devices_mode", "work_dir",

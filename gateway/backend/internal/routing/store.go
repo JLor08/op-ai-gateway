@@ -3135,6 +3135,11 @@ type RuntimeSpec struct {
 	// WSLDistro is the WSL distro a "wsl" spec runs in; always "" for native
 	// (migration 109).
 	WSLDistro string
+	// ProcessTree is how the agent supervises a native spec's process tree on
+	// Windows: "direct" (the default and every pre-feature row) or "job" (a
+	// Windows Job Object; migration 113). "" reads as direct to in-memory
+	// callers that never set it.
+	ProcessTree ProcessTree
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;

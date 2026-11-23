@@ -145,6 +145,7 @@ var migrations = []migration{
 	{version: 110, name: "vendor_account_share_usage", up: migration110Up},
 	{version: 111, name: "token_claude_code_usage_display", up: migration111Up},
 	{version: 112, name: "token_usage_limit_switches", up: migration112Up},
+	{version: 113, name: "runtime_spec_process_tree", up: migration113Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4861,4 +4862,14 @@ func migration112Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		return fmt.Errorf("backfill api_tokens.send_usage_limits: %w", err)
 	}
 	return nil
+}
+
+// migration113Up adds process_tree to agent_runtime_specs: how the agent
+// supervises a native spec's process tree on a Windows host ("direct" or
+// "job", a Windows Job Object). Operator-owned. The default makes every
+// existing row a direct spec, so the upgrade changes no behaviour and a direct
+// spec's pushed document stays byte-identical. addColumnIfMissing keeps the
+// step replayable on both dialects.
+func migration113Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "process_tree text not null default 'direct'")
 }
