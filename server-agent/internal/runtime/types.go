@@ -203,6 +203,32 @@ type Spec struct {
 	// spec whose block it cannot run is dropped at parse time
 	// (invalidExecutionReason).
 	Execution *Execution `json:"execution,omitempty"`
+	// ProcessTree says how the agent holds a native process's tree (#424):
+	// ProcessTreeDirect ("" reads as direct, every document an older gateway
+	// sends) is the process group the agent has always used; ProcessTreeJob
+	// runs the child in a kill-on-close Windows job object, stops it with
+	// Ctrl-Break and kills the whole job after the kill grace. Job mode is
+	// honoured only for a native spec on Windows (startNativeProc); a wsl spec
+	// and every other platform launch exactly as direct. It decides how the
+	// child is created, so it is launch-affecting (sameLaunchShape). Any other
+	// value drops the spec at parse time (invalidProcessTreeReason).
+	ProcessTree string `json:"process_tree,omitempty"`
+}
+
+// ProcessTreeDirect and ProcessTreeJob are the ProcessTree values this agent
+// knows.
+const (
+	ProcessTreeDirect = "direct"
+	ProcessTreeJob    = "job"
+)
+
+// ProcessTreeMode returns the spec's process-tree mode with the empty spelling
+// read as ProcessTreeDirect.
+func (s Spec) ProcessTreeMode() string {
+	if s.ProcessTree == "" {
+		return ProcessTreeDirect
+	}
+	return s.ProcessTree
 }
 
 // Execution is a spec's execution-environment block. Mode is
@@ -655,6 +681,11 @@ func withoutInvalidKinds(specs []Spec) ([]Spec, []string) {
 			dropped = append(dropped, spec.ID)
 			continue
 		}
+		if reason := invalidProcessTreeReason(spec); reason != "" {
+			slog.Warn("runtime: ignoring spec with an invalid process_tree", "spec", spec.ID, "process_tree", spec.ProcessTree, "reason", reason)
+			dropped = append(dropped, spec.ID)
+			continue
+		}
 		kept = append(kept, spec)
 	}
 	if len(dropped) == 0 {
@@ -689,6 +720,21 @@ func invalidExecutionReason(spec Spec) string {
 		return ""
 	default:
 		return "unknown execution mode"
+	}
+}
+
+// invalidProcessTreeReason names why spec's process_tree is unusable, or ""
+// when it is one this agent knows. An unknown mode is dropped like an unknown
+// execution mode: falling back to direct would launch a spec the gateway meant
+// to be held some other way. A wsl spec may carry job -- the gateway accepts it
+// and it is inert there, the scope already holds the tree -- so it is not
+// refused here.
+func invalidProcessTreeReason(spec Spec) string {
+	switch spec.ProcessTree {
+	case "", ProcessTreeDirect, ProcessTreeJob:
+		return ""
+	default:
+		return "unknown process_tree (want direct or job)"
 	}
 }
 

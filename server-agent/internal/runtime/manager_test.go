@@ -4135,7 +4135,8 @@ func TestSameLaunchShape(t *testing.T) {
 		"SetVisibleDevices":  func(s *Spec) { s.SetVisibleDevices = false },
 		"VisibleDevicesMode": func(s *Spec) { s.VisibleDevicesMode = "args" },
 		"APIToken":           func(s *Spec) { s.APIToken = "tok2" },
-		"UpstreamModel":      func(s *Spec) { s.UpstreamModel = "um2" }, // feeds ${MODEL}
+		"UpstreamModel":      func(s *Spec) { s.UpstreamModel = "um2" },        // feeds ${MODEL}
+		"ProcessTree":        func(s *Spec) { s.ProcessTree = ProcessTreeJob }, // how the child is created on Windows (#424)
 	}
 	for name, mut := range launch {
 		b := base

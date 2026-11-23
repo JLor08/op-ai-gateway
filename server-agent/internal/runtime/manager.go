@@ -2333,6 +2333,13 @@ func sameLaunchShape(a, b Spec) bool {
 		if s.Execution != nil && (s.Execution.Mode == ExecutionModeNative || s.Execution.Mode == "") {
 			s.Execution = nil
 		}
+		// ProcessTree stays in the comparison too (#424): job mode decides how
+		// the child is created on Windows (suspended, in a job, with a console
+		// of its own), so a direct<->job edit relaunches. Only the spelling is
+		// normalised, like Execution's: absent and "direct" are one launch.
+		if s.ProcessTree == ProcessTreeDirect {
+			s.ProcessTree = ""
+		}
 		// Kind, DeviceBackend, Cluster and RPC stay in the comparison: they
 		// decide what is exec'd and how (a member's bind and port, a head's
 		// ordered endpoint list). The one exception is the connection
@@ -4822,7 +4829,18 @@ func (o *owner) startProcess(st *specState) {
 		vmBaseline, baselineOK = o.readVMVRAM()
 	}
 
-	if err := cmd.Start(); err != nil {
+	// A native spec starts through startNativeProc, which also picks the
+	// control that signals it: the process group everywhere, a kill-on-close
+	// job object for process_tree "job" on Windows (#424). A wsl spec's wsl.exe
+	// is started as before; its control is the scope below.
+	var nativeCtl procControl
+	var startErr error
+	if spec.IsWSL() {
+		startErr = cmd.Start()
+	} else {
+		nativeCtl, startErr = startNativeProc(cmd, spec)
+	}
+	if err := startErr; err != nil {
 		// The command is retained even though nothing ran: a spec whose exec
 		// fails prints nothing at all, so this is the only thing an operator
 		// opening the log view can be shown -- and "the binary/work_dir it
@@ -4865,7 +4883,7 @@ func (o *owner) startProcess(st *specState) {
 			specID: spec.ID,
 		}
 	} else {
-		proc.ctl = nativeControl{cmd: cmd}
+		proc.ctl = nativeCtl
 	}
 	if wslUnit != "" {
 		o.beginWSLVRAM(proc, spec, vramWindow, vmBaseline, baselineOK)
@@ -4904,6 +4922,14 @@ func (o *owner) startProcess(st *specState) {
 func (o *owner) waitForExit(proc *runningProc) {
 	defer o.m.wg.Done()
 	err := proc.cmd.Wait()
+	// A control that holds an OS resource for its generation's lifetime (the
+	// Windows job object, #424) gives it back now that the process is reaped;
+	// for a job that also ends any descendant still left in it (kill-on-close).
+	if c, ok := proc.control().(procCloser); ok {
+		if cerr := c.close(); cerr != nil {
+			slog.Debug("runtime: releasing the process control failed", "spec", proc.specID, "pid", proc.pid, "error", cerr)
+		}
+	}
 	close(proc.exited)
 	o.m.postCmd(cmdChildExited{proc: proc, exitErr: err})
 }

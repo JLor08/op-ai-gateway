@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -29,6 +30,15 @@ import (
 type procControl interface {
 	terminate() error
 	kill() error
+}
+
+// procCloser is a procControl that holds an OS resource for its generation's
+// lifetime -- the Windows job object of a process_tree "job" spec (#424).
+// waitForExit calls close once the process is reaped; close must be safe to
+// call more than once and concurrently with terminate and kill, which then do
+// nothing.
+type procCloser interface {
+	close() error
 }
 
 // nativeControl signals the process group the agent exec'd itself, on the
@@ -475,4 +485,26 @@ func wslOrphanUnits(listing []byte, nonce string) []string {
 		out = append(out, unit)
 	}
 	return out
+}
+
+// errCallTimedOut is callWithin's error for a call that did not return in time.
+var errCallTimedOut = errors.New("runtime: call did not return in time")
+
+// callWithin runs f and waits for it at most d: f's own error when it returns
+// in time, errCallTimedOut otherwise. The Windows job control's Ctrl-Break
+// delivery (#424) runs under it on the owner goroutine, so a console call that
+// hangs costs the owner d and reads as a failed delivery -- terminate then falls
+// through to the kill -- instead of stalling every spec the owner serves. f
+// keeps running on its own goroutine after a timeout; it must end by itself.
+func callWithin(d time.Duration, f func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-t.C:
+		return fmt.Errorf("%w (%v)", errCallTimedOut, d)
+	}
 }
