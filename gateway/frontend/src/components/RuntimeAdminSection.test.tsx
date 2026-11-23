@@ -13806,6 +13806,14 @@ describe('RuntimeAdminSection process_tree control (#424)', () => {
     expect(screen.queryByText('process_tree_agent_unknown')).not.toBeInTheDocument();
   });
 
+  it('labels the process_tree_agent_unsupported warning', async () => {
+    renderSection({ warnings: ['process_tree_agent_unsupported'] });
+    expect(
+      await screen.findByText(t.runtimeProcessTreeAgentUnsupportedWarning),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('process_tree_agent_unsupported')).not.toBeInTheDocument();
+  });
+
   describe('${HOST_GPU_IDS_MAIN_LAST} agent warning', () => {
     const oldAgent = () =>
       makeReport({ agent_version: '0.20.0', agent_features: ['runtime_manager'] });

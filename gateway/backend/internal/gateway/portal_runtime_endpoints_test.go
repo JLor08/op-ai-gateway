@@ -257,6 +257,48 @@ func TestHandlePortalMappingRuntimeSpecPutProcessTreeErrors(t *testing.T) {
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutStoredJobOnUnsupportedAgent pins the
+// WIRE side of the refusal's scope: a spec stored as job before its agent
+// reported stays writable once the agent reports a non-Windows OS -- the
+// portal's override buttons re-send the whole spec with a new admin_state --
+// and the warnings endpoint then lists process_tree_agent_unsupported. A
+// direct spec on that agent is still refused the move into job (400).
+func TestHandlePortalMappingRuntimeSpecPutStoredJobOnUnsupportedAgent(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	put := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+		return rec
+	}
+	if rec := put(`{"binary":"/usr/local/bin/llama-server","process_tree":"job"}`); rec.Code != http.StatusOK {
+		t.Fatalf("job before the agent reported: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	if err := srv.Routes.UpsertTelemetry(context.Background(), routing.ServerTelemetry{
+		ServerID: "srv_runtime_spec", ReportedAt: now, AgentVersion: "0.21.0", OS: "linux", Arch: "amd64",
+		ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("UpsertTelemetry: %v", err)
+	}
+	if rec := put(`{"binary":"/usr/local/bin/llama-server","process_tree":"job","admin_state":"force_stopped"}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin_state re-save of a stored job spec: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodGet, "/api/portal/applications/app_runtime_spec/runtime/warnings", ""))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"process_tree_agent_unsupported"`) {
+		t.Fatalf("warnings: status = %d, body = %s, want process_tree_agent_unsupported", rec.Code, rec.Body.String())
+	}
+	if rec := put(`{"binary":"/usr/local/bin/llama-server","process_tree":"direct"}`); rec.Code != http.StatusOK {
+		t.Fatalf("job -> direct: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rec = put(`{"binary":"/usr/local/bin/llama-server","process_tree":"job"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"runtime_spec.process_tree_unsupported"`) {
+		t.Fatalf("direct -> job: status = %d, body = %s, want 400 runtime_spec.process_tree_unsupported", rec.Code, rec.Body.String())
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400 pins the WIRE
 // contract of portal.ErrRuntimeSpecConfigFilesInvalid (#257): 400 with its own
 // code, a message that names the offending file and rule, and no echo of the

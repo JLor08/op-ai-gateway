@@ -271,6 +271,7 @@ const runtimeWarningLabelByCode: Record<string, MessageKey> = {
   timeout_ms_below_startup_timeout: 'runtimeTimeoutWarning',
   binary_path_os_mismatch: 'runtimeBinaryPathOsMismatchWarning',
   process_tree_agent_unknown: 'runtimeProcessTreeAgentUnknownWarning',
+  process_tree_agent_unsupported: 'runtimeProcessTreeAgentUnsupportedWarning',
   api_flavors_not_on_application: 'runtimeFlavorNotOnApplicationWarning',
   api_flavors_text_on_stable_diffusion: 'runtimeTextOnStableDiffusionWarning',
   api_flavors_text_on_vllm_sr: 'runtimeTextOnVllmSrWarning',

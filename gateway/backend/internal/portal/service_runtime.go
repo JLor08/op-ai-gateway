@@ -206,8 +206,9 @@ var (
 	// ErrRuntimeSpecProcessTreeInvalid rejects a process_tree outside
 	// "direct"/"job" ("" stores direct). HTTP 400.
 	ErrRuntimeSpecProcessTreeInvalid = errors.New("runtime_spec.process_tree_invalid")
-	// ErrRuntimeSpecProcessTreeUnsupported refuses an operator's job write when
-	// the gateway knows the spec's agent cannot honour it: its reported OS is
+	// ErrRuntimeSpecProcessTreeUnsupported refuses an operator's write that
+	// moves a spec into job (a new spec, or one not stored as job) when the
+	// gateway knows the spec's agent cannot honour it: its reported OS is
 	// not Windows, or it declared its features without
 	// AgentFeatureRuntimeProcessTreeJob. Silently running such a spec direct
 	// would leave the engine's descendants alive on stop. HTTP 400.
@@ -794,9 +795,10 @@ type PutRuntimeSpecRequest struct {
 	// required for "wsl" and stored "" for native whatever the request carried.
 	ExecutionMode string `json:"execution_mode"`
 	WSLDistro     string `json:"wsl_distro"`
-	// ProcessTree: see RuntimeSpecDTO; "" stores "direct". An operator's "job"
-	// is refused for an agent known not to honour it
-	// (ErrRuntimeSpecProcessTreeUnsupported).
+	// ProcessTree: see RuntimeSpecDTO; "" stores "direct". An operator's write
+	// that moves a spec into "job" is refused for an agent known not to honour
+	// it (ErrRuntimeSpecProcessTreeUnsupported); a re-save of a spec already
+	// stored as "job" is not.
 	ProcessTree string `json:"process_tree"`
 	// ClusterEnabled turns the spec into a llama.cpp RPC cluster head with the
 	// members in ClusterMembers, in that order (the --rpc order, and so the
@@ -1180,8 +1182,13 @@ func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app rou
 		return clusterPlan{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
 			ErrClusterHeadBinaryVersionUnknown, fields.binary)
 	}
-	// The process-tree check is the newest refusal and so runs last.
-	if fields.processTree == routing.ProcessTreeJob {
+	// The process-tree check is the newest refusal and so runs last. It
+	// refuses only a write that moves the spec into job: a re-save of a spec
+	// stored as job (the portal's Stop/Start/Pin/Clear overrides re-send the
+	// whole spec) succeeds, and RuntimeWarnings reports the agent's lack of
+	// support (runtimeProcessTreeAgentUnsupportedWarning).
+	movesIntoJob := !prior.ok || normalizeProcessTree(prior.spec.ProcessTree) != routing.ProcessTreeJob
+	if fields.processTree == routing.ProcessTreeJob && movesIntoJob {
 		if err := s.checkProcessTreeSupported(ctx, app.ServerID); err != nil {
 			return clusterPlan{}, err
 		}
@@ -1240,12 +1247,15 @@ func (s *Service) agentProcessTreeSupport(ctx context.Context, serverID string) 
 	return processTreeSupported, nil
 }
 
-// checkProcessTreeSupported refuses an operator's job write for an agent the
+// checkProcessTreeSupported refuses an operator's write that moves a spec into
+// job (a new spec, or a stored one that was not job) for an agent the
 // gateway knows cannot honour it (ErrRuntimeSpecProcessTreeUnsupported): an
 // older agent ignores the field and runs the spec direct, which leaves the
-// engine's descendants alive on stop. An agent that cannot be judged yet does
-// not block the save; RuntimeWarnings reports it as
-// runtimeProcessTreeAgentUnknownWarning until it has reported. Only the
+// engine's descendants alive on stop. A re-save of a spec already stored as
+// job is not checked, so the operator's overrides keep working; RuntimeWarnings
+// reports such a spec as runtimeProcessTreeAgentUnsupportedWarning. An agent
+// that cannot be judged yet does not block the save; RuntimeWarnings reports
+// it as runtimeProcessTreeAgentUnknownWarning until it has reported. Only the
 // operator path checks: a benchmark writer re-saves a stored spec as it was.
 func (s *Service) checkProcessTreeSupported(ctx context.Context, serverID string) error {
 	support, err := s.agentProcessTreeSupport(ctx, serverID)
@@ -2844,6 +2854,16 @@ const runtimeNoAudioOnSGLangOmniWarning = "api_flavors_no_audio_on_sglang_omni"
 // direct.
 const runtimeProcessTreeAgentUnknownWarning = "process_tree_agent_unknown"
 
+// runtimeProcessTreeAgentUnsupportedWarning: a runtime spec of the application
+// is stored with process_tree "job", and the server's agent is known not to
+// honour it (its reported OS is not Windows, or it declared its features
+// without AgentFeatureRuntimeProcessTreeJob). Such a spec reached the store
+// before the agent reported, or before the agent changed; the save that keeps
+// it job is not refused (checkProcessTreeSupported refuses only a move into
+// job), so the operator's overrides keep working. The agent runs it direct,
+// which leaves the engine's descendants alive on stop.
+const runtimeProcessTreeAgentUnsupportedWarning = "process_tree_agent_unsupported"
+
 // RuntimeWarnings is a pure derivation (no store write) of operator-facing
 // warnings about appID's current runtime configuration. authorizeApplication
 // gates it (404-no-leak). Always a non-nil slice, even when empty.
@@ -2888,30 +2908,29 @@ func (s *Service) RuntimeWarnings(ctx context.Context, principal auth.Token, app
 	if anySGLangOmniSpecLacksAudioFlavor(app, specs) {
 		warnings = append(warnings, runtimeNoAudioOnSGLangOmniWarning)
 	}
-	processTreeUnknown, err := s.anyJobSpecOnUnknownAgent(ctx, server.ID, specs)
+	processTree, err := s.jobSpecAgentSupport(ctx, server.ID, specs)
 	if err != nil {
 		return nil, err
 	}
-	if processTreeUnknown {
+	switch processTree {
+	case processTreeSupportUnknown:
 		warnings = append(warnings, runtimeProcessTreeAgentUnknownWarning)
+	case processTreeUnsupported:
+		warnings = append(warnings, runtimeProcessTreeAgentUnsupportedWarning)
 	}
 	return warnings, nil
 }
 
-// anyJobSpecOnUnknownAgent backs runtimeProcessTreeAgentUnknownWarning: it
-// reports whether any of specs has process_tree "job" while serverID's agent
-// cannot yet be judged (agentProcessTreeSupport). Like the OS-mismatch
-// advisory it does not skip disabled specs, and it reads nothing when no spec
-// uses job.
-func (s *Service) anyJobSpecOnUnknownAgent(ctx context.Context, serverID string, specs []routing.RuntimeSpec) (bool, error) {
+// jobSpecAgentSupport backs runtimeProcessTreeAgentUnknownWarning and
+// runtimeProcessTreeAgentUnsupportedWarning: when any of specs has
+// process_tree "job" it reports serverID's agentProcessTreeSupport, and
+// processTreeSupported (no warning) otherwise. Like the OS-mismatch advisory
+// it does not skip disabled specs, and it reads nothing when no spec uses job.
+func (s *Service) jobSpecAgentSupport(ctx context.Context, serverID string, specs []routing.RuntimeSpec) (processTreeSupport, error) {
 	if !slices.ContainsFunc(specs, func(spec routing.RuntimeSpec) bool { return spec.ProcessTree == routing.ProcessTreeJob }) {
-		return false, nil
+		return processTreeSupported, nil
 	}
-	support, err := s.agentProcessTreeSupport(ctx, serverID)
-	if err != nil {
-		return false, err
-	}
-	return support == processTreeSupportUnknown, nil
+	return s.agentProcessTreeSupport(ctx, serverID)
 }
 
 // anySpecBinaryContradictsReportedOS backs runtimeBinaryPathOSMismatchWarning:

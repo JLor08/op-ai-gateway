@@ -397,8 +397,10 @@ var Features = []Feature{
 
 	// runtime_gpu_main_last: the agent resolves ${HOST_GPU_IDS_MAIN_LAST} (the
 	// spec's host GPU indices with the first declared GPU moved last) in args,
-	// env and config-file content. The gateway sends a spec using it only to an
-	// agent declaring it.
+	// env and config-file content. The gateway gates nothing on it: it pushes a
+	// spec using the placeholder to any agent, and the portal warns when the
+	// connected agent does not declare it (an older agent leaves the token
+	// literal).
 	//
 	// Since is 0.21.0: agent.Features gains an entry, so the rule is a MINOR bump.
 	{Name: FeatureRuntimeGPUMainLast, Since: "0.21.0"},

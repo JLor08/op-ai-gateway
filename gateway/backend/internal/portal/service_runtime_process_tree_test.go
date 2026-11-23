@@ -170,6 +170,77 @@ func TestPutRuntimeSpecProcessTreeAgentNegotiation(t *testing.T) {
 	})
 }
 
+// TestPutRuntimeSpecProcessTreeStoredJobOnUnsupportedAgent pins the refusal's
+// scope: it refuses only a write that moves a spec into job. A spec stored as
+// job while its agent could not be judged stays writable once the agent is
+// known not to honour it -- the portal's Stop/Start/Pin/Clear overrides
+// re-send the whole spec with a new admin_state, and refusing that would lock
+// the operator out of them -- and RuntimeWarnings then carries
+// process_tree_agent_unsupported instead of process_tree_agent_unknown. A
+// direct spec on the same agent is still refused the move into job.
+func TestPutRuntimeSpecProcessTreeStoredJobOnUnsupportedAgent(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore, mappingID, serverID := instanceSpecFixture(t, nil, nil)
+	svc.agentFeatures = fakeAgentFeatures{"srv_other": nil}
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: processTreeStrataBinary, ProcessTree: "job",
+	}); err != nil {
+		t.Fatalf("job on an agent that never reported: %v", err)
+	}
+	_, app, _, err := svc.authorizeMapping(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("authorizeMapping: %v", err)
+	}
+	warningsOf := func() []string {
+		t.Helper()
+		warnings, err := svc.RuntimeWarnings(ctx, ownerToken(), app.ID)
+		if err != nil {
+			t.Fatalf("RuntimeWarnings: %v", err)
+		}
+		return warnings
+	}
+	if w := warningsOf(); !slices.Contains(w, "process_tree_agent_unknown") || slices.Contains(w, "process_tree_agent_unsupported") {
+		t.Fatalf("warnings before the agent reported = %#v, want process_tree_agent_unknown only", w)
+	}
+
+	// The agent now reports: Windows, but without the flag.
+	reportAgentOS(t, routeStore, serverID, "windows")
+	svc.agentFeatures = fakeAgentFeatures{serverID: {"runtime_manager"}}
+
+	stored, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID)
+	if err != nil {
+		t.Fatalf("GetRuntimeSpec: %v", err)
+	}
+	override := putRequestFromDTO(stored)
+	override.AdminState = "force_stopped"
+	put, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, override)
+	if err != nil {
+		t.Fatalf("admin_state-only re-save of a stored job spec: %v", err)
+	}
+	if put.ProcessTree != "job" || put.AdminState != "force_stopped" {
+		t.Fatalf("re-save echo process_tree %q admin_state %q, want job/force_stopped", put.ProcessTree, put.AdminState)
+	}
+	if w := warningsOf(); !slices.Contains(w, "process_tree_agent_unsupported") || slices.Contains(w, "process_tree_agent_unknown") {
+		t.Fatalf("warnings on an agent known to lack job = %#v, want process_tree_agent_unsupported only", w)
+	}
+
+	// Moving the spec to direct and back into job is refused again.
+	override.ProcessTree = "direct"
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, override); err != nil {
+		t.Fatalf("job -> direct: %v", err)
+	}
+	if w := warningsOf(); slices.Contains(w, "process_tree_agent_unsupported") {
+		t.Fatalf("a direct spec still warns: %#v", w)
+	}
+	override.ProcessTree = "job"
+	if _, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, override); !errors.Is(err, ErrRuntimeSpecProcessTreeUnsupported) {
+		t.Fatalf("direct -> job err = %v, want %v", err, ErrRuntimeSpecProcessTreeUnsupported)
+	}
+	if got, err := svc.GetRuntimeSpec(ctx, ownerToken(), mappingID); err != nil || got.ProcessTree != "direct" {
+		t.Fatalf("after the refused move the spec reads %q (err %v), want direct", got.ProcessTree, err)
+	}
+}
+
 // TestAgentRuntimeDocProcessTree pins the push: a job spec carries
 // "process_tree":"job" in the agent document, a direct spec carries no key at
 // all (so its document, ETag included, is the one it was before the field

@@ -13339,8 +13339,9 @@ facts were measured against a running desktop app.
   type's behaviour changes: the context through `UpdateMappingContextProbe` (source `probe`, the lock and the size cap
   apply), vision as `yes` under the new probe-rank source `strata_models`. A listing without `image` writes no verdict,
   never a `no`, because nothing pins the list as exhaustive.
-- **The spec type launches `strata serve`.** Detection matches the substring `strata` in the binary's basename, checked
-  last, so it shadows no existing row. Probe paths: metrics `/metrics?format=prometheus` (the existing running/queued parser
+- **The spec type launches `strata serve`.** Detection matches the binary's basename exactly (`strata`, `strata.cmd`,
+  `strata.exe`, or a `strata-<name>[.exe]` engine helper; case-insensitive), checked last, so it shadows no existing row
+  and a name that merely contains the word stays `custom`. Probe paths: metrics `/metrics?format=prometheus` (the existing running/queued parser
   reads llama.cpp's names) and context `/props` (`default_generation_settings.n_ctx`, the llama.cpp extractor); the agent's
   `/props` capability probe runs as for llama.cpp, and the router's `/upstream/{model}/props` context probe is kept. The
   health path is `/health`, which answers without a key. The portal template, filled into a new spec when the type is
@@ -13410,11 +13411,14 @@ facts were measured against a running desktop app.
   Windows-tagged tests that CI cannot run; the owner's Windows acceptance decides, among other things, whether the template
   keeps `strata.cmd` as the binary or switches to the bundled `python.exe` with `strata.py` as the first argument (cmd.exe's
   "Terminate batch job" prompt on Ctrl-Break is the open question; the kill still ends the tree either way).
-- **The gateway refuses a `job` save it knows cannot be honoured.** An operator's spec PUT with `job` is refused with 400
-  `runtime_spec.process_tree_unsupported` when the server's reported OS is not Windows, or its agent has declared its
-  features since the gateway started and `runtime_process_tree_job` is not among them. When either fact is still unknown and
-  neither known fact refuses, the save succeeds and the runtime warnings carry `process_tree_agent_unknown`. Silently running a job spec as `direct` would leave
-  the engine alive on stop.
+- **The gateway refuses a move into `job` it knows cannot be honoured.** An operator's spec PUT that moves a spec into
+  `job` (a new spec, or one not stored as `job`) is refused with 400 `runtime_spec.process_tree_unsupported` when the
+  server's reported OS is not Windows, or its agent has declared its features since the gateway started and
+  `runtime_process_tree_job` is not among them. When either fact is still unknown and neither known fact refuses, the save
+  succeeds and the runtime warnings carry `process_tree_agent_unknown`. Silently running a job spec as `direct` would leave
+  the engine alive on stop. A re-save of a spec already stored as `job` is not refused: the portal's Stop/Start/Pin/Clear
+  overrides re-send the whole spec, and refusing them would lock the operator out. On an agent known to lack support such
+  a spec draws the runtime warning `process_tree_agent_unsupported` instead; there is no push-time withhold.
 - **Agent `0.20.1` → `0.21.0`, MINOR, one bump for the branch.** Two flags on the agent's list only, both `Since: "0.21.0"`:
   `runtime_gpu_main_last` (resolves the new placeholder; the portal warns when a spec uses it and the agent lacks the flag)
   and `runtime_process_tree_job` (honours `job`). The latter is declared on every OS, as `runtime_exec_wsl` is, because the
