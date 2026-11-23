@@ -671,10 +671,7 @@ terminated; RAM and per-GPU VRAM are measured over every process in the job. If 
 launcher exits, anything it left behind is killed at once, and if the agent itself
 dies, Windows ends the whole job with it. A spec left at `direct` (the default) is
 stopped by killing the launcher alone, which leaves the engine running, so keep `job`
-for Strata. **Verified on hardware (2026-11-23):** the job-mode start with `strata.cmd`, per-GPU VRAM over the whole tree and the agent's probes. **Still pending:** graceful stop through Ctrl-Break and no leftover processes, the RAM figure and the console-less (service) agent path. If `strata.cmd` turns out
-to misbehave under the agent, the fallback is the bundled
-`…\terminal\current\python\python.exe` as the binary with
-`…\terminal\current\strata.py` as its first argument.
+for Strata. **Verified on hardware (2026-11-23):** the job-mode start with `strata.cmd`, per-GPU VRAM over the whole tree and the agent's probes, and the stop: Ctrl-Break reached Strata, which drained and exited 0 about 2.7 s after the stop; cmd.exe's "Terminate batch job" prompt only adds a log line and a root exit code of -1, and VRAM was freed within about 2 s, so `strata.cmd` stays the binary. The measured RAM (private working set over the job) under-counts: it read 7.7 GB while host RAM in use fell by about 11.5 GB at stop. **Still pending:** the RAM figure against Task Manager beyond that, Claude Code and Codex round trips and the console-less (service) agent path.
 
 The key goes in the spec's environment as `STRATA_API_KEY=${API_TOKEN}`, never in
 the run config file; the agent's own probes of the child (metrics, context,
