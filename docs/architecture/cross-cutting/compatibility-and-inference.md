@@ -3309,7 +3309,7 @@ The native passthrough relay therefore translates it, for a streamed
 
 | Flavor | What the client gets in place of the agent's frame |
 |---|---|
-| Anthropic Messages | `event: error` with `{"type":"error","error":{"type":<t>,"message":"<code>: <agent message>"}}`; `<t>` is `overloaded_error` for `runtime.admission_blocked`, `runtime.instance_busy`, `runtime.instance_no_capacity`, `runtime.cluster_not_ready` and `runtime.start_timeout`, `api_error` for every other code |
+| Anthropic Messages | `event: error` with `{"type":"error","error":{"type":<t>,"message":"<code>: <agent message>"}}`; `<t>` is `overloaded_error` for `runtime.admission_blocked`, `runtime.instance_busy`, `runtime.instance_no_capacity`, `runtime.cluster_not_ready`, `runtime.cluster_member_unreachable` and `runtime.start_timeout`, `api_error` for every other code |
 | Responses | `event: error` with `{"type":"error","code":<code>,"message":<agent message>,"param":null,"sequence_number":…}`, then `event: response.failed` shaped like the translate path's own (`status: "failed"`, `error: {code, message}` with the agent's code). Its `response.id` is the one from a relayed `response.created`, else `resp_<gateway request id>`. The `response.failed` is sent without a prior `response.created` too, because Codex ignores a bare `error` event and reads only `response.failed` |
 
 Chat Completions never takes the native passthrough, and OpenAI's own chat stream
@@ -3323,6 +3323,15 @@ agent-managed. Every other byte, the `: keepalive` comments included, is relayed
 unchanged and as soon as it arrives. The one exception is an event that opens like
 `data: {"error":`: it is held until it ends (at most 64 KiB) and is then written
 whole.
+
+`runtime.upstream_gone` also carries a non-2xx the child itself answered after the
+router had committed `200`, such as a model server's `400` for an over-long context.
+It becomes `api_error`, so an Anthropic client may retry without streaming where it
+would otherwise have seen an invalid-request error. That is no worse than before:
+the verbatim frame was not readable as an error either.
+
+A captured response (`respBuf`) holds the bytes the client received, so it shows the
+translated error event, not the agent's raw frame.
 
 The usage row records the request as failed: status `error`, the agent's code as the
 error code, `http_status` the `200` that was on the wire, and no tokens. An idle

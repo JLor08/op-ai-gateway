@@ -39,7 +39,10 @@ var agentCapacityErrorCodes = map[string]bool{
 	"runtime.instance_busy":        true,
 	"runtime.instance_no_capacity": true,
 	"runtime.cluster_not_ready":    true,
-	"runtime.start_timeout":        true,
+	// A member the cluster start could not reach is as transient as a head
+	// that is not ready yet (both 503 on the agent's plain path).
+	"runtime.cluster_member_unreachable": true,
+	"runtime.start_timeout":              true,
 }
 
 // agentStreamFailure is the agent's terminal error frame, as recognized.

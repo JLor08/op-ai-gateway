@@ -109,6 +109,7 @@ func TestAgentStreamErrorFilterAnthropicTranslation(t *testing.T) {
 	}{
 		{agentStartFailedFrame, "api_error", "runtime.start_failed: engine exited during startup", "runtime.start_failed"},
 		{agentAdmissionFrame, "overloaded_error", "runtime.admission_blocked: no free VRAM", "runtime.admission_blocked"},
+		{`data: {"error":{"code":"runtime.cluster_member_unreachable","message":"member down"}}` + "\n\n", "overloaded_error", "runtime.cluster_member_unreachable: member down", "runtime.cluster_member_unreachable"},
 	}
 	for _, tc := range cases {
 		for _, n := range []int{1, 7, 1 << 20} {
