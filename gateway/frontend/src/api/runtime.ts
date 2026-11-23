@@ -221,6 +221,13 @@ export interface RuntimeSpec {
   // the agent has no default distro. Empty for a native spec, which stores
   // none.
   wsl_distro?: string;
+  // How a native spec's child process tree is managed: 'direct' (a plain child
+  // process; also what an empty or missing value means) or 'job' (a Windows
+  // job object that stops the whole tree). The PUT replaces the whole spec, so
+  // every save must send it back. Refused with 400
+  // runtime_spec.process_tree_unsupported unless the spec's agent is on Windows
+  // with the runtime_process_tree_job capability (agent 0.21.0+).
+  process_tree?: 'direct' | 'job';
   gpus: RuntimeSpecGPU[];
   // This spec's resident HOST RAM demand, in MB. RAM is host-scoped, so both
   // numbers are single scalars on the spec -- not per-GPU rows like `gpus`

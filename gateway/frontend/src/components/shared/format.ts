@@ -202,6 +202,8 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.device_backend_invalid': 'errorRuntimeSpecDeviceBackendInvalid',
   'runtime_spec.execution_mode_invalid': 'errorRuntimeSpecExecutionModeInvalid',
   'runtime_spec.wsl_distro_invalid': 'errorRuntimeSpecWSLDistroInvalid',
+  'runtime_spec.process_tree_invalid': 'errorRuntimeSpecProcessTreeInvalid',
+  'runtime_spec.process_tree_unsupported': 'errorRuntimeSpecProcessTreeUnsupported',
   'runtime_spec.wsl_path_not_linux': 'errorRuntimeSpecWSLPathNotLinux',
   'runtime_spec.wsl_cluster_unsupported': 'errorRuntimeSpecWSLClusterUnsupported',
   'runtime_spec.member_flag_reserved': 'errorRuntimeSpecMemberFlagReserved',

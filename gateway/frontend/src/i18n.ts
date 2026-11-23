@@ -2444,6 +2444,18 @@ const de = {
   runtimeExecutionWSL: 'WSL2',
   runtimeStatusVRAMFromVM: 'VRAM der WSL-VM zugerechnet',
   errorRuntimeSpecExecutionModeInvalid: 'Die Ausführung muss nativ oder WSL sein.',
+  runtimeSpecProcessTree: 'Prozessbaum',
+  runtimeSpecProcessTreeDirect: 'Direkt (einzelner Prozess)',
+  runtimeSpecProcessTreeJob: 'Windows-Job (gesamter Prozessbaum)',
+  runtimeSpecProcessTreeHint:
+    'Nur Windows: Im Job-Modus startet der Agent das Programm in einem Windows-Job-Objekt und beendet beim Stoppen den gesamten Prozessbaum (z. B. strata.cmd samt Kindprozessen); RAM und VRAM werden dem ganzen Baum zugerechnet. Unter Linux und macOS hat die Einstellung keine Wirkung. Erfordert Agent 0.21.0 oder neuer.',
+  runtimeSpecAgentNoGpuMainLast:
+    'Der verbundene Agent meldet „runtime_gpu_main_last“ nicht: Er ersetzt ${HOST_GPU_IDS_MAIN_LAST} nicht, der Platzhalter bleibt wörtlich stehen.',
+  runtimeProcessTreeAgentUnknownWarning:
+    'Mindestens eine Spezifikation nutzt den Windows-Job-Prozessbaum, aber für den Agenten dieses Servers liegen noch keine Fähigkeiten vor (er hat noch nichts gemeldet). Ob er den Job-Modus unterstützt, lässt sich erst nach seinem ersten Bericht prüfen.',
+  errorRuntimeSpecProcessTreeInvalid: 'Der Prozessbaum-Modus muss „direct“ oder „job“ sein.',
+  errorRuntimeSpecProcessTreeUnsupported:
+    'Der Job-Prozessbaum wird vom Agenten dieser Spezifikation nicht unterstützt: Der Agent läuft nicht unter Windows, seine Version ist älter als 0.21.0 oder er meldet die Fähigkeit „runtime_process_tree_job“ nicht. Das kann auch beim erneuten Speichern einer unveränderten Job-Spezifikation nach einem Agent-Downgrade auftreten.',
   errorRuntimeSpecWSLDistroInvalid: 'Der Name der WSL-Distribution ist ungültig.',
   errorRuntimeSpecWSLPathNotLinux:
     'Im WSL-Modus müssen Programmpfad und Arbeitsverzeichnis absolute Linux-Pfade sein.',
@@ -6453,6 +6465,18 @@ const en: PortalMessages = {
   runtimeExecutionWSL: 'WSL2',
   runtimeStatusVRAMFromVM: 'VRAM attributed from the WSL VM',
   errorRuntimeSpecExecutionModeInvalid: 'The execution mode must be native or WSL.',
+  runtimeSpecProcessTree: 'Process tree',
+  runtimeSpecProcessTreeDirect: 'Direct (single process)',
+  runtimeSpecProcessTreeJob: 'Windows job (whole process tree)',
+  runtimeSpecProcessTreeHint:
+    'Windows only: in job mode the agent starts the program inside a Windows job object and stops the whole process tree (e.g. strata.cmd and its children); RAM and VRAM are attributed to the whole tree. Has no effect on Linux and macOS. Requires agent 0.21.0 or newer.',
+  runtimeSpecAgentNoGpuMainLast:
+    'The connected agent does not report "runtime_gpu_main_last": it does not expand ${HOST_GPU_IDS_MAIN_LAST}, so the placeholder stays literal.',
+  runtimeProcessTreeAgentUnknownWarning:
+    "At least one spec uses the Windows job process tree, but no capabilities are known yet for this server's agent (it has not reported). Whether it supports job mode can only be checked after its first report.",
+  errorRuntimeSpecProcessTreeInvalid: 'The process tree mode must be "direct" or "job".',
+  errorRuntimeSpecProcessTreeUnsupported:
+    'This spec\'s agent does not support the job process tree: the agent is not running on Windows, its version is older than 0.21.0, or it does not report the "runtime_process_tree_job" capability. This can also fire when re-saving an unchanged job spec after an agent downgrade.',
   errorRuntimeSpecWSLDistroInvalid: 'The WSL distro name is invalid.',
   errorRuntimeSpecWSLPathNotLinux:
     'In WSL mode the binary path and working directory must be absolute Linux paths.',

@@ -270,6 +270,7 @@ const configFileIssueLabel: Record<ConfigFileIssue, MessageKey> = {
 const runtimeWarningLabelByCode: Record<string, MessageKey> = {
   timeout_ms_below_startup_timeout: 'runtimeTimeoutWarning',
   binary_path_os_mismatch: 'runtimeBinaryPathOsMismatchWarning',
+  process_tree_agent_unknown: 'runtimeProcessTreeAgentUnknownWarning',
   api_flavors_not_on_application: 'runtimeFlavorNotOnApplicationWarning',
   api_flavors_text_on_stable_diffusion: 'runtimeTextOnStableDiffusionWarning',
   api_flavors_text_on_vllm_sr: 'runtimeTextOnVllmSrWarning',
@@ -313,6 +314,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     execution_mode: 'native',
+    process_tree: 'direct',
     wsl_distro: '',
     gpus: [],
     ram_estimate_mb: 0,
@@ -1001,6 +1003,8 @@ function whitespaceDetailLine(arg: string, lineNumber: number): string {
 function blankDetailLine(arg: string, lineNumber: number): string {
   return `${lineNumber}: ${visualiseWhitespaceRun(arg)}`;
 }
+
+const GPU_MAIN_LAST_PLACEHOLDER = '${HOST_GPU_IDS_MAIN_LAST}';
 
 type ArgsWarning = { key: string; message: string; detail?: string };
 
@@ -2784,6 +2788,7 @@ export function RuntimeAdminSection({
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
   const [executionMode, setExecutionMode] = useState<'native' | 'wsl'>('native');
   const [wslDistro, setWslDistro] = useState('');
+  const [processTree, setProcessTree] = useState<'direct' | 'job'>('direct');
   // Runtime-Spec API Token: mode + its per-mode write-only state.
   // `apiTokenHeaderSource`/`apiTokenHeader` are declared here alongside mode,
   // even though their own select + inherited-header display render later in
@@ -3006,6 +3011,7 @@ export function RuntimeAdminSection({
     setVisibleDevicesMode(spec.visible_devices_mode);
     setExecutionMode(spec.execution_mode === 'wsl' ? 'wsl' : 'native');
     setWslDistro(spec.wsl_distro ?? '');
+    setProcessTree(spec.process_tree === 'job' ? 'job' : 'direct');
     setApiTokenMode(spec.api_token_mode);
     setApiTokenHeaderSource(spec.api_token_header_source);
     setApiTokenHeader(spec.api_token_header);
@@ -3485,6 +3491,8 @@ export function RuntimeAdminSection({
       visible_devices_mode: visibleDevicesMode,
       execution_mode: executionMode,
       wsl_distro: executionMode === 'wsl' ? wslDistro.trim() : '',
+      // Always sent (the PUT replaces the whole spec); a wsl spec has no job.
+      process_tree: executionMode === 'wsl' ? 'direct' : processTree,
       api_token_mode: apiTokenMode,
       api_token_header_source: apiTokenHeaderSource,
       api_token_header: apiTokenHeader,
@@ -3631,6 +3639,7 @@ export function RuntimeAdminSection({
     setSpecApiFlavors(template.flavors);
     setSpecResponsesMode(template.responsesMode);
     setSpecMessagesMode(template.messagesMode);
+    setProcessTree(template.processTree);
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
@@ -5003,6 +5012,15 @@ export function RuntimeAdminSection({
     const configFileRowIssues = configFileIssues(configFiles);
     const showAgentNoConfigFiles =
       configFiles.length > 0 && reportReady && !agentFeatures.includes('runtime_config_files');
+    // ${HOST_GPU_IDS_MAIN_LAST} (#424) is expanded by the agent only when it
+    // declares runtime_gpu_main_last; an older one leaves it literal. Same
+    // advisory shape as above: only once the placeholder is actually used.
+    const usesGpuMainLast =
+      argsText.includes(GPU_MAIN_LAST_PLACEHOLDER) ||
+      envText.includes(GPU_MAIN_LAST_PLACEHOLDER) ||
+      configFiles.some((r) => r.content.includes(GPU_MAIN_LAST_PLACEHOLDER));
+    const showAgentNoGpuMainLast =
+      usesGpuMainLast && reportReady && !agentFeatures.includes('runtime_gpu_main_last');
     const gpuOrderIsCustom = gpuRows.some((r, i, all) => i > 0 && r.index < all[i - 1].index);
     const argsHaveMetalDevices = parseArgsText(argsText).some((a) =>
       a.includes('${METAL_DEVICES}'),
@@ -5220,6 +5238,28 @@ export function RuntimeAdminSection({
                   <Alert severity="warning">{t.runtimeSpecWSLAgentUnsupported}</Alert>
                 )}
               </>
+            )}
+            {executionMode !== 'wsl' && (
+              <>
+                <SelectField
+                  id="runtime-spec-process-tree"
+                  label={t.runtimeSpecProcessTree}
+                  value={processTree}
+                  onChange={(e) => setProcessTree(e.target.value as 'direct' | 'job')}
+                  sx={{ maxWidth: 340 }}
+                >
+                  <option value="direct">{t.runtimeSpecProcessTreeDirect}</option>
+                  <option value="job">{t.runtimeSpecProcessTreeJob}</option>
+                </SelectField>
+                <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                  {t.runtimeSpecProcessTreeHint}
+                </Typography>
+              </>
+            )}
+            {showAgentNoGpuMainLast && (
+              <Alert severity="warning">
+                {`${t.runtimeSpecAgentNoGpuMainLast} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+              </Alert>
             )}
             <SelectField
               id="runtime-spec-type"

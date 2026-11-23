@@ -30,6 +30,7 @@ describe('strataSpecTemplate', () => {
       flavors: ['openai', 'anthropic'],
       responsesMode: 'passthrough',
       messagesMode: 'passthrough',
+      processTree: 'job',
     });
   });
 

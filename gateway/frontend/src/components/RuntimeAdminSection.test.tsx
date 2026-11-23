@@ -176,6 +176,7 @@ function makeSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     execution_mode: 'native',
+    process_tree: 'direct',
     wsl_distro: '',
     gpus: [],
     ram_estimate_mb: 0,
@@ -4108,6 +4109,7 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // reset a wsl spec to native on a Start/Stop/Pin click.
     execution_mode: spec.execution_mode,
     wsl_distro: spec.wsl_distro,
+    process_tree: spec.process_tree,
     api_token_mode: spec.api_token_mode,
     api_token_header_source: spec.api_token_header_source,
     api_token_header: spec.api_token_header,
@@ -13714,6 +13716,145 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
+  });
+});
+
+describe('RuntimeAdminSection process_tree control (#424)', () => {
+  const processTreeSelect = () => screen.getByRole('combobox', { name: t.runtimeSpecProcessTree });
+
+  async function openEdit(spec: Partial<RuntimeSpec>, report?: RuntimeReport) {
+    const binaryLabel =
+      spec.execution_mode === 'wsl' ? t.runtimeSpecBinaryLinux : t.runtimeSpecBinary;
+    const rendered = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          ...spec,
+        }),
+      },
+      ...(report ? { report } : {}),
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(binaryLabel);
+    return rendered;
+  }
+
+  it('shows the Windows-only control for a native spec, defaulting to direct', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeDirect);
+    expect(screen.getByText(t.runtimeSpecProcessTreeHint)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('direct');
+  });
+
+  it('is hidden for a wsl spec and sends direct', async () => {
+    const { putSpecs } = await openEdit({
+      execution_mode: 'wsl',
+      wsl_distro: 'Ubuntu-24.04',
+      process_tree: 'direct',
+    });
+    expect(screen.queryByRole('combobox', { name: t.runtimeSpecProcessTree })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('direct');
+  });
+
+  it('loads a stored job value and sends it unchanged on save', async () => {
+    const { putSpecs } = await openEdit({ process_tree: 'job' });
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeJob);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('job');
+  });
+
+  it('treats a missing stored value as direct', async () => {
+    const { putSpecs } = await openEdit({ process_tree: undefined });
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeDirect);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('direct');
+  });
+
+  it('the strata template on a new spec selects job', async () => {
+    const { putSpecs } = renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app-new' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: 'C:\\strata.cmd' },
+    });
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(processTreeSelect().textContent).toContain(t.runtimeSpecProcessTreeJob);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.process_tree).toBe('job');
+  });
+
+  it('labels the process_tree_agent_unknown warning', async () => {
+    renderSection({ warnings: ['process_tree_agent_unknown'] });
+    expect(await screen.findByText(t.runtimeProcessTreeAgentUnknownWarning)).toBeInTheDocument();
+    expect(screen.queryByText('process_tree_agent_unknown')).not.toBeInTheDocument();
+  });
+
+  describe('${HOST_GPU_IDS_MAIN_LAST} agent warning', () => {
+    const oldAgent = () =>
+      makeReport({ agent_version: '0.20.0', agent_features: ['runtime_manager'] });
+    const newAgent = () =>
+      makeReport({
+        agent_version: '0.21.0',
+        agent_features: ['runtime_manager', 'runtime_gpu_main_last'],
+      });
+    const settle = async () => {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    };
+
+    it('warns when args use the placeholder and the agent lacks runtime_gpu_main_last', async () => {
+      await openEdit({ args: ['--gpu', '${HOST_GPU_IDS_MAIN_LAST}'] }, oldAgent());
+      expect(
+        await screen.findByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).toHaveTextContent('0.20.0');
+    });
+
+    it('warns for the placeholder in env or a config file too', async () => {
+      await openEdit({ env: { GPUS: '${HOST_GPU_IDS_MAIN_LAST}' } }, oldAgent());
+      expect(
+        await screen.findByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).toBeInTheDocument();
+      cleanup();
+      await openEdit(
+        { config_files: [{ name: 'a.json', content: '{"g":"${HOST_GPU_IDS_MAIN_LAST}"}' }] },
+        oldAgent(),
+      );
+      expect(
+        await screen.findByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).toBeInTheDocument();
+    });
+
+    it('stays quiet when the agent declares it, or the placeholder is unused', async () => {
+      await openEdit({ args: ['--gpu', '${HOST_GPU_IDS_MAIN_LAST}'] }, newAgent());
+      await settle();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).not.toBeInTheDocument();
+      cleanup();
+      await openEdit({ args: ['serve'] }, oldAgent());
+      await settle();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoGpuMainLast, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
   });
 });
 

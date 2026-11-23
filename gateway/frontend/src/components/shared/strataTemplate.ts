@@ -20,6 +20,9 @@ export type RuntimeSpecDraft = {
   flavors: string[];
   responsesMode: EndpointMode;
   messagesMode: EndpointMode;
+  // Windows job-object process tree: Strata's launcher (strata.cmd) spawns a
+  // child tree, and only a job stops it as a unit.
+  processTree: 'direct' | 'job';
 };
 
 /**
@@ -63,5 +66,6 @@ export function strataSpecTemplate(): RuntimeSpecDraft {
     flavors: ['openai', 'anthropic'],
     responsesMode: 'passthrough',
     messagesMode: 'passthrough',
+    processTree: 'job',
   };
 }
