@@ -1283,10 +1283,11 @@ function gpuOptionLabel(gpu: HardwareGPU): string {
  *  1. `pci_bus_id` — maps to a physical slot and survives the index
  *     renumbering across reboots that the GPU budget rows'
  *     expected_uuid/expected_name drift detection exists to catch. NVIDIA
- *     only.
+ *     and AMD (rocm-smi `PCI Bus`).
  *  2. a shortened `uuid` — unique and stable but opaque; enough to tell two
  *     otherwise identical rows apart, which is all this needs to do.
- *  3. nothing — AMD and Apple report neither. The label falls back to index +
+ *  3. nothing — Apple reports neither (and an AMD host whose rocm-smi omits
+ *     both). The label falls back to index +
  *     name, which still distinguishes every row.
  */
 function stableGpuHandle(gpu: HardwareGPU): string {

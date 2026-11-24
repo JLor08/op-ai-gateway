@@ -809,10 +809,11 @@ func (m *Manager) Transitions() <-chan struct{} {
 // (main.go wires this to collector.NewVRAMMeasurer, which picks a
 // platform-appropriate one: PDH + D3DKMT on Windows, where nvidia-smi's
 // per-process query returns [N/A] under WDDM, and nvidia-smi
-// --query-compute-apps everywhere else). f may be nil to go back to estimates
+// --query-compute-apps elsewhere, with AMD KFD sysfs as the Linux fallback).
+// f may be nil to go back to estimates
 // only, which is also NewManager's default -- measurement is a hardware
-// capability, not a negotiated protocol feature, so every AMD, Apple and
-// CPU-only host simply never installs one and is entirely unaffected by
+// capability, not a negotiated protocol feature, so every Apple, CPU-only,
+// AMD-on-Windows and non-KFD AMD host simply never installs one and is entirely unaffected by
 // everything below.
 //
 // f is called from TWO places, and it must be safe for concurrent use because
@@ -2962,7 +2963,7 @@ func (o *owner) recordFailure(st *specState, message string, exitCode int, stder
 //
 //   - A VRAM measurer is installed. The exception exists only to CAPTURE a first
 //     measurement, so where none can be taken it must not fire. Measurement is
-//     NVIDIA-only (§5.3): on an AMD, Apple-silicon or GPU-less host "waiting for
+//     NVIDIA- and AMD-Linux-only (§5.3): on an Apple-silicon or GPU-less host "waiting for
 //     the measurement to arrive is waiting for something that will not happen",
 //     and there §5.3 is explicit that an unknown-demand spec simply WAITS behind
 //     a busy/pinned holder. Evicting a working known-demand model on such a host
@@ -3690,10 +3691,10 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 // TestManagerStatusStaysResponsiveWhileAMeasurementIsInFlight.
 //
 // NO MEASURER INSTALLED IS THE FIRST CHECK, and it is the one that matters
-// most: every AMD, Apple unified-memory and CPU-only deployment lands here
-// (collector.NewVRAMMeasurer returns nil when the host cannot support the
-// platform's measurer at all -- nvidia-smi off PATH everywhere, and on
-// Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
+// most: every Apple unified-memory, CPU-only, AMD-on-Windows and non-KFD AMD
+// deployment lands here (collector.NewVRAMMeasurer returns nil when the host
+// cannot support the platform's measurer at all -- nvidia-smi off PATH and no
+// /sys/class/kfd/kfd/proc on Linux, and on Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
 // NewManager's default). Those hosts take the first branch,
 // spawn nothing, allocate nothing, and behave exactly as they did before this
 // function existed. "No measurer" now means neither of the two: the host-RAM

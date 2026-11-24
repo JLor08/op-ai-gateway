@@ -4195,8 +4195,9 @@ keep the exception from reintroducing the thrash the order closed:
   evicted (busy, still loading) spends nothing: the decision is a plain `Wait`
   and the shot is still there for when the neighbour is idle.
 - **It needs a measurer.** The exception exists only to capture a measurement,
-  and measurement is NVIDIA-only (below). On an AMD, Apple-silicon or GPU-less
-  host no number could ever arrive, and this section is explicit that an
+  and measurement exists only for NVIDIA and for AMD on Linux (below). On an
+  Apple-silicon, GPU-less, AMD-on-Windows or non-ROCm AMD host no number could
+  ever arrive, and this section is explicit that an
   unknown-demand spec there simply waits behind a busy or pinned holder;
   evicting a working model for a spec that can never be measured is exactly the
   regression the order exists to prevent. So a host with no VRAM measurer never
@@ -4233,16 +4234,26 @@ moment a child first passes a health probe — the point where a model server
 has finished mapping its weights, so the first number is already the
 meaningful one.
 
-**VRAM measurement is NVIDIA-only (host RAM is measured on every platform, §5.1),
-and which NVIDIA measurer runs is decided per platform.** `main.go` installs exactly one measurer,
-`collector.NewVRAMMeasurer()` — a build-tag split (`measurer_other.go` /
-`measurer_windows.go`), not a `runtime.GOOS` branch — which yields the
-compute-apps measurer on every non-Windows host, the PDH measurer on Windows,
-and **nil** whenever the chosen one cannot work on this host. Both of them need
-`nvidia-smi` on PATH, so the NVIDIA-only scope is unchanged: an AMD host (the
-host-level `rocm-smi` collector reports no per-PID split), an Apple
-unified-memory host, and a host with no GPU at all install **no** measurer and
-never write a measurement back. On those hosts the operator's
+**VRAM measurement exists for NVIDIA and for AMD on Linux (host RAM is measured on
+every platform, §5.1), and which measurer runs is decided per platform.** `main.go`
+installs exactly one measurer, `collector.NewVRAMMeasurer()` — a build-tag split
+(`measurer_other.go` / `measurer_fallback_linux.go` / `measurer_fallback_other.go` /
+`measurer_windows.go`), not a `runtime.GOOS` branch — which yields, on **Linux**, the
+NVIDIA compute-apps measurer when `nvidia-smi` is on PATH, else the **KFD** measurer
+when `/sys/class/kfd/kfd/proc` exists, else nil; on other non-Windows hosts the
+compute-apps measurer or nil; and on Windows the PDH measurer or nil. The **KFD
+measurer** (`kfd_measurer.go`) reads the amdgpu compute driver's per-process counter
+`/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes) — a world-readable sysfs file,
+no subprocess — maps each `gpu_id` to its rank among the KFD topology's GPU nodes in
+numeric node order (the CPU node, `gpu_id 0`, is skipped; that rank is taken as the
+rocm-smi card index the manager's GPU indices use), attributes through the
+process-group leader exactly as the NVIDIA path does, sums the figures and floors to
+MiB, and returns nil on any failure so the manager falls back to the estimate. NVIDIA
+wins on a mixed host. The KFD sees only ROCm/HIP compute allocations: a Vulkan build
+of an engine allocates through the graphics stack and reads as absent. An Apple
+unified-memory host, a host with no GPU, AMD on Windows and an AMD runtime that is
+not ROCm/HIP install **no** measurer (or measure nothing) and never write a
+measurement back. On those hosts the operator's
 `vram_estimate_mb` is the only number there will ever be. The rule above still applies — a spec left at the default `0` waits
 while a pinned or busy spec holds one of its GPUs — but nothing resolves it
 except the other spec becoming evictable or the operator filling the estimate
@@ -10648,8 +10659,9 @@ operator meets first:
   whose address is only a name is allowed by the IPv4 addresses that name
   resolves to, so DNS is in the trust path and an IPv6-only head is never
   allowed.
-- **VRAM measurement is NVIDIA-only** (§5.3). On AMD, Apple unified memory and
-  GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
+- **VRAM measurement covers NVIDIA and AMD on Linux only** (§5.3; ROCm/HIP
+  allocations, not Vulkan). On Apple unified memory, GPU-less hosts, AMD on Windows
+  and non-ROCm AMD runtimes the agent installs no measurer, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for
   the agent to resolve. Host RAM does not share the limit: it is measured on every
   platform whose OS exposes per-process memory to the agent (a container without

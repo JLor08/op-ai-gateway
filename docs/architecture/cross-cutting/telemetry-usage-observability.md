@@ -60,7 +60,7 @@ than one GPU vendor active, e.g. none in practice, but the composition allows it
 | Vendor | File | Tool | Notes |
 |---|---|---|---|
 | NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version, PCI bus id; `[N/A]`-style sentinels map to 0 |
-| AMD | `amd.go` | `rocm-smi --json` (`--showid --showuse --showmemuse --showtemp --showpower --showdriverversion`) | Parses the `cardN`-keyed JSON object; a `"system"` entry supplies the driver version for every card |
+| AMD | `amd.go` | `rocm-smi --json` (`--showid --showproductname --showuse --showmeminfo vram --showtemp --showpower --showdriverversion --showbus --showuniqueid`) | Parses the `cardN`-keyed JSON object, in both the 3.x/5.x key spelling and rocm-smi 4.x's. Name: `Device Name`, else `Card Series`/`Card series`, else `Card Model`/`Card model`. `Unique ID` is the UUID and `PCI Bus` the `pci_bus_id`; VRAM total/used come from `--showmeminfo vram`. `N/A`-style sentinels mean "not reported". A `"system"` entry supplies the driver version for every card |
 | Apple | `apple.go` | `ioreg -r -c IOAccelerator -d 1` | Regex-scrapes the integrated-GPU text dump; always exactly one GPU (`Index 0`); memory is in-use/allocated **system** memory (Apple unified memory has no separate VRAM total) |
 
 The per-GPU `MemTotalBytes` these collectors report is also what the runtime manager's
@@ -111,9 +111,9 @@ Per GPU the report carries `index`, `name`, `uuid`, `driver_version`,
 consumer can tell "not reported" from "reported blank".
 
 **`pci_bus_id` is a display and disambiguation aid, and deliberately not an
-identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` and is therefore
-NVIDIA-only: `rocm-smi` and `ioreg` report nothing of this form and leave it
-empty rather than inventing an equivalent, so every consumer must render
+identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` on NVIDIA and from rocm-smi's
+`PCI Bus` on AMD; `ioreg` reports nothing of this form, so Apple leaves it
+empty rather than inventing an equivalent (as does an AMD host whose rocm-smi omits it), so every consumer must render
 without it. It exists because 4×/8× identical cards is the normal AI-server
 build, and of the handles telemetry actually offers — an `index` that can
 renumber across reboots (which is exactly what the GPU-budget rows'
