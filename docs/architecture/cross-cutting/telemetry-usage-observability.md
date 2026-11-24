@@ -60,7 +60,7 @@ than one GPU vendor active, e.g. none in practice, but the composition allows it
 | Vendor | File | Tool | Notes |
 |---|---|---|---|
 | NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version, PCI bus id; `[N/A]`-style sentinels map to 0 |
-| AMD | `amd.go` | `rocm-smi --json` (`--showid --showproductname --showuse --showmeminfo vram --showtemp --showpower --showdriverversion --showbus --showuniqueid`) | Parses the `cardN`-keyed JSON object, in both the 3.x/5.x key spelling and rocm-smi 4.x's. Name: `Device Name`, else `Card Series`/`Card series`, else `Card Model`/`Card model`. `Unique ID` is the UUID and `PCI Bus` the `pci_bus_id`; VRAM total/used come from `--showmeminfo vram`. `N/A`-style sentinels mean "not reported". A `"system"` entry supplies the driver version for every card |
+| AMD | `amd.go` | `rocm-smi --json` (`--showid --showproductname --showuse --showmeminfo vram --showtemp --showpower --showdriverversion --showbus --showuniqueid`) | Parses the `cardN`-keyed JSON object, in both the pre-4.0 (3.x) key spelling and rocm-smi 4.x's. Name: `Device Name`, else `Card Series`/`Card series`, else `Card Model`/`Card model`. `Unique ID` is the UUID and `PCI Bus` the `pci_bus_id`; VRAM total/used come from `--showmeminfo vram`. `N/A`-style sentinels mean "not reported". A `"system"` entry supplies the driver version for every card |
 | Apple | `apple.go` | `ioreg -r -c IOAccelerator -d 1` | Regex-scrapes the integrated-GPU text dump; always exactly one GPU (`Index 0`); memory is in-use/allocated **system** memory (Apple unified memory has no separate VRAM total) |
 
 The per-GPU `MemTotalBytes` these collectors report is also what the runtime manager's
@@ -111,18 +111,22 @@ Per GPU the report carries `index`, `name`, `uuid`, `driver_version`,
 consumer can tell "not reported" from "reported blank".
 
 **`pci_bus_id` is a display and disambiguation aid, and deliberately not an
-identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` on NVIDIA and from rocm-smi's
-`PCI Bus` on AMD; `ioreg` reports nothing of this form, so Apple leaves it
-empty rather than inventing an equivalent (as does an AMD host whose rocm-smi omits it), so every consumer must render
-without it. It exists because 4×/8× identical cards is the normal AI-server
+identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` on NVIDIA and
+from rocm-smi's `PCI Bus` on AMD. `ioreg` reports nothing of this form, so
+Apple leaves it empty rather than inventing an equivalent, as does an AMD host
+whose rocm-smi omits it (pre-4.0); every consumer must render without it. It exists because 4×/8× identical cards is the normal AI-server
 build, and of the handles telemetry actually offers — an `index` that can
 renumber across reboots (which is exactly what the GPU-budget rows'
 `expected_uuid`/`expected_name` drift detection exists to catch), an opaque
 `uuid`, and live utilisation, which is not identity at all — the bus id is the
-only one that maps to a physical slot and survives renumbering. Nothing in the
-system matches or keys on it: spec GPU rows, budgets and the whole admission
-arithmetic key on `index`, and making the bus id a second identity would be a
-separate design, not a field addition.
+only one that maps to a physical slot and survives renumbering. Nothing keys on
+it: spec GPU rows, budgets and the whole admission arithmetic key on `index`,
+and making the bus id a second identity would be a separate design, not a field
+addition. Its one logical reader is the portal's vendor guess for the
+NVIDIA-only RPC-member exemptions (`gpuLooksNVIDIA`): a name marking the card
+as AMD (`amd`, `radeon`, `instinct`) means not NVIDIA first, and only then does
+a non-empty bus id count as NVIDIA, as a fallback for NVIDIA names without a
+vendor keyword.
 
 Privacy is a schema-level guarantee, documented on `sample.SystemReport`
 (`server-agent/internal/sample/system_report.go`): the struct has **no** serial,

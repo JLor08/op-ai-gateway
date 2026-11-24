@@ -616,7 +616,7 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
 	if Version != "0.21.1" {
-		t.Fatalf("Version = %q, want 0.21.1 (the Strata MINOR bump; runtime_stop keeps Since 0.17.0)", Version)
+		t.Fatalf("Version = %q, want 0.21.1; runtime_stop keeps Since 0.17.0", Version)
 	}
 }
 
@@ -640,7 +640,7 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
 	if Version != "0.21.1" {
-		t.Fatalf("Version = %q, want 0.21.1 (the Strata MINOR bump; rpc_cluster keeps Since 0.18.0)", Version)
+		t.Fatalf("Version = %q, want 0.21.1; rpc_cluster keeps Since 0.18.0", Version)
 	}
 }
 
@@ -697,7 +697,7 @@ func TestFeaturesDeclareRealtimeProxy(t *testing.T) {
 		t.Fatal("FeatureNames() does not carry realtime_proxy, so it never reaches the gateway in capabilities.features")
 	}
 	if Version != "0.21.1" {
-		t.Fatalf("Version = %q, want 0.21.1 (the Strata MINOR bump; realtime_proxy keeps Since 0.20.0)", Version)
+		t.Fatalf("Version = %q, want 0.21.1; realtime_proxy keeps Since 0.20.0", Version)
 	}
 }
 

@@ -3201,9 +3201,9 @@ describe('VRAM-benchmark portal i18n keys', () => {
   it('never lets "cannot verify" read as "verified", in both locales', () => {
     // The recorded fingerprint is compared against the live card before the
     // number is offered, and the three outcomes are three different facts. An
-    // empty fingerprint (GPUSample.UUID is NVIDIA-only) means the check could
-    // not be MADE -- claiming it passed would be the drift bug with a
-    // reassuring label on it.
+    // empty fingerprint (GPUSample.UUID needs NVIDIA or AMD with rocm-smi 4.x)
+    // means the check could not be MADE -- claiming it passed would be the
+    // drift bug with a reassuring label on it.
     for (const locale of ['de', 'en'] as const) {
       const m = messages[locale];
       // Each is a sentence naming what was (or was not) established, never a

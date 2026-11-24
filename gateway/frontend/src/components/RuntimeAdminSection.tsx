@@ -1287,8 +1287,8 @@ function gpuOptionLabel(gpu: HardwareGPU): string {
  *  2. a shortened `uuid` — unique and stable but opaque; enough to tell two
  *     otherwise identical rows apart, which is all this needs to do.
  *  3. nothing — Apple reports neither (and an AMD host whose rocm-smi omits
- *     both). The label falls back to index +
- *     name, which still distinguishes every row.
+ *     both). The label falls back to index + name, which still
+ *     distinguishes every row.
  */
 function stableGpuHandle(gpu: HardwareGPU): string {
   const busID = gpu.pci_bus_id?.trim() ?? '';
@@ -2040,9 +2040,10 @@ export function RuntimeAdminSection({
   // created, and never overwrites them again. A live mismatch means the card
   // at this index changed (driver update renumbering GPUs, or a hardware
   // swap) -- worth a warning, never a block: a renumbered card must not take
-  // the server out of service. UUID is NVIDIA-only (AMD reports none, Apple
-  // is a single unified-memory device), so an absent UUID on either side
-  // means "no drift detection available here", not "drift detected".
+  // the server out of service. UUID comes from NVIDIA and from AMD with
+  // rocm-smi 4.x only (pre-4.0 rocm-smi reports none, Apple is a single
+  // unified-memory device), so an absent UUID on either side means "no drift
+  // detection available here", not "drift detected".
   function driftFor(row: BudgetRow): HardwareGPU | undefined {
     if (!row.expectedUuid) return undefined;
     const live = telemetryGpus.find((g) => g.index === row.index);

@@ -810,11 +810,10 @@ func (m *Manager) Transitions() <-chan struct{} {
 // platform-appropriate one: PDH + D3DKMT on Windows, where nvidia-smi's
 // per-process query returns [N/A] under WDDM, and nvidia-smi
 // --query-compute-apps elsewhere, with AMD KFD sysfs as the Linux fallback).
-// f may be nil to go back to estimates
-// only, which is also NewManager's default -- measurement is a hardware
-// capability, not a negotiated protocol feature, so every Apple, CPU-only,
-// AMD-on-Windows and non-KFD AMD host simply never installs one and is entirely unaffected by
-// everything below.
+// f may be nil to go back to estimates only, which is also NewManager's
+// default -- measurement is a hardware capability, not a negotiated protocol
+// feature, so every Apple, CPU-only, AMD-on-Windows and non-KFD AMD host
+// simply never installs one and is entirely unaffected by everything below.
 //
 // f is called from TWO places, and it must be safe for concurrent use because
 // they can overlap:
@@ -2963,10 +2962,10 @@ func (o *owner) recordFailure(st *specState, message string, exitCode int, stder
 //
 //   - A VRAM measurer is installed. The exception exists only to CAPTURE a first
 //     measurement, so where none can be taken it must not fire. Measurement is
-//     NVIDIA- and AMD-Linux-only (§5.3): on an Apple-silicon or GPU-less host "waiting for
-//     the measurement to arrive is waiting for something that will not happen",
-//     and there §5.3 is explicit that an unknown-demand spec simply WAITS behind
-//     a busy/pinned holder. Evicting a working known-demand model on such a host
+//     NVIDIA- and AMD-Linux-only (§5.3): on an Apple-silicon or GPU-less host
+//     "waiting for the measurement to arrive is waiting for something that
+//     will not happen", and there §5.3 is explicit that an unknown-demand
+//     spec simply WAITS behind a busy/pinned holder. Evicting a working known-demand model on such a host
 //     for an unknown spec that can never be measured is exactly the ADR-032
 //     regression the order exists to prevent -- so the bootstrap is gated on the
 //     measurer, the VRAM twin of P4a's ramMeasurerInstalled gate. It is asked
@@ -3694,10 +3693,10 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 // most: every Apple unified-memory, CPU-only, AMD-on-Windows and non-KFD AMD
 // deployment lands here (collector.NewVRAMMeasurer returns nil when the host
 // cannot support the platform's measurer at all -- nvidia-smi off PATH and no
-// /sys/class/kfd/kfd/proc on Linux, and on Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
-// NewManager's default). Those hosts take the first branch,
-// spawn nothing, allocate nothing, and behave exactly as they did before this
-// function existed. "No measurer" now means neither of the two: the host-RAM
+// /sys/class/kfd/kfd/proc on Linux, and on Windows also a missing
+// pdh.dll/gdi32.dll export -- and nil is also NewManager's default). Those
+// hosts take the first branch, spawn nothing, allocate nothing, and behave
+// exactly as they did before this function existed. "No measurer" now means neither of the two: the host-RAM
 // measurer (SetRAMMeasurer) rides this same beat, and a host that has only that
 // one still measures RAM -- see the note on the two gates below.
 //

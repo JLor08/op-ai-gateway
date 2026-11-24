@@ -13581,8 +13581,8 @@ inventing usage figures and hammering a vendor's rate-limited usage endpoint, an
 ## ADR-113 — Per-process VRAM on AMD Linux: KFD sysfs, not start-delta attribution or amd-smi
 
 **Context.** On AMD Linux hosts the runtime manager never measured a spec's VRAM, so an unfilled `vram_estimate_mb` waited forever and the
-benchmark reported only the per-GPU delta (#432). Two causes stacked: the agent's `rocm-smi` collector asked for flags and read keys of the 3.x/5.x
-output, while rocm-smi 4.x spells them differently, so on such a host the device name, total VRAM, UUID and PCI bus all read empty or 0; and no
+benchmark reported only the per-GPU delta (#432). Two causes stacked: the agent's `rocm-smi` collector asked for flags and read keys of the pre-4.0
+(3.x) output, while rocm-smi 4.x spells them differently, so on such a host the device name, total VRAM, UUID and PCI bus all read empty or 0; and no
 per-process measurer existed for AMD at all. With the total at 0, the auto-detected budgets of
 [ADR-083](#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides) were silently
 absent on those hosts.

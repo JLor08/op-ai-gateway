@@ -2187,8 +2187,9 @@ member, not replicable, an explicit startup timeout); the member list (one entry
 per server, none on the head's server); then rights and consent, member specs,
 member binaries, network and transport, and the member GPUs (an Apple GPU needs
 a GPU budget; a known non-NVIDIA GPU needs an estimate on an automatic member,
-and `--tensor-split` on the head, because its share is never measured per
-process); last of all, automatic members need the head binary's version known
+and `--tensor-split` on the head, because its share is not reliably measured
+per process: AMD is measured only on Linux and only for ROCm/HIP builds, never
+for a Vulkan `rpc-server`); last of all, automatic members need the head binary's version known
 (`runtime_spec.cluster_head_binary_version_unknown`). Rights are needed on every
 member server the write keeps or adds; removing members, turning the cluster
 off included, needs the head's rights only, as deleting the head does: removal
@@ -4577,10 +4578,11 @@ and two things follow from that.
 > `notPermittedRetryInterval` elapses, and unlike a candidate that cannot start,
 > a pinned occupant *is* running — so **where a measurer is installed** the
 > housekeeping beat measures it and the block clears with nothing evicted. That
-> is the NVIDIA case and only the NVIDIA case: on AMD, Apple-silicon and
-> GPU-less hosts the agent installs no measurer at all, so nothing but an
-> operator filling the estimate in will ever clear it, and the re-evaluation
-> loop simply re-confirms the same block every five seconds. Do not read
+> is the NVIDIA case and the AMD Linux case for ROCm/HIP builds only: for a
+> Vulkan build on AMD (which the KFD measurer cannot see), on AMD Windows,
+> Apple-silicon and GPU-less hosts nothing measures the occupant, so nothing
+> but an operator filling the estimate in will ever clear it, and the
+> re-evaluation loop simply re-confirms the same block every five seconds. Do not read
 > "terminal is not permanent" as a property of the state — it is a property of
 > the host, which is why the message has to name the spec whose estimate is
 > missing.
@@ -9241,7 +9243,8 @@ figures and this feature claims nothing about spillover.
 **The card fingerprint degrades, and says how far.** A stored VRAM number
 attributed to index 1 after the cards were renumbered is worse than no number,
 so each per-GPU item carries what identified the card *and* which field did it:
-`uuid` on NVIDIA (any renumbering is detectable) or `name_total` elsewhere,
+`uuid` where the sample has one (NVIDIA, and AMD with rocm-smi 4.x; any
+renumbering is detectable) or `name_total` elsewhere,
 read from the **post-load window's own sample** rather than the trigger-time
 one, because that is the sample the numbers came from: recording the
 trigger-time identity beside a window-time figure pairs the OLD card's uuid
@@ -9250,8 +9253,9 @@ the exact event a fingerprint exists to detect and is worse than recording no
 identity at all —
 which catches a swap between *unlike* cards only, since two identical cards
 trading indices are indistinguishable. `GPUSample.UUID` is populated only by
-the NVIDIA parse, so a UUID-only detector would silently verify nothing on
-exactly the host classes the delta strategy exists to serve. On Apple silicon
+the NVIDIA parse and the AMD parse of rocm-smi 4.x, so a UUID-only detector
+would silently verify nothing on Apple and pre-4.0 rocm-smi hosts, which the
+delta strategy exists to serve. On Apple silicon
 the figures are unified **system** memory read from ioreg rather than dedicated
 VRAM, so the item carries `unified_memory` and must be labelled wherever it is
 shown.

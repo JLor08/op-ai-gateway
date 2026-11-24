@@ -9528,8 +9528,9 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
   });
 
   it('says CANNOT VERIFY, not "verified", when there was no identifier to compare', async () => {
-    // GPUSample.UUID is NVIDIA-only, so an empty fingerprint is the normal
-    // case on exactly the AMD and Apple hosts the delta strategy exists for.
+    // GPUSample.UUID needs NVIDIA or AMD with rocm-smi 4.x, so an empty
+    // fingerprint is the normal case on Apple and older-AMD hosts, which the
+    // delta strategy exists for.
     // The offer stands there -- withholding it would kill the feature on
     // those hosts -- but it must not borrow the verified sentence.
     await openSpecEdit({

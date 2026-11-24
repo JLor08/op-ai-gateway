@@ -63,8 +63,8 @@ func (c *amdCollector) Collect(ctx context.Context) ([]sample.GPU, error) {
 // never fails the parse. Memory values are already bytes; temperature is a
 // float truncated to whole degrees.
 //
-// rocm-smi 3.x and 4.x name the product keys differently, so both are
-// accepted. The name is the first usable of "Device Name" (4.x marketing
+// rocm-smi pre-4.0 (3.x) and 4.x name the product keys differently, so both
+// are accepted. The name is the first usable of "Device Name" (4.x marketing
 // name), "Card Series"/"Card series", then "Card Model"/"Card model" (a bare
 // PCI device id on 4.x, hence last). "Unique ID" feeds UUID and "PCI Bus" feeds
 // PCIBusID; 3.x emits neither, which leaves them empty. Placeholder values
