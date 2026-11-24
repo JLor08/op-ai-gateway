@@ -486,9 +486,10 @@ export function TokenList({
   }
 
   async function saveChatSettings(next: NonNullable<typeof chatDraft>) {
-    // The policy goes out as an explicit object whenever the card edits it (never
-    // null: the backend reads null as "leave untouched"); otherwise the body is the
-    // two booleans only.
+    // The policy goes out as an explicit object only when the card edited it in this
+    // draft (never null: the backend reads null as "leave untouched"); an untouched
+    // editor sends the two booleans only, so a flag toggle never runs the policy
+    // validation or turns "unset" into an explicit policy.
     const vendorAccess =
       chatVendorEditable && next.vendor_access
         ? buildVendorAccessDTO(next.vendor_access, vendorAccounts, vendorGroups)
@@ -953,7 +954,9 @@ export function TokenList({
   const chatVendorDraft =
     chatDraftValue?.vendor_access ?? vendorAccessDraftFromDTO(chatSession?.vendor_access);
   const chatVendorInvalid =
-    chatVendorEditable && vendorAccessDraftInvalid(chatVendorDraft, vendorAccounts, vendorGroups);
+    chatVendorEditable &&
+    chatDraftValue?.vendor_access !== undefined &&
+    vendorAccessDraftInvalid(chatVendorDraft, vendorAccounts, vendorGroups);
 
   return (
     <>
@@ -1005,31 +1008,27 @@ export function TokenList({
               size="small"
               type="button"
               disabled={chatVendorInvalid}
-              onClick={() =>
-                saveChatSettings({
-                  ...chatDraftValue,
-                  ...(chatVendorEditable ? { vendor_access: chatVendorDraft } : {}),
-                })
-              }
+              onClick={() => saveChatSettings(chatDraftValue)}
             >
               {t.tokenActionSave}
             </Button>
           </Box>
           {vendorAccountsEnabled && (
             <Box sx={{ mt: 2 }}>
-              <VendorAccessEditor
-                value={chatVendorDraft}
-                onChange={(next) => setChatDraft({ ...chatDraftValue, vendor_access: next })}
-                accounts={vendorAccounts}
-                groups={vendorGroups}
-                t={t}
-                idPrefix="chat"
-                labels={{
-                  heading: t.tokenVendorAccessLabel,
-                  note: t.chatSessionVendorAccessNote,
-                }}
-                disabled={!chatVendorEditable}
-              />
+              {chatVendorEditable && (
+                <VendorAccessEditor
+                  value={chatVendorDraft}
+                  onChange={(next) => setChatDraft({ ...chatDraftValue, vendor_access: next })}
+                  accounts={vendorAccounts}
+                  groups={vendorGroups}
+                  t={t}
+                  idPrefix="chat"
+                  labels={{
+                    heading: t.tokenVendorAccessLabel,
+                    note: t.chatSessionVendorAccessNote,
+                  }}
+                />
+              )}
               {!chatVendorEditable && (
                 <Typography variant="caption" color="text.secondary">
                   {t.chatSessionVendorAccessUnavailable}

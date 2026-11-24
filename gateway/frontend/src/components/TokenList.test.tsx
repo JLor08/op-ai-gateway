@@ -690,7 +690,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(chatPanel().getByRole('button', { name: t.tokenActionSave }));
     }
 
-    it('pre-fills "all + incl. groups" for an unset user and sends the draft on every save', async () => {
+    it('pre-fills "all + incl. groups" for an unset user and sends only the booleans when untouched', async () => {
       const { fakeApi } = renderTokenList({
         vendorAccountsEnabled: true,
         tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
@@ -700,17 +700,54 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(chat.getByLabelText(t.tokenVendorAccessAll)).toBeChecked();
       expect(chat.getByLabelText(t.tokenVendorAccessIncludeGroups)).toBeChecked();
 
+      fireEvent.click(chat.getByLabelText(`${t.tokenSecretLabel} ${t.chatSessionName}`));
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: true,
+      });
+      expect(fakeApi.vendorAccountGroups).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends the explicit object once the editor was edited, even alongside a flag toggle', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      const chat = chatPanel();
+      fireEvent.click(chat.getByLabelText(t.tokenVendorAccessAll));
+      fireEvent.click(await chat.findByRole('checkbox', { name: 'Work OpenAI' }));
+      fireEvent.click(chat.getByLabelText(`${t.tokenSecretLabel} ${t.chatSessionName}`));
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: true,
+        vendor_access: { all: false, accounts: [{ account_id: 'acc_a' }] },
+      });
+    });
+
+    it('an explicit-zero edit still sends {all:false, accounts:[]}', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      const chat = chatPanel();
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalled());
+      fireEvent.click(chat.getByLabelText(t.tokenVendorAccessAll));
+
       save();
       await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
       expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
         log_communication: false,
         secret: false,
-        vendor_access: { all: true, include_groups: true },
+        vendor_access: { all: false, accounts: [] },
       });
-      expect(fakeApi.vendorAccountGroups).toHaveBeenCalledTimes(1);
     });
 
-    it('pre-fills an explicit "no providers" row with nothing ticked and saves it as an object', async () => {
+    it('leaves an explicit "no providers" row untouched when only a flag is saved', async () => {
       const { fakeApi } = renderTokenList({
         vendorAccountsEnabled: true,
         tokens: [makeChatSessionRow({ vendor_access: { all: false, accounts: [] } })],
@@ -724,7 +761,6 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
         log_communication: false,
         secret: false,
-        vendor_access: { all: false, accounts: [] },
       });
     });
 
@@ -746,14 +782,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
     });
 
-    it('disables the editor with a hint and sends only the booleans when the row has no policy', async () => {
+    it('hides the editor behind a hint and sends only the booleans when the row has no policy', async () => {
       const { fakeApi } = renderTokenList({
         vendorAccountsEnabled: true,
         tokens: [makeChatSessionRow()],
       });
       const chat = chatPanel();
       expect(chat.getByText(t.chatSessionVendorAccessUnavailable)).toBeInTheDocument();
-      expect(chat.getByLabelText(t.tokenVendorAccessAll)).toBeDisabled();
+      expect(chat.queryByLabelText(t.tokenVendorAccessAll)).not.toBeInTheDocument();
 
       save();
       await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
