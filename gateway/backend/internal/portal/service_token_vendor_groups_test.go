@@ -208,3 +208,45 @@ func TestTokenVendorGroupsNeverForServices(t *testing.T) {
 		t.Errorf("service all:true = %v, want nil", err)
 	}
 }
+
+// A listed own account that is a member of an opted-in group but cannot serve right
+// now (needs_reconnect) is still shadowed by the group: the same effective name is
+// not a conflict, because the group answers it either way. Membership, not current
+// usability, decides the shadowing.
+func TestTokenVendorGroupShadowsAnUnusableListedMember(t *testing.T) {
+	fx := newTokenGroupFixture(t)
+	ctx := context.Background()
+	if err := fx.rs.CreateVendorAccount(ctx, routing.VendorAccount{
+		ID: "acc_e", OwnerUserID: "usr_1", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
+		Name: "acc_e", Status: routing.VendorAccountStatusNeedsReconnect, CreatedAt: offeringTime, UpdatedAt: offeringTime,
+	}); err != nil {
+		t.Fatalf("CreateVendorAccount: %v", err)
+	}
+	if err := fx.rs.SetVendorAccountModels(ctx, "acc_e", []routing.VendorAccountModel{
+		{GatewayModel: "gpt-4o", UpstreamModel: "gpt-4o", APIFlavor: routing.APIFlavorOpenAI},
+	}); err != nil {
+		t.Fatalf("SetVendorAccountModels: %v", err)
+	}
+	if err := fx.rs.CreateVendorAccountGroup(ctx, routing.VendorAccountGroup{
+		ID: "vag_e", OwnerUserID: "usr_1", Vendor: routing.VendorOpenAI, Name: "vag_e",
+		Status:               routing.VendorAccountGroupStatusActive,
+		ThresholdFiveHourPct: 99, ThresholdWeeklyPct: 99, ThresholdCreditsPct: 99,
+		CreatedAt: offeringTime, UpdatedAt: offeringTime,
+	}); err != nil {
+		t.Fatalf("CreateVendorAccountGroup: %v", err)
+	}
+	// acc_e (unusable) first, acc_c (usable, serving gpt-4o) second: the group claims gpt-4o.
+	if err := fx.rs.SetVendorAccountGroupMembers(ctx, "vag_e", []string{"acc_e", "acc_c"}); err != nil {
+		t.Fatalf("SetVendorAccountGroupMembers: %v", err)
+	}
+	owner := userTokenPrincipal(fx.owner)
+	va := &VendorAccessDTO{Accounts: accountEntries("acc_e"), Groups: groupEntries("vag_e")}
+	if err := fx.svc.validateVendorAccess(ctx, owner, va); err != nil {
+		t.Fatalf("validateVendorAccess = %v, want no conflict (the group shadows its own member)", err)
+	}
+	// A non-member on the same name is still a conflict.
+	va = &VendorAccessDTO{Accounts: accountEntries("acc_d"), Groups: groupEntries("vag_e")}
+	if err := fx.svc.validateVendorAccess(ctx, owner, va); !errors.Is(err, ErrTokenVendorAccessConflict) {
+		t.Fatalf("non-member on the group's name = %v, want a conflict", err)
+	}
+}

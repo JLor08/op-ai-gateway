@@ -2901,7 +2901,9 @@ collide (give one a distinct `model_prefix`, §6.5). Two layers handle it:
 `group prefix + model` for the **union** of its usable members' models (so members that expose
 identical vendor ids do not collide with each other: the token opts into the group, not the
 members); an account claims its own names. A name shared by a group and **one of its own members**
-is not a conflict, because the group shadows the member (§12.2). Any other shared effective name
+is not a conflict, because the group shadows the member (§12.2); membership decides, so a listed
+member that cannot serve right now (`needs_reconnect`, disabled, a subscription while subscriptions
+are off) is shadowed too. Any other shared effective name
 (another group, or an account outside the group) is the same `400
 portal.token_vendor_access_conflict`. The group save itself refuses a prefix that makes the
 group's names collide with the owner's own accounts outside the group or with another own group

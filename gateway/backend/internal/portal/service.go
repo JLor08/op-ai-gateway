@@ -6215,9 +6215,9 @@ type vendorAccessCheck struct {
 	byID  map[string]routing.VendorAccount // the accounts the principal can reach, by id
 	seen  map[string]struct{}              // account ids already listed in the policy
 	names map[string]string                // effective public name -> id of the account or group that first produced it
-	// groupMembers lists, per opted-in group id, the member accounts whose names the
-	// group claims: a clash between a group and one of these is the group shadowing
-	// its member, not a conflict (spec 5.1).
+	// groupMembers lists, per opted-in group id, every member account of the group
+	// (usable or not): a clash between a group and one of these is the group
+	// shadowing its member, not a conflict (spec 5.1).
 	groupMembers map[string]map[string]struct{}
 	// groupNames is the public name -> group id of every name an opted-in group
 	// claims, and subscriptionsOn the vendor_subscriptions_enabled switch the group

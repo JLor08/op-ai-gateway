@@ -25,9 +25,10 @@ import (
 // The names are then claimed per opted-in group: the policy is rendered as the token
 // it will become and run through advertisedVendorGroupModels, the listing's own group
 // step, so a group claims exactly prefix + upstream over its usable members' models
-// and the save-time check cannot drift from what is advertised and routed. Members
-// are recorded so that a clash between a group and one of its own members is not a
-// conflict (the group shadows it); any other shared name is.
+// and the save-time check cannot drift from what is advertised and routed. Every
+// member of an opted-in group is recorded (recordVendorGroupMembers), usable or not,
+// so that a clash between a group and one of its own members is not a conflict (the
+// group shadows it); any other shared name is.
 func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.Token, byID map[string]routing.VendorAccount, d *VendorAccessDTO, check *vendorAccessCheck) error {
 	covered := d.All && d.IncludeGroups
 	entries := make([]auth.VendorAccessGroupEntry, 0, len(d.Groups))
@@ -65,15 +66,12 @@ func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.To
 	token := auth.Token{UserID: principal.UserID, VendorAccess: auth.VendorAccess{
 		All: d.All, IncludeGroups: d.IncludeGroups, Groups: entries,
 	}}
+	if err := s.recordVendorGroupMembers(ctx, principal, covered, entries, check); err != nil {
+		return err
+	}
 	claims, loaded := s.advertisedVendorGroupModels(ctx, token, slices.Collect(maps.Values(byID)), check.subscriptionsOn)
 	if !loaded {
 		slog.Warn("portal: token vendor-access group collision check ran on an incomplete group listing; the routing backstop still applies")
-	}
-	for _, c := range claims {
-		if check.groupMembers[c.GroupID] == nil {
-			check.groupMembers[c.GroupID] = make(map[string]struct{})
-		}
-		check.groupMembers[c.GroupID][c.Account.ID] = struct{}{}
 	}
 	for _, c := range claims {
 		for _, m := range c.Models {
@@ -82,6 +80,42 @@ func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.To
 			}
 			check.groupNames[m.GatewayModel] = c.GroupID
 		}
+	}
+	return nil
+}
+
+// recordVendorGroupMembers records, for every group the policy opts into (every own
+// group under all + include_groups, else the listed entries), ALL of its member
+// accounts, whether they can serve right now or not. A group shadows a member by
+// membership: a listed member that is needs_reconnect, disabled or a subscription
+// while subscriptions are off contributes no name to the group's claim, yet the group
+// still answers that name, so the member's own claim on it is no conflict. A store
+// failure is an infrastructure error and is returned raw, like the group lookup's.
+func (s *Service) recordVendorGroupMembers(ctx context.Context, principal auth.Token, covered bool, entries []auth.VendorAccessGroupEntry, check *vendorAccessCheck) error {
+	ids := make([]string, 0, len(entries))
+	if covered {
+		groups, err := s.routes.VendorAccountGroupsByOwner(ctx, principal.UserID)
+		if err != nil {
+			return err
+		}
+		for _, g := range groups {
+			ids = append(ids, g.ID)
+		}
+	} else {
+		for _, e := range entries {
+			ids = append(ids, e.GroupID)
+		}
+	}
+	for _, id := range ids {
+		members, err := s.routes.VendorAccountGroupMembers(ctx, id)
+		if err != nil {
+			return err
+		}
+		set := make(map[string]struct{}, len(members))
+		for _, m := range members {
+			set[m.AccountID] = struct{}{}
+		}
+		check.groupMembers[id] = set
 	}
 	return nil
 }
