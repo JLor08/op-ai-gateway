@@ -316,10 +316,10 @@ was relayed to the client, the gateway:
 4. stops when no eligible member is left, and relays the **last** vendor error
    unchanged.
 
-Limit errors are HTTP 429, HTTP 402, and the vendors' quota error codes in a
-non-streamed error body (e.g. OpenAI `insufficient_quota`, Codex
-`usage_limit_reached`; VERIFY-LIVE). 5xx and 529 (`overloaded`) are **not**
-limit errors in this project.
+Limit errors are HTTP 429 and HTTP 402, decided by status alone (OpenAI
+`insufficient_quota` and Codex `usage_limit_reached` arrive as 429, so no body
+parsing is needed). 5xx and 529 (`overloaded`) are **not** limit errors in
+this project.
 
 Cooldown is in-memory per gateway process (it only bridges the time until the
 next scrape or pull tells the truth), keyed by `(account id, upstream model)`.
