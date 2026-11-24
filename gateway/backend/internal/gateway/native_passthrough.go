@@ -431,6 +431,32 @@ type passthroughRequest struct {
 	pf        preflight
 }
 
+// passthroughModeFor is the upstream path and the mode in which relayPassthroughTarget
+// serves apiFlavor's endpoint on target (failoverPassthrough asks it too).
+//
+// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
+// AND mode != disabled. endpointModeFor only ever answers the mode half;
+// for a coding-agent endpoint (path != "") whose coarse flavor the resolved
+// target no longer serves, treat it as disabled here — the one place a
+// server_agent app's per-model spec flavor is enforceable for these two
+// endpoints (candidacy only checked the app-level flavor; see
+// targetServesFlavor). It runs BEFORE the mode decides anything, so it holds
+// a translate-mode endpoint to the full rule too -- but only for the target
+// it judged: a request it finds lacking its flavor never reaches the
+// translate dispatch. What does reach that dispatch unjudged (a body whose
+// model the routing probe could not read, a request whose resolve failed in
+// tryProxyNative, and every translate-path re-resolve) is checked there only by
+// targetIsImagesOnly and targetIsAudioOnly (resolveTranslateTarget), with
+// neither this flavor check nor the mode read. A no-op for an ordinary app, whose flavor-less
+// state already excluded it at candidacy.
+func passthroughModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
+	path, mode := endpointModeFor(target, apiFlavor)
+	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
+		mode = routing.EndpointModeDisabled
+	}
+	return path, mode
+}
+
 // relayPassthroughTarget is tryProxyNative past its resolve: it relays pr's request to
 // target, already resolved, when target passes this endpoint through, refuses it when
 // the endpoint is disabled there, and returns false -- having written nothing -- when
@@ -439,25 +465,7 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 	token, raw, apiFlavor := pr.token, pr.raw, pr.apiFlavor
 	req := pr.pf.Req
 	model := req.Model
-	path, mode := endpointModeFor(target, apiFlavor)
-	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
-	// AND mode != disabled. endpointModeFor above only ever answers the mode half;
-	// for a coding-agent endpoint (path != "") whose coarse flavor the resolved
-	// target no longer serves, treat it as disabled here — the one place a
-	// server_agent app's per-model spec flavor is enforceable for these two
-	// endpoints (candidacy only checked the app-level flavor; see
-	// targetServesFlavor). It runs BEFORE the mode decides anything, so it holds
-	// a translate-mode endpoint to the full rule too -- but only for the target
-	// it judged: a request it finds lacking its flavor never reaches the
-	// translate dispatch. What does reach that dispatch unjudged (a body whose
-	// model the routing probe could not read, a request whose resolve failed
-	// above, and every translate-path re-resolve) is checked there only by
-	// targetIsImagesOnly and targetIsAudioOnly (resolveTranslateTarget), with
-	// neither this flavor check nor the mode read. A no-op for an ordinary app, whose flavor-less
-	// state already excluded it at candidacy.
-	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
-		mode = routing.EndpointModeDisabled
-	}
+	path, mode := passthroughModeFor(target, apiFlavor)
 	switch mode {
 	case routing.EndpointModePassthrough:
 		// The raw body reaches the upstream unexamined, so a strata target's image
@@ -478,6 +486,9 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 			endpoint: pr.endpoint,
 			reselect: func(lost routing.Target, gone error) {
 				s.reselectPassthrough(w, r, pr, lost, gone)
+			},
+			vendorFailover: func(lost routing.Target, h http.Header, retryAfter time.Duration, release func()) bool {
+				return s.failoverPassthrough(w, r, pr, lost, h, retryAfter, release)
 			},
 		})
 		return true
@@ -540,6 +551,33 @@ func (s *Server) reselectPassthrough(w http.ResponseWriter, r *http.Request, pr 
 	}
 	slog.Warn("native passthrough: the routed instance is gone and the instance re-selected serves this endpoint by translate only", "path", r.URL.Path, "api_flavor", again.apiFlavor, "model", again.pf.Req.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
 	s.failPassthrough(w, r, again, start, lost, gone)
+}
+
+// failoverPassthrough is the vendorFailover hook of a /v1/responses or /v1/messages
+// passthrough: lost, a vendor group member, answered pr's request with a limit (h its
+// headers, retryAfter its Retry-After). It fails the request over (vendorGroupFailover,
+// resolving like tryProxyNative) and, when another member of the group takes it and
+// passes this endpoint through as lost did, ends the refused attempt (release) and
+// relays the request there through relayPassthroughTarget, reporting true. A member
+// that would serve the endpoint by translate cannot take a relay that has already
+// chosen to pass the client's body through, so it is no failover either: on false
+// nothing was written and the caller relays lost's refusal.
+func (s *Server) failoverPassthrough(w http.ResponseWriter, r *http.Request, pr passthroughRequest, lost routing.Target, h http.Header, retryAfter time.Duration, release func()) bool {
+	resolve := func(token *auth.Token, req inference.Request) (routing.Target, error) {
+		return s.resolveTarget(r.Context(), token, req)
+	}
+	next, target, ok := s.vendorGroupFailover(pr.token, pr.pf.Req, lost, h, retryAfter, resolve)
+	if !ok {
+		return false
+	}
+	if _, mode := passthroughModeFor(target, pr.apiFlavor); mode != routing.EndpointModePassthrough {
+		slog.Warn("native passthrough: the vendor group member failed over to does not pass this endpoint through; relaying the limit answer", "path", r.URL.Path, "api_flavor", pr.apiFlavor, "model", pr.pf.Req.Model, "group", lost.VendorGroupID, "lost", lost.VendorAccountID, "account", target.VendorAccountID, "mode", string(mode))
+		return false
+	}
+	release()
+	again := pr
+	again.pf.Req = next
+	return s.relayPassthroughTarget(w, r, again, target, time.Now())
 }
 
 // failPassthrough answers a /v1/responses or /v1/messages request that ends before any
@@ -875,6 +913,28 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		}
 		s.failNativeExchange(w, r, ex, gone)
 		return
+	}
+
+	// A vendor group member that answered a limit (vendor_group_failover.go): nothing
+	// has been written to the client and nothing recorded. rel.vendorFailover moves the
+	// request to the group's next member; it ends this attempt first (release: the
+	// refusal's body closed, the watchdog stopped, the upstream context cancelled, the
+	// active row removed -- the new attempt registers its own), then that member
+	// answers and records in this attempt's place. When no member can take it, nothing
+	// has changed and the refusal is relayed below as it came, header allowlist and
+	// entitlement included.
+	if rel.vendorFailover != nil && rel.target.VendorGroupID != "" && provider.IsLimitStatus(resp.StatusCode) {
+		release := func() {
+			_ = resp.Body.Close()
+			if watchdog != nil {
+				watchdog.Stop()
+			}
+			cancel()
+			s.Active.Remove(id)
+		}
+		if rel.vendorFailover(rel.target, resp.Header, provider.ParseRetryAfter(resp.Header, time.Now()), release) {
+			return
+		}
 	}
 
 	// A STREAMED audio request (bufferedRetry is set only for a transcription or a speech
@@ -1431,6 +1491,18 @@ type nativeRelay struct {
 	// cannot take. Set by every relay caller; nil for a relay that is never re-selected,
 	// whose gone refusal proxyNative answers with gone's error itself.
 	reselect func(lost routing.Target, gone error)
+	// vendorFailover moves the request to the next member of its vendor group when
+	// the upstream answered a group target (VendorGroupID set) with a limit (429 or
+	// 402) before anything was written (vendor_group_failover.go): lost is the
+	// refusing member, h the refusal's headers, retryAfter its parsed Retry-After.
+	// When another member can take the request it first calls release, which ends
+	// this attempt -- the refusal's body closed, the watchdog stopped, the upstream
+	// context cancelled, the active row removed -- then relays the request to that
+	// member, which answers and records the usage row, and returns true. On false it
+	// has written nothing and called nothing, and proxyNative relays the refusal as it
+	// came. Set by relayPassthroughTarget (/v1/messages and /v1/responses); nil on
+	// every other relay.
+	vendorFailover func(lost routing.Target, h http.Header, retryAfter time.Duration, release func()) bool
 	// decisionsRewrite hands a decisions response to the buffered
 	// relayDecisionsResponse instead of the streaming copier: set on every
 	// translated /v1/decisions or /v1/systemone relay (the answer must be
