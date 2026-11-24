@@ -54,7 +54,7 @@ func assertMigration102Column(ctx context.Context, t *testing.T, s *SQLStore) {
 // column set, which a database stopped at version 101 does not have yet.
 func seedMigration102Pin(ctx context.Context, t *testing.T, s *SQLStore, now time.Time) {
 	t.Helper()
-	if err := s.CreateUser(ctx, newTestUser("u_m102", "m102@example.test", now)); err != nil {
+	if err := createUserAtBaseline(ctx, s, newTestUser("u_m102", "m102@example.test", now)); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
 	seedBaselineToken(ctx, t, s, "tok_m102", "u_m102", "m102", "m102-affinity-secret", now)

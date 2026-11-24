@@ -276,6 +276,28 @@ func TestUpdateUserAppliesChatFlags(t *testing.T) {
 	}
 }
 
+func TestUpdateOwnProfileAppliesChatVendorAccess(t *testing.T) {
+	svc, dir, _ := newTestService(t)
+	seedActiveUser(t, dir, "usr_cva", "cva@example.test", "password-1", "user")
+	ctx := context.Background()
+
+	set, err := svc.UpdateOwnProfile(ctx, "usr_cva", UserUpdate{ChatVendorAccess: ptr(`{"all":false}`)})
+	if err != nil || set.ChatVendorAccess != `{"all":false}` {
+		t.Fatalf("set policy: %+v err=%v", set, err)
+	}
+	// A nil pointer leaves the stored policy alone (an old client that only
+	// sends the chat flags must not clear it).
+	kept, err := svc.UpdateOwnProfile(ctx, "usr_cva", UserUpdate{ChatSecret: ptr(true)})
+	if err != nil || kept.ChatVendorAccess != `{"all":false}` || !kept.ChatSecret {
+		t.Fatalf("nil pointer must keep the policy: %+v err=%v", kept, err)
+	}
+	// An explicit empty string resets to unset.
+	cleared, err := svc.UpdateOwnProfile(ctx, "usr_cva", UserUpdate{ChatVendorAccess: ptr("")})
+	if err != nil || cleared.ChatVendorAccess != "" {
+		t.Fatalf("reset: %+v err=%v", cleared, err)
+	}
+}
+
 func TestUpdateUserLastAdminGuard(t *testing.T) {
 	svc, dir, _ := newTestService(t)
 	seedActiveUser(t, dir, "usr_admin", "admin@example.test", "password-1", "admin")

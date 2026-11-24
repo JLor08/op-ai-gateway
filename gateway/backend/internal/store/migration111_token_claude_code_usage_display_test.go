@@ -24,7 +24,7 @@ func TestMigration111TokenClaudeCodeUsageDisplay(t *testing.T) {
 		if cols := tableColumns(ctx, t, s, "api_tokens"); slices.Contains(cols, "claude_code_usage_display") {
 			t.Fatalf("api_tokens already has claude_code_usage_display at v110: %v", cols)
 		}
-		if err := s.CreateUser(ctx, newTestUser("u_m111", "m111@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m111", "m111@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		seedBaselineToken(ctx, t, s, "tok_pre111", "u_m111", "Pre", "hash-pre111", now)

@@ -133,7 +133,7 @@ func TestMigration91AddsVendorAccountShareColumns(t *testing.T) {
 			}
 		}
 
-		if err := s.CreateUser(ctx, newTestUser("u_m91", "m91@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m91", "m91@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		insertAccount := func(id string) {
@@ -284,7 +284,7 @@ func TestMigration91CreatesVendorAccountAdminGroups(t *testing.T) {
 
 		// Behavior: seed one account and two admin groups, then exercise the
 		// constraints the catalog claims.
-		if err := s.CreateUser(ctx, newTestUser("u_m91g", "m91g@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m91g", "m91g@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		sys := UserGroup{ID: "ugrp_m91_sys", Tier: GroupTierSystem, Name: "Sys", CreatedAt: now, UpdatedAt: now}

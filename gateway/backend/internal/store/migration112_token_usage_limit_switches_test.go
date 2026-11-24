@@ -28,7 +28,7 @@ func TestMigration112TokenUsageLimitSwitches(t *testing.T) {
 				t.Fatalf("api_tokens already has %s at v111: %v", c, cols)
 			}
 		}
-		if err := s.CreateUser(ctx, newTestUser("u_m112", "m112@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m112", "m112@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		seedBaselineToken(ctx, t, s, "tok_display", "u_m112", "Display", "hash-display", now)
