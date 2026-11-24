@@ -436,7 +436,7 @@ switch it off at any time.
 cannot be told apart from a deliberate choice, so no data migration flips it.
 The column default in the schema may stay `0`; the service decides the value at
 create. The docs that call the setting an "opt-in" (vendor doc §1.3, §8.2,
-ADR-108 entitlement bullet) are updated to "default on for new accounts".
+ADR-106 entitlement bullet) are updated to "default on for new accounts".
 
 ## 11. Persistence and API
 
