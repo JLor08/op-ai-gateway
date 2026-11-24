@@ -447,7 +447,11 @@ import (
 // ${HOST_GPU_IDS_MAIN_LAST} placeholder) and the runtime_process_tree_job
 // entry (process-tree job supervision). This is the ONE bump for the whole
 // branch; later commits on it do not bump again.
-const Version = "0.21.0"
+//
+// 0.21.0 -> 0.21.1 is a PATCH: the AMD Linux VRAM telemetry fix (#432) reads
+// rocm-smi 4.x output and adds a KFD per-process VRAM measurer. Hardware
+// capability, not a negotiated feature, so no agent.Features entry.
+const Version = "0.21.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
