@@ -30,13 +30,15 @@ type VendorUsagePuller interface {
 // no usable candidate (every member unreachable, disabled, without the model, or
 // excluded, or all blocked while fallback is off) yields no match and the next
 // group, then the account loop, runs. reachable is the grant's answer
-// (routableVendorAccounts), so a revoked share drops its member here.
+// (routableVendorAccounts), so a revoked share drops its member here. A token that
+// can use no group (TokenUsesVendorGroups) returns at once without reading the
+// groups, so a failing group read never fails a resolve that never needed groups.
 //
 // The listing (portal advertisedVendorAccountModels) uses the same group and
 // member rules, minus thresholds and cooldowns, so advertised names stay
 // routable.
 func (r *Resolver) resolveVendorGroup(ctx context.Context, token auth.Token, req inference.Request, apiFlavor string, reachable []VendorAccount) (Target, bool, error) {
-	if token.UserID == "" {
+	if !TokenUsesVendorGroups(token) {
 		return Target{}, false, nil
 	}
 	groups, err := r.store.VendorAccountGroupsByOwner(ctx, token.UserID)

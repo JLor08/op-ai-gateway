@@ -246,3 +246,65 @@ func TestResolveVendorGroupRequestsPullForUnknownReset(t *testing.T) {
 		t.Errorf("pulls = %v, want [subA]", puller.ids)
 	}
 }
+
+// failingGroupStore answers every group read with an error and counts the reads, so
+// a test can tell a resolve that never needs groups from one that reads them.
+type failingGroupStore struct {
+	*MemoryStore
+	groupReads int
+}
+
+func (s *failingGroupStore) VendorAccountGroupsByOwner(context.Context, string) ([]VendorAccountGroup, error) {
+	s.groupReads++
+	return nil, errors.New("groups table unavailable")
+}
+
+// A token that can use no group (neither all + include_groups nor a listed group)
+// never reads the groups, so a failing group read cannot fail its resolve; a token
+// that can still reads them.
+func TestResolveVendorGroupSkippedForTokensThatUseNoGroup(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	newFixture := func(t *testing.T) (*groupFixture, *failingGroupStore) {
+		t.Helper()
+		store := &failingGroupStore{MemoryStore: NewMemoryStore()}
+		f := &groupFixture{store: store.MemoryStore, r: vendorResolver(store, now, true, vendorRoutingModeVendorFirst), now: now}
+		f.account(t, "keyB", groupTestOwner, "key/", "claude-opus-4-5")
+		return f, store
+	}
+	listed := []auth.VendorAccessEntry{{AccountID: "keyB"}}
+	for name, access := range map[string]auth.VendorAccess{
+		"all without include_groups": {All: true},
+		"include_groups without all": {IncludeGroups: true, Accounts: listed},
+		"accounts only":              {Accounts: listed},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, store := newFixture(t)
+			token := groupToken()
+			token.VendorAccess = access
+			target, err := f.r.Resolve(ctx, token, groupRequest("key/claude-opus-4-5"))
+			if err != nil || target.VendorAccountID != "keyB" || target.VendorGroupID != "" {
+				t.Fatalf("Resolve = account %q group %q, err %v; want keyB outside any group", target.VendorAccountID, target.VendorGroupID, err)
+			}
+			if store.groupReads != 0 {
+				t.Fatalf("group reads = %d, want none for a token that can use no group", store.groupReads)
+			}
+		})
+	}
+	for name, access := range map[string]auth.VendorAccess{
+		"all + include_groups": {All: true, IncludeGroups: true},
+		"a listed group":       {Accounts: listed, Groups: []auth.VendorAccessGroupEntry{{GroupID: "vag_1"}}},
+	} {
+		t.Run(name+" still reads the groups", func(t *testing.T) {
+			f, store := newFixture(t)
+			token := groupToken()
+			token.VendorAccess = access
+			if _, err := f.r.Resolve(ctx, token, groupRequest("key/claude-opus-4-5")); err == nil {
+				t.Fatal("Resolve succeeded, want the group read's failure")
+			}
+			if store.groupReads != 1 {
+				t.Fatalf("group reads = %d, want 1", store.groupReads)
+			}
+		})
+	}
+}

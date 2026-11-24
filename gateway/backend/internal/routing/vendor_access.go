@@ -63,6 +63,17 @@ func TokenOwnsVendorGroup(token auth.Token, g VendorAccountGroup) bool {
 	return token.UserID != "" && g.OwnerUserID == token.UserID
 }
 
+// TokenUsesVendorGroups reports whether token can use any vendor account group at
+// all: a token with a user that has all + include_groups, or lists a group. The
+// resolver's group step and the listing's group half read the groups only for such
+// a token, so a token that can use none neither pays for the read nor fails on it.
+// Whether a listed group is the user's own and active is still decided per group
+// (TokenVendorGroupPrefix).
+func TokenUsesVendorGroups(token auth.Token) bool {
+	access := token.VendorAccess
+	return token.UserID != "" && ((access.All && access.IncludeGroups) || len(access.Groups) > 0)
+}
+
 // TokenVendorGroupPrefix reports the public model-name prefix a token serves group
 // g under, and whether g is allowed for the token at all. A group the token's user
 // does not own is never allowed, even when listed.

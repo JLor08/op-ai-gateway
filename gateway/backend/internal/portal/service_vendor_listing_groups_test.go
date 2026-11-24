@@ -4,6 +4,8 @@
 package portal
 
 import (
+	"context"
+	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
@@ -150,5 +152,35 @@ func TestVendorListingGroupParityWithResolver(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// groupReadFailStore fails every group read and counts the reads.
+type groupReadFailStore struct {
+	routing.Store
+	groupReads int
+}
+
+func (s *groupReadFailStore) VendorAccountGroupsByOwner(context.Context, string) ([]routing.VendorAccountGroup, error) {
+	s.groupReads++
+	return nil, errors.New("groups table unavailable")
+}
+
+// A token that can use no group never reads the groups, so a failing group read
+// leaves its listing complete; a token that uses groups sees the incomplete set.
+func TestVendorListingReadsGroupsOnlyForTokensThatUseThem(t *testing.T) {
+	e := groupListingEnv(t)
+	store := &groupReadFailStore{Store: e.routes}
+	e.svc.routes = store
+
+	owned, loaded := e.svc.ownVendorAccountModels(e.ctx, groupOwnerToken(false))
+	if !loaded || len(owned) == 0 {
+		t.Fatalf("all without include_groups = %d accounts, loaded %v; want the own accounts and a complete set", len(owned), loaded)
+	}
+	if store.groupReads != 0 {
+		t.Fatalf("group reads = %d, want none for a token that can use no group", store.groupReads)
+	}
+	if _, loaded := e.svc.ownVendorAccountModels(e.ctx, groupOwnerToken(true)); loaded || store.groupReads != 1 {
+		t.Fatalf("all + include_groups: loaded %v after %d group reads, want an incomplete set after one read", loaded, store.groupReads)
 	}
 }

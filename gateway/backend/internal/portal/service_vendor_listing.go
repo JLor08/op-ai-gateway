@@ -151,10 +151,12 @@ type vendorAccountModels struct {
 // listing: they decide which member serves, not whether the name exists. Groups
 // come first because the resolver tries them before any single account (a group
 // shadows its members' names). loaded is false when a store read failed; what was
-// read is still returned. Nothing more is read for a token with no user (groups
-// are personal).
+// read is still returned. Nothing is read for a token that can use no group
+// (routing.TokenUsesVendorGroups: no user -- groups are personal -- or neither
+// all + include_groups nor a listed group), so its listing never depends on the
+// group tables.
 func (s *Service) advertisedVendorGroupModels(ctx context.Context, token auth.Token, accounts []routing.VendorAccount, subscriptionsOn bool) (out []vendorAccountModels, loaded bool) {
-	if token.UserID == "" {
+	if !routing.TokenUsesVendorGroups(token) {
 		return nil, true
 	}
 	groups, err := s.routes.VendorAccountGroupsByOwner(ctx, token.UserID)

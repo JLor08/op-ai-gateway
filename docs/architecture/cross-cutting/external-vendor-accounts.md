@@ -3072,7 +3072,9 @@ own accounts, then shared accounts.
   the grant) and never breaks token decode, listing or routing.
 - **Listing** is §6.7: the union of the usable members' models under the group prefix, thresholds ignored.
 - **Principals.** The group step runs only for a principal with a user id (a service owns no group) and reads the
-  owner's groups on a vendor-eligible request.
+  owner's groups on a vendor-eligible request **only when the token can use a group** at all (`all` + `include_groups`,
+  or a listed group: `routing.TokenUsesVendorGroups`); the listing's group half applies the same gate, so a token that
+  uses no group never reads the group tables and a failing group read cannot fail its resolve or listing.
 
 ### 12.4 Failover on vendor limit errors
 
