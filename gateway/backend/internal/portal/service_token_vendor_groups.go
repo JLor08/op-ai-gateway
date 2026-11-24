@@ -86,8 +86,8 @@ func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.To
 	return nil
 }
 
-// checkOwnAccountsAgainstGroups is the backstop of `all + include_groups`: all makes
-// every active own account of the principal an advertised source under its own
+// checkOwnAccountsAgainstGroups is the backstop of `all` with groups (listed or via
+// include_groups): all makes every active own account of the principal an advertised source under its own
 // prefix, next to the groups the switch pulls in, so an own account that is NOT a
 // member of a group yet serves one of the group's names is a conflict (group save
 // already prevents it). Own accounts clashing with each other stay as tolerated under

@@ -146,6 +146,7 @@ func TestTokenVendorGroupEntryValidation(t *testing.T) {
 		{"two groups, one overridden away", &VendorAccessDTO{Groups: []VendorAccessGroupDTO{
 			{GroupID: "vag_c"}, {GroupID: "vag_d", PrefixOverride: &PrefixOverrideDTO{Enabled: true, Value: "d/"}},
 		}}, nil},
+		{"all with a listed group clashing with a non-member own account", &VendorAccessDTO{All: true, Groups: groupEntries("vag_c")}, ErrTokenVendorAccessConflict},
 		{"all+include_groups over the whole fixture clashes", &VendorAccessDTO{All: true, IncludeGroups: true, Accounts: []VendorAccessEntryDTO{}}, ErrTokenVendorAccessConflict},
 		{"old policy without groups", &VendorAccessDTO{Accounts: accountEntries("acc_a", "acc_b")}, nil},
 		{"all without include_groups ignores group clashes", &VendorAccessDTO{All: true}, nil},

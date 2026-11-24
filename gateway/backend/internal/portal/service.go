@@ -6194,7 +6194,7 @@ func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token
 			return err
 		}
 	}
-	if d.All && d.IncludeGroups {
+	if d.All {
 		return s.checkOwnAccountsAgainstGroups(ctx, principal, &check)
 	}
 	return nil
