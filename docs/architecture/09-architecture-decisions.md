@@ -13674,6 +13674,8 @@ a token with a server override, a prefix override or generated Claude aliases of
 
 - Narrowing the policy narrows the session's own `/v1/models`, the Models page and the dashboard's live routes too (intended: like a token), and a
   default user is unaffected.
+- The token editor's override and fallback model-target pickers are fed the session listing, so a narrowed chat policy narrows their choices too;
+  this is accepted (a follow-up may feed the editor an unrestricted own listing).
 - A token with a server override still shows raw server model names in the chat picker.
 - The users table exists only on the SQL store (SQLite and PostgreSQL), so there is no in-memory implementation of the column.
 - → [External Vendor Accounts §11.4](cross-cutting/external-vendor-accounts.md#114-who-is-restricted-api-tokens-and-the-owners-chat-session-policy),

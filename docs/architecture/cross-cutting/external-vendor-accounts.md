@@ -2932,7 +2932,9 @@ choice. The token list's synthetic "chat session" row carries the **effective** 
 `vendor_access` whenever the user row was read (unset reads back as
 `{all: true, include_groups: true}`, an explicit zero as `{all: false}` with no accounts);
 it is omitted only when that lookup fails, and the chat card then disables the editor and
-sends no policy. Admins see each user's chat policy through
+sends no policy. A narrowed chat policy also narrows the token editor's override and
+fallback model-target pickers, which are fed the session listing; this is an accepted
+consequence (a follow-up may feed the editor an unrestricted own listing). Admins see each user's chat policy through
 `GET /api/admin/users/{id}/tokens`, as they already see token policies; the admin PATCH
 surface cannot write it.
 

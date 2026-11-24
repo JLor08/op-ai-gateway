@@ -1982,7 +1982,8 @@ func (s *Service) UserTokens(ctx context.Context, principal auth.Token, userID s
 
 // tokensForUser lists userID's real tokens with the synthetic, non-deletable
 // ChatSession row prepended, carrying that user's profile chat flags. A user
-// lookup failure falls back to false/false rather than failing the whole list;
+// lookup failure falls back to false/false (and omits the chat row's
+// vendor_access, so the editor stays disabled) rather than failing the whole list;
 // the frontend localizes the display name via is_chat_session.
 func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListResponse, error) {
 	records, err := s.tokens.TokensByUser(ctx, userID)
