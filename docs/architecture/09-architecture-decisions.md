@@ -13653,11 +13653,11 @@ a token with a server override, a prefix override or generated Claude aliases of
   generated Claude aliases (with `original_model_id`) come from the existing listing code, and the loading counts use the run-as principal. A bearer caller
   sending the header is refused `403 portal.token_forbidden` before any lookup (inference endpoints silently ignore the header for bearers; here a silent
   ignore would return the bearer's own list as if it were the answer). A foreign, unknown or disabled token gets the gate's own `403
-  portal.token_forbidden` with an identical body, so there is no existence leak. With `?manage=1` the header is `400 portal.models_run_as_conflict`.
+  portal.token_forbidden` with an identical body, so there is no existence leak. With `?manage=1` the header is `400 portal.models_run_as_conflict`; that check runs before the bearer refusal, so a bearer sending both gets the 400 (the 403 still precedes any token lookup).
 - **The chat picker follows the selected token.** The whole chat list (voice pickers included) swaps to the token-scoped list while a token is selected, never
   showing the session's models during the load; the first failed scoped fetch leaves the picker empty with the error surfaced, never the session list. A
-  generated alias is labelled `id (original_model_id)`. Picking a manual alias that exists in the scoped list skips the client-side override remap, since the
-  backend remaps through the run-as token. A token with a `server_override` keeps the server-locked picker (an accepted exception: its picker shows the
+  generated alias is labelled `id (original_model_id)`. Picking an **offered** manual alias (a `model_override_map` key with `offer: true`) that is in the scoped list skips the client-side override remap, since the
+  backend remaps through the run-as token; the catch-all `model_override` and `offer: false` keys still remap client-side. A token with a `server_override` keeps the server-locked picker (an accepted exception: its picker shows the
   raw server model names).
 
 **Rejected:**
