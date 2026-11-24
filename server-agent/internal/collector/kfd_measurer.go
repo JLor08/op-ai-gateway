@@ -161,17 +161,29 @@ func attributeKFD(perPID map[int]map[uint64]int64, ordinals map[uint64]int, pids
 		if !ok || !wanted[owner] {
 			continue
 		}
-		for gpuID, bytes := range byGPU {
-			ordinal, ok := ordinals[gpuID]
-			if !ok {
-				continue
-			}
-			if sums[owner] == nil {
-				sums[owner] = make(map[int]int64)
-			}
-			sums[owner][ordinal] += bytes
-		}
+		sumKFDBytes(sums, owner, byGPU, ordinals)
 	}
+	return kfdSumsToMiB(sums)
+}
+
+// sumKFDBytes adds one process's per-GPU bytes to its owner's per-ordinal
+// sums, skipping GPUs that have no ordinal.
+func sumKFDBytes(sums map[int]map[int]int64, owner int, byGPU map[uint64]int64, ordinals map[uint64]int) {
+	for gpuID, bytes := range byGPU {
+		ordinal, ok := ordinals[gpuID]
+		if !ok {
+			continue
+		}
+		if sums[owner] == nil {
+			sums[owner] = make(map[int]int64)
+		}
+		sums[owner][ordinal] += bytes
+	}
+}
+
+// kfdSumsToMiB converts summed bytes to MiB, dropping entries that round to
+// zero or below. The result is nil when nothing remains.
+func kfdSumsToMiB(sums map[int]map[int]int64) map[int]map[int]int {
 	var out map[int]map[int]int
 	for owner, byOrdinal := range sums {
 		for ordinal, bytes := range byOrdinal {
