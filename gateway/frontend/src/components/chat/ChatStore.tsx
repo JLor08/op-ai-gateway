@@ -291,6 +291,9 @@ export type ChatStore = {
   maxTokens: number;
   selectedTokenId: string;
   chatModels: ModelOption[];
+  // True while the selected token's own model list is being fetched for the first time (the
+  // picker is empty until it lands; the session's list is never shown in its place).
+  modelsLoading: boolean;
   modelOptions: ModelOption[];
   usableTokens: PortalToken[];
   // The caller's manageable servers (see ChatStoreProvider's `servers` prop):
@@ -640,6 +643,9 @@ export const ChatStoreContext = createContext<ChatStore | null>(null);
 // streaming actually flips. Default false = safe outside any provider.
 export const ChatStreamingContext = createContext<boolean>(false);
 
+// A stable empty list, so a loading scoped picker does not re-derive chatModels every render.
+const NO_MODELS: ModelOption[] = [];
+
 export function useChatStore(): ChatStore {
   const c = useContext(ChatStoreContext);
   if (!c) throw new Error('useChatStore must be used within ChatStoreProvider');
@@ -660,6 +666,7 @@ export function ChatStoreProvider({
   servers,
   onRefresh,
   refreshModels,
+  fetchModels,
   t,
   locale,
   children,
@@ -704,6 +711,10 @@ export function ChatStoreProvider({
   // once the upstream recovers. Optional so existing test renders that don't
   // care about recovery keep working unchanged.
   refreshModels?: () => void;
+  // Reads the model listing AS a run-as token (the token's own names, aliases and
+  // visibility). While a token without a server override is selected the picker lists
+  // this instead of `models`. Optional so renders that never select a token keep working.
+  fetchModels?: (runAsTokenId: string) => Promise<ModelOption[]>;
   t: Translation;
   // The portal's current UI language (the one `t` is in). The speech composer pre-fills its
   // language control with it (see the pre-fill effect), so a spoken answer follows the
@@ -847,9 +858,39 @@ export function ChatStoreProvider({
   // an audio row's flavor (unprobed ones and agent-managed ones whose agent has
   // not reported either verdict have none and are listed there anyway).
   // anthropic alone offers nothing: the chat sends no /v1/messages request.
+  // Only the caller's own active gateway:use tokens may be selected as a
+  // run-as target (mirrors the backend's AuthorizeRunAsToken check).
+  const usableTokens = useMemo(
+    () => tokens.filter((tk) => tk.status === 'active' && tk.scopes.includes('gateway:use')),
+    [tokens],
+  );
+  // The selected run-as token's own listing. A token with a server override keeps the
+  // server-locked picker (serverModels), so only the others are scoped.
+  const scopedTokenId =
+    fetchModels !== undefined &&
+    selectedTokenId !== '' &&
+    usableTokens.some((tk) => tk.id === selectedTokenId && (tk.server_override ?? '') === '')
+      ? selectedTokenId
+      : '';
+  // Keyed by token: a list fetched for another token is never shown for this one, so a
+  // switch shows an empty picker (loading) rather than the previous token's or the
+  // session's models. rows stays null until the first fetch for that token lands.
+  const [scoped, setScoped] = useState<{
+    tokenId: string;
+    rows: ModelOption[] | null;
+    failed: boolean;
+  }>({ tokenId: '', rows: null, failed: false });
+  const scopedCurrent = scopedTokenId !== '' && scoped.tokenId === scopedTokenId;
+  const scopedRows = scopedCurrent ? scoped.rows : null;
+  const modelsLoading =
+    scopedTokenId !== '' && scopedRows === null && !(scopedCurrent && scoped.failed);
+  const effectiveModels = useMemo(
+    () => (scopedTokenId !== '' ? (scopedRows ?? NO_MODELS) : models),
+    [scopedTokenId, scopedRows, models],
+  );
   const chatModels = useMemo(
     () =>
-      models.filter((option) => {
+      effectiveModels.filter((option) => {
         const offered = offeredFlavors(option);
         return (
           offered.includes('openai') ||
@@ -865,7 +906,7 @@ export function ChatStoreProvider({
             (speechOffered(option) || option.transcription === true))
         );
       }),
-    [models],
+    [effectiveModels],
   );
   // The dropdown's option list. A non-empty `model` that is not (or no longer)
   // in chatModels is injected as a synthetic trailing option so SearchableSelect
@@ -887,19 +928,17 @@ export function ChatStoreProvider({
     return chatModels;
   }, [chatModels, model]);
 
-  // Only the caller's own active gateway:use tokens may be selected as a
-  // run-as target (mirrors the backend's AuthorizeRunAsToken check).
-  const usableTokens = useMemo(
-    () => tokens.filter((tk) => tk.status === 'active' && tk.scopes.includes('gateway:use')),
-    [tokens],
-  );
   const selectedToken = usableTokens.find((tk) => tk.id === selectedTokenId);
   // The run-as token's override for the CURRENTLY-selected model: an exact
   // per-model map entry wins, otherwise the catch-all (model_override), otherwise
   // none. Mirrors the backend's resolveModelOverride so the effective model shown
   // matches what the server will route (the server does the actual remap via the
   // run-as token; the chat sends the raw picked model, see currentSettings).
-  const overrideModel = resolveTokenOverride(selectedToken, model);
+  // Not for a model the token's own scoped listing offers: a picked manual alias is already
+  // the name the token is called by, and the server remaps it exactly once.
+  const pickedInScopedList =
+    scopedRows !== null && model !== '' && scopedRows.some((option) => option.id === model);
+  const overrideModel = pickedInScopedList ? '' : resolveTokenOverride(selectedToken, model);
   // A pure catch-all (a catch-all with no per-model entries) forces every model, so
   // the model picker is locked to it (old single-override behavior). With per-model
   // entries the picked model IS the map key, so the picker stays editable.
@@ -1105,9 +1144,18 @@ export function ChatStoreProvider({
   const apiRef = useRef(api);
   apiRef.current = api;
   const onRefreshRef = useRef(onRefresh);
-  onRefreshRef.current = onRefresh;
+  // After every run the token's own listing is reloaded with the rest.
+  onRefreshRef.current = () => {
+    void refreshScopedRef.current();
+    return onRefresh();
+  };
   const refreshModelsRef = useRef(refreshModels);
   refreshModelsRef.current = refreshModels;
+  const fetchModelsRef = useRef(fetchModels);
+  fetchModelsRef.current = fetchModels;
+  const scopedTokenIdRef = useRef(scopedTokenId);
+  scopedTokenIdRef.current = scopedTokenId;
+  const refreshScopedRef = useRef<() => Promise<void>>(async () => {});
   const tRef = useRef(t);
   tRef.current = t;
   // The UI language is read by the language pre-fill, which must not re-run when only the
@@ -1641,10 +1689,38 @@ export function ChatStoreProvider({
   useEffect(() => {
     if (modelAvailable || effectiveModel === '') return;
     const id = setInterval(() => {
-      refreshModelsRef.current?.();
+      if (scopedTokenIdRef.current !== '') void refreshScopedRef.current();
+      else refreshModelsRef.current?.();
     }, 15000);
     return () => clearInterval(id);
   }, [modelAvailable, effectiveModel]);
+
+  // (Re)load the selected token's own listing. Latest-wins per token: a response for a
+  // token that is no longer the selected one is dropped. A failure keeps the rows already
+  // held for this token; with none yet (the first fetch after a switch) the picker stays
+  // empty and the error is shown -- never the session's list in its place.
+  const refreshScoped = useCallback(async () => {
+    const tokenId = scopedTokenIdRef.current;
+    const fetch = fetchModelsRef.current;
+    if (tokenId === '' || !fetch) return;
+    try {
+      const rows = await fetch(tokenId);
+      if (scopedTokenIdRef.current !== tokenId) return;
+      setScoped({ tokenId, rows, failed: false });
+    } catch (err) {
+      if (scopedTokenIdRef.current !== tokenId) return;
+      setScoped((prev) =>
+        prev.tokenId === tokenId
+          ? { ...prev, failed: true }
+          : { tokenId, rows: null, failed: true },
+      );
+      showErrorRef.current(formatPortalError(err, tRef.current));
+    }
+  }, []);
+  refreshScopedRef.current = refreshScoped;
+  useEffect(() => {
+    if (scopedTokenId !== '') void refreshScoped();
+  }, [scopedTokenId, refreshScoped]);
 
   // Clear a composer attachment the (newly) effective model will not use —
   // e.g. switching from a vision-capable model to one that is not, with an
@@ -3083,6 +3159,7 @@ export function ChatStoreProvider({
     maxTokens,
     selectedTokenId,
     chatModels,
+    modelsLoading,
     modelOptions,
     usableTokens,
     manageableServers,

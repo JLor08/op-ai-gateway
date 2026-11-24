@@ -236,7 +236,13 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
       ? c.serverOverrideModels.map((option) => ({ value: option.id, label: option.display_name }))
       : c.modelOptions.map((option) => ({
           value: option.id,
-          label: option.display_name,
+          // A generated alias row (the name a token offers for another model) reads
+          // "offered name (original name)". Not display_name: on an alias row that is the
+          // TARGET's label, which would hide the name the user picks.
+          label:
+            option.original_model_id && option.original_model_id !== option.id
+              ? `${option.id} (${option.original_model_id})`
+              : option.display_name,
           loaded: option.loaded,
           loadedTitle:
             option.loaded_on && option.loaded_on.length > 0
@@ -335,6 +341,8 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
     modelHelperText = `${t.chatModelFromToken}: ${c.overrideModel}`;
   } else if (c.effectiveServerOverride !== '') {
     modelHelperText = t.serverOverrideFilteredHint;
+  } else if (c.modelsLoading) {
+    modelHelperText = t.chatModelsLoadingForToken;
   }
 
   // The advanced image controls follow the PICKED model: each dropdown offers
