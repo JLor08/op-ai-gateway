@@ -338,14 +338,46 @@ func TestVendorAccountGroupMemberStates(t *testing.T) {
 	})
 	t.Run("cooldown", func(t *testing.T) {
 		e := newVendorGroupEnv(t)
+		// An own member's usage counts, so its line carries the routing end.
 		until := e.now.Add(30 * time.Second)
-		e.cooldowns.Set(grantOwnAccount, "gpt-x", until)
+		e.cooldowns.Set(grantOwnAccount, "gpt-x", until, e.now.Add(routing.DefaultVendorLimitCooldown))
 		g := e.create("p/", grantOwnAccount, groupOwn2)
 		m := requireMember(t, g, 1, grantOwnAccount, "cooldown", "cooldown")
 		if m.FreeAt == nil || !m.FreeAt.Equal(until) || len(m.Cooldowns) != 1 || m.Cooldowns[0].Model != "gpt-x" || !m.Cooldowns[0].Until.Equal(until) {
 			t.Errorf("cooldown member = %+v", m)
 		}
 		requireMember(t, g, 2, groupOwn2, "active", "")
+	})
+	t.Run("cooldown of a shared member without usage opt-in shows only the public end", func(t *testing.T) {
+		e := newVendorGroupEnv(t)
+		// At 100 % with a known reset, and cooled down until that scraped reset for
+		// routing: the borrower's view must show neither the figure nor the reset, only
+		// the cooldown with its public end (Retry-After or the default).
+		reset := e.now.Add(2 * time.Hour)
+		public := e.now.Add(routing.DefaultVendorLimitCooldown)
+		e.usage(grantShared, 100, &reset)
+		e.cooldowns.Set(grantShared, "gpt-x", reset, public)
+		g := e.create("p/", grantShared, groupOwn2)
+		m := requireMember(t, g, 1, grantShared, "cooldown", "cooldown")
+		if m.FreeAt == nil || !m.FreeAt.Equal(public) {
+			t.Errorf("free at = %v, want the public cooldown end %v (never the scraped reset %v)", m.FreeAt, public, reset)
+		}
+		if len(m.Cooldowns) != 1 || m.Cooldowns[0].Model != "gpt-x" || !m.Cooldowns[0].Until.Equal(public) {
+			t.Errorf("cooldowns = %+v, want gpt-x until the public end %v", m.Cooldowns, public)
+		}
+		if m.Pct != nil || m.Usage != nil {
+			t.Errorf("a member the owner does not share usage of exposes figures: %+v", m)
+		}
+		requireMember(t, g, 2, groupOwn2, "active", "")
+
+		// Past the public end the view shows no cooldown, although routing still
+		// skips the member until the scraped reset.
+		setUsageClock(e.svc, public.Add(time.Second))
+		g, _ = e.svc.GetVendorAccountGroup(e.ctx, e.owner, g.ID)
+		m = requireMember(t, g, 1, grantShared, "active", "")
+		if m.FreeAt != nil || len(m.Cooldowns) != 0 || m.Pct != nil || m.Usage != nil {
+			t.Errorf("past the public end = %+v, want an active line with no cooldown, end or figure", m)
+		}
 	})
 	t.Run("every member blocked falls back to the soonest", func(t *testing.T) {
 		e := newVendorGroupEnv(t)

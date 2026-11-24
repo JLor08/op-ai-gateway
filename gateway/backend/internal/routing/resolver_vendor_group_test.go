@@ -176,7 +176,7 @@ func TestResolveVendorGroupSkipsCooldownForThatModelOnly(t *testing.T) {
 	f.account(t, "keyB", groupTestOwner, "key/", "claude-opus-4-5", "claude-sonnet-4-5")
 	f.group(t, "vag_1", "claude/", "subA", "keyB")
 	cd := NewVendorLimitCooldowns()
-	cd.Set("subA", "claude-opus-4-5", f.now.Add(time.Minute))
+	cd.Set("subA", "claude-opus-4-5", f.now.Add(time.Minute), f.now.Add(time.Minute))
 	f.r.SetVendorLimitCooldowns(cd)
 
 	opus, err := f.r.Resolve(context.Background(), groupToken(), groupRequest("claude/claude-opus-4-5"))

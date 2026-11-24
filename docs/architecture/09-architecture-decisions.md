@@ -13536,6 +13536,8 @@ inventing usage figures and hammering a vendor's rate-limited usage endpoint, an
   of a Codex window at 100 %, each only when in the future (a reset already past would create a zero-length cooldown and is ignored); with none
   known it is 60 s. A per-model weekly window can be days away, and an account-wide block would push other models to the paid reserve while the
   subscription still has room; account-wide exhaustion is what the thresholds cover. A restart forgets it, which at worst costs one rejected attempt.
+  Each entry keeps a second, public end from `Retry-After` or the 60 s default alone; routing honours the precise end, and the group status view
+  shows the public one for a member whose usage the viewer is not entitled to, so the process-wide entry cannot leak a scraped reset to a borrower.
 - **No mid-stream switch.** Failover happens before the first upstream byte. On the translate stream the gateway's own opening frames
   (`response.created`, `message_start`) do not count: they are member-independent, so the request may still move on after them; the first
   upstream event ends the window. Passthrough peeks the status before writing anything. Once a byte of the member's response reached the client,

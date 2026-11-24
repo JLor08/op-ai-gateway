@@ -12,7 +12,7 @@ import (
 func TestVendorLimitCooldownsPerAccountAndModel(t *testing.T) {
 	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	c := NewVendorLimitCooldowns()
-	c.Set("acc_1", "claude-opus", now.Add(time.Minute))
+	c.Set("acc_1", "claude-opus", now.Add(time.Minute), now.Add(time.Minute))
 	if u, ok := c.Until("acc_1", "claude-opus", now); !ok || !u.Equal(now.Add(time.Minute)) {
 		t.Fatalf("opus = (%v,%v)", u, ok)
 	}
@@ -27,7 +27,7 @@ func TestVendorLimitCooldownsPerAccountAndModel(t *testing.T) {
 func TestVendorLimitCooldownsExpiryDeletes(t *testing.T) {
 	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	c := NewVendorLimitCooldowns()
-	c.Set("acc_1", "m", now.Add(time.Minute))
+	c.Set("acc_1", "m", now.Add(time.Minute), now.Add(time.Minute))
 	if _, ok := c.Until("acc_1", "m", now.Add(time.Minute)); ok {
 		t.Fatal("expired cooldown still reported")
 	}
@@ -39,10 +39,10 @@ func TestVendorLimitCooldownsExpiryDeletes(t *testing.T) {
 func TestVendorLimitCooldownsActiveSorted(t *testing.T) {
 	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	c := NewVendorLimitCooldowns()
-	c.Set("acc_1", "b", now.Add(time.Minute))
-	c.Set("acc_1", "a", now.Add(2*time.Minute))
-	c.Set("acc_1", "old", now.Add(-time.Minute))
-	c.Set("acc_2", "z", now.Add(time.Minute))
+	c.Set("acc_1", "b", now.Add(time.Minute), now.Add(time.Minute))
+	c.Set("acc_1", "a", now.Add(2*time.Minute), now.Add(2*time.Minute))
+	c.Set("acc_1", "old", now.Add(-time.Minute), now.Add(-time.Minute))
+	c.Set("acc_2", "z", now.Add(time.Minute), now.Add(time.Minute))
 	got := c.Active("acc_1", now)
 	if len(got) != 2 || got[0].UpstreamModel != "a" || got[1].UpstreamModel != "b" {
 		t.Fatalf("Active = %#v", got)
@@ -52,15 +52,64 @@ func TestVendorLimitCooldownsActiveSorted(t *testing.T) {
 	}
 }
 
+// A cooldown has two ends: the one routing honours (which may come from a scraped
+// window reset) and the public one built from Retry-After or the default alone,
+// which is all a viewer not entitled to the account's usage may see. Each end
+// expires on its own; the entry goes once both have.
+func TestVendorLimitCooldownsKeepAPublicEnd(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+
+	t.Run("a scraped reset later than the public end", func(t *testing.T) {
+		c := NewVendorLimitCooldowns()
+		precise, public := now.Add(2*time.Hour), now.Add(DefaultVendorLimitCooldown)
+		c.Set("acc", "m", precise, public)
+		if u, ok := c.Until("acc", "m", now); !ok || !u.Equal(precise) {
+			t.Fatalf("Until = (%v,%v), want the routing end %v", u, ok, precise)
+		}
+		if got := c.Active("acc", now); len(got) != 1 || !got[0].Until.Equal(precise) {
+			t.Fatalf("Active = %#v, want the routing end %v", got, precise)
+		}
+		if got := c.ActivePublic("acc", now); len(got) != 1 || got[0].UpstreamModel != "m" || !got[0].Until.Equal(public) {
+			t.Fatalf("ActivePublic = %#v, want the public end %v", got, public)
+		}
+		later := public.Add(time.Second)
+		if got := c.ActivePublic("acc", later); len(got) != 0 {
+			t.Fatalf("ActivePublic past the public end = %#v, want none", got)
+		}
+		if u, ok := c.Until("acc", "m", later); !ok || !u.Equal(precise) {
+			t.Fatalf("Until past the public end = (%v,%v), want routing still cooling down until %v", u, ok, precise)
+		}
+	})
+	t.Run("a public end later than the routing end", func(t *testing.T) {
+		c := NewVendorLimitCooldowns()
+		precise, public := now.Add(10*time.Second), now.Add(time.Hour)
+		c.Set("acc", "m", precise, public)
+		later := now.Add(20 * time.Second)
+		if _, ok := c.Until("acc", "m", later); ok {
+			t.Fatal("Until past the routing end still reports a cooldown")
+		}
+		if got := c.Active("acc", later); len(got) != 0 {
+			t.Fatalf("Active past the routing end = %#v, want none", got)
+		}
+		if got := c.ActivePublic("acc", later); len(got) != 1 || !got[0].Until.Equal(public) {
+			t.Fatalf("ActivePublic = %#v, want the public end %v kept after the routing end passed", got, public)
+		}
+		c.Until("acc", "m", public)
+		if len(c.m) != 0 {
+			t.Fatalf("entry not deleted once both ends passed: %v", c.m)
+		}
+	})
+}
+
 func TestVendorLimitCooldownsNilSafe(t *testing.T) {
 	var c *VendorLimitCooldowns
 	now := time.Now()
-	c.Set("a", "m", now.Add(time.Minute))
+	c.Set("a", "m", now.Add(time.Minute), now.Add(time.Minute))
 	if _, ok := c.Until("a", "m", now); ok {
 		t.Fatal("nil registry reported a cooldown")
 	}
-	if c.Active("a", now) != nil {
-		t.Fatal("nil registry Active must be nil")
+	if c.Active("a", now) != nil || c.ActivePublic("a", now) != nil {
+		t.Fatal("nil registry Active and ActivePublic must be nil")
 	}
 }
 
@@ -73,9 +122,10 @@ func TestVendorLimitCooldownsConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 200; j++ {
-				c.Set("acc", "m", now.Add(time.Minute))
+				c.Set("acc", "m", now.Add(time.Minute), now.Add(time.Minute))
 				c.Until("acc", "m", now)
 				c.Active("acc", now)
+				c.ActivePublic("acc", now)
 			}
 		}()
 	}

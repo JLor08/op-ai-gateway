@@ -179,6 +179,39 @@ func TestPassthroughMessagesFailsOverOnVendor429(t *testing.T) {
 	}
 }
 
+// TestPassthroughCooldownPublicEndIgnoresTheScrapedReset: a refusal without a
+// Retry-After cools the member down until the scraped unified reset for routing, but
+// its public end -- the one a borrower who is not entitled to the account's usage is
+// shown -- is the 60 s default, never that reset.
+func TestPassthroughCooldownPublicEndIgnoresTheScrapedReset(t *testing.T) {
+	reset := time.Now().Add(time.Hour).Truncate(time.Second)
+	stub := newKeyedVendorStub(t, map[string]keyedVendorAnswer{
+		"sk-ant-a": anthropicLimitAnswer("A", "", reset),
+		"sk-ant-b": sseAnswer(vgMessagesSSE),
+	})
+	srv, routes, seed := newPassthroughGroupServer(t, stub)
+	seed("acc_a", routing.VendorAnthropic, "a/", "sk-ant-a")
+	seed("acc_b", routing.VendorAnthropic, "b/", "sk-ant-b")
+	seedVendorGroup(t, routes, vgGroupID, routing.VendorAnthropic, "grp/", "acc_a", "acc_b")
+
+	before := time.Now()
+	rec := vgPost(t, srv, "/v1/messages", vgMessagesBody(vgGroupModel))
+
+	if rec.Code != http.StatusOK || rec.Body.String() != vgMessagesSSE {
+		t.Fatalf("status = %d body = %q, want 200 with member 2's stream verbatim", rec.Code, rec.Body.String())
+	}
+	if until, ok := srv.VendorLimitCooldowns().Until("acc_a", vgUpstream, time.Now()); !ok || !until.Equal(reset) {
+		t.Fatalf("routing cooldown = %s (active %v), want the scraped unified reset %s", until, ok, reset)
+	}
+	public := srv.VendorLimitCooldowns().ActivePublic("acc_a", time.Now())
+	if len(public) != 1 || public[0].UpstreamModel != vgUpstream {
+		t.Fatalf("public cooldowns = %+v, want one for %s", public, vgUpstream)
+	}
+	if got := public[0].Until; got.Before(before.Add(routing.DefaultVendorLimitCooldown)) || got.After(time.Now().Add(routing.DefaultVendorLimitCooldown)) {
+		t.Fatalf("public cooldown end = %s, want about now+%s (the default, never the scraped reset)", got, routing.DefaultVendorLimitCooldown)
+	}
+}
+
 // TestPassthroughResponsesFailsOverOnVendor429 is the Codex (/v1/responses) twin,
 // over OpenAI api-key accounts.
 func TestPassthroughResponsesFailsOverOnVendor429(t *testing.T) {
@@ -282,7 +315,7 @@ func TestPassthroughVendorFailoverDeclinesOnShadowedAccount(t *testing.T) {
 	seed("acc_a", routing.VendorAnthropic, "", "sk-ant-a")
 	seed("acc_b", routing.VendorAnthropic, "b/", "sk-ant-b")
 	seedVendorGroup(t, routes, vgGroupID, routing.VendorAnthropic, "", "acc_a", "acc_b")
-	srv.VendorLimitCooldowns().Set("acc_b", vgUpstream, time.Now().Add(time.Hour))
+	srv.VendorLimitCooldowns().Set("acc_b", vgUpstream, time.Now().Add(time.Hour), time.Now().Add(time.Hour))
 
 	rec := vgPost(t, srv, "/v1/messages", vgMessagesBody(vgUpstream))
 

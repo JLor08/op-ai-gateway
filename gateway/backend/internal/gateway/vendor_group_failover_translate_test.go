@@ -207,6 +207,28 @@ func TestVendorLimitCooldownUntil(t *testing.T) {
 	}
 }
 
+// The public end of a cooldown is built from Retry-After or the default alone: a
+// scraped window reset, earlier or later, never shapes it.
+func TestVendorLimitPublicCooldownUntil(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name       string
+		retryAfter time.Duration
+		want       time.Time
+	}{
+		{"retry-after", 5 * time.Minute, now.Add(5 * time.Minute)},
+		{"no retry-after: the default", 0, now.Add(routing.DefaultVendorLimitCooldown)},
+		{"a negative retry-after: the default", -time.Second, now.Add(routing.DefaultVendorLimitCooldown)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := vendorLimitPublicCooldownUntil(tc.retryAfter, now); !got.Equal(tc.want) {
+				t.Fatalf("vendorLimitPublicCooldownUntil = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestWithExcludedVendorAccountCopiesTheSlice(t *testing.T) {
 	orig := inference.Request{ExcludeVendorAccountIDs: make([]string, 1, 4)}
 	orig.ExcludeVendorAccountIDs[0] = "acc_a"

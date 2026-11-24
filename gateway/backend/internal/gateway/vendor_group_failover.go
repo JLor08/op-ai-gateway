@@ -24,7 +24,10 @@ import (
 //  1. the refusal's headers are scraped into the member's usage snapshot, as for any
 //     served response;
 //  2. the member is cooled down for the requested upstream model
-//     (vendorLimitCooldownUntil), so the requests that follow skip it too;
+//     (vendorLimitCooldownUntil), so the requests that follow skip it too. The
+//     registry also keeps the cooldown's public end (vendorLimitPublicCooldownUntil:
+//     Retry-After or the default, never a scraped window reset), which is all a
+//     group owner who may not see that account's usage is shown;
 //  3. the request is resolved again with the member excluded
 //     (withExcludedVendorAccount), by the resolve step of the path in hand. Only a
 //     target of the SAME group that is not excluded -- another member -- is taken:
@@ -89,6 +92,18 @@ func vendorLimitCooldownUntil(h http.Header, retryAfter time.Duration, now time.
 	return until
 }
 
+// vendorLimitPublicCooldownUntil is the public end of the cooldown of a member that
+// answered a limit with Retry-After retryAfter: now+retryAfter when positive, else
+// now+routing.DefaultVendorLimitCooldown. Unlike vendorLimitCooldownUntil it never
+// reads a scraped window reset, so it reveals nothing of the account's usage; the
+// portal shows it for a member whose usage the viewer is not entitled to.
+func vendorLimitPublicCooldownUntil(retryAfter time.Duration, now time.Time) time.Time {
+	if retryAfter > 0 {
+		return now.Add(retryAfter)
+	}
+	return now.Add(routing.DefaultVendorLimitCooldown)
+}
+
 // withExcludedVendorAccount returns req with accountID added to the vendor accounts
 // its group selection must skip. The slice is copied, so the caller's request is
 // untouched (as withLostInstance does for instances).
@@ -109,8 +124,9 @@ func (s *Server) vendorGroupFailover(token *auth.Token, req inference.Request, l
 		return req, routing.Target{}, false
 	}
 	s.scrapeVendorAccountUsage(lost, h)
-	until := vendorLimitCooldownUntil(h, retryAfter, time.Now())
-	s.vendorCooldowns.Set(lost.VendorAccountID, lost.ProviderModel, until)
+	now := time.Now()
+	until := vendorLimitCooldownUntil(h, retryAfter, now)
+	s.vendorCooldowns.Set(lost.VendorAccountID, lost.ProviderModel, until, vendorLimitPublicCooldownUntil(retryAfter, now))
 	next := withExcludedVendorAccount(req, lost.VendorAccountID)
 	target, err := resolve(token, next)
 	if err != nil || target.VendorGroupID != lost.VendorGroupID || slices.Contains(next.ExcludeVendorAccountIDs, target.VendorAccountID) {

@@ -3090,7 +3090,12 @@ gateway moves the request to the next eligible member, and the client never sees
    the subscription still has room. Account-wide exhaustion is what the thresholds of §12.2 cover. The cooldown ends
    at the **earliest** of `Retry-After`, the scraped Anthropic unified reset and the reset of every Codex window
    reported at 100 % or more, each **only when it lies after now** (a reset already in the past would create a
-   zero-length cooldown and is ignored); with none known it is `routing.DefaultVendorLimitCooldown`, **60 s**. The
+   zero-length cooldown and is ignored); with none known it is `routing.DefaultVendorLimitCooldown`, **60 s**. Each
+   entry also keeps a second, **public end** built from `Retry-After` or the 60 s default **alone**, never from a scraped
+   reset (`vendorLimitPublicCooldownUntil`): routing honours the precise end (`Until`, `Active`), and the group view
+   shows the public one (`ActivePublic`) for a member whose usage the group owner is not entitled to see (§12.7), so a
+   cooldown end cannot reveal that account's window reset. The registry is process-wide per `(account, model)`, so
+   this holds whoever's request set the cooldown. Each end expires on its own and the entry goes once both have. The
    registry is process-local and unpersisted, it only bridges the time until the next scrape or pull tells the truth,
    and a restart forgets it.
 4. The request is **resolved again with that member excluded** (`Request.ExcludeVendorAccountIDs`, mirroring
@@ -3179,8 +3184,9 @@ The throttle is per process and forgotten at restart, which at worst repeats one
   lifts), `cooldown` (the models and the end) or `not_usable` (`disabled`, `needs_reconnect`, `subscriptions_disabled`,
   `not_reachable`). `active_member_id` is the member routing would pick **ignoring the requested model**, so it is
   model-independent. For a shared member without the owner's usage opt-in the line never carries percent, usage or a
-  window reset: only active, cooldown (the end from `Retry-After` or the 60 s default, never a scraped reset) or not
-  usable.
+  window reset: only active, cooldown (the cooldown's public end from `Retry-After` or the 60 s default, never a scraped
+  reset, §12.4; both `cooldowns[].until` and `free_at`) or not usable. Past that public end the view shows the member
+  without a cooldown even while routing still skips it until the precise end.
 - **Dashboard.** `DashboardVendorGroups.tsx` sits next to the vendor usage cards (§5.4), polls the same group endpoint and
   shows per group its name, the active member and one compact line per member, labelling a skipped member from the DTO's
   `reason` (never by guessing from the percent). It is behind the same `vendor_accounts_enabled` gate as the vendor usage

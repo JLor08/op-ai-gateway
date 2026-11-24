@@ -75,9 +75,10 @@ type VendorCooldownDTO struct {
 
 // VendorAccountGroupMemberDTO is one member with its computed status (spec section 9).
 // Position is the 1-based index in member order. OwnerName is set only for a member
-// owned by someone else. Pct, FreeAt and Usage are never set for a member whose
-// usage the group owner is not entitled to see (a shared account without the
-// owner's usage opt-in); its cooldown FreeAt comes from the cooldown alone.
+// owned by someone else. Pct and Usage are never set for a member whose usage the
+// group owner is not entitled to see (a shared account without the owner's usage
+// opt-in); its Cooldowns and FreeAt carry the cooldowns' public end (Retry-After or
+// the default), never a scraped window reset (memberVendorCooldowns).
 type VendorAccountGroupMemberDTO struct {
 	AccountID   string                 `json:"account_id"`
 	AccountName string                 `json:"account_name"`
@@ -549,7 +550,7 @@ func (s *Service) vendorAccountGroupDTO(ctx context.Context, g routing.VendorAcc
 			} else if found {
 				cands[i].Usage, cands[i].HasUsage = u, true
 			}
-			cooldowns[i] = s.vendorCooldowns.Active(m.AccountID, now)
+			cooldowns[i] = s.memberVendorCooldowns(m.AccountID, cands[i].ThresholdsApply, now)
 			for _, c := range cooldowns[i] {
 				member.Cooldowns = append(member.Cooldowns, VendorCooldownDTO{Model: c.UpstreamModel, Until: c.Until})
 				if c.Until.After(cands[i].CooldownUntil) {
@@ -584,6 +585,19 @@ func (s *Service) vendorAccountGroupDTO(ctx context.Context, g routing.VendorAcc
 		}
 	}
 	return dto, nil
+}
+
+// memberVendorCooldowns is the active cooldowns of member accountID as the group
+// owner may see them: with the routing end when the member's usage counts for the
+// owner (thresholdsApply), else with the public end only -- Retry-After or the
+// default, never a scraped window reset (spec section 9) -- so neither the cooldown
+// list nor the member's FreeAt reveals the usage of an account the owner is not
+// entitled to. Routing itself keeps honouring the routing end.
+func (s *Service) memberVendorCooldowns(accountID string, thresholdsApply bool, now time.Time) []routing.VendorCooldown {
+	if thresholdsApply {
+		return s.vendorCooldowns.Active(accountID, now)
+	}
+	return s.vendorCooldowns.ActivePublic(accountID, now)
 }
 
 // applyVendorGroupBlocks sets a blocked member's state: over_threshold with the first
