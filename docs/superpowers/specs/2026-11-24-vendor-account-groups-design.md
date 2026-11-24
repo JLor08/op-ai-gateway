@@ -82,9 +82,9 @@ Anthropic API key as the reserve at the end".
   five-hour and weekly percent with reset times, credits/spend. Writers: a
   passive header scrape on every served request (§5.1) and an active pull for
   OpenAI subscriptions and OpenRouter/Kilo keys (§5.2).
-- Today the Anthropic scrape reads `anthropic-ratelimit-unified-5h-utilization`,
-  `-7d-utilization` and the single `-reset`, which it attributes to the
-  five-hour window; the weekly reset is never filled for Anthropic
+- Since #407 the Anthropic scrape reads `anthropic-ratelimit-unified-5h-utilization`
+  / `-5h-reset`, `-7d-utilization` / `-7d-reset` and the representative claim,
+  so both Anthropic windows carry their own reset time already
   (`gateway/backend/internal/gateway/vendor_usage_scrape.go`).
 
 ### 3.1 Code map (verified on `a5a4eacd`; paths under `gateway/backend/` unless noted)
@@ -229,14 +229,15 @@ collide. Names are claimed **per opted-in source**: a group claims
 `group prefix + model` for the union of its members' models, an account claims
 its own names. Members of one group naturally expose identical vendor model
 ids; that is not a conflict, because the token opts into the group, not into
-the members. It is a conflict only when the token also uses a member (or any
-other account or group) under the **same effective name**, e.g. an account
-whose own prefix equals the group's prefix under `all: true`.
+the members. A name shared by a group and **one of its own members** is not a
+conflict either: the group shadows the member (§5.3). Any other shared
+effective name is a conflict (another group, or an account outside the group).
 
-Group save (create/update of the prefix) also refuses a prefix that makes the
-group's names collide with the owner's own accounts' native names or another
-own group's names (`vendor_account_group.prefix_conflict`), so the common
-`all + include_groups` token never trips the token check by accident.
+Group save (create/update of the prefix or the members) refuses a prefix that
+makes the group's names collide with the owner's own accounts **outside the
+group** or with another own group's names (`vendor_account_group.prefix_conflict`),
+so the common `all + include_groups` token never trips the token check by
+accident.
 
 ### 5.2 Names and listing
 
@@ -260,23 +261,32 @@ by position and pick the first that is **eligible**:
    (percent `>= 0`), it is over when `pct >= threshold` **and** its reset time
    is unknown or in the future. A category whose reset time has passed counts
    as renewed (the stale snapshot is not trusted past its own reset);
-5. **not in limit cooldown** (§6).
+5. **not in limit cooldown** for the requested upstream model (§6).
 
 If no member is eligible but at least one passes rules 1–3, choose the member
 that becomes **available again soonest**: for each such member, its "free at"
 time is the **latest** reset among the categories that block it (and its
 cooldown end); the member with the earliest "free at" is chosen; a member with
 no known reset sorts last; ties keep position order. The request goes there and
-the vendor's own answer (success or its limit error, with all its headers) is
-relayed, so Claude Code shows the vendor's limit message and wait time.
+the vendor's own answer (success or its limit error) is relayed under the
+**existing** header rules (the rate-limit header entitlement and the
+`send_usage_limits` token switch stay as they are), so Claude Code shows the
+vendor's limit message and wait time where it is entitled to.
 
 If no member passes rules 1–3, the group does not serve this model and
 resolution continues as if the name were unknown to the group.
 
 **Precedence.** Groups take part in the existing vendor branch and in
 `vendor_account_routing_mode` (`vendor_first` / `fallback_only`) exactly like
-accounts. Collisions are refused at save (§5.1); the routing backstop order is
-own accounts, then own groups (id order), then shared accounts.
+accounts. **A group shadows its own members:** when a token uses both a group
+and one of its member accounts under the same effective name (the typical
+case: own Claude subscription with an empty prefix, a group with an empty
+prefix that starts with that subscription, a token with
+"all + incl. groups"), the group answers that name. This is safe because the
+group serves that member first anyway, and it is what makes plain names like
+`claude-opus-4-5` fail over without extra setup. Every other collision is
+refused at save (§5.1); the routing backstop order is own groups (id order),
+then own accounts, then shared accounts.
 
 ## 6. Failover on vendor limit errors
 
@@ -285,9 +295,14 @@ was relayed to the client, the gateway:
 
 1. scrapes the response headers into the member's snapshot (as for any served
    response);
-2. puts the member into **cooldown** until the earliest of: `Retry-After`, the
-   scraped reset of the rejected window, or a default of 60 s when neither is
-   known;
+2. puts the member into **cooldown for the requested upstream model** until the
+   earliest of: `Retry-After`, the scraped reset of the rejected window, or a
+   default of 60 s when neither is known. The cooldown is keyed by
+   `(account id, upstream model)`, not by account: a per-model weekly window
+   (e.g. Opus) can be days away, and an account-wide block would push the
+   other models to the paid reserve while the subscription still has room.
+   Account-wide exhaustion is already covered by the thresholds of §5.3, which
+   apply to every model;
 3. re-runs member selection without that member and retries the same request
    on the next eligible member;
 4. stops when no eligible member is left, and relays the **last** vendor error
@@ -299,7 +314,7 @@ non-streamed error body (e.g. OpenAI `insufficient_quota`, Codex
 limit errors in this project.
 
 Cooldown is in-memory per gateway process (it only bridges the time until the
-next scrape or pull tells the truth), keyed by account id.
+next scrape or pull tells the truth), keyed by `(account id, upstream model)`.
 
 Retries are bounded by the number of members. Each attempt is a separate
 upstream call; only the served attempt produces the request's usage event.
@@ -323,10 +338,8 @@ The request body must be replayable (buffered before dispatch).
 
 ## 7. Usage data
 
-**Anthropic passive scrape** additionally reads (VERIFY-LIVE, community-documented):
-`anthropic-ratelimit-unified-5h-reset` → five-hour reset,
-`anthropic-ratelimit-unified-7d-reset` → weekly reset. The existing single
-`-reset` stays the fallback for the five-hour reset when `-5h-reset` is absent.
+**Anthropic passive scrape:** no change needed; it already reads both windows
+with their own reset times (#407, §3).
 
 **Anthropic subscription active pull** (new, VERIFY-LIVE, ToS-restricted like
 the whole subscription path): `GET https://api.anthropic.com/api/oauth/usage`
@@ -351,10 +364,15 @@ request, and gains `vendor_group_id` (empty when not routed through a group).
 The analytics views may filter by group later; this project only records it.
 
 The client-facing limit relays (#413 Claude Code, #416/#418 Codex, opt-in via
-#420) keep working unchanged: passthrough forwards the **serving member's**
-live headers, and the per-principal window caches record the last serving
-account, so after a switch the client sees the windows of the account it is
-actually using. That is the intended behavior; no aggregation across members.
+#420): passthrough forwards the **serving member's** live headers. One change
+is needed in the per-principal window caches (`ratelimit_window_cache.go`,
+`codex_window_cache.go`): today `Attach` adds the principal's last cached
+subscription windows to any response that carries none. For a response served
+by a **group member that reports no windows** (an API-key reserve), nothing is
+attached and the principal's cached entry is dropped, so the client never
+shows, and never blocks itself on, the windows of a member that was skipped.
+A member that reports windows overwrites the entry as today. No aggregation
+across members.
 
 ## 9. Dashboard
 
@@ -365,7 +383,7 @@ and one compact line per member:
 
 - active;
 - over threshold — which category, percent, "free at" time;
-- cooldown — until when (after a limit error);
+- cooldown — for which model, until when (after a limit error);
 - not usable — disabled, needs reconnect, subscriptions switched off, or no
   longer reachable.
 
@@ -411,11 +429,20 @@ feature flag.
 - Groups are personal and cannot be shared (§2).
 - A token opted into a group may use shared members through the group without
   naming them individually (§5.1).
+- A group shadows its own members' names, so plain model names fail over
+  without extra setup (§5.3).
+- Limit cooldown is per `(account, upstream model)`, not per account (§6).
+- After a switch to a member without windows (API key), the client is sent no
+  cached windows of the skipped member (§8).
 - The portal session uses all own groups until project 2 makes it configurable.
 - "Active member" on the dashboard is model-independent (§9).
 - Cooldown default 60 s; pull throttle 15 min; both in-memory.
 - No new feature flag.
 - Per-model weekly windows are left to the limit-error failover.
+
+**Open — the user's decision:** shared members whose owner has **not** switched
+on `share_usage_with_members` (vendor doc §1.3: the owner's opt-in that shows
+the account's usage figures to the people allowed to use it).
 
 ## 13. Project 2 (follows this one; recorded, not designed here)
 
