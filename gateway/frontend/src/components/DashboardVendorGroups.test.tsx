@@ -76,6 +76,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           members: [
             member({
               state: 'over_threshold',
+              reason: 'five_hour',
               pct: 99,
               free_at: FREE_AT,
               usage: {
@@ -108,6 +109,76 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           { exact: false },
         ),
       ).toBeVisible();
+    });
+
+    it('shows the category from the reason when the usage snapshot is absent', async () => {
+      renderGroups(t, [
+        group({
+          members: [
+            member({ state: 'over_threshold', reason: 'weekly', pct: 97, free_at: FREE_AT }),
+          ],
+        }),
+      ]);
+      const card = await waitFor(() => cardOf('Claude pool'));
+      expect(
+        within(card).getByText(
+          t.dashboardVendorGroupLineOverThreshold(
+            `${t.dashboardVendorGroupWindowWeekly} 97 %`,
+            localTime(FREE_AT),
+          ),
+          { exact: false },
+        ),
+      ).toBeVisible();
+    });
+
+    it('labels a weekly block as weekly even when the five-hour percent is equal', async () => {
+      const usage = {
+        five_hour_pct: 100,
+        five_hour_reset_at: null,
+        weekly_pct: 100,
+        weekly_reset_at: FREE_AT,
+        credit_balance: '',
+        spend_unit: '',
+        spend_limit: '',
+        spend_used: '',
+        spend_remaining: '',
+        spend_used_pct: -1,
+        spend_reset_at: null,
+        credit_status: '',
+        updated_at: FREE_AT,
+      };
+      renderGroups(t, [
+        group({
+          members: [
+            member({
+              state: 'over_threshold',
+              reason: 'weekly',
+              pct: 100,
+              free_at: FREE_AT,
+              usage,
+            }),
+          ],
+        }),
+      ]);
+      const card = await waitFor(() => cardOf('Claude pool'));
+      expect(
+        within(card).getByText(
+          t.dashboardVendorGroupLineOverThreshold(
+            `${t.dashboardVendorGroupWindowWeekly} 100 %`,
+            localTime(FREE_AT),
+          ),
+          { exact: false },
+        ),
+      ).toBeVisible();
+    });
+
+    it('falls back to the bare state for a cooldown without entries', async () => {
+      renderGroups(t, [
+        group({ members: [member({ account_name: 'Idle', state: 'cooldown', cooldowns: [] })] }),
+      ]);
+      const card = await waitFor(() => cardOf('Claude pool'));
+      const row = within(card).getByText('Idle').closest('li') as HTMLElement;
+      expect(row.textContent).toContain(t.vendorGroupStateCooldown);
     });
 
     it('names the model and the local time in a cooldown line', async () => {

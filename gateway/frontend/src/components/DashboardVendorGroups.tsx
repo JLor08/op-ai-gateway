@@ -15,15 +15,18 @@ const GROUPS_POLL_MS = 60_000;
 const localTime = (iso: string) =>
   new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-// Which window the member's `pct` belongs to: the one of its usage snapshot with the
-// same figure. Empty when the snapshot is absent or matches none (nothing is guessed).
-function bindingWindow(t: Translation, member: VendorAccountGroupMember): string {
-  const usage = member.usage;
-  if (!usage || member.pct === undefined) return '';
-  if (usage.five_hour_pct === member.pct) return t.dashboardVendorGroupWindowFiveHour;
-  if (usage.weekly_pct === member.pct) return t.dashboardVendorGroupWindowWeekly;
-  if (usage.spend_used_pct === member.pct) return t.dashboardVendorGroupWindowCredits;
-  return '';
+// The blocking category the backend reports in `reason` of an over-threshold member.
+function windowLabel(t: Translation, reason: string): string {
+  switch (reason) {
+    case 'five_hour':
+      return t.dashboardVendorGroupWindowFiveHour;
+    case 'weekly':
+      return t.dashboardVendorGroupWindowWeekly;
+    case 'credits':
+      return t.dashboardVendorGroupWindowCredits;
+    default:
+      return '';
+  }
 }
 
 function memberLine(t: Translation, member: VendorAccountGroupMember): string {
@@ -35,14 +38,17 @@ function memberLine(t: Translation, member: VendorAccountGroupMember): string {
     case 'over_threshold': {
       if (member.pct === undefined) return t.dashboardVendorGroupLineOverThresholdBare;
       return t.dashboardVendorGroupLineOverThreshold(
-        `${bindingWindow(t, member)} ${member.pct} %`.trim(),
+        `${windowLabel(t, member.reason)} ${member.pct} %`.trim(),
         member.free_at ? localTime(member.free_at) : '',
       );
     }
-    case 'cooldown':
-      return (member.cooldowns ?? [])
+    case 'cooldown': {
+      const cooldowns = member.cooldowns ?? [];
+      if (cooldowns.length === 0) return t.vendorGroupStateCooldown;
+      return cooldowns
         .map((c) => t.dashboardVendorGroupLineCooldown(localTime(c.until), c.model))
         .join('; ');
+    }
     default:
       return t.dashboardVendorGroupLineNotUsable(reasonLabel(t, member.reason));
   }
