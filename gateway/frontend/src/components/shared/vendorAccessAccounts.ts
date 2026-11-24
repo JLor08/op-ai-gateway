@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import type { VendorAccessAccountDTO, VendorAccount } from '../../api';
+import type {
+  VendorAccessAccountDTO,
+  VendorAccessGroupDTO,
+  VendorAccount,
+  VendorAccountGroup,
+} from '../../api';
 import type { Translation } from './types';
 import { isValidModelPrefix, normalizeModelPrefix } from './vendorInputs';
 
@@ -119,4 +124,32 @@ export function patchVendorAccessEntry(
   patch: Partial<VendorAccessEntryState>,
 ): VendorAccessEntryState[] {
   return entries.map((entry) => (entry.accountId === accountId ? { ...entry, ...patch } : entry));
+}
+
+// A vendor account group a token is opted in to reuses the entry state of an
+// account: `accountId` then carries the GROUP id, so the toggle/patch/invalid
+// helpers above and the override controls (VendorAccessEntryGroups) work unchanged.
+
+/** The form state of one stored group entry; an override counts only when enabled. */
+export function vendorAccessGroupEntryState(entry: VendorAccessGroupDTO): VendorAccessEntryState {
+  return {
+    accountId: entry.group_id,
+    overrideEnabled: entry.prefix_override?.enabled === true,
+    prefix: entry.prefix_override?.value ?? '',
+  };
+}
+
+/** The wire entry of a group form entry (same override rule as vendorAccessEntryDTO). */
+export function vendorAccessGroupEntryDTO(entry: VendorAccessEntryState): VendorAccessGroupDTO {
+  return {
+    group_id: entry.accountId,
+    ...(entry.overrideEnabled
+      ? { prefix_override: { enabled: true, value: normalizeModelPrefix(entry.prefix) } }
+      : {}),
+  };
+}
+
+/** The label of a group in the opt-in list: its name (user-supplied text, rendered as text only). */
+export function vendorGroupOptionLabel(group: Pick<VendorAccountGroup, 'name'>): string {
+  return group.name;
 }

@@ -17,6 +17,7 @@ import type {
   ServerModelOption,
   UpdateTokenRequest,
   VendorAccessDTO,
+  VendorAccountGroup,
   VendorAccount,
 } from '../api';
 import type { Translation, MessageKey, PortalApi } from './shared/types';
@@ -66,8 +67,11 @@ import {
   patchVendorAccessEntry,
   toggleVendorAccessEntry,
   vendorAccessEntryDTO,
+  vendorAccessGroupEntryDTO,
+  vendorAccessGroupEntryState,
   vendorAccessEntryInvalid,
   vendorAccessEntryState,
+  vendorGroupOptionLabel,
   vendorAccountOptionLabel,
   type VendorAccessEntryState,
 } from './shared/vendorAccessAccounts';
@@ -109,6 +113,7 @@ export function TokenList({
     | 'updateChatSettings'
     | 'updateToken'
     | 'vendorAccounts'
+    | 'vendorAccountGroups'
   >;
   tokens: PortalToken[];
   setTokens: Dispatch<SetStateAction<PortalToken[]>>;
@@ -202,6 +207,14 @@ export function TokenList({
   const [vaAccounts, setVaAccounts] = useState<VendorAccessEntryState[]>([]);
   const [vendorAccounts, setVendorAccounts] = useState<VendorAccount[] | null>(null);
   const vendorAccountsReqIdRef = useRef(0);
+  // Vendor account groups: vaIncludeGroups = every group the caller owns, also
+  // future ones (only meaningful together with vaAll); vaGroups is the explicit
+  // per-group opt-in list (entry.accountId carries the GROUP id). vendorGroups is
+  // the caller's group list, loaded with the same latest-wins guard.
+  const [vaIncludeGroups, setVaIncludeGroups] = useState(false);
+  const [vaGroups, setVaGroups] = useState<VendorAccessEntryState[]>([]);
+  const [vendorGroups, setVendorGroups] = useState<VendorAccountGroup[] | null>(null);
+  const vendorGroupsReqIdRef = useRef(0);
 
   // Synthetic, token-less ChatSession pseudo-token (own settings panel).
   const chatSession = tokens.find((row) => row.is_chat_session) ?? null;
@@ -234,6 +247,19 @@ export function TokenList({
       })
       .catch(() => {
         /* best-effort: the list stays unloaded and the section renders without options */
+      });
+  }, [mode, api, vendorAccountsEnabled]);
+
+  useEffect(() => {
+    if (mode === 'list' || !vendorAccountsEnabled) return;
+    const reqId = ++vendorGroupsReqIdRef.current;
+    api
+      .vendorAccountGroups()
+      .then((resp) => {
+        if (vendorGroupsReqIdRef.current === reqId) setVendorGroups(resp.groups);
+      })
+      .catch(() => {
+        /* best-effort: the group list stays unloaded and the section renders without it */
       });
   }, [mode, api, vendorAccountsEnabled]);
 
@@ -284,12 +310,20 @@ export function TokenList({
       (entry) => offeredIds.has(entry.accountId) && !(vaAll && ownIds.has(entry.accountId)),
     );
   }
+  // The group opt-ins the request carries: once the list has loaded, a group that
+  // no longer exists is dropped (the form cannot show, let alone remove, it).
+  function sentVendorGroups(): VendorAccessEntryState[] {
+    if (vendorGroups === null) return vaGroups;
+    const ids = new Set(vendorGroups.map((group) => group.id));
+    return vaGroups.filter((entry) => ids.has(entry.accountId));
+  }
   // An enabled per-account prefix override with a malformed value blocks the
   // save (the same client-side mirror of the backend rule the provider form
   // uses); a disabled override is never sent, so its value is not judged, and
   // neither is an entry that is not sent at all. Moot while the section is hidden.
   const vendorAccessInvalid =
-    vendorAccountsEnabled && sentVendorEntries().some(vendorAccessEntryInvalid);
+    vendorAccountsEnabled &&
+    [...sentVendorEntries(), ...sentVendorGroups()].some(vendorAccessEntryInvalid);
 
   function openCreate() {
     setName('');
@@ -314,6 +348,9 @@ export function TokenList({
     setVaAll(false);
     setVaAccounts([]);
     setVendorAccounts(null);
+    setVaIncludeGroups(false);
+    setVaGroups([]);
+    setVendorGroups(null);
     setMode('create');
   }
 
@@ -356,6 +393,9 @@ export function TokenList({
     // missing one (or enabled:false) is OFF.
     setVaAccounts((row.vendor_access?.accounts ?? []).map(vendorAccessEntryState));
     setVendorAccounts(null);
+    setVaIncludeGroups(row.vendor_access?.include_groups ?? false);
+    setVaGroups((row.vendor_access?.groups ?? []).map(vendorAccessGroupEntryState));
+    setVendorGroups(null);
     setMode({ edit: row });
   }
 
@@ -368,12 +408,27 @@ export function TokenList({
   function buildVendorAccess(): VendorAccessDTO | undefined {
     if (!vendorAccountsEnabled) return undefined;
     const accounts = sentVendorEntries().map(vendorAccessEntryDTO);
-    if (!vaAll) return { all: false, accounts };
-    return accounts.length > 0 ? { all: true, accounts } : { all: true };
+    const groups = sentVendorGroups().map(vendorAccessGroupEntryDTO);
+    const groupFields = groups.length > 0 ? { groups } : {};
+    if (!vaAll) return { all: false, accounts, ...groupFields };
+    return {
+      all: true,
+      ...(vaIncludeGroups ? { include_groups: true } : {}),
+      ...(accounts.length > 0 ? { accounts } : {}),
+      ...groupFields,
+    };
   }
 
   function toggleVendorAccount(accountId: string) {
     setVaAccounts((current) => toggleVendorAccessEntry(current, accountId));
+  }
+
+  function toggleVendorGroup(groupId: string) {
+    setVaGroups((current) => toggleVendorAccessEntry(current, groupId));
+  }
+
+  function updateVendorGroupEntry(groupId: string, patch: Partial<VendorAccessEntryState>) {
+    setVaGroups((current) => patchVendorAccessEntry(current, groupId, patch));
   }
 
   function updateVendorEntry(accountId: string, patch: Partial<VendorAccessEntryState>) {
@@ -654,6 +709,15 @@ export function TokenList({
       const entry = vendorAccessById.get(acc.id);
       return entry ? [{ id: acc.id, label: vendorAccountOptionLabel(acc, t), entry }] : [];
     });
+    const groupOptions = (vendorGroups ?? []).map((group) => ({
+      value: group.id,
+      label: vendorGroupOptionLabel(group),
+    }));
+    const vendorGroupEntryById = new Map(vaGroups.map((entry) => [entry.accountId, entry]));
+    const optedInGroups = (vendorGroups ?? []).flatMap((group) => {
+      const entry = vendorGroupEntryById.get(group.id);
+      return entry ? [{ id: group.id, label: vendorGroupOptionLabel(group), entry }] : [];
+    });
     const accountOption = (acc: VendorAccount) => ({
       value: acc.id,
       label: vendorAccountOptionLabel(acc, t),
@@ -916,10 +980,28 @@ export function TokenList({
                 </Typography>
                 <FormControlLabel
                   control={
-                    <Checkbox checked={vaAll} onChange={(e) => setVaAll(e.target.checked)} />
+                    <Checkbox
+                      checked={vaAll}
+                      onChange={(e) => {
+                        setVaAll(e.target.checked);
+                        if (!e.target.checked) setVaIncludeGroups(false);
+                      }}
+                    />
                   }
                   label={t.tokenVendorAccessAll}
                 />
+                <Box sx={{ pl: 3 }}>
+                  <FormControlLabel
+                    control={
+                      <Checkbox
+                        checked={vaAll && vaIncludeGroups}
+                        disabled={!vaAll}
+                        onChange={(e) => setVaIncludeGroups(e.target.checked)}
+                      />
+                    }
+                    label={t.tokenVendorAccessIncludeGroups}
+                  />
+                </Box>
                 {vaAll && (
                   <Typography variant="caption" color="text.secondary">
                     {t.tokenVendorAccessAllHint}
@@ -957,6 +1039,20 @@ export function TokenList({
                   items={optedInAccounts}
                   idPrefix="token-va"
                   onChange={updateVendorEntry}
+                  t={t}
+                />
+                {groupOptions.length > 0 && (
+                  <CheckboxGroup
+                    legend={t.tokenVendorAccessGroupsLabel}
+                    options={groupOptions}
+                    selected={vaGroups.map((entry) => entry.accountId)}
+                    onToggle={toggleVendorGroup}
+                  />
+                )}
+                <VendorAccessEntryGroups
+                  items={optedInGroups}
+                  idPrefix="token-vg"
+                  onChange={updateVendorGroupEntry}
                   t={t}
                 />
               </Box>

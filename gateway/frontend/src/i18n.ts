@@ -3527,6 +3527,8 @@ const de = {
   tokenVendorAccessAllHint:
     'Nutzt alle eigenen Konten unter ihrem eigenen Prefix. Mit dir geteilte Anbieter gehören nicht dazu: Sie werden unten einzeln gewählt.',
   tokenVendorAccessAccountsLabel: 'Eigene Anbieter',
+  tokenVendorAccessGroupsLabel: 'Gruppen',
+  tokenVendorAccessIncludeGroups: 'inkl. Gruppen',
   tokenVendorAccessSharedLabel: 'Mit mir geteilte Anbieter',
   tokenVendorAccessSharedHint:
     'Ein geteilter Anbieter wird nie automatisch freigeschaltet, auch nicht mit „Alle eigenen Anbieter“. Nutzbar ist er nur, wenn du ihn über eine Ressourcengruppe erreichst; sonst wird das Speichern abgelehnt.',
@@ -7552,6 +7554,8 @@ const en: PortalMessages = {
   tokenVendorAccessAllHint:
     'Uses every own account under its own prefix. Providers shared with you are not part of it: you pick them one by one below.',
   tokenVendorAccessAccountsLabel: 'Own providers',
+  tokenVendorAccessGroupsLabel: 'Groups',
+  tokenVendorAccessIncludeGroups: 'incl. groups',
   tokenVendorAccessSharedLabel: 'Providers shared with me',
   tokenVendorAccessSharedHint:
     'A shared provider is never enabled automatically, not even by "All own providers". It is usable only when you reach it through a resource group; otherwise saving is refused.',

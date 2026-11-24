@@ -204,6 +204,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // The vendor-access section's account list (the caller's own accounts).
       // Only fetched while vendorAccountsEnabled is on.
       vendorAccounts: vi.fn(async () => ({ data: opts.vendorAccounts ?? defaultVendorAccounts })),
+      vendorAccountGroups: vi.fn(async () => ({ groups: [] })),
     };
 
     render(
@@ -592,6 +593,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         updateChatSettings: vi.fn(),
         updateToken: vi.fn(),
         vendorAccounts: vi.fn(async () => ({ data: [] })),
+        vendorAccountGroups: vi.fn(async () => ({ groups: [] })),
       };
 
       render(
@@ -807,6 +809,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         myProjects: vi.fn(async () => defaultProjects),
         serverModels: vi.fn(async () => []),
         vendorAccounts: vi.fn(async () => ({ data: [] })),
+        vendorAccountGroups: vi.fn(async () => ({ groups: [] })),
       };
       const setTokens = vi.fn();
       render(
