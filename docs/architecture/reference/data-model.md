@@ -1086,8 +1086,8 @@ plausible-looking validation rule would break the normal case:
   a server out of service. AMD with pre-4.0 rocm-smi (`cardN`, no UUID) and
   Apple (always index 0, unified memory) report no UUID and skip the check
   entirely rather than warning falsely; AMD with rocm-smi 4.x reports its
-  `Unique ID` and is checked like NVIDIA. Refreshing the snapshot from the latest sample, or honouring the
-  client's values, destroys the detector.
+  `Unique ID` and is checked like NVIDIA. Refreshing the snapshot from the
+  latest sample, or honouring the client's values, destroys the detector.
 - `server_runtime_reports.report_json` is an **opaque string to the store**: it
   validates nothing. All sanitisation, env-value masking and `parse_error`
   redaction happen in the gateway's ingest before the upsert, so anyone adding a

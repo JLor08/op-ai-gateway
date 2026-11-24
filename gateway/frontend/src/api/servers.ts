@@ -354,13 +354,13 @@ export type HardwareMemoryModule = {
 export type HardwareMemory = { total_bytes: number; modules?: HardwareMemoryModule[] };
 export type HardwareMainboard = { vendor: string; product: string; version: string };
 export type HardwareBIOS = { vendor: string; version: string };
-// pci_bus_id is the card's PCI address ("00000000:65:00.0"), reported by
-// NVIDIA and by AMD with rocm-smi 4.x, omitted by Apple, pre-4.0 rocm-smi and
-// any agent older than this field -- so every consumer must render without it. It is a display/disambiguation
-// aid: on the 4x/8x identical-card hosts that are the normal AI-server build
-// it is the only handle that maps to a physical slot and survives index
-// renumbering across reboots. It is deliberately NOT an identity -- GPU rows,
-// budgets and admission all key on `index`.
+// pci_bus_id is the card's PCI address ("00000000:65:00.0"), reported by NVIDIA
+// and by AMD with rocm-smi 4.x, omitted by Apple, pre-4.0 rocm-smi and any
+// agent older than this field -- so every consumer must render without it. It
+// is a display/disambiguation aid: on the 4x/8x identical-card hosts that are
+// the normal AI-server build it is the only handle that maps to a physical slot
+// and survives index renumbering across reboots. It is deliberately NOT an
+// identity -- GPU rows, budgets and admission all key on `index`.
 export type HardwareGPU = {
   index: number;
   name: string;
@@ -523,7 +523,8 @@ export type CapacityReportDTO = {
 // is the model's marginal cost on that card (a constant neighbour, driver
 // reserve or ECC overhead cancels out of it), while the measured value is that
 // process's attributed usage from the agent's own per-process measurer, which
-// only NVIDIA hosts and AMD Linux hosts (ROCm/HIP builds) have. 0 means unknown for both, as everywhere else.
+// only NVIDIA hosts and AMD Linux hosts (ROCm/HIP builds) have. 0 means
+// unknown for both, as everywhere else.
 // `unified_memory` marks a figure read from unified SYSTEM memory (Apple
 // silicon) rather than dedicated VRAM — label it as such wherever it is shown.
 // `fingerprint_kind` says what was actually compared: "uuid" catches any

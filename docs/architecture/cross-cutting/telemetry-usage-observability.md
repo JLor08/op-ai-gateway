@@ -114,19 +114,19 @@ consumer can tell "not reported" from "reported blank".
 identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` on NVIDIA and
 from rocm-smi's `PCI Bus` on AMD. `ioreg` reports nothing of this form, so
 Apple leaves it empty rather than inventing an equivalent, as does an AMD host
-whose rocm-smi omits it (pre-4.0); every consumer must render without it. It exists because 4×/8× identical cards is the normal AI-server
-build, and of the handles telemetry actually offers — an `index` that can
-renumber across reboots (which is exactly what the GPU-budget rows'
-`expected_uuid`/`expected_name` drift detection exists to catch), an opaque
-`uuid`, and live utilisation, which is not identity at all — the bus id is the
-only one that maps to a physical slot and survives renumbering. Nothing keys on
-it: spec GPU rows, budgets and the whole admission arithmetic key on `index`,
-and making the bus id a second identity would be a separate design, not a field
-addition. Its one logical reader is the portal's vendor guess for the
-NVIDIA-only RPC-member exemptions (`gpuLooksNVIDIA`): a name marking the card
-as AMD (`amd`, `radeon`, `instinct`) means not NVIDIA first, and only then does
-a non-empty bus id count as NVIDIA, as a fallback for NVIDIA names without a
-vendor keyword.
+whose rocm-smi omits it (pre-4.0); every consumer must render without it. It
+exists because 4×/8× identical cards is the normal AI-server build, and of the
+handles telemetry actually offers — an `index` that can renumber across reboots
+(which is exactly what the GPU-budget rows' `expected_uuid`/`expected_name`
+drift detection exists to catch), an opaque `uuid`, and live utilisation, which
+is not identity at all — the bus id is the only one that maps to a physical slot
+and survives renumbering. Nothing keys on it: spec GPU rows, budgets and the
+whole admission arithmetic key on `index`, and making the bus id a second
+identity would be a separate design, not a field addition. Its one logical
+reader is the portal's vendor guess for the NVIDIA-only RPC-member exemptions
+(`gpuLooksNVIDIA`): a name marking the card as AMD (`amd`, `radeon`, `instinct`)
+means not NVIDIA first, and only then does a non-empty bus id count as NVIDIA,
+as a fallback for NVIDIA names without a vendor keyword.
 
 Privacy is a schema-level guarantee, documented on `sample.SystemReport`
 (`server-agent/internal/sample/system_report.go`): the struct has **no** serial,

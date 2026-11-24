@@ -10979,7 +10979,9 @@ resolve.
     spent across restarts or every exit would re-arm it and the bidirectional thrash would return one restart at a time. It resets
     only when the spec is removed and re-added; an in-place edit keeps it. A bootstrap blocked by a non-evictable toucher spends
     nothing (the flag rides only an `Evict` decision). At most one mixed pair, once, ever cold-loads the other.
-  - **(g) Measurer-gated.** Measurement is NVIDIA-only ([§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)):
+  - **(g) Measurer-gated.** (Superseded in part by [ADR-113](#adr-113--per-process-vram-on-amd-linux-kfd-sysfs-not-start-delta-attribution-or-amd-smi):
+    AMD Linux ROCm/HIP builds are measured via KFD sysfs, so an AMD Linux host now has a measurer installed.) Measurement is
+    NVIDIA-only ([§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)):
     on an AMD, Apple or GPU-less host nothing could capture the number, and §5.3 is explicit that an unknown-demand spec there simply
     waits. Evicting a working model for a spec that can never be measured is the ADR-032 regression, so a measurer-less host never
     gets the shot.

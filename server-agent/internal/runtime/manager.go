@@ -2963,17 +2963,18 @@ func (o *owner) recordFailure(st *specState, message string, exitCode int, stder
 //   - A VRAM measurer is installed. The exception exists only to CAPTURE a first
 //     measurement, so where none can be taken it must not fire. Measurement is
 //     NVIDIA- and AMD-Linux-only (§5.3): on an Apple-silicon or GPU-less host
-//     "waiting for the measurement to arrive is waiting for something that
-//     will not happen", and there §5.3 is explicit that an unknown-demand
-//     spec simply WAITS behind a busy/pinned holder. Evicting a working known-demand model on such a host
-//     for an unknown spec that can never be measured is exactly the ADR-032
-//     regression the order exists to prevent -- so the bootstrap is gated on the
-//     measurer, the VRAM twin of P4a's ramMeasurerInstalled gate. It is asked
-//     PER SPEC (vramMeasurable): a wsl spec's figure is the WSL VM's growth
-//     across its start (#381), which also needs the VM's worker to be findable
-//     (SetWSLVMPIDs). A Windows NVIDIA host always has the PDH measurer, so
-//     without the per-spec question a wsl spec there would be granted an
-//     eviction for a measurement that can never arrive.
+//     "waiting for the measurement to arrive is waiting for something that will
+//     not happen", and there §5.3 is explicit that an unknown-demand spec
+//     simply WAITS behind a busy/pinned holder. Evicting a working known-demand
+//     model on such a host for an unknown spec that can never be measured is
+//     exactly the ADR-032 regression the order exists to prevent -- so the
+//     bootstrap is gated on the measurer, the VRAM twin of P4a's
+//     ramMeasurerInstalled gate. It is asked PER SPEC (vramMeasurable): a wsl
+//     spec's figure is the WSL VM's growth across its start (#381), which also
+//     needs the VM's worker to be findable (SetWSLVMPIDs). A Windows NVIDIA
+//     host always has the PDH measurer, so without the per-spec question a wsl
+//     spec there would be granted an eviction for a measurement that can never
+//     arrive.
 //   - The declared VRAM demand is unknown. A known-demand candidate never runs
 //     rule 4 at all, so the grant would be meaningless.
 //   - The bootstrap is still unresolved: no measurement captured and the one shot
@@ -3696,9 +3697,10 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 // /sys/class/kfd/kfd/proc on Linux, and on Windows also a missing
 // pdh.dll/gdi32.dll export -- and nil is also NewManager's default). Those
 // hosts take the first branch, spawn nothing, allocate nothing, and behave
-// exactly as they did before this function existed. "No measurer" now means neither of the two: the host-RAM
-// measurer (SetRAMMeasurer) rides this same beat, and a host that has only that
-// one still measures RAM -- see the note on the two gates below.
+// exactly as they did before this function existed. "No measurer" now means
+// neither of the two: the host-RAM measurer (SetRAMMeasurer) rides this same
+// beat, and a host that has only that one still measures RAM -- see the note
+// on the two gates below.
 //
 // GATED ON A SPEC DECLARING A GPU, NOT ON BUDGETS EXISTING. Skipping the
 // measurement when no GPU budget is configured was considered and rejected:
