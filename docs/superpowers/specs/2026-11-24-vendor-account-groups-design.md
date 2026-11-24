@@ -260,7 +260,12 @@ by position and pick the first that is **eligible**:
 4. **not over a threshold**: for each category the member reports
    (percent `>= 0`), it is over when `pct >= threshold` **and** its reset time
    is unknown or in the future. A category whose reset time has passed counts
-   as renewed (the stale snapshot is not trusted past its own reset);
+   as renewed (the stale snapshot is not trusted past its own reset).
+   **Not applied to a shared member whose owner has not switched on
+   `share_usage_with_members`** (vendor doc §1.3): the borrower is not entitled
+   to that account's figures, and skipping it at 99 % would reveal them. Such a
+   member is used until the vendor rejects it with a limit error, and the
+   transparent failover of §6 then moves the request on (user decision);
 5. **not in limit cooldown** for the requested upstream model (§6).
 
 If no member is eligible but at least one passes rules 1–3, choose the member
@@ -384,6 +389,13 @@ and one compact line per member:
 - active;
 - over threshold — which category, percent, "free at" time;
 - cooldown — for which model, until when (after a limit error);
+
+For a shared member without the owner's usage opt-in the line never shows
+figures or window resets: only active, cooldown (its end taken from the
+vendor's `Retry-After` or the 60 s default, never from the scraped window
+reset) or not usable. In the "all over threshold" choice of §5.3 such a member
+has no known reset unless it is in cooldown, so it sorts by its cooldown end or
+last.
 - not usable — disabled, needs reconnect, subscriptions switched off, or no
   longer reachable.
 
@@ -440,9 +452,10 @@ feature flag.
 - No new feature flag.
 - Per-model weekly windows are left to the limit-error failover.
 
-**Open — the user's decision:** shared members whose owner has **not** switched
-on `share_usage_with_members` (vendor doc §1.3: the owner's opt-in that shows
-the account's usage figures to the people allowed to use it).
+**Decided by the user:** a shared member whose owner has **not** switched on
+`share_usage_with_members` is not subject to the thresholds; it is left only on
+a vendor limit error (§5.3 rule 4, §9). The existing header entitlement rules
+stay unchanged.
 
 ## 13. Project 2 (follows this one; recorded, not designed here)
 
