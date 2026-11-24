@@ -46,6 +46,9 @@ export type UsageEvent = {
   // deleted account) -- so render "account_id present, account_name empty" too.
   account_id?: string;
   account_name?: string;
+  // The vendor account group that served the request (failover groups); absent
+  // when it was served by a plain account or a server.
+  vendor_group_id?: string;
   // ServiceID / ServiceName attribute the request to a Service Account (Phase 1
   // service accounts) when it was served by a service token; empty/absent for
   // ordinary user-token/session usage. Mirrors token_id/token_name.

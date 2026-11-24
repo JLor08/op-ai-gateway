@@ -27,6 +27,7 @@ import { netbirdApi } from './api/netbird';
 import { chatApi } from './api/chat';
 import { runtimeApi } from './api/runtime';
 import { vendorAccountsApi } from './api/vendorAccounts';
+import { vendorAccountGroupsApi } from './api/vendorAccountGroups';
 import { voiceChatApi } from './api/voiceChat';
 import { rpcMembersApi } from './api/rpcMembers';
 import { binariesApi } from './api/binaries';
@@ -48,6 +49,7 @@ export * from './api/netbird';
 export * from './api/chat';
 export * from './api/runtime';
 export * from './api/vendorAccounts';
+export * from './api/vendorAccountGroups';
 export * from './api/voiceChat';
 export * from './api/rpcMembers';
 export * from './api/binaries';
@@ -69,6 +71,7 @@ export function createPortalApi(fetcher: Fetcher = fetch) {
     ...chatApi(fetcher),
     ...runtimeApi(fetcher),
     ...vendorAccountsApi(fetcher),
+    ...vendorAccountGroupsApi(fetcher),
     ...voiceChatApi(fetcher),
     ...rpcMembersApi(fetcher),
     ...binariesApi(fetcher),
