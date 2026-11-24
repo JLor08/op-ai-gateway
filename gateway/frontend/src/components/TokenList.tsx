@@ -212,9 +212,14 @@ export function TokenList({
   const [chatDraft, setChatDraft] = useState<{
     log_communication: boolean;
     secret: boolean;
+    vendor_access?: VendorAccessDraft;
   } | null>(null);
-  // The vendor lists load while the token form is open.
-  const needsVendorLists = vendorAccountsEnabled && mode !== 'list';
+  // The chat card edits the session's provider policy only while the flag is on and
+  // the backend could read the user (the row then carries vendor_access).
+  const chatVendorEditable = vendorAccountsEnabled && chatSession?.vendor_access !== undefined;
+  // One fetch serves whichever surface needs the lists: the token form or the chat
+  // card (the form replaces the list view, so they are never both visible).
+  const needsVendorLists = vendorAccountsEnabled && (mode !== 'list' || chatVendorEditable);
 
   useEffect(() => {
     if (mode === 'list') return;
@@ -480,13 +485,29 @@ export function TokenList({
     }
   }
 
-  async function saveChatSettings(next: { log_communication: boolean; secret: boolean }) {
+  async function saveChatSettings(next: NonNullable<typeof chatDraft>) {
+    // The policy goes out as an explicit object whenever the card edits it (never
+    // null: the backend reads null as "leave untouched"); otherwise the body is the
+    // two booleans only.
+    const vendorAccess =
+      chatVendorEditable && next.vendor_access
+        ? buildVendorAccessDTO(next.vendor_access, vendorAccounts, vendorGroups)
+        : undefined;
     try {
-      await api.updateChatSettings(next);
+      await api.updateChatSettings({
+        log_communication: next.log_communication,
+        secret: next.secret,
+        ...(vendorAccess ? { vendor_access: vendorAccess } : {}),
+      });
       setTokens((current) =>
         current.map((row) =>
           row.is_chat_session
-            ? { ...row, log_communication: next.log_communication, secret: next.secret }
+            ? {
+                ...row,
+                log_communication: next.log_communication,
+                secret: next.secret,
+                ...(vendorAccess ? { vendor_access: vendorAccess } : {}),
+              }
             : row,
         ),
       );
@@ -929,6 +950,10 @@ export function TokenList({
         secret: chatSession.secret,
       })
     : null;
+  const chatVendorDraft =
+    chatDraftValue?.vendor_access ?? vendorAccessDraftFromDTO(chatSession?.vendor_access);
+  const chatVendorInvalid =
+    chatVendorEditable && vendorAccessDraftInvalid(chatVendorDraft, vendorAccounts, vendorGroups);
 
   return (
     <>
@@ -979,11 +1004,39 @@ export function TokenList({
               variant="outlined"
               size="small"
               type="button"
-              onClick={() => saveChatSettings(chatDraftValue)}
+              disabled={chatVendorInvalid}
+              onClick={() =>
+                saveChatSettings({
+                  ...chatDraftValue,
+                  ...(chatVendorEditable ? { vendor_access: chatVendorDraft } : {}),
+                })
+              }
             >
               {t.tokenActionSave}
             </Button>
           </Box>
+          {vendorAccountsEnabled && (
+            <Box sx={{ mt: 2 }}>
+              <VendorAccessEditor
+                value={chatVendorDraft}
+                onChange={(next) => setChatDraft({ ...chatDraftValue, vendor_access: next })}
+                accounts={vendorAccounts}
+                groups={vendorGroups}
+                t={t}
+                idPrefix="chat"
+                labels={{
+                  heading: t.tokenVendorAccessLabel,
+                  note: t.chatSessionVendorAccessNote,
+                }}
+                disabled={!chatVendorEditable}
+              />
+              {!chatVendorEditable && (
+                <Typography variant="caption" color="text.secondary">
+                  {t.chatSessionVendorAccessUnavailable}
+                </Typography>
+              )}
+            </Box>
+          )}
         </Panel>
       )}
 

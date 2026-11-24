@@ -682,6 +682,120 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`TokenList chat-session provider access [${locale}]`, () => {
+    function chatPanel() {
+      return within(screen.getByRole('region', { name: t.chatSessionName }));
+    }
+    function save() {
+      fireEvent.click(chatPanel().getByRole('button', { name: t.tokenActionSave }));
+    }
+
+    it('pre-fills "all + incl. groups" for an unset user and sends the draft on every save', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalledTimes(1));
+      const chat = chatPanel();
+      expect(chat.getByLabelText(t.tokenVendorAccessAll)).toBeChecked();
+      expect(chat.getByLabelText(t.tokenVendorAccessIncludeGroups)).toBeChecked();
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+        vendor_access: { all: true, include_groups: true },
+      });
+      expect(fakeApi.vendorAccountGroups).toHaveBeenCalledTimes(1);
+    });
+
+    it('pre-fills an explicit "no providers" row with nothing ticked and saves it as an object', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: false, accounts: [] } })],
+      });
+      const chat = chatPanel();
+      expect(await chat.findByRole('checkbox', { name: 'Work OpenAI' })).not.toBeChecked();
+      expect(chat.getByLabelText(t.tokenVendorAccessAll)).not.toBeChecked();
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+        vendor_access: { all: false, accounts: [] },
+      });
+    });
+
+    it('unticking all and ticking one account sends that explicit list', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      const chat = chatPanel();
+      fireEvent.click(chat.getByLabelText(t.tokenVendorAccessAll));
+      fireEvent.click(await chat.findByRole('checkbox', { name: 'Work OpenAI' }));
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+        vendor_access: { all: false, accounts: [{ account_id: 'acc_a' }] },
+      });
+    });
+
+    it('disables the editor with a hint and sends only the booleans when the row has no policy', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow()],
+      });
+      const chat = chatPanel();
+      expect(chat.getByText(t.chatSessionVendorAccessUnavailable)).toBeInTheDocument();
+      expect(chat.getByLabelText(t.tokenVendorAccessAll)).toBeDisabled();
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+      });
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+    });
+
+    it('omits the editor and the field while the vendor-accounts flag is off', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      expect(chatPanel().queryByText(t.tokenVendorAccessLabel)).not.toBeInTheDocument();
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+      });
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+    });
+
+    it('renders a policy conflict translated', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      fakeApi.updateChatSettings.mockRejectedValueOnce(
+        new PortalApiError(400, 'portal.token_vendor_access_conflict', 'raw'),
+      );
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalled());
+      save();
+      expect(
+        await screen.findByText(
+          `portal.token_vendor_access_conflict: ${t.errorTokenVendorAccessConflict}`,
+        ),
+      ).toBeInTheDocument();
+    });
+  });
+
   describe(`TokenList one-time-secret reveal modal [${locale}]`, () => {
     it('shows the created secret in a widened (md) dialog', async () => {
       renderTokenList({});
