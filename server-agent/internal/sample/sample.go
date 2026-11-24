@@ -479,8 +479,9 @@ type GPU struct {
 	UUID          string `json:"uuid"`
 	DriverVersion string `json:"driver_version,omitempty"`
 	// PCIBusID is the card's PCI address, e.g. "00000000:65:00.0". NVIDIA
-	// only -- rocm-smi and ioreg report nothing of this form and must leave
-	// it empty rather than inventing an equivalent. It is a DISPLAY and
+	// reports it via nvidia-smi pci.bus_id and AMD via rocm-smi --showbus;
+	// Apple/ioreg has no such address and must leave it empty rather than
+	// inventing an equivalent. It is a DISPLAY and
 	// disambiguation aid: on the 4x/8x identical-card hosts that are the
 	// normal AI-server build it is the one handle that maps to a physical
 	// slot and survives the index renumbering across reboots that
