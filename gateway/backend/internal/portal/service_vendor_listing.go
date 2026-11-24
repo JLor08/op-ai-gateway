@@ -176,29 +176,47 @@ func (s *Service) advertisedVendorGroupModels(ctx context.Context, token auth.To
 		if !allowed {
 			continue
 		}
-		members, err := s.routes.VendorAccountGroupMembers(ctx, g.ID)
-		if err != nil {
-			loaded = false
-			continue
-		}
-		for _, m := range members {
-			acc, ok := reachable[m.AccountID]
-			if !ok || acc.Vendor != g.Vendor || acc.Status != routing.VendorAccountStatusActive {
-				continue
-			}
-			if acc.AuthType == routing.VendorAuthSubscription && !subscriptionsOn {
-				continue
-			}
-			models, err := s.routes.VendorAccountModels(ctx, acc.ID)
-			if err != nil {
-				loaded = false
-				continue
-			}
-			models, _ = relabelVendorModels(models, prefix)
-			out = append(out, vendorAccountModels{Account: acc, Models: models, GroupID: g.ID, GroupName: g.Name})
-		}
+		members, complete := s.advertisedVendorGroupMembers(ctx, g, prefix, reachable, subscriptionsOn)
+		out = append(out, members...)
+		loaded = loaded && complete
 	}
 	return out, loaded
+}
+
+// advertisedVendorGroupMembers is group g's entries of the listing: one per usable
+// member (vendorGroupMemberListable) with that member's models relabeled to prefix,
+// in member order. complete is false when the member list or a member's models could
+// not be read; what could be read is still returned.
+func (s *Service) advertisedVendorGroupMembers(ctx context.Context, g routing.VendorAccountGroup, prefix string, reachable map[string]routing.VendorAccount, subscriptionsOn bool) (out []vendorAccountModels, complete bool) {
+	members, err := s.routes.VendorAccountGroupMembers(ctx, g.ID)
+	if err != nil {
+		return nil, false
+	}
+	complete = true
+	for _, m := range members {
+		acc, ok := reachable[m.AccountID]
+		if !ok || !vendorGroupMemberListable(g, acc, subscriptionsOn) {
+			continue
+		}
+		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
+		if err != nil {
+			complete = false
+			continue
+		}
+		models, _ = relabelVendorModels(models, prefix)
+		out = append(out, vendorAccountModels{Account: acc, Models: models, GroupID: g.ID, GroupName: g.Name})
+	}
+	return out, complete
+}
+
+// vendorGroupMemberListable reports whether reachable account acc counts as a usable
+// member of g for the listing: of the group's vendor, active, and not a subscription
+// while vendor_subscriptions_enabled is off (the resolver's structural rules).
+func vendorGroupMemberListable(g routing.VendorAccountGroup, acc routing.VendorAccount, subscriptionsOn bool) bool {
+	if acc.Vendor != g.Vendor || acc.Status != routing.VendorAccountStatusActive {
+		return false
+	}
+	return acc.AuthType != routing.VendorAuthSubscription || subscriptionsOn
 }
 
 // vendorModelFlavorSets returns, for the PRINCIPAL, each gateway model one of

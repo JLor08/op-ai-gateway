@@ -273,25 +273,53 @@ func (s *Service) UpdateVendorAccountGroup(ctx context.Context, principal auth.T
 	if err != nil {
 		return VendorAccountGroupDTO{}, err
 	}
-	prefixChanged := false
+	prefixChanged, err := applyVendorGroupUpdate(&g, req)
+	if err != nil {
+		return VendorAccountGroupDTO{}, err
+	}
+	if prefixChanged {
+		if err := s.checkVendorGroupPrefixConflictOfMembers(ctx, g); err != nil {
+			return VendorAccountGroupDTO{}, err
+		}
+	}
+	g.UpdatedAt = s.clock().UTC()
+	if err := s.routes.UpdateVendorAccountGroup(ctx, g); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return VendorAccountGroupDTO{}, ErrVendorGroupNotFound
+		}
+		return VendorAccountGroupDTO{}, err
+	}
+	return s.vendorAccountGroupDTO(ctx, g)
+}
+
+// applyVendorGroupUpdate applies the set fields of req to g, each validated, and
+// reports whether the model prefix changed. The first invalid field is the error
+// and g may then be partly updated (the caller discards it).
+func applyVendorGroupUpdate(g *routing.VendorAccountGroup, req UpdateVendorAccountGroupRequest) (prefixChanged bool, err error) {
 	if req.Name != nil {
 		if g.Name, err = normalizeVendorGroupName(*req.Name); err != nil {
-			return VendorAccountGroupDTO{}, err
+			return false, err
 		}
 	}
 	if req.ModelPrefix != nil {
 		prefix, err := normalizeVendorGroupPrefix(*req.ModelPrefix)
 		if err != nil {
-			return VendorAccountGroupDTO{}, err
+			return false, err
 		}
 		prefixChanged = prefix != g.ModelPrefix
 		g.ModelPrefix = prefix
 	}
 	if req.Status != nil {
 		if g.Status, err = normalizeVendorGroupStatus(*req.Status); err != nil {
-			return VendorAccountGroupDTO{}, err
+			return false, err
 		}
 	}
+	return prefixChanged, applyVendorGroupThresholdUpdate(g, req)
+}
+
+// applyVendorGroupThresholdUpdate sets each threshold req carries on g; a value
+// outside 1..100 is ErrVendorGroupThresholdInvalid.
+func applyVendorGroupThresholdUpdate(g *routing.VendorAccountGroup, req UpdateVendorAccountGroupRequest) error {
 	for _, t := range []struct {
 		in  *int
 		out *int
@@ -304,27 +332,21 @@ func (s *Service) UpdateVendorAccountGroup(ctx context.Context, principal auth.T
 			continue
 		}
 		if *t.in < 1 || *t.in > 100 {
-			return VendorAccountGroupDTO{}, ErrVendorGroupThresholdInvalid
+			return ErrVendorGroupThresholdInvalid
 		}
 		*t.out = *t.in
 	}
-	if prefixChanged {
-		ids, err := s.vendorGroupMemberIDs(ctx, g.ID)
-		if err != nil {
-			return VendorAccountGroupDTO{}, err
-		}
-		if err := s.checkVendorGroupPrefixConflict(ctx, g, ids); err != nil {
-			return VendorAccountGroupDTO{}, err
-		}
+	return nil
+}
+
+// checkVendorGroupPrefixConflictOfMembers runs checkVendorGroupPrefixConflict for g
+// over its stored members.
+func (s *Service) checkVendorGroupPrefixConflictOfMembers(ctx context.Context, g routing.VendorAccountGroup) error {
+	ids, err := s.vendorGroupMemberIDs(ctx, g.ID)
+	if err != nil {
+		return err
 	}
-	g.UpdatedAt = s.clock().UTC()
-	if err := s.routes.UpdateVendorAccountGroup(ctx, g); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return VendorAccountGroupDTO{}, ErrVendorGroupNotFound
-		}
-		return VendorAccountGroupDTO{}, err
-	}
-	return s.vendorAccountGroupDTO(ctx, g)
+	return s.checkVendorGroupPrefixConflict(ctx, g, ids)
 }
 
 // DeleteVendorAccountGroup deletes one of the caller's groups. A token policy that
@@ -446,14 +468,15 @@ func (s *Service) checkVendorGroupPrefixConflict(ctx context.Context, g routing.
 	if err != nil || len(mine) == 0 {
 		return err
 	}
-	clash := func(other map[string]struct{}, what string) error {
-		for name := range other {
-			if _, hit := mine[name]; hit {
-				return fmt.Errorf("%w: %q is also served by %s", ErrVendorGroupPrefixConflict, name, what)
-			}
-		}
-		return nil
+	if err := s.checkVendorGroupNamesAgainstOwnAccounts(ctx, g, ids, mine); err != nil {
+		return err
 	}
+	return s.checkVendorGroupNamesAgainstOwnGroups(ctx, g, mine)
+}
+
+// checkVendorGroupNamesAgainstOwnAccounts refuses mine, the public names of group g
+// with members ids, when an own account of g's owner outside the group serves one.
+func (s *Service) checkVendorGroupNamesAgainstOwnAccounts(ctx context.Context, g routing.VendorAccountGroup, ids []string, mine map[string]struct{}) error {
 	own, err := s.routes.VendorAccountsByOwner(ctx, g.OwnerUserID)
 	if err != nil {
 		return err
@@ -466,10 +489,16 @@ func (s *Service) checkVendorGroupPrefixConflict(ctx context.Context, g routing.
 		if err != nil {
 			return err
 		}
-		if err := clash(names, fmt.Sprintf("account %q", acc.Name)); err != nil {
+		if err := vendorGroupNameClash(mine, names, fmt.Sprintf("account %q", acc.Name)); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// checkVendorGroupNamesAgainstOwnGroups refuses mine, the public names of group g,
+// when another group of g's owner serves one.
+func (s *Service) checkVendorGroupNamesAgainstOwnGroups(ctx context.Context, g routing.VendorAccountGroup, mine map[string]struct{}) error {
 	groups, err := s.routes.VendorAccountGroupsByOwner(ctx, g.OwnerUserID)
 	if err != nil {
 		return err
@@ -486,8 +515,19 @@ func (s *Service) checkVendorGroupPrefixConflict(ctx context.Context, g routing.
 		if err != nil {
 			return err
 		}
-		if err := clash(names, fmt.Sprintf("group %q", other.Name)); err != nil {
+		if err := vendorGroupNameClash(mine, names, fmt.Sprintf("group %q", other.Name)); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// vendorGroupNameClash is ErrVendorGroupPrefixConflict naming what (another source)
+// when a name of other is also one of mine, else nil.
+func vendorGroupNameClash(mine, other map[string]struct{}, what string) error {
+	for name := range other {
+		if _, hit := mine[name]; hit {
+			return fmt.Errorf("%w: %q is also served by %s", ErrVendorGroupPrefixConflict, name, what)
 		}
 	}
 	return nil
@@ -509,8 +549,7 @@ func (s *Service) vendorAccountGroupDTO(ctx context.Context, g routing.VendorAcc
 	if err != nil {
 		return VendorAccountGroupDTO{}, err
 	}
-	subscriptionsOn := s.VendorSubscriptionsEnabled(ctx)
-	now := s.clock()
+	v := vendorGroupView{group: g, subscriptionsOn: s.VendorSubscriptionsEnabled(ctx), now: s.clock()}
 	th := g.Thresholds()
 	dto := VendorAccountGroupDTO{
 		ID: g.ID, Vendor: g.Vendor, Name: g.Name, ModelPrefix: g.ModelPrefix, Status: g.Status,
@@ -519,72 +558,109 @@ func (s *Service) vendorAccountGroupDTO(ctx context.Context, g routing.VendorAcc
 		CreatedAt:  g.CreatedAt, UpdatedAt: g.UpdatedAt,
 	}
 	cands := make([]routing.VendorGroupCandidate, len(members))
-	cooldowns := make([][]routing.VendorCooldown, len(members))
 	for i, m := range members {
-		member := VendorAccountGroupMemberDTO{AccountID: m.AccountID, Position: i + 1, Cooldowns: []VendorCooldownDTO{}}
-		cands[i].AccountID = m.AccountID
 		acc, ok := reachable[m.AccountID]
-		switch {
-		case !ok || acc.Vendor != g.Vendor:
-			member.State, member.Reason = VendorGroupStateNotUsable, VendorGroupReasonNotReachable
-		default:
-			member.AccountName, member.AuthType = acc.Name, acc.AuthType
-			if acc.OwnerUserID != g.OwnerUserID {
-				member.OwnerName = s.vendorAccountOwnerName(ctx, acc)
-			}
-			switch {
-			case acc.Status == routing.VendorAccountStatusNeedsReconnect:
-				member.State, member.Reason = VendorGroupStateNotUsable, VendorGroupReasonNeedsReconnect
-			case acc.Status != routing.VendorAccountStatusActive:
-				member.State, member.Reason = VendorGroupStateNotUsable, VendorGroupReasonDisabled
-			case acc.AuthType == routing.VendorAuthSubscription && !subscriptionsOn:
-				member.State, member.Reason = VendorGroupStateNotUsable, VendorGroupReasonSubscriptionsDisabled
-			default:
-				cands[i].Usable = true
-				cands[i].ThresholdsApply = acc.OwnerUserID == g.OwnerUserID || acc.ShareUsageWithMembers
-			}
+		if dto.Members[i], cands[i], err = s.vendorGroupMemberBase(ctx, v, i, m.AccountID, acc, ok); err != nil {
+			return VendorAccountGroupDTO{}, err
 		}
-		if cands[i].Usable {
-			if u, found, err := s.routes.VendorAccountUsageByID(ctx, m.AccountID); err != nil {
-				return VendorAccountGroupDTO{}, err
-			} else if found {
-				cands[i].Usage, cands[i].HasUsage = u, true
-			}
-			cooldowns[i] = s.memberVendorCooldowns(m.AccountID, cands[i].ThresholdsApply, now)
-			for _, c := range cooldowns[i] {
-				member.Cooldowns = append(member.Cooldowns, VendorCooldownDTO{Model: c.UpstreamModel, Until: c.Until})
-				if c.Until.After(cands[i].CooldownUntil) {
-					cands[i].CooldownUntil = c.Until
-				}
-			}
-		}
-		dto.Members[i] = member
 	}
-	active, hasActive := routing.SelectVendorGroupMember(cands, th, now, true)
+	active, hasActive := routing.SelectVendorGroupMember(cands, th, v.now, true)
 	for i := range dto.Members {
 		if !cands[i].Usable {
 			continue
 		}
-		member := &dto.Members[i]
-		blocks := routing.VendorGroupMemberBlocks(cands[i], th, now)
-		if cands[i].ThresholdsApply && cands[i].HasUsage {
-			usage, err := s.vendorAccountUsageDTO(ctx, cands[i].AccountID)
-			if err != nil {
-				return VendorAccountGroupDTO{}, err
-			}
-			member.Usage = usage
-		}
-		switch {
-		case hasActive && i == active:
-			member.State = VendorGroupStateActive
-			dto.ActiveMemberID = member.AccountID
-		case len(blocks) == 0:
-			member.State = VendorGroupStateAvailable
-		default:
-			applyVendorGroupBlocks(member, blocks)
+		if err := s.settleVendorGroupMember(ctx, &dto.Members[i], cands[i], th, v.now, hasActive && i == active); err != nil {
+			return VendorAccountGroupDTO{}, err
 		}
 	}
+	if hasActive { // the selection only ever picks a usable member
+		dto.ActiveMemberID = dto.Members[active].AccountID
+	}
 	return dto, nil
+}
+
+// vendorGroupView is what one vendorAccountGroupDTO render shares across its members:
+// the group, the vendor_subscriptions_enabled switch and the render's clock reading.
+type vendorGroupView struct {
+	group           routing.VendorAccountGroup
+	subscriptionsOn bool
+	now             time.Time
+}
+
+// vendorGroupMemberBase is the member at index i (account accountID; acc and
+// reachable the owner's grant answer for it) before the selection runs: its labels,
+// not_usable with its reason when it fails spec 5.3 rules 1 and 2, else a usable
+// candidate carrying ThresholdsApply, its usage snapshot and the cooldowns the owner
+// may see (memberVendorCooldowns), the latest of which is its CooldownUntil.
+func (s *Service) vendorGroupMemberBase(ctx context.Context, v vendorGroupView, i int, accountID string, acc routing.VendorAccount, reachable bool) (VendorAccountGroupMemberDTO, routing.VendorGroupCandidate, error) {
+	member := VendorAccountGroupMemberDTO{AccountID: accountID, Position: i + 1, Cooldowns: []VendorCooldownDTO{}}
+	cand := routing.VendorGroupCandidate{AccountID: accountID}
+	if !reachable || acc.Vendor != v.group.Vendor {
+		member.State, member.Reason = VendorGroupStateNotUsable, VendorGroupReasonNotReachable
+		return member, cand, nil
+	}
+	member.AccountName, member.AuthType = acc.Name, acc.AuthType
+	if acc.OwnerUserID != v.group.OwnerUserID {
+		member.OwnerName = s.vendorAccountOwnerName(ctx, acc)
+	}
+	if reason := vendorGroupNotUsableReason(acc, v.subscriptionsOn); reason != "" {
+		member.State, member.Reason = VendorGroupStateNotUsable, reason
+		return member, cand, nil
+	}
+	cand.Usable = true
+	cand.ThresholdsApply = acc.OwnerUserID == v.group.OwnerUserID || acc.ShareUsageWithMembers
+	if u, found, err := s.routes.VendorAccountUsageByID(ctx, accountID); err != nil {
+		return VendorAccountGroupMemberDTO{}, routing.VendorGroupCandidate{}, err
+	} else if found {
+		cand.Usage, cand.HasUsage = u, true
+	}
+	for _, c := range s.memberVendorCooldowns(accountID, cand.ThresholdsApply, v.now) {
+		member.Cooldowns = append(member.Cooldowns, VendorCooldownDTO{Model: c.UpstreamModel, Until: c.Until})
+		if c.Until.After(cand.CooldownUntil) {
+			cand.CooldownUntil = c.Until
+		}
+	}
+	return member, cand, nil
+}
+
+// vendorGroupNotUsableReason is why a reachable account of the group's vendor cannot
+// serve (spec 5.3 rule 2) -- needs_reconnect, disabled, or a subscription while
+// subscriptions are off -- and "" when it can.
+func vendorGroupNotUsableReason(acc routing.VendorAccount, subscriptionsOn bool) string {
+	switch {
+	case acc.Status == routing.VendorAccountStatusNeedsReconnect:
+		return VendorGroupReasonNeedsReconnect
+	case acc.Status != routing.VendorAccountStatusActive:
+		return VendorGroupReasonDisabled
+	case acc.AuthType == routing.VendorAuthSubscription && !subscriptionsOn:
+		return VendorGroupReasonSubscriptionsDisabled
+	default:
+		return ""
+	}
+}
+
+// settleVendorGroupMember sets a usable member's final state from its candidate
+// cand: active when the selection picked it (isActive), else available, else its
+// blocks (applyVendorGroupBlocks). Its usage DTO is attached only when its usage
+// counts for the owner (ThresholdsApply) and a snapshot exists.
+func (s *Service) settleVendorGroupMember(ctx context.Context, member *VendorAccountGroupMemberDTO, cand routing.VendorGroupCandidate, th routing.VendorGroupThresholds, now time.Time, isActive bool) error {
+	if cand.ThresholdsApply && cand.HasUsage {
+		usage, err := s.vendorAccountUsageDTO(ctx, cand.AccountID)
+		if err != nil {
+			return err
+		}
+		member.Usage = usage
+	}
+	blocks := routing.VendorGroupMemberBlocks(cand, th, now)
+	switch {
+	case isActive:
+		member.State = VendorGroupStateActive
+	case len(blocks) == 0:
+		member.State = VendorGroupStateAvailable
+	default:
+		applyVendorGroupBlocks(member, blocks)
+	}
+	return nil
 }
 
 // memberVendorCooldowns is the active cooldowns of member accountID as the group

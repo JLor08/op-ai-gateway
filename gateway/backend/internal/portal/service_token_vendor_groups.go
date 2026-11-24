@@ -31,33 +31,9 @@ import (
 // group shadows it); any other shared name is.
 func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.Token, byID map[string]routing.VendorAccount, d *VendorAccessDTO, check *vendorAccessCheck) error {
 	covered := d.All && d.IncludeGroups
-	entries := make([]auth.VendorAccessGroupEntry, 0, len(d.Groups))
-	seen := make(map[string]struct{}, len(d.Groups))
-	for _, e := range d.Groups {
-		id := strings.TrimSpace(e.GroupID)
-		g, err := s.routes.VendorAccountGroupByID(ctx, id)
-		if errors.Is(err, store.ErrNotFound) || (err == nil && (principal.UserID == "" || g.OwnerUserID != principal.UserID)) {
-			return fmt.Errorf("%w: unknown group %q", ErrTokenVendorAccessInvalid, id)
-		}
-		if err != nil {
-			return err
-		}
-		if covered {
-			continue
-		}
-		if _, dup := seen[id]; dup {
-			return fmt.Errorf("%w: group %q listed more than once", ErrTokenVendorAccessInvalid, id)
-		}
-		seen[id] = struct{}{}
-		entry := auth.VendorAccessGroupEntry{GroupID: id}
-		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
-			prefix, err := normalizeVendorAccountModelPrefix(e.PrefixOverride.Value)
-			if err != nil {
-				return fmt.Errorf("%w: group %q: %w", ErrTokenVendorAccessInvalid, id, err)
-			}
-			entry.OverrideEnabled, entry.OverridePrefix = true, prefix
-		}
-		entries = append(entries, entry)
+	entries, err := s.vendorAccessGroupEntries(ctx, principal, d.Groups, covered)
+	if err != nil {
+		return err
 	}
 	check.subscriptionsOn = s.VendorSubscriptionsEnabled(ctx)
 	if len(entries) == 0 && !covered {
@@ -73,12 +49,73 @@ func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.To
 	if !loaded {
 		slog.Warn("portal: token vendor-access group collision check ran on an incomplete group listing; the routing backstop still applies")
 	}
-	for _, c := range claims {
-		for _, m := range c.Models {
-			if err := check.claim(m.GatewayModel, c.GroupID); err != nil {
+	return check.claimGroupNames(claims)
+}
+
+// vendorAccessGroupEntries validates the policy's group entries in order and returns
+// them as stored: every entry names a group the principal owns (ownedVendorAccessGroup),
+// and, unless covered (all + include_groups, which ignores the listed entries), is
+// listed once with a valid override prefix. The first failure is the one reported.
+func (s *Service) vendorAccessGroupEntries(ctx context.Context, principal auth.Token, raw []VendorAccessGroupDTO, covered bool) ([]auth.VendorAccessGroupEntry, error) {
+	entries := make([]auth.VendorAccessGroupEntry, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, e := range raw {
+		id := strings.TrimSpace(e.GroupID)
+		if err := s.ownedVendorAccessGroup(ctx, principal, id); err != nil {
+			return nil, err
+		}
+		if covered {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			return nil, fmt.Errorf("%w: group %q listed more than once", ErrTokenVendorAccessInvalid, id)
+		}
+		seen[id] = struct{}{}
+		entry, err := vendorAccessGroupEntry(id, e.PrefixOverride)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// ownedVendorAccessGroup checks that group id is one the principal owns. A foreign,
+// unknown or blank id is the same ErrTokenVendorAccessInvalid (no existence leak);
+// any other store failure is returned raw.
+func (s *Service) ownedVendorAccessGroup(ctx context.Context, principal auth.Token, id string) error {
+	g, err := s.routes.VendorAccountGroupByID(ctx, id)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && (principal.UserID == "" || g.OwnerUserID != principal.UserID)) {
+		return fmt.Errorf("%w: unknown group %q", ErrTokenVendorAccessInvalid, id)
+	}
+	return err
+}
+
+// vendorAccessGroupEntry is the stored entry for group id with the requested prefix
+// override: none unless it is enabled, then the normalized override value.
+func vendorAccessGroupEntry(id string, override *PrefixOverrideDTO) (auth.VendorAccessGroupEntry, error) {
+	entry := auth.VendorAccessGroupEntry{GroupID: id}
+	if override == nil || !override.Enabled {
+		return entry, nil
+	}
+	prefix, err := normalizeVendorAccountModelPrefix(override.Value)
+	if err != nil {
+		return auth.VendorAccessGroupEntry{}, fmt.Errorf("%w: group %q: %w", ErrTokenVendorAccessInvalid, id, err)
+	}
+	entry.OverrideEnabled, entry.OverridePrefix = true, prefix
+	return entry, nil
+}
+
+// claimGroupNames claims every public name of the opted-in groups' listing entries
+// for their group (claim) and records it in groupNames, which
+// checkOwnAccountsAgainstGroups reads.
+func (c *vendorAccessCheck) claimGroupNames(claims []vendorAccountModels) error {
+	for _, am := range claims {
+		for _, m := range am.Models {
+			if err := c.claim(m.GatewayModel, am.GroupID); err != nil {
 				return err
 			}
-			check.groupNames[m.GatewayModel] = c.GroupID
+			c.groupNames[m.GatewayModel] = am.GroupID
 		}
 	}
 	return nil
@@ -92,19 +129,9 @@ func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.To
 // still answers that name, so the member's own claim on it is no conflict. A store
 // failure is an infrastructure error and is returned raw, like the group lookup's.
 func (s *Service) recordVendorGroupMembers(ctx context.Context, principal auth.Token, covered bool, entries []auth.VendorAccessGroupEntry, check *vendorAccessCheck) error {
-	ids := make([]string, 0, len(entries))
-	if covered {
-		groups, err := s.routes.VendorAccountGroupsByOwner(ctx, principal.UserID)
-		if err != nil {
-			return err
-		}
-		for _, g := range groups {
-			ids = append(ids, g.ID)
-		}
-	} else {
-		for _, e := range entries {
-			ids = append(ids, e.GroupID)
-		}
+	ids, err := s.optedInVendorGroupIDs(ctx, principal, covered, entries)
+	if err != nil {
+		return err
 	}
 	for _, id := range ids {
 		members, err := s.routes.VendorAccountGroupMembers(ctx, id)
@@ -118,6 +145,26 @@ func (s *Service) recordVendorGroupMembers(ctx context.Context, principal auth.T
 		check.groupMembers[id] = set
 	}
 	return nil
+}
+
+// optedInVendorGroupIDs is the ids of the groups a policy opts into: every group the
+// principal owns under all + include_groups (covered), else the listed entries'.
+func (s *Service) optedInVendorGroupIDs(ctx context.Context, principal auth.Token, covered bool, entries []auth.VendorAccessGroupEntry) ([]string, error) {
+	ids := make([]string, 0, len(entries))
+	if !covered {
+		for _, e := range entries {
+			ids = append(ids, e.GroupID)
+		}
+		return ids, nil
+	}
+	groups, err := s.routes.VendorAccountGroupsByOwner(ctx, principal.UserID)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		ids = append(ids, g.ID)
+	}
+	return ids, nil
 }
 
 // checkOwnAccountsAgainstGroups is the backstop of `all` with groups (listed or via
