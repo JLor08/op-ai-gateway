@@ -44,6 +44,10 @@ func vaMemberFixture(t *testing.T, level string) (f *adminGroupsFixture, account
 	if err := f.routes.SetResourceGroupProvision(ctx, rg, routing.ProvisionKindUser, "usr_va_b"); err != nil {
 		t.Fatalf("provision the member: %v", err)
 	}
+	// New accounts share usage by default; these tests pin the opted-out member view.
+	if err := f.routes.UpdateVendorAccountShareUsage(ctx, accountID, false); err != nil {
+		t.Fatalf("switch the usage opt-in off: %v", err)
+	}
 	// A usage snapshot, so the member's view lacking it is not vacuous.
 	reset := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	if err := f.routes.UpsertVendorAccountUsage(ctx, routing.VendorAccountUsage{

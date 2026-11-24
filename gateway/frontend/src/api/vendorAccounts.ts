@@ -185,6 +185,8 @@ export type CreateVendorAccountRequest = {
   api_key?: string;
   model_prefix?: string;
   base_url?: string;
+  // The initial usage opt-in; omitted = the backend default (on for a new account).
+  share_usage_with_members?: boolean;
 };
 
 // PATCH /api/portal/vendor-accounts/{id} body -- pointer-semantics on the

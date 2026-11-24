@@ -359,8 +359,9 @@ type VendorAccount struct {
 	// reach this account through sharing also see its usage figures: the rate-limit
 	// windows and spend in the portal (account page, member view and dashboard) and the
 	// subscription's usage limits in Claude Code; the owner always sees them. Written only by
-	// UpdateVendorAccountShareUsage (default false); CreateVendorAccount and
-	// UpdateVendorAccount never write it.
+	// UpdateVendorAccountShareUsage and, for the initial value, by CreateVendorAccount
+	// (the portal service defaults it to true for new accounts; the column default and
+	// existing rows stay false). UpdateVendorAccount never writes it.
 	ShareUsageWithMembers bool
 	CreatedAt             time.Time
 	UpdatedAt             time.Time

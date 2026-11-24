@@ -513,12 +513,35 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         auth_type: 'api_key',
         name: 'Work',
         api_key: 'sk-test-123',
+        share_usage_with_members: true,
       });
 
       // Back on the list with the new account; the key is nowhere in the DOM.
       expect(await screen.findByText('Work')).toBeInTheDocument();
       expect(container.innerHTML).not.toContain('sk-test-123');
       expect(screen.queryByDisplayValue('sk-test-123')).not.toBeInTheDocument();
+    });
+
+    it('offers the usage-sharing checkbox ticked and sends the choice', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+
+      const box = screen.getByLabelText(t.vendorAccountShareUsageLabel);
+      expect(box).toBeChecked();
+      fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+        target: { value: 'Quiet' },
+      });
+      fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+        target: { value: 'sk-quiet' },
+      });
+      fireEvent.click(box);
+      expect(box).not.toBeChecked();
+      fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.createVendorAccount.mock.calls[0][0]).toMatchObject({
+        share_usage_with_members: false,
+      });
     });
 
     it('submits the chosen vendor', async () => {
@@ -584,6 +607,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         vendor: 'openai',
         auth_type: 'subscription',
         name: 'Team Claude Max',
+        share_usage_with_members: true,
       });
       expect('api_key' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
 
@@ -669,6 +693,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           auth_type: 'api_key',
           name: 'Work',
           api_key: 'sk-test-123',
+          share_usage_with_members: true,
         });
       });
 
@@ -3510,6 +3535,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           name: 'Work',
           api_key: 'sk-test-123',
           model_prefix: 'chatgpt/',
+          share_usage_with_members: true,
         });
       });
 
@@ -3540,6 +3566,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           auth_type: 'subscription',
           name: 'Team',
           model_prefix: 'claude/',
+          share_usage_with_members: true,
         });
         await screen.findByText(t.vendorAccountSettingsTitle);
         expect(prefixField()).toHaveValue('claude/');
@@ -4479,6 +4506,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         name: 'Custom',
         api_key: 'sk-custom',
         base_url: 'https://llm.example.com',
+        share_usage_with_members: true,
       });
     });
 
@@ -4512,6 +4540,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         auth_type: 'api_key',
         name: 'Grok',
         api_key: 'xai-key',
+        share_usage_with_members: true,
       });
       expect('base_url' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
     });
@@ -4549,6 +4578,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         api_key: 'or-key',
         model_prefix: 'or/',
         base_url: 'https://proxy.example.com/or',
+        share_usage_with_members: true,
       });
     });
 
@@ -4582,6 +4612,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         name: 'Custom',
         api_key: 'sk-custom',
         base_url: 'https://llm.example.com/v1/',
+        share_usage_with_members: true,
       });
     });
 
@@ -4649,6 +4680,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         auth_type: 'api_key',
         name: 'Work',
         api_key: 'sk-test-123',
+        share_usage_with_members: true,
       });
     });
 

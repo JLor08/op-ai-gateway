@@ -13,8 +13,8 @@ import (
 )
 
 // TestConformanceVendorAccountShareUsageRoundTrip pins the owner's opt-in to
-// showing a subscription's usage limits to members (migration 110): a new account
-// reads back false, UpdateVendorAccountShareUsage flips it both ways through its
+// showing a subscription's usage limits to members (migration 110): an account created
+// without the opt-in reads back false, UpdateVendorAccountShareUsage flips it both ways through its
 // own column, and an unknown id is ErrNotFound. Runs on memory, sqlite and
 // postgres.
 func TestConformanceVendorAccountShareUsageRoundTrip(t *testing.T) {
@@ -22,17 +22,6 @@ func TestConformanceVendorAccountShareUsageRoundTrip(t *testing.T) {
 	forEachRoutingStoreSeeded(t, func(t *testing.T, s *SQLStore) { seedVendorSharingSQL(t, s, now) }, func(t *testing.T, s routing.Store) {
 		ctx := context.Background()
 		createSharingAccounts(t, s, now, "va_su", "va_su_other")
-
-		// Create never writes the opt-in: a create carrying true reads false on every
-		// driver (SQL's INSERT omits the column, so memory must zero it too).
-		forced := newSharingAccount("va_su_forced", now)
-		forced.ShareUsageWithMembers = true
-		if err := s.CreateVendorAccount(ctx, forced); err != nil {
-			t.Fatalf("CreateVendorAccount(forced): %v", err)
-		}
-		if acc, err := s.VendorAccountByID(ctx, "va_su_forced"); err != nil || acc.ShareUsageWithMembers {
-			t.Fatalf("a create with ShareUsageWithMembers=true reads %v (err %v), want false", acc.ShareUsageWithMembers, err)
-		}
 
 		read := func(id string) routing.VendorAccount {
 			t.Helper()
@@ -77,6 +66,33 @@ func TestConformanceVendorAccountShareUsageRoundTrip(t *testing.T) {
 		for _, a := range list {
 			if want := a.ID == "va_su"; a.ShareUsageWithMembers != want {
 				t.Errorf("VendorAccountsByOwner %s ShareUsageWithMembers = %v, want %v", a.ID, a.ShareUsageWithMembers, want)
+			}
+		}
+	})
+}
+
+// TestCreateVendorAccountPersistsShareUsage pins that a create stores the usage
+// opt-in it carries (spec 10.1), both values, on every driver.
+func TestCreateVendorAccountPersistsShareUsage(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStoreSeeded(t, func(t *testing.T, s *SQLStore) { seedVendorSharingSQL(t, s, now) }, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		for _, want := range []bool{true, false} {
+			id := "va_su_create_off"
+			if want {
+				id = "va_su_create_on"
+			}
+			acc := newSharingAccount(id, now)
+			acc.ShareUsageWithMembers = want
+			if err := s.CreateVendorAccount(ctx, acc); err != nil {
+				t.Fatalf("CreateVendorAccount(%s): %v", id, err)
+			}
+			got, err := s.VendorAccountByID(ctx, id)
+			if err != nil {
+				t.Fatalf("VendorAccountByID(%s): %v", id, err)
+			}
+			if got.ShareUsageWithMembers != want {
+				t.Errorf("create with ShareUsageWithMembers=%v reads %v", want, got.ShareUsageWithMembers)
 			}
 		}
 	})

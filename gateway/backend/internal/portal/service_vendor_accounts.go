@@ -176,6 +176,8 @@ type CreateVendorAccountRequest struct {
 	APIKey      string `json:"api_key"`
 	ModelPrefix string `json:"model_prefix"`
 	BaseURL     string `json:"base_url"`
+	// ShareUsageWithMembers is the initial usage opt-in; nil means true for a new account.
+	ShareUsageWithMembers *bool `json:"share_usage_with_members,omitempty"`
 }
 
 // UpdateVendorAccountRequest is a partial update: a nil field keeps the stored
@@ -1324,6 +1326,9 @@ func (s *Service) CreateVendorAccount(ctx context.Context, principal auth.Token,
 		BaseURL:     baseURL,
 		CreatedAt:   now,
 		UpdatedAt:   now,
+		// Usage is shared with members unless the creator opts out (spec 10.1);
+		// existing accounts keep their stored value.
+		ShareUsageWithMembers: req.ShareUsageWithMembers == nil || *req.ShareUsageWithMembers,
 	}
 	if err := s.routes.CreateVendorAccount(ctx, acc); err != nil {
 		return VendorAccountDTO{}, err

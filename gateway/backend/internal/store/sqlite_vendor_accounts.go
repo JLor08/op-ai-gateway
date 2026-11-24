@@ -19,8 +19,13 @@ import (
 // string) whatever the routing.VendorAccount carries -- a zero-value struct must
 // not write an empty string into share_level and bypass the DEFAULT. The two
 // columns are changed only by their narrow writers (UpdateVendorAccountShareLevel,
-// UpdateVendorAccountSystemGroup, ClearVendorAccountSharing).
+// UpdateVendorAccountSystemGroup, ClearVendorAccountSharing). share_usage_with_members
+// is the exception: the create decides its initial value, so it is written from the struct.
 const vendorAccountInsertColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at`
+
+// vendorAccountCreateColumns is vendorAccountInsertColumns plus the usage opt-in,
+// the one sharing column a create writes.
+const vendorAccountCreateColumns = vendorAccountInsertColumns + `, share_usage_with_members`
 
 // vendorAccountColumns is the single column list every vendor_accounts reader
 // selects, in the order scanVendorAccount scans them: the insert columns, then
@@ -29,12 +34,13 @@ const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
 // exactly as given -- the caller seals them first. ShareLevel and SystemGroupID
-// are ignored: the account starts at the column DEFAULTs (private). A duplicate id
+// are ignored: the account starts at the column DEFAULTs (private).
+// ShareUsageWithMembers is stored as given. A duplicate id
 // is ErrConflict.
 func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
-	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountInsertColumns+`)
-		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.BaseURL, a.CreatedAt, a.UpdatedAt)
+	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountCreateColumns+`)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.BaseURL, a.CreatedAt, a.UpdatedAt, a.ShareUsageWithMembers)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
 			return ErrConflict

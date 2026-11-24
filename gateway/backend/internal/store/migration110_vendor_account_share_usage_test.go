@@ -29,10 +29,12 @@ func TestMigration110VendorAccountShareUsage(t *testing.T) {
 		if err := s.CreateUser(ctx, newTestUser("u_m110", "m110@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
-		if err := s.CreateVendorAccount(ctx, routing.VendorAccount{
-			ID: "va_pre110", OwnerUserID: "u_m110", Vendor: routing.VendorAnthropic, AuthType: routing.VendorAuthSubscription,
-			Name: "Pre", Status: routing.VendorAccountStatusActive, CreatedAt: now, UpdatedAt: now,
-		}); err != nil {
+		// Raw insert: CreateVendorAccount now writes share_usage_with_members, a column
+		// the version-109 schema does not have yet.
+		if _, err := s.db.ExecContext(ctx, s.dl.rebind(`insert into vendor_accounts
+			(id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at)
+			values (?, ?, ?, ?, ?, ?, '', '', '', '', ?, ?)`),
+			"va_pre110", "u_m110", routing.VendorAnthropic, routing.VendorAuthSubscription, "Pre", routing.VendorAccountStatusActive, now, now); err != nil {
 			t.Fatalf("seed account: %v", err)
 		}
 

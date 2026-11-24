@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useRef, useState, type SubmitEvent } from 'react';
-import { Alert, Box, Button, Typography } from '@mui/material';
+import { Alert, Box, Button, Checkbox, FormControlLabel, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
@@ -227,6 +227,8 @@ export function VendorAccountsView({
   // on send; immutable once created, so the detail view never edits it).
   const [baseUrl, setBaseUrl] = useState('');
   const baseUrlValid = isValidBaseUrl(baseUrl);
+  // Create only: share the usage figures with members (on by default for a new account).
+  const [shareUsage, setShareUsage] = useState(true);
   const rootVendor = isConfigurableRootVendor(vendor);
   // Custom has no default root, so a blank base URL cannot be created.
   const baseUrlMissing = vendor === 'openai_compatible' && baseUrl.trim() === '';
@@ -248,6 +250,7 @@ export function VendorAccountsView({
     setAuthType('api_key');
     setModelPrefix('');
     setBaseUrl('');
+    setShareUsage(true);
     resetKeyInput();
     setMode('create');
   }
@@ -283,12 +286,19 @@ export function VendorAccountsView({
       // A subscription account carries no key: it is created disconnected.
       const created = await api.createVendorAccount(
         createAuthType === 'subscription'
-          ? { vendor, auth_type: 'subscription', name, ...prefixField }
+          ? {
+              vendor,
+              auth_type: 'subscription',
+              name,
+              share_usage_with_members: shareUsage,
+              ...prefixField,
+            }
           : {
               vendor,
               auth_type: 'api_key',
               name,
               api_key: apiKey,
+              share_usage_with_members: shareUsage,
               ...prefixField,
               ...baseUrlField,
             },
@@ -662,6 +672,20 @@ export function VendorAccountsView({
                 required
               />
             )}
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={shareUsage}
+                    onChange={(e) => setShareUsage(e.target.checked)}
+                  />
+                }
+                label={t.vendorAccountShareUsageLabel}
+              />
+              <Typography variant="body2" color="text.secondary">
+                {t.vendorAccountShareUsageHelp}
+              </Typography>
+            </Box>
             <Box sx={{ display: 'flex', gap: 1.5 }}>
               <Button
                 type="submit"
