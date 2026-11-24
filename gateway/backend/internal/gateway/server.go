@@ -323,6 +323,14 @@ type ServerDeps struct {
 	// it at its own construction. Server never stores or reads this field. nil is
 	// correct for any Server built without cmd/gateway.
 	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
+	// SetVendorLimitCooldowns is the same wiring conduit for the vendor limit-cooldown
+	// registry: it is portal.Service.SetVendorLimitCooldowns itself, called ONCE by
+	// cmd/gateway's buildGatewayServer with the just-built Server's registry (the one
+	// the resolver reads), so a group's member status shows the cooldowns routing
+	// applies. The registry belongs to the Server, which does not exist until
+	// gateway.New returns. Server never stores or reads this field. nil is correct
+	// for any Server built without cmd/gateway (the group view then shows none).
+	SetVendorLimitCooldowns func(*routing.VendorLimitCooldowns)
 	// SetClusterStatusReader is the same wiring conduit for the cluster
 	// orchestration's state: it is portal.Service.SetClusterStatusReader
 	// itself, called ONCE by cmd/gateway's buildGatewayServer with the
@@ -846,10 +854,11 @@ type Server struct {
 	// rateLimitWindows remembers each principal's last subscription rate-limit
 	// windows so they can ride along on /v1/messages responses from other providers
 	// (ratelimit_window_cache.go). Nil in a bare &Server{}; the helpers tolerate that.
-	// vendorCooldowns is the process-local registry of vendor limit cooldowns,
-	// shared with the resolver so a group skips a member that just hit a limit.
-	vendorCooldowns  *routing.VendorLimitCooldowns
 	rateLimitWindows *rateLimitWindowCache
+	// vendorCooldowns is the process-local registry of vendor limit cooldowns,
+	// shared with the resolver so a group skips a member that just hit a limit, and
+	// with the portal service so the group view shows the cooldowns.
+	vendorCooldowns *routing.VendorLimitCooldowns
 	// codexRateLimitWindows is the Codex-family counterpart on /v1/responses, kept
 	// apart so one principal using both clients never has one family evict the other.
 	codexRateLimitWindows *rateLimitWindowCache
@@ -1830,6 +1839,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/vendor-accounts", s.handlePortalVendorAccounts)
 	s.mux.HandleFunc("/api/portal/vendor-accounts/enabled", s.handlePortalVendorAccountsEnabled)
 	s.mux.HandleFunc("/api/portal/vendor-accounts/", s.handlePortalVendorAccountItem)
+	s.mux.HandleFunc(pathPortalVendorGroups, s.handlePortalVendorGroups)
+	s.mux.HandleFunc(pathPortalVendorGroups+"/", s.handlePortalVendorGroupItem)
 	s.mux.HandleFunc("/api/portal/vendor-account-admin-group-candidates", s.handleVendorAccountAdminGroupCandidates)
 	s.mux.HandleFunc("/api/portal/server-admin-group-candidates", s.handleServerAdminGroupCandidates)
 	s.mux.HandleFunc("/api/portal/service-admin-group-candidates", s.handleServiceAdminGroupCandidates)

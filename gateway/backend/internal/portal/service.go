@@ -44,6 +44,8 @@ const (
 	// exported so internal/gateway/portal_vendor_account_endpoints.go shares the
 	// exact value instead of re-hardcoding it.
 	CodeVendorAccountNotFound = "vendor_account.not_found"
+	// CodeVendorGroupNotFound is ErrVendorGroupNotFound's API error code.
+	CodeVendorGroupNotFound = "vendor_account_group.not_found"
 )
 
 var (
@@ -68,6 +70,21 @@ var (
 	// changes only through rotation (a PATCH with the stored value is a no-op).
 	ErrTokenClaudeCodeUsageDisplayRequiresRotation = errors.New("portal.token_claude_code_usage_display_requires_rotation")
 	ErrTokenNotDeletable                           = errors.New("token.not_deletable")
+
+	// Vendor account groups (spec 2026-11-24). The not-found answer is the same for a
+	// stranger's group and an unknown id. The member, prefix and threshold failures
+	// are all validation errors (400).
+	ErrVendorGroupNotFound             = errors.New(CodeVendorGroupNotFound)
+	ErrVendorGroupForbidden            = errors.New("vendor_account_group.forbidden")
+	ErrVendorGroupNameRequired         = errors.New("vendor_account_group.name_required")
+	ErrVendorGroupVendorInvalid        = errors.New("vendor_account_group.vendor_invalid")
+	ErrVendorGroupModelPrefixInvalid   = errors.New("vendor_account_group.model_prefix_invalid")
+	ErrVendorGroupStatusInvalid        = errors.New("vendor_account_group.status_invalid")
+	ErrVendorGroupThresholdInvalid     = errors.New("vendor_account_group.threshold_invalid")
+	ErrVendorGroupMemberVendorMismatch = errors.New("vendor_account_group.member_vendor_mismatch")
+	ErrVendorGroupMemberUnreachable    = errors.New("vendor_account_group.member_unreachable")
+	ErrVendorGroupMemberDuplicate      = errors.New("vendor_account_group.member_duplicate")
+	ErrVendorGroupPrefixConflict       = errors.New("vendor_account_group.prefix_conflict")
 
 	ErrServerNotFound       = errors.New(CodeServerNotFound)
 	ErrServerForbidden      = errors.New("server.forbidden")
@@ -859,6 +876,8 @@ type netbirdState struct {
 }
 
 type Service struct {
+	// vendorCooldowns is the routing limit-cooldown registry (nil: none shown).
+	vendorCooldowns   *routing.VendorLimitCooldowns
 	users             UserReader
 	tokens            TokenRepository
 	usage             usage.Store
@@ -1139,6 +1158,15 @@ func (s *Service) SetBenchmarkReservationHook(fn func(serverID string) bool) {
 // once at startup, before the Service serves requests; it is not synchronised.
 func (s *Service) SetVendorTokenRefresher(fn VendorTokenRefresher) {
 	s.vendorDiscovery.tokenRefresher = fn
+}
+
+// SetVendorLimitCooldowns hands the service the gateway's process-local registry of
+// vendor limit cooldowns, so a group's member status shows the cooldowns routing
+// applies. A setter for the same reason as SetVendorTokenRefresher: the registry
+// belongs to the gateway Server, built after the Service. nil (the default) shows no
+// cooldowns. Call it once at startup; it is not synchronised.
+func (s *Service) SetVendorLimitCooldowns(c *routing.VendorLimitCooldowns) {
+	s.vendorCooldowns = c
 }
 
 type CurrentUser struct {

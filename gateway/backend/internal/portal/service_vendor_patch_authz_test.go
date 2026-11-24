@@ -696,6 +696,17 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"VendorOpenAICodexClientVersion":   "setting",
 		// The injection point of the dispatch-time token refresher: wiring, no account.
 		"SetVendorTokenRefresher": "wiring",
+		// Likewise the limit-cooldown registry the group member status reads.
+		"SetVendorLimitCooldowns": "wiring",
+		// Vendor account groups (service_vendor_groups.go, pinned by
+		// service_vendor_groups_test.go): personal, owner-only, never a credential
+		// write. They only link accounts the owner can already reach.
+		"ListVendorAccountGroups":      "group",
+		"GetVendorAccountGroup":        "group",
+		"CreateVendorAccountGroup":     "group",
+		"UpdateVendorAccountGroup":     "group",
+		"DeleteVendorAccountGroup":     "group",
+		"SetVendorAccountGroupMembers": "group",
 	}
 
 	typ := reflect.TypeFor[*Service]()

@@ -30,6 +30,10 @@ type API interface {
 	AgentCertificate(context.Context, string) (AgentCertificateDTO, error)
 	AgentProxyRoutes(context.Context, string) (AgentProxyRoutesDTO, error)
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
+	CreateVendorAccountGroup(context.Context, auth.Token, CreateVendorAccountGroupRequest) (VendorAccountGroupDTO, error)
+	DeleteVendorAccountGroup(context.Context, auth.Token, string) error
+	GetVendorAccountGroup(context.Context, auth.Token, string) (VendorAccountGroupDTO, error)
+	ListVendorAccountGroups(context.Context, auth.Token) (VendorAccountGroupListResponse, error)
 	NotifyClustersOfServer(context.Context, string)
 	KeptUpClusterHeads(context.Context) ([]string, error)
 	ReconcileRPCPolicies(context.Context) []RPCPolicyWrite
@@ -55,6 +59,8 @@ type API interface {
 	ChatBlobBytes(context.Context, auth.Token, string) ([]byte, string, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
+	SetVendorAccountGroupMembers(context.Context, auth.Token, string, []string) (VendorAccountGroupDTO, error)
+	UpdateVendorAccountGroup(context.Context, auth.Token, string, UpdateVendorAccountGroupRequest) (VendorAccountGroupDTO, error)
 	VendorAccountUsageManager(context.Context, auth.Token, string) (bool, error)
 	ClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)
 	ClusterPlan(context.Context, string) (ClusterPlan, error)
