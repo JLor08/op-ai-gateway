@@ -24,9 +24,21 @@ export type VendorGroupThresholds = {
 export type VendorGroupMemberState =
   'active' | 'available' | 'over_threshold' | 'cooldown' | 'not_usable';
 
-// Why a not_usable member cannot serve ("" for every other state).
+// Why a member is not simply active or available: for not_usable the cause
+// (disabled, needs_reconnect, subscriptions_disabled, not_reachable), for
+// over_threshold the first blocking window (five_hour, weekly, credits), for cooldown
+// "cooldown"; "" for active and available (portal.VendorGroupReason* and
+// routing.VendorBlock*).
 export type VendorGroupMemberReason =
-  '' | 'disabled' | 'needs_reconnect' | 'subscriptions_disabled' | 'not_reachable';
+  | ''
+  | 'disabled'
+  | 'needs_reconnect'
+  | 'subscriptions_disabled'
+  | 'not_reachable'
+  | 'five_hour'
+  | 'weekly'
+  | 'credits'
+  | 'cooldown';
 
 export type VendorGroupCooldown = { model: string; until: string };
 
@@ -39,7 +51,7 @@ export type VendorAccountGroupMember = {
   // 1-based index in member order.
   position: number;
   state: VendorGroupMemberState;
-  reason: VendorGroupMemberReason | string;
+  reason: VendorGroupMemberReason;
   // Percent used of the binding window and when it frees up; absent when the group
   // owner may not see the member's usage.
   pct?: number;

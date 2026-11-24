@@ -20,7 +20,12 @@ import CloseIcon from '@mui/icons-material/Close';
 import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
-import type { VendorAccount, VendorAccountGroup, VendorAccountGroupMember } from '../api';
+import type {
+  VendorAccount,
+  VendorAccountGroup,
+  VendorAccountGroupMember,
+  VendorGroupThresholds,
+} from '../api';
 import { memberReasonCaption } from './shared/vendorGroupLabels';
 import { formatPortalError } from './shared/format';
 import { useLatestFetch } from './shared/useLatestFetch';
@@ -82,6 +87,45 @@ function ownedLabel(t: Translation, name: string, owner: string): string {
   return owner ? `${name} (${t.vendorAccountSharedBy} ${owner})` : name;
 }
 
+// A threshold field's starting text: the group's stored value, or the default for a new group.
+function initialThreshold(
+  group: VendorAccountGroup | null,
+  key: keyof VendorGroupThresholds,
+): string {
+  return group ? String(group.thresholds[key]) : DEFAULT_THRESHOLD;
+}
+
+// Display labels for the dialog's member list: what the group itself reported first,
+// then the account list (a member the list no longer shows keeps its label).
+function memberLabels(
+  t: Translation,
+  group: VendorAccountGroup | null,
+  accounts: VendorAccount[],
+): Map<string, string> {
+  const labels = new Map<string, string>();
+  for (const m of group?.members ?? []) {
+    labels.set(m.account_id, ownedLabel(t, m.account_name, m.owner_name));
+  }
+  for (const a of accounts) {
+    labels.set(a.id, ownedLabel(t, a.name, a.is_owner ? '' : a.shared_by));
+  }
+  return labels;
+}
+
+// A member's plain account name (for the move and remove buttons' labels): the account
+// list first, then what the group reported, else the id.
+function memberPlainName(
+  id: string,
+  group: VendorAccountGroup | null,
+  accounts: VendorAccount[],
+): string {
+  return (
+    accounts.find((a) => a.id === id)?.name ??
+    group?.members.find((m) => m.account_id === id)?.account_name ??
+    id
+  );
+}
+
 function isThreshold(raw: string): boolean {
   const n = Number(raw);
   return raw.trim() !== '' && Number.isInteger(n) && n >= 1 && n <= 100;
@@ -138,34 +182,17 @@ function GroupDialog({
   const [vendor, setVendor] = useState(group?.vendor ?? '');
   const [prefix, setPrefix] = useState(group?.model_prefix ?? '');
   const [status, setStatus] = useState(group?.status ?? 'active');
-  const [fiveHour, setFiveHour] = useState(
-    group ? String(group.thresholds.five_hour_pct) : DEFAULT_THRESHOLD,
-  );
-  const [weekly, setWeekly] = useState(
-    group ? String(group.thresholds.weekly_pct) : DEFAULT_THRESHOLD,
-  );
-  const [credits, setCredits] = useState(
-    group ? String(group.thresholds.credits_pct) : DEFAULT_THRESHOLD,
-  );
+  const [fiveHour, setFiveHour] = useState(initialThreshold(group, 'five_hour_pct'));
+  const [weekly, setWeekly] = useState(initialThreshold(group, 'weekly_pct'));
+  const [credits, setCredits] = useState(initialThreshold(group, 'credits_pct'));
   const originalIds = group?.members.map((m) => m.account_id) ?? [];
   const [memberIds, setMemberIds] = useState<string[]>(originalIds);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
-  // Names for the current members: the account list first, then what the group
-  // itself reported (a member the list no longer shows keeps its label).
-  const labels = new Map<string, string>();
-  for (const m of group?.members ?? []) {
-    labels.set(m.account_id, ownedLabel(t, m.account_name, m.owner_name));
-  }
-  for (const a of accounts) {
-    labels.set(a.id, ownedLabel(t, a.name, a.is_owner ? '' : a.shared_by));
-  }
+  const labels = memberLabels(t, group, accounts);
   const labelOf = (id: string) => labels.get(id) ?? id;
-  const plainName = (id: string) =>
-    accounts.find((a) => a.id === id)?.name ??
-    group?.members.find((m) => m.account_id === id)?.account_name ??
-    id;
+  const plainName = (id: string) => memberPlainName(id, group, accounts);
 
   const candidates = accounts.filter((a) => a.vendor === vendor && !memberIds.includes(a.id));
   const prefixValid = isValidModelPrefix(prefix);
