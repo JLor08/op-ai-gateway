@@ -1979,6 +1979,11 @@ func (_d *APIWithTracing) RenewCertificateNow(ctx context.Context, t1 auth.Token
 	return _d.API.RenewCertificateNow(ctx, t1, s1)
 }
 
+func (_d *APIWithTracing) RequestVendorUsagePull(s1 string) {
+	_d.API.RequestVendorUsagePull(s1)
+	return
+}
+
 func (_d *APIWithTracing) ResolveGatewayPeerDNS(ctx context.Context) (s1 string, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.ResolveGatewayPeerDNS")
 	defer span.End()

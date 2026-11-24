@@ -1587,5 +1587,6 @@ func (s *Service) DeleteVendorAccount(ctx context.Context, principal auth.Token,
 		return false, err
 	}
 	s.vendorUsagePulls.forget(acc.ID)
+	s.vendorGroupPulls.forget(acc.ID)
 	return true, nil
 }

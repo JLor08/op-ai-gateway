@@ -698,6 +698,10 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"SetVendorTokenRefresher": "wiring",
 		// Likewise the limit-cooldown registry the group member status reads.
 		"SetVendorLimitCooldowns": "wiring",
+		// The resolver's group-triggered usage pull: system-initiated and throttled,
+		// it reads a credential to ask the vendor but takes no principal and writes
+		// only the usage snapshot.
+		"RequestVendorUsagePull": "system",
 		// Vendor account groups (service_vendor_groups.go, pinned by
 		// service_vendor_groups_test.go): personal, owner-only, never a credential
 		// write. They only link accounts the owner can already reach.

@@ -974,6 +974,9 @@ type Service struct {
 	// vendor (in memory, zero value ready), so the on-view lazy usage refresh can
 	// skip a pull that is still fresh (see vendorUsagePullTracker).
 	vendorUsagePulls vendorUsagePullTracker
+	// vendorGroupPulls is the in-memory throttle of the group-triggered usage pull
+	// (RequestVendorUsagePull; zero value ready).
+	vendorGroupPulls vendorGroupPullState
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.

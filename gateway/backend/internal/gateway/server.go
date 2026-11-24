@@ -1200,6 +1200,10 @@ func New(deps ServerDeps) *Server {
 			// the OPPOSITE meaning of nil: without a portal the resolver falls back
 			// to OWNER-ONLY vendor accounts, never allow-all.
 			resolver.SetVendorAccountEnumerator(portalVendorAccountEnumerator{api: deps.Portal})
+			// The group failover's on-demand usage pull: the portal service throttles
+			// it and runs it off the resolve path. A genuinely nil seam without a
+			// portal, like the two above.
+			resolver.SetVendorUsagePuller(deps.Portal)
 		}
 		// SetModelWarmer is deferred until after s is built (the warmer needs the fully-
 		// assembled Server for its provider/routes/upstream-auth); see below.

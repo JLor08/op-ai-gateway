@@ -13,7 +13,7 @@ import (
 
 // The dedicated usage refresh: the "Usage & Limits" panel asks for an account's usage
 // snapshot on its own, decoupled from the model discovery the models refresh runs
-// first. Two account kinds have an active pull: an OpenAI subscription
+// first. Three account kinds have an active pull: an OpenAI or Anthropic subscription
 // (fetchVendorUsage) and an OpenRouter/Kilo api-key account
 // (fetchCompatibleVendorUsage); both are shared with the models refresh. This file
 // adds the owner-gated entry point and the in-memory rate limit that keeps a
@@ -128,14 +128,14 @@ func vendorUsagePreset(acc routing.VendorAccount) (routing.VendorPreset, bool) {
 }
 
 // hasActiveVendorUsagePull reports whether acc has an active usage pull at all: an
-// OpenAI subscription (the ChatGPT backend's usage endpoint) or an api_key account of
-// a provider whose preset names a usage strategy (OpenRouter, Kilo; see
-// vendorUsagePreset). A native openai/anthropic api_key account, the other
-// OpenAI-compatible providers and an Anthropic subscription have none; an Anthropic
-// subscription's snapshot only ever comes from the passive header scrape.
+// OpenAI subscription (the ChatGPT backend's usage endpoint), an Anthropic
+// subscription (the Claude OAuth usage endpoint, see vendorauth.AnthropicOAuthUsageURL)
+// or an api_key account of a provider whose preset names a usage strategy
+// (OpenRouter, Kilo; see vendorUsagePreset). A native openai/anthropic api_key
+// account and the other OpenAI-compatible providers have none.
 func hasActiveVendorUsagePull(acc routing.VendorAccount) bool {
 	if acc.AuthType == routing.VendorAuthSubscription {
-		return acc.Vendor == routing.VendorOpenAI
+		return acc.Vendor == routing.VendorOpenAI || acc.Vendor == routing.VendorAnthropic
 	}
 	_, ok := vendorUsagePreset(acc)
 	return ok

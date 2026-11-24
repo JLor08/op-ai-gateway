@@ -201,6 +201,7 @@ type API interface {
 	RemoveVendorAccountFromResourceGroup(context.Context, auth.Token, string, string) error
 	RenameGroup(context.Context, auth.Token, string, string) (UserGroupDTO, error)
 	RenewCertificateNow(context.Context, auth.Token, string) error
+	RequestVendorUsagePull(string)
 	ResolveGatewayPeerDNS(context.Context) (string, error)
 	ResolveGatewayPeerIP(context.Context) (string, error)
 	ResolveInviteAdminGroup(context.Context, auth.Token, string) (string, string, error)

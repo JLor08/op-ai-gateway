@@ -133,6 +133,13 @@ type VendorOpenAISubscriptionDiscoverer func(ctx context.Context, httpClient *ht
 // (vendorauth.FetchOpenAISubscriptionUsage has exactly this shape).
 type VendorOpenAIUsageFetcher func(ctx context.Context, httpClient *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus)
 
+// VendorAnthropicUsageFetcher is the Claude-subscription usage fetch: only the
+// OAuth access token is needed. A vendorauth.ErrUsageRateLimited error means the
+// usage endpoint throttled the call and drives the group pull's backoff; any other
+// error is a plain miss (vendorauth.FetchAnthropicSubscriptionUsage has exactly
+// this shape).
+type VendorAnthropicUsageFetcher func(ctx context.Context, httpClient *http.Client, accessToken string) (vendorauth.OpenAISubscriptionUsage, error)
+
 // VendorOpenAICompatibleUsageFetcher is the api-key usage fetch of an
 // OpenAI-compatible provider that publishes a spend or balance figure (OpenRouter's
 // per-key limit, Kilo's balance). ONE seam carries the strategy so a single field
@@ -176,6 +183,9 @@ type VendorModelDiscoverers struct {
 	// OpenAIUsage is the usage fetch refreshVendorUsage runs for an OpenAI
 	// subscription account after its models were refreshed.
 	OpenAIUsage VendorOpenAIUsageFetcher
+	// AnthropicUsage is the usage fetch of a Claude subscription account, run by the
+	// dedicated usage refresh and by the vendor-group pull.
+	AnthropicUsage VendorAnthropicUsageFetcher
 	// OpenAICompatibleUsage is the usage fetch of an OpenRouter / Kilo api-key
 	// account (the preset's UsageVia picks the vendorauth function), run by the
 	// dedicated usage refresh and by the models refresh's trailing pull.
@@ -204,6 +214,9 @@ func (d VendorModelDiscoverers) withDefaults() VendorModelDiscoverers {
 	}
 	if d.OpenAIUsage == nil {
 		d.OpenAIUsage = vendorauth.FetchOpenAISubscriptionUsage
+	}
+	if d.AnthropicUsage == nil {
+		d.AnthropicUsage = vendorauth.FetchAnthropicSubscriptionUsage
 	}
 	if d.OpenAICompatibleUsage == nil {
 		d.OpenAICompatibleUsage = defaultCompatibleUsageFetcher
@@ -585,7 +598,7 @@ func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAcco
 	_ = s.fetchVendorUsage(ctx, acc, ts)
 }
 
-// fetchVendorUsage pulls an OpenAI subscription account's usage snapshot (the
+// fetchVendorUsage pulls an OpenAI or Anthropic subscription account's usage snapshot (the
 // five-hour and weekly windows, the credit balance and, for a Business plan, the
 // spend control and the credit state) and stores it MERGED over
 // the stored one (routing.MergeVendorAccountUsage: a field the pull does not know
@@ -614,7 +627,17 @@ func (s *Service) fetchVendorUsage(ctx context.Context, acc routing.VendorAccoun
 	if acc.AuthType != routing.VendorAuthSubscription || !hasActiveVendorUsagePull(acc) || ts.AccessToken == "" {
 		return VendorUsageRefreshUnsupported
 	}
-	usage, status := s.vendorDiscovery.discoverers.OpenAIUsage(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts))
+	var (
+		usage  vendorauth.OpenAISubscriptionUsage
+		status vendorauth.DiscoveryStatus
+	)
+	if acc.Vendor == routing.VendorAnthropic {
+		var err error
+		usage, err = s.vendorDiscovery.discoverers.AnthropicUsage(ctx, s.vendorDiscovery.client, ts.AccessToken)
+		status = s.noteAnthropicUsageOutcome(ctx, acc.ID, err)
+	} else {
+		usage, status = s.vendorDiscovery.discoverers.OpenAIUsage(ctx, s.vendorDiscovery.client, ts.AccessToken, chatGPTAccountID(ts))
+	}
 	if ctx.Err() == nil {
 		s.vendorUsagePulls.record(acc.ID, s.clock())
 	}

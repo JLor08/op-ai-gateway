@@ -149,11 +149,10 @@ func TestRefreshVendorAccountUsageRefusesWhileTheMasterFlagIsOff(t *testing.T) {
 	fake.requireNoUsageCalls(t, "while the module is off")
 }
 
-// Only an OpenAI SUBSCRIPTION (and an OpenRouter/Kilo api key, below) has an active
-// usage pull. The native api keys of either vendor and an Anthropic subscription
-// answer "unsupported": no token is opened or renewed (a sealed credential that
-// cannot be read is no error here), no fetcher runs, and the stored snapshot, if any,
-// is still answered.
+// Only a subscription (OpenAI or Anthropic) and an OpenRouter/Kilo api key have an
+// active usage pull. The native api keys of either vendor answer "unsupported": no
+// token is opened or renewed (a sealed credential that cannot be read is no error
+// here), no fetcher runs, and the stored snapshot, if any, is still answered.
 func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -164,21 +163,6 @@ func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testi
 		}},
 		{"anthropic api key", func(t *testing.T, svc *Service, _ *routing.MemoryStore) VendorAccountDTO {
 			return apiKeyAccount(t, svc, routing.VendorAnthropic, "")
-		}},
-		{"anthropic subscription, token expired", func(t *testing.T, svc *Service, routeStore *routing.MemoryStore) VendorAccountDTO {
-			return expiredSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
-		}},
-		{"anthropic subscription, credential unreadable", func(t *testing.T, svc *Service, routeStore *routing.MemoryStore) VendorAccountDTO {
-			acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Broken")
-			row, err := routeStore.VendorAccountByID(context.Background(), acc.ID)
-			if err != nil {
-				t.Fatalf("VendorAccountByID: %v", err)
-			}
-			row.OAuthTokens = "garbage-without-a-prefix"
-			if err := routeStore.UpdateVendorAccount(context.Background(), row); err != nil {
-				t.Fatalf("UpdateVendorAccount: %v", err)
-			}
-			return acc
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -211,7 +195,7 @@ func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testi
 
 	t.Run("a snapshot the passive scrape stored is still answered", func(t *testing.T) {
 		svc, routeStore, fake := newDiscoveryTestService(t)
-		acc := connectedSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
+		acc := apiKeyAccount(t, svc, routing.VendorAnthropic, "")
 		before := passiveUsage(acc.ID)
 		seedUsage(t, routeStore, before)
 
@@ -222,7 +206,7 @@ func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testi
 		if usage == nil || usage.FiveHourPct != before.FiveHourPct || usage.WeeklyPct != before.WeeklyPct {
 			t.Fatalf("usage = %+v, want the stored snapshot %+v", usage, before)
 		}
-		fake.requireNoUsageCalls(t, "for an Anthropic subscription")
+		fake.requireNoUsageCalls(t, "for an Anthropic api key")
 	})
 }
 
@@ -457,7 +441,9 @@ func TestFetchVendorUsageStatus(t *testing.T) {
 		},
 		{name: "openai without an access token", acc: openAI, usageOK: true, want: VendorUsageRefreshUnsupported},
 		{name: "openai api key", acc: openAIAPIKey, usageOK: true, ts: tokens, want: VendorUsageRefreshUnsupported},
-		{name: "anthropic subscription", acc: anthropicSubscription, usageOK: true, ts: tokens, want: VendorUsageRefreshUnsupported},
+		// The Anthropic subscription has its own fetcher; the fake's default answer is
+		// a failure, so it is asked (and answers unverifiable), never the OpenAI one.
+		{name: "anthropic subscription", acc: anthropicSubscription, usageOK: true, ts: tokens, want: VendorUsageRefreshUnverifiable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, routeStore, fake := newDiscoveryTestService(t)
@@ -857,7 +843,7 @@ func TestHasActiveVendorUsagePull(t *testing.T) {
 		{"openai subscription", routing.VendorOpenAI, routing.VendorAuthSubscription, true},
 		{"openai api key", routing.VendorOpenAI, routing.VendorAuthAPIKey, false},
 		{"anthropic api key", routing.VendorAnthropic, routing.VendorAuthAPIKey, false},
-		{"anthropic subscription", routing.VendorAnthropic, routing.VendorAuthSubscription, false},
+		{"anthropic subscription", routing.VendorAnthropic, routing.VendorAuthSubscription, true},
 		{"xai api key", routing.VendorXAI, routing.VendorAuthAPIKey, false},
 		{"google api key", routing.VendorGoogle, routing.VendorAuthAPIKey, false},
 		{"custom openai-compatible api key", routing.VendorOpenAICompatible, routing.VendorAuthAPIKey, false},

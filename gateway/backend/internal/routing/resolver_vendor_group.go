@@ -15,7 +15,9 @@ import (
 
 // VendorUsagePuller asks for a fresh usage snapshot of a vendor account. The
 // implementation throttles; the resolver may call it on every request that
-// skips a member for a limit whose reset it does not know.
+// skips a member for a limit whose reset it does not know. The resolver calls it
+// synchronously on the resolve path, so an implementation MUST NOT block: the
+// throttle check must be cheap and any vendor call must run asynchronously.
 type VendorUsagePuller interface {
 	RequestVendorUsagePull(accountID string)
 }
