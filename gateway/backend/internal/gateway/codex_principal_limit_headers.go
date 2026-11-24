@@ -7,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
 	"strconv"
 	"time"
 )
@@ -127,18 +128,20 @@ func codexGatewayLimitTakesOver(ctx context.Context, now time.Time) bool {
 }
 
 // attachTranslatedCodexUsageLimits fills the client header set of a translated
-// /v1/responses success: the Codex windows last observed for the caller, then the
-// principal's own fullest limit unless those windows already put figures there.
+// /v1/responses success served by target: the Codex windows last observed for the
+// caller (none, and the entry dropped, for a vendor group member: see
+// attachCodexRateLimitWindows), then the principal's own fullest limit unless those
+// windows already put figures there.
 // When the gateway's own limit takes over (codexGatewayLimitTakesOver) the cached
 // windows are skipped and the standing is written instead.
 // A token without the send_usage_limits opt-in (#420) gets nothing.
-func (s *Server) attachTranslatedCodexUsageLimits(r *http.Request, token auth.Token, dst http.Header) {
+func (s *Server) attachTranslatedCodexUsageLimits(r *http.Request, token auth.Token, target routing.Target, dst http.Header) {
 	if !token.SendUsageLimits {
 		return
 	}
 	now := time.Now()
 	if !codexGatewayLimitTakesOver(r.Context(), now) {
-		s.attachCodexRateLimitWindows(token, dst)
+		s.attachCodexRateLimitWindows(token, target, dst)
 	}
 	attachCodexPrincipalLimitStanding(r.Context(), dst, now, token.CodexModelSwitchPrompt)
 }

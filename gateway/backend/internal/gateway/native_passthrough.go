@@ -1228,9 +1228,11 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
 		// A success from a provider that reports no subscription windows of its own
 		// (a local model) carries the caller's last observed ones, so Claude Code
-		// keeps its usage display. Fresh upstream windows are never overlaid.
+		// keeps its usage display -- unless a vendor group member served it, which
+		// drops them instead (attachRateLimitWindows). Fresh upstream windows are
+		// never overlaid.
 		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get(unifiedRateLimitPrefix+"status") == "" {
-			s.attachRateLimitWindows(rel.token, w.Header())
+			s.attachRateLimitWindows(rel.token, rel.target, w.Header())
 		}
 		// A principal with quotas or budgets then has its own fullest limit laid over
 		// the top-level fields, on any 2xx whatever the upstream sent. It writes the
@@ -1254,12 +1256,13 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		// model) carries the caller's last observed ones, so the Codex CLI keeps its
 		// usage display, unless the gateway's own limit takes over (written percent at
 		// codexGatewayTakeoverPercent or more): then the cached windows are skipped and
-		// the standing below is the only figure. Fresh upstream windows are never
+		// the standing below is the only figure. A vendor group member's success drops
+		// them instead (attachCodexRateLimitWindows). Fresh upstream windows are never
 		// overlaid, and an error response keeps exactly what the upstream said.
 		now := time.Now()
 		success := resp.StatusCode >= 200 && resp.StatusCode < 300
 		if sendUsage && success && !hasCodexRateLimitHeader(resp.Header) && !codexGatewayLimitTakesOver(r.Context(), now) {
-			s.attachCodexRateLimitWindows(rel.token, w.Header())
+			s.attachCodexRateLimitWindows(rel.token, rel.target, w.Header())
 		}
 		// A principal with quotas or budgets then has its own fullest limit written in
 		// the default x-codex family on any 2xx that carries no Codex figures yet

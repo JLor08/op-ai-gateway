@@ -238,13 +238,21 @@ func (s *Server) observeCodexRateLimitWindows(token auth.Token, target routing.T
 }
 
 // attachCodexRateLimitWindows writes the caller's last observed Codex windows into
-// dst, the header set of a /v1/responses success that carries none of its own. It
+// dst, the header set of a /v1/responses success that carries none of its own;
+// target is the target that served it. As on Messages (attachRateLimitWindows), a
+// target from a vendor group gets nothing and drops the principal's entry. It
 // writes nothing for a token without send_usage_limits (#420).
-func (s *Server) attachCodexRateLimitWindows(token auth.Token, dst http.Header) {
+func (s *Server) attachCodexRateLimitWindows(token auth.Token, target routing.Target, dst http.Header) {
 	if !token.SendUsageLimits || s.codexRateLimitWindows == nil {
 		return
 	}
-	if key, ok := principalKey(token); ok {
-		s.codexRateLimitWindows.AttachCodex(key, dst, time.Now())
+	key, ok := principalKey(token)
+	if !ok {
+		return
 	}
+	if target.VendorGroupID != "" {
+		s.codexRateLimitWindows.Drop(key)
+		return
+	}
+	s.codexRateLimitWindows.AttachCodex(key, dst, time.Now())
 }

@@ -130,11 +130,11 @@ func (s *Server) completeOn(w http.ResponseWriter, r *http.Request, token auth.T
 		slog.Debug("inference ok", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "server", s.serverName(target.ServerID), "output_tokens", resp.Usage.OutputTokens, "duration_ms", time.Since(start).Milliseconds())
 		if req.APIFlavor == inference.APIFlavorAnthropicMessages {
 			// #407's cached subscription windows, then the principal's own limit standing.
-			s.attachTranslatedUsageLimits(r, token, w.Header())
+			s.attachTranslatedUsageLimits(r, token, target, w.Header())
 		}
 		if req.APIFlavor == inference.APIFlavorOpenAIResponses {
 			// The Codex windows last observed for the caller (unless the gateway's own limit takes over from 75 %), then the principal's own limit standing.
-			s.attachTranslatedCodexUsageLimits(r, token, w.Header())
+			s.attachTranslatedCodexUsageLimits(r, token, target, w.Header())
 		}
 		body = writeJSONCaptured(w, http.StatusOK, render(resp))
 	}

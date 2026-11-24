@@ -147,6 +147,15 @@ func (c *rateLimitWindowCache) Forget(key, accountID string) {
 	}
 }
 
+// Drop deletes the principal's entry whatever account it was observed from: the
+// principal was just served by a vendor group member that reports no windows of
+// its own, so the cached ones belong to a member the group skipped.
+func (c *rateLimitWindowCache) Drop(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
+
 // hasEntryFrom reports whether the principal's entry was observed from accountID.
 func (c *rateLimitWindowCache) hasEntryFrom(key, accountID string) bool {
 	c.mu.Lock()
@@ -269,13 +278,25 @@ func (s *Server) observeRateLimitWindows(token auth.Token, target routing.Target
 
 // attachRateLimitWindows writes the caller's last observed subscription windows into
 // dst, the header set of a /v1/messages response answered by another provider. The
-// callers decide that the flavor is Anthropic Messages and the response a success.
-// It writes nothing for a token without send_usage_limits (#420).
-func (s *Server) attachRateLimitWindows(token auth.Token, dst http.Header) {
+// callers decide that the flavor is Anthropic Messages and the response a success
+// that carries no windows of its own; target is the target that served it. A
+// target from a vendor group gets nothing, and the principal's entry is dropped:
+// the group switched to a member that reports no windows, so the cached ones are a
+// skipped member's, which the client must neither show nor block itself on. A
+// group member that does report windows replaces the entry when the response is
+// observed (observeRateLimitWindows). It writes nothing for a token without
+// send_usage_limits (#420).
+func (s *Server) attachRateLimitWindows(token auth.Token, target routing.Target, dst http.Header) {
 	if !token.SendUsageLimits || s.rateLimitWindows == nil {
 		return
 	}
-	if key, ok := principalKey(token); ok {
-		s.rateLimitWindows.Attach(key, dst, time.Now())
+	key, ok := principalKey(token)
+	if !ok {
+		return
 	}
+	if target.VendorGroupID != "" {
+		s.rateLimitWindows.Drop(key)
+		return
+	}
+	s.rateLimitWindows.Attach(key, dst, time.Now())
 }
