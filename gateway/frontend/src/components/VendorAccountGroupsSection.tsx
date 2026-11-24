@@ -21,6 +21,7 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import type { VendorAccount, VendorAccountGroup, VendorAccountGroupMember } from '../api';
+import { reasonLabel } from './shared/vendorGroupLabels';
 import { formatPortalError } from './shared/format';
 import { useLatestFetch } from './shared/useLatestFetch';
 import { Panel } from './shared/Panel';
@@ -73,21 +74,6 @@ function stateLabel(t: Translation, state: string): string {
       return t.vendorGroupStateCooldown;
     default:
       return t.vendorGroupStateNotUsable;
-  }
-}
-
-function reasonLabel(t: Translation, reason: string): string {
-  switch (reason) {
-    case 'disabled':
-      return t.vendorGroupReasonDisabled;
-    case 'needs_reconnect':
-      return t.vendorGroupReasonNeedsReconnect;
-    case 'subscriptions_disabled':
-      return t.vendorGroupReasonSubscriptionsDisabled;
-    case 'not_reachable':
-      return t.vendorGroupReasonNotReachable;
-    default:
-      return reason;
   }
 }
 

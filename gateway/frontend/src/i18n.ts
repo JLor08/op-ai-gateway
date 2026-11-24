@@ -4181,6 +4181,20 @@ const de = {
     'Zeitlimit erreicht: Der Code wurde nicht rechtzeitig bestätigt. Den Device-Code neu starten.',
   vendorUsageTitle: 'Nutzung & Limits',
   dashboardVendorUsageTitle: 'Anbieter — Nutzung & Limits',
+  dashboardVendorGroupsTitle: 'Anbieter — Gruppen',
+  dashboardVendorGroupActiveMember: (name: string) => `Aktiv: ${name}`,
+  dashboardVendorGroupNoActiveMember: 'Kein Konto nutzbar',
+  dashboardVendorGroupLineActive: 'aktiv',
+  dashboardVendorGroupLineReady: 'bereit',
+  dashboardVendorGroupLineOverThreshold: (detail: string, freeAt: string) =>
+    `über Schwelle: ${detail}, frei ab ${freeAt}`,
+  dashboardVendorGroupLineOverThresholdBare: 'über Schwelle',
+  dashboardVendorGroupLineCooldown: (until: string, model: string) =>
+    `gesperrt bis ${until} (${model})`,
+  dashboardVendorGroupLineNotUsable: (reason: string) => `nicht nutzbar: ${reason}`,
+  dashboardVendorGroupWindowFiveHour: '5h',
+  dashboardVendorGroupWindowWeekly: 'Woche',
+  dashboardVendorGroupWindowCredits: 'Guthaben',
   vendorUsageIntro:
     'Verbrauch in Prozent des Limits beim Anbieter; absolute Werte nennt der Anbieter nicht. Angezeigt werden nur die Limits, die der Anbieter für dieses Konto meldet. Der Stand wird mit jeder über das Gateway bedienten Anfrage aktualisiert.',
   vendorUsageFiveHour: '5-Stunden-Limit',
@@ -8200,6 +8214,20 @@ const en: PortalMessages = {
     'Timed out: the code was not confirmed in time. Start the device code again.',
   vendorUsageTitle: 'Usage & limits',
   dashboardVendorUsageTitle: 'Providers — usage & limits',
+  dashboardVendorGroupsTitle: 'Providers — groups',
+  dashboardVendorGroupActiveMember: (name: string) => `Active: ${name}`,
+  dashboardVendorGroupNoActiveMember: 'No account usable',
+  dashboardVendorGroupLineActive: 'active',
+  dashboardVendorGroupLineReady: 'ready',
+  dashboardVendorGroupLineOverThreshold: (detail: string, freeAt: string) =>
+    `over threshold: ${detail}, free from ${freeAt}`,
+  dashboardVendorGroupLineOverThresholdBare: 'over threshold',
+  dashboardVendorGroupLineCooldown: (until: string, model: string) =>
+    `blocked until ${until} (${model})`,
+  dashboardVendorGroupLineNotUsable: (reason: string) => `not usable: ${reason}`,
+  dashboardVendorGroupWindowFiveHour: '5h',
+  dashboardVendorGroupWindowWeekly: 'week',
+  dashboardVendorGroupWindowCredits: 'credits',
   vendorUsageIntro:
     'Usage as a percentage of the provider limit; the provider does not publish absolute values. Only the limits the provider reports for this account are shown. The figures are refreshed with every request the gateway serves.',
   vendorUsageFiveHour: '5-hour limit',
