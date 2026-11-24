@@ -614,6 +614,7 @@ function Probe({ altModelId = '' }: { altModelId?: string } = {}) {
           pick-{m.id}
         </button>
       ))}
+      <span data-testid="model-vision">{String(c.modelVisionCapable)}</span>
       <span data-testid="models-loading">{String(c.modelsLoading)}</span>
       <span data-testid="chat-models">{c.chatModels.map((o) => o.id).join(',')}</span>
       <button type="button" onClick={() => c.setSelectedTokenId('')}>
@@ -2573,6 +2574,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // No client-side remap: the token's map entry is not applied to the alias row.
       expect(screen.getByTestId('override-model').textContent).toBe('');
       expect(screen.getByTestId('model-available').textContent).toBe('true');
+      // The capability gates read the picked (alias) row.
+      expect(screen.getByTestId('model-vision').textContent).toBe('true');
       expect(screen.getByTestId('chat-models').textContent).not.toContain('real-target');
       fireEvent.change(screen.getByLabelText('probe-input'), { target: { value: 'hi' } });
       fireEvent.click(screen.getByRole('button', { name: 'send' }));
@@ -2582,6 +2585,67 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       };
       expect(body.settings.model).toBe('quick-alias');
       expect(body.settings.run_as_token_id).toBe('tok_scoped');
+    });
+
+    it('still applies a scoped catch-all token override to a listed real model', async () => {
+      const token = scopedToken({ model_override: 'catch-target' });
+      const fetchModels = vi.fn(async () => [
+        row('listed-real'),
+        row('catch-target', { vision: true }),
+      ]);
+      renderProvider([token], { models: sessionModels, fetchModels });
+      await waitForReady();
+      pick('select-token-tok_scoped');
+      await waitFor(() =>
+        expect(screen.getByTestId('chat-models').textContent).toBe('listed-real,catch-target'),
+      );
+      pick('pick-listed-real');
+      expect(screen.getByTestId('override-model').textContent).toBe('catch-target');
+      expect(screen.getByTestId('override-locks').textContent).toBe('true');
+      // Gates come from the target the server routes to, not the picked row.
+      expect(screen.getByTestId('model-vision').textContent).toBe('true');
+    });
+
+    it('still remaps a listed real model named by an offer:false map entry', async () => {
+      const token = scopedToken({
+        model_override_map: {
+          'listed-real': { to: 'map-target', offer: false, hide_target: false },
+        },
+      });
+      const fetchModels = vi.fn(async () => [row('listed-real'), row('map-target')]);
+      renderProvider([token], { models: sessionModels, fetchModels });
+      await waitForReady();
+      pick('select-token-tok_scoped');
+      await waitFor(() =>
+        expect(screen.getByTestId('chat-models').textContent).toBe('listed-real,map-target'),
+      );
+      pick('pick-listed-real');
+      expect(screen.getByTestId('override-model').textContent).toBe('map-target');
+    });
+
+    it('shows the loading state again when a token whose first fetch failed is re-selected', async () => {
+      let calls = 0;
+      let resolve!: (rows: ModelOption[]) => void;
+      const fetchModels = vi.fn(() => {
+        calls += 1;
+        if (calls === 1) return Promise.reject(new Error('first boom'));
+        return new Promise<ModelOption[]>((r) => {
+          resolve = r;
+        });
+      });
+      renderProvider([scopedToken()], { models: sessionModels, fetchModels });
+      await waitForReady();
+      pick('select-token-tok_scoped');
+      await waitFor(() => expect(screen.getAllByRole('alert').length).toBeGreaterThan(0));
+      expect(screen.getByTestId('models-loading').textContent).toBe('false');
+      pick('select-no-token');
+      pick('select-token-tok_scoped');
+      await waitFor(() => expect(fetchModels).toHaveBeenCalledTimes(2));
+      expect(screen.getByTestId('models-loading').textContent).toBe('true');
+      await act(async () => {
+        resolve([row('scoped-model')]);
+      });
+      expect(screen.getByTestId('chat-models').textContent).toBe('scoped-model');
     });
 
     it('keeps the server-locked picker for a token with a server override (no scoped fetch)', async () => {

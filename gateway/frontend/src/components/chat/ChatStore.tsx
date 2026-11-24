@@ -934,11 +934,16 @@ export function ChatStoreProvider({
   // none. Mirrors the backend's resolveModelOverride so the effective model shown
   // matches what the server will route (the server does the actual remap via the
   // run-as token; the chat sends the raw picked model, see currentSettings).
-  // Not for a model the token's own scoped listing offers: a picked manual alias is already
-  // the name the token is called by, and the server remaps it exactly once.
-  const pickedInScopedList =
-    scopedRows !== null && model !== '' && scopedRows.some((option) => option.id === model);
-  const overrideModel = pickedInScopedList ? '' : resolveTokenOverride(selectedToken, model);
+  // Not for an OFFERED alias (a map entry with offer:true) that the token's own scoped listing
+  // carries: that name is the one the token is called by, and the server remaps it exactly once.
+  // Every other listed model keeps its remap (the catch-all and offer:false entries still route
+  // elsewhere), so the effective model and its gates match what the server will route.
+  const pickedOfferedAlias =
+    scopedRows !== null &&
+    model !== '' &&
+    selectedToken?.model_override_map?.[model]?.offer === true &&
+    scopedRows.some((option) => option.id === model);
+  const overrideModel = pickedOfferedAlias ? '' : resolveTokenOverride(selectedToken, model);
   // A pure catch-all (a catch-all with no per-model entries) forces every model, so
   // the model picker is locked to it (old single-override behavior). With per-model
   // entries the picked model IS the map key, so the picker stays editable.
@@ -1703,6 +1708,11 @@ export function ChatStoreProvider({
     const tokenId = scopedTokenIdRef.current;
     const fetch = fetchModelsRef.current;
     if (tokenId === '' || !fetch) return;
+    // A fetch under way is not a failed one: a re-selected token whose first fetch failed
+    // shows the loading state again.
+    setScoped((prev) =>
+      prev.tokenId === tokenId && prev.failed ? { ...prev, failed: false } : prev,
+    );
     try {
       const rows = await fetch(tokenId);
       if (scopedTokenIdRef.current !== tokenId) return;
