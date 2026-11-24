@@ -56,6 +56,9 @@ the accounts a principal can reach each API token may use is the token's own,
 strictly opt-in decision, per account and always by name for a shared one, with an
 optional per-token prefix override (§11,
 [ADR-060](../09-architecture-decisions.md#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in)).
+Several accounts of one vendor can be put into a personal, ordered **vendor account
+group** that serves a request from the first member with room and moves on when a member is
+almost used up or the vendor answers a limit error (§12, [ADR-112](../09-architecture-decisions.md#adr-112--vendor-account-groups-are-personal-ordered-same-vendor-sets-that-shadow-their-members-fail-over-per-account-and-model-on-status-only-limit-errors-and-skip-thresholds-for-members-whose-usage-is-not-shared)).
 
 ## 1. The entity and its ownership
 
@@ -186,7 +189,12 @@ piece, and routing eligibility does **not** (§4.6):
 - **Usage opt-in** (`PUT /api/portal/vendor-accounts/{id}/share-usage`, `{enabled}`,
   `SetVendorAccountShareUsage`): the **owner's** decision to show the account's usage
   figures to everyone allowed to use it (column `share_usage_with_members`, migration
-  110, default off). The owner check of the raise gate without the admin role (a CM or
+  110; the column default stays off, but the create path switches it **on for every account
+  created from the vendor-account-groups change on**: `share_usage_with_members` on
+  `POST /api/portal/vendor-accounts` is optional and a missing value means `true`, and the
+  create form shows the toggle ticked. Accounts that existed before keep their stored value,
+  because a stored off cannot be told from a deliberate choice, so no data step flips them).
+  The owner check of the raise gate without the admin role (a CM or
   a member is `403`, a stranger, an unknown id and system scope `404`); behind the
   `vendor_accounts_enabled` flag but **not** gated on the sharing flags and allowed at
   any level (it grants nothing while the account is private). It unlocks the figures in
@@ -1430,6 +1438,11 @@ keep identical. A principal with neither is denied before any enumerator is cons
 and so is a service token whose id is blank. A service owns no account and reaches a
 shared one only through the grant.
 
+**Vendor account groups sit in front of this.** A token that uses a group reaches the
+group's members **through the group** even when the policy does not name a shared member
+individually; the grant still applies, so the group never widens reach and a member the
+principal lost access to drops out of the group at the next resolve (§12.3).
+
 **Precedence and parity.** The own block comes first, so the owner's own account wins a
 same-name or same-prefix collision; among shared accounts the first active one by id
 wins. The resolver chooses per **(name, dialect)**, not per name: an account that does
@@ -1515,19 +1528,31 @@ The headers arrive only with a served request, so a ChatGPT subscription that ha
 not been used lately shows no windows, or old ones. For that account kind the
 gateway can also **ask** the vendor, and for an OpenRouter or Kilo `api_key`
 account, whose responses never carry usage headers at all, the pull is the only way
-to learn anything (the api-key pull, below). An OpenAI `api_key` account (a
-platform account has no subscription window to report), every Anthropic account
-and the x.ai, Google, Google (native) and Custom accounts have no such endpoint; for Anthropic the
-header scrape stays the only source.
+to learn anything (the api-key pull, below). An Anthropic **subscription** has one too since the vendor account groups (§12.5, VERIFY-LIVE),
+because a group must learn a member's reset time without waiting for a served request. An
+OpenAI `api_key` account (a platform account has no subscription window to report), an
+Anthropic `api_key` account and the x.ai, Google, Google (native) and Custom accounts have no
+such endpoint; for them the header scrape stays the only source.
 
 | Credential | Request | Provenance |
 |---|---|---|
 | OpenAI **subscription** | `GET https://chatgpt.com/backend-api/wham/usage` with `Authorization: Bearer`, `ChatGPT-Account-Id` (left out when the account id is unknown) and `User-Agent: codex-cli`; no query, no body | reverse-engineered from the open-source Codex client, **VERIFY-LIVE** — the **Business** body below is the first sample confirmed against a live account; the `rate_limit` window shape of the other plans is still unconfirmed |
+| Anthropic **subscription** | `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer` (the subscription's OAuth access token), `anthropic-beta: oauth-2025-04-20` and `User-Agent: claude-cli/2.1.0 (external, cli)`; no query, no body | the endpoint the Claude Code CLI's `/usage` reads, community-documented only and **never confirmed against a real account** by this project, **VERIFY-LIVE** (`AnthropicOAuthUsageURL` and `AnthropicUsageUserAgent` in `constants.go`), ToS-restricted like the whole subscription path (§10) |
 
-The fetcher is `vendorauth.FetchOpenAISubscriptionUsage` (`internal/vendorauth/usage.go`),
+The OpenAI fetcher is `vendorauth.FetchOpenAISubscriptionUsage` (`internal/vendorauth/usage.go`),
 built like the discovery fetchers (§6): one GET, **no error return**, only a
 snapshot and a status, `ok` or `unverifiable`. The URL and the `User-Agent` live in
-`constants.go` beside the other VERIFY-LIVE constants.
+`constants.go` beside the other VERIFY-LIVE constants. The Anthropic fetcher,
+`vendorauth.FetchAnthropicSubscriptionUsage` (`internal/vendorauth/anthropic_usage.go`),
+differs in one way: it **has an error return**, because the group pull must tell a
+rate-limited endpoint (the typed `ErrUsageRateLimited`, HTTP 429, answered by backing off,
+§12.5) from any other miss. It maps `five_hour` to the five-hour window and `seven_day` to
+the weekly one (each `utilization` 0..100, clamped, and `resets_at` as RFC 3339); a window
+that is `null` or absent (a weekly-only plan has no `five_hour`) stays unknown (`-1`, no
+reset), and a body from which neither window could be read is an error, so an empty
+snapshot is never stored as a success. Redirects are not followed and no error text carries a
+token or vendor text. The snapshot is the same shape the OpenAI pull returns, written
+through the merge rule (§5.3), so the passive scrape and the pull cooperate.
 
 **Three quota shapes.** The body carries a plan's quota in one of three shapes, and
 the fetcher reads each independently (a body may carry more than one, and a plan
@@ -1697,7 +1722,7 @@ since removed: a merge cannot express "now absent". A failed pull, on the other
 hand, writes nothing: the last good snapshot stays, as for every other pull.
 
 **What the gate and the request path do.** `hasActiveVendorUsagePull` is true for
-an OpenAI subscription and for an `api_key` account whose preset names a
+an OpenAI or Anthropic subscription and for an `api_key` account whose preset names a
 `UsageVia` (OpenRouter, Kilo); the native OpenAI and Anthropic api-key accounts are
 not in the preset registry and stay false. The dedicated refresh (§5.5) branches
 **before** the OAuth token step, which would answer "not connected" for an account
@@ -1803,7 +1828,7 @@ rather than a toast. An
 `api_key` account has no snapshot from the scrape, since its responses carry none of
 the headers of §5.1: an OpenRouter or Kilo account gets one from the active pull
 (§5.2), and the others (x.ai, Google, Google (native), Custom, a native OpenAI or Anthropic key)
-show the empty-state line. A window the vendor did not
+show the empty-state line. (An Anthropic subscription's snapshot now also gets the group pull of §12.5.) A window the vendor did not
 report (`-1`, never observed) has **no row at all** — it is hidden, not drawn as
 "no data" and never as a real 0 % (a real `0` is a known value and is shown). The
 rows are therefore a subset of: the five-hour window, the weekly window and one
@@ -1850,8 +1875,10 @@ same account also gets **one on-view-lazy refresh** (the plain call, no `force`)
 its detail view opens, so figures that went stale while nobody looked are renewed
 without a click; it is best effort, its failure is silent and it never loops or
 polls. Every other account (an x.ai, Google, Google (native), Custom or native `api_key`, an Anthropic
-subscription) gets neither the button nor the call: it learns its usage only from
-the requests it serves. The frontend names the two api-key vendors itself
+subscription) gets neither the button nor the call in the portal: it learns its usage from
+the requests it serves and, for an Anthropic subscription that sits in a group, from the
+throttled group pull (§12.5); the backend refresh endpoint itself does serve an Anthropic
+subscription, only the portal never offers it. The frontend names the two api-key vendors itself
 (`hasActiveUsagePull`), mirroring the registry's `UsageVia`; the backend registry
 is the authority, so a drift between the two only shows or hides a button, and the
 backend still answers `unsupported` for an account it cannot ask.
@@ -1887,7 +1914,7 @@ connected.
 ### 5.5 The dedicated usage refresh and its lazy TTL
 
 `POST /api/portal/vendor-accounts/{id}/usage/refresh` (no body;
-[API Surface](../reference/api-surface.md#vendor-accounts-anbieter)) pulls an OpenAI
+[API Surface](../reference/api-surface.md#vendor-accounts-anbieter)) pulls an OpenAI or Anthropic
 subscription's or an OpenRouter or Kilo api key's usage **without re-listing the
 models**, so the usage panel can keep
 its figures current on its own (`RefreshVendorAccountUsage`,
@@ -1928,7 +1955,7 @@ merged write is idempotent).
 | `ok` | The vendor was asked, answered usably and the snapshot was stored (merged, §5.3, for an OpenAI subscription; as fetched for an api-key account, §5.2). |
 | `fresh` | The lazy TTL skipped the pull; the vendor was **not** called. It says the pull was skipped, not that the data is current: the last attempt may have failed, so the stored snapshot can be older than the TTL, or `usage` can be `null`. |
 | `unverifiable` | Nothing usable could be had: no usable token, or no API key set, the vendor unreachable or answering with an error or an unusable body (Kilo's undocumented balance endpoint is expected to do so while the stored key type is unconfirmed), or a snapshot that could not be stored. The stored snapshot is kept. It says nothing about the credential (only the dispatch moves an account to `needs_reconnect`, §3.4). |
-| `unsupported` | Neither an OpenAI subscription nor an OpenRouter or Kilo api key: a native OpenAI or Anthropic `api_key` account, an x.ai, Google, Google (native) or Custom account and an Anthropic subscription have no active pull; their snapshot, when they have one, only comes from the scrape (§5.1). No credential is opened. |
+| `unsupported` | Neither an OpenAI or Anthropic subscription nor an OpenRouter or Kilo api key: a native OpenAI or Anthropic `api_key` account and an x.ai, Google, Google (native) or Custom account have no active pull; their snapshot, when they have one, only comes from the scrape (§5.1). No credential is opened. |
 
 `refresh.detail` is a short English phrase for diagnostics; the portal keys off
 `status` only. The endpoint is **fail-soft** like the models refresh: an
@@ -2186,6 +2213,16 @@ which applies to self-hosted models.
 | **Admin Models management** (`ManageModels`, the admin view of the Models page) | **Not listed — deliberately.** It shows the system's real models, and a vendor model is one principal's own, not something an operator manages for the system. |
 | A **personal** account of another user, a shared account the caller is not provisioned into (or one that is paused, lowered or in no resource group), a shared account the caller's token does not name, or a disabled / `needs_reconnect` account | Never. |
 | A `subscription` account while `vendor_subscriptions_enabled` is off | Never on any row above (the account is kept, and listed again once the switch is back on); its `api_key` siblings are unaffected. The listing reads the same switch as the resolver's skip (§4), from one settings read together with the master flag, and the skip also drops the account's models from the generated-alias vendor-shadow set. |
+
+**Groups.** The same source also lists the token's **vendor account groups** (§12.1): for each active
+group the token uses, one entry per usable member (reachable, of the group's vendor, active,
+subscriptions switch on) with that member's models relabeled to `group prefix + upstream_model`
+(`advertisedVendorGroupModels`, the listing's group step; `advertisedVendorAccountModels` calls it
+first). A group therefore advertises the **union** of its usable members' models, under the union of
+the dialects they serve. Thresholds and cooldowns do **not** affect the listing: they decide which
+member serves, not whether the name exists. Groups come first because the resolver tries them before
+any single account, so a group name shadows the same name of its own members. The dashboard's live
+routes and the model pickers show a group model once, under the group.
 
 A name several accounts serve is advertised under the **union** of the dialects they
 serve it on (the resolver picks an account per name **and** dialect, §4.6), so a name
@@ -2721,15 +2758,24 @@ deliberate, named choice**, because `all: true` never covers a shared account (�
 
 The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 (column, a JSON string on `api_tokens`, migration 85;
-[Data Model](../reference/data-model.md#4-migration-history-113-migrations)):
+[Data Model](../reference/data-model.md#4-migration-history-114-migrations)):
 
 ```json
 { "all": false,
   "accounts": [
     { "account_id": "va_…" },
     { "account_id": "va_…", "prefix_override": { "enabled": true, "value": "work/" } }
+  ],
+  "include_groups": false,
+  "groups": [
+    { "group_id": "vag_…" },
+    { "group_id": "vag_…", "prefix_override": { "enabled": true, "value": "" } }
   ] }
 ```
+
+`include_groups` and `groups` extend the policy for **vendor account groups** (§12) in the same
+JSON column; both are omitted from the wire when unset, and the tolerant decoder reads a stored row
+without them as "no groups", so no migration was needed.
 
 | Setting | Effect |
 |---|---|
@@ -2740,6 +2786,9 @@ The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 | `prefix_override` `{enabled: true, value}` | The token sees that account's models under `value` **instead of** the account's `model_prefix`. |
 | `prefix_override` with **`enabled: true` and an empty `value`** | The account's models are served under their **original vendor names, with no prefix** (`gpt-5` rather than `chatgpt/gpt-5`). This is a real, supported setting, not an unset field. |
 | No `prefix_override`, or `enabled: false` | The account's own `model_prefix`. A stored override only counts while it is enabled, so an object with `enabled: false` is a switched-off override. |
+| `groups` entry | The token uses that **vendor account group** under the group's `model_prefix`, or the entry's `prefix_override` (same shape and rules as an account's, an empty enabled value meaning no prefix). The group must be **owned** by the token's principal; a foreign, unknown or blank id, a repeated one and a malformed enabled override are `400 portal.token_vendor_access_invalid`. A group (or member) deleted after the grant simply matches nothing and never breaks token decode, listing or routing. |
+| `all: true` + `include_groups: true` | Every **active** group the principal **owns**, groups created later included, each under its own `model_prefix`; an entry naming an own group is covered by the switch and ignored. |
+| `include_groups` without `all` | Ignored (the token editor only offers it next to the "all" switch). A service owns no group, so for a service token neither field covers anything. |
 
 An override value follows the account-prefix rule (§1: at most 64 bytes from
 `A-Z a-z 0-9 - _ . ~ : / @ +`, no `..`); an enabled one that breaks it is refused at
@@ -2753,8 +2802,9 @@ open access. An account deleted after a grant leaves a stale id behind, which
 simply matches nothing.
 
 The token editor (portal, **Provider access** / "Anbieter-Zugriff") exposes it as
-an "All providers (incl. future)" switch, a checkbox per connected account and,
-for each ticked account, an "Override prefix" toggle with a prefix field whose
+an "All providers (incl. future)" switch with a nested **"incl. groups"** checkbox (enabled only
+while the switch is ticked), a checkbox per connected account and per vendor account group
+and, for each ticked entry, an "Override prefix" toggle with a prefix field whose
 hint states that empty means no prefix. Accounts shared with the creator are offered
 too, each labelled with its owner's name; the list is the creator's own, managed and
 member accounts, so it can offer an account the token's principal cannot actually reach,
@@ -2781,6 +2831,12 @@ save-time check alike:
 | listed (own or shared), no (or disabled) override | allowed, the account's own `model_prefix` |
 | listed (own or shared), override enabled | allowed, the override value (possibly `""`) |
 | not listed (and not covered by `all`) | **denied** |
+
+Groups have the twin helper `routing.TokenVendorGroupPrefix(token, group) → (prefix, allowed)`:
+allowed for a group in the token's `groups` (the group's prefix or the override) and, under
+`all` + `include_groups`, for every group the principal owns (its own prefix); a group the
+principal does not own is denied, and so is every group for a token with no user. Listing and
+resolver ask the one helper, so the parity contract holds for groups as it does for accounts.
 
 For an **own** account `all` wins over a listed entry (its override is not applied),
 exactly as before sharing.
@@ -2841,6 +2897,18 @@ collide (give one a distinct `model_prefix`, §6.5). Two layers handle it:
   never ambiguous; the cost is that a shadowed account's model is unreachable under
   that name until the owner separates the prefixes.
 
+**Groups and collisions.** Names are claimed **per opted-in source**. A group claims
+`group prefix + model` for the **union** of its usable members' models (so members that expose
+identical vendor ids do not collide with each other: the token opts into the group, not the
+members); an account claims its own names. A name shared by a group and **one of its own members**
+is not a conflict, because the group shadows the member (§12.2). Any other shared effective name
+(another group, or an account outside the group) is the same `400
+portal.token_vendor_access_conflict`. The group save itself refuses a prefix that makes the
+group's names collide with the owner's own accounts outside the group or with another own group
+(`vendor_account_group.prefix_conflict`, all statuses counted), so the common `all` + `include_groups`
+token cannot trip the token check by accident. The routing backstop order is own groups (id order),
+then own accounts, then shared accounts.
+
 ### 11.4 Who is restricted: API tokens, not the owner's session
 
 The opt-in binds **API tokens**, and only those:
@@ -2848,7 +2916,7 @@ The opt-in binds **API tokens**, and only those:
 | Principal | Vendor access |
 |---|---|
 | **API token** (user-owned) | Its stored policy; strict default none. Its own accounts are covered by `all`, a shared account only by a named entry. |
-| **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | **Always all** of the owner's **own** active accounts under their native prefixes (`VendorAccess{All: true}`), and, because `all` never covers a shared account, **never a shared one**. It has no `api_tokens` row to opt in on, and the chat model picker, the Models page and the dashboard's live routes (§6.7) depend on seeing every account the user owns; an account shared with the user is reached through a token that names it. |
+| **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | **Always all** of the owner's **own** active accounts under their native prefixes (`VendorAccess{All: true, IncludeGroups: true}`, so also all of the owner's own groups; making this configurable is a follow-up), and, because `all` never covers a shared account, **never a shared one**. It has no `api_tokens` row to opt in on, and the chat model picker, the Models page and the dashboard's live routes (§6.7) depend on seeing every account the user owns; an account shared with the user is reached through a token that names it. |
 | **A run-as token** (a chat run that acts through one of the user's tokens) | That token's own stored policy, like any API call with it. |
 | **Service token** (a service id, no user id) | Its stored policy, **create-only** (§11.6). A service owns no account, so `all: true` covers nothing for it; it reaches a shared account only when its policy **names** it **and** the service is **provisioned directly** into a resource group that contains it. A service token with no policy has no vendor access, as before. |
 
@@ -2901,6 +2969,233 @@ A service token carries the same opt-in as a user token, on **new plumbing**:
   **closed** on a store error, which reads as "not reachable", the same answer routing
   gives in that window.
 
+## 12. Vendor account groups
+
+A **vendor account group** ("Anbieter-Gruppe") lets a user keep working when one account is used up.
+It is a personal, ordered list of accounts of the **same vendor**: the gateway serves each request from
+the first member that still has room and moves on when a member is almost used up or the vendor
+answers a limit error. The typical group is "my Claude subscription first, a subscription shared
+with me second, a paid Anthropic API key as the reserve". Decisions and rejected options:
+[ADR-112](../09-architecture-decisions.md#adr-112--vendor-account-groups-are-personal-ordered-same-vendor-sets-that-shadow-their-members-fail-over-per-account-and-model-on-status-only-limit-errors-and-skip-thresholds-for-members-whose-usage-is-not-shared).
+
+What a group is **not**: it cannot be shared with other users or services; it cannot span vendors (model
+ids differ across vendors, so a failover by model name could not work); it does not balance load (the order
+is a strict priority); it does not use per-model weekly windows (Anthropic's Opus and Sonnet weeklies) as
+thresholds, those are caught by the limit-error failover (§12.4); and it is unrelated to the admin-managed
+self-hosted **model groups** ([Routing & Model Selection](routing-and-model-selection.md)).
+
+### 12.1 The entity
+
+| Field | Meaning |
+|---|---|
+| `id` | `vag_` plus 32 hex characters (`compactRandomHex(16)`). |
+| `owner_user_id` | The owning user, `on delete cascade`. Groups are personal; a service owns none. |
+| `vendor` | The vendor id every member shares (`anthropic`, `openai`, `openrouter`, ...), fixed at create. "Same vendor" is equality of `vendor_accounts.vendor`, so the shim `google` and `google_native` cannot be mixed. |
+| `name` | The user-facing label (trimmed, required). |
+| `model_prefix` | The group's own namespace, with the account-prefix syntax (§1). May be empty. |
+| `status` | `active` or `disabled`; a disabled group is neither listed nor routed. |
+| `threshold_five_hour_pct`, `threshold_weekly_pct`, `threshold_credits_pct` | Whole percentages 1..100, default **99** (`routing.DefaultVendorGroupThresholdPct`). The credits threshold applies to the categories that report a percentage (Codex Business spend control, the OpenRouter and Kilo limit). |
+
+The members are a separate link table with `(group_id, account_id, position)`: position is the priority
+(lower first), an account may sit in several groups, and a delete of the group or of a member account
+cascades the link row away. Routing and the portal view rely on the member **order**, never on positions being
+contiguous (the memory store renumbers after an account delete, the SQL cascade leaves gaps), and the DTO's
+`position` is the 1-based index in the returned order. Schema and migration 114:
+[Data Model](../reference/data-model.md#external-vendor-accounts-anbieter).
+
+**Adding a member** requires the group's vendor, a listed-once account, and that the account is **reachable by
+the group owner at save time** (owned, or in the owner's routing grant, §4.6). That is a save-time check only:
+routing re-checks reach on every request, so a later loss of access (the owner lowered the share level, removed
+the provisioning, a subscription was switched off) needs no data step. The member row stays and is skipped, and
+the management view marks it `not_usable` with reason `not_reachable`.
+
+### 12.2 Selection
+
+A request whose model starts with a group's effective prefix (§11.2) walks the group's members **in order** and
+takes the first member that is **eligible**, with the upstream model being the request model minus that prefix:
+
+1. **Reachable now** by the token's principal (the grant answer of `routableVendorAccounts`), of the group's
+   vendor and not in the request's exclusion list (§12.4);
+2. account `status = active` and, for a subscription account, `vendor_subscriptions_enabled` on (the resolver's
+   `vendorAccountUsable`, the same gate the single-account loop applies);
+3. it serves the requested `(upstream_model, dialect)` (the member's `vendor_account_models` rows, the same
+   target builder as the account path);
+4. **not over a threshold.** For each category the member reports (a percent that is known, `>= 0`), the member is
+   over when `pct >= threshold` **and** that category's reset time is unknown or in the future. A category whose
+   reset time has **passed** counts as renewed: the stale snapshot is not trusted past its own reset, so a
+   five-hour window at 99.5 % with a reset in the past does not block position 1. An unknown category is unknown,
+   never `0` and never over. Thresholds apply only when `ThresholdsApply` holds for the member: **the member
+   belongs to the group's owner, or its owner has `share_usage_with_members` on** (§1.3). A shared member whose owner
+   has not switched it on is **never** held against a threshold, because the borrower is not entitled to that
+   account's figures and a skip at 99 % would reveal them; it is used until the vendor answers a limit error and
+   §12.4 moves the request on;
+5. **not in limit cooldown** for the requested upstream model (§12.4).
+
+`routing.SelectVendorGroupMember` implements 4 and 5 over candidates built by the resolver; `VendorGroupMemberBlocks`
+returns the reasons a member is blocked (`five_hour`, `weekly`, `credits`, `cooldown`, each with a percent and a
+"free at" time or unknown), which the portal view reuses.
+
+**All members blocked.** When no member is eligible but at least one passes rules 1 to 3, the request goes to the
+member that becomes available **soonest**: a member's free-at time is the **latest** end among the categories that
+block it (and its cooldown), a member with no known end sorts last, ties keep position order. The vendor's own
+answer, success or limit error, is then relayed under the **existing** header rules (the entitlement and the
+`send_usage_limits` token switch are unchanged), so Claude Code shows the vendor's limit message where it is
+entitled to it. This fallback is **off** on a failover pass (a non-empty exclusion list): a member the request
+already tried is never retried, and a blocked one is not substituted.
+
+**No usable member.** If no member passes rules 1 to 3 (every share revoked, account disabled, subscription
+switched off or model missing), the group does **not serve** the name and resolution continues as if the group were
+unknown: the next group, then the own and shared accounts and the standard path, never a `500`.
+
+**A usage pull is requested** for every usable member blocked by a threshold whose reset time is unknown, through
+the `routing.VendorUsagePuller` seam (§12.5); the call is a cheap in-memory check and never blocks the resolve.
+
+**Precedence and shadowing.** Groups take part in the vendor branch and in `vendor_account_routing_mode`
+(`vendor_first` / `fallback_only`, §7) exactly like accounts. The group step runs **before** the single-account
+loop, so **a group shadows its own members**: when a token uses a group and one of its member accounts under the
+same effective name (the typical case: an own Claude subscription with an empty prefix, a group with an empty prefix
+that starts with it, a token with "all + incl. groups"), the group answers that name. This is safe because the group
+serves that member first anyway, and it is what makes plain names such as `claude-opus-4-5` fail over without extra
+setup. Every other collision is refused at save (§11.3); the routing backstop order is own groups (id order), then
+own accounts, then shared accounts.
+
+### 12.3 Reach, policy and listing
+
+- **A group never widens reach.** The resolver builds its candidates only from the grant's answer (§4.6), so a
+  member the principal could not reach anyway does not exist for the group. Losing access to a shared account
+  silently removes it.
+- **A token opted into a group uses its members through the group** even when a shared member is not named under
+  `accounts`. This is the deliberate exception to "a shared account is used only when an entry names it" (§11.1,
+  ADR-050): putting a shared account into a group is the user's own named choice, and the grant still applies. The
+  portal session is treated as `all` + `include_groups` (§11.4), so it reaches a shared account only through a group.
+- **A deleted group or member still named in a token policy matches nothing** (a group id not found, a member not in
+  the grant) and never breaks token decode, listing or routing.
+- **Listing** is §6.7: the union of the usable members' models under the group prefix, thresholds ignored.
+- **Principals.** The group step runs only for a principal with a user id (a service owns no group) and reads the
+  owner's groups on a vendor-eligible request.
+
+### 12.4 Failover on vendor limit errors
+
+When the member the group chose answers with a **limit error** before the client has received any upstream byte, the
+gateway moves the request to the next eligible member, and the client never sees the refusal. The mechanism
+(`vendor_group_failover.go`):
+
+1. **Limit errors are decided by status alone: HTTP 429 and HTTP 402** (`provider.IsLimitStatus`). OpenAI
+   `insufficient_quota` and Codex `usage_limit_reached` arrive as 429, so no body is parsed. 5xx and 529
+   (`overloaded`) are **not** limit errors: a vendor outage must not silently move traffic to a paid reserve.
+2. The refusal's headers are **scraped** into the member's usage snapshot, as for any served response.
+3. The member is put into a **cooldown for the requested upstream model**, in the in-memory
+   `routing.VendorLimitCooldowns` registry keyed by `(account id, upstream model)`, not by account: a per-model weekly
+   window (Opus) can be days away, and an account-wide block would push the other models to the paid reserve while
+   the subscription still has room. Account-wide exhaustion is what the thresholds of §12.2 cover. The cooldown ends
+   at the **earliest** of `Retry-After`, the scraped Anthropic unified reset and the reset of every Codex window
+   reported at 100 % or more, each **only when it lies after now** (a reset already in the past would create a
+   zero-length cooldown and is ignored); with none known it is `routing.DefaultVendorLimitCooldown`, **60 s**. The
+   registry is process-local and unpersisted, it only bridges the time until the next scrape or pull tells the truth,
+   and a restart forgets it.
+4. The request is **resolved again with that member excluded** (`Request.ExcludeVendorAccountIDs`, mirroring
+   `ExcludeInstanceKeys`), by the resolve step of the path in hand, and runs on the new target as a fresh attempt. The
+   failover proceeds **only** when the re-resolved target belongs to the **same group** and is not excluded: the
+   resolver's own-account step ignores the exclusion list, so where a group prefix shadows an own account's, a
+   re-resolve could return the very account that refused, outside the group; that, an error, or no target ends the
+   failover and the original answer is relayed.
+5. A limit answer on the new member fails over again with the exclusion list grown, so **each member is tried at most
+   once** per request. With none left the client gets the **last** vendor answer: verbatim on the passthrough, and the
+   translate path's `502 provider.unavailable` (changing that mapping is out of scope).
+
+Only the attempt that answers writes the request's usage row (one row per request, with `account_id` the serving
+member and `vendor_group_id` the group, §12.6). A target that did not come from a group never fails over, and a single
+account behaves exactly as it always has. The request body must be replayable (it is buffered before dispatch).
+
+**Where it hooks in.**
+
+- *Passthrough* (Claude Code `/v1/messages`, Codex `/v1/responses`): in `proxyNative`, where the upstream status is
+  already peeked before anything is written (the place where a lost instance is re-selected). A limit status on a group
+  target calls `vendorGroupFailover` with `resolveTarget` and relays the next member. The refused attempt's active
+  row, connection and watchdog are released (the `release` callback of `nativeRelay.vendorFailover`) before the next
+  member's stream is relayed.
+- *Translate* (`/v1/chat/completions` and the translate modes): the provider clients classify 429 and 402 into a typed
+  `provider.LimitError` (status, parsed `Retry-After`, a clone of the headers for the scrape; it unwraps to
+  `ErrUnavailable`, so every other consumer keeps its behavior). The buffered path (`completeOn`) and the stream path
+  (`streamSession.vendorFailover`) fail over using `resolveTranslateTarget`.
+- **"Before any response byte" means before any upstream byte.** A streamed translate response may already have sent
+  the gateway's own opening frames (`response.created` / `response.in_progress`, `message_start`); those are
+  member-independent, so a failover is still allowed after them, and the first upstream event ends the window
+  (`delivered`). The cost is one stream whose content came from the second member under the first member's opening
+  frames, which corrupts nothing. After the first upstream event the client keeps the stream it has, even on a limit.
+
+### 12.5 Usage data and the group pull
+
+The passive Anthropic scrape already reads both windows with their own reset times (§5.1). A group additionally needs
+a member's reset time without waiting for a served request, so an **Anthropic subscription** has an active pull since
+this feature (§5.2, `FetchAnthropicSubscriptionUsage`): `GET https://api.anthropic.com/api/oauth/usage` with the
+subscription's OAuth bearer, `anthropic-beta: oauth-2025-04-20` and the Claude CLI-shaped
+`User-Agent: claude-cli/2.1.0 (external, cli)`, returning `five_hour` and `seven_day` with `utilization` (0..100) and
+`resets_at`, `five_hour` being `null` on a weekly-only plan. The endpoint and the user agent are **VERIFY-LIVE**
+(`AnthropicOAuthUsageURL`, `AnthropicUsageUserAgent`): community-documented, never confirmed against a real account by
+this project, and ToS-restricted like the whole subscription path (§10). It is written through the merge rule (§5.3).
+
+**When pulls run**, for any account with an active pull: on the existing triggers (usage view open or refresh, models
+refresh, connect), and, for a **group member skipped by a threshold whose reset time is unknown**, on request of the
+resolver through `routing.VendorUsagePuller.RequestVendorUsagePull` (implemented by `portal.Service`):
+
+- **at most once per 15 minutes per account** (`vendorGroupUsagePullInterval`), enforced by an in-memory throttle;
+- **asynchronously**: the call only consults the throttle and starts a detached goroutine with its own bounded
+  context, so the vendor is never asked on the request path and the resolver is never blocked;
+- with **exponential backoff after a 429** from the usage endpoint (`ErrUsageRateLimited`): the wait doubles per
+  consecutive 429 and is **capped at 4 hours** (`vendorGroupUsagePullMaxBackoff`); a good fetch resets it;
+- fail-soft: whether the account has an active pull at all is decided in the goroutine (an account without one costs a
+  throttled goroutine at most), an expired token is renewed through the gateway's locked refresher, and every miss
+  leaves the stored snapshot as it was.
+
+The throttle is per process and forgotten at restart, which at worst repeats one pull. The manual and lazy refreshes of
+§5.5 do not consult the group backoff (they are user actions).
+
+### 12.6 Attribution and client-facing limits
+
+- **Usage events.** `account_id` stays the member that actually served; `vendor_group_id` records the group (empty
+  when the request was not routed through one; the usage list JSON carries it `omitempty`). Analytics may filter by
+  group later; this only records it.
+- **Window caches.** The per-principal caches of the Claude Code and Codex limit displays (§4.1, ADR-106, ADR-108) attach
+  the principal's last cached subscription windows to a response that carries none. For a response served by a **group
+  member that reports no windows** (an API-key reserve), nothing is attached and the principal's cached entry is
+  **dropped** (`Drop(key)`, whatever account it was observed from), so the client never shows, and never blocks itself
+  on, the windows of a member the group skipped. A member that reports windows overwrites the entry as before. There is
+  no aggregation across members, and nothing is written for a token without `send_usage_limits` (ADR-110). The drop runs
+  on the attach path, so a path that skips attach (a Codex takeover, the `send_usage_limits` gate) can leave a skipped
+  member's entry until the next observation.
+
+### 12.7 Management and dashboard
+
+- **Portal.** Groups are managed on the **"Anbieter" / "Providers"** page next to the accounts
+  (`VendorAccountGroupsSection.tsx`): create, rename, enable or disable, delete; set the prefix (the vendor is fixed after
+  create); three threshold fields with a hint that each applies only where the account reports that category; a member
+  list with reorder, add from the accounts of the same vendor the user can reach (shared ones labelled with their owner)
+  and remove. The token editor lists groups with the account checkbox pattern and the nested "incl. groups" checkbox
+  (`TokenList.tsx`, §11.1).
+- **Member states.** `GET /api/portal/vendor-account-groups[/{id}]`
+  ([API surface](../reference/api-surface.md#vendor-account-groups)) renders each member as `active` (the one routing
+  picks), `available`, `over_threshold` (reason: the first blocking category, with percent and the moment every block
+  lifts), `cooldown` (the models and the end) or `not_usable` (`disabled`, `needs_reconnect`, `subscriptions_disabled`,
+  `not_reachable`). `active_member_id` is the member routing would pick **ignoring the requested model**, so it is
+  model-independent. For a shared member without the owner's usage opt-in the line never carries percent, usage or a
+  window reset: only active, cooldown (the end from `Retry-After` or the 60 s default, never a scraped reset) or not
+  usable.
+- **Dashboard.** `DashboardVendorGroups.tsx` sits next to the vendor usage cards (§5.4), polls the same group endpoint and
+  shows per group its name, the active member and one compact line per member, labelling a skipped member from the DTO's
+  `reason` (never by guessing from the percent). It is behind the same `vendor_accounts_enabled` gate as the vendor usage
+  section.
+
+### 12.8 Switches and errors
+
+Everything sits behind `vendor_accounts_enabled` (§7); there is no new feature flag, no new system setting and no
+ServerAgent change. The group endpoints answer `409 vendor_accounts.module_disabled` while the flag is off. The stable
+`vendor_account_group.*` error codes are `not_found` (404), `forbidden` (403), `name_required`, `vendor_invalid`,
+`model_prefix_invalid`, `status_invalid`, `threshold_invalid`, `member_vendor_mismatch`, `member_unreachable`,
+`member_duplicate` and `prefix_conflict` (all 400) and `failed` (500); the token policy reuses
+`portal.token_vendor_access_invalid` and `portal.token_vendor_access_conflict` (§11.3). The table is in the
+[API surface](../reference/api-surface.md#vendor-account-groups).
+
 ## Related chapters
 
 - [Routing & Model Selection](routing-and-model-selection.md) — the resolver and
@@ -2917,7 +3212,8 @@ A service token carries the same opt-in as a user token, on **new plumbing**:
   preset accounts' (OpenAI-compatible and native Gemini) `vendor_accounts.base_url`
   column (migration 86) and the share model (migrations 90 to 92: the
   `can_manage_vendor_accounts` flag, `share_level` / `system_group_id`,
-  `vendor_account_admin_groups` and `resource_group_vendor_accounts`).
+  `vendor_account_admin_groups` and `resource_group_vendor_accounts`) and the vendor account groups
+  (migration 114: `vendor_account_groups`, `vendor_account_group_members`, `usage_events.vendor_group_id`).
 - [HTTP API Surface](../reference/api-surface.md#vendor-accounts-anbieter) — the
   `/api/portal/vendor-accounts*` routes (the model and usage refreshes and the
   share-level, management-group and resource-group endpoints included) and
@@ -2949,3 +3245,6 @@ A service token carries the same opt-in as a user token, on **new plumbing**:
   — shared vendor accounts: the tiered share level, management that mirrors servers
   with a routing grant that does not, authorization by level, the subscription cap and
   the per-account opt-in across user and service tokens.
+- [ADR-112](../09-architecture-decisions.md#adr-112--vendor-account-groups-are-personal-ordered-same-vendor-sets-that-shadow-their-members-fail-over-per-account-and-model-on-status-only-limit-errors-and-skip-thresholds-for-members-whose-usage-is-not-shared)
+  — vendor account groups: personal ordered same-vendor sets, shadowing, status-only limit failover with a per-model
+  cooldown, thresholds skipped for members whose usage is not shared, and the share-usage default on for new accounts.

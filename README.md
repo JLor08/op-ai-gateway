@@ -101,6 +101,9 @@ servers, models, launch specifications, users, and policies in a bilingual
 - Accounts are personal by default; when sharing is enabled, an admin owner
   can share one through resource groups, and each API token opts in to the
   accounts it may use.
+- Several accounts of one vendor can be put into an ordered **vendor account
+  group**: requests go to the first member with room and move on to the next
+  when one is almost used up or the vendor answers a limit error.
 
 **Observability**
 
