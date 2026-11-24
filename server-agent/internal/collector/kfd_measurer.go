@@ -37,6 +37,12 @@ const kfdRoot = "/sys/class/kfd/kfd"
 
 const kfdVRAMPrefix = "vram_"
 
+// kfdGPUNode is one GPU entry of the KFD topology.
+type kfdGPUNode struct {
+	node  int
+	gpuID uint64
+}
+
 // kfdGPUOrdinals maps each GPU's KFD gpu_id to its ordinal under root. Nodes
 // whose gpu_id cannot be read or parsed are skipped rather than failing the
 // whole map; an error means the topology itself is unreadable.
@@ -46,25 +52,11 @@ func kfdGPUOrdinals(root string) (map[uint64]int, error) {
 	if err != nil {
 		return nil, err
 	}
-	type gpuNode struct {
-		node  int
-		gpuID uint64
-	}
-	var gpus []gpuNode
+	var gpus []kfdGPUNode
 	for _, e := range entries {
-		node, err := strconv.Atoi(e.Name())
-		if err != nil || node < 0 {
-			continue
+		if g, ok := readKFDGPUNode(nodesDir, e.Name()); ok {
+			gpus = append(gpus, g)
 		}
-		raw, err := os.ReadFile(filepath.Join(nodesDir, e.Name(), "gpu_id"))
-		if err != nil {
-			continue
-		}
-		gpuID, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
-		if err != nil || gpuID == 0 {
-			continue
-		}
-		gpus = append(gpus, gpuNode{node: node, gpuID: gpuID})
 	}
 	// Directory order is lexical, so node 10 would sort before node 2.
 	sort.Slice(gpus, func(i, j int) bool { return gpus[i].node < gpus[j].node })
@@ -73,6 +65,25 @@ func kfdGPUOrdinals(root string) (map[uint64]int, error) {
 		out[g.gpuID] = rank
 	}
 	return out, nil
+}
+
+// readKFDGPUNode reads one topology node directory. It reports false for a
+// non-numeric name, an unreadable or unparseable gpu_id, and gpu_id 0 (a CPU
+// node).
+func readKFDGPUNode(nodesDir, name string) (kfdGPUNode, bool) {
+	node, err := strconv.Atoi(name)
+	if err != nil || node < 0 {
+		return kfdGPUNode{}, false
+	}
+	raw, err := os.ReadFile(filepath.Join(nodesDir, name, "gpu_id"))
+	if err != nil {
+		return kfdGPUNode{}, false
+	}
+	gpuID, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || gpuID == 0 {
+		return kfdGPUNode{}, false
+	}
+	return kfdGPUNode{node: node, gpuID: gpuID}, true
 }
 
 // kfdProcessVRAM reads every KFD process's per-GPU VRAM bytes, keyed by pid
@@ -91,36 +102,47 @@ func kfdProcessVRAM(root string) (map[int]map[uint64]int64, error) {
 		if err != nil {
 			continue
 		}
-		pidDir := filepath.Join(procDir, e.Name())
-		files, err := os.ReadDir(pidDir)
-		if err != nil {
-			continue
-		}
-		byGPU := make(map[uint64]int64)
-		for _, f := range files {
-			idText, ok := strings.CutPrefix(f.Name(), kfdVRAMPrefix)
-			if !ok {
-				continue
-			}
-			gpuID, err := strconv.ParseUint(idText, 10, 64)
-			if err != nil {
-				continue
-			}
-			raw, err := os.ReadFile(filepath.Join(pidDir, f.Name()))
-			if err != nil {
-				continue
-			}
-			bytes, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
-			if err != nil {
-				continue
-			}
-			byGPU[gpuID] = bytes
-		}
-		if len(byGPU) > 0 {
+		if byGPU := readKFDPidVRAM(filepath.Join(procDir, e.Name())); len(byGPU) > 0 {
 			out[pid] = byGPU
 		}
 	}
 	return out, nil
+}
+
+// readKFDPidVRAM reads one pid directory's vram_<gpu_id> files. An unreadable
+// directory or file is skipped, so the result may be empty.
+func readKFDPidVRAM(pidDir string) map[uint64]int64 {
+	byGPU := make(map[uint64]int64)
+	files, err := os.ReadDir(pidDir)
+	if err != nil {
+		return byGPU
+	}
+	for _, f := range files {
+		gpuID, ok := parseKFDVRAMName(f.Name())
+		if !ok {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(pidDir, f.Name()))
+		if err != nil {
+			continue
+		}
+		bytes, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+		if err != nil {
+			continue
+		}
+		byGPU[gpuID] = bytes
+	}
+	return byGPU
+}
+
+// parseKFDVRAMName extracts the gpu_id from a vram_<gpu_id> file name.
+func parseKFDVRAMName(name string) (uint64, bool) {
+	idText, ok := strings.CutPrefix(name, kfdVRAMPrefix)
+	if !ok {
+		return 0, false
+	}
+	gpuID, err := strconv.ParseUint(idText, 10, 64)
+	return gpuID, err == nil
 }
 
 // attributeKFD charges each KFD process's VRAM to its group owner when that
