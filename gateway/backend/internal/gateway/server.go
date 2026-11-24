@@ -846,6 +846,9 @@ type Server struct {
 	// rateLimitWindows remembers each principal's last subscription rate-limit
 	// windows so they can ride along on /v1/messages responses from other providers
 	// (ratelimit_window_cache.go). Nil in a bare &Server{}; the helpers tolerate that.
+	// vendorCooldowns is the process-local registry of vendor limit cooldowns,
+	// shared with the resolver so a group skips a member that just hit a limit.
+	vendorCooldowns  *routing.VendorLimitCooldowns
 	rateLimitWindows *rateLimitWindowCache
 	// codexRateLimitWindows is the Codex-family counterpart on /v1/responses, kept
 	// apart so one principal using both clients never has one family evict the other.
@@ -1271,6 +1274,7 @@ func New(deps ServerDeps) *Server {
 		voiceCoLoadTimeout:             voiceCoLoadTimeout,
 		voiceTiming:                    voiceTiming,
 		voicePrewarm:                   deps.VoicePrewarmEnabled,
+		vendorCooldowns:                routing.NewVendorLimitCooldowns(),
 	}
 	if s.newMailer == nil {
 		s.newMailer = func(cfg mail.Config) Mailer { return mail.New(cfg) }
@@ -1279,6 +1283,7 @@ func New(deps ServerDeps) *Server {
 	// upstream-auth), so it is wired here rather than in the pre-s resolver-checker block.
 	if resolver != nil {
 		resolver.SetModelWarmer(newModelWarmer(s))
+		resolver.SetVendorLimitCooldowns(s.vendorCooldowns)
 		// The per-user vendor-account branch reads the vendor_accounts_enabled
 		// master flag and the vendor_account_routing_mode through these cached
 		// accessors (invalidated on a settings PUT), so it never hits the

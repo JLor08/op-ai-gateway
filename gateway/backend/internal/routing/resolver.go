@@ -635,6 +635,11 @@ type resolverStore interface {
 	// which already declares them).
 	VendorAccountsByOwner(ctx context.Context, userID string) ([]VendorAccount, error)
 	VendorAccountModels(ctx context.Context, accountID string) ([]VendorAccountModel, error)
+	// The group step (resolveVendorGroup) reads the owner's groups, their ordered
+	// members and each member's usage snapshot.
+	VendorAccountGroupsByOwner(ctx context.Context, userID string) ([]VendorAccountGroup, error)
+	VendorAccountGroupMembers(ctx context.Context, groupID string) ([]VendorAccountGroupMember, error)
+	VendorAccountUsageByID(ctx context.Context, accountID string) (VendorAccountUsage, bool, error)
 }
 
 type Resolver struct {
@@ -650,6 +655,10 @@ type Resolver struct {
 	admission         AdmissionController
 	provisioning      ProvisioningGate
 	vendorEnumerator  VendorAccountEnumerator
+	// vendorCooldowns and vendorPuller feed the group step; both are nil-safe
+	// (nil = no cooldowns known / no usage pulls).
+	vendorCooldowns   *VendorLimitCooldowns
+	vendorPuller      VendorUsagePuller
 	groups            GroupResolver
 	warmer            ModelWarmer
 	instances         InstanceSource
@@ -748,6 +757,14 @@ func (r *Resolver) SetProvisioningGate(g ProvisioningGate) { r.provisioning = g 
 // OWN accounts -- owner-only, NEVER allow-all: the inverse of SetProvisioningGate's
 // nil, because here an unwired seam must deny the shared arm, not open it.
 func (r *Resolver) SetVendorAccountEnumerator(e VendorAccountEnumerator) { r.vendorEnumerator = e }
+
+// SetVendorLimitCooldowns installs the limit-cooldown registry the vendor group
+// step consults. Leaving it unset (nil) means no member is ever on cooldown.
+func (r *Resolver) SetVendorLimitCooldowns(c *VendorLimitCooldowns) { r.vendorCooldowns = c }
+
+// SetVendorUsagePuller installs the source of on-demand usage pulls for group
+// members whose blocking window has no known reset. Nil means no pulls.
+func (r *Resolver) SetVendorUsagePuller(p VendorUsagePuller) { r.vendorPuller = p }
 
 // SetGroupResolver installs the model-group config source. Leaving it unset (nil)
 // means no groups exist, so Resolve is byte-identical to the single-model path
@@ -1184,10 +1201,16 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 	if err != nil {
 		return Target{}, false, fmt.Errorf("resolve vendor accounts: %w", err)
 	}
+	if t, ok, err := r.resolveVendorGroup(ctx, token, req, apiFlavor, accounts); err != nil || ok {
+		return t, ok, err
+	}
 	decision := isVendorDecisionRequest(req, apiFlavor)
 	for _, acc := range accounts {
-		prefix, ok := r.vendorAccountServes(token, acc, apiFlavor, decision)
-		if !ok {
+		if !r.vendorAccountUsable(acc, apiFlavor, decision) {
+			continue
+		}
+		prefix, allowed := TokenVendorPrefix(token, acc)
+		if !allowed {
 			continue
 		}
 		models, err := r.store.VendorAccountModels(ctx, acc.ID)
@@ -1201,17 +1224,18 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 	return Target{}, false, nil
 }
 
-// vendorAccountServes is resolveVendorAccount's per-account gate, before any
-// model row is read: whether acc may serve this request for this token, and
-// under which token-effective prefix (TokenVendorPrefix). decision is
-// isVendorDecisionRequest for the request; for a decision request only an
-// OpenAI api-key account (isVendorDecisionAccount) serves, the model row then
-// decides (vendorAccountModelTarget).
-func (r *Resolver) vendorAccountServes(token auth.Token, acc VendorAccount, apiFlavor string, decision bool) (prefix string, ok bool) {
+// vendorAccountUsable is resolveVendorAccount's per-account gate, before any
+// model row is read: whether acc may serve this request at all, independent of
+// which token asks and under which prefix (the account loop applies
+// TokenVendorPrefix afterwards; the group step needs no token prefix per
+// member). decision is isVendorDecisionRequest for the request; for a decision
+// request only an OpenAI api-key account (isVendorDecisionAccount) serves, the
+// model row then decides (vendorAccountModelTarget).
+func (r *Resolver) vendorAccountUsable(acc VendorAccount, apiFlavor string, decision bool) bool {
 	// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
 	// disabled accounts are skipped and fall through to the standard path.
 	if acc.Status != VendorAccountStatusActive {
-		return "", false
+		return false
 	}
 	// The vendor_subscriptions_enabled switch: while it is off a SUBSCRIPTION
 	// account does not serve (api_key accounts are untouched) and falls through
@@ -1220,19 +1244,7 @@ func (r *Resolver) vendorAccountServes(token auth.Token, acc VendorAccount, apiF
 	// applies the same skip (portal ownVendorAccountModels); the two must move
 	// together or served_flavors parity breaks.
 	if acc.AuthType == VendorAuthSubscription && !r.subscriptionsAllowed() {
-		return "", false
-	}
-	// Per-token access (the opt-in): the grant (routableVendorAccounts, in the
-	// caller) decided REACH; a token only USES the accounts its VendorAccess
-	// policy covers, under the token-effective prefix. all:true covers the
-	// principal's OWN accounts only; an account shared with it is used only when
-	// the policy names it (per-account opt-in).
-	// The zero policy denies every account, so a token that was never granted
-	// vendor access resolves nothing here. TokenVendorPrefix is the same helper
-	// the model listing uses, so advertised names equal routable names.
-	prefix, allowed := TokenVendorPrefix(token, acc)
-	if !allowed {
-		return "", false
+		return false
 	}
 	// An OpenAI SUBSCRIPTION account now serves BOTH openai inbound shapes
 	// (Milestone 5c): a fine openai_responses request is forwarded LOSSLESSLY to
@@ -1249,15 +1261,15 @@ func (r *Resolver) vendorAccountServes(token auth.Token, acc VendorAccount, apiF
 	// both dialects and are unaffected: translate, apart from an OpenAI api_key
 	// account's openai_responses passthrough.)
 	if acc.AuthType == VendorAuthSubscription && acc.Vendor == VendorOpenAI && apiFlavor != APIFlavorOpenAI {
-		return "", false
+		return false
 	}
 	// A decision request (ADR-100) is served by an OpenAI api-key account only:
 	// the one vendor backend with an OpenAI /v1/decisions. Checked here, before the
 	// model read, so no other account is even asked for its rows.
 	if decision && !isVendorDecisionAccount(acc) {
-		return "", false
+		return false
 	}
-	return prefix, true
+	return true
 }
 
 // vendorAccountModelMatch returns the dispatch target for the FIRST model row whose

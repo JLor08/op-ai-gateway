@@ -318,6 +318,12 @@ type Request struct {
 	// agent cannot serve a realtime session at all. Internal only: set by the
 	// gateway when it re-selects, never parsed from a client body.
 	ExcludeInstanceKeys []string `json:"-"`
+	// ExcludeVendorAccountIDs are vendor account ids routing must not pick for
+	// this request: members of a vendor account group already tried and answered
+	// with a limit error. A non-empty list also disables the group's
+	// all-blocked fallback. Internal only: set by the gateway when it re-resolves,
+	// never parsed from a client body.
+	ExcludeVendorAccountIDs []string `json:"-"`
 	// AdmissionStart, when set, is when this request's admission began (wall
 	// clock): a bounded admission-queue timeout counts from it instead of from
 	// the resolve's own start, so one client call that resolves more than once
