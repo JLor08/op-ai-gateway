@@ -212,3 +212,46 @@ id>`**:
   dashboard live routes (intended: "like a token", default unchanged).
 - `portal.API` is hand-edited with a regenerated tracing wrapper — keep the
   SPDX header (regression in #431 history).
+
+## 7. Design-review amendments (binding; supersede earlier text where they differ)
+
+1. **Picker label** (§4.3): when `original_model_id` is present and differs
+   from the row `id`, the label is `${id} (${original_model_id})`; value
+   stays `id`. `display_name` is not used there (on alias rows it is the
+   target's label).
+2. **Run-as transport** (§4.2): `GET /api/portal/models` reads the existing,
+   capture-redacted `X-OP-Run-As-Token` header — never a query param, so
+   token ids stay out of access logs.
+3. **Answers** (§4.2): a bearer caller sending the header → 403
+   `portal.token_forbidden`, decided before any lookup (inference endpoints
+   silently ignore the header for bearers; this endpoint refuses
+   deliberately). A foreign, unknown or disabled token → the gate's own 403
+   `portal.token_forbidden`, identical body. `?manage=1` plus the header →
+   400 `portal.models_run_as_conflict`. Loading counts use the run-as
+   principal.
+4. **Chat-settings save** (§4.1): `vendor_access` is accepted only from a
+   session caller; a bearer token sending it → 403 `portal.token_forbidden`,
+   nothing stored. The two booleans keep today's session-or-bearer rule.
+5. **Read-back shape** (§4.1): on the synthetic chat row `vendor_access` is
+   always present when the user lookup succeeded — unset →
+   `{all:true, include_groups:true}`, explicit zero → `{all:false}` with an
+   empty `accounts` list. On a failed lookup the field is omitted, and the
+   chat card then disables the editor and sends only the booleans.
+6. **Admin visibility**: `GET /api/admin/users/{id}/tokens` reuses the same
+   builder and so shows each user's chat policy to admins, as it already
+   shows token policies. `account.UserUpdate.ChatVendorAccess` is
+   pre-validated encoded JSON produced only by the portal encoder; the admin
+   PATCH surface does not expose it.
+7. **Server-override tokens** (§4.3): a run-as token with a
+   `server_override` keeps today's server-locked picker — an accepted
+   exception to R-B, documented.
+8. **Manual aliases** (§4.3): picking an alias that exists in the scoped
+   list skips the client-side override remap; availability and capability
+   gates read the picked row.
+9. **First fetch failure** (§4.3): the picker stays empty with the error
+   surfaced; never the session list.
+10. **Corrections**: the users table exists only on SQLStore (sqlite +
+    postgres, no memory leg); two tests (not four) pin the old
+    `sessionPrincipal` policy; the docs list for the PR grows to ADR-050/060
+    amendments, the vendor doc §1/§6.7/§11.4/§12.3, security §5/§7/§12,
+    risks §11.4, glossary, and three API-surface sentences.
