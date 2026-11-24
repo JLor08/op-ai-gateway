@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
 	"strconv"
 	"strings"
 	"time"
@@ -258,13 +259,14 @@ func attachPrincipalLimitStanding(ctx context.Context, dst http.Header) {
 }
 
 // attachTranslatedUsageLimits is the last header step of a translated /v1/messages
-// success: #407's cached subscription windows, then the principal's limit standing
-// from the request context. It writes nothing for a token without send_usage_limits
-// (#420).
-func (s *Server) attachTranslatedUsageLimits(r *http.Request, token auth.Token, dst http.Header) {
+// success served by target: #407's cached subscription windows (none, and the entry
+// dropped, for a vendor group member: see attachRateLimitWindows), then the
+// principal's limit standing from the request context. It writes nothing for a
+// token without send_usage_limits (#420).
+func (s *Server) attachTranslatedUsageLimits(r *http.Request, token auth.Token, target routing.Target, dst http.Header) {
 	if !token.SendUsageLimits {
 		return
 	}
-	s.attachRateLimitWindows(token, dst)
+	s.attachRateLimitWindows(token, target, dst)
 	attachPrincipalLimitStanding(r.Context(), dst)
 }

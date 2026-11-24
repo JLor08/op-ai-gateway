@@ -293,7 +293,7 @@ func TestObserveCodexRateLimitWindowsGatesOnEntitlement(t *testing.T) {
 	}
 	s.observeCodexRateLimitWindows(owner, target, h)
 	dst := http.Header{}
-	s.attachCodexRateLimitWindows(owner, dst)
+	s.attachCodexRateLimitWindows(owner, target, dst)
 	if dst.Get("x-codex-primary-used-percent") != "42.5" {
 		t.Fatalf("owner windows not attached: %v", dst)
 	}

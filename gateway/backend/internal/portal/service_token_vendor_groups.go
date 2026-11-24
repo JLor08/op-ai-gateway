@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package portal
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
+	"slices"
+	"strings"
+)
+
+// claimVendorAccessGroups is the group half of validateVendorAccess (spec 5.1). Every
+// listed group entry must name a group the principal owns (a foreign, unknown or
+// blank id is the same "invalid", no existence leak), be listed once and carry a valid
+// override prefix; under all + include_groups an entry naming an own group is
+// covered by the switch and, like a covered account entry, ignored.
+//
+// The names are then claimed per opted-in group: the policy is rendered as the token
+// it will become and run through advertisedVendorGroupModels, the listing's own group
+// step, so a group claims exactly prefix + upstream over its usable members' models
+// and the save-time check cannot drift from what is advertised and routed. Every
+// member of an opted-in group is recorded (recordVendorGroupMembers), usable or not,
+// so that a clash between a group and one of its own members is not a conflict (the
+// group shadows it); any other shared name is.
+func (s *Service) claimVendorAccessGroups(ctx context.Context, principal auth.Token, byID map[string]routing.VendorAccount, d *VendorAccessDTO, check *vendorAccessCheck) error {
+	covered := d.All && d.IncludeGroups
+	entries, err := s.vendorAccessGroupEntries(ctx, principal, d.Groups, covered)
+	if err != nil {
+		return err
+	}
+	check.subscriptionsOn = s.VendorSubscriptionsEnabled(ctx)
+	if len(entries) == 0 && !covered {
+		return nil
+	}
+	token := auth.Token{UserID: principal.UserID, VendorAccess: auth.VendorAccess{
+		All: d.All, IncludeGroups: d.IncludeGroups, Groups: entries,
+	}}
+	if err := s.recordVendorGroupMembers(ctx, principal, covered, entries, check); err != nil {
+		return err
+	}
+	claims, loaded := s.advertisedVendorGroupModels(ctx, token, slices.Collect(maps.Values(byID)), check.subscriptionsOn)
+	if !loaded {
+		slog.Warn("portal: token vendor-access group collision check ran on an incomplete group listing; the routing backstop still applies")
+	}
+	return check.claimGroupNames(claims)
+}
+
+// vendorAccessGroupEntries validates the policy's group entries in order and returns
+// them as stored: every entry names a group the principal owns (ownedVendorAccessGroup),
+// and, unless covered (all + include_groups, which ignores the listed entries), is
+// listed once with a valid override prefix. The first failure is the one reported.
+func (s *Service) vendorAccessGroupEntries(ctx context.Context, principal auth.Token, raw []VendorAccessGroupDTO, covered bool) ([]auth.VendorAccessGroupEntry, error) {
+	entries := make([]auth.VendorAccessGroupEntry, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, e := range raw {
+		id := strings.TrimSpace(e.GroupID)
+		if err := s.ownedVendorAccessGroup(ctx, principal, id); err != nil {
+			return nil, err
+		}
+		if covered {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			return nil, fmt.Errorf("%w: group %q listed more than once", ErrTokenVendorAccessInvalid, id)
+		}
+		seen[id] = struct{}{}
+		entry, err := vendorAccessGroupEntry(id, e.PrefixOverride)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// ownedVendorAccessGroup checks that group id is one the principal owns. A foreign,
+// unknown or blank id is the same ErrTokenVendorAccessInvalid (no existence leak);
+// any other store failure is returned raw.
+func (s *Service) ownedVendorAccessGroup(ctx context.Context, principal auth.Token, id string) error {
+	g, err := s.routes.VendorAccountGroupByID(ctx, id)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && (principal.UserID == "" || g.OwnerUserID != principal.UserID)) {
+		return fmt.Errorf("%w: unknown group %q", ErrTokenVendorAccessInvalid, id)
+	}
+	return err
+}
+
+// vendorAccessGroupEntry is the stored entry for group id with the requested prefix
+// override: none unless it is enabled, then the normalized override value.
+func vendorAccessGroupEntry(id string, override *PrefixOverrideDTO) (auth.VendorAccessGroupEntry, error) {
+	entry := auth.VendorAccessGroupEntry{GroupID: id}
+	if override == nil || !override.Enabled {
+		return entry, nil
+	}
+	prefix, err := normalizeVendorAccountModelPrefix(override.Value)
+	if err != nil {
+		return auth.VendorAccessGroupEntry{}, fmt.Errorf("%w: group %q: %w", ErrTokenVendorAccessInvalid, id, err)
+	}
+	entry.OverrideEnabled, entry.OverridePrefix = true, prefix
+	return entry, nil
+}
+
+// claimGroupNames claims every public name of the opted-in groups' listing entries
+// for their group (claim) and records it in groupNames, which
+// checkOwnAccountsAgainstGroups reads.
+func (c *vendorAccessCheck) claimGroupNames(claims []vendorAccountModels) error {
+	for _, am := range claims {
+		for _, m := range am.Models {
+			if err := c.claim(m.GatewayModel, am.GroupID); err != nil {
+				return err
+			}
+			c.groupNames[m.GatewayModel] = am.GroupID
+		}
+	}
+	return nil
+}
+
+// recordVendorGroupMembers records, for every group the policy opts into (every own
+// group under all + include_groups, else the listed entries), ALL of its member
+// accounts, whether they can serve right now or not. A group shadows a member by
+// membership: a listed member that is needs_reconnect, disabled or a subscription
+// while subscriptions are off contributes no name to the group's claim, yet the group
+// still answers that name, so the member's own claim on it is no conflict. A store
+// failure is an infrastructure error and is returned raw, like the group lookup's.
+func (s *Service) recordVendorGroupMembers(ctx context.Context, principal auth.Token, covered bool, entries []auth.VendorAccessGroupEntry, check *vendorAccessCheck) error {
+	ids, err := s.optedInVendorGroupIDs(ctx, principal, covered, entries)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		members, err := s.routes.VendorAccountGroupMembers(ctx, id)
+		if err != nil {
+			return err
+		}
+		set := make(map[string]struct{}, len(members))
+		for _, m := range members {
+			set[m.AccountID] = struct{}{}
+		}
+		check.groupMembers[id] = set
+	}
+	return nil
+}
+
+// optedInVendorGroupIDs is the ids of the groups a policy opts into: every group the
+// principal owns under all + include_groups (covered), else the listed entries'.
+func (s *Service) optedInVendorGroupIDs(ctx context.Context, principal auth.Token, covered bool, entries []auth.VendorAccessGroupEntry) ([]string, error) {
+	ids := make([]string, 0, len(entries))
+	if !covered {
+		for _, e := range entries {
+			ids = append(ids, e.GroupID)
+		}
+		return ids, nil
+	}
+	groups, err := s.routes.VendorAccountGroupsByOwner(ctx, principal.UserID)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		ids = append(ids, g.ID)
+	}
+	return ids, nil
+}
+
+// checkOwnAccountsAgainstGroups is the backstop of `all` with groups (listed or via
+// include_groups): all makes every active own account of the principal an advertised source under its own
+// prefix, next to the groups the switch pulls in, so an own account that is NOT a
+// member of a group yet serves one of the group's names is a conflict (group save
+// already prevents it). Own accounts clashing with each other stay as tolerated under
+// all as ever; only the clash with a group is looked at.
+func (s *Service) checkOwnAccountsAgainstGroups(ctx context.Context, principal auth.Token, check *vendorAccessCheck) error {
+	if len(check.groupNames) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(check.byID))
+	for id, acc := range check.byID {
+		if routing.TokenOwnsVendorAccount(principal, acc) && acc.Status == routing.VendorAccountStatusActive &&
+			(acc.AuthType != routing.VendorAuthSubscription || check.subscriptionsOn) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	for _, id := range ids {
+		acc := check.byID[id]
+		models, err := s.routes.VendorAccountModels(ctx, id)
+		if err != nil {
+			slog.Warn("portal: token vendor-access collision check skipped for an account whose models could not be read; the routing backstop still applies",
+				"account_id", id, "error", err)
+			continue
+		}
+		for _, m := range models {
+			name := acc.ModelPrefix + m.UpstreamModel
+			if gid, hit := check.groupNames[name]; hit && !check.shadows(gid, id) {
+				return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, gid, id)
+			}
+		}
+	}
+	return nil
+}

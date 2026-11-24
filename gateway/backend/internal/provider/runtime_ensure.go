@@ -196,11 +196,12 @@ const routerErrorBodyLimit = 4 << 10
 // the caller has not read. An agent router's refusal keeps its code: at most
 // routerErrorBodyLimit of the body is read for RouterStatusError, so the gateway
 // can tell an instance that is gone from any other failure. Every other
-// upstream's answer maps through unavailableStatus alone, its body unread, as it
-// always has.
+// upstream's answer maps through vendorStatusError alone, its body unread: a
+// 429/402 is a *LimitError (still ErrUnavailable), every other status
+// unavailableStatus's error, as it always was.
 func chatStatusError(target routing.Target, resp *http.Response) error {
 	if target.Provider != routing.ProviderServerAgent {
-		return unavailableStatus(resp.StatusCode)
+		return vendorStatusError(resp)
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, routerErrorBodyLimit))
 	return RouterStatusError(resp.StatusCode, body)

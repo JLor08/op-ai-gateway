@@ -149,11 +149,10 @@ func TestRefreshVendorAccountUsageRefusesWhileTheMasterFlagIsOff(t *testing.T) {
 	fake.requireNoUsageCalls(t, "while the module is off")
 }
 
-// Only an OpenAI SUBSCRIPTION (and an OpenRouter/Kilo api key, below) has an active
-// usage pull. The native api keys of either vendor and an Anthropic subscription
-// answer "unsupported": no token is opened or renewed (a sealed credential that
-// cannot be read is no error here), no fetcher runs, and the stored snapshot, if any,
-// is still answered.
+// Only a subscription (OpenAI or Anthropic) and an OpenRouter/Kilo api key have an
+// active usage pull. The native api keys of either vendor answer "unsupported": no
+// token is opened or renewed (a sealed credential that cannot be read is no error
+// here), no fetcher runs, and the stored snapshot, if any, is still answered.
 func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -164,21 +163,6 @@ func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testi
 		}},
 		{"anthropic api key", func(t *testing.T, svc *Service, _ *routing.MemoryStore) VendorAccountDTO {
 			return apiKeyAccount(t, svc, routing.VendorAnthropic, "")
-		}},
-		{"anthropic subscription, token expired", func(t *testing.T, svc *Service, routeStore *routing.MemoryStore) VendorAccountDTO {
-			return expiredSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
-		}},
-		{"anthropic subscription, credential unreadable", func(t *testing.T, svc *Service, routeStore *routing.MemoryStore) VendorAccountDTO {
-			acc := createSubscriptionAccount(t, svc, ownerToken(), routing.VendorAnthropic, "Broken")
-			row, err := routeStore.VendorAccountByID(context.Background(), acc.ID)
-			if err != nil {
-				t.Fatalf("VendorAccountByID: %v", err)
-			}
-			row.OAuthTokens = "garbage-without-a-prefix"
-			if err := routeStore.UpdateVendorAccount(context.Background(), row); err != nil {
-				t.Fatalf("UpdateVendorAccount: %v", err)
-			}
-			return acc
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -211,7 +195,7 @@ func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testi
 
 	t.Run("a snapshot the passive scrape stored is still answered", func(t *testing.T) {
 		svc, routeStore, fake := newDiscoveryTestService(t)
-		acc := connectedSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
+		acc := apiKeyAccount(t, svc, routing.VendorAnthropic, "")
 		before := passiveUsage(acc.ID)
 		seedUsage(t, routeStore, before)
 
@@ -222,7 +206,7 @@ func TestRefreshVendorAccountUsageIsUnsupportedForEveryOtherAccountKind(t *testi
 		if usage == nil || usage.FiveHourPct != before.FiveHourPct || usage.WeeklyPct != before.WeeklyPct {
 			t.Fatalf("usage = %+v, want the stored snapshot %+v", usage, before)
 		}
-		fake.requireNoUsageCalls(t, "for an Anthropic subscription")
+		fake.requireNoUsageCalls(t, "for an Anthropic api key")
 	})
 }
 
@@ -421,7 +405,8 @@ func TestRefreshVendorAccountUsageStoreFailures(t *testing.T) {
 
 // fetchVendorUsage is the extracted pull: its status is "ok" only when a snapshot
 // was stored, "unverifiable" for a fetch that is not OK or a store read/write
-// failure, "unsupported" for anything but an OpenAI subscription with an access token.
+// failure, "unsupported" for anything but an OpenAI or Anthropic subscription with an
+// access token.
 func TestFetchVendorUsageStatus(t *testing.T) {
 	ctx := context.Background()
 	tokens := vendorauth.TokenSet{AccessToken: discoveryTestAccess, AccountID: discoveryTestAccount}
@@ -457,7 +442,9 @@ func TestFetchVendorUsageStatus(t *testing.T) {
 		},
 		{name: "openai without an access token", acc: openAI, usageOK: true, want: VendorUsageRefreshUnsupported},
 		{name: "openai api key", acc: openAIAPIKey, usageOK: true, ts: tokens, want: VendorUsageRefreshUnsupported},
-		{name: "anthropic subscription", acc: anthropicSubscription, usageOK: true, ts: tokens, want: VendorUsageRefreshUnsupported},
+		// The Anthropic subscription has its own fetcher; the fake's default answer is
+		// a failure, so it is asked (and answers unverifiable), never the OpenAI one.
+		{name: "anthropic subscription", acc: anthropicSubscription, usageOK: true, ts: tokens, want: VendorUsageRefreshUnverifiable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, routeStore, fake := newDiscoveryTestService(t)
@@ -701,6 +688,82 @@ func TestRefreshVendorAccountUsageUnreadableCredentialIsAnError(t *testing.T) {
 	fake.requireNoUsageCalls(t, "for an unreadable credential")
 }
 
+// An Anthropic subscription has an active pull (the Claude OAuth usage endpoint), so
+// its credential is opened on the refresh path exactly like an OpenAI one's: an
+// expired token with no refresher wired is the fail-soft unverifiable answer (no
+// fetcher asked, the stored snapshot answered), an expired token with a refresher is
+// renewed once and the Anthropic fetcher gets the fresh one, and a stored credential
+// that cannot be opened is ErrVendorAccountCredentialUnreadable with no fetch.
+func TestRefreshVendorAccountUsageAnthropicSubscriptionCredential(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("expired token, no refresher wired", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okAnthropicUsage(usagePulled())
+		acc := expiredSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
+		before := passiveUsage(acc.ID)
+		seedUsage(t, routeStore, before)
+
+		usage, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0)
+		if err != nil || res.Status != VendorUsageRefreshUnverifiable || !strings.Contains(res.Detail, noVendorTokenRefresherNote) {
+			t.Fatalf("result = %+v, err = %v, want unverifiable carrying %q", res, err, noVendorTokenRefresherNote)
+		}
+		if usage == nil || usage.FiveHourPct != before.FiveHourPct {
+			t.Fatalf("usage = %+v, want the stored snapshot %+v", usage, before)
+		}
+		if got := fake.anthropicUsageRecorded(); len(got) != 0 {
+			t.Fatalf("anthropic usage calls = %+v, want none without a usable access token", got)
+		}
+		fake.requireNoUsageCalls(t, "for an Anthropic subscription")
+		for _, secret := range []string{refreshTestOldAccess, refreshTestRefresh} {
+			requireNoSubstring(t, res, secret)
+		}
+	})
+	t.Run("expired token, renewed once", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okAnthropicUsage(usagePulled())
+		refresher := installTokenRefresher(t, svc, routeStore)
+		acc := expiredSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
+
+		usage, res, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0)
+		if err != nil || res.Status != VendorUsageRefreshOK {
+			t.Fatalf("result = %+v, err = %v, want ok", res, err)
+		}
+		if got := refresher.recorded(); !reflect.DeepEqual(got, []string{acc.ID}) {
+			t.Fatalf("refresher calls = %v, want exactly one", got)
+		}
+		calls := fake.anthropicUsageRecorded()
+		if len(calls) != 1 || calls[0].accessToken != refreshTestFreshAccess {
+			t.Fatalf("anthropic usage calls = %+v, want one with the refreshed access token", calls)
+		}
+		fake.requireNoUsageCalls(t, "for an Anthropic subscription (never the OpenAI fetcher)")
+		if usage == nil || usage.FiveHourPct != 23 || usage.WeeklyPct != 61 {
+			t.Fatalf("usage = %+v, want the pulled windows", usage)
+		}
+	})
+	t.Run("credential unreadable", func(t *testing.T) {
+		svc, routeStore, fake := newDiscoveryTestService(t)
+		fake.okAnthropicUsage(usagePulled())
+		acc := connectedSubscription(t, svc, routeStore, routing.VendorAnthropic, "")
+		row := accountRow(t, svc, acc)
+		row.OAuthTokens = "garbage-without-a-prefix"
+		if err := routeStore.UpdateVendorAccount(ctx, row); err != nil {
+			t.Fatalf("UpdateVendorAccount: %v", err)
+		}
+
+		usage, _, err := svc.RefreshVendorAccountUsage(ctx, ownerToken(), acc.ID, 0)
+		if !errors.Is(err, ErrVendorAccountCredentialUnreadable) {
+			t.Fatalf("err = %v, want ErrVendorAccountCredentialUnreadable", err)
+		}
+		if usage != nil {
+			t.Fatalf("usage = %+v, want none on an error", usage)
+		}
+		if got := fake.anthropicUsageRecorded(); len(got) != 0 {
+			t.Fatalf("anthropic usage calls = %+v, want none for an unreadable credential", got)
+		}
+	})
+}
+
 // The tracker survives concurrent refreshes (run under -race): the pulls of many
 // goroutines for several accounts neither race nor lose the TTL.
 func TestRefreshVendorAccountUsageIsSafeUnderConcurrency(t *testing.T) {
@@ -857,7 +920,7 @@ func TestHasActiveVendorUsagePull(t *testing.T) {
 		{"openai subscription", routing.VendorOpenAI, routing.VendorAuthSubscription, true},
 		{"openai api key", routing.VendorOpenAI, routing.VendorAuthAPIKey, false},
 		{"anthropic api key", routing.VendorAnthropic, routing.VendorAuthAPIKey, false},
-		{"anthropic subscription", routing.VendorAnthropic, routing.VendorAuthSubscription, false},
+		{"anthropic subscription", routing.VendorAnthropic, routing.VendorAuthSubscription, true},
 		{"xai api key", routing.VendorXAI, routing.VendorAuthAPIKey, false},
 		{"google api key", routing.VendorGoogle, routing.VendorAuthAPIKey, false},
 		{"custom openai-compatible api key", routing.VendorOpenAICompatible, routing.VendorAuthAPIKey, false},

@@ -4251,6 +4251,145 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-account-groups:
+    description: >
+      Vendor account groups: a user's personal, ordered set of accounts of one
+      vendor (their own and ones shared with them), routed across as one logical
+      account. Session scope gateway:use, CSRF on writes. Every operation 409s
+      with vendor_accounts.module_disabled while the vendor_accounts_enabled
+      master flag is off (there is no separate flag). Groups are personal: only
+      the caller's own groups are visible. See api-surface.md for the DTO and
+      the stable vendor_account_group.* error codes.
+    get:
+      tags: [portal]
+      summary: List the caller's own vendor account groups with their member states
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The caller's groups in id order (never null), each with its computed member states.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+    post:
+      tags: [portal]
+      summary: Create a vendor account group
+      description: >
+        Missing thresholds default to 99, a blank status to active; the vendor is
+        fixed at create. account_ids is the member list in priority order. A
+        refused create leaves no group behind. 403 vendor_account_group.forbidden
+        for a principal that is not a user; 400 for name_required, vendor_invalid,
+        model_prefix_invalid, status_invalid, threshold_invalid,
+        member_vendor_mismatch, member_unreachable, member_duplicate or
+        prefix_conflict (all vendor_account_group.*).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountGroupCreateRequest' }
+      responses:
+        '201':
+          description: The group with its member states
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-account-groups/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Read one vendor account group with its member states
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The group
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+    patch:
+      tags: [portal]
+      summary: Partially update a vendor account group
+      description: >
+        An absent field keeps the stored value. The vendor and the members are
+        not editable here (members: PUT .../members). 404
+        vendor_account_group.not_found for an unknown or foreign group; 400
+        vendor_account_group.* for an invalid field or a prefix_conflict.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountGroupUpdateRequest' }
+      responses:
+        '200':
+          description: The updated group
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+    delete:
+      tags: [portal]
+      summary: Delete a vendor account group
+      description: A token policy that still names the group matches nothing afterwards.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-account-groups/{id}/members:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Replace a vendor account group's member set and order
+      description: >
+        account_ids in priority order (positions 1..n). Atomic: a rejected set
+        leaves the previous one untouched. 400 member_vendor_mismatch,
+        member_unreachable, member_duplicate or prefix_conflict
+        (vendor_account_group.*).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_ids]
+              properties:
+                account_ids:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: The group with its member states
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-account-admin-group-candidates:
     get:
       tags: [portal]
@@ -5931,9 +6070,39 @@ components:
         in both the model listing and routing.
       properties:
         all: { type: boolean }
+        include_groups:
+          type: boolean
+          description: >
+            Only meaningful with all=true (ignored without it): the token also
+            uses every active vendor account group its principal owns, groups
+            created later included, each under its own model_prefix. Omitted
+            when false.
         accounts:
           type: array
           items: { $ref: '#/components/schemas/TokenVendorAccessEntry' }
+        groups:
+          type: array
+          description: >
+            Individual vendor account groups (vag_...) the token uses, each under
+            the group's model_prefix or its prefix_override. A group the
+            principal does not own, an unknown or blank id, a repeated id or a
+            malformed enabled override is 400
+            portal.token_vendor_access_invalid; a group deleted later matches
+            nothing. Opting in to a group lets the token use its members through
+            the group even when a shared member is not named under accounts.
+            Omitted when empty.
+          items: { $ref: '#/components/schemas/TokenVendorAccessGroupEntry' }
+    TokenVendorAccessGroupEntry:
+      type: object
+      required: [group_id]
+      properties:
+        group_id: { type: string, description: 'Id of a vendor account group (vag_...) the token''s principal owns.' }
+        prefix_override:
+          type: object
+          description: Same shape and rules as TokenVendorAccessEntry.prefix_override, replacing the group's model_prefix for this token.
+          properties:
+            enabled: { type: boolean }
+            value: { type: string }
     TokenVendorAccessEntry:
       type: object
       required: [account_id]
@@ -6355,6 +6524,97 @@ components:
         detail:
           type: string
           description: Short English phrase (what happened, or why nothing was pulled). Never a credential or vendor text; key off status, not this.
+    VendorAccountGroupCreateRequest:
+      type: object
+      description: portal.CreateVendorAccountGroupRequest.
+      required: [name, vendor]
+      properties:
+        name: { type: string }
+        vendor: { type: string, description: 'The vendor id every member shares; fixed at create.' }
+        model_prefix: { type: string, maxLength: 64, pattern: '^[A-Za-z0-9._~:/@+-]*$' }
+        status: { type: string, enum: [active, disabled], description: Defaults to active. }
+        threshold_five_hour_pct: { type: integer, minimum: 1, maximum: 100, description: Defaults to 99. }
+        threshold_weekly_pct: { type: integer, minimum: 1, maximum: 100, description: Defaults to 99. }
+        threshold_credits_pct: { type: integer, minimum: 1, maximum: 100, description: Defaults to 99. }
+        account_ids:
+          type: array
+          description: Members in priority order.
+          items: { type: string }
+    VendorAccountGroupUpdateRequest:
+      type: object
+      description: portal.UpdateVendorAccountGroupRequest; an absent field keeps the stored value.
+      properties:
+        name: { type: string }
+        model_prefix: { type: string, maxLength: 64, pattern: '^[A-Za-z0-9._~:/@+-]*$' }
+        status: { type: string, enum: [active, disabled] }
+        threshold_five_hour_pct: { type: integer, minimum: 1, maximum: 100 }
+        threshold_weekly_pct: { type: integer, minimum: 1, maximum: 100 }
+        threshold_credits_pct: { type: integer, minimum: 1, maximum: 100 }
+    VendorAccountGroup:
+      type: object
+      description: portal.VendorAccountGroupDTO.
+      required: [id, vendor, name, model_prefix, status, thresholds, active_member_id, members, created_at, updated_at]
+      properties:
+        id: { type: string, description: 'vag_ plus 32 hex characters.' }
+        vendor: { type: string }
+        name: { type: string }
+        model_prefix: { type: string }
+        status: { type: string, enum: [active, disabled] }
+        thresholds:
+          type: object
+          required: [five_hour_pct, weekly_pct, credits_pct]
+          description: Percent used (1..100) at which routing moves on to the next member, per limit category.
+          properties:
+            five_hour_pct: { type: integer }
+            weekly_pct: { type: integer }
+            credits_pct: { type: integer }
+        active_member_id:
+          type: string
+          description: The member routing would pick ignoring the requested model; empty when no member is usable.
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/VendorAccountGroupMember' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    VendorAccountGroupMember:
+      type: object
+      description: portal.VendorAccountGroupMemberDTO, in priority order.
+      required: [account_id, account_name, auth_type, owner_name, position, state, reason, cooldowns]
+      properties:
+        account_id: { type: string }
+        account_name: { type: string }
+        auth_type: { type: string }
+        owner_name: { type: string, description: Set only for a member somebody else owns. }
+        position: { type: integer, description: The 1-based index in the returned order. }
+        state:
+          type: string
+          enum: [active, available, over_threshold, cooldown, not_usable]
+        reason:
+          type: string
+          description: >
+            For over_threshold the first blocking category (five_hour, weekly or
+            credits); for not_usable one of disabled, needs_reconnect,
+            subscriptions_disabled, not_reachable; empty otherwise.
+        pct:
+          type: number
+          description: The blocking category's percent used. Never set for a shared member whose owner did not switch on share_usage_with_members.
+        free_at:
+          type: string
+          format: date-time
+          description: When every block lifts, when known. For a member without the owner's usage opt-in it comes from the cooldown alone.
+        cooldowns:
+          type: array
+          description: Active limit cooldowns per upstream model.
+          items:
+            type: object
+            required: [model, until]
+            properties:
+              model: { type: string }
+              until: { type: string, format: date-time }
+        usage:
+          description: The member's usage snapshot; omitted without the owner's usage opt-in.
+          allOf:
+            - { $ref: '#/components/schemas/VendorAccountUsage' }
     VendorAccountCreateRequest:
       type: object
       description: portal.CreateVendorAccountRequest.
@@ -6377,6 +6637,11 @@ components:
           description: >
             Optional namespace for the account's model ids (trimmed; no "..").
             An invalid value is a 400 vendor_account.model_prefix_invalid.
+        share_usage_with_members:
+          type: boolean
+          description: >
+            The owner's initial usage opt-in. A missing value means true for a
+            new account (accounts created earlier keep their stored value).
         base_url:
           type: string
           description: >

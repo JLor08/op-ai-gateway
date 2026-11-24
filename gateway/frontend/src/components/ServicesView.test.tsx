@@ -1400,6 +1400,18 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ).not.toBeInTheDocument();
     });
 
+    it('offers no vendor groups: a service token may not carry any', async () => {
+      const { createDialog } = await openCreateDialog({ vendorAccounts: [memberAccount] });
+
+      await createDialog.findByRole('checkbox', { name: memberLabel });
+      expect(
+        createDialog.queryByRole('group', { name: t.tokenVendorAccessGroupsLabel }),
+      ).not.toBeInTheDocument();
+      expect(
+        createDialog.queryByRole('checkbox', { name: t.tokenVendorAccessIncludeGroups }),
+      ).not.toBeInTheDocument();
+    });
+
     it('states that the opt-in is set at create only and what a rotation does with it', async () => {
       const { createDialog } = await openCreateDialog({ vendorAccounts: [memberAccount] });
 

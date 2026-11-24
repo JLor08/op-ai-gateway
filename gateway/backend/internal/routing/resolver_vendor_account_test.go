@@ -490,6 +490,7 @@ func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T)
 // cannot be silently forgotten here. It describes the openai_responses
 // (passthrough) shape, so ResponsesMode is deliberately absent.
 var vendorTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
@@ -518,6 +519,7 @@ var vendorTargetMayBeZero = map[string]bool{
 // is zero-OK (an Anthropic upstream has no Responses surface). ExtraHeaders stays
 // zero-OK: AnthropicClient.ProxyNative guarantees anthropic-version itself.
 var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
@@ -544,6 +546,7 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 // endpoint modes are zero by design: the compat vendors are translate-only and never
 // enter the OpenAI-Responses / Anthropic-Messages passthrough branches.
 var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
@@ -569,6 +572,7 @@ var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
 // model mark are non-zero (the whole point), so they are NOT listed;
 // ResponsesMode is zero-OK (a decision request is no Responses request).
 var vendorDecisionTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; a decision request is no Responses request
 	"MessagesMode":                true, // zero == translate (the OpenAI shape has no messages passthrough)

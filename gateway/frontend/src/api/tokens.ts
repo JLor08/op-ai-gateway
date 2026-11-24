@@ -19,6 +19,11 @@ export type ModelOverrideEntry = {
 // (the account's models are offered under their bare original names), ON with a
 // value replaces the account's own model_prefix for this token. On write, OMIT
 // `prefix_override` entirely when the override is off (never send enabled:false).
+export type VendorAccessGroupDTO = {
+  group_id: string;
+  prefix_override?: { enabled: boolean; value: string };
+};
+
 export type VendorAccessAccountDTO = {
   account_id: string;
   prefix_override?: { enabled: boolean; value: string };
@@ -39,6 +44,11 @@ export type VendorAccessAccountDTO = {
 export type VendorAccessDTO = {
   all: boolean;
   accounts?: VendorAccessAccountDTO[];
+  // Vendor account groups: `include_groups` covers every group the token's own
+  // user owns (also future ones); `groups` names explicit groups with an optional
+  // per-group prefix override. A deleted group named here matches nothing.
+  include_groups?: boolean;
+  groups?: VendorAccessGroupDTO[];
 };
 
 export type PortalToken = {

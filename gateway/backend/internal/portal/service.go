@@ -44,6 +44,8 @@ const (
 	// exported so internal/gateway/portal_vendor_account_endpoints.go shares the
 	// exact value instead of re-hardcoding it.
 	CodeVendorAccountNotFound = "vendor_account.not_found"
+	// CodeVendorGroupNotFound is ErrVendorGroupNotFound's API error code.
+	CodeVendorGroupNotFound = "vendor_account_group.not_found"
 )
 
 var (
@@ -68,6 +70,21 @@ var (
 	// changes only through rotation (a PATCH with the stored value is a no-op).
 	ErrTokenClaudeCodeUsageDisplayRequiresRotation = errors.New("portal.token_claude_code_usage_display_requires_rotation")
 	ErrTokenNotDeletable                           = errors.New("token.not_deletable")
+
+	// Vendor account groups (spec 2026-11-24). The not-found answer is the same for a
+	// stranger's group and an unknown id. The member, prefix and threshold failures
+	// are all validation errors (400).
+	ErrVendorGroupNotFound             = errors.New(CodeVendorGroupNotFound)
+	ErrVendorGroupForbidden            = errors.New("vendor_account_group.forbidden")
+	ErrVendorGroupNameRequired         = errors.New("vendor_account_group.name_required")
+	ErrVendorGroupVendorInvalid        = errors.New("vendor_account_group.vendor_invalid")
+	ErrVendorGroupModelPrefixInvalid   = errors.New("vendor_account_group.model_prefix_invalid")
+	ErrVendorGroupStatusInvalid        = errors.New("vendor_account_group.status_invalid")
+	ErrVendorGroupThresholdInvalid     = errors.New("vendor_account_group.threshold_invalid")
+	ErrVendorGroupMemberVendorMismatch = errors.New("vendor_account_group.member_vendor_mismatch")
+	ErrVendorGroupMemberUnreachable    = errors.New("vendor_account_group.member_unreachable")
+	ErrVendorGroupMemberDuplicate      = errors.New("vendor_account_group.member_duplicate")
+	ErrVendorGroupPrefixConflict       = errors.New("vendor_account_group.prefix_conflict")
 
 	ErrServerNotFound       = errors.New(CodeServerNotFound)
 	ErrServerForbidden      = errors.New("server.forbidden")
@@ -859,6 +876,8 @@ type netbirdState struct {
 }
 
 type Service struct {
+	// vendorCooldowns is the routing limit-cooldown registry (nil: none shown).
+	vendorCooldowns   *routing.VendorLimitCooldowns
 	users             UserReader
 	tokens            TokenRepository
 	usage             usage.Store
@@ -955,6 +974,9 @@ type Service struct {
 	// vendor (in memory, zero value ready), so the on-view lazy usage refresh can
 	// skip a pull that is still fresh (see vendorUsagePullTracker).
 	vendorUsagePulls vendorUsagePullTracker
+	// vendorGroupPulls is the in-memory throttle of the group-triggered usage pull
+	// (RequestVendorUsagePull; zero value ready).
+	vendorGroupPulls vendorGroupPullState
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.
@@ -1141,6 +1163,15 @@ func (s *Service) SetVendorTokenRefresher(fn VendorTokenRefresher) {
 	s.vendorDiscovery.tokenRefresher = fn
 }
 
+// SetVendorLimitCooldowns hands the service the gateway's process-local registry of
+// vendor limit cooldowns, so a group's member status shows the cooldowns routing
+// applies. A setter for the same reason as SetVendorTokenRefresher: the registry
+// belongs to the gateway Server, built after the Service. nil (the default) shows no
+// cooldowns. Call it once at startup; it is not synchronised.
+func (s *Service) SetVendorLimitCooldowns(c *routing.VendorLimitCooldowns) {
+	s.vendorCooldowns = c
+}
+
 type CurrentUser struct {
 	ID                             string `json:"id"`
 	Email                          string `json:"email"`
@@ -1286,9 +1317,23 @@ type TokenDTO struct {
 // covered by All: it is used only when Accounts names it, with an optional prefix
 // override (the per-account opt-in, ADR-050). Mirrors the stored
 // vendor_provider_access shape (see store.DecodeVendorAccess).
+//
+// IncludeGroups (honored only together with All) additionally covers every active
+// vendor account group the principal owns, under the group's own prefix; Groups opts
+// individual own groups in, with the same optional prefix override as an account
+// entry. A service owns no group, so a service token carrying either is invalid.
 type VendorAccessDTO struct {
-	All      bool                   `json:"all"`
-	Accounts []VendorAccessEntryDTO `json:"accounts"`
+	All           bool                   `json:"all"`
+	IncludeGroups bool                   `json:"include_groups,omitempty"`
+	Accounts      []VendorAccessEntryDTO `json:"accounts"`
+	Groups        []VendorAccessGroupDTO `json:"groups,omitempty"`
+}
+
+// VendorAccessGroupDTO opts one vendor account group in, by its id: one the
+// principal owns. PrefixOverride is the one the account entries use.
+type VendorAccessGroupDTO struct {
+	GroupID        string             `json:"group_id"`
+	PrefixOverride *PrefixOverrideDTO `json:"prefix_override,omitempty"`
 }
 
 // VendorAccessEntryDTO opts one vendor account in, by its stable account id: one
@@ -6023,7 +6068,17 @@ func encodeVendorAccessDTO(d *VendorAccessDTO) string {
 	if d == nil {
 		return ""
 	}
-	v := auth.VendorAccess{All: d.All}
+	// include_groups only means something next to all (spec 5.1); anything else is
+	// dropped rather than stored as a flag that does nothing.
+	v := auth.VendorAccess{All: d.All, IncludeGroups: d.All && d.IncludeGroups}
+	for _, e := range d.Groups {
+		entry := auth.VendorAccessGroupEntry{GroupID: strings.TrimSpace(e.GroupID)}
+		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
+			entry.OverrideEnabled = true
+			entry.OverridePrefix = strings.TrimSpace(e.PrefixOverride.Value)
+		}
+		v.Groups = append(v.Groups, entry)
+	}
 	for _, e := range d.Accounts {
 		entry := auth.VendorAccessEntry{AccountID: strings.TrimSpace(e.AccountID)}
 		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
@@ -6040,11 +6095,18 @@ func encodeVendorAccessDTO(d *VendorAccessDTO) string {
 // strict default (blank, malformed, or empty) so the field is omitted.
 func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 	v := store.DecodeVendorAccess(s)
-	if !v.All && len(v.Accounts) == 0 {
+	if !v.All && len(v.Accounts) == 0 && len(v.Groups) == 0 {
 		return nil
 	}
 	// Accounts is always an array on the wire (never null), even for all=true.
-	d := &VendorAccessDTO{All: v.All, Accounts: []VendorAccessEntryDTO{}}
+	d := &VendorAccessDTO{All: v.All, IncludeGroups: v.All && v.IncludeGroups, Accounts: []VendorAccessEntryDTO{}}
+	for _, e := range v.Groups {
+		entry := VendorAccessGroupDTO{GroupID: e.GroupID}
+		if e.OverrideEnabled {
+			entry.PrefixOverride = &PrefixOverrideDTO{Enabled: true, Value: e.OverridePrefix}
+		}
+		d.Groups = append(d.Groups, entry)
+	}
 	for _, e := range v.Accounts {
 		entry := VendorAccessEntryDTO{AccountID: e.AccountID}
 		if e.OverrideEnabled {
@@ -6098,11 +6160,15 @@ func serviceTokenPrincipal(serviceID string) auth.Token {
 // the grant fails CLOSED (VendorAccountsForRouting), so a store error there reads as
 // "not reachable" -- the same answer routing gives in that window.
 func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token, d *VendorAccessDTO) error {
-	if d == nil || len(d.Accounts) == 0 {
+	includesGroups := d != nil && (len(d.Groups) > 0 || d.IncludeGroups)
+	if includesGroups && principal.IsService() {
+		return fmt.Errorf("%w: a service owns no vendor account group", ErrTokenVendorAccessInvalid)
+	}
+	if d == nil || (len(d.Accounts) == 0 && len(d.Groups) == 0 && !(d.All && d.IncludeGroups)) {
 		return nil
 	}
 	if s.routes == nil {
-		if d.All {
+		if d.All && len(d.Groups) == 0 {
 			return nil
 		}
 		return fmt.Errorf("%w: vendor accounts unavailable", ErrTokenVendorAccessInvalid)
@@ -6112,9 +6178,16 @@ func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token
 		return err
 	}
 	check := vendorAccessCheck{
-		byID:  byID,
-		seen:  make(map[string]struct{}, len(d.Accounts)),
-		names: make(map[string]string),
+		byID:         byID,
+		seen:         make(map[string]struct{}, len(d.Accounts)),
+		names:        make(map[string]string),
+		groupMembers: make(map[string]map[string]struct{}),
+		groupNames:   make(map[string]string),
+	}
+	// Groups first: an account entry that names one of a group's members must know
+	// the group's members to tell "shadowed by the group" from a real clash.
+	if err := s.claimVendorAccessGroups(ctx, principal, byID, d, &check); err != nil {
+		return err
 	}
 	for _, e := range d.Accounts {
 		if d.All && coveredByAll(principal, byID, e) {
@@ -6123,6 +6196,9 @@ func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token
 		if err := s.checkVendorAccessEntry(ctx, &check, e); err != nil {
 			return err
 		}
+	}
+	if d.All {
+		return s.checkOwnAccountsAgainstGroups(ctx, principal, &check)
 	}
 	return nil
 }
@@ -6138,7 +6214,40 @@ func coveredByAll(principal auth.Token, byID map[string]routing.VendorAccount, e
 type vendorAccessCheck struct {
 	byID  map[string]routing.VendorAccount // the accounts the principal can reach, by id
 	seen  map[string]struct{}              // account ids already listed in the policy
-	names map[string]string                // effective public name -> id of the account that first produced it
+	names map[string]string                // effective public name -> id of the account or group that first produced it
+	// groupMembers lists, per opted-in group id, every member account of the group
+	// (usable or not): a clash between a group and one of these is the group
+	// shadowing its member, not a conflict (spec 5.1).
+	groupMembers map[string]map[string]struct{}
+	// groupNames is the public name -> group id of every name an opted-in group
+	// claims, and subscriptionsOn the vendor_subscriptions_enabled switch the group
+	// claims were computed under (checkOwnAccountsAgainstGroups reuses it).
+	groupNames      map[string]string
+	subscriptionsOn bool
+}
+
+// shadows reports whether group id groupID has accountID as a member.
+func (c *vendorAccessCheck) shadows(groupID, accountID string) bool {
+	_, ok := c.groupMembers[groupID][accountID]
+	return ok
+}
+
+// claim records source (an account id, or a group id) as the producer of the public
+// name and reports ErrTokenVendorAccessConflict when another source already produced
+// it, except for a group and one of its own members (the group wins the name).
+func (c *vendorAccessCheck) claim(name, source string) error {
+	prior, clash := c.names[name]
+	switch {
+	case !clash || prior == source:
+		c.names[name] = source
+	case c.shadows(prior, source):
+		// the earlier group shadows this member; the name stays the group's
+	case c.shadows(source, prior):
+		c.names[name] = source
+	default:
+		return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, prior, source)
+	}
+	return nil
 }
 
 // reachableVendorAccountsByID loads the accounts principal can reach keyed by id:
@@ -6185,7 +6294,7 @@ func (s *Service) checkVendorAccessEntry(ctx context.Context, check *vendorAcces
 			"account_id", acc.ID, "error", err)
 		return nil
 	}
-	return claimVendorAccessNames(check.names, id, prefix, models)
+	return check.claimNames(id, prefix, models)
 }
 
 // tokenVendorEntryPrefix resolves the prefix an entry serves its account's models
@@ -6202,16 +6311,14 @@ func tokenVendorEntryPrefix(acc routing.VendorAccount, e VendorAccessEntryDTO) (
 	return norm, nil
 }
 
-// claimVendorAccessNames records the effective public name (prefix + upstream
-// model id) of each of accountID's models in names, and reports
-// ErrTokenVendorAccessConflict when another account already produced one of them.
-func claimVendorAccessNames(names map[string]string, accountID, prefix string, models []routing.VendorAccountModel) error {
+// claimNames records the effective public name (prefix + upstream model id) of each
+// of sourceID's models, and reports ErrTokenVendorAccessConflict when another source
+// already produced one of them (see claim).
+func (c *vendorAccessCheck) claimNames(sourceID, prefix string, models []routing.VendorAccountModel) error {
 	for _, m := range models {
-		name := prefix + m.UpstreamModel
-		if prior, clash := names[name]; clash && prior != accountID {
-			return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, prior, accountID)
+		if err := c.claim(prefix+m.UpstreamModel, sourceID); err != nil {
+			return err
 		}
-		names[name] = accountID
 	}
 	return nil
 }

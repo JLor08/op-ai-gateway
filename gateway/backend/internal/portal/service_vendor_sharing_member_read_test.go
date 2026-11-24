@@ -269,6 +269,10 @@ func TestVendorAccountMemberReadOfAFullyPopulatedAccount(t *testing.T) {
 	acc := e.newAccountOf(routing.VendorShareLevelFull, CreateVendorAccountRequest{
 		Vendor: routing.VendorXAI, AuthType: routing.VendorAuthAPIKey, Name: "Everything", APIKey: hygieneAPIKey, ModelPrefix: "team/",
 	})
+	// New accounts share usage by default; this test pins the member-safe (off) state.
+	if err := e.routes.UpdateVendorAccountShareUsage(e.ctx, acc.ID, false); err != nil {
+		t.Fatalf("UpdateVendorAccountShareUsage: %v", err)
+	}
 	if len(e.snapshot(acc.ID).Models) == 0 {
 		if err := e.routes.SetVendorAccountModels(e.ctx, acc.ID, []routing.VendorAccountModel{
 			{AccountID: acc.ID, GatewayModel: "team/grok-x", UpstreamModel: "grok-x", APIFlavor: routing.APIFlavorOpenAI, DisplayName: "Grok X"},

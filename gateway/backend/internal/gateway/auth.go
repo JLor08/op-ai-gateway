@@ -326,7 +326,8 @@ func sessionPrincipal(user store.User, elevated bool) auth.Token {
 	// native prefixes -- the chat picker and dashboard depend on it. All covers
 	// the user's OWN accounts only: an account shared with the user is used only
 	// through an explicit per-account entry on a token, which a session never has
-	// (routing.TokenVendorPrefix, spec 2026-10-15 section 8).
+	// (routing.TokenVendorPrefix, spec 2026-10-15 section 8). IncludeGroups
+	// likewise covers the user's own vendor account groups.
 	return auth.Token{
 		UserID:           user.ID,
 		Name:             user.DisplayName,
@@ -334,7 +335,7 @@ func sessionPrincipal(user store.User, elevated bool) auth.Token {
 		Scopes:           scopes,
 		LogCommunication: user.ChatLogCommunication,
 		Secret:           user.ChatSecret,
-		VendorAccess:     auth.VendorAccess{All: true},
+		VendorAccess:     auth.VendorAccess{All: true, IncludeGroups: true},
 	}
 }
 

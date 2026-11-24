@@ -160,6 +160,22 @@ const (
 	//
 	// REVERSE-ENGINEERED / VERIFY LIVE.
 	AnthropicOAuthProfileURL = "https://api.anthropic.com/api/oauth/profile"
+	// AnthropicOAuthUsageURL is the Claude subscription usage endpoint the Claude
+	// Code CLI's /usage reads: GET with the subscription's OAuth bearer and the
+	// anthropic-beta OAuth opt-in (AnthropicBeta). It answers the plan's rate-limit
+	// windows as {five_hour, seven_day: {utilization (0..100), resets_at (RFC
+	// 3339)}}; five_hour is null for a weekly-only plan. It is undocumented and
+	// rate-limits aggressively (a 429 is common), so callers throttle. See
+	// anthropic_usage.go for the parser.
+	//
+	// VERIFY-LIVE: community-documented only, never confirmed against a real
+	// account by this project.
+	AnthropicOAuthUsageURL = "https://api.anthropic.com/api/oauth/usage"
+	// AnthropicUsageUserAgent is the User-Agent sent on the usage request, the
+	// shape of the Claude Code CLI's own (the endpoint is meant for that client).
+	//
+	// VERIFY-LIVE.
+	AnthropicUsageUserAgent = "claude-cli/2.1.0 (external, cli)"
 
 	// OpenAIModelsURL and AnthropicModelsURL are the documented public model
 	// listings, used to probe an API key (not an OAuth token).

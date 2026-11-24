@@ -647,7 +647,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -703,7 +703,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -872,7 +872,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1083,7 +1083,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1298,7 +1298,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-113-migrations),
+[§4](reference/data-model.md#4-migration-history-114-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1524,7 +1524,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-113-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-114-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1671,7 +1671,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-113-migrations),
+[§4](reference/data-model.md#4-migration-history-114-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3642,7 +3642,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-113-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-114-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3866,7 +3866,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-113-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-114-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4898,7 +4898,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5024,7 +5024,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-113-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5167,7 +5167,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-113-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-114-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7681,7 +7681,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-113-migrations),
+[Data Model](reference/data-model.md#4-migration-history-114-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7904,7 +7904,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-113-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-114-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8045,7 +8045,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-113-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-114-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8309,7 +8309,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-113-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-114-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -12165,7 +12165,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-113-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-114-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -12992,7 +12992,8 @@ relayed none of these headers, issued only opaque tokens, and withholds a shared
   nothing; the third segment carries the entropy, so `alg: none` is harmless. The setting changes only through rotation, because the
   shape of a secret cannot change in place; PATCH refuses a different value.
 - **Entitlement follows the portal's management view.** The unified figures of a vendor account reach the owner, a community manager of a
-  `shared`/`full` account, and, when the owner opted in with `share_usage_with_members`, every principal that may use the account. An
+  `shared`/`full` account, and, when the owner has `share_usage_with_members` on (the default for accounts created since ADR-112; an
+  account created earlier keeps its stored value), every principal that may use the account. An
   inference token never carries system scope. The opt-in also puts `usage` into the portal member view and the dashboard, so one setting
   has one meaning. The check is cached per principal and account and fails closed. A non-entitled principal still gets `retry-after`
   and `x-should-retry`, so Claude Code waits correctly on a 429.
@@ -13095,7 +13096,7 @@ HTTP, not WebSocket. Each response's snapshot replaces the windows, so a respons
   `x-codex-credits-balance`, `x-codex-active-limit`, `x-codex-rate-limit-reached-type` or `x-codex-promo-message`. One predicate
   drives the relay, the entitlement trigger and the capture redaction.
 - **Same entitlement as ADR-106.** The family reaches only a caller for whom `rateLimitFiguresEntitled` holds (self-hosted target; the
-  owner; a community manager of a `shared`/`full` account; anyone when the owner opted in with `share_usage_with_members`). The lookup runs
+  owner; a community manager of a `shared`/`full` account; anyone when the owner has `share_usage_with_members` on, the default for new accounts since ADR-112). The lookup runs
   only when the upstream sent a family header, is cached per principal and account, and fails closed. `retry-after` and `x-should-retry`
   still reach a non-entitled caller.
 - **A per-principal window cache for Codex.** The gateway remembers the principal's last observed family windows in memory (a second
@@ -13490,3 +13491,89 @@ facts were measured against a running desktop app.
   [§3.9](cross-cutting/agent-runtime-manager.md#39-the-windows-process-tree-process_tree),
   [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
   [Compatibility & Inference §3.1](cross-cutting/compatibility-and-inference.md#31-openai-chat-completions).
+
+## ADR-112 — Vendor account groups are personal, ordered same-vendor sets that shadow their members, fail over per account and model on status-only limit errors and skip thresholds for members whose usage is not shared
+
+**Context.** A token reached a vendor model through exactly one vendor account, so when that account's subscription window was used up,
+Claude Code or Codex stopped until the window reset. The user wants to keep working: a typical set is "my Claude subscription first, a
+subscription shared with me second, a paid API key as the reserve". The design had to avoid widening reach, switching mid-stream,
+inventing usage figures and hammering a vendor's rate-limited usage endpoint, and it touched the entitlement of ADR-106.
+
+**Decision.**
+
+- **A group is a personal, ordered set of accounts of one vendor.** Table `vendor_account_groups` (owner, vendor fixed at create, name,
+  `model_prefix`, `active`/`disabled`, three thresholds, default 99) plus the member link table; positions are a strict priority, not a load
+  balance. Members mix auth types and mix the owner's own accounts with accounts shared with the owner. Groups are not shareable, and a
+  service owns none. Cross-vendor groups are out of scope because model ids differ across vendors, so no failover by model name could work.
+- **A group never widens reach.** The member must be reachable by the owner at save time, and routing re-reads the grant on every request,
+  so a revoked share drops the member silently. A group whose every member is unreachable resolves as "not served by this group" and falls
+  through to the accounts and the standard path, never as an error. A token opted into a group uses its members through the group even when a
+  shared member is not named under `accounts`: putting the account into the group is itself the user's named choice.
+- **A group shadows its own members.** When a token uses a group and one of its members under the same effective name (own subscription with
+  an empty prefix, a group with an empty prefix starting with it, a token with "all + incl. groups"), the group answers. Safe because the
+  group serves that member first anyway; it is what makes plain names like `claude-opus-4-5` fail over without extra setup. Every other
+  collision is a save-time `400` (group claim versus another group or an account outside the group); the routing backstop is own groups
+  (id order), then own accounts, then shared accounts.
+- **Selection** per request, by position: reachable now, active (and subscriptions switched on), serves `(model, dialect)`, not over a threshold,
+  not in cooldown. A category is over only when the percent is known and at or above the threshold and its reset time is unknown or in the future;
+  a snapshot past its own reset counts as renewed. When all usable members are blocked, the one that frees up soonest (the latest reset among its
+  blocks; unknown sorts last) serves, so the vendor's own answer reaches the client under the existing header rules. A failover pass
+  (`ExcludeVendorAccountIDs` non-empty) never falls back to a blocked member.
+- **Thresholds are skipped for a shared member whose owner has not switched on `share_usage_with_members`.** The borrower is not entitled to those
+  figures, and skipping at 99 % would reveal them. Such a member is used until the vendor answers a limit, and failover then moves on. The
+  group status view applies the same rule: such a member shows only active, cooldown (its end from `Retry-After` or the default, never a scraped
+  reset) or not usable.
+- **`share_usage_with_members` defaults to on for accounts created from now on** (the create path decides; the column default stays 0), so
+  shared members normally take part in thresholds. Existing accounts keep their stored value because a stored off cannot be told from a
+  deliberate choice. This amends the ADR-106 and ADR-108 entitlement wording from "opted in" to "has it on".
+- **Failover on vendor limit errors, decided by status only.** HTTP 429 and 402 are limit errors (OpenAI `insufficient_quota` and Codex
+  `usage_limit_reached` arrive as 429, so no body parsing); 5xx and 529 are not. On a limit the gateway scrapes the response headers into the
+  member's snapshot, cools the member down, re-resolves with it excluded and retries on the next member; each member is tried at most once per
+  request, and with none left the client gets the last vendor answer (verbatim on passthrough, the translate path's `502 provider.unavailable`
+  unchanged). Only a target that came from a group fails over, and only when the re-resolve returns a different member of the **same group**: the
+  own-account step ignores exclusions, so a re-resolve that lands outside the group ends the failover and the original answer is relayed.
+- **The cooldown is per `(account, upstream model)`, in memory.** The end is the earliest of `Retry-After`, the scraped Anthropic reset and the reset
+  of a Codex window at 100 %, each only when in the future (a reset already past would create a zero-length cooldown and is ignored); with none
+  known it is 60 s. A per-model weekly window can be days away, and an account-wide block would push other models to the paid reserve while the
+  subscription still has room; account-wide exhaustion is what the thresholds cover. A restart forgets it, which at worst costs one rejected attempt.
+  Each entry keeps a second, public end from `Retry-After` or the 60 s default alone; routing honours the precise end, and the group status view
+  shows the public one for a member whose usage the viewer is not entitled to, so the process-wide entry cannot leak a scraped reset to a borrower.
+- **No mid-stream switch.** Failover happens before the first upstream byte. On the translate stream the gateway's own opening frames
+  (`response.created`, `message_start`) do not count: they are member-independent, so the request may still move on after them; the first
+  upstream event ends the window. Passthrough peeks the status before writing anything. Once a byte of the member's response reached the client,
+  the client keeps the stream it has.
+- **A usage pull for Anthropic subscriptions and a throttled group pull.** `GET api/oauth/usage` (VERIFY-LIVE, undocumented, ToS-restricted
+  like the whole subscription path) fills the five-hour and weekly windows with their reset times. For a group member skipped by a threshold
+  whose reset is unknown, the resolver asks for a pull; it is asynchronous (never on the request path), at most once per 15 minutes per account,
+  with exponential backoff after a 429 from the endpoint, capped at 4 hours.
+- **The client-facing window cache drops, it does not mix.** A response served by a group member that reports no windows (an API-key reserve) attaches
+  nothing and drops the principal's cached entry, so the client never shows or blocks itself on the windows of a member the group skipped. There is no
+  aggregation across members.
+- **Attribution.** A usage event keeps `account_id` as the member that served and gains `vendor_group_id` (empty outside a group; migration 114).
+- **No new flag.** Everything sits behind `vendor_accounts_enabled`; token policy and ServerAgent are unchanged apart from the policy's `groups` and
+  `include_groups` fields (stored in the existing JSON column; old rows read as no groups).
+
+**Rejected:**
+
+- **Shareable groups.** A shared group would need its own authorization story; the first need is the owner's own continuity.
+- **An account-wide cooldown.** It would cost the user the models that still have room.
+- **Body-based limit detection.** The status already separates the cases that matter, and bodies differ per vendor and change.
+- **Thresholds for every shared member regardless of the owner's opt-in.** A skip at the threshold would leak the figure the entitlement withholds.
+- **Flipping `share_usage_with_members` for existing accounts.** An old off may be deliberate.
+- **Failing over to 5xx or `overloaded`.** Those are not exhausted quotas, and moving to a paid reserve for a vendor outage is a cost decision the user
+  did not make.
+- **Mid-stream failover.** It would corrupt the client's stream.
+
+**Consequences and limits.**
+
+- A translate stream that fails over after the gateway's opening frames can show one stream whose content came from the second member; a client
+  that keys on frame ids sees no corruption, only one id sequence.
+- The cooldown and the pull throttle are per process; a cluster of gateways learns from its own traffic.
+- The Anthropic usage endpoint is unverified against a real account and rate-limits hard; a wrong shape or a persistent 429 leaves only the
+  header scrape and the limit-error failover, which still keep the group working.
+- A per-model window (Anthropic Opus or Sonnet weekly) is not a threshold; the member is skipped through its limit error and cooldown.
+- A skipped member's cached window entry is dropped only on the attach path, so a Codex takeover or the `send_usage_limits` gate can leave it until the
+  next observation.
+- → [External Vendor Accounts §12](cross-cutting/external-vendor-accounts.md#12-vendor-account-groups),
+  [HTTP API surface](reference/api-surface.md#vendor-account-groups),
+  [Data model](reference/data-model.md#external-vendor-accounts-anbieter).

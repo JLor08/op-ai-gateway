@@ -7,7 +7,9 @@ import (
 	"context"
 	"net/http"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"testing"
+	"time"
 )
 
 // PUT /api/portal/vendor-accounts/{id}/share-usage (#407): the owner's opt-in to show
@@ -85,5 +87,53 @@ func TestVendorAccountShareUsageOverHTTP(t *testing.T) {
 	rec = vaDo(t, f.srv, http.MethodPut, path, vaSystemSecret, `{"enabled":false}`)
 	if rec.Code != http.StatusOK || vaDecode(t, rec).ShareUsageWithMembers || stored() {
 		t.Errorf("owner PUT off = %d %s, stored %v", rec.Code, rec.Body.String(), stored())
+	}
+}
+
+// A new account shares its usage with members unless the creator opts out; an
+// account stored earlier with the opt-in off keeps it across a read and an edit
+// (spec 10.1: no data migration).
+func TestCreateVendorAccountSharesUsageByDefault(t *testing.T) {
+	srv, routes := newVendorAccountTestServer(t, true)
+	const path = "/api/portal/vendor-accounts"
+
+	dto := vaCreate(t, srv, vaOwnerSecret, "default")
+	if !dto.ShareUsageWithMembers {
+		t.Errorf("create without the field: share_usage_with_members = false, want true")
+	}
+
+	body := strings.Replace(vaCreateBody("opt out"), `"name"`, `"share_usage_with_members":false,"name"`, 1)
+	rec := vaDo(t, srv, http.MethodPost, path, vaOwnerSecret, body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create opt-out = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if vaDecode(t, rec).ShareUsageWithMembers {
+		t.Error("create with false: share_usage_with_members = true, want false")
+	}
+
+	body = strings.Replace(vaCreateBody("opt in"), `"name"`, `"share_usage_with_members":true,"name"`, 1)
+	rec = vaDo(t, srv, http.MethodPost, path, vaOwnerSecret, body)
+	if rec.Code != http.StatusCreated || !vaDecode(t, rec).ShareUsageWithMembers {
+		t.Errorf("create with true = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	// An account that predates the default (stored with the opt-in off) stays off.
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	if err := routes.CreateVendorAccount(context.Background(), routing.VendorAccount{
+		ID: "va_legacy", OwnerUserID: "usr_va_a", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthAPIKey,
+		Name: "legacy", Status: routing.VendorAccountStatusActive, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed legacy account: %v", err)
+	}
+	rec = vaDo(t, srv, http.MethodGet, path+"/va_legacy", vaOwnerSecret, "")
+	if rec.Code != http.StatusOK || vaDecode(t, rec).ShareUsageWithMembers {
+		t.Errorf("GET legacy = %d, body = %s, want share_usage_with_members false", rec.Code, rec.Body.String())
+	}
+	rec = vaDo(t, srv, http.MethodPatch, path+"/va_legacy", vaOwnerSecret, `{"name":"legacy renamed"}`)
+	if rec.Code != http.StatusOK || vaDecode(t, rec).ShareUsageWithMembers {
+		t.Errorf("PATCH legacy = %d, body = %s, want share_usage_with_members false", rec.Code, rec.Body.String())
+	}
+	if acc, err := routes.VendorAccountByID(context.Background(), "va_legacy"); err != nil || acc.ShareUsageWithMembers {
+		t.Errorf("stored legacy opt-in = %v (err %v), want false", acc.ShareUsageWithMembers, err)
 	}
 }

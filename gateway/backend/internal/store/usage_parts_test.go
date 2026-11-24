@@ -13,8 +13,14 @@ import (
 
 func seedUsageEventForParts(t *testing.T, s *SQLStore, id, host string, latencyMS int64, at time.Time) {
 	t.Helper()
-	s.Record(usage.Event{ID: id, UserID: "u1", Host: host, LatencyMS: latencyMS, CreatedAt: at})
-	if err := s.LastUsageError(); err != nil {
+	// A raw insert of the long-standing columns only, not Record: this helper also
+	// seeds databases migrated to an old version, which lack every later usage_events
+	// column that Record's INSERT names.
+	if _, err := s.exec(context.Background(), `insert into usage_events
+		(id, request_id, user_id, token_id, session_id, api_flavor, model, provider, host, status, error_code, http_status,
+		 input_tokens, output_tokens, total_tokens, latency_ms, created_at)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, id, "u1", "", "", "", "", "", host, "", "", 0, 0, 0, 0, latencyMS, at); err != nil {
 		t.Fatalf("record usage %s: %v", id, err)
 	}
 }

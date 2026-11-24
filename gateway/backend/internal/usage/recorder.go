@@ -39,10 +39,14 @@ type Event struct {
 	// account, api-key or subscription alike. "" for the ordinary self-hosted
 	// AI-server path (the overwhelming default; existing rows read back "" via the
 	// usage_events.account_id column default).
-	AccountID    string `json:"account_id,omitempty"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
-	TotalTokens  int    `json:"total_tokens"`
+	AccountID string `json:"account_id,omitempty"`
+	// VendorGroupID attributes the request to the vendor account GROUP that routed
+	// it to AccountID (routing.Target.VendorGroupID). "" when no group was involved
+	// and on rows recorded before migration 114.
+	VendorGroupID string `json:"vendor_group_id,omitempty"`
+	InputTokens   int    `json:"input_tokens"`
+	OutputTokens  int    `json:"output_tokens"`
+	TotalTokens   int    `json:"total_tokens"`
 	// CachedTokens = prompt cache READ tokens; CacheWriteTokens = prompt cache WRITE
 	// (Anthropic cache_creation, OpenAI Decisions cache_write_tokens, 0 for other
 	// OpenAI/Responses traffic). Disjoint from InputTokens

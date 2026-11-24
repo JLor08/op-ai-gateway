@@ -28,6 +28,7 @@ var targetFromMayLeaveZero = map[string]bool{
 	"ExtraHeaders":                true, // static upstream headers only a vendor subscription target carries
 	"Masquerade":                  true, // "" (no disguise) for every self-hosted target
 	"VendorAccountID":             true, // non-empty only for a vendor target (usage attribution); a self-hosted target carries none
+	"VendorGroupID":               true, // non-empty only when a vendor account group routed a vendor target (usage attribution)
 	"VendorAccountOwnerUserID":    true, // vendor-target only (usage-limit gate); a self-hosted target carries none
 	"VendorShareUsageWithMembers": true, // vendor-target only (the owner opt-in); a self-hosted target carries none
 	"Subscription":                true, // false for every self-hosted target (OAuth-bearer trigger, subscription-only)

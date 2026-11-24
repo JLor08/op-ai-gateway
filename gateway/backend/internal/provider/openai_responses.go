@@ -203,12 +203,12 @@ func (c *OpenAIResponsesClient) scanStream(ctx context.Context, r io.Reader, st 
 // post sends the rendered body to {endpoint}/responses and returns the 2xx
 // response (the caller owns closing its Body). Every failure is already mapped to
 // a provider error: ErrTimeout when ctx's deadline elapsed, ErrUnavailable for a
-// transport error, and unavailableStatus for a non-2xx status (401/403 ->
-// ErrAuthRejected, 503 -> ErrUpstreamStarting). A non-2xx status keeps that
-// sentinel and appends a bounded, single-line snippet of the vendor's error body to
-// the message: the ChatGPT backend states WHY it refused a request (an unsupported
-// or missing parameter) only there, and without it the log reads just "upstream
-// status 400". The snippet is the vendor's response, never the request, so it
+// transport error, and vendorStatusError for a non-2xx status (429/402 ->
+// *LimitError, 401/403 -> ErrAuthRejected, 503 -> ErrUpstreamStarting). A non-2xx
+// status keeps that error and appends a bounded, single-line snippet of the
+// vendor's error body to the message: the ChatGPT backend states WHY it refused a
+// request (an unsupported or missing parameter) only there, and without it the log
+// reads just "upstream status 400". The snippet is the vendor's response, never the request, so it
 // carries no credential. It records the outbound request and the response headers
 // (and, for a non-2xx status, the same bounded body snippet) with the context's
 // capture sink. The credential + the static Codex headers ride on ctx
@@ -235,16 +235,17 @@ func (c *OpenAIResponsesClient) post(ctx context.Context, target routing.Target,
 		snippet := readUpstreamErrorSnippet(httpResp.Body, openaiResponsesErrorBodyLimit)
 		httpResp.Body.Close()
 		sink.WriteResponse([]byte(snippet))
-		return nil, upstreamStatusError(httpResp.StatusCode, snippet)
+		return nil, upstreamStatusError(httpResp, snippet)
 	}
 	return httpResp, nil
 }
 
-// upstreamStatusError is unavailableStatus plus the upstream's own explanation: it
-// keeps the status -> sentinel mapping (errors.Is still matches ErrAuthRejected /
-// ErrUpstreamStarting / ErrUnavailable) and appends snippet when there is one.
-func upstreamStatusError(status int, snippet string) error {
-	base := unavailableStatus(status)
+// upstreamStatusError is vendorStatusError plus the upstream's own explanation: it
+// keeps the status -> error mapping (errors.As still finds a *LimitError for
+// 429/402, errors.Is still matches ErrAuthRejected / ErrUpstreamStarting /
+// ErrUnavailable) and appends snippet when there is one.
+func upstreamStatusError(resp *http.Response, snippet string) error {
+	base := vendorStatusError(resp)
 	if snippet == "" {
 		return base
 	}
