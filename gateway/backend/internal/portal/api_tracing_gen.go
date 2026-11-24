@@ -979,6 +979,18 @@ func (_d *APIWithTracing) EdgeProxyConfig(ctx context.Context) (s1 string, err e
 	return _d.API.EdgeProxyConfig(ctx)
 }
 
+func (_d *APIWithTracing) EncodeChatSessionVendorAccess(ctx context.Context, s1 string, vp1 *VendorAccessDTO) (s2 string, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.EncodeChatSessionVendorAccess")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.EncodeChatSessionVendorAccess(ctx, s1, vp1)
+}
+
 func (_d *APIWithTracing) EnrollGatewaySidecar(ctx context.Context, t1 auth.Token) (s1 string, s2 string, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.EnrollGatewaySidecar")
 	defer span.End()

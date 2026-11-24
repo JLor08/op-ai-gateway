@@ -111,6 +111,7 @@ type API interface {
 	EdgeCertificateKeyPEM(context.Context) (string, error)
 	EdgeCertificateView(context.Context) (EdgeCertificateDTO, error)
 	EdgeProxyConfig(context.Context) (string, error)
+	EncodeChatSessionVendorAccess(context.Context, string, *VendorAccessDTO) (string, error)
 	EnrollGatewaySidecar(context.Context, auth.Token) (string, string, error)
 	ExternalThemeAsset(string, string) (string, bool)
 	GenerateAgentToken(context.Context, auth.Token, string) (GenerateAgentTokenResponse, error)

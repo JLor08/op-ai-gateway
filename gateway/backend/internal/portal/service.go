@@ -1990,10 +1990,12 @@ func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListRe
 		return TokenListResponse{}, err
 	}
 	var chatLog, chatSecret bool
+	var chatVendorAccess *VendorAccessDTO
 	if s.users != nil {
 		if user, err := s.users.UserByID(ctx, userID); err == nil {
 			chatLog = user.ChatLogCommunication
 			chatSecret = user.ChatSecret
+			chatVendorAccess = chatSessionVendorAccessDTO(user.ChatVendorAccess)
 		}
 	}
 	chat := TokenDTO{
@@ -2003,6 +2005,7 @@ func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListRe
 		Scopes:           []string{},
 		LogCommunication: chatLog,
 		Secret:           chatSecret,
+		VendorAccess:     chatVendorAccess,
 		IsChatSession:    true,
 		Deletable:        false,
 	}
@@ -6098,7 +6101,12 @@ func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 	if !v.All && len(v.Accounts) == 0 && len(v.Groups) == 0 {
 		return nil
 	}
-	// Accounts is always an array on the wire (never null), even for all=true.
+	return vendorAccessToDTO(v)
+}
+
+// vendorAccessToDTO renders a policy as the wire shape; Accounts is always an
+// array on the wire (never null), even for all=true or an empty policy.
+func vendorAccessToDTO(v auth.VendorAccess) *VendorAccessDTO {
 	d := &VendorAccessDTO{All: v.All, IncludeGroups: v.All && v.IncludeGroups, Accounts: []VendorAccessEntryDTO{}}
 	for _, e := range v.Groups {
 		entry := VendorAccessGroupDTO{GroupID: e.GroupID}
@@ -6115,6 +6123,15 @@ func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 		d.Accounts = append(d.Accounts, entry)
 	}
 	return d
+}
+
+// chatSessionVendorAccessDTO renders users.chat_vendor_provider_access for the
+// synthetic chat-session row. Unlike decodeVendorAccessDTO it is never nil: the
+// zero policy is an explicit "no providers" choice there and must stay distinct
+// from the unset default (all accounts and groups), which store.ChatSessionVendorAccess
+// owns.
+func chatSessionVendorAccessDTO(encoded string) *VendorAccessDTO {
+	return vendorAccessToDTO(store.ChatSessionVendorAccess(encoded))
 }
 
 // userTokenPrincipal is the principal a USER token acts as: the owning user, and

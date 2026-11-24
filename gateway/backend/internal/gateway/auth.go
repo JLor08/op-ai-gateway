@@ -671,16 +671,38 @@ func (s *Server) handlePortalChatSettings(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req struct {
-		LogCommunication bool `json:"log_communication"`
-		Secret           bool `json:"secret"`
+		LogCommunication bool                    `json:"log_communication"`
+		Secret           bool                    `json:"secret"`
+		VendorAccess     *portal.VendorAccessDTO `json:"vendor_access"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
 		return
 	}
+	update := account.UserUpdate{ChatLogCommunication: &req.LogCommunication, ChatSecret: &req.Secret}
+	// vendor_access is absent => untouched (an old client sending only the two
+	// booleans must not clear the policy). Setting it is a session-only
+	// management action: a bearer token (token.ID != "") is refused before
+	// anything is validated or stored.
+	if req.VendorAccess != nil {
+		if token.ID != "" {
+			writePortalTokenError(w, portal.ErrTokenForbidden)
+			return
+		}
+		encoded, err := s.Portal.EncodeChatSessionVendorAccess(r.Context(), token.UserID, req.VendorAccess)
+		if err != nil {
+			if errors.Is(err, portal.ErrTokenVendorAccessInvalid) || errors.Is(err, portal.ErrTokenVendorAccessConflict) {
+				writePortalTokenError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, apierror.Response("portal.chat_settings_update_failed", "chat settings update failed", ""))
+			return
+		}
+		update.ChatVendorAccess = &encoded
+	}
 	// Self-service edit of the caller's OWN chat capture flags: UpdateOwnProfile
 	// (see handlePortalLanguage's comment on why this is not UpdateUser).
-	user, err := s.Account.UpdateOwnProfile(r.Context(), token.UserID, account.UserUpdate{ChatLogCommunication: &req.LogCommunication, ChatSecret: &req.Secret})
+	user, err := s.Account.UpdateOwnProfile(r.Context(), token.UserID, update)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apierror.Response("portal.chat_settings_update_failed", "chat settings update failed", ""))
 		return
