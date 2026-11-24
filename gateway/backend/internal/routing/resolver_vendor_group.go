@@ -48,12 +48,13 @@ func (r *Resolver) resolveVendorGroup(ctx context.Context, token auth.Token, req
 	if len(groups) == 0 {
 		return Target{}, false, nil
 	}
-	byID := make(map[string]VendorAccount, len(reachable))
-	for _, acc := range reachable {
-		byID[acc.ID] = acc
+	vr := vendorGroupRequest{
+		req: req, apiFlavor: apiFlavor, decision: isVendorDecisionRequest(req, apiFlavor),
+		reachable: make(map[string]VendorAccount, len(reachable)), now: r.clock(),
 	}
-	decision := isVendorDecisionRequest(req, apiFlavor)
-	now := r.clock()
+	for _, acc := range reachable {
+		vr.reachable[acc.ID] = acc
+	}
 	for _, g := range groups {
 		if g.Status != VendorAccountGroupStatusActive {
 			continue
@@ -62,8 +63,7 @@ func (r *Resolver) resolveVendorGroup(ctx context.Context, token auth.Token, req
 		if !allowed || !strings.HasPrefix(req.Model, prefix) {
 			continue
 		}
-		upstream := strings.TrimPrefix(req.Model, prefix)
-		t, ok, err := r.resolveVendorGroupMember(ctx, g, upstream, req, apiFlavor, decision, byID, now)
+		t, ok, err := r.resolveVendorGroupMember(ctx, g, strings.TrimPrefix(req.Model, prefix), vr)
 		if err != nil || ok {
 			return t, ok, err
 		}
@@ -71,7 +71,23 @@ func (r *Resolver) resolveVendorGroup(ctx context.Context, token auth.Token, req
 	return Target{}, false, nil
 }
 
-func (r *Resolver) resolveVendorGroupMember(ctx context.Context, g VendorAccountGroup, upstream string, req inference.Request, apiFlavor string, decision bool, reachable map[string]VendorAccount, now time.Time) (Target, bool, error) {
+// vendorGroupRequest is what the group step resolves one request against: the
+// request, its coarse flavor and whether it is a decision request
+// (isVendorDecisionRequest), the grant's reachable accounts by id, and the resolve's
+// clock reading.
+type vendorGroupRequest struct {
+	req       inference.Request
+	apiFlavor string
+	decision  bool
+	reachable map[string]VendorAccount
+	now       time.Time
+}
+
+// resolveVendorGroupMember builds one candidate per member of g, in member order,
+// for the request's upstream model and lets SelectVendorGroupMember pick; the
+// all-blocked fallback is off on a failover pass (a non-empty exclusion list). No
+// pick is (Target{}, false, nil): the group does not serve the request.
+func (r *Resolver) resolveVendorGroupMember(ctx context.Context, g VendorAccountGroup, upstream string, vr vendorGroupRequest) (Target, bool, error) {
 	members, err := r.store.VendorAccountGroupMembers(ctx, g.ID)
 	if err != nil {
 		return Target{}, false, fmt.Errorf("resolve vendor group members: %w", err)
@@ -79,48 +95,65 @@ func (r *Resolver) resolveVendorGroupMember(ctx context.Context, g VendorAccount
 	cands := make([]VendorGroupCandidate, len(members))
 	targets := make([]Target, len(members))
 	for i, m := range members {
-		cands[i].AccountID = m.AccountID
-		acc, ok := reachable[m.AccountID]
-		if !ok || acc.Vendor != g.Vendor || !r.vendorAccountUsable(acc, apiFlavor, decision) ||
-			slices.Contains(req.ExcludeVendorAccountIDs, acc.ID) {
-			continue
-		}
-		models, err := r.store.VendorAccountModels(ctx, acc.ID)
-		if err != nil {
-			return Target{}, false, fmt.Errorf("resolve vendor group member models: %w", err)
-		}
-		for _, row := range models {
-			if row.UpstreamModel != upstream {
-				continue
-			}
-			if t, ok := vendorAccountModelTarget(acc, row, req, apiFlavor); ok {
-				targets[i] = t
-				cands[i].Usable = true
-			}
-			break
-		}
-		if !cands[i].Usable {
-			continue
-		}
-		cands[i].ThresholdsApply = acc.OwnerUserID == g.OwnerUserID || acc.ShareUsageWithMembers
-		if u, ok, err := r.store.VendorAccountUsageByID(ctx, acc.ID); err != nil {
-			return Target{}, false, fmt.Errorf("resolve vendor group member usage: %w", err)
-		} else if ok {
-			cands[i].Usage, cands[i].HasUsage = u, true
-		}
-		if until, ok := r.vendorCooldowns.Until(acc.ID, upstream, now); ok {
-			cands[i].CooldownUntil = until
+		if cands[i], targets[i], err = r.vendorGroupCandidate(ctx, g, m.AccountID, upstream, vr); err != nil {
+			return Target{}, false, err
 		}
 	}
 	th := g.Thresholds()
-	r.requestVendorUsagePulls(cands, th, now)
-	idx, ok := SelectVendorGroupMember(cands, th, now, len(req.ExcludeVendorAccountIDs) == 0)
+	r.requestVendorUsagePulls(cands, th, vr.now)
+	idx, ok := SelectVendorGroupMember(cands, th, vr.now, len(vr.req.ExcludeVendorAccountIDs) == 0)
 	if !ok {
 		return Target{}, false, nil
 	}
 	t := targets[idx]
 	t.VendorGroupID = g.ID
 	return t, true, nil
+}
+
+// vendorGroupCandidate is member accountID of g as the selector sees it, with the
+// target it would serve the request on. The member is Usable only when it passes
+// spec 5.3 rules 1 to 3 -- reachable, of the group's vendor, usable for the request
+// (vendorAccountUsable), not excluded, and serving (upstream, dialect); a usable
+// member then carries its usage snapshot and its cooldown for upstream.
+func (r *Resolver) vendorGroupCandidate(ctx context.Context, g VendorAccountGroup, accountID, upstream string, vr vendorGroupRequest) (VendorGroupCandidate, Target, error) {
+	cand := VendorGroupCandidate{AccountID: accountID}
+	acc, ok := vr.reachable[accountID]
+	if !ok || acc.Vendor != g.Vendor || !r.vendorAccountUsable(acc, vr.apiFlavor, vr.decision) ||
+		slices.Contains(vr.req.ExcludeVendorAccountIDs, acc.ID) {
+		return cand, Target{}, nil
+	}
+	t, serves, err := r.vendorGroupMemberTarget(ctx, acc, upstream, vr)
+	if err != nil || !serves {
+		return cand, Target{}, err
+	}
+	cand.Usable = true
+	cand.ThresholdsApply = acc.OwnerUserID == g.OwnerUserID || acc.ShareUsageWithMembers
+	if u, found, err := r.store.VendorAccountUsageByID(ctx, acc.ID); err != nil {
+		return cand, Target{}, fmt.Errorf("resolve vendor group member usage: %w", err)
+	} else if found {
+		cand.Usage, cand.HasUsage = u, true
+	}
+	if until, cooling := r.vendorCooldowns.Until(acc.ID, upstream, vr.now); cooling {
+		cand.CooldownUntil = until
+	}
+	return cand, t, nil
+}
+
+// vendorGroupMemberTarget is the target member acc serves the request's upstream
+// model on, from its model rows (the account path's target builder); false when it
+// does not serve that model on the request's dialect.
+func (r *Resolver) vendorGroupMemberTarget(ctx context.Context, acc VendorAccount, upstream string, vr vendorGroupRequest) (Target, bool, error) {
+	models, err := r.store.VendorAccountModels(ctx, acc.ID)
+	if err != nil {
+		return Target{}, false, fmt.Errorf("resolve vendor group member models: %w", err)
+	}
+	for _, row := range models {
+		if row.UpstreamModel == upstream {
+			t, ok := vendorAccountModelTarget(acc, row, vr.req, vr.apiFlavor)
+			return t, ok, nil
+		}
+	}
+	return Target{}, false, nil
 }
 
 // requestVendorUsagePulls asks the puller for a fresh snapshot of every usable
