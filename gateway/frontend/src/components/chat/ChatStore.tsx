@@ -934,16 +934,27 @@ export function ChatStoreProvider({
   // none. Mirrors the backend's resolveModelOverride so the effective model shown
   // matches what the server will route (the server does the actual remap via the
   // run-as token; the chat sends the raw picked model, see currentSettings).
-  // Not for an OFFERED alias (a map entry with offer:true) that the token's own scoped listing
-  // carries: that name is the one the token is called by, and the server remaps it exactly once.
+  // Two skips, both for a name the token's own scoped listing carries and the server
+  // remaps exactly once (backend order: map entry -> generated Claude alias -> catch-all):
+  //  - an OFFERED alias (a map entry with offer:true): the name the token is called by;
+  //  - a GENERATED Claude alias (claude_model_aliases on, scoped row with
+  //    original_model_id) with no map entry for that id: the server routes it to
+  //    original_model_id, so the catch-all must not be shown or gated on.
   // Every other listed model keeps its remap (the catch-all and offer:false entries still route
   // elsewhere), so the effective model and its gates match what the server will route.
+  const pickedScopedRow =
+    scopedRows !== null && model !== ''
+      ? scopedRows.find((option) => option.id === model)
+      : undefined;
   const pickedOfferedAlias =
-    scopedRows !== null &&
-    model !== '' &&
-    selectedToken?.model_override_map?.[model]?.offer === true &&
-    scopedRows.some((option) => option.id === model);
-  const overrideModel = pickedOfferedAlias ? '' : resolveTokenOverride(selectedToken, model);
+    pickedScopedRow !== undefined && selectedToken?.model_override_map?.[model]?.offer === true;
+  const pickedGeneratedAlias =
+    pickedScopedRow !== undefined &&
+    selectedToken?.claude_model_aliases === true &&
+    !selectedToken.model_override_map?.[model]?.to &&
+    !!pickedScopedRow.original_model_id;
+  const overrideModel =
+    pickedOfferedAlias || pickedGeneratedAlias ? '' : resolveTokenOverride(selectedToken, model);
   // A pure catch-all (a catch-all with no per-model entries) forces every model, so
   // the model picker is locked to it (old single-override behavior). With per-model
   // entries the picked model IS the map key, so the picker stays editable.

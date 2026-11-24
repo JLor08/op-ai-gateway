@@ -562,6 +562,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByRole('option', { name: models[0].display_name })).toBeNull();
     });
 
+    it('shows no red "!" for the saved model while the token\'s list loads, and shows it if the list lacks it', async () => {
+      let resolve!: (rows: ModelOption[]) => void;
+      const fetchModels = vi.fn(
+        () =>
+          new Promise<ModelOption[]>((r) => {
+            resolve = r;
+          }),
+      );
+      renderChat(tokens, models, [], fetchModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+      await pickOption(t.chatRunAsTokenLabel, plainToken.name);
+      await waitFor(() => expect(fetchModels).toHaveBeenCalled());
+
+      expect(screen.queryByTestId('searchable-select-unavailable')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
+
+      await act(async () => {
+        resolve([
+          { id: 'other-row', display_name: 'Other', flavors: ['openai'], loading_on_count: 0 },
+        ]);
+      });
+      expect(await screen.findByTestId('searchable-select-unavailable')).toBeInTheDocument();
+    });
+
     it('disables the model select and shows the override hint when a model-override token is selected', async () => {
       renderChat();
       await waitForChatReady();

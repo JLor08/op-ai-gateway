@@ -2606,6 +2606,31 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByTestId('model-vision').textContent).toBe('true');
     });
 
+    it('does not apply the catch-all to a picked generated Claude alias, but a map entry still wins', async () => {
+      const token = scopedToken({
+        claude_model_aliases: true,
+        model_override: 'catch-target',
+        model_override_map: { 'mapped-id': { to: 'map-target', offer: false, hide_target: false } },
+      });
+      const fetchModels = vi.fn(async () => [
+        row('claude-sonnet-x', { original_model_id: 'real-sonnet' }),
+        row('mapped-id', { original_model_id: 'real-mapped' }),
+        row('plain'),
+      ]);
+      renderProvider([token], { models: sessionModels, fetchModels });
+      await waitForReady();
+      pick('select-token-tok_scoped');
+      await waitFor(() => expect(fetchModels).toHaveBeenCalled());
+      await waitFor(() => expect(screen.getByTestId('models-loading').textContent).toBe('false'));
+      pick('pick-claude-sonnet-x');
+      expect(screen.getByTestId('override-model').textContent).toBe('');
+      expect(screen.getByTestId('model-available').textContent).toBe('true');
+      pick('pick-mapped-id');
+      expect(screen.getByTestId('override-model').textContent).toBe('map-target');
+      pick('pick-plain');
+      expect(screen.getByTestId('override-model').textContent).toBe('catch-target');
+    });
+
     it('still remaps a listed real model named by an offer:false map entry', async () => {
       const token = scopedToken({
         model_override_map: {

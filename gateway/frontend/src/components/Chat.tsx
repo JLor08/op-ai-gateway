@@ -397,7 +397,11 @@ export function Chat({ t }: Readonly<{ t: Translation }>) {
               // selected) before the name in the field. A picked-but-unavailable model
               // shows a red "!" in the same leading spot instead (not for an empty,
               // deliberately cleared selection) — see SearchableSelect.
-              unavailable={(c.model !== '' || c.overrideModel !== '') && !c.modelAvailable}
+              // Not while the token's scoped list is still loading: the picked model
+              // is unknown, not unavailable (the send guard stays on modelAvailable).
+              unavailable={
+                (c.model !== '' || c.overrideModel !== '') && !c.modelAvailable && !c.modelsLoading
+              }
               unavailableTitle={t.chatModelUnavailable}
               options={modelPickerOptions}
             />
