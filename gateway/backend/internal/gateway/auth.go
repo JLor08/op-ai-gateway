@@ -319,15 +319,17 @@ func sessionPrincipal(user store.User, elevated bool) auth.Token {
 	// the user profile. A real run-as token keeps its own flags via
 	// AuthorizeRunAsToken and never passes through here.
 	//
-	// VendorAccess{All: true}: the per-token vendor-account opt-in is strict by
-	// default for API tokens, but the owner's own interactive session (and the
-	// trusted loopback chat that acts for it) has no api_tokens row to opt in on and
-	// must keep seeing all of the user's own active vendor accounts under their
-	// native prefixes -- the chat picker and dashboard depend on it. All covers
-	// the user's OWN accounts only: an account shared with the user is used only
-	// through an explicit per-account entry on a token, which a session never has
-	// (routing.TokenVendorPrefix, spec 2026-10-15 section 8). IncludeGroups
-	// likewise covers the user's own vendor account groups.
+	// VendorAccess follows the user's stored chat policy
+	// (store.ChatSessionVendorAccess). Unset keeps the historical behaviour:
+	// the per-token vendor-account opt-in is strict by default for API tokens,
+	// but the owner's own interactive session (and the trusted loopback chat
+	// that acts for it) has no api_tokens row to opt in on and sees all of the
+	// user's own active vendor accounts and groups under their native prefixes
+	// -- the chat picker and dashboard depend on it. All covers the user's OWN
+	// accounts only: an account shared with the user is used only through an
+	// explicit per-account entry (routing.TokenVendorPrefix, spec 2026-10-15
+	// section 8). A user who saved an explicit policy gets exactly that policy,
+	// the same semantics as a token's.
 	return auth.Token{
 		UserID:           user.ID,
 		Name:             user.DisplayName,
@@ -335,7 +337,7 @@ func sessionPrincipal(user store.User, elevated bool) auth.Token {
 		Scopes:           scopes,
 		LogCommunication: user.ChatLogCommunication,
 		Secret:           user.ChatSecret,
-		VendorAccess:     auth.VendorAccess{All: true, IncludeGroups: true},
+		VendorAccess:     store.ChatSessionVendorAccess(user.ChatVendorAccess),
 	}
 }
 

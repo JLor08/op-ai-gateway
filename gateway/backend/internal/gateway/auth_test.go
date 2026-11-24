@@ -113,10 +113,11 @@ func TestSessionPrincipalInheritsChatFlags(t *testing.T) {
 
 // TestSessionPrincipalGrantsAllVendorAccess pins that the owner's interactive
 // session (cookie or trusted loopback) sees ALL of their own vendor accounts under
-// each account's native prefix. Per-token vendor access is strict by default for
-// API tokens only; a session principal has no api_tokens row to opt in on, so it
-// carries VendorAccess{All: true} itself. Without it the chat picker and the
-// dashboard (Models(), Dashboard()) would list none of the user's vendor models.
+// each account's native prefix while the user has stored no chat policy. Per-token
+// vendor access is strict by default for API tokens only; a session principal has
+// no api_tokens row to opt in on, so an unset policy yields VendorAccess{All: true}.
+// Without it the chat picker and the dashboard (Models(), Dashboard()) would list
+// none of the user's vendor models.
 func TestSessionPrincipalGrantsAllVendorAccess(t *testing.T) {
 	for _, role := range []string{"user", "admin", "system_admin"} {
 		for _, elevated := range []bool{false, true} {
@@ -1083,6 +1084,7 @@ func TestLoginEnabledUserOffModeSkipsChallenge(t *testing.T) {
 	}
 }
 
+// An unset chat policy keeps covering the user's own groups.
 func TestSessionPrincipalVendorAccessIncludesGroups(t *testing.T) {
 	p := sessionPrincipal(store.User{ID: "usr_1", Role: "user"}, false)
 	if !p.VendorAccess.All || !p.VendorAccess.IncludeGroups {

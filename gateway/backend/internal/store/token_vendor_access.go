@@ -99,3 +99,18 @@ func EncodeVendorAccess(v auth.VendorAccess) string {
 	}
 	return string(b)
 }
+
+// ChatSessionVendorAccess resolves users.chat_vendor_provider_access into the
+// policy the token-less portal chat session runs under. It is the one place the
+// "unset" rule lives, shared by the gateway's session principal and the portal's
+// settings view: the empty string means the user never chose a policy and keeps
+// the historical behaviour (all of their own vendor accounts and groups); any
+// other value is an explicit policy decoded with DecodeVendorAccess, so an
+// explicit "no providers" ({"all":false}) stays distinct from unset, and a stale
+// account or group id is carried through and simply matches nothing.
+func ChatSessionVendorAccess(encoded string) auth.VendorAccess {
+	if encoded == "" {
+		return auth.VendorAccess{All: true, IncludeGroups: true}
+	}
+	return DecodeVendorAccess(encoded)
+}
