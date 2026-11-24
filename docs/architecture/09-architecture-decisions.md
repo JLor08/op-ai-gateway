@@ -647,7 +647,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -703,7 +703,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -872,7 +872,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1083,7 +1083,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1298,7 +1298,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-114-migrations),
+[§4](reference/data-model.md#4-migration-history-115-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1524,7 +1524,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-114-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-115-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1671,7 +1671,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-114-migrations),
+[§4](reference/data-model.md#4-migration-history-115-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3642,7 +3642,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-114-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3662,6 +3662,12 @@ collision-checked at save like an `all: false` entry (an id the token's principa
 reach is the "unknown" `400`), so only an entry naming an **own** account goes unchecked
 and rests on the backstop, and a policy now names accounts its principal can *reach*, not
 only ones the owner owns, though it still never widens that reach.
+
+**Amended by [ADR-113](#adr-113--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token) (chat-session policy).** Decision (e) no longer
+holds as written: the interactive session (and the trusted loopback chat) carries the owner's
+**stored** chat-session policy, which defaults to `all: true` plus groups when never configured,
+and may be narrowed, even to nothing, or may name a shared account. A run-as token still replaces
+that policy entirely, and a service token is as ADR-060 left it.
 
 ## ADR-051 — Anthropic translate prompt caching is flag-gated, decided at the gateway by a hybrid auto-switch, and placed by the provider
 **Context:** Anthropic caches a prompt prefix only where the request carries a
@@ -3866,7 +3872,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-114-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4898,7 +4904,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5024,7 +5030,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-114-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5114,6 +5120,9 @@ the key or hands a delegate the owner's token.
   session, which is always `all: true`), never a shared one, so borrowing another owner's
   credential is always a deliberate, named choice; an `all: true` policy may still carry
   an entry naming a non-own account, which is a live opt-in validated like any other.
+  (Amended by [ADR-113](#adr-113--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token): the portal session carries the owner's stored chat-session
+  policy, `all: true` plus groups only while it is unset, so a named shared account is reachable from the
+  token-less chat.)
   The own-versus-shared line is one function (`TokenOwnsVendorAccount`). The save-time
   check validates against the **token's own principal** (the owning user, or the service),
   never the admin saving it, and is **advisory**: routing re-evaluates the grant on every
@@ -5167,7 +5176,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-114-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7681,7 +7690,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-114-migrations),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7904,7 +7913,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-114-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-115-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8045,7 +8054,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-114-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8309,7 +8318,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-114-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-115-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -12167,7 +12176,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-114-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -13614,3 +13623,60 @@ rank equalled the rocm-smi card order.
 - With real device totals, ADR-083's auto-detected VRAM budgets now apply on AMD hosts running rocm-smi 4.x.
 - → [Agent Runtime Manager §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
   [Telemetry](cross-cutting/telemetry-usage-observability.md).
+## ADR-113 — The token-less chat session carries a stored per-user vendor policy, and the models listing can be read as a run-as token
+
+**Context.** ADR-050 (e) fixed the owner's interactive session at `all: true`, because the session has no `api_tokens` row to opt in on. Two
+needs collided with it. A user wanted the token-less portal chat to stop offering some or all vendor accounts (and to reach a shared account
+without minting a token). And once a chat run goes through a token, the picker still showed the session's models, not the ones that token can use:
+a token with a server override, a prefix override or generated Claude aliases offered names the run could not route, or hid the ones it could.
+
+**Decision.**
+
+- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-115-migrations))
+  holds the same JSON as `api_tokens.vendor_provider_access` and goes through the same codec, validated like a token policy against the user's own
+  reach. `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}` (`store.ChatSessionVendorAccess`), so every existing user keeps
+  today's behavior with no backfill. An explicit save whose encoding would be `''` is stored as `{"all":false}`, so "no providers" never collapses into
+  *unset*. `sessionPrincipal` decodes it tolerantly (an entry naming a deleted account or group matches nothing) and both callers, the cookie
+  session and the trusted loopback chat, inherit it, so the chat, the session's listings and session-cookie inference follow one rule: the session behaves
+  like a token holding the stored policy. A run-as token still replaces the whole policy.
+- **The save is session-only.** `PUT /api/portal/chat-settings` takes an optional `vendor_access`: absent or `null` leaves the stored policy untouched (an
+  older client that sends only the two booleans changes nothing), a value is validated (`portal.token_vendor_access_invalid` / `_conflict`) and stored. A
+  bearer token sending it is refused `403 portal.token_forbidden`, so a `gateway:use` key cannot rewrite the session's provider policy. The two booleans
+  keep their session-or-bearer rule.
+- **The read-back is the effective policy.** The synthetic chat-session row of the token list carries `vendor_access` whenever the user row was read
+  (unset as `{all: true, include_groups: true}`, explicit zero as `{all: false}` with no accounts) and omits it when that lookup fails, in which case the
+  chat card disables the editor and sends no policy; the same applies when `vendor_accounts_enabled` is off. Admins see each user's chat policy through
+  `GET /api/admin/users/{id}/tokens`, as they see token policies; the admin PATCH surface does not expose it (`account.UserUpdate.ChatVendorAccess` is
+  pre-validated encoded JSON produced only by the portal encoder).
+- **The listing can be read as a run-as token.** `GET /api/portal/models` accepts the existing capture-redacted `X-OP-Run-As-Token` header from a session
+  caller and computes the listing for that token's principal through the same gate as a chat run (`AuthorizeRunAsToken`), so prefixes, overrides, overlays and
+  generated Claude aliases (with `original_model_id`) come from the existing listing code, and the loading counts use the run-as principal. A bearer caller
+  sending the header is refused `403 portal.token_forbidden` before any lookup (inference endpoints silently ignore the header for bearers; here a silent
+  ignore would return the bearer's own list as if it were the answer). A foreign, unknown or disabled token gets the gate's own `403
+  portal.token_forbidden` with an identical body, so there is no existence leak. With `?manage=1` the header is `400 portal.models_run_as_conflict`.
+- **The chat picker follows the selected token.** The whole chat list (voice pickers included) swaps to the token-scoped list while a token is selected, never
+  showing the session's models during the load; the first failed scoped fetch leaves the picker empty with the error surfaced, never the session list. A
+  generated alias is labelled `id (original_model_id)`. Picking a manual alias that exists in the scoped list skips the client-side override remap, since the
+  backend remaps through the run-as token. A token with a `server_override` keeps the server-locked picker (an accepted exception: its picker shows the
+  raw server model names).
+
+**Rejected:**
+
+- **A separate chat-policy table.** One atomic value per user sits next to the token's own column, and a link table would add orphan cleanup for it.
+- **Scoping only the chat.** A policy applied to the chat alone would leave the session's listings and cookie inference on a different rule; one rule for
+  the principal is easier to reason about.
+- **A new endpoint for the token-scoped listing.** The existing listing already computes everything from a principal.
+- **A query parameter for the run-as token.** It would put token ids into reverse-proxy access logs; the header is already redacted by capture.
+- **The inference rule (silently ignore the header for a bearer).** On a listing endpoint it would answer with the wrong set instead of an error.
+- **Treating an absent `vendor_access` as clearing.** It would reset the policy for every older client that saves only the booleans.
+
+**Consequences and limits.**
+
+- Narrowing the policy narrows the session's own `/v1/models`, the Models page and the dashboard's live routes too (intended: like a token), and a
+  default user is unaffected.
+- A token with a server override still shows raw server model names in the chat picker.
+- The users table exists only on the SQL store (SQLite and PostgreSQL), so there is no in-memory implementation of the column.
+- → [External Vendor Accounts §11.4](cross-cutting/external-vendor-accounts.md#114-who-is-restricted-api-tokens-and-the-owners-chat-session-policy),
+  [Security, Auth & RBAC §5](cross-cutting/security-auth-rbac.md),
+  [HTTP API surface](reference/api-surface.md),
+  [Data model](reference/data-model.md#4-migration-history-115-migrations).

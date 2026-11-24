@@ -348,8 +348,21 @@ bare session. `handleOpenAISpeech` (`speech_handler.go`) and
 shared `runAsPrincipal` helper, so a speech or transcription call made over the
 loopback pair with a run-as header would bill and capture under the token rather than
 under the bare session. The flowchart in [§7](#7-request-authentication-decision-flow)
-shows both edges into `AuthorizeRunAsToken`; do not read this section as
+shows the edges into `AuthorizeRunAsToken`; do not read this section as
 naming chat completions exclusively.
+
+**The portal models listing is a further consumer, with a stricter rule.**
+`GET /api/portal/models` reads the same header from a **session** caller and
+computes the listing for the token's principal, so the chat picker shows what a
+run with that token can use ([ADR-113](../09-architecture-decisions.md#adr-113--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token)).
+It runs the same `AuthorizeRunAsToken` gate, but where the inference handlers
+**silently ignore** the header for a bearer caller, this endpoint **refuses**: a
+bearer caller (`token.ID != ""`) sending it gets `403 portal.token_forbidden`,
+decided before any lookup. A token that is foreign, unknown or disabled gets the
+gate's own `403 portal.token_forbidden` with an identical body, so the answer
+does not reveal whether a token id exists. Combined with `?manage=1` the header
+is `400 portal.models_run_as_conflict`. The loading counts of the listing use the
+run-as principal too.
 
 The gate is the resolved principal's **token id being empty**, not the path and
 not the headers the request carries: `token.ID == ""` is true only for the
@@ -435,6 +448,8 @@ flowchart TD
     M --> N["requireWebAnyScope:<br/>gateway:use OR llm:invoke"]
     N -- "session + optional<br/>X-OP-Run-As-Token" --> O["AuthorizeRunAsToken<br/>(ownership + active + scope)"]
     N -- pass --> L
+
+    H -- "GET /api/portal/models<br/>+ X-OP-Run-As-Token<br/>(bearer: 403 before lookup)" --> O
 
     D -- "/v1/responses, /v1/messages,<br/>/v1/messages/count_tokens,<br/>model-listing endpoints" --> P["Bearer ONLY<br/>(authenticate / requireAnyScope)"]
     P -- no/invalid bearer --> X2
@@ -1035,7 +1050,7 @@ the owner's single-use refresh token. The properties that matter for the securit
   the shared arm (the owner's own accounts are always kept), and an unwired seam falls
   back to owner-only, never allow-all. It decides *reach* only: a token still *uses* a
   shared account only when its policy **names** it (`all: true` and a portal session
-  cover only the principal's own accounts), for a user token and, create-only, a service
+  whose stored chat policy is unset cover only the principal's own accounts), for a user token and, create-only, a service
   token, and a service reaches one only through a **direct** service provision
   ([External Vendor Accounts §4.6](external-vendor-accounts.md#46-routing-to-a-shared-account-the-pure-grant),
   [§11](external-vendor-accounts.md#11-per-token-vendor-access),
