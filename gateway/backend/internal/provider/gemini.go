@@ -261,7 +261,7 @@ func (c *GeminiClient) renderBody(target routing.Target, req inference.Request) 
 // post sends the rendered body to path and returns the 2xx response (the caller
 // owns closing its Body). Every failure is already mapped to a provider error:
 // ErrTimeout when ctx's deadline elapsed, ErrUnavailable for a transport error,
-// and upstreamStatusError (unavailableStatus plus a bounded body snippet, so a 400
+// and upstreamStatusError (vendorStatusError plus a bounded body snippet, so a 400
 // INVALID_ARGUMENT explains itself) for a non-2xx status. It records the outbound
 // request and, on success, the response headers with the context's capture sink.
 // It sends x-goog-api-key via applyUpstreamAuth and never the ?key= query
@@ -286,7 +286,7 @@ func (c *GeminiClient) post(ctx context.Context, target routing.Target, path str
 		snippet := readUpstreamErrorSnippet(httpResp.Body, geminiErrorBodyLimit)
 		httpResp.Body.Close()
 		sink.WriteResponse([]byte(snippet))
-		return nil, upstreamStatusError(httpResp.StatusCode, snippet)
+		return nil, upstreamStatusError(httpResp, snippet)
 	}
 	sink.RecordResponseHeaders(httpResp.Header)
 	return httpResp, nil

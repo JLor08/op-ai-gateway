@@ -46,6 +46,14 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor), nil)
 		return
 	}
+	s.completeOn(w, r, token, req, raw, render, target, start, id)
+}
+
+// completeOn is complete past its resolve: it calls target, already resolved, and
+// writes and records the answer. start and id are the attempt's: complete's own,
+// or a fresh pair for a vendor group's failover attempt (vendor_group_failover.go).
+func (s *Server) completeOn(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, render func(provider.Response) any, target routing.Target, start time.Time, id string) {
+	capturing := s.capturingEnabled(token)
 	// Register the in-flight request now that routing has resolved the target
 	// server, so the running-connections view can label it with the server name
 	// (mirrors completeStream, which registers after Resolve). A resolve failure
@@ -97,6 +105,18 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 		s.Active.Remove(id)
 		s.complete(w, r, token, withLostInstance(req, target), raw, render)
 		return
+	}
+	var limit *provider.LimitError
+	if target.VendorGroupID != "" && errors.As(err, &limit) {
+		// A group member answered a limit (vendor_group_failover.go): nothing has been
+		// written to the client and nothing recorded. The request moves to the next
+		// member as a fresh attempt, which answers and records in this one's place;
+		// with no member left, this attempt's error is the answer below.
+		if next, nextTarget, ok := s.vendorGroupFailover(&token, req, target, limit.Header, limit.RetryAfter, s.translateTargetResolver(r)); ok {
+			s.Active.Remove(id)
+			s.completeOn(w, r, token, next, raw, render, nextTarget, time.Now(), nextRequestID())
+			return
+		}
 	}
 	status := "success"
 	errorCode := ""
