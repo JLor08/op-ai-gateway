@@ -318,11 +318,14 @@ type Request struct {
 	// agent cannot serve a realtime session at all. Internal only: set by the
 	// gateway when it re-selects, never parsed from a client body.
 	ExcludeInstanceKeys []string `json:"-"`
-	// ExcludeVendorAccountIDs are vendor account ids routing must not pick for
-	// this request: members of a vendor account group already tried and answered
-	// with a limit error. A non-empty list also disables the group's
-	// all-blocked fallback. Internal only: set by the gateway when it re-resolves,
-	// never parsed from a client body.
+	// ExcludeVendorAccountIDs are vendor account ids a vendor account group must
+	// not pick for this request: members already tried that answered with a limit
+	// error. Only the resolver's group step honours the list (and a non-empty one
+	// disables the group's all-blocked fallback); the single-account loop does
+	// NOT, so a re-resolve can still land on an excluded account outside the
+	// group, which is why the gateway's failover accepts only a target of the same
+	// group that is not excluded (vendorGroupFailover). Internal only: set by the
+	// gateway when it re-resolves, never parsed from a client body.
 	ExcludeVendorAccountIDs []string `json:"-"`
 	// AdmissionStart, when set, is when this request's admission began (wall
 	// clock): a bounded admission-queue timeout counts from it instead of from

@@ -606,10 +606,11 @@ func (s *Service) refreshVendorUsage(ctx context.Context, acc routing.VendorAcco
 // current token set; the caller opened (and, if it was expired, renewed) it, so
 // this never opens or renews a token itself.
 //
-// It runs ONLY for an OpenAI subscription account that has an access token (an
-// api_key account and every Anthropic account are skipped, the fetcher is never
-// called; an OpenRouter/Kilo api-key account's pull is fetchCompatibleVendorUsage)
-// and is purely ADDITIVE and BEST EFFORT: it answers a status and never an
+// It runs ONLY for an OpenAI or Anthropic subscription account that has an access
+// token -- an OpenAI one asks the ChatGPT backend's usage endpoint, an Anthropic one
+// the Claude OAuth usage endpoint (vendorauth.AnthropicOAuthUsageURL) -- and never
+// for an api_key account (no fetcher is called; an OpenRouter/Kilo api-key account's
+// pull is fetchCompatibleVendorUsage). It is purely ADDITIVE and BEST EFFORT: it answers a status and never an
 // error. The status is VendorUsageRefreshOK when a snapshot was stored,
 // VendorUsageRefreshUnsupported when the gate above fails, and
 // VendorUsageRefreshUnverifiable for a fetch that was not OK (a 401 included: only

@@ -28,8 +28,8 @@ const VendorUsageLazyTTL = 5 * time.Minute
 // The status vocabulary of VendorUsageRefreshResult, on the wire as refresh.status.
 const (
 	// VendorUsageRefreshOK: the vendor answered and the snapshot was stored (merged
-	// over the passive scrape's for an OpenAI subscription; as fetched for an
-	// api-key account, whose pull is its only usage writer).
+	// over the passive scrape's for an OpenAI or Anthropic subscription; as fetched
+	// for an api-key account, whose pull is its only usage writer).
 	VendorUsageRefreshOK = "ok"
 	// VendorUsageRefreshFresh: the last active pull was younger than the requested
 	// maxAge, so the vendor was NOT asked and the stored snapshot is answered as it
@@ -42,8 +42,8 @@ const (
 	// Never a statement about the credential.
 	VendorUsageRefreshUnverifiable = "unverifiable"
 	// VendorUsageRefreshUnsupported: the account has no active usage pull (only an
-	// OpenAI subscription and an OpenRouter/Kilo api-key account have one). No
-	// credential was opened.
+	// OpenAI or Anthropic subscription and an OpenRouter/Kilo api-key account have
+	// one, hasActiveVendorUsagePull). No credential was opened.
 	VendorUsageRefreshUnsupported = "unsupported"
 )
 
@@ -142,7 +142,7 @@ func hasActiveVendorUsagePull(acc routing.VendorAccount) bool {
 }
 
 // RefreshVendorAccountUsage pulls an account's usage snapshot on its own (an OpenAI
-// subscription's, or an OpenRouter/Kilo api-key account's), without the model
+// or Anthropic subscription's, or an OpenRouter/Kilo api-key account's), without the model
 // discovery RefreshVendorAccountModels runs, and answers the stored snapshot (nil
 // when none has been stored yet) with what the refresh did. It is what the Usage &
 // Limits panel's refresh button and its on-view lazy pull call.
@@ -158,7 +158,7 @@ func hasActiveVendorUsagePull(acc routing.VendorAccount) bool {
 // account may both ask the vendor; the write is idempotent.
 //
 // Statuses (VendorUsageRefreshResult.Status):
-//   - ok: the vendor answered and the snapshot was stored (an OpenAI subscription's
+//   - ok: the vendor answered and the snapshot was stored (a subscription's
 //     merged over the passive scrape's, see routing.MergeVendorAccountUsage; an
 //     api-key account's as fetched, because its pull is the only writer and a merge
 //     could not express a limit that is gone).
@@ -169,8 +169,8 @@ func hasActiveVendorUsagePull(acc routing.VendorAccount) bool {
 //     undocumented, so a miss there is expected), or a snapshot that could not be
 //     stored. The stored snapshot is kept; Detail says why for a token or key
 //     problem.
-//   - unsupported: neither an OpenAI subscription nor an OpenRouter/Kilo api-key
-//     account. No credential is opened.
+//   - unsupported: neither an OpenAI or Anthropic subscription nor an
+//     OpenRouter/Kilo api-key account. No credential is opened.
 //
 // A subscription's expired-but-refreshable token is renewed first through the
 // VendorTokenRefresher (the gateway's locked refresh); the portal never refreshes by

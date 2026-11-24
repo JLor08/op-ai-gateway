@@ -342,9 +342,6 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // connect_upstream_failed above: the latter is transient (keep polling).
   'vendor_account.device_not_supported': 'errorVendorAccountDeviceNotSupported',
   'vendor_account.device_connect_state': 'errorVendorAccountDeviceConnectState',
-  // The master flag is off (writePortalVendorAccountError's 409 row). Mapped
-  // although the portal hides the area in that state: a stale tab or a flag
-  // flipped mid-session still reaches it.
   // Vendor account groups (portal_vendor_group_endpoints.go).
   'vendor_account_group.not_found': 'errorVendorAccountGroupNotFound',
   'vendor_account_group.name_required': 'errorVendorAccountGroupNameRequired',
@@ -357,6 +354,9 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'vendor_account_group.member_duplicate': 'errorVendorAccountGroupMemberDuplicate',
   'vendor_account_group.prefix_conflict': 'errorVendorAccountGroupPrefixConflict',
   'vendor_account_group.forbidden': 'errorVendorAccountGroupForbidden',
+  // The master flag is off (writePortalVendorAccountError's 409 row). Mapped
+  // although the portal hides the area in that state: a stale tab or a flag
+  // flipped mid-session still reaches it.
   'vendor_accounts.module_disabled': 'errorVendorAccountsModuleDisabled',
   // The vendor_subscriptions_enabled switch is off: creating or connecting a
   // subscription account is refused (same 409 row table; api_key accounts never
