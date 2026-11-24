@@ -264,11 +264,11 @@ function vramLiveFingerprint(live: HardwareGPU, kind: VramFingerprintKind): stri
  *    `kind` says WHICH field, because `name_total` catches a swap between
  *    UNLIKE cards only;
  *  - `unverifiable`: there is nothing to compare — no fingerprint was recorded
- *    (`GPUSample.UUID` is NVIDIA-only, and a collector reporting neither a
- *    name nor a total leaves the field empty on exactly the AMD and Apple
- *    hosts the delta strategy exists for), or no live card is known at this
- *    index yet. It must READ differently from `verified`: a check that could
- *    not be made is not a check that passed;
+ *    (`GPUSample.UUID` needs NVIDIA or AMD with rocm-smi 4.x, and a
+ *    collector reporting neither a name nor a total leaves the field empty
+ *    on the Apple and older-AMD hosts the delta strategy exists for), or no
+ *    live card is known at this index yet. It must READ differently from
+ *    `verified`: a check that could not be made is not a check that passed;
  *  - `drifted`: the run measured a demonstrably different card than the one
  *    sitting at this index now. The number is real but belongs to other
  *    hardware, so it is named rather than offered.

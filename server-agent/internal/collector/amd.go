@@ -15,15 +15,19 @@ import (
 
 // rocmArgs is the argument list the collector passes to rocm-smi to obtain a
 // JSON object keyed by card ("card0", "card1", …). parseRocmJSON reads the
-// per-card fields these flags emit.
+// per-card fields these flags emit. --showmemuse is deliberately absent:
+// rocm-smi 4.x reports only a percentage there, while --showmeminfo vram
+// carries the VRAM byte keys in every version.
 var rocmArgs = []string{
 	"--showid",
 	"--showproductname",
 	"--showuse",
-	"--showmemuse",
+	"--showmeminfo", "vram",
 	"--showtemp",
 	"--showpower",
 	"--showdriverversion",
+	"--showbus",
+	"--showuniqueid",
 	"--json",
 }
 
@@ -58,6 +62,13 @@ func (c *amdCollector) Collect(ctx context.Context) ([]sample.GPU, error) {
 // Each field is read defensively: a missing key defaults to its zero value and
 // never fails the parse. Memory values are already bytes; temperature is a
 // float truncated to whole degrees.
+//
+// rocm-smi pre-4.0 (3.x) and 4.x name the product keys differently, so both
+// are accepted. The name is the first usable of "Device Name" (4.x marketing
+// name), "Card Series"/"Card series", then "Card Model"/"Card model" (a bare
+// PCI device id on 4.x, hence last). "Unique ID" feeds UUID and "PCI Bus" feeds
+// PCIBusID; 3.x emits neither, which leaves them empty. Placeholder values
+// such as "N/A" count as absent so they never reach the portal as data.
 func parseRocmJSON(data []byte) ([]sample.GPU, error) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -81,8 +92,16 @@ func parseRocmJSON(data []byte) ([]sample.GPU, error) {
 			continue
 		}
 		gpus = append(gpus, sample.GPU{
-			Index:         cardIndex(k),
-			Name:          firstNonEmpty(fields["Card series"], fields["Card model"]),
+			Index: cardIndex(k),
+			Name: firstNonEmpty(
+				rocmString(fields["Device Name"]),
+				rocmString(fields["Card Series"]),
+				rocmString(fields["Card series"]),
+				rocmString(fields["Card Model"]),
+				rocmString(fields["Card model"]),
+			),
+			UUID:          rocmString(fields["Unique ID"]),
+			PCIBusID:      rocmString(fields["PCI Bus"]),
 			UtilPct:       rocmFloat(fields["GPU use (%)"]),
 			MemUsedBytes:  rocmInt64(fields["VRAM Total Used Memory (B)"]),
 			MemTotalBytes: rocmInt64(fields["VRAM Total Memory (B)"]),
@@ -94,7 +113,7 @@ func parseRocmJSON(data []byte) ([]sample.GPU, error) {
 	if sysRaw, ok := raw["system"]; ok {
 		var sys map[string]string
 		if json.Unmarshal(sysRaw, &sys) == nil {
-			driver := firstNonEmpty(sys["Driver version"], sys["Driver Version"])
+			driver := firstNonEmpty(rocmString(sys["Driver version"]), rocmString(sys["Driver Version"]))
 			for i := range gpus {
 				gpus[i].DriverVersion = driver
 			}
@@ -123,6 +142,17 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// rocmString trims a rocm-smi string value and maps the placeholders it prints
+// for unsupported fields ("N/A", "unknown", …) to "".
+func rocmString(s string) string {
+	s = strings.TrimSpace(s)
+	switch strings.ToLower(s) {
+	case "", "n/a", "na", "unknown":
+		return ""
+	}
+	return s
 }
 
 // rocmFloat parses a rocm-smi numeric string, returning 0 for an empty or

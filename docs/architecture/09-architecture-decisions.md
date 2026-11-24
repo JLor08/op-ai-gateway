@@ -10979,7 +10979,9 @@ resolve.
     spent across restarts or every exit would re-arm it and the bidirectional thrash would return one restart at a time. It resets
     only when the spec is removed and re-added; an in-place edit keeps it. A bootstrap blocked by a non-evictable toucher spends
     nothing (the flag rides only an `Evict` decision). At most one mixed pair, once, ever cold-loads the other.
-  - **(g) Measurer-gated.** Measurement is NVIDIA-only ([§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)):
+  - **(g) Measurer-gated.** (Superseded in part by [ADR-113](#adr-113--per-process-vram-on-amd-linux-kfd-sysfs-not-start-delta-attribution-or-amd-smi):
+    AMD Linux ROCm/HIP builds are measured via KFD sysfs, so an AMD Linux host now has a measurer installed.) Measurement is
+    NVIDIA-only ([§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)):
     on an AMD, Apple or GPU-less host nothing could capture the number, and §5.3 is explicit that an unknown-demand spec there simply
     waits. Evicting a working model for a spec that can never be measured is the ADR-032 regression, so a measurer-less host never
     gets the shot.
@@ -13577,3 +13579,38 @@ inventing usage figures and hammering a vendor's rate-limited usage endpoint, an
 - → [External Vendor Accounts §12](cross-cutting/external-vendor-accounts.md#12-vendor-account-groups),
   [HTTP API surface](reference/api-surface.md#vendor-account-groups),
   [Data model](reference/data-model.md#external-vendor-accounts-anbieter).
+
+## ADR-113 — Per-process VRAM on AMD Linux: KFD sysfs, not start-delta attribution or amd-smi
+
+**Context.** On AMD Linux hosts the runtime manager never measured a spec's VRAM, so an unfilled `vram_estimate_mb` waited forever and the
+benchmark reported only the per-GPU delta (#432). Two causes stacked: the agent's `rocm-smi` collector asked for flags and read keys of the pre-4.0
+(3.x) output, while rocm-smi 4.x spells them differently, so on such a host the device name, total VRAM, UUID and PCI bus all read empty or 0; and no
+per-process measurer existed for AMD at all. With the total at 0, the auto-detected budgets of
+[ADR-083](#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides) were silently
+absent on those hosts.
+
+**Decision.** The collector requests `--showproductname --showmeminfo vram --showbus --showuniqueid` and reads both key spellings (name from
+`Device Name`, then `Card Series`/`Card series`, then `Card Model`/`Card model`; `Unique ID` as UUID; `PCI Bus` as `pci_bus_id`), treating
+`N/A`-style sentinels as "not reported". A new KFD measurer reads `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes), maps each `gpu_id` to
+its rank among the topology's GPU nodes in numeric node order (the CPU node is skipped), attributes through the process-group leader as the NVIDIA
+path does, sums and floors to MiB, and returns nil on any failure. On Linux the selector prefers NVIDIA compute-apps, then KFD, else installs
+nothing; other non-Windows hosts keep NVIDIA-or-nil and Windows keeps PDH. On the test host (two RX 6900 XT, kernel 6.8, ROCm 10.2,
+rocm-smi 4.0.0) a 4B llama.cpp model measured 3949375488 B on GPU 0 and a 12B model 9405710336 B on GPU 1, the card totals matched, and the KFD node
+rank equalled the rocm-smi card order.
+
+**Alternatives rejected.**
+- *Start-delta attribution like the WSL path* ([§3.8](cross-cutting/agent-runtime-manager.md#38-execution-modes-wsl2)): needless where the kernel
+  already reports a per-process figure, and it would add the serialisation and noise the delta approach carries.
+- *`amd-smi process`*: it works, but costs a subprocess and a JSON format to pin, for the same figure a world-readable sysfs read gives. (The earlier
+  belief that consumer parts lack it came from calling a non-existent `process list` subcommand.)
+- *DRM fdinfo `drm-memory-vram`*: reading another user's fds needs privileges, and it counts graphics clients too. It stays the candidate route for
+  Vulkan builds, which the KFD cannot see.
+
+**Consequences.**
+- The ordinal is an assumption, not a contract: KFD node rank is taken to equal the rocm-smi card index. Verified on the test host, recorded as a
+  risk in [§11.1](11-risks-and-technical-debt.md#111-operational-risks).
+- Visibility is ROCm/HIP only; a Vulkan engine on AMD still reads as absent and falls back to the estimate.
+- On a mixed NVIDIA and AMD Linux host NVIDIA has priority and the KFD measurer is not installed.
+- With real device totals, ADR-083's auto-detected VRAM budgets now apply on AMD hosts running rocm-smi 4.x.
+- → [Agent Runtime Manager §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
+  [Telemetry](cross-cutting/telemetry-usage-observability.md).

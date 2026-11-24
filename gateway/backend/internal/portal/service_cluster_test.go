@@ -534,6 +534,15 @@ func TestPutClusterSaveChecks(t *testing.T) {
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0, VRAMEstimateMB: 40000}}
 			r.Env = map[string]string{"LLAMA_ARG_TENSOR_SPLIT": "1,1"}
 		}), nil},
+		{"AMD member reporting a pci bus id without an estimate", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			f.hardware(r.ClusterMembers[0].ServerID, amdLinuxHardwareReport)
+			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0}}
+			r.Args = append(r.Args, "--tensor-split", "1,1")
+		}), ErrRPCMemberVRAMEstimateRequired},
+		{"AMD member reporting a pci bus id without --tensor-split", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			f.hardware(r.ClusterMembers[0].ServerID, amdLinuxHardwareReport)
+			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0, VRAMEstimateMB: 12000}}
+		}), ErrClusterTensorSplitRequired},
 		{"NVIDIA member needs neither", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			f.hardware(r.ClusterMembers[0].ServerID, `{"os":"linux","gpus":[{"index":0,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:01:00.0"}]}`)
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0}}
@@ -1476,6 +1485,10 @@ func TestPutClusterBinaryChangeRunsMemberChecks(t *testing.T) {
 		}
 	})
 }
+
+// amdLinuxHardwareReport is an AMD card as the agent reports it from
+// rocm-smi 4.x on Linux: with a PCI bus id and a uuid, like an NVIDIA card.
+const amdLinuxHardwareReport = `{"os":"linux","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0","uuid":"0x12b1004de0189bb2","memory_total_bytes":17163091968}]}`
 
 // TestPutClusterHiddenMemberGPURefusalNamesNothing: in an unchanged
 // membership the member GPU rules still hold for a hidden member, but the

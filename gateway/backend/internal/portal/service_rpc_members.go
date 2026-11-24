@@ -28,7 +28,8 @@ var (
 	ErrRPCMemberDeviceBackendInvalid = errors.New("runtime_spec.device_backend_invalid")
 	// ErrRPCMemberVRAMEstimateRequired rejects a GPU row without a VRAM
 	// estimate on a server whose hardware report shows no NVIDIA GPU: only
-	// NVIDIA devices can be measured, so admission needs the operator's
+	// NVIDIA devices are measured reliably (AMD only for ROCm/HIP builds on
+	// Linux, never a Vulkan rpc-server), so admission needs the operator's
 	// number.
 	ErrRPCMemberVRAMEstimateRequired = errors.New("runtime_spec.member_vram_estimate_required")
 	// ErrRPCMemberInUse rejects disabling or deleting a member spec that a
@@ -386,10 +387,16 @@ func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID st
 }
 
 // gpuLooksNVIDIA recognises an NVIDIA card in a hardware report, which has no
-// vendor field: the collector fills the PCI bus id only for NVIDIA devices,
-// and the name is the fallback.
+// vendor field. Both the NVIDIA and the AMD collector fill pci_bus_id, so a
+// name that marks the card as AMD ("amd", "radeon", "instinct") is checked
+// first and always means not NVIDIA. Otherwise an NVIDIA name keyword or a
+// non-empty bus id means NVIDIA; the bus id stays the fallback for NVIDIA
+// names that carry no keyword (an "H100 PCIe", say).
 func gpuLooksNVIDIA(name, pciBusID string) bool {
 	n := strings.ToLower(name)
+	if strings.Contains(n, "amd") || strings.Contains(n, "radeon") || strings.Contains(n, "instinct") {
+		return false
+	}
 	return pciBusID != "" || strings.Contains(n, "nvidia") || strings.Contains(n, "geforce") ||
 		strings.Contains(n, "quadro") || strings.Contains(n, "tesla")
 }
