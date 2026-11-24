@@ -296,6 +296,10 @@ type Target struct {
 	// trigger it once was: that trigger moved to the explicit Subscription flag
 	// below. A self-hosted target leaves this "".
 	VendorAccountID string
+	// VendorGroupID, when non-empty, names the vendor account group that routed
+	// this request to VendorAccountID, for usage attribution (the recorded
+	// usage_events.vendor_group_id). "" when the account was addressed directly.
+	VendorGroupID string
 	// VendorAccountOwnerUserID and VendorShareUsageWithMembers are the serving
 	// account's owner and the owner's opt-in to showing its usage limits to members
 	// (VendorAccount.ShareUsageWithMembers). They are stamped on every vendor target

@@ -63,6 +63,7 @@ var benchmarkOmits = map[string]bool{
 	"ExtraHeaders":                true, // static upstream headers only a vendor subscription target carries
 	"Masquerade":                  true, // no client-side disguise on a benchmark stream
 	"VendorAccountID":             true, // a benchmark measures on-prem server throughput, never a vendor account
+	"VendorGroupID":               true, // a benchmark never routes through a vendor account group
 	"VendorAccountOwnerUserID":    true, // a benchmark measures on-prem server throughput, never a vendor account
 	"VendorShareUsageWithMembers": true, // a benchmark measures on-prem server throughput, never a vendor account
 	"Subscription":                true, // a benchmark never dispatches a vendor subscription bearer
