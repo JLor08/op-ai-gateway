@@ -55,3 +55,38 @@ func TokenVendorPrefix(token auth.Token, acc VendorAccount) (prefix string, allo
 	}
 	return "", false
 }
+
+// TokenOwnsVendorGroup reports whether g is one of token's OWN vendor account
+// groups. Groups are personal, so unlike accounts there is no shared case: a token
+// with no user, or a blank owner id, owns nothing.
+func TokenOwnsVendorGroup(token auth.Token, g VendorAccountGroup) bool {
+	return token.UserID != "" && g.OwnerUserID == token.UserID
+}
+
+// TokenVendorGroupPrefix reports the public model-name prefix a token serves group
+// g under, and whether g is allowed for the token at all. A group the token's user
+// does not own is never allowed, even when listed.
+//
+//   - All && IncludeGroups: allowed under the group's own ModelPrefix; a listed
+//     entry's override is ignored (all wins, as for own accounts).
+//   - A listed entry: its override prefix when enabled, else the group's ModelPrefix.
+//   - Otherwise denied.
+func TokenVendorGroupPrefix(token auth.Token, g VendorAccountGroup) (prefix string, allowed bool) {
+	if !TokenOwnsVendorGroup(token, g) {
+		return "", false
+	}
+	access := token.VendorAccess
+	if access.All && access.IncludeGroups {
+		return g.ModelPrefix, true
+	}
+	for _, e := range access.Groups {
+		if e.GroupID != g.ID {
+			continue
+		}
+		if e.OverrideEnabled {
+			return e.OverridePrefix, true
+		}
+		return g.ModelPrefix, true
+	}
+	return "", false
+}

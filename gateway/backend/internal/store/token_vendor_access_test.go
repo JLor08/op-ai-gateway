@@ -64,3 +64,39 @@ func TestDecodeVendorAccessHonorsOverrideEnabledFlag(t *testing.T) {
 		t.Fatalf("Encode(Decode(..)) = %q", enc)
 	}
 }
+
+func TestVendorAccessGroupsRoundTrip(t *testing.T) {
+	in := auth.VendorAccess{
+		All:           true,
+		IncludeGroups: true,
+		Groups: []auth.VendorAccessGroupEntry{
+			{GroupID: "vag_1"},
+			{GroupID: "vag_2", OverrideEnabled: true, OverridePrefix: ""},
+		},
+	}
+	enc := EncodeVendorAccess(in)
+	if !reflect.DeepEqual(DecodeVendorAccess(enc), in) {
+		t.Fatalf("Decode(Encode(%q)) = %#v, want %#v", enc, DecodeVendorAccess(enc), in)
+	}
+	groupsOnly := auth.VendorAccess{Groups: []auth.VendorAccessGroupEntry{{GroupID: "vag_1", OverrideEnabled: true, OverridePrefix: "p/"}}}
+	if got := DecodeVendorAccess(EncodeVendorAccess(groupsOnly)); !reflect.DeepEqual(got, groupsOnly) {
+		t.Fatalf("groups-only round trip = %#v, want %#v", got, groupsOnly)
+	}
+	if got := EncodeVendorAccess(auth.VendorAccess{}); got != "" {
+		t.Fatalf("zero policy encodes to %q, want empty", got)
+	}
+}
+
+func TestDecodeVendorAccessLegacyAndGroupTolerance(t *testing.T) {
+	old := DecodeVendorAccess(`{"all":true}`)
+	if !old.All || old.IncludeGroups || old.Groups != nil {
+		t.Fatalf("legacy row = %#v", old)
+	}
+	got := DecodeVendorAccess(`{"groups":[{"prefix_override":{"enabled":true}}]}`)
+	if got.Groups != nil || len(got.Groups) != 0 {
+		t.Fatalf("id-less group entry kept: %#v", got.Groups)
+	}
+	if got := EncodeVendorAccess(got); got != "" {
+		t.Fatalf("re-encode = %q, want empty", got)
+	}
+}

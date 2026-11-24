@@ -12,8 +12,14 @@ import (
 // vendor_provider_access wire shape. Kept local; auth.VendorAccess is the
 // in-memory type (store imports auth, auth cannot import store).
 type vendorAccessWire struct {
-	All      bool                    `json:"all,omitempty"`
-	Accounts []vendorAccessEntryWire `json:"accounts,omitempty"`
+	All           bool                    `json:"all,omitempty"`
+	IncludeGroups bool                    `json:"include_groups,omitempty"`
+	Accounts      []vendorAccessEntryWire `json:"accounts,omitempty"`
+	Groups        []vendorAccessGroupWire `json:"groups,omitempty"`
+}
+type vendorAccessGroupWire struct {
+	GroupID        string              `json:"group_id"`
+	PrefixOverride *prefixOverrideWire `json:"prefix_override,omitempty"`
 }
 type vendorAccessEntryWire struct {
 	AccountID      string              `json:"account_id"`
@@ -36,7 +42,7 @@ func DecodeVendorAccess(s string) auth.VendorAccess {
 	if err := json.Unmarshal([]byte(s), &w); err != nil {
 		return auth.VendorAccess{}
 	}
-	out := auth.VendorAccess{All: w.All}
+	out := auth.VendorAccess{All: w.All, IncludeGroups: w.IncludeGroups}
 	for _, e := range w.Accounts {
 		id := strings.TrimSpace(e.AccountID)
 		if id == "" {
@@ -51,22 +57,41 @@ func DecodeVendorAccess(s string) auth.VendorAccess {
 		}
 		out.Accounts = append(out.Accounts, entry)
 	}
+	for _, e := range w.Groups {
+		id := strings.TrimSpace(e.GroupID)
+		if id == "" {
+			continue
+		}
+		entry := auth.VendorAccessGroupEntry{GroupID: id}
+		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
+			entry.OverrideEnabled = true
+			entry.OverridePrefix = e.PrefixOverride.Value
+		}
+		out.Groups = append(out.Groups, entry)
+	}
 	return out
 }
 
 // EncodeVendorAccess serializes the policy. The strict default encodes to "" (the
 // column default) so "no access" round-trips as the empty string, not "{}".
 func EncodeVendorAccess(v auth.VendorAccess) string {
-	if !v.All && len(v.Accounts) == 0 {
+	if !v.All && !v.IncludeGroups && len(v.Accounts) == 0 && len(v.Groups) == 0 {
 		return ""
 	}
-	w := vendorAccessWire{All: v.All}
+	w := vendorAccessWire{All: v.All, IncludeGroups: v.IncludeGroups}
 	for _, e := range v.Accounts {
 		ew := vendorAccessEntryWire{AccountID: e.AccountID}
 		if e.OverrideEnabled {
 			ew.PrefixOverride = &prefixOverrideWire{Enabled: true, Value: e.OverridePrefix}
 		}
 		w.Accounts = append(w.Accounts, ew)
+	}
+	for _, e := range v.Groups {
+		ew := vendorAccessGroupWire{GroupID: e.GroupID}
+		if e.OverrideEnabled {
+			ew.PrefixOverride = &prefixOverrideWire{Enabled: true, Value: e.OverridePrefix}
+		}
+		w.Groups = append(w.Groups, ew)
 	}
 	b, err := json.Marshal(w)
 	if err != nil {

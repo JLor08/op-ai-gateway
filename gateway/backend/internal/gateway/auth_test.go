@@ -1082,3 +1082,10 @@ func TestLoginEnabledUserOffModeSkipsChallenge(t *testing.T) {
 		t.Fatalf("body = %s, want totp_mode:off", body)
 	}
 }
+
+func TestSessionPrincipalVendorAccessIncludesGroups(t *testing.T) {
+	p := sessionPrincipal(store.User{ID: "usr_1", Role: "user"}, false)
+	if !p.VendorAccess.All || !p.VendorAccess.IncludeGroups {
+		t.Fatalf("VendorAccess = %#v, want All && IncludeGroups", p.VendorAccess)
+	}
+}
