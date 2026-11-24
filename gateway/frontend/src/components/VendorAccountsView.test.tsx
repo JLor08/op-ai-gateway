@@ -60,8 +60,8 @@ const SUBSCRIPTION: Partial<VendorAccount> = {
 };
 
 // A connected OpenAI subscription: one kind of account the gateway can actively ask
-// for its usage (the refresh button and the on-view refresh); an OpenRouter or Kilo
-// api key is the other.
+// for its usage (the refresh button and the on-view refresh); a connected Anthropic
+// subscription and an OpenRouter or Kilo api key are the others.
 const OPENAI_SUBSCRIPTION: Partial<VendorAccount> = {
   id: 'va_oai_sub',
   vendor: 'openai',
@@ -2934,11 +2934,6 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           'va_key',
         ],
         [
-          'a connected Anthropic subscription',
-          makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true }),
-          'va_sub',
-        ],
-        [
           'an x.ai api-key account',
           makeVendorAccount({ id: 'va_key', vendor: 'xai', auth_type: 'api_key' }),
           'va_key',
@@ -3188,12 +3183,37 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         },
       );
 
+      // A connected Anthropic subscription has the Claude OAuth usage pull (the backend's
+      // hasActiveVendorUsagePull), so it gets the button and the one on-view refresh.
+      it('shows the button and fires ONE lazy refresh for a connected Anthropic subscription', async () => {
+        const account = makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true });
+        const { fakeApi } = renderView({
+          accounts: [account],
+          vendorAccount: async (id: string) =>
+            makeVendorAccount({ ...account, id, usage: makeUsage() }),
+        });
+        await openDetail();
+
+        await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+        const panel = screen.getByRole('region', { name: t.vendorUsageTitle });
+        expect(
+          within(panel).getByRole('button', { name: t.vendorUsageRefreshAction }),
+        ).toBeEnabled();
+        await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+        expect(fakeApi.refreshUsage.mock.calls[0]).toEqual(['va_sub']);
+      });
+
+      it('hides the button for an Anthropic subscription that was never connected', async () => {
+        const { fakeApi } = renderView({ accounts: [makeVendorAccount(SUBSCRIPTION)] });
+        await openDetail();
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(usageButton()).not.toBeInTheDocument();
+        expect(fakeApi.refreshUsage).not.toHaveBeenCalled();
+      });
+
       it.each([
         ['an OpenAI api-key account', makeVendorAccount({ id: 'va_key' })],
-        [
-          'a connected Anthropic subscription',
-          makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true }),
-        ],
         [
           'an Anthropic api-key account',
           makeVendorAccount({ id: 'va_key', vendor: 'anthropic', auth_type: 'api_key' }),

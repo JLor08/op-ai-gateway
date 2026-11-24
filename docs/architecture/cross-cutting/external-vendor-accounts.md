@@ -1623,7 +1623,7 @@ for discovery (§6.3): it must not be able to wipe a stored snapshot. The respon
 is capped at the same 8 MiB as a discovery fetch (§6.4).
 
 **When it runs.** There are **two pulls**, one per credential kind, sharing one
-store tail: `fetchVendorUsage` for an OpenAI subscription (the fetch with its
+store tail: `fetchVendorUsage` for an OpenAI or Anthropic subscription (the fetch with its
 token set, then the merge over the stored row and the store write) and
 `fetchCompatibleVendorUsage` for an OpenRouter or Kilo api key (the fetch with the
 opened key, then the store write of the snapshot as fetched, no merge; see the
@@ -1863,7 +1863,7 @@ its credit row, with no empty window placeholders. Under the rows the panel prin
 the last write, not a per-field freshness (§5.3).
 
 **Refreshing it from the panel.** For an account the gateway can actively ask — a
-connected **OpenAI subscription**, or an **OpenRouter or Kilo `api_key` account with
+connected **OpenAI or Anthropic subscription**, or an **OpenRouter or Kilo `api_key` account with
 a key stored** — the panel's frame also carries an "Aktualisieren"
 button ("Refresh") that calls the dedicated refresh with `?force=1` (§5.5), shows the
 answer inline by its `status` (an answer the gateway delivered is not an error:
@@ -1874,14 +1874,13 @@ the provider), and re-reads the snapshot; a call that itself failed is a toast. 
 same account also gets **one on-view-lazy refresh** (the plain call, no `force`) when
 its detail view opens, so figures that went stale while nobody looked are renewed
 without a click; it is best effort, its failure is silent and it never loops or
-polls. Every other account (an x.ai, Google, Google (native), Custom or native `api_key`, an Anthropic
-subscription) gets neither the button nor the call in the portal: it learns its usage from
-the requests it serves and, for an Anthropic subscription that sits in a group, from the
-throttled group pull (§12.5); the backend refresh endpoint itself does serve an Anthropic
-subscription, only the portal never offers it. The frontend names the two api-key vendors itself
-(`hasActiveUsagePull`), mirroring the registry's `UsageVia`; the backend registry
-is the authority, so a drift between the two only shows or hides a button, and the
-backend still answers `unsupported` for an account it cannot ask.
+polls. Every other account (an x.ai, Google, Google (native), Custom or native `api_key`) gets
+neither the button nor the call in the portal: it learns its usage from the requests it serves.
+The frontend names the accounts with a pull itself (`hasActiveUsagePull`: the two subscription
+vendors, mirroring the backend's `hasActiveVendorUsagePull`, and the two api-key vendors,
+mirroring the registry's `UsageVia`); the backend is the authority, so a drift between the two
+only shows or hides a button, and the backend still answers `unsupported` for an account it
+cannot ask.
 
 **On the dashboard.** The portal dashboard has a flag-gated section "Anbieter —
 Nutzung & Limits" (English "Providers — usage & limits") that shows the user's own
