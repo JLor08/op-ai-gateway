@@ -199,6 +199,11 @@ type MemoryStore struct {
 	// account-first like serverAdminGroups, so DeleteVendorAccount cascades it
 	// with one single-key delete.
 	vendorAccountAdminGroups map[string]map[string]time.Time
+	// vendorGroups mirrors vendor_account_groups (migration 114) and
+	// vendorGroupMembers vendor_account_group_members: groupID -> the member
+	// account ids in position order (position = index + 1).
+	vendorGroups       map[string]VendorAccountGroup
+	vendorGroupMembers map[string][]string
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -247,6 +252,8 @@ func NewMemoryStore() *MemoryStore {
 
 		resourceGroupVendorAccounts: map[string]map[string]time.Time{},
 		vendorAccountAdminGroups:    map[string]map[string]time.Time{},
+		vendorGroups:                map[string]VendorAccountGroup{},
+		vendorGroupMembers:          map[string][]string{},
 	}
 }
 
@@ -3467,6 +3474,7 @@ func (m *MemoryStore) DeleteVendorAccount(_ context.Context, id string) error {
 	delete(m.vendorAccountUsage, id)
 	delete(m.vendorAccountAdminGroups, id) // vendor_account_admin_groups (keyed account-first: one delete)
 	m.dropVendorAccountFromResourceGroupsLocked(id)
+	m.dropVendorAccountFromGroupsLocked(id) // vendor_account_group_members
 	return nil
 }
 

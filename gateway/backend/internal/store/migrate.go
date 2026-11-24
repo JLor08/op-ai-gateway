@@ -146,6 +146,7 @@ var migrations = []migration{
 	{version: 111, name: "token_claude_code_usage_display", up: migration111Up},
 	{version: 112, name: "token_usage_limit_switches", up: migration112Up},
 	{version: 113, name: "runtime_spec_process_tree", up: migration113Up},
+	{version: 114, name: "vendor_account_groups", up: migration114Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4872,4 +4873,52 @@ func migration112Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // step replayable on both dialects.
 func migration113Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "process_tree text not null default 'direct'")
+}
+
+// migration114Up creates the vendor account group tables and stamps usage rows
+// with the group that routed them. vendor_account_groups is a user's personal,
+// named, ordered set of their own vendor accounts of one vendor;
+// vendor_account_group_members is its link table, the twin of migration92Up's:
+// both sides are real foreign keys ON DELETE CASCADE (deleting the group, or a
+// member account, drops the link row; deleting the owner drops the group), the
+// unique pairs keep a member listed once and positions distinct, and the
+// vendor_account_id index serves the reverse lookup the unique pair's implicit
+// index (led by group_id) does not. The three threshold columns default to 99
+// (routing.DefaultVendorGroupThresholdPct).
+//
+// usage_events.vendor_group_id is the group's id on a request it served; the
+// empty-string default is every pre-upgrade row and every request outside a group.
+// Create-if-not-exists and addColumnIfMissing make a second run change nothing.
+func migration114Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists vendor_account_groups (
+			id text primary key,
+			owner_user_id text not null references users(id) on delete cascade,
+			vendor text not null,
+			name text not null,
+			model_prefix text not null default '',
+			status text not null default 'active',
+			threshold_five_hour_pct integer not null default 99,
+			threshold_weekly_pct integer not null default 99,
+			threshold_credits_pct integer not null default 99,
+			created_at ` + ts + ` not null,
+			updated_at ` + ts + ` not null
+		)`,
+		`create index if not exists idx_vendor_account_groups_owner on vendor_account_groups(owner_user_id)`,
+		`create table if not exists vendor_account_group_members (
+			group_id text not null references vendor_account_groups(id) on delete cascade,
+			vendor_account_id text not null references vendor_accounts(id) on delete cascade,
+			position integer not null,
+			unique(group_id, vendor_account_id),
+			unique(group_id, position)
+		)`,
+		`create index if not exists idx_vendor_account_group_members_vendor_account on vendor_account_group_members(vendor_account_id)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return addColumnIfMissing(ctx, tx, dl, "usage_events", "vendor_group_id text not null default ''")
 }

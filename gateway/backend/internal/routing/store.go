@@ -3678,6 +3678,7 @@ type Store interface {
 	RuntimeStore
 	RPCClusterStore
 	VendorAccountStore
+	VendorAccountGroupStore
 }
 
 // applicationHasAPIFlavor reports whether the application serves the flavor.
