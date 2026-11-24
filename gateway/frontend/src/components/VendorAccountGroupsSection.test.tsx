@@ -130,6 +130,30 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByText(t.vendorUsageFiveHour)).toBeTruthy();
     });
 
+    it('labels an over-threshold member by its window and a cooldown by its state, never with the raw reason code', async () => {
+      const group = makeGroup({
+        members: [
+          member({ state: 'over_threshold', reason: 'weekly', pct: 95 }),
+          member({
+            account_id: 'va_b',
+            account_name: 'Max B',
+            position: 2,
+            state: 'cooldown',
+            reason: 'cooldown',
+            cooldowns: [{ model: 'claude-opus-4-5', until: '2026-11-24T12:01:00Z' }],
+            free_at: '2026-11-24T12:01:00Z',
+          }),
+        ],
+      });
+      renderSection(makeApi([group]));
+
+      expect(await screen.findByText(`${t.dashboardVendorGroupWindowWeekly} 95 %`)).toBeTruthy();
+      expect(screen.getByText(t.vendorGroupStateOverThreshold)).toBeTruthy();
+      expect(screen.getByText(t.vendorGroupStateCooldown)).toBeTruthy();
+      expect(screen.queryByText('weekly')).toBeNull();
+      expect(screen.queryByText('cooldown')).toBeNull();
+    });
+
     it('shows the empty state without groups', async () => {
       renderSection(makeApi([]));
       expect(await screen.findByText(t.vendorGroupsEmpty)).toBeTruthy();

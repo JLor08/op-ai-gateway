@@ -6,7 +6,7 @@ import type { VendorAccountGroup, VendorAccountGroupMember } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { usePolledFetch } from './shared/usePolledFetch';
-import { reasonLabel } from './shared/vendorGroupLabels';
+import { overThresholdDetail, reasonLabel } from './shared/vendorGroupLabels';
 
 // Same cadence as DashboardVendorUsage: the group list is a database read of what
 // the gateway already knows (it never reaches a vendor), so a minute is gentle.
@@ -14,20 +14,6 @@ const GROUPS_POLL_MS = 60_000;
 
 const localTime = (iso: string) =>
   new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-// The blocking category the backend reports in `reason` of an over-threshold member.
-function windowLabel(t: Translation, reason: string): string {
-  switch (reason) {
-    case 'five_hour':
-      return t.dashboardVendorGroupWindowFiveHour;
-    case 'weekly':
-      return t.dashboardVendorGroupWindowWeekly;
-    case 'credits':
-      return t.dashboardVendorGroupWindowCredits;
-    default:
-      return '';
-  }
-}
 
 function memberLine(t: Translation, member: VendorAccountGroupMember): string {
   switch (member.state) {
@@ -38,7 +24,7 @@ function memberLine(t: Translation, member: VendorAccountGroupMember): string {
     case 'over_threshold': {
       if (member.pct === undefined) return t.dashboardVendorGroupLineOverThresholdBare;
       return t.dashboardVendorGroupLineOverThreshold(
-        `${windowLabel(t, member.reason)} ${member.pct} %`.trim(),
+        overThresholdDetail(t, member),
         member.free_at ? localTime(member.free_at) : '',
       );
     }

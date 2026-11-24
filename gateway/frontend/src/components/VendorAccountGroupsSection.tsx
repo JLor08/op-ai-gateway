@@ -21,7 +21,7 @@ import DeleteIcon from '@mui/icons-material/Delete';
 import EditIcon from '@mui/icons-material/Edit';
 import type { BadgeStatus, PortalApi, Translation } from './shared/types';
 import type { VendorAccount, VendorAccountGroup, VendorAccountGroupMember } from '../api';
-import { reasonLabel } from './shared/vendorGroupLabels';
+import { memberReasonCaption } from './shared/vendorGroupLabels';
 import { formatPortalError } from './shared/format';
 import { useLatestFetch } from './shared/useLatestFetch';
 import { Panel } from './shared/Panel';
@@ -88,6 +88,7 @@ function isThreshold(raw: string): boolean {
 }
 
 function MemberRow({ t, member }: Readonly<{ t: Translation; member: VendorAccountGroupMember }>) {
+  const caption = memberReasonCaption(t, member);
   return (
     <Box sx={{ py: 1, borderTop: 1, borderColor: 'divider' }}>
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
@@ -96,9 +97,9 @@ function MemberRow({ t, member }: Readonly<{ t: Translation; member: VendorAccou
         </Typography>
         <Typography>{ownedLabel(t, member.account_name, member.owner_name)}</Typography>
         <StatusChip status={stateBadge(member.state)} label={stateLabel(t, member.state)} />
-        {member.reason !== '' && (
+        {caption !== '' && (
           <Typography variant="caption" color="text.secondary">
-            {reasonLabel(t, member.reason)}
+            {caption}
           </Typography>
         )}
         {member.free_at && (
