@@ -39,6 +39,9 @@ Anthropic API key as the reserve at the end".
 - The **dashboard** shows, per group, which member is active and why the ones
   before it are skipped.
 - Groups are managed under the existing **"Anbieter" (Providers)** menu item.
+- The owner's usage opt-in `share_usage_with_members` ("Nutzung teilen")
+  defaults to **on** for newly created accounts (§10.1), so shared members of a
+  group normally take part in the thresholds.
 
 **Non-goals (this project)**
 
@@ -421,6 +424,20 @@ accounts with the same checkbox + prefix override; the existing checkbox
 Everything is behind the existing `vendor_accounts_enabled` master flag; no new
 feature flag.
 
+### 10.1 "Nutzung teilen" defaults to on (user decision)
+
+`vendor_accounts.share_usage_with_members` (migration 110, today default off,
+set through `PUT /api/portal/vendor-accounts/{id}/share-usage`) becomes **on by
+default for every account created after this change**: the create path sets it
+to `true`, and the create form shows the toggle ticked. The owner can still
+switch it off at any time.
+
+**Existing accounts keep their stored value** (designer's call): a stored "off"
+cannot be told apart from a deliberate choice, so no data migration flips it.
+The column default in the schema may stay `0`; the service decides the value at
+create. The docs that call the setting an "opt-in" (vendor doc §1.3, §8.2,
+ADR-108 entitlement bullet) are updated to "default on for new accounts".
+
 ## 11. Persistence and API
 
 - New tables `vendor_account_groups` and `vendor_account_group_members`, new
@@ -450,6 +467,8 @@ feature flag.
 - "Active member" on the dashboard is model-independent (§9).
 - Cooldown default 60 s; pull throttle 15 min; both in-memory.
 - No new feature flag.
+- "Nutzung teilen" default on applies to **new** accounts only; existing
+  accounts keep their stored value (§10.1).
 - Per-model weekly windows are left to the limit-error failover.
 
 **Decided by the user:** a shared member whose owner has **not** switched on
