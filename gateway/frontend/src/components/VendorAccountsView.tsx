@@ -31,6 +31,7 @@ import {
 import { vendorAccountAccess } from './shared/vendorAccountAccess';
 import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountReadOnlyDetail } from './VendorAccountReadOnlyDetail';
+import { VendorAccountGroupsSection } from './VendorAccountGroupsSection';
 import { VendorAccountResourceGroupsSection } from './VendorAccountResourceGroupsSection';
 import { VendorAccountSharePanel, VendorAccountSharingOffPanel } from './VendorAccountSharePanel';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
@@ -168,6 +169,11 @@ export function VendorAccountsView({
     | 'vendorAccountResourceGroups'
     | 'joinVendorAccountResourceGroup'
     | 'leaveVendorAccountResourceGroup'
+    | 'vendorAccountGroups'
+    | 'createVendorAccountGroup'
+    | 'updateVendorAccountGroup'
+    | 'deleteVendorAccountGroup'
+    | 'setVendorAccountGroupMembers'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -1045,6 +1051,9 @@ export function VendorAccountsView({
           loading={loading || accountsData === null}
         />
       </Panel>
+      <Box sx={{ mt: 3 }}>
+        <VendorAccountGroupsSection t={t} api={api} />
+      </Box>
     </>
   );
 }

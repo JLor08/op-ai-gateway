@@ -287,6 +287,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       joinVendorAccountResourceGroup: vi.fn<PortalApi['joinVendorAccountResourceGroup']>(
         async () => ({ ok: true }),
       ),
+      // The Groups section below the list reads the groups; none by default.
+      vendorAccountGroups: vi.fn<PortalApi['vendorAccountGroups']>(async () => ({ groups: [] })),
+      createVendorAccountGroup: vi.fn<PortalApi['createVendorAccountGroup']>(),
+      updateVendorAccountGroup: vi.fn<PortalApi['updateVendorAccountGroup']>(),
+      deleteVendorAccountGroup: vi.fn<PortalApi['deleteVendorAccountGroup']>(),
+      setVendorAccountGroupMembers: vi.fn<PortalApi['setVendorAccountGroupMembers']>(),
       leaveVendorAccountResourceGroup: vi.fn<PortalApi['leaveVendorAccountResourceGroup']>(
         async () => ({ ok: true }),
       ),
