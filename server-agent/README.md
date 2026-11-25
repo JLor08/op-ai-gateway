@@ -1425,8 +1425,10 @@ limit as for the hostpower endpoint):
   the counters were read; a cached response repeats it. The agent divides the
   energy delta by the difference of two `read_ns` values, so a cached reading
   is never misread as 0 W: it yields no value and the next fresh one covers the
-  whole span. At the 250 ms interval floor about every other helper sample is
-  therefore empty; at the 1 s default every sample is fresh. Against a helper
+  whole span. At the 250 ms interval floor about every other helper sample
+  therefore carries no value, and that metric falls through to the next source
+  (hwmon, hostpower, LHM) or stays empty for that sample; at the 1 s default
+  every sample is fresh. Against a helper
   without `read_ns` the agent times the delta with its own clock. An empty
   list is valid (no RAPL); the helper warns at startup
   (`helper: no readable RAPL zone`) and keeps running.

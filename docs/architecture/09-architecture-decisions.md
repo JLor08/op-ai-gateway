@@ -13892,8 +13892,8 @@ reports.
   false boundary that suggests protection it cannot give.
 - *Fresh RAPL reads per request:* every same-uid reader could sample as fast as the socket allows, which is what the side channel needs. The
   250 ms cache costs the agent no accuracy: Δt comes from the helper's read timestamp, so a cached reading is never misread as 0 W. At the
-  250 ms interval floor about every other helper sample is empty (nil) because the cache has not refreshed; at the 1 s default every sample is
-  fresh.
+  250 ms interval floor about every other helper sample carries no value because the cache has not refreshed, and that metric falls through to
+  the next source (hwmon, hostpower, LHM) or stays empty for that sample; at the 1 s default every sample is fresh.
 
 **Consequences.**
 
@@ -13907,7 +13907,7 @@ reports.
   deny, directory and socket permissions, stale and live sockets) and a local Linux-container run (helper as root, clients as uid 1000, uid 2000
   and root). Real RAPL, a real DMI table compared with `dmidecode -t memory`, and the systemd unit under `systemd-analyze security` are a
   step-by-step checklist in the agent README; the example unit's capability and system-call sets are **unverified** until then.
-- Agent version 0.24.0; no new `agent.Features` entry (no wire change).
+- Agent version 0.24.0; no new `agent.Features` entry (no agent↔gateway wire change).
 - → [Telemetry §8.2.3](cross-cutting/telemetry-usage-observability.md#823-power-draw-watts),
   [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
   [Config env](reference/config-env.md),
