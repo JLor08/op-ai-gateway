@@ -118,9 +118,16 @@ to a read-only bind mount of that directory (for example
 `/run/op-hostpower-ro`, established from fstab before PVE autostarts VMs), so a
 guest cannot write into its share, and runs the unit with `ProtectSystem=strict`,
 `ReadWritePaths` limited to the out directory, `NoNewPrivileges` and
-`PrivateTmp`. It is not an enrolled agent: it has no token,
-never contacts the gateway and opens no listener
-([ADR-115](09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs)).
+`PrivateTmp`, and with `StateDirectoryMode=0700`. A guest receives its counter over
+virtiofs (Linux tree `<vmid>/intel-rapl:0`, Windows tree `<vmid>/windows/intel-rapl_0`)
+or over HTTP: with `-listen <bridge-address>:9873` the service serves `GET /v1/energy`
+on the host's address on the VM bridge (off unless set), identifying the VM by the
+`tap<vmid>i<n>` interface the connection entered (MAC mode, needs `CAP_NET_RAW`) or by
+a per-VM token whose SHA-256 sits in `/etc/op-hostpower/tokens.json` (`0600`, managed
+with `server-agent hostpower token`). It is not an enrolled agent: it has no gateway
+token and never contacts the gateway; its only listener is that optional HTTP endpoint
+([ADR-115](09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs),
+[ADR-116](09-architecture-decisions.md#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token)).
 
 **An AI server that is a llama.cpp RPC cluster member opens one more listener per
 member** ([ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)).
