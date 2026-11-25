@@ -354,7 +354,7 @@ naming chat completions exclusively.
 **The portal models listing is a further consumer, with a stricter rule.**
 `GET /api/portal/models` reads the same header from a **session** caller and
 computes the listing for the token's principal, so the chat picker shows what a
-run with that token can use ([ADR-113](../09-architecture-decisions.md#adr-113--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token)).
+run with that token can use ([ADR-114](../09-architecture-decisions.md#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token)).
 It runs the same `AuthorizeRunAsToken` gate, but where the inference handlers
 **silently ignore** the header for a bearer caller, this endpoint **refuses**: a
 bearer caller (`token.ID != ""`) sending it gets `403 portal.token_forbidden`,

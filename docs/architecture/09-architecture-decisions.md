@@ -3663,7 +3663,7 @@ reach is the "unknown" `400`), so only an entry naming an **own** account goes u
 and rests on the backstop, and a policy now names accounts its principal can *reach*, not
 only ones the owner owns, though it still never widens that reach.
 
-**Amended by [ADR-113](#adr-113--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token) (chat-session policy).** Decision (e) no longer
+**Amended by [ADR-114](#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token) (chat-session policy).** Decision (e) no longer
 holds as written: the interactive session (and the trusted loopback chat) carries the owner's
 **stored** chat-session policy, which defaults to `all: true` plus groups when never configured,
 and may be narrowed, even to nothing, or may name a shared account. A run-as token still replaces
@@ -5120,7 +5120,7 @@ the key or hands a delegate the owner's token.
   session, which is always `all: true`), never a shared one, so borrowing another owner's
   credential is always a deliberate, named choice; an `all: true` policy may still carry
   an entry naming a non-own account, which is a live opt-in validated like any other.
-  (Amended by [ADR-113](#adr-113--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token): the portal session carries the owner's stored chat-session
+  (Amended by [ADR-114](#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token): the portal session carries the owner's stored chat-session
   policy, `all: true` plus groups only while it is unset, so a named shared account is reachable from the
   token-less chat.)
   The own-versus-shared line is one function (`TokenOwnsVendorAccount`). The save-time
@@ -13623,7 +13623,7 @@ rank equalled the rocm-smi card order.
 - With real device totals, ADR-083's auto-detected VRAM budgets now apply on AMD hosts running rocm-smi 4.x.
 - → [Agent Runtime Manager §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
   [Telemetry](cross-cutting/telemetry-usage-observability.md).
-## ADR-113 — The token-less chat session carries a stored per-user vendor policy, and the models listing can be read as a run-as token
+## ADR-114 — The token-less chat session carries a stored per-user vendor policy, and the models listing can be read as a run-as token
 
 **Context.** ADR-050 (e) fixed the owner's interactive session at `all: true`, because the session has no `api_tokens` row to opt in on. Two
 needs collided with it. A user wanted the token-less portal chat to stop offering some or all vendor accounts (and to reach a shared account
