@@ -1975,3 +1975,41 @@ func TestHostpowerOptionsResolution(t *testing.T) {
 		t.Fatalf("env over file = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
 	}
 }
+
+func TestLoadWarnsOnHostpowerOptions(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	for _, tc := range []struct {
+		name, url, token string
+		want             string // substring of the one warning; "" = no warning
+	}{
+		{"url only", "http://192.0.2.10:9873", "", ""},
+		{"https with token", "https://192.0.2.10:9873/", "ophp_tok", ""},
+		{"nothing", "", "", ""},
+		{"token without url", "", "ophp_tok", "hostpower_url is empty"},
+		{"no scheme", "192.0.2.10:9873", "", "http:// or https://"},
+		{"host only", "192.0.2.10", "", "http:// or https://"},
+		{"other scheme", "ftp://192.0.2.10:9873", "", "http:// or https://"},
+		{"no host", "http:///v1", "", "with a host"},
+		{"unparsable", "http://[::1", "ophp_tok", "with a host"},
+	} {
+		env := map[string]string{"OP_AGENT_HOSTPOWER_URL": tc.url, "OP_AGENT_HOSTPOWER_TOKEN": tc.token}
+		cfg, err := Load(base, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("%s: Load must still succeed: %v", tc.name, err)
+		}
+		if tc.want == "" {
+			if len(cfg.Warnings) != 0 {
+				t.Errorf("%s: Warnings = %v, want none", tc.name, cfg.Warnings)
+			}
+			continue
+		}
+		if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], tc.want) {
+			t.Errorf("%s: Warnings = %v, want one containing %q", tc.name, cfg.Warnings, tc.want)
+		}
+		for _, w := range cfg.Warnings {
+			if tc.token != "" && strings.Contains(w, tc.token) {
+				t.Errorf("%s: warning leaks the token: %q", tc.name, w)
+			}
+		}
+	}
+}

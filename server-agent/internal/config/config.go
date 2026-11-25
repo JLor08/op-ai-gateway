@@ -654,8 +654,27 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
-	cfg.Warnings = runtimeAllowlistWarnings(cfg, fileKeys, getenv)
+	cfg.Warnings = append(runtimeAllowlistWarnings(cfg, fileKeys, getenv), hostpowerWarnings(cfg)...)
 	return cfg, nil
+}
+
+// hostpowerWarnings returns the startup warnings for the hostpower HTTP
+// options: a token without a URL (the token is unused) and a URL the guest
+// collector cannot use (no http:// or https:// scheme, or no host). The agent
+// starts regardless; a warning never contains the token or the URL itself
+// (a URL may carry a password in its userinfo).
+func hostpowerWarnings(cfg Config) []string {
+	var w []string
+	if cfg.HostpowerToken != "" && cfg.HostpowerURL == "" {
+		w = append(w, "hostpower_token is set but hostpower_url is empty: the token is unused and the hostpower HTTP source stays off")
+	}
+	if cfg.HostpowerURL != "" {
+		u, err := url.Parse(cfg.HostpowerURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			w = append(w, "hostpower_url must be an http:// or https:// URL with a host (for example http://<host>:9873); every hostpower request will fail")
+		}
+	}
+	return w
 }
 
 // removedWSLSettings maps each removed WSL allowlist setting (config key and

@@ -62,6 +62,11 @@ func openVMRoot(vmDir string, create bool) (*os.Root, error) {
 			return nil, err
 		}
 	}
+	// The Lstat and the OpenRoot below are two steps, which is safe only
+	// because <out> is host-owned with mode 0700 (no unprivileged host
+	// process can swap <vmid> in between) and a guest's share starts at
+	// <vmid> (or below it, <vmid>/windows), so a guest cannot replace its
+	// own share root with a symlink.
 	fi, err := out.Lstat(name)
 	if err != nil {
 		return nil, err

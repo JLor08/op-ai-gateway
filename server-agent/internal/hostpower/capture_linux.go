@@ -28,6 +28,12 @@ const (
 	// can make a VM's request fail. Counting drops via PACKET_STATISTICS is
 	// deferred.
 	captureRcvBuf = 4 << 20
+
+	// solPacket and packetIgnoreOutgoing are SOL_PACKET and
+	// PACKET_IGNORE_OUTGOING from linux/socket.h and linux/if_packet.h
+	// (Linux 4.20+); package syscall does not define the latter.
+	solPacket            = 263
+	packetIgnoreOutgoing = 23
 )
 
 // htons converts v to network byte order as the kernel expects it in a
@@ -50,6 +56,12 @@ func StartCapture(ctx context.Context, port uint16, table *ObservationTable, log
 	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, int(htons(syscall.ETH_P_ALL)))
 	if err != nil {
 		return fmt.Errorf("hostpower: open packet socket: %w", err)
+	}
+	// Let the kernel skip frames the host sends, which only cost CPU: the
+	// read loop drops PACKET_OUTGOING frames itself, so an older kernel
+	// without the option loses nothing but that saving.
+	if err := syscall.SetsockoptInt(fd, solPacket, packetIgnoreOutgoing, 1); err != nil {
+		log.Debug("hostpower: kernel cannot ignore outgoing frames on the packet socket", "err", err)
 	}
 	// Frames queued between socket() and the filter attach are unfiltered;
 	// the userspace re-check in the read loop drops what does not belong.
