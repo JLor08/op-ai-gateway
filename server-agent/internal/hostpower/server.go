@@ -18,12 +18,30 @@ import (
 	"time"
 )
 
+// Request limits. The source limit applies before identification and
+// protects the MAC-mode resolver's wait from a flood; it is generous so that
+// many guests behind one NAT address stay under it. The VM limit applies once
+// a request is tied to a VM and holds each VM to a little above a 1 Hz
+// poller's needs.
 const (
-	rateLimitPerSecond = 10.0
-	rateLimitBurst     = 20.0
-	sourceIdleTTL      = time.Minute
-	sourceSweepEvery   = time.Second
-	maxSources         = 10000
+	sourceRatePerSecond = 100.0
+	sourceRateBurst     = 200.0
+	vmRatePerSecond     = 10.0
+	vmRateBurst         = 20.0
+	limitIdleTTL        = time.Minute
+	stateSweepEvery     = time.Second
+	maxSources          = 10000
+	maxVMs              = 10000
+
+	// rejectLogEvery bounds the Warn lines per (source IP, reason).
+	rejectLogEvery = 10 * time.Minute
+	maxLogKeys     = 10000
+)
+
+// Rejection reasons of the two request limits.
+const (
+	reasonRateSource = "rate limited (source)"
+	reasonRateVM     = "rate limited (vm)"
 )
 
 // AuthModes selects which identification modes the HTTP endpoint accepts.
@@ -60,13 +78,71 @@ type tokenLookup interface {
 	Lookup(token string) (string, bool)
 }
 
-// sourceState is the per-source-IP rate-limit bucket and log state.
-type sourceState struct {
-	tokens     float64
-	refilled   time.Time
-	lastSeen   time.Time
-	lastReason string // non-empty while the source's latest verdict is a rejection
+// bucket is one token bucket.
+type bucket struct {
+	tokens   float64
+	refilled time.Time
+	lastSeen time.Time
 }
+
+// limiter holds one token bucket per key. Idle buckets are swept lazily (an
+// idle bucket is full again, so dropping it changes nothing) and the map
+// never exceeds max keys. It is not safe for concurrent use.
+type limiter struct {
+	rate, burst float64
+	max         int
+	buckets     map[string]*bucket
+	lastSweep   time.Time
+}
+
+func newLimiter(rate, burst float64, maxKeys int) *limiter {
+	return &limiter{rate: rate, burst: burst, max: maxKeys, buckets: make(map[string]*bucket)}
+}
+
+func (l *limiter) allow(key string, now time.Time) bool {
+	if now.Sub(l.lastSweep) >= stateSweepEvery {
+		l.lastSweep = now
+		for k, b := range l.buckets {
+			if now.Sub(b.lastSeen) > limitIdleTTL {
+				delete(l.buckets, k)
+			}
+		}
+	}
+	b, ok := l.buckets[key]
+	if !ok {
+		if len(l.buckets) >= l.max {
+			evictOldest(l.buckets, func(b *bucket) time.Time { return b.lastSeen })
+		}
+		b = &bucket{tokens: l.burst, refilled: now}
+		l.buckets[key] = b
+	}
+	if el := now.Sub(b.refilled).Seconds(); el > 0 {
+		b.tokens = min(l.burst, b.tokens+el*l.rate)
+		b.refilled = now
+	}
+	b.lastSeen = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// evictOldest deletes the entry of m with the oldest time.
+func evictOldest[K comparable, V any](m map[K]V, at func(V) time.Time) {
+	var oldestKey K
+	var oldest time.Time
+	first := true
+	for k, v := range m {
+		if t := at(v); first || t.Before(oldest) {
+			oldestKey, oldest, first = k, t, false
+		}
+	}
+	delete(m, oldestKey)
+}
+
+// logKey identifies one rejection log stream.
+type logKey struct{ ip, reason string }
 
 type handler struct {
 	modes    AuthModes
@@ -77,20 +153,26 @@ type handler struct {
 	now      func() time.Time
 
 	mu        sync.Mutex
-	sources   map[string]*sourceState
-	lastSweep time.Time
+	sources   *limiter             // per source IP, before identification
+	vms       *limiter             // per VM ID, after identification
+	logged    map[logKey]time.Time // last Warn per (source IP, reason)
+	lastLogGC time.Time
 }
 
 func newHandler(modes AuthModes, counters counterSource, resolver vmResolver, tokens tokenLookup, log *slog.Logger, now func() time.Time) http.Handler {
 	return &handler{
 		modes: modes, counters: counters, resolver: resolver, tokens: tokens,
-		log: log, now: now, sources: make(map[string]*sourceState),
+		log: log, now: now,
+		sources: newLimiter(sourceRatePerSecond, sourceRateBurst, maxSources),
+		vms:     newLimiter(vmRatePerSecond, vmRateBurst, maxVMs),
+		logged:  make(map[logKey]time.Time),
 	}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ip := sourceIP(r.RemoteAddr)
-	if !h.allow(ip) {
+	if !h.allow(h.sources, ip) {
+		h.noteRejected(ip, "", "", reasonRateSource)
 		plain(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
@@ -106,18 +188,23 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	vmid, mode, reason, ok := h.identify(r)
 	if !ok {
-		h.noteRejected(ip, mode, reason)
+		h.noteRejected(ip, mode, "", reason)
 		plain(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if !h.allow(h.vms, vmid) {
+		h.noteRejected(ip, mode, vmid, reasonRateVM)
+		plain(w, http.StatusTooManyRequests, "too many requests")
 		return
 	}
 
 	energy, live := h.counters.LiveCounter(vmid)
 	if !live {
-		h.noteRejected(ip, mode, "not live")
+		h.noteRejected(ip, mode, vmid, "not live")
 		plain(w, http.StatusServiceUnavailable, "not ready")
 		return
 	}
-	h.noteAccepted(ip, mode)
+	h.log.Debug("hostpower: request served", "remote", ip, "vmid", vmid, "mode", mode)
 	body, err := json.Marshal(collector.HostpowerEnergy{
 		VMID: vmid, EnergyUJ: energy, MaxEnergyRangeUJ: MaxEnergyRangeUJ,
 	})
@@ -184,73 +271,49 @@ func sourceIP(remoteAddr string) string {
 	return remoteAddr
 }
 
-// state returns ip's entry, creating it (full bucket) when absent. Caller holds mu.
-func (h *handler) state(ip string, now time.Time) *sourceState {
-	if now.Sub(h.lastSweep) >= sourceSweepEvery {
-		h.lastSweep = now
-		for k, s := range h.sources {
-			if now.Sub(s.lastSeen) > sourceIdleTTL {
-				delete(h.sources, k)
-			}
-		}
-	}
-	s, ok := h.sources[ip]
-	if ok {
-		return s
-	}
-	if len(h.sources) >= maxSources {
-		var oldestKey string
-		var oldest time.Time
-		first := true
-		for k, v := range h.sources {
-			if first || v.lastSeen.Before(oldest) {
-				oldestKey, oldest, first = k, v.lastSeen, false
-			}
-		}
-		delete(h.sources, oldestKey)
-	}
-	s = &sourceState{tokens: rateLimitBurst, refilled: now, lastSeen: now}
-	h.sources[ip] = s
-	return s
-}
-
-func (h *handler) allow(ip string) bool {
+func (h *handler) allow(l *limiter, key string) bool {
 	now := h.now()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	s := h.state(ip, now)
-	if el := now.Sub(s.refilled).Seconds(); el > 0 {
-		s.tokens = min(rateLimitBurst, s.tokens+el*rateLimitPerSecond)
-		s.refilled = now
-	}
-	s.lastSeen = now
-	if s.tokens < 1 {
-		return false
-	}
-	s.tokens--
-	return true
+	return l.allow(key, now)
 }
 
-func (h *handler) noteRejected(ip, mode, reason string) {
+// noteRejected logs a rejected request at Warn, at most once every
+// rejectLogEvery per (source IP, reason), so neither a misconfigured guest
+// nor many guests behind one NAT address flood the log. vmid is empty when
+// the request was not identified. Never logs a credential.
+func (h *handler) noteRejected(ip, mode, vmid, reason string) {
+	now := h.now()
 	h.mu.Lock()
-	s := h.state(ip, h.now())
-	changed := s.lastReason != reason
-	s.lastReason = reason
-	h.mu.Unlock()
-	if changed {
-		h.log.Warn("hostpower: request rejected", "remote", ip, "reason", reason, "mode", mode)
+	if now.Sub(h.lastLogGC) >= stateSweepEvery {
+		h.lastLogGC = now
+		for k, at := range h.logged {
+			if now.Sub(at) >= rejectLogEvery {
+				delete(h.logged, k)
+			}
+		}
 	}
-}
-
-func (h *handler) noteAccepted(ip, mode string) {
-	h.mu.Lock()
-	s := h.state(ip, h.now())
-	recovered := s.lastReason != ""
-	s.lastReason = ""
-	h.mu.Unlock()
-	if recovered {
-		h.log.Info("hostpower: request accepted again", "remote", ip, "mode", mode)
+	key := logKey{ip: ip, reason: reason}
+	last, seen := h.logged[key]
+	emit := !seen || now.Sub(last) >= rejectLogEvery
+	if emit {
+		if !seen && len(h.logged) >= maxLogKeys {
+			evictOldest(h.logged, func(t time.Time) time.Time { return t })
+		}
+		h.logged[key] = now
 	}
+	h.mu.Unlock()
+	if !emit {
+		return
+	}
+	attrs := []any{"remote", ip, "reason", reason}
+	if mode != "" {
+		attrs = append(attrs, "mode", mode)
+	}
+	if vmid != "" {
+		attrs = append(attrs, "vmid", vmid)
+	}
+	h.log.Warn("hostpower: request rejected", attrs...)
 }
 
 func plain(w http.ResponseWriter, code int, msg string) {

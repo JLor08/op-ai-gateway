@@ -113,7 +113,7 @@ func newRig(modes AuthModes) *testRig {
 	rig.h = newHandler(modes,
 		fakeCounters{"100": 7, "101": 9},
 		rig.resolver,
-		fakeTokens{"ophp_secret": "100"},
+		fakeTokens{"ophp_secret": "100", "ophp_other": "101"},
 		slog.New(rig.logs),
 		func() time.Time { return *rig.clock },
 	)
@@ -256,7 +256,46 @@ func TestHandlerMethodAndPath(t *testing.T) {
 	}
 }
 
-func TestHandlerRateLimit(t *testing.T) {
+// warnsWith returns the Warn lines that contain all of parts.
+func (h *srvRecorder) warnsWith(parts ...string) []string {
+	var out []string
+	for _, l := range h.dump() {
+		if !strings.HasPrefix(l, "WARN ") {
+			continue
+		}
+		match := true
+		for _, p := range parts {
+			match = match && strings.Contains(l, p)
+		}
+		if match {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func TestHandlerVMRateLimit(t *testing.T) {
+	rig := newRig(AuthModes{MAC: true, Token: true})
+	for i := 1; i <= 25; i++ {
+		code := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer ophp_secret").Code
+		if want := map[bool]int{true: 200, false: 429}[i <= 20]; code != want {
+			t.Fatalf("request %d: code = %d, want %d", i, code, want)
+		}
+	}
+	if got := rig.logs.warnsWith("reason=rate limited (vm)", "vmid=100", "remote=192.0.2.10"); len(got) != 1 {
+		t.Fatalf("vm 429 warns = %v, want one: %v", got, rig.logs.dump())
+	}
+	// Another VM from the same address has its own bucket.
+	if rec := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer ophp_other"); rec.Code != 200 {
+		t.Fatalf("other VM code = %d", rec.Code)
+	}
+	*rig.clock = rig.clock.Add(time.Second)
+	if rec := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer ophp_secret"); rec.Code != 200 {
+		t.Fatalf("after refill code = %d", rec.Code)
+	}
+}
+
+func TestHandlerVMRateLimitAppliesInMACMode(t *testing.T) {
 	rig := newRig(AuthModes{MAC: true})
 	var last int
 	for range 21 {
@@ -265,16 +304,108 @@ func TestHandlerRateLimit(t *testing.T) {
 	if last != 429 {
 		t.Fatalf("21st request code = %d", last)
 	}
-	if rec := rig.do(http.MethodGet, energyPath, "192.0.2.11:4000", ""); rec.Code != 200 {
+	// The VM, not the address, is limited: VM 101 from another address too.
+	if rec := rig.do(http.MethodGet, energyPath, "192.0.2.11:4000", ""); rec.Code != 429 {
+		t.Fatalf("same VM from other IP code = %d", rec.Code)
+	}
+}
+
+func TestHandlerSourceRateLimit(t *testing.T) {
+	rig := newRig(AuthModes{MAC: true, Token: true})
+	for i := 1; i <= 201; i++ {
+		code := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer wrong").Code
+		if want := map[bool]int{true: 401, false: 429}[i <= 200]; code != want {
+			t.Fatalf("request %d: code = %d, want %d", i, code, want)
+		}
+	}
+	if got := rig.logs.warnsWith("reason=rate limited (source)", "remote=192.0.2.10"); len(got) != 1 {
+		t.Fatalf("source 429 warns = %v, want one: %v", got, rig.logs.dump())
+	}
+	// A source-limited request never reaches identification.
+	rig2 := newRig(AuthModes{MAC: true})
+	for range 201 {
+		rig2.do(http.MethodGet, "/x", "192.0.2.10:4000", "")
+	}
+	if rec := rig2.do(http.MethodGet, energyPath, "192.0.2.10:4000", ""); rec.Code != 429 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if got := rig2.resolver.callCount(); got != 0 {
+		t.Fatalf("resolver calls = %d, want 0", got)
+	}
+	if rec := rig2.do(http.MethodGet, energyPath, "192.0.2.11:4000", ""); rec.Code != 200 {
 		t.Fatalf("other IP code = %d", rec.Code)
 	}
-	// Rejected-by-limit requests never reached the resolver.
-	if got := rig.resolver.callCount(); got != 21 {
-		t.Fatalf("resolver calls = %d, want 21 (20 + other IP)", got)
+}
+
+func TestHandlerManyVMsBehindOneAddressNeverLimited(t *testing.T) {
+	// Token mode behind NAT: two guests share one source address and poll
+	// at 1 Hz each.
+	rig := newRig(AuthModes{Token: true})
+	for sec := range 600 {
+		for _, tok := range []string{"ophp_secret", "ophp_other"} {
+			if rec := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer "+tok); rec.Code != 200 {
+				t.Fatalf("second %d, %s: code = %d", sec, tok, rec.Code)
+			}
+		}
+		*rig.clock = rig.clock.Add(time.Second)
 	}
-	*rig.clock = rig.clock.Add(time.Second)
-	if rec := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", ""); rec.Code != 200 {
-		t.Fatalf("after refill code = %d", rec.Code)
+	if n := rig.logs.count(slog.LevelWarn) + rig.logs.count(slog.LevelInfo); n != 0 {
+		t.Fatalf("logs above Debug for successful requests: %v", rig.logs.dump())
+	}
+}
+
+func TestHandlerRejectionLoggedOncePerTenMinutes(t *testing.T) {
+	rig := newRig(AuthModes{Token: true})
+	t0 := *rig.clock
+	for range 50 {
+		rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer wrong")
+		*rig.clock = rig.clock.Add(10 * time.Second)
+	}
+	if got := rig.logs.warnsWith("reason=unknown token"); len(got) != 1 {
+		t.Fatalf("warns = %v, want 1", got)
+	}
+	// Interleaved successes do not reset the suppression (no flip-flop).
+	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer ophp_secret")
+	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer wrong")
+	if n := rig.logs.count(slog.LevelWarn); n != 1 {
+		t.Fatalf("warns = %d, want 1: %v", n, rig.logs.dump())
+	}
+	if n := rig.logs.count(slog.LevelInfo); n != 0 {
+		t.Fatalf("infos = %d, want 0: %v", n, rig.logs.dump())
+	}
+	// Another reason or another address is its own stream.
+	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Basic x")
+	rig.do(http.MethodGet, energyPath, "192.0.2.11:4000", "Bearer wrong")
+	if n := rig.logs.count(slog.LevelWarn); n != 3 {
+		t.Fatalf("warns = %d, want 3: %v", n, rig.logs.dump())
+	}
+	*rig.clock = t0.Add(rejectLogEvery)
+	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer wrong")
+	if got := rig.logs.warnsWith("reason=unknown token", "remote=192.0.2.10"); len(got) != 2 {
+		t.Fatalf("warns after 10 minutes = %v, want 2", got)
+	}
+}
+
+func TestHandlerBoundsLogState(t *testing.T) {
+	rig := newRig(AuthModes{Token: true})
+	hd := rig.h.(*handler)
+	for i := range maxLogKeys + 50 {
+		ip := fmt.Sprintf("10.%d.%d.%d:1", (i>>16)&255, (i>>8)&255, i&255)
+		rig.do(http.MethodGet, energyPath, ip, "Bearer wrong")
+	}
+	hd.mu.Lock()
+	n := len(hd.logged)
+	hd.mu.Unlock()
+	if n > maxLogKeys {
+		t.Fatalf("log keys = %d, exceeds %d", n, maxLogKeys)
+	}
+	*rig.clock = rig.clock.Add(rejectLogEvery)
+	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer wrong")
+	hd.mu.Lock()
+	n = len(hd.logged)
+	hd.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("log keys = %d after expiry, want 1", n)
 	}
 }
 
@@ -293,28 +424,6 @@ func TestHandlerNeverLogsToken(t *testing.T) {
 	}
 }
 
-func TestHandlerLogsRejectionOncePerChange(t *testing.T) {
-	rig := newRig(AuthModes{Token: true})
-	for range 3 {
-		rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer wrong")
-	}
-	if n := rig.logs.count(slog.LevelWarn); n != 1 {
-		t.Fatalf("warns = %d, want 1: %v", n, rig.logs.dump())
-	}
-	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer ophp_secret")
-	if n := rig.logs.count(slog.LevelInfo); n != 1 {
-		t.Fatalf("infos = %d, want 1: %v", n, rig.logs.dump())
-	}
-	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer ophp_secret")
-	if n := rig.logs.count(slog.LevelInfo); n != 1 {
-		t.Fatalf("success repeated Info: %d", n)
-	}
-	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "Bearer wrong")
-	if n := rig.logs.count(slog.LevelWarn); n != 2 {
-		t.Fatalf("warns after new failure = %d, want 2", n)
-	}
-}
-
 func TestHandlerEvictsIdleSourceState(t *testing.T) {
 	rig := newRig(AuthModes{MAC: true})
 	rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", "")
@@ -323,8 +432,8 @@ func TestHandlerEvictsIdleSourceState(t *testing.T) {
 	hd := rig.h.(*handler)
 	hd.mu.Lock()
 	defer hd.mu.Unlock()
-	if len(hd.sources) != 1 {
-		t.Fatalf("sources = %d, want 1 after idle eviction", len(hd.sources))
+	if len(hd.sources.buckets) != 1 {
+		t.Fatalf("sources = %d, want 1 after idle eviction", len(hd.sources.buckets))
 	}
 }
 
@@ -338,8 +447,8 @@ func TestHandlerBoundsSourceState(t *testing.T) {
 	}
 	hd.mu.Lock()
 	defer hd.mu.Unlock()
-	if len(hd.sources) > maxSources {
-		t.Fatalf("sources = %d, exceeds %d", len(hd.sources), maxSources)
+	if len(hd.sources.buckets) > maxSources {
+		t.Fatalf("sources = %d, exceeds %d", len(hd.sources.buckets), maxSources)
 	}
 }
 
@@ -422,17 +531,17 @@ func TestHandlerNotLiveIsLoggedAsItsOwnReason(t *testing.T) {
 	if n := rig.logs.count(slog.LevelWarn); n != 1 {
 		t.Fatalf("warns = %d, want 1: %v", n, rig.logs.dump())
 	}
-	if n := rig.logs.count(slog.LevelInfo); n != 0 {
-		t.Fatalf("503 counted as accepted: %v", rig.logs.dump())
-	}
-	if d := rig.logs.dump(); !strings.Contains(d[0], "reason=not live") {
+	if d := rig.logs.dump(); !strings.Contains(d[0], "reason=not live") || !strings.Contains(d[0], "vmid=999") {
 		t.Fatalf("log = %v", d)
 	}
 	rig.resolver.vmid = "101"
 	if rec := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", ""); rec.Code != 200 {
 		t.Fatalf("code = %d", rec.Code)
 	}
-	if n := rig.logs.count(slog.LevelInfo); n != 1 {
-		t.Fatalf("infos = %d, want 1 once the VM is live", n)
+	if n := rig.logs.count(slog.LevelInfo); n != 0 {
+		t.Fatalf("infos = %d, want 0 (success stays at Debug)", n)
+	}
+	if n := rig.logs.count(slog.LevelDebug); n != 1 {
+		t.Fatalf("debugs = %d, want 1 for the served request", n)
 	}
 }

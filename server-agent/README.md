@@ -1129,10 +1129,15 @@ to MAC mode; a request without it is handled in MAC mode. Status codes: `401`
 not identified (malformed authorization, unknown or revoked token, the mode
 is disabled, capture unavailable, IPv6 source, no SYN observed, not a VM
 port, ambiguous or foreign ingress, no VM config, MAC mismatch), `503`
-identified but the VM has no live counter yet (just started, or stopped), `404`/`405` for another path or method, `429` above 10 requests
-per second per source (burst 20). Keep-alive is disabled, so every request is
-its own connection. Rejections are logged per source address on state change
-only; tokens and `Authorization` values are never logged. The guest client
+identified but the VM has no live counter yet (just started, or stopped), `404`/`405` for another path or method, `429` above
+100 requests per second from one source address (burst 200, checked before
+identification) or above 10 requests per second for one VM (burst 20, checked
+once the request is tied to a VM), so many token-mode guests behind one NAT
+address are never limited by each other. Keep-alive is disabled, so every
+request is its own connection. Rejections, `429`s included, are logged at Warn
+at most once every 10 minutes per source address and reason (`rate limited
+(source)` and `rate limited (vm)` for the two limits); served requests are
+logged at Debug only; tokens and `Authorization` values are never logged. The guest client
 ignores `HTTP_PROXY`/`HTTPS_PROXY` (through a proxy VM, MAC mode would
 identify the proxy) and does not follow redirects.
 

@@ -13759,6 +13759,10 @@ side by side; the attribution, cadence and counter semantics of ADR-115 are unch
 - **Token mode.** Token `ophp_` + base64url of 32 random bytes; the store (`/etc/op-hostpower/tokens.json`, `0600`, directory `0700`) keeps only the
   SHA-256, written atomically, matched in constant time, reloaded on a modification-time change; `server-agent hostpower token create|revoke|list`
   manages it and prints a token once. Tokens and `Authorization` values are never logged.
+- **Limits keyed by what they protect.** A per-source-address limit (100 requests/s, burst 200) runs before identification and guards the
+  MAC-mode resolver's bounded wait; a per-VM limit (10 requests/s, burst 20) runs after it. Keying the tight limit by VM rather than by address keeps
+  token-mode guests behind one NAT address from starving each other. Rejections and `429`s are logged at Warn at most once every 10 minutes per
+  (source address, reason), so mixed outcomes behind one address cannot flood the log.
 - **No TLS in this version.** Token mode is designed so TLS with a pinned certificate can be added later without changing the guest's identity model;
   it is the follow-up that also closes the layer-2 man-in-the-middle case.
 - **Proxy-free guest client.** The guest uses its own `http.Transport` with no proxy and no redirect following, because through a proxy VM on the bridge MAC
