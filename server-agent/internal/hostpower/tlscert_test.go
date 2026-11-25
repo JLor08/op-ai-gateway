@@ -279,9 +279,9 @@ func TestLoadOrCreateCertReadOnlyHint(t *testing.T) {
 	if err == nil {
 		t.Fatal("no error")
 	}
-	const hint = "read-only file system: add StateDirectory=op-hostpower-tls and ReadWritePaths=/var/lib/op-hostpower-tls to the unit (see the agent README)"
-	if !strings.Contains(err.Error(), hint) {
-		t.Fatalf("err = %q lacks the hint", err)
+	const hint = ": read-only file system; add StateDirectory=op-hostpower-tls and ReadWritePaths=/var/lib/op-hostpower-tls to the unit (see the agent README)"
+	if !strings.HasSuffix(err.Error(), hint) || strings.Count(err.Error(), "read-only file system") != 1 {
+		t.Fatalf("err = %q, want it to end in %q", err, hint)
 	}
 }
 
@@ -310,5 +310,97 @@ func TestLoadOrCreateCertKeyWriteFailureWritesNoCert(t *testing.T) {
 	}
 	if !slices.Equal(order, []string{"tls.key"}) {
 		t.Fatalf("write order = %v, want key only", order)
+	}
+}
+
+func TestLoadOrCreateCertCertWriteFailureRemovesKey(t *testing.T) {
+	orig := writeFileAtomic
+	t.Cleanup(func() { writeFileAtomic = orig })
+	calls := 0
+	writeFileAtomic = func(path string, data []byte) error {
+		calls++
+		if calls == 2 {
+			return errors.New("cert write failed")
+		}
+		return orig(path, data)
+	}
+	certPath, keyPath := certPaths(t.TempDir())
+	_, created, err := LoadOrCreateCert(certPath, keyPath, clockAt(fixedNow), nil)
+	if err == nil || created || !strings.Contains(err.Error(), "cert write failed") {
+		t.Fatalf("created = %v err = %v", created, err)
+	}
+	if calls != 2 {
+		t.Fatalf("writes = %d, want 2 (key, then cert)", calls)
+	}
+	for _, p := range []string{keyPath, certPath} {
+		if _, statErr := os.Lstat(p); !errors.Is(statErr, fs.ErrNotExist) {
+			t.Errorf("%s left behind (stat err %v)", p, statErr)
+		}
+	}
+	// The next start generates a fresh pair instead of failing on half a pair.
+	writeFileAtomic = orig
+	if _, created, err := LoadOrCreateCert(certPath, keyPath, clockAt(fixedNow), nil); err != nil || !created {
+		t.Fatalf("retry: created = %v err = %v", created, err)
+	}
+}
+
+func TestLoadOrCreateCertSymlinkedPair(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	srcCert, srcKey := certPaths(t.TempDir())
+	want, _, err := LoadOrCreateCert(srcCert, srcKey, clockAt(fixedNow), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkDir := t.TempDir()
+	linkCert, linkKey := certPaths(linkDir)
+	if err := os.Symlink(srcCert, linkCert); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(srcKey, linkKey); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	got, created, err := LoadOrCreateCert(linkCert, linkKey, clockAt(fixedNow), log)
+	if err != nil || created {
+		t.Fatalf("created = %v err = %v", created, err)
+	}
+	if !bytes.Equal(got.Certificate[0], want.Certificate[0]) {
+		t.Fatal("symlinked pair loaded a different certificate")
+	}
+	// The 0600 target counts, not the symlink's own 0777 mode.
+	if strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("unexpected warning: %q", logs.String())
+	}
+}
+
+func TestLoadOrCreateCertBadSymlinkIsAnError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	for _, tc := range []struct {
+		name   string
+		target func(t *testing.T) string
+	}{
+		{"dangling", func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing.crt") }},
+		{"to a directory", func(t *testing.T) string { return t.TempDir() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			certPath, keyPath := certPaths(dir)
+			if err := os.Symlink(tc.target(t), certPath); err != nil {
+				t.Fatal(err)
+			}
+			before := listDir(t, dir)
+			_, created, err := LoadOrCreateCert(certPath, keyPath, clockAt(fixedNow), nil)
+			if err == nil || created || !strings.Contains(err.Error(), certPath) {
+				t.Fatalf("created = %v err = %v, want an error naming %s", created, err, certPath)
+			}
+			if after := listDir(t, dir); !slices.Equal(before, after) {
+				t.Errorf("dir listing changed: %v -> %v", before, after)
+			}
+		})
 	}
 }

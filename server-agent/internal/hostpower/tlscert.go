@@ -37,7 +37,7 @@ const (
 	tlsCertLifetime = 100 // years
 	maxTLSFileBytes = 1 << 20
 
-	readOnlyHint = "read-only file system: add StateDirectory=op-hostpower-tls and ReadWritePaths=/var/lib/op-hostpower-tls to the unit (see the agent README)"
+	readOnlyHint = "add StateDirectory=op-hostpower-tls and ReadWritePaths=/var/lib/op-hostpower-tls to the unit (see the agent README)"
 )
 
 // writeFileAtomic writes a generated certificate file. It is a variable so
@@ -50,16 +50,19 @@ var writeFileAtomic = writePrivateFileAtomic
 // self-signed ECDSA P-256 certificate is generated and written (key first) with
 // mode 0600 into 0700 parent directories; created reports this case. Exactly
 // one existing file, or a path that is not a regular file, is an error and
-// nothing is written. A nil log means slog.Default().
+// nothing is written. Existing paths may be symlinks to regular files (an
+// operator's own material, such as a certbot live/ link); a dangling symlink or
+// one to anything else is an error, and only two absent paths (per Lstat) lead
+// to generation. A nil log means slog.Default().
 func LoadOrCreateCert(certPath, keyPath string, now func() time.Time, log *slog.Logger) (cert tls.Certificate, created bool, err error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	certInfo, err := lstatRegular(certPath)
+	certInfo, err := statRegular(certPath)
 	if err != nil {
 		return tls.Certificate{}, false, fmt.Errorf("hostpower: tls certificate: %w", err)
 	}
-	keyInfo, err := lstatRegular(keyPath)
+	keyInfo, err := statRegular(keyPath)
 	if err != nil {
 		return tls.Certificate{}, false, fmt.Errorf("hostpower: tls key: %w", err)
 	}
@@ -89,16 +92,26 @@ func LoadOrCreateCert(certPath, keyPath string, now func() time.Time, log *slog.
 	return cert, true, nil
 }
 
-// lstatRegular returns path's FileInfo, nil for a missing path, or an error
-// for a path that exists but is not a regular file (a symlink included).
-func lstatRegular(path string) (fs.FileInfo, error) {
+// statRegular returns the FileInfo of path, or of its target when path is a
+// symlink; nil when path does not exist (per Lstat, so a dangling symlink
+// exists); or an error when path or its target is not a regular file.
+func statRegular(path string) (fs.FileInfo, error) {
 	fi, err := os.Lstat(path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil, nil
 	case err != nil:
 		return nil, err
-	case !fi.Mode().IsRegular():
+	case fi.Mode()&fs.ModeSymlink != 0:
+		fi, err = os.Stat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%s is a dangling symlink", path)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", path)
 	}
 	return fi, nil
@@ -106,8 +119,9 @@ func lstatRegular(path string) (fs.FileInfo, error) {
 
 // generateCert creates a self-signed server certificate valid from an hour
 // before now for tlsCertLifetime years and writes the key, then the
-// certificate. A crash between the two writes leaves "key only", which the
-// next start reports instead of overwriting.
+// certificate. A failed certificate write removes the key again (best effort)
+// so the next start generates afresh; only a crash between the two writes
+// leaves "key only", which the next start reports instead of overwriting.
 func generateCert(certPath, keyPath string, now time.Time) (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -147,14 +161,23 @@ func generateCert(certPath, keyPath string, now time.Time) (tls.Certificate, err
 		return tls.Certificate{}, err
 	}
 	if err := writeFileAtomic(certPath, certPEM); err != nil {
+		_ = os.Remove(keyPath)
 		return tls.Certificate{}, err
 	}
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
 // readCertDER returns the DER of the first CERTIFICATE block in the PEM file
-// at path (the block tls.LoadX509KeyPair serves as the leaf).
+// at path (the block tls.LoadX509KeyPair serves as the leaf). path follows the
+// same rule as in LoadOrCreateCert: a regular file or a symlink to one.
 func readCertDER(path string) ([]byte, error) {
+	fi, err := statRegular(path)
+	if err != nil {
+		return nil, err
+	}
+	if fi == nil {
+		return nil, &fs.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
+	}
 	data, ok, err := readCapped(path, maxTLSFileBytes)
 	if err != nil {
 		return nil, err

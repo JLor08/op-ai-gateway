@@ -206,6 +206,59 @@ func TestMainTLSFingerprint(t *testing.T) {
 	}
 }
 
+func TestMainTLSFingerprintSymlinkedCert(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	certPath, keyPath := certPaths(t.TempDir())
+	cert, _, err := LoadOrCreateCert(certPath, keyPath, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "live.crt")
+	if err := os.Symlink(certPath, link); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := Main([]string{"tls", "-tls-cert", link, "fingerprint"}, &out, &errb); code != 0 {
+		t.Fatalf("code = %d stderr=%q", code, errb.String())
+	}
+	if want := collector.FormatHostpowerFingerprint(cert.Certificate[0]) + "\n"; out.String() != want {
+		t.Fatalf("stdout = %q, want %q", out.String(), want)
+	}
+}
+
+func TestMainTLSFingerprintNonRegularExits1(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFOs and symlinks")
+	}
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo.crt")
+	if err := mkfifo(fifo); err != nil {
+		t.Fatal(err)
+	}
+	fifoLink := filepath.Join(dir, "fifo-link.crt")
+	dangling := filepath.Join(dir, "dangling.crt")
+	for link, target := range map[string]string{fifoLink: fifo, dangling: filepath.Join(dir, "missing.crt")} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{fifo, fifoLink, dangling} {
+		var out, errb bytes.Buffer
+		done := make(chan int, 1)
+		go func() { done <- Main([]string{"tls", "-tls-cert", path, "fingerprint"}, &out, &errb) }()
+		select {
+		case code := <-done:
+			if code != 1 || !strings.Contains(errb.String(), path) {
+				t.Errorf("%s: code = %d stderr=%q", path, code, errb.String())
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: fingerprint blocked on a non-regular file", path)
+		}
+	}
+}
+
 func TestMainTLSFingerprintUnreadableExits1(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing.crt")
