@@ -325,7 +325,8 @@ type resolverFixture struct {
 }
 
 // newResolverFixture writes the VM configs and a fake /sys/class/net in which
-// vmbr0 and vmbr1 are bridges and enp3s0 is a plain interface.
+// vmbr0 and vmbr1 are bridges, enp3s0 is a plain interface, vmbr0.10 is a
+// VLAN over vmbr0 and enp3s0.10 a VLAN over enp3s0.
 func newResolverFixture(t *testing.T, confs map[string]string) *resolverFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -340,12 +341,42 @@ func newResolverFixture(t *testing.T, confs map[string]string) *resolverFixture 
 			t.Fatal(err)
 		}
 	}
+	fakeNetDev(t, sys, "vmbr0.10", "DEVTYPE=vlan", "vmbr0")
+	fakeNetDev(t, sys, "enp3s0.10", "DEVTYPE=vlan", "enp3s0")
 	table := NewObservationTable(30*time.Second, time.Now)
 	return &resolverFixture{
 		table: table,
 		res:   &IngressResolver{Table: table, PVEConfDir: dir, SysClassNet: sys, MaxWait: 50 * time.Millisecond},
 		dir:   dir,
 		sys:   sys,
+	}
+}
+
+// fakeNetDev creates <sys>/<name> with a uevent holding devtype (empty: no
+// DEVTYPE line) and, as real sysfs does, a lower_<lower> symlink per lower
+// device.
+func fakeNetDev(t *testing.T, sys, name, devtype string, lowers ...string) {
+	t.Helper()
+	dir := filepath.Join(sys, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	uevent := "INTERFACE=" + name + "\nIFINDEX=42\n"
+	if devtype != "" {
+		uevent += devtype + "\n"
+	}
+	if err := os.WriteFile(filepath.Join(dir, "uevent"), []byte(uevent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, lower := range lowers {
+		link := filepath.Join(dir, "lower_"+lower)
+		if os.Symlink(filepath.Join("..", lower), link) != nil {
+			// Only the entry's name is read; a plain file stands in where
+			// symlinks need privileges (Windows).
+			if err := os.WriteFile(link, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 
@@ -475,7 +506,7 @@ func TestResolveSYNCopyOnForeignInterface(t *testing.T) {
 }
 
 func TestResolveTransitClassification(t *testing.T) {
-	for _, name := range []string{"vmbr0", "vmbr1", "fwbr100i0", "fwln100i0", "fwpr100p0", "fwbr7i3", "fwpr7p3"} {
+	for _, name := range []string{"vmbr0", "vmbr1", "vmbr0.10", "fwbr100i0", "fwln100i0", "fwpr100p0", "fwbr7i3", "fwpr7p3"} {
 		t.Run("transit "+name, func(t *testing.T) {
 			f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
 			f.handshake(t, testKey, testMACA, "tap100i0")
@@ -485,8 +516,9 @@ func TestResolveTransitClassification(t *testing.T) {
 		})
 	}
 	for _, name := range []string{
-		"lo", "enp3s0", "enp3s0.10", "vmbr0.10", "veth200i0", "tap101i0", "tap100i1", "bond0",
+		"lo", "enp3s0", "enp3s0.10", "vmbr1.20", "veth200i0", "tap101i0", "tap100i1", "bond0",
 		"fwbr100", "fwpr100i0", "xfwbr100i0", "fwln100i0x", "notabridge", "../vmbr0", "",
+		"vlannolower", "vlanghost", "vlantwo", "macvlan0", "vlanoverfile",
 	} {
 		t.Run("foreign "+name, func(t *testing.T) {
 			f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
@@ -496,12 +528,56 @@ func TestResolveTransitClassification(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(f.sys, "notabridge", "bridge"), nil, 0o644); err != nil {
 				t.Fatal(err) // a file, not a directory
 			}
+			fakeNetDev(t, f.sys, "vlannolower", "DEVTYPE=vlan")                // no lower device
+			fakeNetDev(t, f.sys, "vlanghost", "DEVTYPE=vlan", "ghost")         // lower does not exist
+			fakeNetDev(t, f.sys, "vlantwo", "DEVTYPE=vlan", "vmbr0", "vmbr1")  // not a plain VLAN
+			fakeNetDev(t, f.sys, "macvlan0", "DEVTYPE=macvlan", "vmbr0")       // over a bridge, not a VLAN
+			fakeNetDev(t, f.sys, "vlanoverfile", "DEVTYPE=vlan", "notabridge") // lower's bridge is a file
 			f.handshake(t, testKey, testMACA, "tap100i0")
 			f.ack(t, testKey, testMACA, name)
 			vmid, err := f.resolve()
 			wantReason(t, vmid, err, "foreign ingress")
 		})
 	}
+}
+
+func TestResolveVLANOverBridgeIsTransit(t *testing.T) {
+	// The host's address sits on a VLAN of a VLAN-aware bridge: a VM's frames
+	// are also received on vmbr0.10.
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0", "vmbr0.10")
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "100")
+}
+
+func TestResolveVLANOverNICIsForeign(t *testing.T) {
+	// A LAN device's frames arrive on the uplink and its VLAN device.
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.see(t, testKey, testMACA, "tap100i0", "vmbr0", "vmbr0.10")
+	f.ack(t, testKey, testMACB, "enp3s0.10", "vmbr0.10")
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+}
+
+func TestResolveVLANUeventNeedsExactDevtype(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	fakeNetDev(t, f.sys, "vlanlike", "DEVTYPE=vlanx", "vmbr0")
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	f.ack(t, testKey, testMACA, "vlanlike")
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+}
+
+func TestResolveVLANLookupCached(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0.10")
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "100")
+	if err := os.RemoveAll(filepath.Join(f.sys, "vmbr0.10")); err != nil {
+		t.Fatal(err)
+	}
+	vmid, err = f.resolve()
+	wantVMID(t, vmid, err, "100")
 }
 
 func TestResolveBridgeLookupCached(t *testing.T) {

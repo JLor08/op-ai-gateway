@@ -423,7 +423,7 @@ type IngressResolver struct {
 	MaxWait     time.Duration
 
 	mu      sync.Mutex
-	bridges map[string]bool // interface name -> is a bridge master
+	transit map[string]bool // interface name -> only carries copies (isTransit)
 }
 
 // Resolve returns the ID of the VM that opened the connection from remote to
@@ -489,37 +489,81 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 }
 
 // isTransit reports whether frames received on ifname are only copies of
-// frames that entered the host elsewhere: a bridge master or a PVE firewall
-// device. Physical NICs, VLAN sub-interfaces, lo, veth and taps are ingress.
+// frames that entered the host elsewhere: a PVE firewall device, a bridge
+// master, or a VLAN device over a bridge master (a frame on vmbr0.10 was
+// first received on the tap or uplink that fed vmbr0). Physical NICs, VLANs
+// over them, lo, veth, taps and anything that cannot be classified are
+// ingress.
 func (r *IngressResolver) isTransit(ifname string) bool {
 	if fwBridgePattern.MatchString(ifname) || fwPeerPattern.MatchString(ifname) {
 		return true
 	}
-	return r.isBridge(ifname)
-}
-
-// isBridge reports whether ifname is a Linux bridge master, caching the
-// answer per name (interface names are created and renamed only by root).
-func (r *IngressResolver) isBridge(ifname string) bool {
-	if ifname == "" || ifname == "." || ifname == ".." || strings.ContainsAny(ifname, `/\`) {
+	if !validIfname(ifname) {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if is, ok := r.bridges[ifname]; ok {
+	if is, ok := r.transit[ifname]; ok {
 		return is
 	}
 	root := r.SysClassNet
 	if root == "" {
 		root = DefaultSysClassNet
 	}
-	fi, err := os.Stat(filepath.Join(root, ifname, "bridge"))
-	is := err == nil && fi.IsDir()
-	if r.bridges == nil {
-		r.bridges = make(map[string]bool)
+	is := isBridgeMaster(root, ifname) || isVLANOverBridge(root, ifname)
+	if r.transit == nil {
+		r.transit = make(map[string]bool)
 	}
-	r.bridges[ifname] = is
+	// Cached per name: interfaces are created and renamed only by root, and
+	// a device's type and lower device do not change while it exists.
+	r.transit[ifname] = is
 	return is
+}
+
+func validIfname(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\`)
+}
+
+// isBridgeMaster reports whether <root>/<ifname>/bridge is a directory.
+func isBridgeMaster(root, ifname string) bool {
+	fi, err := os.Stat(filepath.Join(root, ifname, "bridge"))
+	return err == nil && fi.IsDir()
+}
+
+// isVLANOverBridge reports whether ifname is an 802.1Q device (DEVTYPE=vlan
+// in its uevent) whose single lower device, named by the lower_<name> link
+// the kernel creates for stacked devices, is a bridge master.
+func isVLANOverBridge(root, ifname string) bool {
+	dir := filepath.Join(root, ifname)
+	uevent, ok, err := readCapped(filepath.Join(dir, "uevent"), maxTextFileBytes)
+	if err != nil || !ok || !hasLine(uevent, "DEVTYPE=vlan") {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	lower := ""
+	for _, e := range entries {
+		name, found := strings.CutPrefix(e.Name(), "lower_")
+		if !found {
+			continue
+		}
+		if lower != "" {
+			return false // a VLAN has exactly one lower device
+		}
+		lower = name
+	}
+	return validIfname(lower) && isBridgeMaster(root, lower)
+}
+
+func hasLine(data []byte, want string) bool {
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // configNICMAC returns the MAC of the VM config's current net<nic> line: the
