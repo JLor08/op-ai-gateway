@@ -904,12 +904,15 @@ for example `op-hostpower.service` with
 `ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower`
 and `Restart=always`. Options: `-out DIR` (default `/var/lib/op-hostpower`),
 `-interval D` (default `250ms`, minimum `100ms`; keep it at most a quarter of
-the guest's `OP_AGENT_INTERVAL`), `-v`. The service needs no token, contacts no
+the guest's `OP_AGENT_INTERVAL`, so each guest reading spans several host updates; a host tick near the guest interval makes readings alternate between 0 W and twice the true value), `-v`. The service needs no token, contacts no
 gateway and opens no listener. It warns at startup when the host has no RAPL
 domain or no `qemu.slice`, and keeps running.
 
-**2. Per VM (on the host).** The service must have run once so
-`/var/lib/op-hostpower/<vmid>` exists. Then map and attach it:
+**2. Per VM (on the host).** The directory
+`/var/lib/op-hostpower/<vmid>` appears only after the service has ticked while
+that VM is running (it discovers VMs by their live `qemu.slice/<vmid>.scope`);
+for a stopped VM create it yourself with `mkdir -p /var/lib/op-hostpower/<vmid>`.
+Then map and attach it:
 
 ```
 pvesh create /cluster/mapping/dir --id hostpower-<vmid> --map node=<node>,path=/var/lib/op-hostpower/<vmid>
@@ -919,9 +922,11 @@ qm set <vmid> --virtiofs0 dirid=hostpower-<vmid>
 **3. In the guest.** Mount the share read-only, for example with the fstab
 line `hostpower-<vmid> /run/op-hostpower virtiofs ro,nofail 0 0`, and point the
 agent at it with `OP_AGENT_POWERCAP_ROOT=/run/op-hostpower` (or `-powercap-root`
-or `powercap_root` in the config file). The startup diagnostic then lists
-`rapl` in `power_sources` and logs `powercap_root`. The first sample after
-start is `null` (RAPL delta), as on bare metal.
+or `powercap_root` in the config file). The resolved `powercap_root` is logged at debug level (`-v`); the startup
+`power_sources` always lists `rapl` on Linux, so it does not prove the mount
+works. To check: `cat /run/op-hostpower/intel-rapl:0/energy_uj` in the guest
+must rise between two reads, and `cpu_power_w` turns non-null from the second
+sample (the first is `null`, a RAPL delta, as on bare metal).
 
 **How the share is computed.** Per interval the service takes the host's
 RAPL package energy delta and splits it across VMs by active CPU time (from

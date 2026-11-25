@@ -13694,8 +13694,10 @@ domains, `/proc/stat` and each VM's `qemu.slice/<vmid>.scope/cpu.stat`, and attr
 idle floor included**, so the sum of shares stays at or below the package. For each VM it writes an atomic synthetic `intel-rapl:0` tree
 (`name`, `energy_uj`, `max_energy_range_uj`) under `<out>/<vmid>/`, and persists the counter in `energy_uj` so it survives restarts. The tree reaches
 the guest through a PVE directory mapping and a virtiofs device; the guest agent's unchanged RAPL collector reads it through the new
-`powercap_root` option (`OP_AGENT_POWERCAP_ROOT`). The host ticks every 250 ms against the guest's 1 s cadence, so each guest delta spans several host
-updates and stays inside the Tier-1 measured-power gap rule (2 s).
+`powercap_root` option (`OP_AGENT_POWERCAP_ROOT`). The host ticks every 250 ms against the guest's 1 s default `OP_AGENT_INTERVAL`; the rule is a host interval of at most a quarter of the guest interval.
+A host tick close to the guest interval makes guest readings alternate between 0 W and twice the true value, which defeats Tier-1's need for a positive
+reading, sinks the rolling-minimum idle tracker to 0 W and pushes short requests to Tier 2; at 250 ms against 1 s the residual lumpiness is about
+±25 %. The guest interval cannot simply be raised to match a slow host, because the Tier-1 gap rule (2 s) bounds how far apart guest samples may be.
 
 **Alternatives rejected.**
 - *An HTTP exporter on the host with VM identification by SMBIOS UUID:* it needs a listener, authentication and a network path between guest and host,

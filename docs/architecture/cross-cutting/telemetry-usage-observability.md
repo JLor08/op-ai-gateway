@@ -73,7 +73,8 @@ it), and **skips Apple**, whose "total" is allocated memory rather than a ceilin
 
 ### 8.2.3 Power draw (watts)
 
-`DetectPowerCollector(lhmURL)` composes the OS-native collector with an optional LHM
+`DetectPowerCollector(lhmURL, powercapRoot)` (and `DetectPowerAndTempCollectors(lhmURL, powercapRoot)`,
+which shares the same power composition) composes the OS-native collector with an optional LHM
 source:
 
 | Source | File | Platform | Mechanism |
