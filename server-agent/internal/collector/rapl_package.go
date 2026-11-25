@@ -37,10 +37,14 @@ func NewPackageEnergyReader(powercapRoot string) *PackageEnergyReader {
 // ok is false on the first call (no previous reading) and whenever no package
 // domain yielded a delta (none present, or energy_uj unreadable, e.g. EACCES when
 // not root). Domains without a previous reading (newly readable) are skipped for
-// that call and contribute from the next one.
+// that call and contribute from the next one. A domain whose energy_uj cannot be
+// read, or that is no longer a present package domain, loses its previous
+// reading, so when it returns it re-baselines instead of attributing the whole
+// gap to one call.
 func (r *PackageEnergyReader) DeltaJoules() (joules float64, ok bool) {
 	now := time.Now()
 	domains, _ := filepath.Glob(filepath.Join(r.powercapRoot, "intel-rapl:*"))
+	present := make(map[string]bool, len(domains))
 	for _, dir := range domains {
 		name := strings.TrimSpace(readSysfsString(filepath.Join(dir, "name")))
 		if !strings.HasPrefix(name, "package") {
@@ -48,8 +52,9 @@ func (r *PackageEnergyReader) DeltaJoules() (joules float64, ok bool) {
 		}
 		energy, readable := readSysfsUint(filepath.Join(dir, "energy_uj"))
 		if !readable {
-			continue
+			continue // not marked present: its stale reading is dropped
 		}
+		present[dir] = true
 		maxUJ, _ := readSysfsUint(filepath.Join(dir, "max_energy_range_uj"))
 		prev, seen := r.prev[dir]
 		r.prev[dir] = raplReading{energyUJ: energy, maxUJ: maxUJ, at: now}
@@ -58,6 +63,11 @@ func (r *PackageEnergyReader) DeltaJoules() (joules float64, ok bool) {
 		}
 		joules += raplDeltaJoules(prev.energyUJ, energy, prev.maxUJ)
 		ok = true
+	}
+	for dir := range r.prev {
+		if !present[dir] {
+			delete(r.prev, dir)
+		}
 	}
 	return joules, ok
 }

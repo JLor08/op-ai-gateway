@@ -54,7 +54,10 @@ type Service struct {
 	prevBusy  uint64
 	hasBusy   bool
 	prevUsage map[string]uint64 // last successful cpu.stat reading per VM
-	counters  map[string]uint64 // monotonic energy counter per VM in microjoules
+	// counters holds the monotonic energy counter per VM in microjoules. A
+	// vanished VM's counter is deliberately never pruned, so a VM that stops and
+	// starts again continues from its previous value instead of jumping.
+	counters map[string]uint64
 }
 
 // New builds a Service; empty option fields take their defaults.
@@ -104,6 +107,10 @@ func (s *Service) Tick() error {
 
 	if haveBusy {
 		s.prevBusy, s.hasBusy = busy, true
+	} else {
+		// No baseline: the next readable /proc/stat re-baselines instead of
+		// spreading two intervals of busy time over one interval of energy.
+		s.hasBusy = false
 	}
 	s.prevUsage = usage // unreadable and vanished VMs drop out and re-baseline
 

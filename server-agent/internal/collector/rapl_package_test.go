@@ -5,6 +5,7 @@ package collector
 
 import (
 	"math"
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -66,5 +67,65 @@ func TestPackageEnergyReaderNoDomainsNotOK(t *testing.T) {
 		if _, ok := r.DeltaJoules(); ok {
 			t.Fatalf("call %d: ok with no domains", i+1)
 		}
+	}
+}
+
+func TestPackageEnergyReaderThirdCallDeltasAgainstSecond(t *testing.T) {
+	root := t.TempDir()
+	writeRAPLDomain(t, root, "intel-rapl:0", "package-0", 1_000_000)
+	r := NewPackageEnergyReader(root)
+	r.DeltaJoules()
+	setRAPLEnergy(t, root, "intel-rapl:0", 4_000_000)
+	if j, ok := r.DeltaJoules(); !ok || math.Abs(j-3.0) > 1e-9 {
+		t.Fatalf("second call (%v,%v), want (3.0,true)", j, ok)
+	}
+	setRAPLEnergy(t, root, "intel-rapl:0", 10_000_000)
+	if j, ok := r.DeltaJoules(); !ok || math.Abs(j-6.0) > 1e-9 {
+		t.Fatalf("third call (%v,%v), want (6.0,true) against the second reading", j, ok)
+	}
+}
+
+func TestPackageEnergyReaderUnreadableDomainReBaselines(t *testing.T) {
+	root := t.TempDir()
+	writeRAPLDomain(t, root, "intel-rapl:0", "package-0", 1_000_000)
+	r := NewPackageEnergyReader(root)
+	r.DeltaJoules()
+
+	// Unreadable for one call.
+	if err := os.Remove(filepath.Join(root, "intel-rapl:0", "energy_uj")); err != nil {
+		t.Fatal(err)
+	}
+	if j, ok := r.DeltaJoules(); ok || j != 0 {
+		t.Fatalf("unreadable call (%v,%v), want (0,false)", j, ok)
+	}
+
+	// Readable again far ahead: no gap-spanning delta, it re-baselines.
+	setRAPLEnergy(t, root, "intel-rapl:0", 100_000_000)
+	if j, ok := r.DeltaJoules(); ok || j != 0 {
+		t.Fatalf("return call (%v,%v), want (0,false): delta spans the gap", j, ok)
+	}
+	setRAPLEnergy(t, root, "intel-rapl:0", 103_000_000)
+	if j, ok := r.DeltaJoules(); !ok || math.Abs(j-3.0) > 1e-9 {
+		t.Fatalf("next call (%v,%v), want (3.0,true) against the re-baseline", j, ok)
+	}
+}
+
+func TestPackageEnergyReaderDropsVanishedDomain(t *testing.T) {
+	root := t.TempDir()
+	writeRAPLDomain(t, root, "intel-rapl:0", "package-0", 1_000_000)
+	writeRAPLDomain(t, root, "intel-rapl:1", "package-1", 1_000_000)
+	r := NewPackageEnergyReader(root)
+	r.DeltaJoules()
+	if err := os.RemoveAll(filepath.Join(root, "intel-rapl:1")); err != nil {
+		t.Fatal(err)
+	}
+	r.DeltaJoules()
+	if _, kept := r.prev[filepath.Join(root, "intel-rapl:1")]; kept {
+		t.Fatal("prev still holds a domain no longer in the glob")
+	}
+	writeRAPLDomain(t, root, "intel-rapl:1", "package-1", 50_000_000)
+	setRAPLEnergy(t, root, "intel-rapl:0", 2_000_000)
+	if j, ok := r.DeltaJoules(); !ok || math.Abs(j-1.0) > 1e-9 {
+		t.Fatalf("got (%v,%v), want (1.0,true): returned domain must re-baseline", j, ok)
 	}
 }

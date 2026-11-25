@@ -198,13 +198,23 @@ func TestTickNoEnergyDeltaStillAdvancesBaselines(t *testing.T) {
 		t.Fatalf("gap tick attributed %d", c)
 	}
 
-	// Final tick: energy back (+10 J vs. before the gap), busy +1 s, vm +0.25 s.
+	// Energy readable again: the reader re-baselines (no delta spanning the
+	// gap), so nothing is attributed, but busy and VM baselines still advance.
 	f.setEnergyUJ(1_010_000_000)
 	f.setBusyUsec(2_000_000)
 	f.setVMUsec("100", 1_000_000)
 	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 0 {
+		t.Fatalf("energy return tick attributed %d (gap-spanning delta)", c)
+	}
+
+	// Final tick: +10 J, busy +1 s, vm +0.25 s.
+	f.setEnergyUJ(1_020_000_000)
+	f.setBusyUsec(3_000_000)
+	f.setVMUsec("100", 1_250_000)
+	mustTick(t, s)
 	// Final interval only: 0.25 * 10 J. Unadvanced baselines would give
-	// share 1_000_000/2_000_000 = 0.5 -> 5_000_000.
+	// share 1_250_000/3_000_000 and a 20 J gap-spanning delta.
 	if c := s.Counters()["100"]; c != 2_500_000 {
 		t.Errorf("counter = %d, want 2500000", c)
 	}
@@ -218,5 +228,104 @@ func TestOptionsWithDefaults(t *testing.T) {
 	}
 	if got := (Options{OutDir: "/x"}).withDefaults().OutDir; got != "/x" || strings.Contains(got, "op-hostpower") {
 		t.Errorf("explicit OutDir overridden: %q", got)
+	}
+}
+
+func TestTickKeepsWritingOtherVMsWhenOneWriteFails(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	elsewhere := t.TempDir()
+	link := filepath.Join(f.root, "out", "100", DomainDir)
+	if err := os.RemoveAll(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	advanceTwoVMs(f)
+	if err := s.Tick(); err == nil {
+		t.Fatal("Tick returned nil although VM 100's tree escapes its dir")
+	}
+	if got := f.outFile("101"); got != "5000000\n" {
+		t.Errorf("file 101 = %q, want 5000000 (other VM must still advance)", got)
+	}
+	if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
+		t.Errorf("written outside the VM dir: %v", entries)
+	}
+}
+
+func TestTickUnreadableProcStatReBaselines(t *testing.T) {
+	f := newFixture(t, "100")
+	s := f.service()
+	mustTick(t, s) // baselines: energy 1000 J, busy 0, vm 0
+
+	// Gap tick: /proc/stat unreadable while energy and VM usage advance.
+	if err := os.Remove(filepath.Join(f.root, "proc_stat")); err != nil {
+		t.Fatal(err)
+	}
+	f.setEnergyUJ(1_010_000_000)
+	f.setVMUsec("100", 750_000)
+	mustTick(t, s)
+
+	// /proc/stat is back: this tick only re-baselines busy time.
+	f.setEnergyUJ(1_020_000_000)
+	f.setBusyUsec(2_000_000)
+	f.setVMUsec("100", 1_000_000)
+	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 0 {
+		t.Fatalf("re-baseline tick attributed %d (busy delta spans two intervals)", c)
+	}
+
+	// Next tick attributes normally: 0.25 s of 1 s busy, 10 J -> 2.5 J.
+	f.setEnergyUJ(1_030_000_000)
+	f.setBusyUsec(3_000_000)
+	f.setVMUsec("100", 1_250_000)
+	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 2_500_000 {
+		t.Errorf("counter = %d, want 2500000", c)
+	}
+}
+
+func TestTickVanishedScopeReturnsAndContinuesCounter(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	advanceTwoVMs(f) // 101 -> 5_000_000
+	mustTick(t, s)
+
+	// 101 stops: its scope directory disappears for a tick.
+	if err := os.RemoveAll(f.vmDir("101")); err != nil {
+		t.Fatal(err)
+	}
+	f.setEnergyUJ(1_020_000_000)
+	f.setBusyUsec(2_000_000)
+	f.setVMUsec("100", 500_000)
+	mustTick(t, s)
+	if c := s.Counters(); c["101"] != 5_000_000 || c["100"] != 5_000_000 {
+		t.Fatalf("while gone counters = %v", c)
+	}
+
+	// 101 starts again with a fresh, unrelated usage: it re-baselines.
+	f.setEnergyUJ(1_030_000_000)
+	f.setBusyUsec(3_000_000)
+	f.setVMUsec("100", 750_000)
+	f.setVMUsec("101", 40_000_000)
+	mustTick(t, s)
+	if c := s.Counters()["101"]; c != 5_000_000 {
+		t.Fatalf("return tick counter = %d, want 5000000 (no jump, no reset)", c)
+	}
+	if got := f.outFile("101"); got != "5000000\n" {
+		t.Fatalf("return tick file = %q", got)
+	}
+
+	// And then continues from its previous value: 0.5 s of 1 s busy, 10 J.
+	f.setEnergyUJ(1_040_000_000)
+	f.setBusyUsec(4_000_000)
+	f.setVMUsec("100", 1_000_000)
+	f.setVMUsec("101", 40_500_000)
+	mustTick(t, s)
+	if c := s.Counters()["101"]; c != 10_000_000 {
+		t.Errorf("counter = %d, want 10000000", c)
 	}
 }

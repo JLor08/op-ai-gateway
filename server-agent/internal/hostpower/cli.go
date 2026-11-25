@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -34,17 +36,57 @@ func newFlagSet() (*flag.FlagSet, *Options, *time.Duration, *bool) {
 }
 
 // ParseArgs parses the arguments after "hostpower". Besides the flag.FlagSet
-// errors it rejects an interval below MinInterval, which also guards the
-// ticker in Run against a non-positive duration.
+// errors it rejects positional arguments and an interval below MinInterval,
+// which also guards the ticker in Run against a non-positive duration.
 func ParseArgs(args []string) (Options, time.Duration, bool, error) {
 	fs, opts, interval, verbose := newFlagSet()
 	if err := fs.Parse(args); err != nil {
 		return Options{}, 0, false, err
 	}
+	if fs.NArg() > 0 {
+		return Options{}, 0, false, fmt.Errorf("hostpower: unexpected argument %q", fs.Arg(0))
+	}
 	if *interval < MinInterval {
 		return Options{}, 0, false, fmt.Errorf("hostpower: -interval must be at least %s", MinInterval)
 	}
 	return *opts, *interval, *verbose, nil
+}
+
+// msgNotReadable is the startup warning for a service that cannot read RAPL.
+const msgNotReadable = "hostpower: RAPL energy_uj is not readable (run as root); guests would report 0 W"
+
+// startupWarnings returns the startup checks' warnings for opts. notRoot is the
+// caller's effective-UID check (only meaningful on Linux); the readability check
+// covers a root service that still cannot read a package domain's energy_uj.
+func startupWarnings(opts Options, notRoot bool) []string {
+	var warns []string
+	domains, _ := filepath.Glob(filepath.Join(opts.PowercapRoot, "intel-rapl:*"))
+	if len(domains) == 0 {
+		warns = append(warns, fmt.Sprintf("hostpower: no RAPL package domain under %s; is intel_rapl_common loaded and are we root?", opts.PowercapRoot))
+	}
+	if notRoot || (len(domains) > 0 && !packageEnergyReadable(domains)) {
+		warns = append(warns, msgNotReadable)
+	}
+	qemuSlice := filepath.Join(opts.CgroupRoot, "qemu.slice")
+	if fi, err := os.Stat(qemuSlice); err != nil || !fi.IsDir() {
+		warns = append(warns, fmt.Sprintf("hostpower: no qemu.slice under %s; no running QEMU VMs or cgroup v1?", opts.CgroupRoot))
+	}
+	return warns
+}
+
+// packageEnergyReadable reports whether any package domain's energy_uj can be
+// read.
+func packageEnergyReadable(domains []string) bool {
+	for _, dir := range domains {
+		name, err := os.ReadFile(filepath.Join(dir, "name"))
+		if err != nil || !strings.HasPrefix(strings.TrimSpace(string(name)), "package") {
+			continue
+		}
+		if _, err := os.ReadFile(filepath.Join(dir, "energy_uj")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Main runs the hostpower mode and returns the process exit code.
@@ -75,12 +117,12 @@ func Main(args []string, stderr io.Writer) int {
 	}
 	slog.Info("hostpower: starting", "out", opts.OutDir, "interval", interval)
 
-	if m, _ := filepath.Glob(filepath.Join(opts.PowercapRoot, "intel-rapl:*")); len(m) == 0 {
-		slog.Warn(fmt.Sprintf("hostpower: no RAPL package domain under %s; is intel_rapl_common loaded and are we root?", opts.PowercapRoot))
+	notRoot := runtime.GOOS == "linux" && os.Geteuid() != 0
+	for _, w := range startupWarnings(opts, notRoot) {
+		slog.Warn(w)
 	}
-	qemuSlice := filepath.Join(opts.CgroupRoot, "qemu.slice")
-	if fi, err := os.Stat(qemuSlice); err != nil || !fi.IsDir() {
-		slog.Warn(fmt.Sprintf("hostpower: no qemu.slice under %s; no running QEMU VMs or cgroup v1?", opts.CgroupRoot))
+	if err := RemoveStaleTemps(opts.OutDir); err != nil {
+		slog.Warn("hostpower: removing stale temp files", "err", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
