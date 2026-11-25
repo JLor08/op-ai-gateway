@@ -33,12 +33,18 @@ type HostpowerEnergy struct {
 
 // NewHostpowerHTTPClient returns the HTTP client for the guest collector: a short
 // timeout and its own transport that ignores proxy environment variables (the host
-// is a link-local/LAN peer; a proxy must never see the bearer token). Other
+// is a link-local/LAN peer; a proxy must never see the bearer token) and never
+// follows redirects. Other
 // transport defaults, including TLS, are kept.
 func NewHostpowerHTTPClient() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = nil
-	return &http.Client{Timeout: hostpowerHTTPTimeout, Transport: tr}
+	return &http.Client{
+		Timeout:   hostpowerHTTPTimeout,
+		Transport: tr,
+		// A 3xx is a failure: no request may leave the URL hostpowerEnergyURL built.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // hostpowerEnergyURL is the single place the request URL is built.

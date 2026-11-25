@@ -49,6 +49,8 @@ func (f *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			_ = conn.Close()
 		}
+	case "redirect":
+		http.Redirect(w, r, "/elsewhere/v1/energy", http.StatusFound)
 	case "garbage":
 		_, _ = w.Write([]byte("not json"))
 	case "big":
@@ -62,6 +64,23 @@ func (f *fakeHost) set(mode string, energy uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.mode, f.energy = mode, energy
+}
+
+func (f *fakeHost) auth(i int) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.auths[i]
+}
+
+func (f *fakeHost) requested(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.paths {
+		if p == path {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeHost) lastPath() string {
@@ -125,6 +144,7 @@ func TestHostpowerHTTPIdentity(t *testing.T) {
 	if c.Available() {
 		t.Fatal("Available() = true for an empty base URL")
 	}
+	assertProxyFree(t, c.client) // the nil-client fallback is proxy-free too
 	if !newHostpowerHTTPCollector("http://192.0.2.1:8080", "", nil).Available() {
 		t.Fatal("Available() = false for a set base URL")
 	}
@@ -154,7 +174,9 @@ func TestHostpowerHTTPDecreaseWithZeroRangeIsZero(t *testing.T) {
 
 func TestHostpowerHTTPWraparoundUsesRange(t *testing.T) {
 	s := newStepper(t, "")
+	s.f.mu.Lock()
 	s.f.maxUJ = 20_000_000
+	s.f.mu.Unlock()
 	s.collect("ok", 19_000_000, 0)
 	cpu, _ := s.collect("ok", 4_000_000, time.Second) // (20-19)+4 = 5 J
 	wantWatts(t, "cpu", cpu, 5)
@@ -195,12 +217,12 @@ func TestHostpowerHTTPVMIDChangeRebaselines(t *testing.T) {
 func TestHostpowerHTTPSendsTokenOnlyWhenSet(t *testing.T) {
 	s := newStepper(t, "ophp_x")
 	s.collect("ok", 1, 0)
-	if got := s.f.auths[0]; got != "Bearer ophp_x" {
+	if got := s.f.auth(0); got != "Bearer ophp_x" {
 		t.Fatalf("Authorization = %q, want %q", got, "Bearer ophp_x")
 	}
 	s = newStepper(t, "")
 	s.collect("ok", 1, 0)
-	if got := s.f.auths[0]; got != "" {
+	if got := s.f.auth(0); got != "" {
 		t.Fatalf("Authorization = %q, want none", got)
 	}
 }
@@ -234,23 +256,6 @@ func TestHostpowerHTTPHostRestart(t *testing.T) {
 	wantWatts(t, "after restart", cpu, 15)
 }
 
-func TestHostpowerHTTPIgnoresProxyEnv(t *testing.T) {
-	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
-	t.Setenv("http_proxy", "http://127.0.0.1:1")
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
-	f := newFakeHost(t)
-	c := newHostpowerHTTPCollector(f.srv.URL, "", NewHostpowerHTTPClient())
-	if _, _, err := c.Collect(context.Background()); err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.paths) != 1 {
-		t.Fatalf("server saw %d requests, want 1 (proxy env must be ignored)", len(f.paths))
-	}
-}
-
 func TestHostpowerHTTPCapsBody(t *testing.T) {
 	s := newStepper(t, "")
 	s.collect("ok", 1_000_000, 0)
@@ -267,8 +272,8 @@ func TestHostpowerHTTPCapsBody(t *testing.T) {
 	}
 }
 
-func TestHostpowerHTTPClientSettings(t *testing.T) {
-	c := NewHostpowerHTTPClient()
+func assertProxyFree(t *testing.T, c *http.Client) {
+	t.Helper()
 	if c.Timeout != time.Second {
 		t.Fatalf("Timeout = %v, want 1s", c.Timeout)
 	}
@@ -276,4 +281,22 @@ func TestHostpowerHTTPClientSettings(t *testing.T) {
 	if !ok || tr.Proxy != nil {
 		t.Fatalf("Transport = %#v, want *http.Transport with nil Proxy", c.Transport)
 	}
+}
+
+func TestHostpowerHTTPClientSettings(t *testing.T) {
+	assertProxyFree(t, NewHostpowerHTTPClient())
+}
+
+func TestHostpowerHTTPDoesNotFollowRedirects(t *testing.T) {
+	s := newStepper(t, "")
+	s.collect("ok", 1_000_000, 0)
+	cpu, _ := s.collect("redirect", 0, time.Second)
+	wantNil(t, "redirect", cpu)
+	if s.f.requested("/elsewhere/v1/energy") {
+		t.Fatal("collector followed a redirect")
+	}
+	cpu, _ = s.collect("ok", 16_000_000, 2*time.Second)
+	wantNil(t, "first after redirect", cpu)
+	cpu, _ = s.collect("ok", 31_000_000, 3*time.Second)
+	wantWatts(t, "second after redirect", cpu, 15)
 }
