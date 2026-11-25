@@ -13839,7 +13839,7 @@ reports.
   same parser instead of running `dmidecode`, so root and unprivileged agents cannot drift and `dmidecode` is no longer a dependency.
 - **Agent side.** A new option `helper_socket` / `OP_AGENT_HELPER_SOCKET` / `-helper-socket` defaults to the helper's socket on Linux and is
   empty elsewhere; `off` in any source disables it (an empty env var means unset); a value that is not an absolute path is warned about and turns
-  the helper off; a value on a non-Linux OS is warned about and ignored. The helper client dials the socket for every request (fixed URL
+  the helper off; a value on a non-Linux OS is warned about and ignored. The helper client always dials the helper's socket (fixed URL
   `http://op-agent-helper` + path), with the hostpower client's settings (no proxy, no redirects, short timeout) and body caps of 4 KiB
   (`/v1/rapl`) and 64 KiB (`/v1/memory-modules`). The helper is consulted only when the agent runs on Linux, not as euid 0, with a socket set.
 - **Power order.** The Linux native collector is split into its RAPL and its hwmon part, and the composite becomes **native RAPL → helper →

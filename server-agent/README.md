@@ -849,10 +849,12 @@ Everything is best-effort — a field the platform doesn't expose is simply blan
   parses it in-process, an agent running as an ordinary user gets the same list from
   the [privileged helper](#privileged-helper-linux), which parses it with the same
   code. Without either, RAM total only. `dmidecode` is not used and need not be
-  installed. If the helper does not answer when the agent starts, the agent retries
-  just this fetch every 30 s until the first successful reply (an empty reply also
-  ends the retry) and then re-sends the inventory, so a helper that starts late
-  still fills the **Hardware** view.
+  installed. When an unprivileged agent's startup inventory has no modules (the
+  helper did not answer, or answered with none), the agent retries just this
+  fetch every 30 s until the first successful reply. A reply with modules
+  updates the inventory, which is re-sent (Info `memory modules received from the
+  helper`), so a helper that starts late still fills the **Hardware** view; an
+  empty reply also ends the retry (Info `helper reports no memory modules`).
 - **Privacy:** the agent never collects serial numbers, board/product/chassis UUIDs,
   or MAC addresses (and the gateway stores only a canonical blob with no such fields).
 
@@ -1296,9 +1298,20 @@ instead of killing the helper. The capability and system-call sets are
 
 **3. Agent unit** `/etc/systemd/system/op-server-agent.service`, running the
 agent as `op-agent`. Its config file holds the agent token, so keep it `0600`
-and owned by `op-agent`; relative paths in it (`ca_cache_file`,
-`runtime_cache`, `config_files_dir`, ...) resolve beside it, in the state
-directory the unit creates:
+and owned by `op-agent`. Relative paths in it (`ca_file`, `ca_cache_file`,
+`runtime_config`, `runtime_cache`, `config_files_dir`) resolve beside it, in the
+state directory the unit creates. An **empty** `runtime_cache` or
+`config_files_dir`, as in the portal-generated config, does not: it defaults to
+the binary's directory (`/usr/local/bin`), which `op-agent` cannot write, so
+the runtime cache, the specs' config files and the RPC tensor cache would fail.
+Set both to relative names in `server-agent.json`:
+
+```
+  "runtime_cache": "server-agent-runtime.cache.json",
+  "config_files_dir": "server-agent-config-files",
+```
+
+The unit:
 
 ```
 [Unit]
@@ -1346,7 +1359,9 @@ remedy and no code change:
 - **Model files, runtime binaries and caches**: the managed model processes run
   as `op-agent` too, so it must be able to read the allowlisted binaries and the
   model directories and write the caches the runtimes use (its home is
-  `/var/lib/op-agent` with the user above).
+  `/var/lib/op-agent` with the user above). The agent's own `runtime_cache` and
+  `config_files_dir` must be writable as well: set them as in step 3, since
+  their empty defaults point into the binary's directory.
 
 **Helper options.** Usage: `server-agent helper -agent-user user
 [-agent-group group] [-socket path] [-powercap-root dir] [-dmi-table file] [-v]`.
