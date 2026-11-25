@@ -111,7 +111,7 @@ func Main(args []string, stderr io.Writer) int {
 	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})))
 
 	opts = opts.withDefaults()
-	if err := os.MkdirAll(opts.OutDir, 0o755); err != nil {
+	if err := os.MkdirAll(opts.OutDir, 0o700); err != nil {
 		fmt.Fprintf(stderr, "server-agent: hostpower: create out dir: %v\n", err)
 		return 2
 	}
