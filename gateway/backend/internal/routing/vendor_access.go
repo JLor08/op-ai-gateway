@@ -29,7 +29,8 @@ func TokenOwnsVendorAccount(token auth.Token, acc VendorAccount) bool {
 //
 //   - All==true: every account the token's principal OWNS is allowed, under its own
 //     ModelPrefix (native). It never covers a shared account: an all:true token
-//     (and so a portal session, which is always all:true) does not auto-borrow one.
+//     (and so a portal session whose stored chat policy is unset or all:true)
+//     does not auto-borrow one.
 //   - An entry naming the account (own or shared) with OverrideEnabled==false:
 //     allowed, native ModelPrefix.
 //   - An entry naming the account with OverrideEnabled==true: allowed, the override

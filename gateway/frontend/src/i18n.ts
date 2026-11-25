@@ -318,6 +318,7 @@ const de = {
   chatRunAsTokenLabel: 'Als Token senden',
   chatRunAsNone: 'Ohne Token (Session)',
   chatModelFromToken: 'Model durch Token vorgegeben',
+  chatModelsLoadingForToken: 'Modelle des Tokens werden geladen…',
   chatModelUnavailable: 'Modell derzeit nicht verfügbar',
   chatModelLoaded: 'Geladen (sofort verfügbar)',
   chatModelLoadedOn: 'Geladen auf',
@@ -3512,6 +3513,10 @@ const de = {
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
   chatSessionHint: 'Einstellungen für Chat ohne Token',
+  chatSessionVendorAccessNote:
+    'Wähle, welche Anbieter die Chat-Sitzung ohne Token nutzen darf. Ohne Änderung gilt: alle eigenen Anbieter, auch Gruppen.',
+  chatSessionVendorAccessUnavailable:
+    'Der Anbieter-Zugriff konnte gerade nicht gelesen werden und lässt sich nicht bearbeiten. Die beiden Optionen oben kannst du trotzdem speichern.',
   tokenModelOverrideColumn: 'Modell-Override',
   errorPortalTokenModelOverrideInvalid: 'Ausgewähltes Modell ist nicht verfügbar',
   tokenProjectLabel: 'Projekt',
@@ -4738,6 +4743,7 @@ const en: PortalMessages = {
   chatRunAsTokenLabel: 'Send as token',
   chatRunAsNone: 'Without token (session)',
   chatModelFromToken: 'Model set by token',
+  chatModelsLoadingForToken: "Loading the token's models…",
   chatModelUnavailable: 'Model currently unavailable',
   chatModelLoaded: 'Loaded (available immediately)',
   chatModelLoadedOn: 'Loaded on',
@@ -7553,6 +7559,10 @@ const en: PortalMessages = {
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',
   chatSessionHint: 'Settings for token-less chat',
+  chatSessionVendorAccessNote:
+    'Choose which providers the token-less chat session may use. Unchanged, it uses all your own providers, including groups.',
+  chatSessionVendorAccessUnavailable:
+    'The provider access could not be read right now and cannot be edited. You can still save the two options above.',
   tokenModelOverrideColumn: 'Model override',
   errorPortalTokenModelOverrideInvalid: 'Selected model is not available',
   tokenProjectLabel: 'Project',

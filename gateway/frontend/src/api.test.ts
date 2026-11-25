@@ -354,6 +354,33 @@ describe('portal api', () => {
     ]);
   });
 
+  it('asks for a token-scoped model listing through the run-as header, never a query param', async () => {
+    const fetcher = vi
+      .fn()
+      .mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({ data: [{ id: 'alias-1', original_model_id: 'qwen-coder' }] }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          ),
+      );
+    const api = createPortalApi(fetcher);
+
+    const { data } = await api.models('tok_1');
+
+    expect(fetcher).toHaveBeenCalledWith(
+      '/api/portal/models',
+      expect.objectContaining({ headers: { 'X-OP-Run-As-Token': 'tok_1' } }),
+    );
+    expect(data[0].original_model_id).toBe('qwen-coder');
+
+    await api.models();
+    expect(fetcher).toHaveBeenLastCalledWith(
+      '/api/portal/models',
+      expect.objectContaining({ headers: {} }),
+    );
+  });
+
   it('carries the backend-folded speech flag on a model option, independent of image', async () => {
     // ModelDTO.speech is folded in the backend (every offering mapping has a speech:yes
     // verdict, fail-closed), so the client never recomputes it. It travels beside

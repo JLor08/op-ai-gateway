@@ -677,6 +677,10 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		// authorizeVendorAccountRead (system scope, or a CM of a shared/full account). It
 		// writes nothing and opens no credential.
 		"VendorAccountUsageManager": "usage-reader",
+		// Validates a chat-session vendor-access policy against the accounts the USER
+		// can route to (the same advisory check a user token's policy gets). It reads
+		// reach only: it writes nothing, opens no credential, calls no account.
+		"EncodeChatSessionVendorAccess": "policy-validation",
 		// Operate gate (authorizeVendorAccountOperate).
 		"TestVendorAccountConnection": "operate",
 		"RefreshVendorAccountModels":  "operate",

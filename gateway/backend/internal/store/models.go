@@ -108,14 +108,18 @@ type User struct {
 	// log_communication / secret flags and feed the session principal.
 	ChatLogCommunication bool
 	ChatSecret           bool
-	TOTPSecret           string
-	TOTPPendingSecret    string
-	TOTPEnabled          bool
-	TOTPConfirmedAt      *time.Time
-	PasswordHash         string
-	PasswordSetAt        *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// ChatVendorAccess is the token-less chat session's vendor-access policy in
+	// the api_tokens.vendor_provider_access JSON encoding. '' means unset (all
+	// own accounts, groups included); see ChatSessionVendorAccess.
+	ChatVendorAccess  string
+	TOTPSecret        string
+	TOTPPendingSecret string
+	TOTPEnabled       bool
+	TOTPConfirmedAt   *time.Time
+	PasswordHash      string
+	PasswordSetAt     *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type TokenRecord struct {

@@ -64,7 +64,8 @@ almost used up or the vendor answers a limit error (§12, [ADR-112](../09-archit
 
 A `vendor_account` is owned by exactly one user and is **personal** by default
 (`share_level = none`): usable only for that user's own requests, the owner's
-interactive portal session and the owner's own API tokens **that have been opted in
+interactive portal session (which follows the owner's stored chat-session policy, by default
+all of the owner's own accounts) and the owner's own API tokens **that have been opted in
 to it** (§11; a token reaches no account until the owner grants it). The owner, if an
 admin, may **share** it (§1.1): it is then also usable by the principals, users and
 services, provisioned into a resource group that contains it, and manageable by the
@@ -2194,9 +2195,12 @@ or a service token with a service id) and fail-open per account. (That fail-open
 derivation** an unreadable account, like a failed read of the principal's own accounts, makes the vendor
 set incomplete and yields no generated aliases at all, fail-closed, because its
 vendor-shadow exclusion needs the whole set; see
-[Routing and Model Selection §2.4](routing-and-model-selection.md#24-generated-claude-model-aliases).) The owner's interactive portal session (`all: true`) may use all of its **own**
-accounts, so the table below describes what a session sees of them (never a shared
-account, §11); an API token sees the subset, and the names, its policy grants. A
+[Routing and Model Selection §2.4](routing-and-model-selection.md#24-generated-claude-model-aliases).) The owner's interactive portal session carries the owner's stored chat-session policy
+(§11.4; unset means `all: true` plus groups, so all of its **own** accounts), so the
+table below describes what a session sees of them (a shared account only when that policy
+names it, §11); a session call that names a run-as token in `X-OP-Run-As-Token` sees what
+that token's policy grants instead; an API token sees the subset, and the names, its
+policy grants. A
 shared account the grant lets the principal reach is advertised only to a token whose
 policy names it. A failure of the **shared** arm alone is not an incomplete set: it is
 the routable set, the one the resolver uses in that same window. What
@@ -2757,7 +2761,7 @@ deliberate, named choice**, because `all: true` never covers a shared account (�
 
 The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 (column, a JSON string on `api_tokens`, migration 85;
-[Data Model](../reference/data-model.md#4-migration-history-114-migrations)):
+[Data Model](../reference/data-model.md#4-migration-history-115-migrations)):
 
 ```json
 { "all": false,
@@ -2910,21 +2914,29 @@ group's names collide with the owner's own accounts outside the group or with an
 token cannot trip the token check by accident. The routing backstop order is own groups (id order),
 then own accounts, then shared accounts.
 
-### 11.4 Who is restricted: API tokens, not the owner's session
+### 11.4 Who is restricted: API tokens and the owner's chat-session policy
 
-The opt-in binds **API tokens**, and only those:
+The opt-in binds **API tokens**, and the owner's interactive session carries one policy of the same shape:
 
 | Principal | Vendor access |
 |---|---|
 | **API token** (user-owned) | Its stored policy; strict default none. Its own accounts are covered by `all`, a shared account only by a named entry. |
-| **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | **Always all** of the owner's **own** active accounts under their native prefixes (`VendorAccess{All: true, IncludeGroups: true}`, so also all of the owner's own groups; making this configurable is a follow-up), and, because `all` never covers a shared account, **never a shared one**. It has no `api_tokens` row to opt in on, and the chat model picker, the Models page and the dashboard's live routes (§6.7) depend on seeing every account the user owns; an account shared with the user is reached through a token that names it. |
-| **A run-as token** (a chat run that acts through one of the user's tokens) | That token's own stored policy, like any API call with it. |
+| **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | The owner's **stored chat-session policy** (`users.chat_vendor_provider_access`, migration 115, [ADR-114](../09-architecture-decisions.md#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token)), the same JSON shape and codec as a token's. The stored `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}`: all of the owner's own active accounts under their native prefixes and all of the owner's own groups, which is what every user had before the column existed. A non-empty value is the explicit policy, verbatim; an explicit "no providers" save is stored as `{"all":false}`, never as `''`, so it never collapses into *unset*. Because `all` never covers a shared account, a shared account is reachable from the token-less chat only when the policy **names** it (or a group containing it). The same policy applies to every call the session principal makes: the chat, the session's model listings, the Models page, the dashboard's live routes (§6.7) and session-cookie inference. The decode is tolerant, so a stored entry naming a deleted account or group matches nothing and never breaks the principal. The owner edits it on the chat-session card of the token list; the save is session-only ([API Surface](../reference/api-surface.md)). |
+| **A run-as token** (a chat run, or a session call to `GET /api/portal/models`, that acts through one of the user's tokens) | That token's own stored policy, like any API call with it. It **replaces** the session policy entirely; the two are never merged. |
 | **Service token** (a service id, no user id) | Its stored policy, **create-only** (§11.6). A service owns no account, so `all: true` covers nothing for it; it reaches a shared account only when its policy **names** it **and** the service is **provisioned directly** into a resource group that contains it. A service token with no policy has no vendor access, as before. |
 
-So a user always sees and can chat with every account they own, while a key
-they hand to a script reaches only what they ticked for it, and no principal borrows an
-account without a named choice. The token list's
-synthetic "chat session" row carries no `vendor_access` for the same reason.
+So by default a user sees and can chat with every account they own, and can narrow the
+token-less chat (even to nothing) like any token, while a key they hand to a script
+reaches only what they ticked for it, and no principal borrows an account without a named
+choice. The token list's synthetic "chat session" row carries the **effective** policy as
+`vendor_access` whenever the user row was read (unset reads back as
+`{all: true, include_groups: true}`, an explicit zero as `{all: false}` with no accounts);
+it is omitted only when that lookup fails, and the chat card then disables the editor and
+sends no policy. A narrowed chat policy also narrows the token editor's override and
+fallback model-target pickers, which are fed the session listing; this is an accepted
+consequence (a follow-up may feed the editor an unrestricted own listing). Admins see each user's chat policy through
+`GET /api/admin/users/{id}/tokens`, as they already see token policies; the admin PATCH
+surface cannot write it.
 
 ### 11.5 Upgrade behavior
 
@@ -3068,7 +3080,8 @@ own accounts, then shared accounts.
 - **A token opted into a group uses its members through the group** even when a shared member is not named under
   `accounts`. This is the deliberate exception to "a shared account is used only when an entry names it" (§11.1,
   ADR-050): putting a shared account into a group is the user's own named choice, and the grant still applies. The
-  portal session is treated as `all` + `include_groups` (§11.4), so it reaches a shared account only through a group.
+  portal session carries the stored chat-session policy (§11.4; unset is `all` + `include_groups`), so by default it
+  reaches a shared account only through a group, and through a named entry when the owner added one.
 - **A deleted group or member still named in a token policy matches nothing** (a group id not found, a member not in
   the grant) and never breaks token decode, listing or routing.
 - **Listing** is §6.7: the union of the usable members' models under the group prefix, thresholds ignored.

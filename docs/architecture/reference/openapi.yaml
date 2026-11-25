@@ -1484,11 +1484,33 @@ paths:
   /api/portal/chat-settings:
     put:
       tags: [portal]
-      summary: Own default chat run settings
+      summary: Own chat-session settings (chat run booleans and, session only, the provider policy)
+      description: >
+        The two chat run booleans may be saved by a session or a bearer. The
+        optional vendor_access (the token DTO, the token-less chat's
+        provider policy) is accepted from a SESSION caller only: absent or
+        null leaves the stored policy untouched, a value is validated like a
+        token policy (400 portal.token_vendor_access_invalid or
+        portal.token_vendor_access_conflict) and replaces it, and a bearer
+        caller sending it gets 403 portal.token_forbidden with nothing
+        stored. A save that fails is 500 portal.chat_settings_update_failed.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
-      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              properties:
+                vendor_access:
+                  allOf:
+                    - { $ref: '#/components/schemas/TokenVendorAccess' }
+                  nullable: true
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /api/portal/system-admin-mode:
     post:
       tags: [portal]
@@ -1572,9 +1594,13 @@ paths:
         '200':
           description: >
             The caller's tokens, the synthetic non-deletable chat-session row
-            first. vendor_access is omitted for a token with no vendor access
-            (and for the chat-session row, whose session always sees all of
-            the owner's accounts). Other row fields are defined by the Go DTO
+            first. vendor_access is omitted for a token with no vendor access.
+            The chat-session row carries the EFFECTIVE chat-session policy
+            whenever the user row was read (never configured reads back as
+            all=true with include_groups=true, an explicit no-providers save as
+            all=false with an empty accounts array) and omits it only when that
+            lookup failed. GET /api/admin/users/{id}/tokens returns the same
+            shape for the named user. Other row fields are defined by the Go DTO
             (see api-surface.md).
           content:
             application/json:
@@ -2040,10 +2066,33 @@ paths:
   /api/portal/models:
     get:
       tags: [portal]
-      summary: Model catalog visible to the caller
+      summary: Model catalog visible to the caller (a session may read it as one of its own tokens)
+      description: >
+        A SESSION caller may send X-OP-Run-As-Token with one of its own API
+        token ids (the header is capture-redacted; there is no query
+        parameter) to get the listing for that token's principal: its
+        vendor-account policy and prefixes, overrides, overlays and generated
+        alias rows, with the loading counts computed for it. A bearer caller
+        sending the header is refused 403 portal.token_forbidden before any
+        lookup; a foreign, unknown or disabled token is the same 403 with an
+        identical body (no existence leak); the header together with
+        manage=1 is 400 portal.models_run_as_conflict.
+      parameters:
+        - name: X-OP-Run-As-Token
+          in: header
+          required: false
+          description: The id (not the secret) of one of the session user's own API tokens.
+          schema: { type: string }
+        - name: manage
+          in: query
+          required: false
+          description: Admin management view (system models only); mutually exclusive with X-OP-Run-As-Token.
+          schema: { type: string }
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /api/portal/model-servers:
     get:
       tags: [portal]

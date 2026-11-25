@@ -467,6 +467,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     initialTokens: PortalToken[] = tokens,
     modelsOverride: ModelOption[] = models,
     serversOverride: PortalServer[] = [],
+    fetchModels?: (runAsTokenId: string) => Promise<ModelOption[]>,
   ) {
     const onRefresh = vi.fn(async () => {});
     const view = render(
@@ -476,6 +477,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           models={modelsOverride}
           tokens={initialTokens}
           servers={serversOverride}
+          fetchModels={fetchModels}
           onRefresh={onRefresh}
           t={t}
           locale={locale}
@@ -495,6 +497,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
             models={modelsOverride}
             tokens={nextTokens}
             servers={nextServers}
+            fetchModels={fetchModels}
             onRefresh={onRefresh}
             t={t}
             locale={locale}
@@ -523,6 +526,65 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       await waitFor(() => expect(chatApi.spies.startChatRun).toHaveBeenCalled());
       const body = chatApi.spies.startChatRun.mock.calls[0][1] as StartChatRunBody;
       expect(body.settings.run_as_token_id).toBe(plainToken.id);
+    });
+
+    it('lists the token\'s own models, labelling a generated alias row as "offered name (original name)"', async () => {
+      const fetchModels = vi.fn(async () => [
+        {
+          id: 'anthropic-local-3f9a',
+          // On an alias row display_name is the TARGET's label: the picker must not use it.
+          display_name: 'Target Label',
+          original_model_id: 'qwen-coder',
+          flavors: ['openai'],
+          loading_on_count: 0,
+        },
+        { id: 'plain-row', display_name: 'Plain Label', flavors: ['openai'], loading_on_count: 0 },
+        {
+          id: 'same-row',
+          display_name: 'Same Label',
+          original_model_id: 'same-row',
+          flavors: ['openai'],
+          loading_on_count: 0,
+        },
+      ]);
+      renderChat(tokens, models, [], fetchModels);
+      await waitForChatReady();
+
+      await pickOption(t.chatRunAsTokenLabel, plainToken.name);
+      await waitFor(() => expect(fetchModels).toHaveBeenCalledWith(plainToken.id));
+      fireEvent.mouseDown(screen.getByRole('combobox', { name: t.chatModel }));
+      expect(
+        await screen.findByRole('option', { name: 'anthropic-local-3f9a (qwen-coder)' }),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Plain Label' })).toBeInTheDocument();
+      expect(screen.getByRole('option', { name: 'Same Label' })).toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: 'Target Label' })).toBeNull();
+      expect(screen.queryByRole('option', { name: models[0].display_name })).toBeNull();
+    });
+
+    it('shows no red "!" for the saved model while the token\'s list loads, and shows it if the list lacks it', async () => {
+      let resolve!: (rows: ModelOption[]) => void;
+      const fetchModels = vi.fn(
+        () =>
+          new Promise<ModelOption[]>((r) => {
+            resolve = r;
+          }),
+      );
+      renderChat(tokens, models, [], fetchModels);
+      await waitForChatReady();
+      await pickOption(t.chatModel, models[0].display_name);
+      await pickOption(t.chatRunAsTokenLabel, plainToken.name);
+      await waitFor(() => expect(fetchModels).toHaveBeenCalled());
+
+      expect(screen.queryByTestId('searchable-select-unavailable')).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: t.send })).toBeDisabled();
+
+      await act(async () => {
+        resolve([
+          { id: 'other-row', display_name: 'Other', flavors: ['openai'], loading_on_count: 0 },
+        ]);
+      });
+      expect(await screen.findByTestId('searchable-select-unavailable')).toBeInTheDocument();
     });
 
     it('disables the model select and shows the override hint when a model-override token is selected', async () => {

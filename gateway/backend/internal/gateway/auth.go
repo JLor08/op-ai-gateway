@@ -319,15 +319,17 @@ func sessionPrincipal(user store.User, elevated bool) auth.Token {
 	// the user profile. A real run-as token keeps its own flags via
 	// AuthorizeRunAsToken and never passes through here.
 	//
-	// VendorAccess{All: true}: the per-token vendor-account opt-in is strict by
-	// default for API tokens, but the owner's own interactive session (and the
-	// trusted loopback chat that acts for it) has no api_tokens row to opt in on and
-	// must keep seeing all of the user's own active vendor accounts under their
-	// native prefixes -- the chat picker and dashboard depend on it. All covers
-	// the user's OWN accounts only: an account shared with the user is used only
-	// through an explicit per-account entry on a token, which a session never has
-	// (routing.TokenVendorPrefix, spec 2026-10-15 section 8). IncludeGroups
-	// likewise covers the user's own vendor account groups.
+	// VendorAccess follows the user's stored chat policy
+	// (store.ChatSessionVendorAccess). Unset keeps the historical behaviour:
+	// the per-token vendor-account opt-in is strict by default for API tokens,
+	// but the owner's own interactive session (and the trusted loopback chat
+	// that acts for it) has no api_tokens row to opt in on and sees all of the
+	// user's own active vendor accounts and groups under their native prefixes
+	// -- the chat picker and dashboard depend on it. All covers the user's OWN
+	// accounts only: an account shared with the user is used only through an
+	// explicit per-account entry (routing.TokenVendorPrefix, spec 2026-10-15
+	// section 8). A user who saved an explicit policy gets exactly that policy,
+	// the same semantics as a token's.
 	return auth.Token{
 		UserID:           user.ID,
 		Name:             user.DisplayName,
@@ -335,7 +337,7 @@ func sessionPrincipal(user store.User, elevated bool) auth.Token {
 		Scopes:           scopes,
 		LogCommunication: user.ChatLogCommunication,
 		Secret:           user.ChatSecret,
-		VendorAccess:     auth.VendorAccess{All: true, IncludeGroups: true},
+		VendorAccess:     store.ChatSessionVendorAccess(user.ChatVendorAccess),
 	}
 }
 
@@ -669,16 +671,38 @@ func (s *Server) handlePortalChatSettings(w http.ResponseWriter, r *http.Request
 		return
 	}
 	var req struct {
-		LogCommunication bool `json:"log_communication"`
-		Secret           bool `json:"secret"`
+		LogCommunication bool                    `json:"log_communication"`
+		Secret           bool                    `json:"secret"`
+		VendorAccess     *portal.VendorAccessDTO `json:"vendor_access"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
 		return
 	}
+	update := account.UserUpdate{ChatLogCommunication: &req.LogCommunication, ChatSecret: &req.Secret}
+	// vendor_access is absent => untouched (an old client sending only the two
+	// booleans must not clear the policy). Setting it is a session-only
+	// management action: a bearer token (token.ID != "") is refused before
+	// anything is validated or stored.
+	if req.VendorAccess != nil {
+		if token.ID != "" {
+			writePortalTokenError(w, portal.ErrTokenForbidden)
+			return
+		}
+		encoded, err := s.Portal.EncodeChatSessionVendorAccess(r.Context(), token.UserID, req.VendorAccess)
+		if err != nil {
+			if errors.Is(err, portal.ErrTokenVendorAccessInvalid) || errors.Is(err, portal.ErrTokenVendorAccessConflict) {
+				writePortalTokenError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, apierror.Response("portal.chat_settings_update_failed", "chat settings update failed", ""))
+			return
+		}
+		update.ChatVendorAccess = &encoded
+	}
 	// Self-service edit of the caller's OWN chat capture flags: UpdateOwnProfile
 	// (see handlePortalLanguage's comment on why this is not UpdateUser).
-	user, err := s.Account.UpdateOwnProfile(r.Context(), token.UserID, account.UserUpdate{ChatLogCommunication: &req.LogCommunication, ChatSecret: &req.Secret})
+	user, err := s.Account.UpdateOwnProfile(r.Context(), token.UserID, update)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apierror.Response("portal.chat_settings_update_failed", "chat settings update failed", ""))
 		return

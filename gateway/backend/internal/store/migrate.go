@@ -147,6 +147,7 @@ var migrations = []migration{
 	{version: 112, name: "token_usage_limit_switches", up: migration112Up},
 	{version: 113, name: "runtime_spec_process_tree", up: migration113Up},
 	{version: 114, name: "vendor_account_groups", up: migration114Up},
+	{version: 115, name: "user_chat_vendor_access", up: migration115Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4873,6 +4874,17 @@ func migration112Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // step replayable on both dialects.
 func migration113Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "process_tree text not null default 'direct'")
+}
+
+// migration115Up adds users.chat_vendor_provider_access: the encoded
+// vendor-access policy (the api_tokens.vendor_provider_access JSON codec) the
+// token-less portal chat session carries. The empty default means "unset" and
+// keeps today's behaviour (all own accounts, groups included) for every
+// existing user; an explicit "no providers" policy is stored as {"all":false},
+// never as the empty string. addColumnIfMissing keeps the step replayable on
+// both dialects.
+func migration115Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "users", "chat_vendor_provider_access text not null default ''")
 }
 
 // migration114Up creates the vendor account group tables and stamps usage rows

@@ -26,7 +26,7 @@ func TestMigration110VendorAccountShareUsage(t *testing.T) {
 		if cols := tableColumns(ctx, t, s, "vendor_accounts"); slices.Contains(cols, "share_usage_with_members") {
 			t.Fatalf("vendor_accounts already has share_usage_with_members at v109: %v", cols)
 		}
-		if err := s.CreateUser(ctx, newTestUser("u_m110", "m110@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m110", "m110@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		// Raw insert: CreateVendorAccount now writes share_usage_with_members, a column

@@ -95,9 +95,9 @@ export function subscribeSSE(
 export async function request<T>(
   fetcher: Fetcher,
   path: string,
-  options: { method?: string; body?: unknown } = {},
+  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {},
 ): Promise<T> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...options.headers };
   const init: RequestInit = { headers, credentials: 'include' };
   if (options.method) {
     init.method = options.method;

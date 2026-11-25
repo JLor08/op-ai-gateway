@@ -63,19 +63,13 @@ import {
 } from './shared/ModelOverrideEditor';
 import { OverrideTargetSelect, overrideTargets } from './shared/OverrideTargetSelect';
 import {
-  offerableVendorAccounts,
-  patchVendorAccessEntry,
-  toggleVendorAccessEntry,
-  vendorAccessEntryDTO,
-  vendorAccessGroupEntryDTO,
-  vendorAccessGroupEntryState,
-  vendorAccessEntryInvalid,
-  vendorAccessEntryState,
-  vendorGroupOptionLabel,
-  vendorAccountOptionLabel,
-  type VendorAccessEntryState,
-} from './shared/vendorAccessAccounts';
-import { VendorAccessEntryGroups } from './shared/VendorAccessEntryGroups';
+  VendorAccessEditor,
+  buildVendorAccessDTO,
+  emptyVendorAccessDraft,
+  vendorAccessDraftFromDTO,
+  vendorAccessDraftInvalid,
+  type VendorAccessDraft,
+} from './shared/VendorAccessEditor';
 
 const allTokenScopes = ['gateway:use', 'admin'] as const;
 
@@ -195,24 +189,21 @@ export function TokenList({
   const [myProjects, setMyProjects] = useState<ProjectRef[]>([]);
   const projectsReqIdRef = useRef(0);
   // Vendor-account ("Anbieter") access (flag-gated, see vendorAccountsEnabled):
-  // vaAll = every account the caller OWNS, also future ones, under its own prefix
-  // (it never covers a shared account); vaAccounts is the explicit per-account
+  // vaDraft.all = every account the caller OWNS, also future ones, under its own prefix
+  // (it never covers a shared account); vaDraft.accounts is the explicit per-account
   // opt-in list, which is also how a SHARED account is named, with or without
-  // vaAll. vendorAccounts is the account list api.vendorAccounts() returns (own,
+  // all. vendorAccounts is the account list api.vendorAccounts() returns (own,
   // co-managed and shared-with-the-caller rows, rendered for the caller), loaded
   // lazily each time the form opens with the same latest-wins guard as the project
   // picker; null = not loaded for this open (in flight or failed), so nothing can
   // be judged stale yet.
-  const [vaAll, setVaAll] = useState(false);
-  const [vaAccounts, setVaAccounts] = useState<VendorAccessEntryState[]>([]);
+  const [vaDraft, setVaDraft] = useState<VendorAccessDraft>(emptyVendorAccessDraft);
   const [vendorAccounts, setVendorAccounts] = useState<VendorAccount[] | null>(null);
   const vendorAccountsReqIdRef = useRef(0);
-  // Vendor account groups: vaIncludeGroups = every group the caller owns, also
-  // future ones (only meaningful together with vaAll); vaGroups is the explicit
+  // Vendor account groups: includeGroups = every group the caller owns, also
+  // future ones (only meaningful together with all); vaDraft.groups is the explicit
   // per-group opt-in list (entry.accountId carries the GROUP id). vendorGroups is
   // the caller's group list, loaded with the same latest-wins guard.
-  const [vaIncludeGroups, setVaIncludeGroups] = useState(false);
-  const [vaGroups, setVaGroups] = useState<VendorAccessEntryState[]>([]);
   const [vendorGroups, setVendorGroups] = useState<VendorAccountGroup[] | null>(null);
   const vendorGroupsReqIdRef = useRef(0);
 
@@ -222,7 +213,14 @@ export function TokenList({
   const [chatDraft, setChatDraft] = useState<{
     log_communication: boolean;
     secret: boolean;
+    vendor_access?: VendorAccessDraft;
   } | null>(null);
+  // The chat card edits the session's provider policy only while the flag is on and
+  // the backend could read the user (the row then carries vendor_access).
+  const chatVendorEditable = vendorAccountsEnabled && chatSession?.vendor_access !== undefined;
+  // One fetch serves whichever surface needs the lists: the token form or the chat
+  // card (the form replaces the list view, so they are never both visible).
+  const needsVendorLists = vendorAccountsEnabled && (mode !== 'list' || chatVendorEditable);
 
   useEffect(() => {
     if (mode === 'list') return;
@@ -238,7 +236,7 @@ export function TokenList({
   }, [mode, api]);
 
   useEffect(() => {
-    if (mode === 'list' || !vendorAccountsEnabled) return;
+    if (!needsVendorLists) return;
     const reqId = ++vendorAccountsReqIdRef.current;
     api
       .vendorAccounts()
@@ -248,10 +246,10 @@ export function TokenList({
       .catch(() => {
         /* best-effort: the list stays unloaded and the section renders without options */
       });
-  }, [mode, api, vendorAccountsEnabled]);
+  }, [mode, api, needsVendorLists]);
 
   useEffect(() => {
-    if (mode === 'list' || !vendorAccountsEnabled) return;
+    if (!needsVendorLists) return;
     const reqId = ++vendorGroupsReqIdRef.current;
     api
       .vendorAccountGroups()
@@ -261,7 +259,7 @@ export function TokenList({
       .catch(() => {
         /* best-effort: the group list stays unloaded and the section renders without it */
       });
-  }, [mode, api, vendorAccountsEnabled]);
+  }, [mode, api, needsVendorLists]);
 
   // Load the selected override server's offered models so the model-override
   // map's "to" dropdown can narrow to them. Latest-wins guard so a
@@ -290,40 +288,10 @@ export function TokenList({
   // overrideSummary and the row editor itself are shared with ServicesView via
   // ./shared/ModelOverrideEditor (FV-3).
   const overrideInvalid = overrideRowsInvalid(overrideRows);
-  // What the opt-in offers (see offerableVendorAccounts): the caller's own accounts
-  // and the ones shared with them. Empty until the list has loaded.
-  const offerableAccounts = offerableVendorAccounts(vendorAccounts ?? [], 'user');
-  // The opt-in entries the request carries. Once this open's account list has
-  // loaded, an opt-in for an account the list no longer offers (deleted, or no
-  // longer shared with the caller, since) is dropped: the backend rejects an
-  // account the token's owner cannot reach (400 portal.token_vendor_access_invalid)
-  // and the form has no way to show, let alone remove, it. Under all the caller's
-  // OWN accounts are covered by the switch, so an entry naming one is dropped too
-  // (the backend ignores it anyway: all wins); what stays are the shared accounts,
-  // which all never covers. Without a loaded list nothing can be judged, so every
-  // entry stays.
-  function sentVendorEntries(): VendorAccessEntryState[] {
-    if (vendorAccounts === null) return vaAccounts;
-    const ownIds = new Set(offerableAccounts.own.map((acc) => acc.id));
-    const offeredIds = new Set([...ownIds, ...offerableAccounts.shared.map((acc) => acc.id)]);
-    return vaAccounts.filter(
-      (entry) => offeredIds.has(entry.accountId) && !(vaAll && ownIds.has(entry.accountId)),
-    );
-  }
-  // The group opt-ins the request carries: once the list has loaded, a group that
-  // no longer exists is dropped (the form cannot show, let alone remove, it).
-  function sentVendorGroups(): VendorAccessEntryState[] {
-    if (vendorGroups === null) return vaGroups;
-    const ids = new Set(vendorGroups.map((group) => group.id));
-    return vaGroups.filter((entry) => ids.has(entry.accountId));
-  }
-  // An enabled per-account prefix override with a malformed value blocks the
-  // save (the same client-side mirror of the backend rule the provider form
-  // uses); a disabled override is never sent, so its value is not judged, and
-  // neither is an entry that is not sent at all. Moot while the section is hidden.
+  // An enabled per-account prefix override with a malformed value blocks the save
+  // (see vendorAccessDraftInvalid). Moot while the section is hidden.
   const vendorAccessInvalid =
-    vendorAccountsEnabled &&
-    [...sentVendorEntries(), ...sentVendorGroups()].some(vendorAccessEntryInvalid);
+    vendorAccountsEnabled && vendorAccessDraftInvalid(vaDraft, vendorAccounts, vendorGroups);
 
   function openCreate() {
     setName('');
@@ -345,11 +313,8 @@ export function TokenList({
     setLogCommunication(false);
     setSecret(false);
     setProjectId('');
-    setVaAll(false);
-    setVaAccounts([]);
+    setVaDraft(emptyVendorAccessDraft());
     setVendorAccounts(null);
-    setVaIncludeGroups(false);
-    setVaGroups([]);
     setVendorGroups(null);
     setMode('create');
   }
@@ -388,51 +353,17 @@ export function TokenList({
     setSecret(row.secret);
     setProjectId(row.project_id ?? '');
     // A token without vendor_access (the strict default) reads as no access.
-    setVaAll(row.vendor_access?.all ?? false);
-    // The override is ON only for a present prefix_override with enabled true; a
-    // missing one (or enabled:false) is OFF.
-    setVaAccounts((row.vendor_access?.accounts ?? []).map(vendorAccessEntryState));
+    setVaDraft(vendorAccessDraftFromDTO(row.vendor_access));
     setVendorAccounts(null);
-    setVaIncludeGroups(row.vendor_access?.include_groups ?? false);
-    setVaGroups((row.vendor_access?.groups ?? []).map(vendorAccessGroupEntryState));
     setVendorGroups(null);
     setMode({ edit: row });
   }
 
-  // The vendor_access request value: undefined while the flag is off (the
-  // section is hidden and the field stays out of the body); { all: true } for
-  // "all own providers", with the explicit shared-account entries next to it when
-  // there are any; otherwise the explicit opt-in list. An override that is off
-  // omits prefix_override entirely (never enabled:false), and an enabled one sends
-  // its trimmed value ("" = no prefix).
+  // The vendor_access request value: undefined while the flag is off (the section
+  // is hidden and the field stays out of the body), else the draft's policy.
   function buildVendorAccess(): VendorAccessDTO | undefined {
     if (!vendorAccountsEnabled) return undefined;
-    const accounts = sentVendorEntries().map(vendorAccessEntryDTO);
-    const groups = sentVendorGroups().map(vendorAccessGroupEntryDTO);
-    const groupFields = groups.length > 0 ? { groups } : {};
-    if (!vaAll) return { all: false, accounts, ...groupFields };
-    return {
-      all: true,
-      ...(vaIncludeGroups ? { include_groups: true } : {}),
-      ...(accounts.length > 0 ? { accounts } : {}),
-      ...groupFields,
-    };
-  }
-
-  function toggleVendorAccount(accountId: string) {
-    setVaAccounts((current) => toggleVendorAccessEntry(current, accountId));
-  }
-
-  function toggleVendorGroup(groupId: string) {
-    setVaGroups((current) => toggleVendorAccessEntry(current, groupId));
-  }
-
-  function updateVendorGroupEntry(groupId: string, patch: Partial<VendorAccessEntryState>) {
-    setVaGroups((current) => patchVendorAccessEntry(current, groupId, patch));
-  }
-
-  function updateVendorEntry(accountId: string, patch: Partial<VendorAccessEntryState>) {
-    setVaAccounts((current) => patchVendorAccessEntry(current, accountId, patch));
+    return buildVendorAccessDTO(vaDraft, vendorAccounts, vendorGroups);
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
@@ -554,13 +485,30 @@ export function TokenList({
     }
   }
 
-  async function saveChatSettings(next: { log_communication: boolean; secret: boolean }) {
+  async function saveChatSettings(next: NonNullable<typeof chatDraft>) {
+    // The policy goes out as an explicit object only when the card edited it in this
+    // draft (never null: the backend reads null as "leave untouched"); an untouched
+    // editor sends the two booleans only, so a flag toggle never runs the policy
+    // validation or turns "unset" into an explicit policy.
+    const vendorAccess =
+      chatVendorEditable && next.vendor_access
+        ? buildVendorAccessDTO(next.vendor_access, vendorAccounts, vendorGroups)
+        : undefined;
     try {
-      await api.updateChatSettings(next);
+      await api.updateChatSettings({
+        log_communication: next.log_communication,
+        secret: next.secret,
+        ...(vendorAccess ? { vendor_access: vendorAccess } : {}),
+      });
       setTokens((current) =>
         current.map((row) =>
           row.is_chat_session
-            ? { ...row, log_communication: next.log_communication, secret: next.secret }
+            ? {
+                ...row,
+                log_communication: next.log_communication,
+                secret: next.secret,
+                ...(vendorAccess ? { vendor_access: vendorAccess } : {}),
+              }
             : row,
         ),
       );
@@ -698,30 +646,6 @@ export function TokenList({
     // (unlike overrideModelTargets above): the redirect is unrelated to a
     // server override.
     const unknownFallbackTargets = overrideTargets(models, null);
-    // Vendor-access section. Under all the caller's own accounts are covered by the
-    // switch, so only the shared ones are listed for explicit opt-in; otherwise both
-    // groups are. The opted-in accounts follow in the account list's own order, so
-    // each one's override controls sit in a stable place.
-    const ownOptions = vaAll ? [] : offerableAccounts.own;
-    const sharedOptions = offerableAccounts.shared;
-    const vendorAccessById = new Map(vaAccounts.map((entry) => [entry.accountId, entry]));
-    const optedInAccounts = [...ownOptions, ...sharedOptions].flatMap((acc) => {
-      const entry = vendorAccessById.get(acc.id);
-      return entry ? [{ id: acc.id, label: vendorAccountOptionLabel(acc, t), entry }] : [];
-    });
-    const groupOptions = (vendorGroups ?? []).map((group) => ({
-      value: group.id,
-      label: vendorGroupOptionLabel(group),
-    }));
-    const vendorGroupEntryById = new Map(vaGroups.map((entry) => [entry.accountId, entry]));
-    const optedInGroups = (vendorGroups ?? []).flatMap((group) => {
-      const entry = vendorGroupEntryById.get(group.id);
-      return entry ? [{ id: group.id, label: vendorGroupOptionLabel(group), entry }] : [];
-    });
-    const accountOption = (acc: VendorAccount) => ({
-      value: acc.id,
-      label: vendorAccountOptionLabel(acc, t),
-    });
     return (
       <>
         <Breadcrumbs
@@ -967,95 +891,15 @@ export function TokenList({
                 master flag is off. Account names are vendor/owner-supplied text:
                 rendered as text only. */}
             {vendorAccountsEnabled && (
-              <Box
-                role="group"
-                aria-labelledby="token-vendor-access-heading"
-                sx={{ display: 'grid', gap: 1 }}
-              >
-                <Typography id="token-vendor-access-heading" variant="subtitle2">
-                  {t.tokenVendorAccessLabel}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
-                  {t.tokenVendorAccessNote}
-                </Typography>
-                <FormControlLabel
-                  control={
-                    <Checkbox
-                      checked={vaAll}
-                      onChange={(e) => {
-                        setVaAll(e.target.checked);
-                        if (!e.target.checked) setVaIncludeGroups(false);
-                      }}
-                    />
-                  }
-                  label={t.tokenVendorAccessAll}
-                />
-                <Box sx={{ pl: 3 }}>
-                  <FormControlLabel
-                    control={
-                      <Checkbox
-                        checked={vaAll && vaIncludeGroups}
-                        disabled={!vaAll}
-                        onChange={(e) => setVaIncludeGroups(e.target.checked)}
-                      />
-                    }
-                    label={t.tokenVendorAccessIncludeGroups}
-                  />
-                </Box>
-                {vaAll && (
-                  <Typography variant="caption" color="text.secondary">
-                    {t.tokenVendorAccessAllHint}
-                  </Typography>
-                )}
-                {!vaAll &&
-                  vendorAccounts !== null &&
-                  ownOptions.length + sharedOptions.length === 0 && (
-                    <Typography variant="body2" color="text.secondary">
-                      {t.tokenVendorAccessNone}
-                    </Typography>
-                  )}
-                {ownOptions.length > 0 && (
-                  <CheckboxGroup
-                    legend={t.tokenVendorAccessAccountsLabel}
-                    options={ownOptions.map(accountOption)}
-                    selected={vaAccounts.map((entry) => entry.accountId)}
-                    onToggle={toggleVendorAccount}
-                  />
-                )}
-                {sharedOptions.length > 0 && (
-                  <Box sx={{ display: 'grid', gap: 0.5 }}>
-                    <CheckboxGroup
-                      legend={t.tokenVendorAccessSharedLabel}
-                      options={sharedOptions.map(accountOption)}
-                      selected={vaAccounts.map((entry) => entry.accountId)}
-                      onToggle={toggleVendorAccount}
-                    />
-                    <Typography variant="caption" color="text.secondary">
-                      {t.tokenVendorAccessSharedHint}
-                    </Typography>
-                  </Box>
-                )}
-                <VendorAccessEntryGroups
-                  items={optedInAccounts}
-                  idPrefix="token-va"
-                  onChange={updateVendorEntry}
-                  t={t}
-                />
-                {groupOptions.length > 0 && (
-                  <CheckboxGroup
-                    legend={t.tokenVendorAccessGroupsLabel}
-                    options={groupOptions}
-                    selected={vaGroups.map((entry) => entry.accountId)}
-                    onToggle={toggleVendorGroup}
-                  />
-                )}
-                <VendorAccessEntryGroups
-                  items={optedInGroups}
-                  idPrefix="token-vg"
-                  onChange={updateVendorGroupEntry}
-                  t={t}
-                />
-              </Box>
+              <VendorAccessEditor
+                value={vaDraft}
+                onChange={setVaDraft}
+                accounts={vendorAccounts}
+                groups={vendorGroups}
+                t={t}
+                idPrefix="token"
+                labels={{ heading: t.tokenVendorAccessLabel, note: t.tokenVendorAccessNote }}
+              />
             )}
             <SearchableSelect
               id="token-project"
@@ -1107,6 +951,12 @@ export function TokenList({
         secret: chatSession.secret,
       })
     : null;
+  const chatVendorDraft =
+    chatDraftValue?.vendor_access ?? vendorAccessDraftFromDTO(chatSession?.vendor_access);
+  const chatVendorInvalid =
+    chatVendorEditable &&
+    chatDraftValue?.vendor_access !== undefined &&
+    vendorAccessDraftInvalid(chatVendorDraft, vendorAccounts, vendorGroups);
 
   return (
     <>
@@ -1157,11 +1007,35 @@ export function TokenList({
               variant="outlined"
               size="small"
               type="button"
+              disabled={chatVendorInvalid}
               onClick={() => saveChatSettings(chatDraftValue)}
             >
               {t.tokenActionSave}
             </Button>
           </Box>
+          {vendorAccountsEnabled && (
+            <Box sx={{ mt: 2 }}>
+              {chatVendorEditable && (
+                <VendorAccessEditor
+                  value={chatVendorDraft}
+                  onChange={(next) => setChatDraft({ ...chatDraftValue, vendor_access: next })}
+                  accounts={vendorAccounts}
+                  groups={vendorGroups}
+                  t={t}
+                  idPrefix="chat"
+                  labels={{
+                    heading: t.tokenVendorAccessLabel,
+                    note: t.chatSessionVendorAccessNote,
+                  }}
+                />
+              )}
+              {!chatVendorEditable && (
+                <Typography variant="caption" color="text.secondary">
+                  {t.chatSessionVendorAccessUnavailable}
+                </Typography>
+              )}
+            </Box>
+          )}
         </Panel>
       )}
 
