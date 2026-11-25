@@ -510,7 +510,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	metricsURL := fs.String("metrics-url", "", "optional inference /metrics URL to scrape (env OP_AGENT_METRICS_URL / config metrics_url)")
 	modelStatusURL := fs.String("model-status-url", "", "optional model-status URL to poll for loaded models (env OP_AGENT_MODEL_STATUS_URL / config model_status_url)")
 	modelStatusFormat := fs.String("model-status-format", "", "model-status response format: openai|llama_swap|llama_cpp|litellm|auto (env OP_AGENT_MODEL_STATUS_FORMAT / config model_status_format)")
-	powercapRoot := fs.String("powercap-root", "", "optional powercap sysfs root for CPU power, e.g. a Proxmox hostpower virtiofs mount (env OP_AGENT_POWERCAP_ROOT / config powercap_root); Linux only, ignored elsewhere")
+	powercapRoot := fs.String("powercap-root", "", "optional powercap root for CPU power, e.g. a Proxmox hostpower virtiofs mount (Windows: the virtiofs drive root) (env OP_AGENT_POWERCAP_ROOT / config powercap_root); read on Linux and Windows, ignored on macOS")
 	hostpowerURL := fs.String("hostpower-url", "", "optional hostpower HTTP endpoint on the Proxmox host, e.g. http://<host>:9873 (env OP_AGENT_HOSTPOWER_URL / config hostpower_url)")
 	hostpowerToken := fs.String("hostpower-token", "", "optional per-VM token for the hostpower HTTP endpoint (secret; env OP_AGENT_HOSTPOWER_TOKEN / config hostpower_token)")
 	lhmURL := fs.String("lhm-url", "", "optional LibreHardwareMonitor /data.json URL for CPU/system power (env OP_AGENT_LHM_URL / config lhm_url)")

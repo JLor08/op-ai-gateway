@@ -48,7 +48,7 @@ Server-agent (`op-ai-server-agent`):
 |---|---|
 | `gwapi`, `certfiles`, `wslentry` are stdlib-only | leaf contracts (gateway transport, cert-dir file layout, `wsl://` allowlist-entry grammar) shared by the feature packages |
 | `collector` ↛ `proxy`, `trust`, `client`, `agent` | telemetry collection is independent of transport and TLS machinery |
-| `hostpower` ↛ `agent`, `client`, `config`, `proxy`, `runtime`, `trust` | the Proxmox host service is not an enrolled agent: no gateway contact, token, config file or listener, so it may use only the `collector` RAPL reader ([ADR-115](../09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs)) |
+| `hostpower` ↛ `agent`, `client`, `config`, `proxy`, `runtime`, `trust` | the Proxmox host service is not an enrolled agent: no gateway contact and no gateway token (it has an optional HTTP listener and a per-VM token store of its own), so it may use only the `collector` RAPL reader and endpoint type ([ADR-115](../09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs), [ADR-116](../09-architecture-decisions.md#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token)) |
 | `sample` imports no internal package | the wire-format vocabulary is a leaf |
 | `trust`, `proxy`, `certinstall` do not import each other | their only integration is the shared `certfiles`/`gwapi` leaves and the filesystem contract |
 
