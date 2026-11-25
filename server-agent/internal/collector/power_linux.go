@@ -22,5 +22,5 @@ func newNativePowerCollector(powercapRoot string) PowerCollector {
 	if powercapRoot == "" {
 		powercapRoot = defaultPowercapRoot
 	}
-	return newRAPLCollector(powercapRoot, defaultHwmonRoot)
+	return newRAPLCollector(powercapRoot, defaultHwmonRoot, raplDomainGlobLinux)
 }

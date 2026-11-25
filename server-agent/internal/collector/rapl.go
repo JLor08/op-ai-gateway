@@ -30,18 +30,29 @@ type raplReading struct {
 // every counter -> nil (best-effort, no graph).
 type raplCollector struct {
 	powercapRoot string
-	hwmonRoot    string
+	hwmonRoot    string // "" disables the hwmon fallback (and never globs)
+	domainGlob   string // powercap domain directory pattern, per platform
 	now          func() time.Time
 
 	mu   sync.Mutex
 	prev map[string]raplReading // keyed by domain dir path
 }
 
-// newRAPLCollector builds a RAPL collector reading the given sysfs roots.
-func newRAPLCollector(powercapRoot, hwmonRoot string) *raplCollector {
+// Powercap domain directory patterns. Linux names carry a colon; the
+// host-provided Windows tree is colon-free because ':' is illegal in NTFS names.
+const (
+	raplDomainGlobLinux   = "intel-rapl:*"
+	raplDomainGlobWindows = "intel-rapl_*"
+)
+
+// newRAPLCollector builds a RAPL collector reading the given roots. domainGlob
+// selects the powercap domain directories (raplDomainGlobLinux or
+// raplDomainGlobWindows); an empty hwmonRoot disables the hwmon power fallback.
+func newRAPLCollector(powercapRoot, hwmonRoot, domainGlob string) *raplCollector {
 	return &raplCollector{
 		powercapRoot: powercapRoot,
 		hwmonRoot:    hwmonRoot,
+		domainGlob:   domainGlob,
 		now:          time.Now,
 		prev:         map[string]raplReading{},
 	}
@@ -54,13 +65,10 @@ func (c *raplCollector) Name() string { return "rapl" }
 // is present. It does NOT prove the energy files are readable; an unreadable counter
 // simply yields a nil value from Collect.
 func (c *raplCollector) Available() bool {
-	if domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, "intel-rapl:*")); len(domains) > 0 {
+	if domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, c.domainGlob)); len(domains) > 0 {
 		return true
 	}
-	if inputs, _ := filepath.Glob(filepath.Join(c.hwmonRoot, "*", "power*_input")); len(inputs) > 0 {
-		return true
-	}
-	return false
+	return len(c.hwmonInputs()) > 0
 }
 
 // Collect reads every intel-rapl domain, sums the package-* domains for CPU watts
@@ -73,7 +81,7 @@ func (c *raplCollector) Collect(_ context.Context) (*float64, *float64, error) {
 	defer c.mu.Unlock()
 
 	now := c.now()
-	domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, "intel-rapl:*"))
+	domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, c.domainGlob))
 
 	var pkgWatts float64
 	havePkg := false
@@ -133,14 +141,24 @@ func (c *raplCollector) Collect(_ context.Context) (*float64, *float64, error) {
 // hwmonSystemWatts returns the first readable hwmon power*_input (microwatts,
 // instantaneous) as watts, or nil when none is present/readable.
 func (c *raplCollector) hwmonSystemWatts() *float64 {
-	inputs, _ := filepath.Glob(filepath.Join(c.hwmonRoot, "*", "power*_input"))
-	for _, p := range inputs {
+	for _, p := range c.hwmonInputs() {
 		if uw, ok := readSysfsUint(p); ok {
 			w := float64(uw) / 1e6 // microwatts -> watts
 			return &w
 		}
 	}
 	return nil
+}
+
+// hwmonInputs lists the hwmon power*_input files. With no hwmon root it returns
+// nil without globbing: filepath.Join("", "*", ...) would be a relative pattern
+// resolved against the working directory.
+func (c *raplCollector) hwmonInputs() []string {
+	if c.hwmonRoot == "" {
+		return nil
+	}
+	inputs, _ := filepath.Glob(filepath.Join(c.hwmonRoot, "*", "power*_input"))
+	return inputs
 }
 
 // raplDeltaJoules returns the energy delta in JOULES between two µJ counter reads,
