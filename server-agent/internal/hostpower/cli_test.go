@@ -12,6 +12,7 @@ import (
 	"op-ai-server-agent/internal/collector"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -199,6 +200,71 @@ func TestParseArgsTLSDefaults(t *testing.T) {
 	}
 	if !cfg.TLS || cfg.TLSCert != "/x.crt" || cfg.TLSKey != "/x.key" {
 		t.Fatalf("custom paths: %+v", cfg)
+	}
+}
+
+// The out directory is the guests' virtiofs share: a TLS key or certificate in
+// it would be readable by every guest.
+func TestParseArgsTLSPathsOutsideOut(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	sibling := filepath.Join(filepath.Dir(out), "out-tls")
+	cases := []struct {
+		name, cert, key, bad string
+	}{
+		{"key inside", filepath.Join(sibling, "tls.crt"), filepath.Join(out, "tls.key"), "-tls-key"},
+		{"cert inside", filepath.Join(out, "100", "tls.crt"), filepath.Join(sibling, "tls.key"), "-tls-cert"},
+		{"cert via dot-dot", filepath.Join(sibling, "..", "out", "tls.crt"), filepath.Join(sibling, "tls.key"), "-tls-cert"},
+		{"dot-dot file name inside", filepath.Join(sibling, "tls.crt"), filepath.Join(out, "..tls.key"), "-tls-key"},
+		{"sibling with shared prefix", filepath.Join(sibling, "tls.crt"), filepath.Join(sibling, "tls.key"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{"-out", out, "-listen", "127.0.0.1:0", "-tls-cert", tc.cert, "-tls-key", tc.key}
+			if _, err := ParseArgs(args); err != nil {
+				t.Fatalf("without -tls: %v", err)
+			}
+			_, err := ParseArgs(append(args, "-tls"))
+			if tc.bad == "" {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.bad) || !strings.Contains(err.Error(), "-out") {
+				t.Fatalf("err = %v, want one naming %s and -out", err, tc.bad)
+			}
+		})
+	}
+}
+
+func TestParseArgsTLSRelativePathInsideOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	_, err := ParseArgs([]string{
+		"-out", filepath.Join(dir, "out"), "-listen", "127.0.0.1:0", "-tls",
+		"-tls-cert", filepath.Join("out", "tls.crt"), "-tls-key", filepath.Join(dir, "tls", "tls.key"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "-tls-cert") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMainTLSKeyInsideOutExits2(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	var buf bytes.Buffer
+	code := Main([]string{
+		"-out", out, "-listen", "127.0.0.1:0", "-auth", "token", "-tokens", filepath.Join(dir, "tokens.json"),
+		"-tls", "-tls-cert", filepath.Join(dir, "tls", "tls.crt"), "-tls-key", filepath.Join(out, "tls.key"),
+	}, io.Discard, &buf)
+	if code != 2 {
+		t.Fatalf("code = %d stderr=%q", code, buf.String())
+	}
+	if !strings.HasPrefix(buf.String(), "server-agent: hostpower: -tls-key ") || strings.Contains(buf.String(), "hostpower: serving") {
+		t.Fatalf("stderr = %q", buf.String())
+	}
+	if _, err := os.Lstat(out); err == nil {
+		t.Fatal("out directory created before the check")
 	}
 }
 
@@ -397,24 +463,16 @@ func TestRunServesTokenModeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Reserve a free port, release it and let run bind it (the listen address is
-	// the only handle the test has).
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	var stderr lockedBuffer
 	done := make(chan int, 1)
 	go func() {
 		done <- run(ctx, []string{
 			"-out", filepath.Join(dir, "out"), "-interval", "100ms",
-			"-listen", addr, "-auth", "token", "-tokens", tokens,
+			"-listen", "127.0.0.1:0", "-auth", "token", "-tokens", tokens,
 		}, io.Discard, &stderr)
 	}()
+	addr := servingAddr(t, &stderr)
 
 	get := func(auth string) int {
 		req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/energy", nil)
@@ -458,17 +516,22 @@ func TestRunServesTokenModeEndToEnd(t *testing.T) {
 	}
 }
 
-// freeAddr reserves a free loopback port and releases it for run to bind (the
-// listen address is the only handle the test has).
-func freeAddr(t *testing.T) string {
+// servingAddr waits for run's "hostpower: serving" line and returns the bound
+// listen address from it, so tests can listen on port 0 instead of releasing a
+// probed port for run to rebind.
+func servingAddr(t *testing.T, stderr *lockedBuffer) string {
 	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	re := regexp.MustCompile(`msg="hostpower: serving" listen=(\S+)`)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if m := re.FindStringSubmatch(stderr.String()); m != nil {
+			return m[1]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no serving log: %s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	addr := probe.Addr().String()
-	probe.Close()
-	return addr
 }
 
 func TestServeTLSTokenMode(t *testing.T) {
@@ -479,7 +542,6 @@ func TestServeTLSTokenMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	certPath, keyPath := certPaths(filepath.Join(dir, "tls"))
-	addr := freeAddr(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -488,22 +550,16 @@ func TestServeTLSTokenMode(t *testing.T) {
 	go func() {
 		done <- run(ctx, []string{
 			"-out", filepath.Join(dir, "out"), "-interval", "100ms",
-			"-listen", addr, "-auth", "token", "-tokens", tokens,
+			"-listen", "127.0.0.1:0", "-auth", "token", "-tokens", tokens,
 			"-tls", "-tls-cert", certPath, "-tls-key", keyPath,
 		}, io.Discard, &stderr)
 	}()
+	addr := servingAddr(t, &stderr)
 
 	// The certificate is written before the listener opens.
-	var der []byte
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if der, err = readCertDER(certPath); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no certificate: %v; stderr=%s", err, stderr.String())
-		}
-		time.Sleep(20 * time.Millisecond)
+	der, err := readCertDER(certPath)
+	if err != nil {
+		t.Fatalf("no certificate: %v; stderr=%s", err, stderr.String())
 	}
 	fp := collector.FormatHostpowerFingerprint(der)
 	pin, err := collector.ParseHostpowerFingerprint(fp)

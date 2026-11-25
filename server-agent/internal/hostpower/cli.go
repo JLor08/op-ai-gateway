@@ -62,7 +62,8 @@ func newFlagSet() (fs *flag.FlagSet, cfg *Config, auth *string) {
 // ParseArgs parses the arguments after "hostpower". Besides the flag.FlagSet
 // errors it rejects positional arguments and an interval below MinInterval,
 // which also guards the ticker in Run against a non-positive duration. -auth is
-// validated only when -listen enables HTTP, and -tls needs -listen.
+// validated only when -listen enables HTTP, -tls needs -listen, and with -tls
+// neither -tls-key nor -tls-cert may lie inside the -out directory.
 func ParseArgs(args []string) (Config, error) {
 	fs, cfg, auth := newFlagSet()
 	if err := fs.Parse(args); err != nil {
@@ -77,6 +78,11 @@ func ParseArgs(args []string) (Config, error) {
 	if cfg.TLS && cfg.Listen == "" {
 		return Config{}, errors.New("hostpower: -tls needs -listen")
 	}
+	if cfg.TLS {
+		if err := checkTLSPathsOutsideOut(*cfg); err != nil {
+			return Config{}, err
+		}
+	}
 	cfg.Auth = AuthModes{MAC: true, Token: true} // the -auth default
 	if cfg.Listen != "" {
 		modes, err := ParseAuthModes(*auth)
@@ -86,6 +92,31 @@ func ParseArgs(args []string) (Config, error) {
 		cfg.Auth = modes
 	}
 	return *cfg, nil
+}
+
+// checkTLSPathsOutsideOut rejects a -tls-key or -tls-cert inside the out
+// directory, which is the guests' virtiofs share: a key there would be
+// readable by every guest. The check is lexical on the cleaned absolute paths;
+// symlinks are not resolved.
+func checkTLSPathsOutsideOut(cfg Config) error {
+	out, err := filepath.Abs(cfg.Options.withDefaults().OutDir)
+	if err != nil {
+		return fmt.Errorf("hostpower: -out: %w", err)
+	}
+	for _, f := range []struct{ flag, path string }{{"-tls-key", cfg.TLSKey}, {"-tls-cert", cfg.TLSCert}} {
+		p, err := filepath.Abs(f.path)
+		if err != nil {
+			return fmt.Errorf("hostpower: %s: %w", f.flag, err)
+		}
+		rel, err := filepath.Rel(out, p)
+		if err != nil {
+			continue // different volume (Windows): not inside
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("hostpower: %s %s lies inside the -out directory %s, which guests can read; keep the TLS files outside it", f.flag, f.path, out)
+		}
+	}
+	return nil
 }
 
 // msgNotReadable is the startup warning for a service that cannot read RAPL.
