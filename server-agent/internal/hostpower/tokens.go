@@ -330,45 +330,61 @@ func TokenMain(args []string, stdout, stderr io.Writer) int {
 		return usage("missing verb")
 	}
 	verb, vmargs := rest[0], rest[1:]
-	switch verb {
-	case "create", "revoke":
-		if len(vmargs) != 1 {
-			return usage(verb + " needs exactly one vmid")
-		}
-		if err := validVMID(vmargs[0]); err != nil {
-			return usage(err.Error())
-		}
-	case "list":
-		if len(vmargs) != 0 {
-			return usage("list takes no vmid")
-		}
-	default:
-		return usage("unknown verb " + strconv.Quote(verb))
+	if msg := checkTokenArgs(verb, vmargs); msg != "" {
+		return usage(msg)
 	}
 
 	fail := func(err error) int {
 		_, _ = fmt.Fprintf(stderr, "hostpower token %s: %v\n", verb, err)
 		return 1
 	}
+	if err := runTokenVerb(verb, *path, vmargs, stdout); err != nil {
+		return fail(err)
+	}
+	return 0
+}
+
+// checkTokenArgs returns the usage message for a bad verb or argument list,
+// or "" when the arguments are valid.
+func checkTokenArgs(verb string, vmargs []string) string {
+	switch verb {
+	case "create", "revoke":
+		if len(vmargs) != 1 {
+			return verb + " needs exactly one vmid"
+		}
+		if err := validVMID(vmargs[0]); err != nil {
+			return err.Error()
+		}
+	case "list":
+		if len(vmargs) != 0 {
+			return "list takes no vmid"
+		}
+	default:
+		return "unknown verb " + strconv.Quote(verb)
+	}
+	return ""
+}
+
+// runTokenVerb executes a validated verb against the token store at path.
+// vmargs holds the vmid for create and revoke.
+func runTokenVerb(verb, path string, vmargs []string, stdout io.Writer) error {
 	switch verb {
 	case "create":
-		tok, err := CreateToken(*path, vmargs[0])
+		tok, err := CreateToken(path, vmargs[0])
 		if err != nil {
-			return fail(err)
+			return err
 		}
 		_, _ = fmt.Fprintln(stdout, tok)
 	case "revoke":
-		if err := RevokeToken(*path, vmargs[0]); err != nil {
-			return fail(err)
-		}
+		return RevokeToken(path, vmargs[0])
 	case "list":
-		infos, err := ListTokens(*path)
+		infos, err := ListTokens(path)
 		if err != nil {
-			return fail(err)
+			return err
 		}
 		for _, i := range infos {
 			_, _ = fmt.Fprintf(stdout, "%s\t%s\n", i.VMID, i.Created.UTC().Format(time.RFC3339))
 		}
 	}
-	return 0
+	return nil
 }

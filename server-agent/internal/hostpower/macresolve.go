@@ -138,42 +138,13 @@ func parseTCPFrame(frame []byte, wireLen int, dstPort uint16) (key ConnKey, src 
 	if wireLen < len(frame) {
 		frame = frame[:max(wireLen, 0)]
 	}
-	if len(frame) < ethHeaderLen {
-		return ConnKey{}, nil, false, false
-	}
-	l3 := ethHeaderLen
-	etherType := binary.BigEndian.Uint16(frame[12:14])
-	if etherType == etherTypeVLAN {
-		if len(frame) < ethHeaderLen+vlanTagLen {
-			return ConnKey{}, nil, false, false
-		}
-		l3 += vlanTagLen
-		etherType = binary.BigEndian.Uint16(frame[16:18])
-	}
-	if etherType != etherTypeIPv4 {
+	l3, ok := ipv4Offset(frame)
+	if !ok {
 		return ConnKey{}, nil, false, false
 	}
 
-	ip := frame[l3:]
-	if len(ip) < ipv4MinHeader || ip[0]>>4 != 4 {
-		return ConnKey{}, nil, false, false
-	}
-	ihl := int(ip[0]&0x0f) * 4
-	frag := binary.BigEndian.Uint16(ip[6:8])
-	if ihl < ipv4MinHeader || ip[9] != ipProtoTCP || frag&ipFragOffset != 0 {
-		return ConnKey{}, nil, false, false
-	}
-	firstFragment := frag&ipMoreFrags != 0
-	need := tcpMinHeader
-	if firstFragment {
-		need = tcpPortBytes
-	}
-	total := int(binary.BigEndian.Uint16(ip[2:4]))
-	if total < ihl+need || total > wireLen-l3 {
-		return ConnKey{}, nil, false, false
-	}
-	ip = ip[:min(len(ip), total)]
-	if len(ip) < ihl+need {
+	ip, ihl, firstFragment, ok := boundIPv4Packet(frame[l3:], wireLen-l3)
+	if !ok {
 		return ConnKey{}, nil, false, false
 	}
 	tcp := ip[ihl:]
@@ -187,6 +158,55 @@ func parseTCPFrame(frame []byte, wireLen int, dstPort uint16) (key ConnKey, src 
 	}
 	syn = !firstFragment && tcp[13]&(tcpFlagSYN|tcpFlagACK) == tcpFlagSYN
 	return key, bytes.Clone(frame[6:12]), syn, true
+}
+
+// ipv4Offset returns the offset of the IPv4 header in an Ethernet II frame
+// (after an optional single 802.1Q tag), or ok == false when the frame is
+// too short or does not carry IPv4.
+func ipv4Offset(frame []byte) (l3 int, ok bool) {
+	if len(frame) < ethHeaderLen {
+		return 0, false
+	}
+	l3 = ethHeaderLen
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+	if etherType == etherTypeVLAN {
+		if len(frame) < ethHeaderLen+vlanTagLen {
+			return 0, false
+		}
+		l3 += vlanTagLen
+		etherType = binary.BigEndian.Uint16(frame[16:18])
+	}
+	return l3, etherType == etherTypeIPv4
+}
+
+// boundIPv4Packet validates the IPv4 header of ip (the bytes after the
+// Ethernet header; ipWireLen is the packet's length on the wire) and returns
+// the packet trimmed to its total length, its header length and whether it
+// is a first fragment. ok is false for anything that is not a TCP packet
+// with at least the needed TCP bytes inside the frame.
+func boundIPv4Packet(ip []byte, ipWireLen int) (pkt []byte, ihl int, firstFragment, ok bool) {
+	if len(ip) < ipv4MinHeader || ip[0]>>4 != 4 {
+		return nil, 0, false, false
+	}
+	ihl = int(ip[0]&0x0f) * 4
+	frag := binary.BigEndian.Uint16(ip[6:8])
+	if ihl < ipv4MinHeader || ip[9] != ipProtoTCP || frag&ipFragOffset != 0 {
+		return nil, 0, false, false
+	}
+	firstFragment = frag&ipMoreFrags != 0
+	need := tcpMinHeader
+	if firstFragment {
+		need = tcpPortBytes
+	}
+	total := int(binary.BigEndian.Uint16(ip[2:4]))
+	if total < ihl+need || total > ipWireLen {
+		return nil, 0, false, false
+	}
+	ip = ip[:min(len(ip), total)]
+	if len(ip) < ihl+need {
+		return nil, 0, false, false
+	}
+	return ip, ihl, firstFragment, true
 }
 
 // --- kernel packet filter ---
@@ -576,45 +596,63 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 	defer cancel()
 	key := ConnKey{Src: src, Dst: dst}
 
+	tap, vmid, nic, reason := r.awaitIngress(ctx, key)
+	if reason != "" {
+		return resolveFail(reason)
+	}
+	if reason := r.checkVMConfig(vmid, nic, tap); reason != "" {
+		return resolveFail(reason)
+	}
+	return vmid, nil
+}
+
+// awaitIngress waits for the connection's handshake and returns the tap it
+// entered on, or the failure reason.
+func (r *IngressResolver) awaitIngress(ctx context.Context, key ConnKey) (tap *Observation, vmid, nic, reason string) {
 	// The VM-port rule is decided as soon as the SYN is in, then the
 	// handshake is awaited within the same deadline and everything is
 	// evaluated again on the final observations.
 	obs, overflow := r.Table.waitUntil(ctx, key, hasSYN)
 	if overflow {
-		return resolveFail(reasonOverflow)
+		return nil, "", "", reasonOverflow
 	}
 	if _, _, _, reason := selectTap(obs); reason != "" {
-		return resolveFail(reason)
+		return nil, "", "", reason
 	}
 	obs, overflow = r.Table.waitUntil(ctx, key, hasHandshakeSegment)
 	if overflow {
-		return resolveFail(reasonOverflow)
+		return nil, "", "", reasonOverflow
 	}
-	tap, vmid, nic, reason := selectTap(obs)
+	tap, vmid, nic, reason = selectTap(obs)
 	if reason != "" {
-		return resolveFail(reason)
+		return nil, "", "", reason
 	}
 	if !hasHandshakeSegment(obs) {
-		return resolveFail(reasonNoHandshake)
+		return nil, "", "", reasonNoHandshake
 	}
 	for _, o := range obs {
 		if o.Ifname != tap.Ifname && !r.isTransit(o.Ifname) {
-			return resolveFail(reasonForeign)
+			return nil, "", "", reasonForeign
 		}
 	}
+	return tap, vmid, nic, ""
+}
 
+// checkVMConfig verifies the tap's source MAC against the VM's configured
+// NIC and returns the failure reason, or "" when it matches.
+func (r *IngressResolver) checkVMConfig(vmid, nic string, tap *Observation) string {
 	dir := r.PVEConfDir
 	if dir == "" {
 		dir = DefaultPVEConfDir
 	}
 	conf, ok, err := readCapped(filepath.Join(dir, vmid+".conf"), maxTextFileBytes)
 	if err != nil || !ok {
-		return resolveFail(reasonNoVMConfig)
+		return reasonNoVMConfig
 	}
 	if mac := configNICMAC(conf, nic); mac == nil || !bytes.Equal(mac, tap.SrcMAC) {
-		return resolveFail(reasonMACMismatch)
+		return reasonMACMismatch
 	}
-	return vmid, nil
+	return ""
 }
 
 // selectTap returns the single tap device the connection's SYN entered on,

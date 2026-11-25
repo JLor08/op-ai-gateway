@@ -106,46 +106,60 @@ func captureLoop(ctx context.Context, fd int, port uint16, table *ObservationTab
 		// captureReadLen bytes were copied.
 		n, from, err := syscall.Recvfrom(fd, buf, syscall.MSG_TRUNC)
 		if err != nil {
-			switch {
-			case errors.Is(err, syscall.EINTR):
-			case errors.Is(err, syscall.EAGAIN): // idle timeout: the socket works
-				if health.ok() {
-					log.Info("hostpower: packet capture recovered")
-				}
-			default:
-				if health.failed(time.Now()) {
-					log.Warn("hostpower: packet capture read failing; MAC mode rejects requests until it recovers", "err", err)
-				}
-				select {
-				case <-ctx.Done():
-				case <-time.After(captureErrorPause):
-				}
-			}
+			handleCaptureReadError(ctx, err, health, log)
 			continue
 		}
 		if health.ok() {
 			log.Info("hostpower: packet capture recovered")
 		}
-		ll, ok := from.(*syscall.SockaddrLinklayer)
-		if !ok || ll.Pkttype == syscall.PACKET_OUTGOING {
-			continue
-		}
-		if ll.Hatype != syscall.ARPHRD_ETHER && ll.Hatype != syscall.ARPHRD_LOOPBACK {
-			log.Debug("hostpower: skipped captured frame: no Ethernet header", "ifindex", ll.Ifindex, "hatype", ll.Hatype)
-			continue
-		}
-		key, mac, syn, ok := parseTCPFrame(buf[:min(n, len(buf))], n, port)
-		if !ok {
-			log.Debug("hostpower: skipped captured frame: not a TCP segment for the listen port", "ifindex", ll.Ifindex, "len", n)
-			continue
-		}
-		name, ok := interfaceName(names, ll.Ifindex)
-		if !ok {
-			log.Debug("hostpower: skipped captured frame: interface gone", "ifindex", ll.Ifindex)
-			continue
-		}
-		table.Add(key, Observation{Ifname: name, SrcMAC: mac, SYN: syn})
+		recordCapturedFrame(buf, n, from, port, table, names, log)
 	}
+}
+
+// handleCaptureReadError reacts to a failed recvfrom: EINTR is ignored, the
+// idle timeout proves the socket works, anything else counts as a failure
+// and pauses before the next read.
+func handleCaptureReadError(ctx context.Context, err error, health *captureHealth, log *slog.Logger) {
+	switch {
+	case errors.Is(err, syscall.EINTR):
+	case errors.Is(err, syscall.EAGAIN): // idle timeout: the socket works
+		if health.ok() {
+			log.Info("hostpower: packet capture recovered")
+		}
+	default:
+		if health.failed(time.Now()) {
+			log.Warn("hostpower: packet capture read failing; MAC mode rejects requests until it recovers", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(captureErrorPause):
+		}
+	}
+}
+
+// recordCapturedFrame classifies one captured frame and records it in the
+// table; frames that are outgoing, headerless, not for the listen port or on
+// a vanished interface are skipped.
+func recordCapturedFrame(buf []byte, n int, from syscall.Sockaddr, port uint16, table *ObservationTable, names map[int]string, log *slog.Logger) {
+	ll, ok := from.(*syscall.SockaddrLinklayer)
+	if !ok || ll.Pkttype == syscall.PACKET_OUTGOING {
+		return
+	}
+	if ll.Hatype != syscall.ARPHRD_ETHER && ll.Hatype != syscall.ARPHRD_LOOPBACK {
+		log.Debug("hostpower: skipped captured frame: no Ethernet header", "ifindex", ll.Ifindex, "hatype", ll.Hatype)
+		return
+	}
+	key, mac, syn, ok := parseTCPFrame(buf[:min(n, len(buf))], n, port)
+	if !ok {
+		log.Debug("hostpower: skipped captured frame: not a TCP segment for the listen port", "ifindex", ll.Ifindex, "len", n)
+		return
+	}
+	name, ok := interfaceName(names, ll.Ifindex)
+	if !ok {
+		log.Debug("hostpower: skipped captured frame: interface gone", "ifindex", ll.Ifindex)
+		return
+	}
+	table.Add(key, Observation{Ifname: name, SrcMAC: mac, SYN: syn})
 }
 
 // interfaceName maps an interface index to its name, asking the kernel on a

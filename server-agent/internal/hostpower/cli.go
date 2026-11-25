@@ -169,7 +169,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if cfg.Listen == "" {
 		return runTicks(ctx, svc, cfg.Interval, stderr)
 	}
+	return serve(ctx, cancel, cfg, svc, stderr)
+}
 
+// serve runs the HTTP listener next to the tick loop until either ends and
+// returns the exit code.
+func serve(ctx context.Context, cancel context.CancelFunc, cfg Config, svc *Service, stderr io.Writer) int {
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		fmt.Fprintf(stderr, "server-agent: hostpower: listen: %v\n", err)

@@ -23,6 +23,9 @@ import (
 // many guests behind one NAT address stay under it. The VM limit applies once
 // a request is tied to a VM and holds each VM to a little above a 1 Hz
 // poller's needs.
+// reasonBadConnAddr is the auth-rejection reason for an unparsable connection address.
+const reasonBadConnAddr = "bad connection address"
+
 const (
 	sourceRatePerSecond = 100.0
 	sourceRateBurst     = 200.0
@@ -243,15 +246,15 @@ func (h *handler) identify(r *http.Request) (vmid, mode, reason string, ok bool)
 	}
 	remote, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
-		return "", "mac", "bad connection address", false
+		return "", "mac", reasonBadConnAddr, false
 	}
 	laddr, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
 	if laddr == nil {
-		return "", "mac", "bad connection address", false
+		return "", "mac", reasonBadConnAddr, false
 	}
 	local, err := netip.ParseAddrPort(laddr.String())
 	if err != nil {
-		return "", "mac", "bad connection address", false
+		return "", "mac", reasonBadConnAddr, false
 	}
 	id, err := h.resolver.Resolve(r.Context(), remote, local)
 	if err != nil {
