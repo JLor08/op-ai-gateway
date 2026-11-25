@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package collector
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeHost is a scriptable hostpower endpoint. mode: "ok", "503", "close"
+// (hijack and drop the connection), "garbage", "big".
+type fakeHost struct {
+	mu     sync.Mutex
+	mode   string
+	vmid   string
+	energy uint64
+	maxUJ  uint64
+	paths  []string
+	auths  []string
+	srv    *httptest.Server
+}
+
+func newFakeHost(t *testing.T) *fakeHost {
+	t.Helper()
+	f := &fakeHost{mode: "ok", vmid: "100"}
+	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.paths = append(f.paths, r.URL.Path)
+	f.auths = append(f.auths, r.Header.Get("Authorization"))
+	mode, vmid, energy, maxUJ := f.mode, f.vmid, f.energy, f.maxUJ
+	f.mu.Unlock()
+	switch mode {
+	case "503":
+		http.Error(w, "not live", http.StatusServiceUnavailable)
+	case "close":
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	case "garbage":
+		_, _ = w.Write([]byte("not json"))
+	case "big":
+		_, _ = w.Write([]byte(strings.Repeat("x", 1<<20)))
+	default:
+		_, _ = fmt.Fprintf(w, `{"vmid":%q,"energy_uj":%d,"max_energy_range_uj":%d}`, vmid, energy, maxUJ)
+	}
+}
+
+func (f *fakeHost) set(mode string, energy uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mode, f.energy = mode, energy
+}
+
+func (f *fakeHost) lastPath() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.paths[len(f.paths)-1]
+}
+
+// step sets the host state, advances the clock to base+at and collects once.
+type hpStepper struct {
+	t    *testing.T
+	f    *fakeHost
+	c    *hostpowerHTTPCollector
+	base time.Time
+	cur  time.Time
+}
+
+func newStepper(t *testing.T, token string) *hpStepper {
+	t.Helper()
+	f := newFakeHost(t)
+	c := newHostpowerHTTPCollector(f.srv.URL, token, NewHostpowerHTTPClient())
+	s := &hpStepper{t: t, f: f, c: c, base: time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)}
+	s.cur = s.base
+	c.now = func() time.Time { return s.cur }
+	return s
+}
+
+func (s *hpStepper) collect(mode string, energy uint64, at time.Duration) (cpu, system *float64) {
+	s.t.Helper()
+	s.f.set(mode, energy)
+	s.cur = s.base.Add(at)
+	cpu, system, err := s.c.Collect(context.Background())
+	if err != nil {
+		s.t.Fatalf("Collect returned error: %v", err)
+	}
+	return cpu, system
+}
+
+func wantNil(t *testing.T, label string, v *float64) {
+	t.Helper()
+	if v != nil {
+		t.Fatalf("%s = %v, want nil", label, *v)
+	}
+}
+
+func wantWatts(t *testing.T, label string, v *float64, want float64) {
+	t.Helper()
+	if v == nil {
+		t.Fatalf("%s = nil, want %v W", label, want)
+	}
+	if *v < want-0.001 || *v > want+0.001 {
+		t.Fatalf("%s = %v, want %v W", label, *v, want)
+	}
+}
+
+func TestHostpowerHTTPIdentity(t *testing.T) {
+	c := newHostpowerHTTPCollector("", "", NewHostpowerHTTPClient())
+	if c.Name() != "hostpower" {
+		t.Fatalf("Name() = %q", c.Name())
+	}
+	if c.Available() {
+		t.Fatal("Available() = true for an empty base URL")
+	}
+	if !newHostpowerHTTPCollector("http://192.0.2.1:8080", "", nil).Available() {
+		t.Fatal("Available() = false for a set base URL")
+	}
+}
+
+func TestHostpowerHTTPFirstSampleNil(t *testing.T) {
+	s := newStepper(t, "")
+	cpu, system := s.collect("ok", 1_000_000, 0)
+	wantNil(t, "cpu", cpu)
+	wantNil(t, "system", system)
+}
+
+func TestHostpowerHTTPWatts(t *testing.T) {
+	s := newStepper(t, "")
+	s.collect("ok", 1_000_000, 0)
+	cpu, system := s.collect("ok", 16_000_000, time.Second)
+	wantWatts(t, "cpu", cpu, 15)
+	wantNil(t, "system", system)
+}
+
+func TestHostpowerHTTPDecreaseWithZeroRangeIsZero(t *testing.T) {
+	s := newStepper(t, "")
+	s.collect("ok", 5_000_000, 0)
+	cpu, _ := s.collect("ok", 1_000_000, time.Second)
+	wantWatts(t, "cpu", cpu, 0)
+}
+
+func TestHostpowerHTTPWraparoundUsesRange(t *testing.T) {
+	s := newStepper(t, "")
+	s.f.maxUJ = 20_000_000
+	s.collect("ok", 19_000_000, 0)
+	cpu, _ := s.collect("ok", 4_000_000, time.Second) // (20-19)+4 = 5 J
+	wantWatts(t, "cpu", cpu, 5)
+}
+
+func TestHostpowerHTTPErrorRebaselines(t *testing.T) {
+	s := newStepper(t, "")
+	_, _ = s.collect("ok", 1_000_000, 0)
+	cpu, _ := s.collect("503", 0, time.Second)
+	wantNil(t, "503", cpu)
+	cpu, _ = s.collect("ok", 16_000_000, 2*time.Second)
+	wantNil(t, "first after error", cpu)
+	cpu, _ = s.collect("ok", 31_000_000, 3*time.Second)
+	wantWatts(t, "second after error", cpu, 15)
+}
+
+func TestHostpowerHTTPBadJSONIsNilAndRebaselines(t *testing.T) {
+	s := newStepper(t, "")
+	s.collect("ok", 1_000_000, 0)
+	cpu, _ := s.collect("garbage", 0, time.Second)
+	wantNil(t, "garbage", cpu)
+	cpu, _ = s.collect("ok", 16_000_000, 2*time.Second)
+	wantNil(t, "first after garbage", cpu)
+}
+
+func TestHostpowerHTTPVMIDChangeRebaselines(t *testing.T) {
+	s := newStepper(t, "")
+	s.collect("ok", 1_000_000, 0)
+	s.f.mu.Lock()
+	s.f.vmid = "101"
+	s.f.mu.Unlock()
+	cpu, _ := s.collect("ok", 16_000_000, time.Second)
+	wantNil(t, "after vmid change", cpu)
+	cpu, _ = s.collect("ok", 31_000_000, 2*time.Second)
+	wantWatts(t, "next sample", cpu, 15)
+}
+
+func TestHostpowerHTTPSendsTokenOnlyWhenSet(t *testing.T) {
+	s := newStepper(t, "ophp_x")
+	s.collect("ok", 1, 0)
+	if got := s.f.auths[0]; got != "Bearer ophp_x" {
+		t.Fatalf("Authorization = %q, want %q", got, "Bearer ophp_x")
+	}
+	s = newStepper(t, "")
+	s.collect("ok", 1, 0)
+	if got := s.f.auths[0]; got != "" {
+		t.Fatalf("Authorization = %q, want none", got)
+	}
+}
+
+func TestHostpowerHTTPBaseURLForms(t *testing.T) {
+	for suffix, want := range map[string]string{"/": "/v1/energy", "/hp": "/hp/v1/energy", "/hp/": "/hp/v1/energy", "": "/v1/energy"} {
+		f := newFakeHost(t)
+		c := newHostpowerHTTPCollector(f.srv.URL+suffix, "", NewHostpowerHTTPClient())
+		if _, _, err := c.Collect(context.Background()); err != nil {
+			t.Fatalf("Collect: %v", err)
+		}
+		if got := f.lastPath(); got != want {
+			t.Fatalf("base %q: requested %q, want %q", suffix, got, want)
+		}
+	}
+}
+
+// Host restart: connection drop, 503 while the VM is not live, then the counter
+// restarts from a lower value. Nothing is reported until two clean samples exist.
+func TestHostpowerHTTPHostRestart(t *testing.T) {
+	s := newStepper(t, "")
+	cpu, _ := s.collect("ok", 5_000_000, 0)
+	wantNil(t, "baseline", cpu)
+	cpu, _ = s.collect("close", 0, time.Second)
+	wantNil(t, "dropped connection", cpu)
+	cpu, _ = s.collect("503", 0, 2*time.Second)
+	wantNil(t, "503", cpu)
+	cpu, _ = s.collect("ok", 5_000_000, 3*time.Second)
+	wantNil(t, "new baseline", cpu)
+	cpu, _ = s.collect("ok", 20_000_000, 4*time.Second)
+	wantWatts(t, "after restart", cpu, 15)
+}
+
+func TestHostpowerHTTPIgnoresProxyEnv(t *testing.T) {
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("http_proxy", "http://127.0.0.1:1")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+	f := newFakeHost(t)
+	c := newHostpowerHTTPCollector(f.srv.URL, "", NewHostpowerHTTPClient())
+	if _, _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.paths) != 1 {
+		t.Fatalf("server saw %d requests, want 1 (proxy env must be ignored)", len(f.paths))
+	}
+}
+
+func TestHostpowerHTTPCapsBody(t *testing.T) {
+	s := newStepper(t, "")
+	s.collect("ok", 1_000_000, 0)
+	done := make(chan *float64, 1)
+	go func() {
+		cpu, _ := s.collect("big", 0, time.Second)
+		done <- cpu
+	}()
+	select {
+	case cpu := <-done:
+		wantNil(t, "oversized body", cpu)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Collect hung on an oversized body")
+	}
+}
+
+func TestHostpowerHTTPClientSettings(t *testing.T) {
+	c := NewHostpowerHTTPClient()
+	if c.Timeout != time.Second {
+		t.Fatalf("Timeout = %v, want 1s", c.Timeout)
+	}
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Fatalf("Transport = %#v, want *http.Transport with nil Proxy", c.Transport)
+	}
+}
