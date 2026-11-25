@@ -269,7 +269,10 @@ type observedConn struct {
 	start    time.Time // first observation; drives expiry and eviction
 	synStart time.Time // first SYN observation; zero while none was seen
 	obs      []Observation
-	overflow bool // more distinct copies than maxObservationsPerKey
+	// overflow: more distinct copies than maxObservationsPerKey arrived, at
+	// overflowAt; the mark lasts ttl from then.
+	overflow   bool
+	overflowAt time.Time
 }
 
 type queuedKey struct {
@@ -318,7 +321,8 @@ func NewObservationTable(ttl time.Duration, now func() time.Time) *ObservationTa
 // than synBurstWindow earlier (another copy of the same SYN). Replacement
 // only drops positive evidence: the earlier entry's observations on
 // interfaces that are not taps (foreign or transit) are kept, marked
-// Earlier, while younger than ttl, and an overflow stays an overflow.
+// Earlier, while younger than ttl, and so is an overflow mark. Every mark
+// lasts ttl from its latest sighting.
 // Non-SYN segments are added to the key's entry, creating one if needed.
 func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	now := t.now()
@@ -351,48 +355,59 @@ func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	if obs.SYN && e.synStart.IsZero() {
 		e.synStart = obs.At
 	}
-	if !e.overflow && !containsObservation(e.obs, obs) {
-		if len(e.obs) >= maxObservationsPerKey {
-			e.overflow, e.obs = true, nil
-		} else {
-			e.obs = append(e.obs, obs)
-		}
-	}
+	t.recordLocked(e, obs, now)
 	close(t.changed)
 	t.changed = make(chan struct{})
 }
 
-// carryLocked copies the negative evidence of a replaced entry into its
-// successor: observations on non-tap interfaces younger than ttl, as Earlier
-// non-SYN observations, and the overflow mark.
-func (t *ObservationTable) carryLocked(dst, src *observedConn, now time.Time) {
-	dst.overflow = src.overflow
-	for _, o := range src.obs {
-		if dst.overflow {
+// recordLocked adds o to e. A duplicate (same interface, MAC, SYN and
+// Earlier flags) only moves the existing observation's At to the newer of
+// the two; one distinct copy more than maxObservationsPerKey turns e into an
+// overflow at now. An active overflow drops o; an expired one is cleared.
+func (t *ObservationTable) recordLocked(e *observedConn, o Observation, now time.Time) {
+	if e.overflow {
+		if t.overflowed(e, now) {
 			return
 		}
+		e.overflow = false
+	}
+	for i := range e.obs {
+		x := &e.obs[i]
+		if x.Ifname == o.Ifname && x.SYN == o.SYN && x.Earlier == o.Earlier && bytes.Equal(x.SrcMAC, o.SrcMAC) {
+			if o.At.After(x.At) {
+				x.At = o.At
+			}
+			return
+		}
+	}
+	if len(e.obs) >= maxObservationsPerKey {
+		e.overflow, e.overflowAt, e.obs = true, now, nil
+		return
+	}
+	e.obs = append(e.obs, o)
+}
+
+// overflowed reports an overflow mark younger than ttl.
+func (t *ObservationTable) overflowed(e *observedConn, now time.Time) bool {
+	return e.overflow && now.Sub(e.overflowAt) <= t.ttl
+}
+
+// carryLocked copies the negative evidence of a replaced entry into its
+// successor: observations on non-tap interfaces younger than ttl, as Earlier
+// non-SYN observations (copies that collapse keep the latest At), and an
+// overflow mark younger than ttl with its own time.
+func (t *ObservationTable) carryLocked(dst, src *observedConn, now time.Time) {
+	if t.overflowed(src, now) {
+		dst.overflow, dst.overflowAt = true, src.overflowAt
+		return
+	}
+	for _, o := range src.obs {
 		if tapPortPattern.MatchString(o.Ifname) || now.Sub(o.At) > t.ttl {
 			continue
 		}
 		o.SYN, o.Earlier = false, true
-		if containsObservation(dst.obs, o) {
-			continue
-		}
-		if len(dst.obs) >= maxObservationsPerKey {
-			dst.overflow, dst.obs = true, nil
-			return
-		}
-		dst.obs = append(dst.obs, o)
+		t.recordLocked(dst, o, now)
 	}
-}
-
-func containsObservation(list []Observation, o Observation) bool {
-	for _, x := range list {
-		if x.Ifname == o.Ifname && x.SYN == o.SYN && x.Earlier == o.Earlier && bytes.Equal(x.SrcMAC, o.SrcMAC) {
-			return true
-		}
-	}
-	return false
 }
 
 func (t *ObservationTable) expired(e *observedConn, now time.Time) bool {
@@ -486,7 +501,7 @@ func (t *ObservationTable) snapshot(key ConnKey) (obs []Observation, overflow bo
 	defer t.mu.Unlock()
 	now := t.now()
 	if e := t.entries[key]; e != nil && !t.expired(e, now) {
-		if e.overflow {
+		if t.overflowed(e, now) {
 			return nil, true, t.changed
 		}
 		for _, o := range e.obs {
@@ -542,10 +557,7 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 	if !src.Addr().Is4() || !dst.Addr().Is4() {
 		return resolveFail(reasonIPv6)
 	}
-	if r.Table == nil {
-		return resolveFail(reasonNoSYN)
-	}
-	if !r.Table.captureHealthy() {
+	if r.Table == nil || !r.Table.captureHealthy() {
 		return resolveFail(reasonCaptureDown)
 	}
 	maxWait := r.MaxWait

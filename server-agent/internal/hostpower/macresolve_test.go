@@ -792,6 +792,80 @@ func TestResolveForeignMarkExpiresAfterCarry(t *testing.T) {
 	wantVMID(t, vmid, err, "100")
 }
 
+func TestResolveForeignMarkExpiresFromLatestSighting(t *testing.T) {
+	// Repeated foreign segments refresh the mark: it lasts ttl after the
+	// latest sighting, not the first.
+	t0 := time.Unix(1_000_000, 0)
+	clock := t0.Add(time.Second)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.ack(t, testKey, testMACB, "enp3s0")
+	clock = t0.Add(25 * time.Second)
+	f.ack(t, testKey, testMACB, "enp3s0")
+	clock = t0.Add(26 * time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	for _, at := range []time.Duration{31 * time.Second, 54 * time.Second} {
+		clock = t0.Add(at)
+		vmid, err := f.resolve()
+		wantReason(t, vmid, err, "foreign ingress")
+	}
+	clock = t0.Add(55*time.Second + 500*time.Millisecond)
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "100")
+}
+
+func TestResolveCollapsedForeignMarkKeepsLatestSighting(t *testing.T) {
+	// An uplink SYN and a later uplink ACK collapse into one carried
+	// observation, which must keep the later time.
+	t0 := time.Unix(1_000_000, 0)
+	clock := t0.Add(time.Second)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.see(t, testKey, testMACB, "enp3s0")
+	clock = t0.Add(25 * time.Second)
+	f.ack(t, testKey, testMACB, "enp3s0")
+	clock = t0.Add(26 * time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	clock = t0.Add(40 * time.Second)
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+}
+
+func TestResolveCarriedOverflowExpires(t *testing.T) {
+	// An overflow mark survives SYN replacements only until ttl after the
+	// overflow happened.
+	t0 := time.Unix(1_000_000, 0)
+	clock := t0
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.see(t, testKey, testMACA, "tap100i0")
+	for i := range maxObservationsPerKey {
+		f.ack(t, testKey, testMACA, "vmbr0."+string(rune('a'+i%26))+string(rune('a'+i/26)))
+	}
+	for _, at := range []time.Duration{10 * time.Second, 20 * time.Second, 29 * time.Second} {
+		clock = t0.Add(at)
+		f.handshake(t, testKey, testMACA, "tap100i0")
+		vmid, err := f.resolve()
+		wantReason(t, vmid, err, "observation overflow")
+	}
+	clock = t0.Add(31 * time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "100")
+}
+
+func TestObservationTableDuplicateRefreshesTime(t *testing.T) {
+	clock := time.Unix(1_000_000, 0)
+	table := NewObservationTable(30*time.Second, func() time.Time { return clock })
+	mac := mustMAC(t, testMACA)
+	table.Add(testKey, Observation{Ifname: "tap100i0", SrcMAC: mac, SYN: true})
+	table.Add(testKey, Observation{Ifname: "tap100i0", SrcMAC: mac})
+	clock = clock.Add(5 * time.Second)
+	table.Add(testKey, Observation{Ifname: "tap100i0", SrcMAC: mac})
+	table.Add(testKey, Observation{Ifname: "tap100i0", SrcMAC: mac, At: clock.Add(-time.Second)}) // older: ignored
+	got := table.Wait(context.Background(), testKey, 0)
+	if len(got) != 2 || !got[1].At.Equal(clock) {
+		t.Fatalf("got %+v; want the ACK observation at %v", got, clock)
+	}
+}
+
 func TestResolveUplinkSYNWithoutHandshake(t *testing.T) {
 	// The VM-port rule is decided as soon as the SYN is in; no handshake wait.
 	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
@@ -990,7 +1064,7 @@ func TestResolveWaitsForHandshakeSegment(t *testing.T) {
 func TestResolveNilTable(t *testing.T) {
 	r := &IngressResolver{MaxWait: time.Millisecond}
 	vmid, err := r.Resolve(context.Background(), testSrc, testDst)
-	wantReason(t, vmid, err, "no SYN observed")
+	wantReason(t, vmid, err, "capture unavailable")
 }
 
 func TestResolveDefaultMaxWait(t *testing.T) {
