@@ -47,7 +47,7 @@ func main() {
 	// hostpower runs on a Proxmox host as its own systemd service: no gateway,
 	// token or config file, so it returns before config.Load.
 	if len(os.Args) > 1 && os.Args[1] == "hostpower" {
-		os.Exit(hostpower.Main(os.Args[2:], os.Stderr))
+		os.Exit(hostpower.Main(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
 	cfg, err := config.Load(os.Args[1:], os.Getenv)

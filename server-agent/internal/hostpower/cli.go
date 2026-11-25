@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,31 +27,53 @@ const (
 	MinInterval     = 100 * time.Millisecond
 )
 
-func newFlagSet() (*flag.FlagSet, *Options, *time.Duration, *bool) {
-	opts := &Options{}
-	fs := flag.NewFlagSet("hostpower", flag.ContinueOnError)
+// Config is the parsed hostpower command line.
+type Config struct {
+	Options
+	Interval   time.Duration
+	Verbose    bool
+	Listen     string // empty: no HTTP endpoint
+	Auth       AuthModes
+	TokensPath string
+}
+
+func newFlagSet() (fs *flag.FlagSet, cfg *Config, auth *string) {
+	cfg = &Config{}
+	fs = flag.NewFlagSet("hostpower", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringVar(&opts.OutDir, "out", DefaultOutDir, "directory for the synthetic powercap tree")
-	interval := fs.Duration("interval", DefaultInterval, "write interval (minimum 100ms)")
-	verbose := fs.Bool("v", false, "verbose (debug) logging")
-	return fs, opts, interval, verbose
+	fs.StringVar(&cfg.OutDir, "out", DefaultOutDir, "directory for the synthetic powercap tree")
+	fs.DurationVar(&cfg.Interval, "interval", DefaultInterval, "write interval (minimum 100ms)")
+	fs.BoolVar(&cfg.Verbose, "v", false, "verbose (debug) logging")
+	fs.StringVar(&cfg.Listen, "listen", "", "serve /v1/energy over HTTP on host:port (off when empty)")
+	auth = fs.String("auth", "mac,token", "HTTP identification modes: comma list of mac, token")
+	fs.StringVar(&cfg.TokensPath, "tokens", DefaultTokensPath, "token store file for -auth token")
+	return fs, cfg, auth
 }
 
 // ParseArgs parses the arguments after "hostpower". Besides the flag.FlagSet
 // errors it rejects positional arguments and an interval below MinInterval,
-// which also guards the ticker in Run against a non-positive duration.
-func ParseArgs(args []string) (Options, time.Duration, bool, error) {
-	fs, opts, interval, verbose := newFlagSet()
+// which also guards the ticker in Run against a non-positive duration. -auth is
+// validated only when -listen enables HTTP.
+func ParseArgs(args []string) (Config, error) {
+	fs, cfg, auth := newFlagSet()
 	if err := fs.Parse(args); err != nil {
-		return Options{}, 0, false, err
+		return Config{}, err
 	}
 	if fs.NArg() > 0 {
-		return Options{}, 0, false, fmt.Errorf("hostpower: unexpected argument %q", fs.Arg(0))
+		return Config{}, fmt.Errorf("hostpower: unexpected argument %q", fs.Arg(0))
 	}
-	if *interval < MinInterval {
-		return Options{}, 0, false, fmt.Errorf("hostpower: -interval must be at least %s", MinInterval)
+	if cfg.Interval < MinInterval {
+		return Config{}, fmt.Errorf("hostpower: -interval must be at least %s", MinInterval)
 	}
-	return *opts, *interval, *verbose, nil
+	cfg.Auth = AuthModes{MAC: true, Token: true} // the -auth default
+	if cfg.Listen != "" {
+		modes, err := ParseAuthModes(*auth)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Auth = modes
+	}
+	return *cfg, nil
 }
 
 // msgNotReadable is the startup warning for a service that cannot read RAPL.
@@ -89,13 +113,26 @@ func packageEnergyReadable(domains []string) bool {
 	return false
 }
 
+const usageText = "usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-v]\n" +
+	"       server-agent hostpower token [-tokens path] create|revoke|list [vmid]\n"
+
 // Main runs the hostpower mode and returns the process exit code.
-func Main(args []string, stderr io.Writer) int {
-	opts, interval, verbose, err := ParseArgs(args)
+func Main(args []string, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return run(ctx, args, stdout, stderr)
+}
+
+// run is Main with an injectable lifetime context.
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "token" {
+		return TokenMain(args[1:], stdout, stderr)
+	}
+	cfg, err := ParseArgs(args)
 	if errors.Is(err, flag.ErrHelp) {
-		fs, _, _, _ := newFlagSet()
+		fs, _, _ := newFlagSet()
 		fs.SetOutput(stderr)
-		fmt.Fprintln(stderr, "usage: server-agent hostpower [-out dir] [-interval duration] [-v]")
+		fmt.Fprint(stderr, usageText)
 		fs.PrintDefaults()
 		return 0
 	}
@@ -105,17 +142,17 @@ func Main(args []string, stderr io.Writer) int {
 	}
 
 	level := slog.LevelInfo
-	if verbose {
+	if cfg.Verbose {
 		level = slog.LevelDebug
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})))
 
-	opts = opts.withDefaults()
+	opts := cfg.Options.withDefaults()
 	if err := os.MkdirAll(opts.OutDir, 0o700); err != nil {
 		fmt.Fprintf(stderr, "server-agent: hostpower: create out dir: %v\n", err)
 		return 2
 	}
-	slog.Info("hostpower: starting", "out", opts.OutDir, "interval", interval)
+	slog.Info("hostpower: starting", "out", opts.OutDir, "interval", cfg.Interval)
 
 	notRoot := runtime.GOOS == "linux" && os.Geteuid() != 0
 	for _, w := range startupWarnings(opts, notRoot) {
@@ -125,11 +162,70 @@ func Main(args []string, stderr io.Writer) int {
 		slog.Warn("hostpower: removing stale temp files", "err", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := New(opts).Run(ctx, interval); err != nil {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	svc := New(opts)
+	if cfg.Listen == "" {
+		return runTicks(ctx, svc, cfg.Interval, stderr)
+	}
+
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		fmt.Fprintf(stderr, "server-agent: hostpower: listen: %v\n", err)
+		return 2
+	}
+	var table *ObservationTable
+	if cfg.Auth.MAC {
+		table = NewObservationTable(30*time.Second, time.Now)
+		port := uint16(ln.Addr().(*net.TCPAddr).Port)
+		if err := StartCapture(ctx, port, table, slog.Default()); err != nil { //nolint:staticcheck // SA4023: the non-Linux stub always fails; the Linux build can succeed
+			_ = ln.Close()
+			fmt.Fprintf(stderr, "server-agent: hostpower: MAC mode capture: %v\n", err)
+			return 2
+		}
+	}
+	srv := NewServer(ln.Addr().String(), newHandler(cfg.Auth, svc, &IngressResolver{Table: table},
+		NewTokenStore(cfg.TokensPath), slog.Default(), time.Now))
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+	slog.Info("hostpower: serving", "listen", ln.Addr().String(), "auth", authSummary(cfg.Auth))
+
+	code := 0
+	tickDone := make(chan int, 1)
+	go func() { tickDone <- runTicks(ctx, svc, cfg.Interval, stderr) }()
+	select {
+	case code = <-tickDone:
+	case err := <-serveErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("hostpower: http server stopped", "err", err)
+			code = 1
+		}
+		cancel()
+		<-tickDone
+	}
+	shutdownCtx, done := context.WithTimeout(context.Background(), 2*time.Second)
+	defer done()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("hostpower: http shutdown", "err", err)
+	}
+	return code
+}
+
+func runTicks(ctx context.Context, svc *Service, interval time.Duration, stderr io.Writer) int {
+	if err := svc.Run(ctx, interval); err != nil {
 		fmt.Fprintf(stderr, "server-agent: hostpower: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func authSummary(m AuthModes) string {
+	var parts []string
+	if m.MAC {
+		parts = append(parts, "mac")
+	}
+	if m.Token {
+		parts = append(parts, "token")
+	}
+	return strings.Join(parts, ",")
 }
