@@ -20,8 +20,7 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
-// hwCollectTimeout bounds each external source (a GPU CLI, system_profiler,
-// dmidecode) so a wedged tool cannot hang collection. Matches the telemetry
+// hwCollectTimeout bounds each external source (a GPU CLI, system_profiler) so a wedged tool cannot hang collection. Matches the telemetry
 // collectors' per-source budget.
 const hwCollectTimeout = 2 * time.Second
 
