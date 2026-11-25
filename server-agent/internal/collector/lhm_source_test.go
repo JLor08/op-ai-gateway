@@ -72,7 +72,7 @@ func TestDetectPowerAndTempCollectorsShareOneFetch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	power, temp := DetectPowerAndTempCollectors(srv.URL)
+	power, temp := DetectPowerAndTempCollectors(srv.URL, "")
 
 	cpu, system, err := power.Collect(context.Background())
 	if err != nil {
@@ -98,7 +98,7 @@ func TestDetectPowerAndTempCollectorsShareOneFetch(t *testing.T) {
 // collectors behave like the separate Detect*Collector calls when no LHM URL
 // is configured: no "lhm" sub, never nil, never erroring.
 func TestDetectPowerAndTempCollectorsIndependentWithoutURL(t *testing.T) {
-	power, temp := DetectPowerAndTempCollectors("")
+	power, temp := DetectPowerAndTempCollectors("", "")
 	if power == nil || temp == nil {
 		t.Fatal("DetectPowerAndTempCollectors(\"\") returned a nil collector")
 	}

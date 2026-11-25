@@ -110,6 +110,11 @@ export function buildServerAgentConfig(config: AgentConfigMaterial, token: strin
   // best-effort system) power watts. Empty disables it.
   "lhm_url": "",
 
+  // Optional powercap sysfs root for CPU power, e.g. a Proxmox hostpower
+  // virtiofs mount carrying this VM's share of the host CPU package power.
+  // Empty = the platform default (/sys/class/powercap). Linux only.
+  "powercap_root": "",
+
   // Certificate installation mode: "off" (default, never fetch a certificate),
   // "files" (write fullchain/cert/chain/ca/privkey into cert_dir and run
   // cert_reload_command on change), or "proxy" (everything "files" does, and

@@ -21,6 +21,7 @@ import (
 	"op-ai-server-agent/internal/client"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
+	"op-ai-server-agent/internal/hostpower"
 	"op-ai-server-agent/internal/proxy"
 	"slices"
 
@@ -42,6 +43,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-license" {
 		fmt.Print(licenseNotice())
 		os.Exit(0)
+	}
+	// hostpower runs on a Proxmox host as its own systemd service: no gateway,
+	// token or config file, so it returns before config.Load.
+	if len(os.Args) > 1 && os.Args[1] == "hostpower" {
+		os.Exit(hostpower.Main(os.Args[2:], os.Stderr))
 	}
 
 	cfg, err := config.Load(os.Args[1:], os.Getenv)
@@ -85,7 +91,7 @@ func main() {
 	// separately) so that, when LHMURL is configured, the power and temp
 	// collectors share one lhmSource and issue a single LHM /data.json
 	// GET+parse per telemetry cycle instead of two (SA-6).
-	power, temp := collector.DetectPowerAndTempCollectors(cfg.LHMURL)
+	power, temp := collector.DetectPowerAndTempCollectors(cfg.LHMURL, cfg.PowercapRoot)
 
 	// certInstaller is always constructed, even with cert_mode=off: Sync and
 	// Report both no-op internally for that mode (no HTTP call, no disk
@@ -352,6 +358,7 @@ func main() {
 		"model_status_url", cfg.ModelStatusURL,
 		"model_status_format", cfg.ModelStatusFormat,
 		"lhm_url", cfg.LHMURL,
+		"powercap_root", cfg.PowercapRoot,
 		"cert_mode", cfg.CertMode,
 		"cert_dir", cfg.CertDir,
 		"cert_reload_command", cfg.CertReloadCommand,

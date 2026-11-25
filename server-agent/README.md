@@ -49,6 +49,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_MODEL_STATUS_URL` | `-model-status-url` | `model_status_url` | — | Optional endpoint polled each cycle for the models currently **loaded**, e.g. `/running` (llama-swap), `/props` (llama.cpp), `/v1/models` (vLLM). Empty disables it. |
 | `OP_AGENT_MODEL_STATUS_FORMAT` | `-model-status-format` | `model_status_format` | — (auto) | How to parse `model_status_url`: `openai`, `llama_swap`, `llama_cpp`, `litellm`, or empty / `auto` (a tolerant union of all shapes). |
 | `OP_AGENT_TLS_INSECURE` | `-tls-insecure`  | `tls_insecure` | `false` | Skip TLS certificate verification (self-signed dev gateways). `true`/`1`. |
+| `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap sysfs root the Linux RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower`). Empty uses the platform default; ignored on other OSes. See [Linux guest on a Proxmox VE host](#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share). |
 | `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. The only Windows CPU-watt path; a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
 | `OP_AGENT_CERT_DIR`     | `-cert-dir`      | `cert_dir`     | —       | Directory certificate files are written into. **Required** when `cert_mode` is not `off`. |
@@ -882,6 +883,128 @@ Per-platform prerequisites:
   enabled, embed credentials in the URL. The agent ships/links nothing from LHM — the
   operator installs it. Unset/unreachable → power `null` (no chart). Per metric, the
   native reading wins and LHM fills gaps (native first).
+
+- **Linux guest, host-attributed (opt-in).** Set `OP_AGENT_POWERCAP_ROOT` to a
+  mounted `server-agent hostpower` tree; see
+  [below](#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share).
+
+### Linux guest on a Proxmox VE host (virtiofs-attributed share)
+
+A KVM guest has no RAPL: the MSRs are not passed through and
+`/sys/class/powercap` is empty, so `cpu_power_w` stays `null` there. Instead, a
+small service on the Proxmox VE (PVE 9.2) host measures the host's RAPL package
+energy, attributes it to each VM by CPU time, and publishes the result as a
+per-VM synthetic powercap tree that the guest mounts over virtiofs. The
+guest's agent reads it with its normal RAPL collector.
+
+**1. Host service (once per host).** Install virtiofsd (`apt install virtiofsd`),
+download the Linux agent binary to `/usr/local/bin/server-agent`, and run it
+in `hostpower` mode as root (RAPL `energy_uj` is root-only) under systemd,
+for example `/etc/systemd/system/op-hostpower.service`:
+
+```
+[Unit]
+Description=OnPrem AI Gateway hostpower (VM CPU power share)
+
+[Service]
+ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower
+Restart=always
+StateDirectory=op-hostpower
+ProtectSystem=strict
+ReadWritePaths=/var/lib/op-hostpower
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`ProtectSystem=strict` makes the whole file system read-only for the service
+except `/dev`, `/proc` and `/sys`, which it only reads; `ReadWritePaths`
+leaves the out directory as its only writable path, and `StateDirectory`
+creates `/var/lib/op-hostpower` before the unit starts (a missing
+`ReadWritePaths` directory fails the start). Options: `-out DIR` (default
+`/var/lib/op-hostpower`), `-interval D` (default `250ms`, minimum `100ms`;
+keep it at most a quarter of the guest's `OP_AGENT_INTERVAL`, so each guest
+reading spans several host updates; a host tick near the guest interval makes
+readings alternate between 0 W and twice the true value), `-v`. Keep the
+guest at its 1 s default `OP_AGENT_INTERVAL`: at the agent's 250 ms floor the
+quarter rule would need a 62.5 ms host tick, below the host's 100 ms minimum.
+The service needs no token, contacts no gateway and opens no listener. It
+warns at startup when the host has no RAPL domain, when RAPL `energy_uj` is
+not readable (not root; guests would report 0 W) or when there is no
+`qemu.slice`, and keeps running. At startup it also removes leftover temp
+files from an earlier crash.
+
+**2. Read-only source for the shares (once per host, recommended).** Every
+share is writable from inside its VM unless its source is read-only, so a
+guest could fill the host's root file system or plant symlinks in it. Map the
+VMs to a read-only bind mount of the out directory instead of the directory
+the service writes, for example with the host fstab line
+
+```
+/var/lib/op-hostpower /run/op-hostpower-ro none bind,ro 0 0
+```
+
+(create both directories once with
+`mkdir -p /var/lib/op-hostpower /run/op-hostpower-ro`, then
+`systemctl daemon-reload && mount /run/op-hostpower-ro`; at boot systemd
+recreates the mount point under `/run` itself). An fstab mount (or an equivalent systemd `.mount` unit) is part
+of `local-fs.target`, so it is re-established on every boot before PVE
+autostarts VMs. The service keeps writing to `/var/lib/op-hostpower`, and new
+VM directories appear in the bind. The service confines every write to the
+VM's own directory regardless (a symlink that leaves it is refused) and
+never reads a FIFO, other special file or oversized file a guest placed
+there (it replaces it), as defense in depth.
+
+**3. Per VM (on the host).** The directory
+`/var/lib/op-hostpower/<vmid>` appears only after the service has ticked while
+that VM is running (it discovers VMs by their live `qemu.slice/<vmid>.scope`);
+for a stopped VM create it yourself with `mkdir -p /var/lib/op-hostpower/<vmid>`.
+Then map its read-only view and attach it with the virtiofs cache disabled:
+
+```
+pvesh create /cluster/mapping/dir --id hostpower-<vmid> --map node=<node>,path=/run/op-hostpower-ro/<vmid>
+qm set <vmid> --virtiofs0 dirid=hostpower-<vmid>,cache=never
+```
+
+`cache=never` matters: with PVE's default `cache=auto` the guest can read a
+value up to about 1 s old after the host replaced the file, which brings back
+the alternation between 0 W and twice the true value.
+
+**4. In the guest.** Mount the share read-only, for example with the fstab
+line `hostpower-<vmid> /run/op-hostpower virtiofs ro,nofail 0 0`, and point the
+agent at it with `OP_AGENT_POWERCAP_ROOT=/run/op-hostpower` (or `-powercap-root`
+or `powercap_root` in the config file). The resolved `powercap_root` is logged at debug level (`-v`); the startup
+`power_sources` always lists `rapl` on Linux, so it does not prove the mount
+works. To check: `cat /run/op-hostpower/intel-rapl:0/energy_uj` in the guest
+must rise between two reads, and `cpu_power_w` turns non-null from the second
+sample (the first is `null`, a RAPL delta, as on bare metal). Under steady
+load `cpu_power_w` must stay roughly level; if it alternates between about 0
+and about twice the expected value, check `cache=never` (step 3) and the
+quarter rule (step 1).
+
+**How the share is computed.** Per interval the service takes the host's
+RAPL package energy delta and splits it across VMs by active CPU time (from
+each VM's `qemu.slice/<vmid>.scope/cpu.stat` against `/proc/stat`), with the
+idle floor included in the attribution, so the sum of all VM shares never
+exceeds the package energy. Each VM gets `<out>/<vmid>/intel-rapl:0/` with
+`name`, `energy_uj` and `max_energy_range_uj`, each replaced atomically
+(temp file and rename, no fsync); `energy_uj` persists across service
+restarts. `max_energy_range_uj` is `0`, so the guest reads a counter that
+ever goes backwards as 0 J rather than as a wraparound.
+
+**When it stops.** If the service stops, or RAPL becomes unreadable on the
+host, every VM's counter freezes and the guests report a measured 0 W, not
+`null`. That also pulls the gateway's rolling-minimum idle baseline for those
+servers down. To notice: `systemctl status op-hostpower` on the host, and
+`energy_uj` under `/var/lib/op-hostpower/<vmid>/intel-rapl:0/` (or in the
+guest) not changing between two reads while the VM runs.
+
+**Limitations.** A PVE VM with a virtiofs device cannot be live-migrated,
+snapshotted with RAM state or hibernated, and does not support memory
+hotplug. `system_power_w` stays `null` in a guest. Windows guests and LXC
+containers are out of scope.
 
 ## Resilience
 

@@ -1,0 +1,442 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package hostpower
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+)
+
+type fixture struct {
+	t    *testing.T
+	root string
+}
+
+func newFixture(t *testing.T, vms ...string) *fixture {
+	t.Helper()
+	f := &fixture{t: t, root: t.TempDir()}
+	dom := filepath.Join(f.root, "powercap", "intel-rapl:0")
+	f.mkdir(dom)
+	f.write(filepath.Join(dom, "name"), "package-0\n")
+	f.write(filepath.Join(dom, "max_energy_range_uj"), "262143328850\n")
+	f.setEnergyUJ(1_000_000_000)
+	f.setBusyUsec(0)
+	f.mkdir(filepath.Join(f.root, "out"))
+	for _, vm := range vms {
+		f.setVMUsec(vm, 0)
+	}
+	return f
+}
+
+func (f *fixture) mkdir(p string) {
+	f.t.Helper()
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fixture) write(p, content string) {
+	f.t.Helper()
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *fixture) energyPath() string {
+	return filepath.Join(f.root, "powercap", "intel-rapl:0", "energy_uj")
+}
+
+func (f *fixture) setEnergyUJ(v uint64) { f.write(f.energyPath(), strconv.FormatUint(v, 10)+"\n") }
+
+// setBusyUsec writes a /proc/stat whose busy time is v microseconds (user jiffies).
+func (f *fixture) setBusyUsec(v uint64) {
+	f.write(filepath.Join(f.root, "proc_stat"),
+		fmt.Sprintf("cpu  %d 0 0 5000 0 0 0 0 0 0\ncpu0 1 2 3\n", v/usecPerJiffy))
+}
+
+func (f *fixture) vmDir(vm string) string {
+	return filepath.Join(f.root, "cgroup", "qemu.slice", vm+".scope")
+}
+
+func (f *fixture) setVMUsec(vm string, v uint64) {
+	f.mkdir(f.vmDir(vm))
+	f.write(filepath.Join(f.vmDir(vm), "cpu.stat"), fmt.Sprintf("usage_usec %d\nuser_usec 1\n", v))
+}
+
+func (f *fixture) service() *Service {
+	return New(Options{
+		PowercapRoot: filepath.Join(f.root, "powercap"),
+		ProcStatPath: filepath.Join(f.root, "proc_stat"),
+		CgroupRoot:   filepath.Join(f.root, "cgroup"),
+		OutDir:       filepath.Join(f.root, "out"),
+	})
+}
+
+func (f *fixture) outFile(vm string) string {
+	b, err := os.ReadFile(filepath.Join(f.root, "out", vm, DomainDir, "energy_uj"))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return string(b)
+}
+
+func mustTick(t *testing.T, s *Service) {
+	t.Helper()
+	if err := s.Tick(); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+}
+
+func TestTickFirstTickBaselinesAndCreatesDirs(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	for _, vm := range []string{"100", "101"} {
+		if got := f.outFile(vm); got != "0\n" {
+			t.Errorf("vm %s energy_uj = %q, want 0", vm, got)
+		}
+		if c := s.Counters()[vm]; c != 0 {
+			t.Errorf("vm %s counter = %d", vm, c)
+		}
+	}
+}
+
+func advanceTwoVMs(f *fixture) {
+	f.setEnergyUJ(1_010_000_000) // +10 J
+	f.setBusyUsec(1_000_000)
+	f.setVMUsec("100", 250_000)
+	f.setVMUsec("101", 500_000)
+}
+
+func TestTickAttributesByActiveShare(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	advanceTwoVMs(f)
+	mustTick(t, s)
+	c := s.Counters()
+	if c["100"] != 2_500_000 || c["101"] != 5_000_000 {
+		t.Errorf("counters = %v", c)
+	}
+	if got := f.outFile("100"); got != "2500000\n" {
+		t.Errorf("file 100 = %q", got)
+	}
+	if got := f.outFile("101"); got != "5000000\n" {
+		t.Errorf("file 101 = %q", got)
+	}
+}
+
+func TestTickPersistsAcrossRestart(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	advanceTwoVMs(f)
+	mustTick(t, s)
+	s2 := f.service()
+	mustTick(t, s2)
+	if got := s2.Counters()["100"]; got != 2_500_000 {
+		t.Errorf("restored counter = %d, want 2500000", got)
+	}
+}
+
+func TestTickSkipsVMWhoseCPUStatVanished(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	if err := os.Remove(filepath.Join(f.vmDir("101"), "cpu.stat")); err != nil {
+		t.Fatal(err)
+	}
+	f.setEnergyUJ(1_010_000_000)
+	f.setBusyUsec(1_000_000)
+	f.setVMUsec("100", 250_000)
+	mustTick(t, s)
+	c := s.Counters()
+	if c["100"] != 2_500_000 || c["101"] != 0 {
+		t.Errorf("counters = %v", c)
+	}
+	// 101 returns with a large usage: it re-baselines, no huge catch-up delta.
+	f.setEnergyUJ(1_020_000_000)
+	f.setBusyUsec(2_000_000)
+	f.setVMUsec("100", 500_000)
+	f.setVMUsec("101", 9_000_000)
+	mustTick(t, s)
+	if c := s.Counters(); c["101"] != 0 || c["100"] != 5_000_000 {
+		t.Errorf("after return counters = %v", c)
+	}
+}
+
+func TestTickZeroHostDeltaLeavesCountersUnchanged(t *testing.T) {
+	f := newFixture(t, "100")
+	s := f.service()
+	mustTick(t, s)
+	f.setEnergyUJ(1_010_000_000)
+	f.setVMUsec("100", 250_000) // busy stays 0
+	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 0 {
+		t.Errorf("counter = %d, want 0", c)
+	}
+}
+
+func TestTickNoEnergyDeltaStillAdvancesBaselines(t *testing.T) {
+	f := newFixture(t, "100")
+	s := f.service()
+	mustTick(t, s) // baselines: energy 1000 J, busy 0, vm 0
+
+	// Gap tick: energy unreadable while busy and VM usage advance.
+	if err := os.Remove(f.energyPath()); err != nil {
+		t.Fatal(err)
+	}
+	f.setBusyUsec(1_000_000)
+	f.setVMUsec("100", 750_000)
+	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 0 {
+		t.Fatalf("gap tick attributed %d", c)
+	}
+
+	// Energy readable again: the reader re-baselines (no delta spanning the
+	// gap), so nothing is attributed, but busy and VM baselines still advance.
+	f.setEnergyUJ(1_010_000_000)
+	f.setBusyUsec(2_000_000)
+	f.setVMUsec("100", 1_000_000)
+	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 0 {
+		t.Fatalf("energy return tick attributed %d (gap-spanning delta)", c)
+	}
+
+	// Final tick: +10 J, busy +1 s, vm +0.25 s.
+	f.setEnergyUJ(1_020_000_000)
+	f.setBusyUsec(3_000_000)
+	f.setVMUsec("100", 1_250_000)
+	mustTick(t, s)
+	// Final interval only: 0.25 * 10 J. Busy and VM baselines left at their
+	// pre-gap values would give share 1_250_000/3_000_000 (about 4.17 J).
+	if c := s.Counters()["100"]; c != 2_500_000 {
+		t.Errorf("counter = %d, want 2500000", c)
+	}
+}
+
+func TestOptionsWithDefaults(t *testing.T) {
+	o := Options{}.withDefaults()
+	if o.PowercapRoot != DefaultPowercapRoot || o.ProcStatPath != DefaultProcStatPath ||
+		o.CgroupRoot != DefaultCgroupRoot || o.OutDir != DefaultOutDir {
+		t.Errorf("defaults = %+v", o)
+	}
+	if got := (Options{OutDir: "/x"}).withDefaults().OutDir; got != "/x" || strings.Contains(got, "op-hostpower") {
+		t.Errorf("explicit OutDir overridden: %q", got)
+	}
+}
+
+func TestTickKeepsWritingOtherVMsWhenOneWriteFails(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	elsewhere := t.TempDir()
+	link := filepath.Join(f.root, "out", "100", DomainDir)
+	if err := os.RemoveAll(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	advanceTwoVMs(f)
+	if err := s.Tick(); err == nil {
+		t.Fatal("Tick returned nil although VM 100's tree escapes its dir")
+	}
+	if got := f.outFile("101"); got != "5000000\n" {
+		t.Errorf("file 101 = %q, want 5000000 (other VM must still advance)", got)
+	}
+	if entries, _ := os.ReadDir(elsewhere); len(entries) != 0 {
+		t.Errorf("written outside the VM dir: %v", entries)
+	}
+}
+
+func TestTickUnreadableProcStatReBaselines(t *testing.T) {
+	f := newFixture(t, "100")
+	s := f.service()
+	mustTick(t, s) // baselines: energy 1000 J, busy 0, vm 0
+
+	// Gap tick: /proc/stat unreadable while energy and VM usage advance.
+	if err := os.Remove(filepath.Join(f.root, "proc_stat")); err != nil {
+		t.Fatal(err)
+	}
+	f.setEnergyUJ(1_010_000_000)
+	f.setVMUsec("100", 750_000)
+	mustTick(t, s)
+
+	// /proc/stat is back: this tick only re-baselines busy time.
+	f.setEnergyUJ(1_020_000_000)
+	f.setBusyUsec(2_000_000)
+	f.setVMUsec("100", 1_000_000)
+	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 0 {
+		t.Fatalf("re-baseline tick attributed %d (busy delta spans two intervals)", c)
+	}
+
+	// Next tick attributes normally: 0.25 s of 1 s busy, 10 J -> 2.5 J.
+	f.setEnergyUJ(1_030_000_000)
+	f.setBusyUsec(3_000_000)
+	f.setVMUsec("100", 1_250_000)
+	mustTick(t, s)
+	if c := s.Counters()["100"]; c != 2_500_000 {
+		t.Errorf("counter = %d, want 2500000", c)
+	}
+}
+
+func TestTickVanishedScopeReturnsAndContinuesCounter(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	advanceTwoVMs(f) // 101 -> 5_000_000
+	mustTick(t, s)
+
+	// 101 stops: its scope directory disappears for a tick.
+	if err := os.RemoveAll(f.vmDir("101")); err != nil {
+		t.Fatal(err)
+	}
+	f.setEnergyUJ(1_020_000_000)
+	f.setBusyUsec(2_000_000)
+	f.setVMUsec("100", 500_000)
+	mustTick(t, s)
+	if c := s.Counters(); c["101"] != 5_000_000 || c["100"] != 5_000_000 {
+		t.Fatalf("while gone counters = %v", c)
+	}
+
+	// 101 starts again with a fresh, unrelated usage: it re-baselines.
+	f.setEnergyUJ(1_030_000_000)
+	f.setBusyUsec(3_000_000)
+	f.setVMUsec("100", 750_000)
+	f.setVMUsec("101", 40_000_000)
+	mustTick(t, s)
+	if c := s.Counters()["101"]; c != 5_000_000 {
+		t.Fatalf("return tick counter = %d, want 5000000 (no jump, no reset)", c)
+	}
+	if got := f.outFile("101"); got != "5000000\n" {
+		t.Fatalf("return tick file = %q", got)
+	}
+
+	// And then continues from its previous value: 0.5 s of 1 s busy, 10 J.
+	f.setEnergyUJ(1_040_000_000)
+	f.setBusyUsec(4_000_000)
+	f.setVMUsec("100", 1_000_000)
+	f.setVMUsec("101", 40_500_000)
+	mustTick(t, s)
+	if c := s.Counters()["101"]; c != 10_000_000 {
+		t.Errorf("counter = %d, want 10000000", c)
+	}
+}
+
+// recordingHandler is a slog.Handler that keeps every record's level and message.
+type recordingHandler struct {
+	mu   sync.Mutex
+	recs []string
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler            { return h }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.recs = append(h.recs, r.Level.String()+" "+r.Message)
+	return nil
+}
+
+func (h *recordingHandler) count(entry string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.recs {
+		if r == entry {
+			n++
+		}
+	}
+	return n
+}
+
+func TestTickLogsARepeatedWriteFailureOnce(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	h := &recordingHandler{}
+	s.log = slog.New(h)
+	mustTick(t, s)
+
+	link := filepath.Join(f.root, "out", "100", DomainDir)
+	if err := os.RemoveAll(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := s.Tick(); err == nil {
+			t.Fatalf("tick %d: Tick returned nil for an escaping tree", i)
+		}
+	}
+	if n := h.count("WARN hostpower: write failed"); n != 1 {
+		t.Fatalf("write failed logged %d times over 5 identical failures, want 1 (records %v)", n, h.recs)
+	}
+
+	// Recovery is logged once at Info.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	mustTick(t, s)
+	mustTick(t, s)
+	if n := h.count("INFO hostpower: write recovered"); n != 1 {
+		t.Fatalf("write recovered logged %d times, want 1 (records %v)", n, h.recs)
+	}
+	if n := h.count("WARN hostpower: write failed"); n != 1 {
+		t.Fatalf("write failed logged %d times after recovery, want 1", n)
+	}
+}
+
+func TestTickLogsAFailingVMOnceWhateverTheError(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	h := &recordingHandler{}
+	s.log = slog.New(h)
+	mustTick(t, s)
+
+	// A non-empty directory at energy_uj: the rename fails with an error that
+	// names the random temp file, so its text differs on every tick.
+	blocker := filepath.Join(f.root, "out", "100", DomainDir, "energy_uj")
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	f.mkdir(filepath.Join(blocker, "sub"))
+	var msgs []string
+	for i := 0; i < 4; i++ {
+		err := s.Tick()
+		if err == nil {
+			t.Fatalf("tick %d: Tick returned nil with a directory at energy_uj", i)
+		}
+		msgs = append(msgs, err.Error())
+	}
+	// Precondition: the error text changes between ticks (random temp name),
+	// so a dedup keyed on the text would log every tick.
+	if msgs[0] == msgs[1] {
+		t.Fatalf("errors did not vary between ticks (%q); the precondition no longer holds", msgs[0])
+	}
+	if n := h.count("WARN hostpower: write failed"); n != 1 {
+		t.Fatalf("write failed logged %d times over 4 failing ticks, want 1 (records %v)", n, h.recs)
+	}
+
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	mustTick(t, s)
+	if n := h.count("INFO hostpower: write recovered"); n != 1 {
+		t.Fatalf("write recovered logged %d times, want 1 (records %v)", n, h.recs)
+	}
+	if got := f.outFile("100"); got != "0\n" {
+		t.Errorf("energy_uj after recovery = %q", got)
+	}
+}

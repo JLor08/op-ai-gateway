@@ -19,7 +19,7 @@ Two test families per module:
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
    compared against a checked-in allowlist — 68 edges across 29 packages in
-   `op-ai-gateway`, 28 edges across 14 packages in `op-ai-server-agent`. Any
+   `op-ai-gateway`, 30 edges across 15 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
    deliberate act. The allowlist is frozen **in both directions**: a listed
    edge that no longer exists fails too, so an over-generous entry cannot sit
@@ -48,6 +48,7 @@ Server-agent (`op-ai-server-agent`):
 |---|---|
 | `gwapi`, `certfiles`, `wslentry` are stdlib-only | leaf contracts (gateway transport, cert-dir file layout, `wsl://` allowlist-entry grammar) shared by the feature packages |
 | `collector` ↛ `proxy`, `trust`, `client`, `agent` | telemetry collection is independent of transport and TLS machinery |
+| `hostpower` ↛ `agent`, `client`, `config`, `proxy`, `runtime`, `trust` | the Proxmox host service is not an enrolled agent: no gateway contact, token, config file or listener, so it may use only the `collector` RAPL reader ([ADR-115](../09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs)) |
 | `sample` imports no internal package | the wire-format vocabulary is a leaf |
 | `trust`, `proxy`, `certinstall` do not import each other | their only integration is the shared `certfiles`/`gwapi` leaves and the filesystem contract |
 

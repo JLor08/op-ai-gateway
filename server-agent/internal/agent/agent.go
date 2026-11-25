@@ -451,7 +451,14 @@ import (
 // 0.21.0 -> 0.21.1 is a PATCH: the AMD Linux VRAM telemetry fix (#432) reads
 // rocm-smi 4.x output and adds a KFD per-process VRAM measurer. Hardware
 // capability, not a negotiated feature, so no agent.Features entry.
-const Version = "0.21.1"
+//
+// 0.21.1 -> 0.22.0 is the single bump for the VM CPU power share. MINOR: a new
+// `server-agent hostpower` mode runs on a Proxmox VE host and publishes a
+// per-VM synthetic RAPL tree attributed by CPU time, and the agent gains the
+// powercap_root option (OP_AGENT_POWERCAP_ROOT / -powercap-root) so the
+// existing RAPL collector can read that tree mounted into a Linux guest. This
+// is the ONE bump for the whole branch; later commits on it do not bump again.
+const Version = "0.22.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
