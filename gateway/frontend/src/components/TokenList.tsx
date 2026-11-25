@@ -16,6 +16,7 @@ import type {
   ProjectRef,
   ServerModelOption,
   UpdateTokenRequest,
+  VendorAccessDTO,
   VendorAccountGroup,
   VendorAccount,
 } from '../api';
@@ -360,10 +361,9 @@ export function TokenList({
 
   // The vendor_access request value: undefined while the flag is off (the section
   // is hidden and the field stays out of the body), else the draft's policy.
-  function buildVendorAccess() {
-    return vendorAccountsEnabled
-      ? buildVendorAccessDTO(vaDraft, vendorAccounts, vendorGroups)
-      : undefined;
+  function buildVendorAccess(): VendorAccessDTO | undefined {
+    if (!vendorAccountsEnabled) return undefined;
+    return buildVendorAccessDTO(vaDraft, vendorAccounts, vendorGroups);
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
