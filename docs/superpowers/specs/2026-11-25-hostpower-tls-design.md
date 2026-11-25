@@ -85,6 +85,12 @@ nor alter the exchange.
 - Exactly one exists → error naming the missing one; never overwrite half a
   pair.
 - Paths that exist but are not regular files → error.
+- A generation failure caused by a read-only file system (`EROFS`, what
+  `ProtectSystem=strict` produces for a unit without the second state
+  directory) gets a hint appended: add `StateDirectory=op-hostpower-tls` and
+  the `ReadWritePaths` entry (see the README). Verified in Go 1.26 source:
+  `Server.tlsHandshakeTimeout` is the minimum of ReadHeaderTimeout,
+  ReadTimeout and WriteTimeout, so the handshake bound below is 2 s.
 
 `CertFingerprint(der []byte) string` returns the SHA-256 of the leaf DER as
 uppercase colon-separated hex (`AB:CD:…`, 95 chars) — the format
