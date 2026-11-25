@@ -51,6 +51,7 @@ var allowedDeps = map[string][]string{
 		"internal/client",
 		"internal/collector",
 		"internal/config",
+		"internal/hostpower",
 		"internal/proxy",
 		"internal/runtime",
 		"internal/trust",
@@ -80,7 +81,8 @@ var allowedDeps = map[string][]string{
 	"internal/config": {
 		"internal/wslentry",
 	},
-	"internal/gwapi": {},
+	"internal/gwapi":     {},
+	"internal/hostpower": {"internal/collector"},
 	"internal/proxy": {
 		"internal/certfiles",
 		"internal/gwapi",
@@ -193,6 +195,22 @@ func TestForbiddenEdges(t *testing.T) {
 		for _, e := range graph["internal/collector"] {
 			if toSet[e] {
 				t.Errorf("forbidden edge internal/collector -> %s: collector reports sampled data upward and must not depend on the proxy/trust/client/agent orchestration layers", e)
+			}
+		}
+	})
+
+	t.Run("hostpower does not import agent, client, config, proxy, runtime or trust", func(t *testing.T) {
+		toSet := map[string]bool{
+			"internal/agent":   true,
+			"internal/client":  true,
+			"internal/config":  true,
+			"internal/proxy":   true,
+			"internal/runtime": true,
+			"internal/trust":   true,
+		}
+		for _, e := range graph["internal/hostpower"] {
+			if toSet[e] {
+				t.Errorf("forbidden edge internal/hostpower -> %s: the hostpower mode runs on a hypervisor host without gateway contact and must not depend on the agent's orchestration, transport, config or runtime layers", e)
 			}
 		}
 	})
