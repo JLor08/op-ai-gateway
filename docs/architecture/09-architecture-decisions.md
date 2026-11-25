@@ -13698,6 +13698,9 @@ the guest through a PVE directory mapping and a virtiofs device; the guest agent
 A host tick close to the guest interval makes guest readings alternate between 0 W and twice the true value, which defeats Tier-1's need for a positive
 reading, sinks the rolling-minimum idle tracker to 0 W and pushes short requests to Tier 2; at 250 ms against 1 s the residual lumpiness is about
 ±25 %. The guest interval cannot simply be raised to match a slow host, because the Tier-1 gap rule (2 s) bounds how far apart guest samples may be.
+The virtiofs device is attached with `cache=never`: under PVE's default `cache=auto` the guest can read a value up to about 1 s stale after the
+host's rename, which brings the same 0 W / 2× alternation back. `max_energy_range_uj` is published as `0`, so the guest's unchanged collector reads
+any counter decrease as 0 J rather than as a near-full-range wraparound; a uint64 microjoule counter cannot wrap in practice.
 
 **Alternatives rejected.**
 - *An HTTP exporter on the host with VM identification by SMBIOS UUID:* it needs a listener, authentication and a network path between guest and host,
@@ -13707,7 +13710,15 @@ reading, sinks the rolling-minimum idle tracker to 0 W and pushes short requests
 **Consequences.**
 - A VM with a virtiofs device cannot be live-migrated, snapshotted with RAM state or hibernated, and does not support memory hotplug (PVE
   limitations, accepted).
-- The host service runs as root because RAPL `energy_uj` is root-only.
+- The host service runs as root because RAPL `energy_uj` is root-only. PVE 9.2 has no read-only virtiofs option, so each share is writable
+  from its guest: every per-VM file access of the service is confined to that VM's directory with `os.Root` (a symlink that leaves it is
+  refused), the recommended setup maps the VMs to a host-side read-only bind mount of the out directory (so a guest can neither fill the host's
+  root file system nor plant symlinks), and the documented systemd unit runs with `ProtectSystem=strict`, `ReadWritePaths` limited to the out
+  directory, `NoNewPrivileges` and `PrivateTmp`.
+- The idle floor is split by active CPU time, so one VM's load lowers another VM's reading. That is a low-rate cross-VM signal, accepted as
+  part of the attribution policy.
+- If the host service stops or RAPL becomes unreadable, the counters freeze and guests report a measured 0 W, not `null`, which also pulls the
+  gateway's rolling-minimum idle baseline for those servers down.
 - Shares are attributions of the package energy, not per-VM measurements; their sum is at most the package. `system_power_w` stays `null` in a guest.
 - Windows guests and LXC containers are out of scope.
 - → [Telemetry](cross-cutting/telemetry-usage-observability.md),

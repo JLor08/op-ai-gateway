@@ -113,7 +113,12 @@ allows. See [Telemetry](cross-cutting/telemetry-usage-observability.md).
 can run as a systemd service in `server-agent hostpower` mode. It reads the
 host's RAPL package energy, `/proc/stat` and the QEMU VM cgroups, and writes a
 per-VM synthetic powercap tree under `/var/lib/op-hostpower/<vmid>` that a
-guest mounts over virtiofs. It is not an enrolled agent: it has no token,
+guest mounts over virtiofs (`cache=never`). The recommended setup maps the VMs
+to a read-only bind mount of that directory (for example
+`/run/op-hostpower-ro`, established from fstab before PVE autostarts VMs), so a
+guest cannot write into its share, and runs the unit with `ProtectSystem=strict`,
+`ReadWritePaths` limited to the out directory, `NoNewPrivileges` and
+`PrivateTmp`. It is not an enrolled agent: it has no token,
 never contacts the gateway and opens no listener
 ([ADR-115](09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs)).
 
