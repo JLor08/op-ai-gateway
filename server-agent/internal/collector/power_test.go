@@ -72,7 +72,7 @@ func (errPower) Collect(context.Context) (*float64, *float64, error) {
 }
 
 func TestDetectPowerCollectorComposesLHMWhenConfigured(t *testing.T) {
-	m := DetectPowerCollector("http://127.0.0.1:8085/data.json")
+	m := DetectPowerCollector("http://127.0.0.1:8085/data.json", "")
 	if m == nil {
 		t.Fatal("DetectPowerCollector returned nil")
 	}
@@ -83,7 +83,7 @@ func TestDetectPowerCollectorComposesLHMWhenConfigured(t *testing.T) {
 
 func TestDetectPowerCollectorNeverNil(t *testing.T) {
 	// Even with no LHM URL the result is a non-nil, Collect-safe composite.
-	m := DetectPowerCollector("")
+	m := DetectPowerCollector("", "")
 	if m == nil {
 		t.Fatal("DetectPowerCollector(\"\") returned nil")
 	}

@@ -406,6 +406,38 @@ func TestLHMURLResolution(t *testing.T) {
 	}
 }
 
+func TestPowercapRootResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	env := func(k string) string {
+		if k == "OP_AGENT_POWERCAP_ROOT" {
+			return " /mnt/hp "
+		}
+		return ""
+	}
+
+	if cfg, err := Load(base, noenv); err != nil || cfg.PowercapRoot != "" {
+		t.Fatalf("default PowercapRoot = %q (err %v), want \"\"", cfg.PowercapRoot, err)
+	}
+	if cfg, err := Load(append([]string{"-powercap-root=/run/op-hostpower"}, base...), noenv); err != nil || cfg.PowercapRoot != "/run/op-hostpower" {
+		t.Fatalf("-powercap-root PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
+	}
+	if cfg, err := Load(base, env); err != nil || cfg.PowercapRoot != "/mnt/hp" {
+		t.Fatalf("env OP_AGENT_POWERCAP_ROOT PowercapRoot = %q (err %v), want trimmed /mnt/hp", cfg.PowercapRoot, err)
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","powercap_root":"/cfg"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.PowercapRoot != "/cfg" {
+		t.Fatalf("config powercap_root PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
+	}
+	// precedence: flag > env > file
+	if cfg, err := Load([]string{"-config", path, "-powercap-root=/flag"}, env); err != nil || cfg.PowercapRoot != "/flag" {
+		t.Fatalf("flag over env/file PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.PowercapRoot != "/mnt/hp" {
+		t.Fatalf("env over file PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
+	}
+}
+
 func TestSystemReportIntervalDefault(t *testing.T) {
 	cfg, err := Load([]string{"-gateway-url", "http://gw", "-token", "t"}, func(string) string { return "" })
 	if err != nil {

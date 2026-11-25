@@ -8,4 +8,4 @@ package collector
 // newNativePowerCollector returns nil: there is no CGO-free native power path on this
 // OS (Windows RAPL is ring-0/MSR). Windows relies entirely on the optional LHM-HTTP
 // source composed by DetectPowerCollector.
-func newNativePowerCollector() PowerCollector { return nil }
+func newNativePowerCollector(string) PowerCollector { return nil }

@@ -114,9 +114,9 @@ func PowerSources(pc PowerCollector) []string {
 // DetectPowerCollector composes the OS-native power collector (if any) with the
 // optional LHM-HTTP source (when lhmURL != ""), native first. The result is always
 // non-nil (an empty composite when nothing applies) and safe to Collect.
-func DetectPowerCollector(lhmURL string) PowerCollector {
+func DetectPowerCollector(lhmURL, powercapRoot string) PowerCollector {
 	var subs []PowerCollector
-	if native := newNativePowerCollector(); native != nil { //nolint:staticcheck // newNativePowerCollector returns nil only on the !linux && !darwin build (power_other.go); always-true on this build is an intentional cross-platform guard
+	if native := newNativePowerCollector(powercapRoot); native != nil { //nolint:staticcheck // newNativePowerCollector returns nil only on the !linux && !darwin build (power_other.go); always-true on this build is an intentional cross-platform guard
 		subs = append(subs, native)
 	}
 	if strings.TrimSpace(lhmURL) != "" {
@@ -212,9 +212,9 @@ func DetectTempCollector(lhmURL string) TempCollector {
 // (findLHMPower / findLHMTemp) over the shared result. Use this instead of
 // calling DetectPowerCollector/DetectTempCollector separately whenever both
 // are needed.
-func DetectPowerAndTempCollectors(lhmURL string) (PowerCollector, TempCollector) {
+func DetectPowerAndTempCollectors(lhmURL, powercapRoot string) (PowerCollector, TempCollector) {
 	var powerSubs []PowerCollector
-	if native := newNativePowerCollector(); native != nil { //nolint:staticcheck // see DetectPowerCollector's identical guard
+	if native := newNativePowerCollector(powercapRoot); native != nil { //nolint:staticcheck // see DetectPowerCollector's identical guard
 		powerSubs = append(powerSubs, native)
 	}
 	var tempSubs []TempCollector

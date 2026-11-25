@@ -16,7 +16,11 @@ const (
 )
 
 // newNativePowerCollector returns the Linux RAPL/hwmon power collector reading the
-// standard sysfs roots.
-func newNativePowerCollector() PowerCollector {
-	return newRAPLCollector(defaultPowercapRoot, defaultHwmonRoot)
+// standard sysfs roots, or powercapRoot instead of the default powercap root when
+// non-empty (e.g. a host-provided virtiofs tree); the hwmon root is unchanged.
+func newNativePowerCollector(powercapRoot string) PowerCollector {
+	if powercapRoot == "" {
+		powercapRoot = defaultPowercapRoot
+	}
+	return newRAPLCollector(powercapRoot, defaultHwmonRoot)
 }

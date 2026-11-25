@@ -130,3 +130,43 @@ func TestRAPLSystemPsysThenHwmonFallback(t *testing.T) {
 		t.Fatalf("system = %v, want nil (no psys, no hwmon)", *sys3)
 	}
 }
+
+// TestRAPLCollectorCustomRootAppearsLater covers a host-provided powercap root
+// (e.g. a virtiofs mount) that does not exist yet when the agent starts: the
+// collector reports unavailable without error, then picks the tree up once it
+// appears.
+func TestRAPLCollectorCustomRootAppearsLater(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "notyet")
+	c := newRAPLCollector(root, filepath.Join(t.TempDir(), "nohwmon"))
+	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return base }
+
+	if c.Available() {
+		t.Fatal("Available() = true for a missing root, want false")
+	}
+	cpu, _, err := c.Collect(context.Background())
+	if err != nil || cpu != nil {
+		t.Fatalf("Collect on missing root = (%v, %v), want (nil, nil)", cpu, err)
+	}
+
+	pkg := filepath.Join(root, "intel-rapl:0")
+	writeSysfs(t, pkg, "name", "package-0\n")
+	writeSysfs(t, pkg, "max_energy_range_uj", "9223372036854775807\n")
+	writeSysfs(t, pkg, "energy_uj", "1000000\n")
+	if !c.Available() {
+		t.Fatal("Available() = false after the tree appeared, want true")
+	}
+	if cpu, _, err = c.Collect(context.Background()); err != nil || cpu != nil {
+		t.Fatalf("baseline Collect = (%v, %v), want (nil, nil)", cpu, err)
+	}
+
+	writeSysfs(t, pkg, "energy_uj", "16000000\n")
+	c.now = func() time.Time { return base.Add(time.Second) }
+	cpu, _, err = c.Collect(context.Background())
+	if err != nil || cpu == nil {
+		t.Fatalf("second Collect = (%v, %v), want ~15 W", cpu, err)
+	}
+	if *cpu < 14.999 || *cpu > 15.001 {
+		t.Fatalf("CPU watts = %v, want 15", *cpu)
+	}
+}

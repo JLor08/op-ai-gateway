@@ -91,7 +91,7 @@ func main() {
 	// separately) so that, when LHMURL is configured, the power and temp
 	// collectors share one lhmSource and issue a single LHM /data.json
 	// GET+parse per telemetry cycle instead of two (SA-6).
-	power, temp := collector.DetectPowerAndTempCollectors(cfg.LHMURL)
+	power, temp := collector.DetectPowerAndTempCollectors(cfg.LHMURL, cfg.PowercapRoot)
 
 	// certInstaller is always constructed, even with cert_mode=off: Sync and
 	// Report both no-op internally for that mode (no HTTP call, no disk
@@ -353,6 +353,7 @@ func main() {
 		"model_status_url", cfg.ModelStatusURL,
 		"model_status_format", cfg.ModelStatusFormat,
 		"lhm_url", cfg.LHMURL,
+		"powercap_root", cfg.PowercapRoot,
 		"cert_mode", cfg.CertMode,
 		"cert_dir", cfg.CertDir,
 		"cert_reload_command", cfg.CertReloadCommand,

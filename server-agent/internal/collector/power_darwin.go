@@ -21,8 +21,9 @@ type powermetricsCollector struct {
 	interval time.Duration
 }
 
-// newNativePowerCollector returns the macOS powermetrics-backed power collector.
-func newNativePowerCollector() PowerCollector {
+// newNativePowerCollector returns the macOS powermetrics-backed power collector;
+// powercapRoot is a Linux-only option and ignored here.
+func newNativePowerCollector(string) PowerCollector {
 	return &powermetricsCollector{interval: 200 * time.Millisecond}
 }
 
