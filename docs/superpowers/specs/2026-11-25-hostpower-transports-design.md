@@ -250,14 +250,35 @@ CPU but never correctness. Observations expire after 30 s.
    `MAC mismatch`.
 4. The VM must be live (`LiveCounter`), else `503`.
 
+**All segments, not only the SYN** (revised after the implementer's
+analysis): an attacker that poisons the host's ARP cache for VM A's IP
+receives the SYN-ACK of A's own SYN and could complete A's handshake and
+send the request itself. Therefore the capture records every TCP segment to
+the listen port (SYN, ACK, data), and the resolver accepts a connection only
+if its SYN entered on exactly one `tap<vmid>i<n>` AND every observed segment
+of the 4-tuple entered on that same tap (transit copies on bridges and on
+`fwbr`/`fwln`/`fwpr` interfaces are ignored; any other interface — physical
+uplink, VLAN sub-interface, `lo`, `veth`, another tap — is foreign ingress →
+`401` `foreign ingress`). The resolver waits (within the same 250 ms bound)
+until at least one non-SYN segment of the connection has been observed, so
+the handshake's final ACK is always checked.
+
 **Why this is safe** (to be restated in the ADR): the kernel reports the
 interface a frame physically entered, and a guest's frames can only enter
 through its own tap device. A VM that fakes another VM's IP or MAC still
 enters on its own tap, so it resolves to itself (own values) or fails the
 MAC check (`401`). A LAN device enters on the physical uplink and never on a
-`tap` (`401`). Nothing secret travels, so nothing can be sniffed and
-replayed. A different machine cannot ride on an established connection
-without the TCP sequence numbers.
+`tap` (`401`). A device that hijacks a VM's connection by ARP-poisoning the
+host injects its segments over the uplink (`401`). Nothing secret travels,
+so nothing can be replayed. **Out of scope:** passive interception of a
+response by a device in a layer-2 man-in-the-middle position (it would read
+the VM's own counter of a request the VM made). Only TLS prevents that, and
+it applies to token mode equally (where it would even expose the token);
+TLS is deferred (§7).
+
+**Keep-alive:** the HTTP server disables keep-alive, so every request is
+its own connection with a fresh SYN; an observation therefore never has to
+outlive one request (TTL 30 s).
 
 **Requirements and limits:** Linux only (CAP_NET_RAW, which the root
 service has); the VM's NIC must be a QEMU tap on the host (bridge, VLAN
