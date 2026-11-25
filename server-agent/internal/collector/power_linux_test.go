@@ -48,4 +48,9 @@ func TestLinuxCompositeOrder(t *testing.T) {
 	if got := PowerSources(DetectPowerCollector(PowerConfig{})); !slices.Equal(got, want) {
 		t.Fatalf("no socket: sources = %v, want %v", got, want)
 	}
+
+	cfg.HostpowerURL = "http://127.0.0.1:9100"
+	if got, want := PowerSources(DetectPowerCollector(cfg)), []string{"rapl", "helper", "hwmon", "hostpower"}; !slices.Equal(got, want) {
+		t.Fatalf("non-root with socket and hostpower: sources = %v, want %v", got, want)
+	}
 }

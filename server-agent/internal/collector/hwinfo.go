@@ -20,8 +20,9 @@ import (
 	"github.com/shirou/gopsutil/v4/mem"
 )
 
-// hwCollectTimeout bounds each external source (a GPU CLI, system_profiler) so a wedged tool cannot hang collection. Matches the telemetry
-// collectors' per-source budget.
+// hwCollectTimeout bounds each external source (a GPU CLI, system_profiler,
+// the privileged helper's memory-module fetch) so a wedged source cannot hang
+// collection. Matches the telemetry collectors' per-source budget.
 const hwCollectTimeout = 2 * time.Second
 
 // HardwareOptions carries the agent settings the hardware inventory depends on.

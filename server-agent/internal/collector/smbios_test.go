@@ -18,6 +18,7 @@ type t17opts struct {
 	size       uint16
 	extSize    uint32
 	locator    string
+	locIdx     byte // locator string index override; 0 → 1 when locator is set
 	memType    byte
 	speed      uint16
 	confSpeed  uint16
@@ -59,6 +60,9 @@ func type17(o t17opts) []byte {
 	put16(0x0C, o.size)
 	if o.locator != "" {
 		b[0x10] = 1
+	}
+	if o.locIdx != 0 {
+		b[0x10] = o.locIdx
 	}
 	if 0x12 < n {
 		b[0x12] = o.memType
@@ -158,6 +162,29 @@ var smbiosCases = []struct {
 		want:  []sample.MemoryModule{{Locator: "Z", SizeBytes: 1024 * smbMiB, Type: "DDR4", SpeedMHz: 2133}},
 	},
 	{
+		name:  "firmware padding trimmed from the locator",
+		table: join(type17(t17opts{size: 8192, locator: "DIMM 0  ", memType: 0x1A, speed: 3200}), endOfTable()),
+		want:  []sample.MemoryModule{{Locator: "DIMM 0", SizeBytes: 8192 * smbMiB, Type: "DDR4", SpeedMHz: 3200}},
+	},
+	{
+		// The rated speed word ends at 0x17; the string set right after a shorter
+		// formatted area must not be read as a speed.
+		name:  "structure shorter than 0x17 has no rated speed",
+		table: join(type17(t17opts{length: 0x15, size: 2048, locator: "DIMM 0", memType: 0x18}), endOfTable()),
+		want:  []sample.MemoryModule{{Locator: "DIMM 0", SizeBytes: 2048 * smbMiB, Type: "DDR3"}},
+	},
+	{
+		// 0x7FFF points to the extended size dword at 0x1C, absent below 0x20.
+		name:  "0x7FFF size without the extended size field skipped",
+		table: join(type17(t17opts{length: 0x1C, size: 0x7FFF, locator: "DIMM 0", memType: 0x1A}), endOfTable()),
+		want:  nil,
+	},
+	{
+		name:  "out-of-range locator string index yields an empty locator",
+		table: join(type17(t17opts{size: 1024, locator: "A1", locIdx: 5, memType: 0x1A}), endOfTable()),
+		want:  []sample.MemoryModule{{SizeBytes: 1024 * smbMiB, Type: "DDR4"}},
+	},
+	{
 		name:  "stops at end-of-table",
 		table: join(endOfTable(), type17(t17opts{size: 1024, locator: "Z", memType: 0x1A})),
 		want:  nil,
@@ -184,9 +211,13 @@ func TestParseSMBIOSTruncatedStringSet(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
-	// Truncated header / length shorter than header: no panic.
-	_ = ParseSMBIOSMemory([]byte{17, 0x5C})
-	_ = ParseSMBIOSMemory([]byte{17, 2, 0, 0, 0, 0})
+	// Truncated header, length beyond the table, length shorter than the
+	// header: nothing decoded, no panic.
+	for _, in := range [][]byte{{17, 0x5C}, {17, 0x5C, 0, 0, 0, 0}, {17, 2, 0, 0, 0, 0}} {
+		if got := ParseSMBIOSMemory(in); got != nil {
+			t.Fatalf("ParseSMBIOSMemory(%v) = %#v, want nil", in, got)
+		}
+	}
 }
 
 func TestParseSMBIOSNoSensitiveFields(t *testing.T) {

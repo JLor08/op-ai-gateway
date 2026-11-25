@@ -13898,7 +13898,8 @@ reports.
 **Consequences.**
 
 - An unprivileged Linux agent with the helper installed reports CPU watts, `psys` system watts and the DIMM list exactly as a root agent; a root
-  agent is unchanged except that it parses the SMBIOS table itself instead of running `dmidecode`.
+  agent is unchanged except that it parses the SMBIOS table itself instead of running `dmidecode`. Kernels older than 4.2 lack
+  `/sys/firmware/dmi/tables/DMI`, so a root agent there now reports the RAM total only (it used to get the DIMMs from `dmidecode`).
 - A second root service to install on bare-metal Linux; without it an unprivileged agent degrades as before (no CPU watts, RAM total only).
 - The model runtimes can read coarse package power through the helper (accepted, see the threat model).
 - `power_sources` lists `helper` whenever the source is composed; it does not prove the helper answers (the Info log on the first success does).

@@ -148,10 +148,12 @@ func nativeAndHostpowerSubs(cfg PowerConfig) []PowerCollector {
 	return subs
 }
 
-// DetectPowerCollector composes the OS-native power collector (if any), the
-// optional hostpower HTTP source (when HostpowerURL != "") and the optional
-// LHM-HTTP source (when LHMURL != ""), in that order. The result is always
-// non-nil (an empty composite when nothing applies) and safe to Collect.
+// DetectPowerCollector composes, in this order: the OS-native collector (RAPL
+// on Linux, powermetrics on macOS, a host-provided powercap tree elsewhere when
+// PowercapRoot is set), the privileged helper (Linux, non-root agent,
+// HelperSocket set), hwmon (Linux), the hostpower HTTP source (HostpowerURL
+// set) and the LHM-HTTP source (LHMURL set). The result is always non-nil (an
+// empty composite when nothing applies) and safe to Collect.
 func DetectPowerCollector(cfg PowerConfig) PowerCollector {
 	subs := nativeAndHostpowerSubs(cfg)
 	if strings.TrimSpace(cfg.LHMURL) != "" {

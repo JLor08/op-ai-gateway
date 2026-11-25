@@ -9,6 +9,7 @@ import (
 	"io"
 	"op-ai-server-agent/internal/sample"
 	"os"
+	"strings"
 )
 
 // DefaultDMITablePath is the raw SMBIOS structure table exported by the Linux
@@ -114,7 +115,7 @@ func decodeMemoryDevice(b []byte, strs []string) (sample.MemoryModule, bool) {
 	}
 	m.SizeBytes = size
 	if idx := smbiosByte(b, 0x10); idx > 0 && int(idx) <= len(strs) {
-		m.Locator = strs[idx-1]
+		m.Locator = strings.TrimSpace(strs[idx-1]) // firmware pads strings; dmidecode output was trimmed too
 	}
 	m.Type = smbiosMemoryTypes[smbiosByte(b, 0x12)]
 	if m.Type == "Unknown" {
