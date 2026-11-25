@@ -45,7 +45,7 @@ func ResolveIdentity(userSpec, groupSpec string) (Identity, error) {
 		return Identity{}, errRootAgent
 	case uid == nobodyUID:
 		return Identity{}, errors.New("helper: -agent-user must not be nobody (uid 65534)")
-	case uid < 0 || uid >= math.MaxUint32:
+	case uid < 0 || int64(uid) >= math.MaxUint32:
 		return Identity{}, fmt.Errorf("helper: -agent-user %q has invalid uid %d", userSpec, uid)
 	}
 	id := Identity{UID: uid}
@@ -59,7 +59,7 @@ func ResolveIdentity(userSpec, groupSpec string) (Identity, error) {
 	default:
 		return Identity{}, fmt.Errorf("helper: uid %d has no passwd entry, so its primary group is unknown; set -agent-group", uid)
 	}
-	if id.GID < 0 || id.GID >= math.MaxUint32 {
+	if id.GID < 0 || int64(id.GID) >= math.MaxUint32 {
 		return Identity{}, fmt.Errorf("helper: invalid agent gid %d", id.GID)
 	}
 	return id, nil

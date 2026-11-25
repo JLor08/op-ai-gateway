@@ -21,6 +21,7 @@ import (
 	"op-ai-server-agent/internal/client"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
+	"op-ai-server-agent/internal/helper"
 	"op-ai-server-agent/internal/hostpower"
 	"op-ai-server-agent/internal/proxy"
 	"slices"
@@ -48,6 +49,12 @@ func main() {
 	// token or config file, so it returns before config.Load.
 	if len(os.Args) > 1 && os.Args[1] == "hostpower" {
 		os.Exit(hostpower.Main(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
+	// helper is the root-only RAPL/DMI reader serving the unprivileged agent
+	// over a Unix socket; like hostpower it needs no config file.
+	if len(os.Args) > 1 && os.Args[1] == "helper" {
+		os.Exit(helper.Main(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
 	cfg, err := config.Load(os.Args[1:], os.Getenv)
