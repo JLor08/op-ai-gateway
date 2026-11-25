@@ -18,14 +18,14 @@ import (
 	"time"
 )
 
+// reasonBadConnAddr is the auth-rejection reason for an unparsable connection address.
+const reasonBadConnAddr = "bad connection address"
+
 // Request limits. The source limit applies before identification and
 // protects the MAC-mode resolver's wait from a flood; it is generous so that
 // many guests behind one NAT address stay under it. The VM limit applies once
 // a request is tied to a VM and holds each VM to a little above a 1 Hz
 // poller's needs.
-// reasonBadConnAddr is the auth-rejection reason for an unparsable connection address.
-const reasonBadConnAddr = "bad connection address"
-
 const (
 	sourceRatePerSecond = 100.0
 	sourceRateBurst     = 200.0
