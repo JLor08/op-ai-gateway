@@ -115,7 +115,8 @@ func PowerSources(pc PowerCollector) []string {
 type PowerConfig struct {
 	// LHMURL is the optional LibreHardwareMonitor /data.json URL.
 	LHMURL string
-	// PowercapRoot optionally replaces the native powercap root (Linux only).
+	// PowercapRoot optionally replaces the native powercap root; read on Linux
+	// and Windows (Windows: the virtiofs drive root), ignored on macOS.
 	PowercapRoot string
 	// HostpowerURL is the optional hostpower HTTP endpoint on the Proxmox host.
 	HostpowerURL string

@@ -406,9 +406,10 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
   // best-effort system) power watts. Empty disables it.
   "lhm_url": "",
 
-  // Optional powercap sysfs root for CPU power, e.g. a Proxmox hostpower
-  // virtiofs mount carrying this VM's share of the host CPU package power.
-  // Empty = the platform default (/sys/class/powercap). Linux only.
+  // Optional powercap root for CPU power, e.g. a Proxmox hostpower virtiofs
+  // mount carrying this VM's share of the host CPU package power. Read on
+  // Linux and Windows (Windows: the virtiofs drive root, e.g. drive Z);
+  // ignored on macOS. Empty = /sys/class/powercap on Linux, off on Windows.
   "powercap_root": "",
 
   // Optional hostpower HTTP endpoint on the Proxmox host (e.g.

@@ -50,8 +50,8 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_MODEL_STATUS_FORMAT` | `-model-status-format` | `model_status_format` | — (auto) | How to parse `model_status_url`: `openai`, `llama_swap`, `llama_cpp`, `litellm`, or empty / `auto` (a tolerant union of all shapes). |
 | `OP_AGENT_TLS_INSECURE` | `-tls-insecure`  | `tls_insecure` | `false` | Skip TLS certificate verification (self-signed dev gateways). `true`/`1`. |
 | `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap root the RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower` on Linux, a drive root such as `Z:\` on Windows). Empty uses the platform default (Linux) or disables it (Windows); ignored on macOS. See [Linux or Windows guest on a Proxmox VE host](#linux-or-windows-guest-on-a-proxmox-ve-host). |
-| `OP_AGENT_HOSTPOWER_URL` | `-hostpower-url` | `hostpower_url` | — | Optional hostpower HTTP endpoint on the Proxmox host (e.g. `http://<host>:9873`) the guest reads its share of host CPU power from. Empty disables it. Without a token the host identifies the VM by its network port (MAC mode). |
-| `OP_AGENT_HOSTPOWER_TOKEN` | `-hostpower-token` | `hostpower_token` | — | Optional per-VM token for the hostpower HTTP endpoint (token mode; secret; never logged). Create it on the host with `server-agent hostpower token create <vmid>`. |
+| `OP_AGENT_HOSTPOWER_URL` | `-hostpower-url` | `hostpower_url` | — | Optional hostpower HTTP endpoint on the Proxmox host (e.g. `http://<host>:9873`) the guest reads its share of host CPU power from. Empty disables it. Without a token the host identifies the VM by its network port (MAC mode). A value without an `http://` or `https://` scheme or without a host logs a startup warning. |
+| `OP_AGENT_HOSTPOWER_TOKEN` | `-hostpower-token` | `hostpower_token` | — | Optional per-VM token for the hostpower HTTP endpoint (token mode; secret; never logged). Create it on the host with `server-agent hostpower token create <vmid>`. Set without `hostpower_url`, it logs a startup warning. |
 | `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. A Windows CPU-watt path (alongside `powercap_root` and `hostpower_url`); a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
 | `OP_AGENT_CERT_DIR`     | `-cert-dir`      | `cert_dir`     | —       | Directory certificate files are written into. **Required** when `cert_mode` is not `off`. |
@@ -1126,6 +1126,11 @@ in the guest with `OP_AGENT_HOSTPOWER_TOKEN` (or `-hostpower-token` or
 `hostpower_token`) next to `hostpower_url`; it is a secret and is never
 logged. Token mode does not check the request's network origin.
 
+Tokens follow clones and templates: a token baked into a template or a cloned
+disk gives every clone the original VM's identity. Create a VM's token after
+cloning, never put `hostpower_token` into a template, and revoke the token when
+the VM is destroyed or its vmid is reused.
+
 The HTTP transport is plain HTTP: anyone who can read the traffic on the path
 can read the token and the values, so use it only on a trusted segment (see
 the threat model above).
@@ -1138,8 +1143,9 @@ the threat model above).
 (any scheme, even an empty one) is handled in token mode only, with no fallback
 to MAC mode; a request without it is handled in MAC mode. Status codes: `401`
 not identified (malformed authorization, unknown or revoked token, the mode
-is disabled, capture unavailable, IPv6 source, no SYN observed, not a VM
-port, ambiguous or foreign ingress, no VM config, MAC mismatch), `503`
+is disabled, capture unavailable, IPv6 source, observation overflow, no SYN
+observed, handshake not observed, not a VM port, ambiguous or foreign ingress,
+no VM config, MAC mismatch), `503`
 identified but the VM has no live counter yet (just started, or stopped), `404`/`405` for another path or method, `429` above
 100 requests per second from one source address (burst 200, checked before
 identification) or above 10 requests per second for one VM (burst 20, checked

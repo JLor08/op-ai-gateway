@@ -142,13 +142,14 @@ type Config struct {
 	ModelStatusFormat string
 	// LHMURL is an optional LibreHardwareMonitor Remote Web Server /data.json URL the
 	// agent GETs each cycle for CPU (and best-effort system) power watts. Empty
-	// disables it (the default) — the only Windows CPU-watt path and a Linux RAPL
-	// fallback.
+	// disables it (the default) — a Windows CPU-watt path after the native
+	// (virtiofs) and hostpower sources, and a Linux RAPL fallback.
 	LHMURL string
 	// PowercapRoot optionally replaces /sys/class/powercap as the RAPL collector's
 	// root, e.g. a Proxmox hostpower virtiofs mount that carries this VM's share
-	// of the host CPU package power. Empty = the platform default. Linux only;
-	// ignored elsewhere.
+	// of the host CPU package power. Read on Linux and Windows (Windows: the
+	// virtiofs drive root, e.g. Z:\); ignored on macOS. Empty = the platform
+	// default on Linux, off on Windows.
 	PowercapRoot string
 	// HostpowerURL optionally points the guest at the hostpower HTTP endpoint on
 	// the Proxmox host (e.g. http://<host>:9873). Empty disables it.
