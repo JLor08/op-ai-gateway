@@ -21,6 +21,7 @@ import (
 	"op-ai-server-agent/internal/client"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
+	"op-ai-server-agent/internal/hostpower"
 	"op-ai-server-agent/internal/proxy"
 	"slices"
 
@@ -42,6 +43,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-license" {
 		fmt.Print(licenseNotice())
 		os.Exit(0)
+	}
+	// hostpower runs on a Proxmox host as its own systemd service: no gateway,
+	// token or config file, so it returns before config.Load.
+	if len(os.Args) > 1 && os.Args[1] == "hostpower" {
+		os.Exit(hostpower.Main(os.Args[2:], os.Stderr))
 	}
 
 	cfg, err := config.Load(os.Args[1:], os.Getenv)
