@@ -24,11 +24,25 @@ import (
 // collectors' per-source budget.
 const hwCollectTimeout = 2 * time.Second
 
+// HardwareOptions carries the agent settings the hardware inventory depends on.
+type HardwareOptions struct {
+	// HelperSocket is the privileged helper's Unix socket ("" = no helper). An
+	// unprivileged Linux agent reads its memory modules from there.
+	HelperSocket string
+}
+
+// HelperMemoryModulesNeeded reports whether r lacks the memory modules that
+// the privileged helper could supply: Linux, not root, a helper socket set,
+// and no modules in r. The agent retries the helper fetch while this holds.
+func HelperMemoryModulesNeeded(r sample.SystemReport, opts HardwareOptions) bool {
+	return helperEnabled(opts.HelperSocket) && len(r.Memory.Modules) == 0
+}
+
 // CollectHardware gathers a static SystemReport: CPU/RAM/OS from gopsutil, per-OS
 // mainboard/BIOS/DIMMs from platformHardware, and GPUs from the detected GPU
 // collectors (mapped to GPUInfo, including driver_version). Best-effort: any
 // missing source leaves its field blank; the report is always produced.
-func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVersion string) sample.SystemReport {
+func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVersion string, opts HardwareOptions) sample.SystemReport {
 	r := sample.SystemReport{
 		CollectedAt:  time.Now().UTC(),
 		AgentVersion: agentVersion,
@@ -65,7 +79,7 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 		r.Hostname = hn
 	}
 
-	board, bios, modules := platformHardware(ctx)
+	board, bios, modules := platformHardware(ctx, opts)
 	r.Mainboard = board
 	r.BIOS = bios
 	if len(modules) > 0 {

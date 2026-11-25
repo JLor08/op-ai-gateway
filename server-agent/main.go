@@ -103,6 +103,7 @@ func main() {
 		PowercapRoot:   cfg.PowercapRoot,
 		HostpowerURL:   cfg.HostpowerURL,
 		HostpowerToken: cfg.HostpowerToken,
+		HelperSocket:   cfg.HelperSocket,
 	})
 
 	// certInstaller is always constructed, even with cert_mode=off: Sync and
@@ -504,6 +505,7 @@ func resolvedConfigAttrs(cfg config.Config) []any {
 		"powercap_root", cfg.PowercapRoot,
 		"hostpower_url", cfg.HostpowerURL,
 		"hostpower_token_set", cfg.HostpowerToken != "",
+		"helper_socket", cfg.HelperSocket,
 		"cert_mode", cfg.CertMode,
 		"cert_dir", cfg.CertDir,
 		"cert_reload_command", cfg.CertReloadCommand,

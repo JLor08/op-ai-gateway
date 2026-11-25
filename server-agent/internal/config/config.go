@@ -157,6 +157,12 @@ type Config struct {
 	// HostpowerToken is the optional per-VM bearer token for that endpoint
 	// (token mode); empty selects MAC mode. A secret: never logged.
 	HostpowerToken string
+	// HelperSocket is the Unix socket of the privileged `server-agent helper`
+	// an unprivileged Linux agent reads RAPL counters and memory modules from.
+	// Resolved by resolveHelperSocket: Linux defaults to
+	// /run/op-agent-helper/agent.sock, "off" in any source and every other OS
+	// resolve to "" (helper off).
+	HelperSocket string
 
 	// CertMode selects the certificate behavior: CertModeOff (default, never
 	// fetch), CertModeFiles (write files + run CertReloadCommand on change), or
@@ -460,6 +466,7 @@ type fileConfig struct {
 	PowercapRoot         string       `json:"powercap_root"`
 	HostpowerURL         string       `json:"hostpower_url"`
 	HostpowerToken       string       `json:"hostpower_token"`
+	HelperSocket         string       `json:"helper_socket"`
 	CertMode             string       `json:"cert_mode"`
 	CertDir              string       `json:"cert_dir"`
 	CertReloadCommand    string       `json:"cert_reload_command"`
@@ -514,6 +521,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	powercapRoot := fs.String("powercap-root", "", "optional powercap root for CPU power, e.g. a Proxmox hostpower virtiofs mount (Windows: the virtiofs drive root) (env OP_AGENT_POWERCAP_ROOT / config powercap_root); read on Linux and Windows, ignored on macOS")
 	hostpowerURL := fs.String("hostpower-url", "", "optional hostpower HTTP endpoint on the Proxmox host, e.g. http://<host>:9873 (env OP_AGENT_HOSTPOWER_URL / config hostpower_url)")
 	hostpowerToken := fs.String("hostpower-token", "", "optional per-VM token for the hostpower HTTP endpoint (secret; env OP_AGENT_HOSTPOWER_TOKEN / config hostpower_token)")
+	helperSocket := fs.String("helper-socket", "", "Unix socket of the privileged server-agent helper; Linux only, default "+defaultHelperSocket+", \"off\" disables it (env OP_AGENT_HELPER_SOCKET / config helper_socket)")
 	lhmURL := fs.String("lhm-url", "", "optional LibreHardwareMonitor /data.json URL for CPU/system power (env OP_AGENT_LHM_URL / config lhm_url)")
 	certMode := fs.String("cert-mode", "", "certificate mode: off|files|proxy (proxy also runs the agent-side TLS proxy) (env OP_AGENT_CERT_MODE / config cert_mode)")
 	certDir := fs.String("cert-dir", "", "directory certificate files are written into; required unless cert-mode=off (env OP_AGENT_CERT_DIR / config cert_dir)")
@@ -583,6 +591,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 
+	helperSocketPath, helperSocketWarnings := resolveHelperSocket(strings.TrimSpace(resolveStr("helper-socket", *helperSocket, "OP_AGENT_HELPER_SOCKET", file.HelperSocket)))
+
 	cfg := Config{
 		GatewayURL:           strings.TrimSpace(resolveStr("gateway-url", *gatewayURL, "OP_AGENT_GATEWAY_URL", file.GatewayURL)),
 		Token:                resolveStr("token", *token, "OP_AGENT_TOKEN", file.Token),
@@ -593,6 +603,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		PowercapRoot:         strings.TrimSpace(resolveStr("powercap-root", *powercapRoot, "OP_AGENT_POWERCAP_ROOT", file.PowercapRoot)),
 		HostpowerURL:         strings.TrimSpace(resolveStr("hostpower-url", *hostpowerURL, "OP_AGENT_HOSTPOWER_URL", file.HostpowerURL)),
 		HostpowerToken:       strings.TrimSpace(resolveStr("hostpower-token", *hostpowerToken, "OP_AGENT_HOSTPOWER_TOKEN", file.HostpowerToken)),
+		HelperSocket:         helperSocketPath,
 		CertMode:             strings.ToLower(strings.TrimSpace(resolveStr("cert-mode", *certMode, "OP_AGENT_CERT_MODE", file.CertMode))),
 		CertDir:              strings.TrimSpace(resolveStr("cert-dir", *certDir, "OP_AGENT_CERT_DIR", file.CertDir)),
 		CertReloadCommand:    strings.TrimSpace(resolveStr("cert-reload-command", *certReloadCommand, "OP_AGENT_CERT_RELOAD_COMMAND", file.CertReloadCommand)),
@@ -656,7 +667,42 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.Warnings = append(runtimeAllowlistWarnings(cfg, fileKeys, getenv), hostpowerWarnings(cfg)...)
+	cfg.Warnings = append(cfg.Warnings, helperSocketWarnings...)
 	return cfg, nil
+}
+
+// configGOOS is the OS resolveHelperSocket decides for; a variable so tests
+// can exercise the Linux and non-Linux branches on any host.
+var configGOOS = runtime.GOOS
+
+// defaultHelperSocket is the Linux default for helper_socket. It equals
+// collector.HelperDefaultSocket (pinned by TestHelperSocketDefaultLinux); a
+// copy, so config stays free of the collector and its dependencies.
+const defaultHelperSocket = "/run/op-agent-helper/agent.sock"
+
+// helperSocketOff is the helper_socket value that disables the helper. An
+// empty value cannot: resolveStr treats an empty env var as unset.
+const helperSocketOff = "off"
+
+// resolveHelperSocket turns the trimmed helper_socket value into the socket
+// the agent uses ("" = helper off) plus any startup warnings. "off" disables
+// it everywhere; on Linux an unset value means defaultHelperSocket and a
+// relative path is refused; on any other OS a set path is ignored.
+func resolveHelperSocket(raw string) (string, []string) {
+	switch {
+	case strings.EqualFold(raw, helperSocketOff):
+		return "", nil
+	case configGOOS != "linux":
+		if raw != "" {
+			return "", []string{"helper_socket is set but the helper is only used on Linux; ignored"}
+		}
+		return "", nil
+	case raw == "":
+		return defaultHelperSocket, nil
+	case !strings.HasPrefix(raw, "/"):
+		return "", []string{"helper_socket must be an absolute path; the helper source stays off"}
+	}
+	return raw, nil
 }
 
 // hostpowerWarnings returns the startup warnings for the hostpower HTTP

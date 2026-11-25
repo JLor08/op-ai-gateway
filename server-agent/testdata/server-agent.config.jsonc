@@ -54,6 +54,12 @@
   // Create it on the host with: server-agent hostpower token create <vmid>
   "hostpower_token": "",
 
+  // Unix socket of the privileged "server-agent helper" (Linux only), which
+  // lets an agent that does not run as root report CPU/system watts and
+  // memory modules like a root agent. Empty = /run/op-agent-helper/agent.sock
+  // on Linux; "off" disables it. Ignored on macOS and Windows.
+  "helper_socket": "",
+
   // Certificate installation mode: "off" (default, never fetch a certificate),
   // "files" (write fullchain/cert/chain/ca/privkey into cert_dir and run
   // cert_reload_command on change), or "proxy" (everything "files" does, and

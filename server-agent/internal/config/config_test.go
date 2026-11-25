@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"op-ai-server-agent/internal/collector"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2010,6 +2011,114 @@ func TestLoadWarnsOnHostpowerOptions(t *testing.T) {
 			if tc.token != "" && strings.Contains(w, tc.token) {
 				t.Errorf("%s: warning leaks the token: %q", tc.name, w)
 			}
+		}
+	}
+}
+
+// setConfigGOOS points the helper_socket resolution at goos for one test.
+func setConfigGOOS(t *testing.T, goos string) {
+	t.Helper()
+	orig := configGOOS
+	configGOOS = goos
+	t.Cleanup(func() { configGOOS = orig })
+}
+
+func TestHelperSocketDefaultLinux(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	// Without injection the default follows the real OS.
+	cfg, err := Load(base, noenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ""
+	if runtime.GOOS == "linux" {
+		want = collector.HelperDefaultSocket
+	}
+	if cfg.HelperSocket != want {
+		t.Fatalf("default on %s = %q, want %q", runtime.GOOS, cfg.HelperSocket, want)
+	}
+
+	setConfigGOOS(t, "linux")
+	if cfg, err := Load(base, noenv); err != nil || cfg.HelperSocket != collector.HelperDefaultSocket || len(cfg.Warnings) != 0 {
+		t.Fatalf("linux default = %q, warnings %v (err %v), want %q", cfg.HelperSocket, cfg.Warnings, err, collector.HelperDefaultSocket)
+	}
+	env := func(k string) string {
+		if k == "OP_AGENT_HELPER_SOCKET" {
+			return " /run/env.sock "
+		}
+		return ""
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","helper_socket":"/run/file.sock"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.HelperSocket != "/run/file.sock" {
+		t.Fatalf("file = %q (err %v)", cfg.HelperSocket, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.HelperSocket != "/run/env.sock" {
+		t.Fatalf("env over file = %q (err %v), want trimmed env value", cfg.HelperSocket, err)
+	}
+	if cfg, err := Load([]string{"-config", path, "-helper-socket=/run/flag.sock"}, env); err != nil || cfg.HelperSocket != "/run/flag.sock" {
+		t.Fatalf("flag over env/file = %q (err %v)", cfg.HelperSocket, err)
+	}
+}
+
+func TestHelperSocketOff(t *testing.T) {
+	setConfigGOOS(t, "linux")
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	offEnv := func(k string) string {
+		if k == "OP_AGENT_HELPER_SOCKET" {
+			return "off"
+		}
+		return ""
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","helper_socket":"off"}`)
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  func(string) string
+	}{
+		{"env", base, offEnv},
+		{"flag", append([]string{"-helper-socket=off"}, base...), noenv},
+		{"file", []string{"-config", path}, noenv},
+	} {
+		cfg, err := Load(tc.args, tc.env)
+		if err != nil || cfg.HelperSocket != "" || len(cfg.Warnings) != 0 {
+			t.Errorf("%s: HelperSocket = %q, warnings %v (err %v), want empty, none", tc.name, cfg.HelperSocket, cfg.Warnings, err)
+		}
+	}
+}
+
+func TestHelperSocketRelativeWarns(t *testing.T) {
+	setConfigGOOS(t, "linux")
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x", "-helper-socket=run/agent.sock"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load must still succeed: %v", err)
+	}
+	if cfg.HelperSocket != "" {
+		t.Fatalf("HelperSocket = %q, want empty (a relative path turns the helper off)", cfg.HelperSocket)
+	}
+	want := []string{"helper_socket must be an absolute path; the helper source stays off"}
+	if !reflect.DeepEqual(cfg.Warnings, want) {
+		t.Fatalf("Warnings = %v, want %v", cfg.Warnings, want)
+	}
+}
+
+func TestHelperSocketNonLinuxWarns(t *testing.T) {
+	setConfigGOOS(t, "darwin")
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	cfg, err := Load(append([]string{"-helper-socket=/run/op-agent-helper/agent.sock"}, base...), noenv)
+	if err != nil {
+		t.Fatalf("Load must still succeed: %v", err)
+	}
+	want := []string{"helper_socket is set but the helper is only used on Linux; ignored"}
+	if cfg.HelperSocket != "" || !reflect.DeepEqual(cfg.Warnings, want) {
+		t.Fatalf("HelperSocket = %q, Warnings = %v, want empty and %v", cfg.HelperSocket, cfg.Warnings, want)
+	}
+	for _, args := range [][]string{base, append([]string{"-helper-socket=off"}, base...)} {
+		if cfg, err := Load(args, noenv); err != nil || cfg.HelperSocket != "" || len(cfg.Warnings) != 0 {
+			t.Errorf("%v: HelperSocket = %q, warnings %v (err %v), want empty, none", args, cfg.HelperSocket, cfg.Warnings, err)
 		}
 	}
 }
