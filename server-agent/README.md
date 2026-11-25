@@ -1200,8 +1200,8 @@ lines. The service reads `-tls-cert` and `-tls-key` once at start:
 
 - Both absent: it generates a self-signed ECDSA P-256 certificate (subject
   `CN=op-hostpower`, valid for 100 years, no host names) and writes the key,
-  then the certificate, each `0600`, into `0700` directories. If the
-  certificate cannot be written, the key is removed again, so the next start
+  then the certificate, each `0600`. A missing directory is created `0700`;
+  an existing one keeps its mode. If the certificate cannot be written, the key is removed again, so the next start
   generates afresh.
 - Both present: it loads them as a pair (a key that does not belong to the
   certificate fails the start). They may be your own files, for example a pair
@@ -1211,9 +1211,13 @@ lines. The service reads `-tls-cert` and `-tls-key` once at start:
   file: the service refuses to start (exit 2) and writes nothing; it never
   completes half a pair.
 
+Neither path may lie inside the `-out` directory, which guests read over
+virtiofs; the service refuses to start (exit 2) if one does. The check compares
+the cleaned absolute paths and does not resolve symlinks.
+
 The endpoint offers TLS 1.3 only, and a handshake must finish within 2 s.
-Handshake and other connection errors (scanners, a guest with a wrong pin) are
-logged at Debug only. A plain-HTTP request to the TLS port gets `400`. At
+Handshake errors (scanners, a guest with a wrong pin) are logged at Debug
+only; other HTTP server errors, such as a failed accept, at Warn. A plain-HTTP request to the TLS port gets `400`. At
 startup the service logs `hostpower: tls certificate` at Info with `cert` (the
 path), `sha256` (the fingerprint) and `generated` (whether it was just
 created), and its `hostpower: serving` line carries `tls=true`.
@@ -1243,8 +1247,9 @@ OP_AGENT_HOSTPOWER_TLS_FINGERPRINT=<the printed fingerprint>
 (or `-hostpower-tls-fingerprint` or `hostpower_tls_fingerprint` in the config
 file), next to `hostpower_token` in token mode. The value is 64 hex digits,
 with or without `:` separators, in any case; surrounding whitespace is
-ignored. It is not a secret: the resolved value (a valid one normalised to 64
-lowercase hex digits) is logged at Debug with the other settings.
+ignored. It is not a secret: the resolved value, normalised to 64 lowercase
+hex digits, is logged at Debug with the other settings; an invalid value is
+logged as `(invalid)`, since it may be a token pasted into the wrong field.
 
 | `hostpower_url` | `hostpower_tls_fingerprint` | Behaviour |
 |---|---|---|

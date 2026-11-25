@@ -13928,13 +13928,16 @@ guest must be able to verify the host without any CA, host name or gateway invol
 
 - **Opt-in TLS on the existing listener.** `server-agent hostpower -listen … -tls` serves the endpoint over HTTPS, **TLS 1.3 only** (both ends are
   this binary); `-tls` without `-listen` is a usage error. Handler, limits, keep-alive off and timeouts are unchanged; Go bounds the handshake by
-  the smallest of the server's timeouts (2 s). Connection-level errors (handshakes from scanners or mis-pinned guests) go to Debug through the
-  server's `ErrorLog`. A plain-HTTP request to the TLS port gets `400`. Without `-tls` the endpoint behaves as in ADR-116 (only its connection-level error log moved to Debug).
+  the smallest of the server's timeouts (2 s). TLS handshake errors (scanners, mis-pinned guests) go to Debug through the server's `ErrorLog`,
+  every other server error (a recovered handler panic, an accept retry) to Warn. A plain-HTTP request to the TLS port gets `400`. Without `-tls`
+  the endpoint behaves as in ADR-116 (only its server error log now goes through slog).
 - **Certificate material.** `-tls-cert` / `-tls-key` default to `/var/lib/op-hostpower-tls/tls.crt` / `tls.key`, a state directory of its own:
   not the out directory (the source of the guests' virtiofs shares) and not `/etc/op-hostpower` (read-only for the service under
-  `ProtectSystem=strict`). Both absent: the service generates a self-signed ECDSA P-256 certificate (CN `op-hostpower`, random 128-bit serial,
-  100-year validity, `ServerAuth`, no SANs) and writes the key, then the certificate, atomically with mode `0600` into `0700` directories; a failed
-  certificate write removes the key again. Both present: loaded as a pair (symlinks to regular files allowed, so operator material such as a
+  `ProtectSystem=strict`). With `-tls`, a `-tls-key` or `-tls-cert` inside the out directory (cleaned absolute paths, symlinks not resolved) is
+  refused at startup (exit 2). Both absent: the service generates a self-signed ECDSA P-256 certificate (CN `op-hostpower`, random 128-bit serial,
+  100-year validity, `ServerAuth`, no SANs) and writes the key, then the certificate, atomically (fsynced) with mode `0600`; missing directories
+  are created `0700`, an existing one keeps its mode (operator paths such as `/etc/ssl/certs` stay readable). A failed certificate write
+  removes the key again. Both present: loaded as a pair (symlinks to regular files allowed, so operator material such as a
   CA-signed pair works; a key readable by group or others is warned about, not refused). Exactly one present, a dangling symlink or a non-regular
   file: the service refuses to start (exit 2) and never overwrites half a pair. A generation that fails with `EROFS` (a unit without the second
   state directory) carries a hint to add `StateDirectory=op-hostpower-tls` and the `ReadWritePaths` entry.
