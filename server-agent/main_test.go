@@ -156,3 +156,10 @@ func TestResolvedConfigAttrsCarryHelperSocket(t *testing.T) {
 		t.Fatalf("attrs %q lack helper_socket", attrs)
 	}
 }
+
+func TestResolvedConfigAttrsCarryHostpowerTLSFingerprint(t *testing.T) {
+	attrs := fmt.Sprint(resolvedConfigAttrs(config.Config{HostpowerTLSFingerprint: "abcd"}))
+	if !strings.Contains(attrs, "hostpower_tls_fingerprint abcd") {
+		t.Fatalf("attrs %q lack hostpower_tls_fingerprint", attrs)
+	}
+}

@@ -99,11 +99,12 @@ func main() {
 	// collectors share one lhmSource and issue a single LHM /data.json
 	// GET+parse per telemetry cycle instead of two (SA-6).
 	power, temp := collector.DetectPowerAndTempCollectors(collector.PowerConfig{
-		LHMURL:         cfg.LHMURL,
-		PowercapRoot:   cfg.PowercapRoot,
-		HostpowerURL:   cfg.HostpowerURL,
-		HostpowerToken: cfg.HostpowerToken,
-		HelperSocket:   cfg.HelperSocket,
+		LHMURL:                  cfg.LHMURL,
+		PowercapRoot:            cfg.PowercapRoot,
+		HostpowerURL:            cfg.HostpowerURL,
+		HostpowerToken:          cfg.HostpowerToken,
+		HostpowerTLSFingerprint: cfg.HostpowerTLSFingerprint,
+		HelperSocket:            cfg.HelperSocket,
 	})
 
 	// certInstaller is always constructed, even with cert_mode=off: Sync and
@@ -505,6 +506,7 @@ func resolvedConfigAttrs(cfg config.Config) []any {
 		"powercap_root", cfg.PowercapRoot,
 		"hostpower_url", cfg.HostpowerURL,
 		"hostpower_token_set", cfg.HostpowerToken != "",
+		"hostpower_tls_fingerprint", cfg.HostpowerTLSFingerprint,
 		"helper_socket", cfg.HelperSocket,
 		"cert_mode", cfg.CertMode,
 		"cert_dir", cfg.CertDir,

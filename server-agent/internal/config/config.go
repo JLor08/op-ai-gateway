@@ -157,6 +157,11 @@ type Config struct {
 	// HostpowerToken is the optional per-VM bearer token for that endpoint
 	// (token mode); empty selects MAC mode. A secret: never logged.
 	HostpowerToken string
+	// HostpowerTLSFingerprint optionally pins the SHA-256 fingerprint of the
+	// hostpower endpoint's TLS certificate (normalised to 64 lowercase hex
+	// digits; an invalid value is kept trimmed so the collector fails closed).
+	// Used with an https:// HostpowerURL. Not a secret.
+	HostpowerTLSFingerprint string
 	// HelperSocket is the Unix socket of the privileged `server-agent helper`
 	// an unprivileged Linux agent reads RAPL counters and memory modules from.
 	// Resolved by resolveHelperSocket: Linux defaults to
@@ -455,30 +460,31 @@ const MaxEvictionGraceSeconds = 86400
 // by an env var or flag overrides the file. TLSInsecure is a pointer so an
 // absent key is distinguishable from an explicit false.
 type fileConfig struct {
-	GatewayURL           string       `json:"gateway_url"`
-	Token                string       `json:"token"`
-	Interval             string       `json:"interval"`
-	SystemReportInterval string       `json:"system_report_interval"`
-	MetricsURL           string       `json:"metrics_url"`
-	ModelStatusURL       string       `json:"model_status_url"`
-	ModelStatusFormat    string       `json:"model_status_format"`
-	LHMURL               string       `json:"lhm_url"`
-	PowercapRoot         string       `json:"powercap_root"`
-	HostpowerURL         string       `json:"hostpower_url"`
-	HostpowerToken       string       `json:"hostpower_token"`
-	HelperSocket         string       `json:"helper_socket"`
-	CertMode             string       `json:"cert_mode"`
-	CertDir              string       `json:"cert_dir"`
-	CertReloadCommand    string       `json:"cert_reload_command"`
-	CertPollInterval     string       `json:"cert_poll_interval"`
-	CAFile               string       `json:"ca_file"`
-	CACacheFile          string       `json:"ca_cache_file"`
-	CAPEM                string       `json:"ca_pem"`
-	CertProxyRoutes      []ProxyRoute `json:"cert_proxy_routes"`
-	CertProxyRoutesMode  string       `json:"cert_proxy_routes_mode"`
-	TLSInsecure          *bool        `json:"tls_insecure"`
-	Verbose              *bool        `json:"verbose"`
-	Transport            string       `json:"transport"`
+	GatewayURL              string       `json:"gateway_url"`
+	Token                   string       `json:"token"`
+	Interval                string       `json:"interval"`
+	SystemReportInterval    string       `json:"system_report_interval"`
+	MetricsURL              string       `json:"metrics_url"`
+	ModelStatusURL          string       `json:"model_status_url"`
+	ModelStatusFormat       string       `json:"model_status_format"`
+	LHMURL                  string       `json:"lhm_url"`
+	PowercapRoot            string       `json:"powercap_root"`
+	HostpowerURL            string       `json:"hostpower_url"`
+	HostpowerToken          string       `json:"hostpower_token"`
+	HostpowerTLSFingerprint string       `json:"hostpower_tls_fingerprint"`
+	HelperSocket            string       `json:"helper_socket"`
+	CertMode                string       `json:"cert_mode"`
+	CertDir                 string       `json:"cert_dir"`
+	CertReloadCommand       string       `json:"cert_reload_command"`
+	CertPollInterval        string       `json:"cert_poll_interval"`
+	CAFile                  string       `json:"ca_file"`
+	CACacheFile             string       `json:"ca_cache_file"`
+	CAPEM                   string       `json:"ca_pem"`
+	CertProxyRoutes         []ProxyRoute `json:"cert_proxy_routes"`
+	CertProxyRoutesMode     string       `json:"cert_proxy_routes_mode"`
+	TLSInsecure             *bool        `json:"tls_insecure"`
+	Verbose                 *bool        `json:"verbose"`
+	Transport               string       `json:"transport"`
 
 	RuntimeSource          string   `json:"runtime_source"`
 	RuntimeConfigPath      string   `json:"runtime_config"`
@@ -520,6 +526,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	modelStatusFormat := fs.String("model-status-format", "", "model-status response format: openai|llama_swap|llama_cpp|litellm|auto (env OP_AGENT_MODEL_STATUS_FORMAT / config model_status_format)")
 	powercapRoot := fs.String("powercap-root", "", "optional powercap root for CPU power, e.g. a Proxmox hostpower virtiofs mount (Windows: the virtiofs drive root) (env OP_AGENT_POWERCAP_ROOT / config powercap_root); read on Linux and Windows, ignored on macOS")
 	hostpowerURL := fs.String("hostpower-url", "", "optional hostpower HTTP endpoint on the Proxmox host, e.g. http://<host>:9873 (env OP_AGENT_HOSTPOWER_URL / config hostpower_url)")
+	hostpowerTLSFingerprint := fs.String("hostpower-tls-fingerprint", "", "optional SHA-256 fingerprint of the hostpower TLS certificate for an https:// hostpower URL (64 hex digits, ':' allowed; env OP_AGENT_HOSTPOWER_TLS_FINGERPRINT / config hostpower_tls_fingerprint)")
 	hostpowerToken := fs.String("hostpower-token", "", "optional per-VM token for the hostpower HTTP endpoint (secret; env OP_AGENT_HOSTPOWER_TOKEN / config hostpower_token)")
 	helperSocket := fs.String("helper-socket", "", "Unix socket of the privileged server-agent helper; Linux only, default "+defaultHelperSocket+", \"off\" disables it (env OP_AGENT_HELPER_SOCKET / config helper_socket)")
 	lhmURL := fs.String("lhm-url", "", "optional LibreHardwareMonitor /data.json URL for CPU/system power (env OP_AGENT_LHM_URL / config lhm_url)")
@@ -594,30 +601,31 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	helperSocketPath, helperSocketWarnings := resolveHelperSocket(strings.TrimSpace(resolveStr("helper-socket", *helperSocket, "OP_AGENT_HELPER_SOCKET", file.HelperSocket)))
 
 	cfg := Config{
-		GatewayURL:           strings.TrimSpace(resolveStr("gateway-url", *gatewayURL, "OP_AGENT_GATEWAY_URL", file.GatewayURL)),
-		Token:                resolveStr("token", *token, "OP_AGENT_TOKEN", file.Token),
-		MetricsURL:           strings.TrimSpace(resolveStr("metrics-url", *metricsURL, "OP_AGENT_METRICS_URL", file.MetricsURL)),
-		ModelStatusURL:       strings.TrimSpace(resolveStr("model-status-url", *modelStatusURL, "OP_AGENT_MODEL_STATUS_URL", file.ModelStatusURL)),
-		ModelStatusFormat:    strings.TrimSpace(resolveStr("model-status-format", *modelStatusFormat, "OP_AGENT_MODEL_STATUS_FORMAT", file.ModelStatusFormat)),
-		LHMURL:               strings.TrimSpace(resolveStr("lhm-url", *lhmURL, "OP_AGENT_LHM_URL", file.LHMURL)),
-		PowercapRoot:         strings.TrimSpace(resolveStr("powercap-root", *powercapRoot, "OP_AGENT_POWERCAP_ROOT", file.PowercapRoot)),
-		HostpowerURL:         strings.TrimSpace(resolveStr("hostpower-url", *hostpowerURL, "OP_AGENT_HOSTPOWER_URL", file.HostpowerURL)),
-		HostpowerToken:       strings.TrimSpace(resolveStr("hostpower-token", *hostpowerToken, "OP_AGENT_HOSTPOWER_TOKEN", file.HostpowerToken)),
-		HelperSocket:         helperSocketPath,
-		CertMode:             strings.ToLower(strings.TrimSpace(resolveStr("cert-mode", *certMode, "OP_AGENT_CERT_MODE", file.CertMode))),
-		CertDir:              strings.TrimSpace(resolveStr("cert-dir", *certDir, "OP_AGENT_CERT_DIR", file.CertDir)),
-		CertReloadCommand:    strings.TrimSpace(resolveStr("cert-reload-command", *certReloadCommand, "OP_AGENT_CERT_RELOAD_COMMAND", file.CertReloadCommand)),
-		CertPollInterval:     certPollInterval,
-		CAFile:               resolveStr("ca-file", *caFile, "OP_AGENT_CA_FILE", file.CAFile),
-		CACacheFile:          resolveStr("ca-cache-file", *caCacheFile, "OP_AGENT_CA_CACHE_FILE", file.CACacheFile),
-		CAPEM:                resolveStr("ca-pem", *caPEM, "OP_AGENT_CA_PEM", file.CAPEM),
-		CertProxyRoutes:      file.CertProxyRoutes,
-		CertProxyRoutesMode:  strings.ToLower(strings.TrimSpace(file.CertProxyRoutesMode)),
-		Transport:            strings.ToLower(resolveStr("transport", *transport, "OP_AGENT_TRANSPORT", file.Transport)),
-		Interval:             interval,
-		SystemReportInterval: systemReportInterval,
-		TLSInsecure:          resolveBool(set["tls-insecure"], *tlsInsecure, getenv("OP_AGENT_TLS_INSECURE"), file.TLSInsecure),
-		Verbose:              resolveBool(set["v"] || set["verbose"], *vShort || *vLong, getenv("OP_AGENT_VERBOSE"), file.Verbose),
+		GatewayURL:              strings.TrimSpace(resolveStr("gateway-url", *gatewayURL, "OP_AGENT_GATEWAY_URL", file.GatewayURL)),
+		Token:                   resolveStr("token", *token, "OP_AGENT_TOKEN", file.Token),
+		MetricsURL:              strings.TrimSpace(resolveStr("metrics-url", *metricsURL, "OP_AGENT_METRICS_URL", file.MetricsURL)),
+		ModelStatusURL:          strings.TrimSpace(resolveStr("model-status-url", *modelStatusURL, "OP_AGENT_MODEL_STATUS_URL", file.ModelStatusURL)),
+		ModelStatusFormat:       strings.TrimSpace(resolveStr("model-status-format", *modelStatusFormat, "OP_AGENT_MODEL_STATUS_FORMAT", file.ModelStatusFormat)),
+		LHMURL:                  strings.TrimSpace(resolveStr("lhm-url", *lhmURL, "OP_AGENT_LHM_URL", file.LHMURL)),
+		PowercapRoot:            strings.TrimSpace(resolveStr("powercap-root", *powercapRoot, "OP_AGENT_POWERCAP_ROOT", file.PowercapRoot)),
+		HostpowerURL:            strings.TrimSpace(resolveStr("hostpower-url", *hostpowerURL, "OP_AGENT_HOSTPOWER_URL", file.HostpowerURL)),
+		HostpowerToken:          strings.TrimSpace(resolveStr("hostpower-token", *hostpowerToken, "OP_AGENT_HOSTPOWER_TOKEN", file.HostpowerToken)),
+		HostpowerTLSFingerprint: strings.TrimSpace(resolveStr("hostpower-tls-fingerprint", *hostpowerTLSFingerprint, "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT", file.HostpowerTLSFingerprint)),
+		HelperSocket:            helperSocketPath,
+		CertMode:                strings.ToLower(strings.TrimSpace(resolveStr("cert-mode", *certMode, "OP_AGENT_CERT_MODE", file.CertMode))),
+		CertDir:                 strings.TrimSpace(resolveStr("cert-dir", *certDir, "OP_AGENT_CERT_DIR", file.CertDir)),
+		CertReloadCommand:       strings.TrimSpace(resolveStr("cert-reload-command", *certReloadCommand, "OP_AGENT_CERT_RELOAD_COMMAND", file.CertReloadCommand)),
+		CertPollInterval:        certPollInterval,
+		CAFile:                  resolveStr("ca-file", *caFile, "OP_AGENT_CA_FILE", file.CAFile),
+		CACacheFile:             resolveStr("ca-cache-file", *caCacheFile, "OP_AGENT_CA_CACHE_FILE", file.CACacheFile),
+		CAPEM:                   resolveStr("ca-pem", *caPEM, "OP_AGENT_CA_PEM", file.CAPEM),
+		CertProxyRoutes:         file.CertProxyRoutes,
+		CertProxyRoutesMode:     strings.ToLower(strings.TrimSpace(file.CertProxyRoutesMode)),
+		Transport:               strings.ToLower(resolveStr("transport", *transport, "OP_AGENT_TRANSPORT", file.Transport)),
+		Interval:                interval,
+		SystemReportInterval:    systemReportInterval,
+		TLSInsecure:             resolveBool(set["tls-insecure"], *tlsInsecure, getenv("OP_AGENT_TLS_INSECURE"), file.TLSInsecure),
+		Verbose:                 resolveBool(set["v"] || set["verbose"], *vShort || *vLong, getenv("OP_AGENT_VERBOSE"), file.Verbose),
 
 		RuntimeSource:          strings.ToLower(strings.TrimSpace(resolveStr("runtime-source", *runtimeSource, "OP_AGENT_RUNTIME_SOURCE", file.RuntimeSource))),
 		RuntimeConfigPath:      strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
@@ -666,6 +674,9 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
+	if n, ok := normalizeHostpowerFingerprint(cfg.HostpowerTLSFingerprint); ok {
+		cfg.HostpowerTLSFingerprint = n
+	}
 	cfg.Warnings = append(runtimeAllowlistWarnings(cfg, fileKeys, getenv), hostpowerWarnings(cfg)...)
 	cfg.Warnings = append(cfg.Warnings, helperSocketWarnings...)
 	return cfg, nil
@@ -712,16 +723,44 @@ func resolveHelperSocket(raw string) (string, []string) {
 // (a URL may carry a password in its userinfo).
 func hostpowerWarnings(cfg Config) []string {
 	var w []string
+	_, fpOK := normalizeHostpowerFingerprint(cfg.HostpowerTLSFingerprint)
+	if cfg.HostpowerTLSFingerprint != "" && !fpOK {
+		w = append(w, "hostpower_tls_fingerprint is not a SHA-256 fingerprint (64 hex digits, ':' separators allowed); every hostpower request will fail")
+	}
+	if cfg.HostpowerTLSFingerprint != "" && cfg.HostpowerURL == "" {
+		w = append(w, "hostpower_tls_fingerprint is set but hostpower_url is empty: the fingerprint is unused and the hostpower HTTP source stays off")
+	}
 	if cfg.HostpowerToken != "" && cfg.HostpowerURL == "" {
 		w = append(w, "hostpower_token is set but hostpower_url is empty: the token is unused and the hostpower HTTP source stays off")
 	}
 	if cfg.HostpowerURL != "" {
 		u, err := url.Parse(cfg.HostpowerURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		switch {
+		case err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "":
 			w = append(w, "hostpower_url must be an http:// or https:// URL with a host (for example http://<host>:9873); every hostpower request will fail")
+		case u.Scheme == "http" && cfg.HostpowerTLSFingerprint != "":
+			w = append(w, "hostpower_tls_fingerprint requires an https:// hostpower_url; every hostpower request will fail")
+		case u.Scheme == "https" && cfg.HostpowerTLSFingerprint == "":
+			w = append(w, "hostpower_url is https:// without hostpower_tls_fingerprint: the certificate must chain to a system CA and match the host name; a self-signed hostpower certificate fails every request")
 		}
 	}
 	return w
+}
+
+// normalizeHostpowerFingerprint trims s, drops ':' separators and lowercases
+// it; ok is true only for exactly 64 hex digits. It mirrors
+// collector.ParseHostpowerFingerprint (config may not import collector).
+func normalizeHostpowerFingerprint(s string) (string, bool) {
+	n := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(s), ":", ""))
+	if len(n) != 64 {
+		return "", false
+	}
+	for _, c := range n {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return n, true
 }
 
 // removedWSLSettings maps each removed WSL allowlist setting (config key and
