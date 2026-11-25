@@ -397,3 +397,46 @@ func TestTickLogsARepeatedWriteFailureOnce(t *testing.T) {
 		t.Fatalf("write failed logged %d times after recovery, want 1", n)
 	}
 }
+
+func TestTickLogsAFailingVMOnceWhateverTheError(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	h := &recordingHandler{}
+	s.log = slog.New(h)
+	mustTick(t, s)
+
+	// A non-empty directory at energy_uj: the rename fails with an error that
+	// names the random temp file, so its text differs on every tick.
+	blocker := filepath.Join(f.root, "out", "100", DomainDir, "energy_uj")
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	f.mkdir(filepath.Join(blocker, "sub"))
+	var msgs []string
+	for i := 0; i < 4; i++ {
+		err := s.Tick()
+		if err == nil {
+			t.Fatalf("tick %d: Tick returned nil with a directory at energy_uj", i)
+		}
+		msgs = append(msgs, err.Error())
+	}
+	// Precondition: the error text changes between ticks (random temp name),
+	// so a dedup keyed on the text would log every tick.
+	if msgs[0] == msgs[1] {
+		t.Fatalf("errors did not vary between ticks (%q); the precondition no longer holds", msgs[0])
+	}
+	if n := h.count("WARN hostpower: write failed"); n != 1 {
+		t.Fatalf("write failed logged %d times over 4 failing ticks, want 1 (records %v)", n, h.recs)
+	}
+
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	mustTick(t, s)
+	if n := h.count("INFO hostpower: write recovered"); n != 1 {
+		t.Fatalf("write recovered logged %d times, want 1 (records %v)", n, h.recs)
+	}
+	if got := f.outFile("100"); got != "0\n" {
+		t.Errorf("energy_uj after recovery = %q", got)
+	}
+}

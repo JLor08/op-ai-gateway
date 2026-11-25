@@ -59,10 +59,11 @@ type Service struct {
 	// vanished VM's counter is deliberately never pruned, so a VM that stops and
 	// starts again continues from its previous value instead of jumping.
 	counters map[string]uint64
-	// writeErr holds each VM's last logged write error, so a failure that
-	// repeats every tick (a guest can cause one in its own share) is logged
+	// failing marks the VMs whose last tree write failed. Logging keys on the
+	// transition only, never on the error text (which can carry a random temp
+	// name), so a failure a guest causes in its own share every tick is logged
 	// once, not at the tick rate.
-	writeErr map[string]string
+	failing map[string]bool
 }
 
 // New builds a Service; empty option fields take their defaults.
@@ -74,13 +75,15 @@ func New(opts Options) *Service {
 		log:       slog.Default(),
 		prevUsage: map[string]uint64{},
 		counters:  map[string]uint64{},
-		writeErr:  map[string]string{},
+		failing:   map[string]bool{},
 	}
 }
 
 // Tick runs one iteration. Every baseline advances on every tick, even when
 // nothing can be attributed, so a later tick never spreads several intervals of
 // CPU time over one interval of energy. It returns the joined tree-write errors.
+// Tick holds s.mu for the whole iteration; the phase helpers below assume it is
+// held.
 func (s *Service) Tick() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -88,30 +91,49 @@ func (s *Service) Tick() error {
 	joules, haveEnergy := s.energy.DeltaJoules() // always called: advances its baseline
 	busy, haveBusy := s.readBusy()
 	vms := DiscoverVMs(s.opts.CgroupRoot)
+	usage := s.readUsages(vms)
 
+	if haveEnergy && haveBusy && s.hasBusy && busy >= s.prevBusy {
+		s.attribute(joules, busy-s.prevBusy, usage)
+	} else {
+		s.log.Debug("hostpower: nothing to attribute this tick",
+			"energy_delta", haveEnergy, "busy_read", haveBusy, "busy_baseline", s.hasBusy)
+	}
+	s.advanceBaselines(busy, haveBusy, usage)
+	return s.writeTrees(vms)
+}
+
+// readUsages returns the cumulative CPU time of every VM whose cpu.stat is
+// readable. Requires s.mu.
+func (s *Service) readUsages(vms []string) map[string]uint64 {
 	usage := make(map[string]uint64, len(vms))
 	for _, vm := range vms {
 		if u, ok := ReadVMUsageUsec(s.opts.CgroupRoot, vm); ok {
 			usage[vm] = u
 		}
 	}
+	return usage
+}
 
-	if haveEnergy && haveBusy && s.hasBusy && busy >= s.prevBusy {
-		deltas := make(map[string]uint64, len(usage))
-		for vm, u := range usage {
-			if prev, ok := s.prevUsage[vm]; ok && u >= prev {
-				deltas[vm] = u - prev
-			}
+// attribute adds each VM's share of joules to its counter, by its CPU time
+// since the previous tick against the host's busy delta. VMs without a previous
+// reading (new or returning) get no share this tick. Requires s.mu.
+func (s *Service) attribute(joules float64, busyDelta uint64, usage map[string]uint64) {
+	deltas := make(map[string]uint64, len(usage))
+	for vm, u := range usage {
+		if prev, ok := s.prevUsage[vm]; ok && u >= prev {
+			deltas[vm] = u - prev
 		}
-		for vm, share := range Shares(busy-s.prevBusy, deltas) {
-			s.ensureCounter(vm)
-			s.counters[vm] += AttributeUJ(joules, share)
-		}
-	} else {
-		s.log.Debug("hostpower: nothing to attribute this tick",
-			"energy_delta", haveEnergy, "busy_read", haveBusy, "busy_baseline", s.hasBusy)
 	}
+	for vm, share := range Shares(busyDelta, deltas) {
+		s.ensureCounter(vm)
+		s.counters[vm] += AttributeUJ(joules, share)
+	}
+}
 
+// advanceBaselines records this tick's busy time and VM usages as the next
+// tick's baselines. Requires s.mu.
+func (s *Service) advanceBaselines(busy uint64, haveBusy bool, usage map[string]uint64) {
 	if haveBusy {
 		s.prevBusy, s.hasBusy = busy, true
 	} else {
@@ -120,36 +142,40 @@ func (s *Service) Tick() error {
 		s.hasBusy = false
 	}
 	s.prevUsage = usage // unreadable and vanished VMs drop out and re-baseline
+}
 
+// writeTrees publishes every live VM's counter, logs write-state changes and
+// returns the joined write errors. Requires s.mu.
+func (s *Service) writeTrees(vms []string) error {
 	var errs []error
 	live := make(map[string]bool, len(vms))
 	for _, vm := range vms {
 		live[vm] = true
 		s.ensureCounter(vm)
 		err := WriteTree(filepath.Join(s.opts.OutDir, vm), s.counters[vm])
-		s.logWriteResult(vm, err)
+		s.logWriteState(vm, err)
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
-	for vm := range s.writeErr {
+	for vm := range s.failing {
 		if !live[vm] {
-			delete(s.writeErr, vm)
+			delete(s.failing, vm)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// logWriteResult logs a VM's write failure at Warn when it first occurs or its
-// message changes, and once at Info when the VM's writes recover.
-func (s *Service) logWriteResult(vm string, err error) {
-	last, failing := s.writeErr[vm]
+// logWriteState logs at Warn (with the first error) when a VM's writes start
+// failing, stays silent while they keep failing whatever the error, and logs
+// once at Info when they recover. Requires s.mu.
+func (s *Service) logWriteState(vm string, err error) {
 	switch {
-	case err != nil && (!failing || last != err.Error()):
-		s.writeErr[vm] = err.Error()
+	case err != nil && !s.failing[vm]:
+		s.failing[vm] = true
 		s.log.Warn("hostpower: write failed", "vm", vm, "err", err)
-	case err == nil && failing:
-		delete(s.writeErr, vm)
+	case err == nil && s.failing[vm]:
+		delete(s.failing, vm)
 		s.log.Info("hostpower: write recovered", "vm", vm)
 	}
 }
@@ -170,7 +196,7 @@ func (s *Service) ensureCounter(vm string) {
 }
 
 // Run ticks every interval until ctx is done. A Tick error is never fatal and
-// is not logged here: Tick already logs each VM's write failure on change.
+// is not logged here: Tick already logs each VM's write-state changes.
 func (s *Service) Run(ctx context.Context, interval time.Duration) error {
 	t := time.NewTicker(interval)
 	defer t.Stop()
