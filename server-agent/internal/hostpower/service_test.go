@@ -440,3 +440,45 @@ func TestTickLogsAFailingVMOnceWhateverTheError(t *testing.T) {
 		t.Errorf("energy_uj after recovery = %q", got)
 	}
 }
+
+func TestLiveCounterBeforeFirstTick(t *testing.T) {
+	s := newFixture(t, "100").service()
+	if v, ok := s.LiveCounter("100"); ok || v != 0 {
+		t.Errorf("LiveCounter = (%d, %v), want (0, false)", v, ok)
+	}
+}
+
+func TestLiveCounterForRunningVM(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	advanceTwoVMs(f)
+	mustTick(t, s)
+	if v, ok := s.LiveCounter("100"); !ok || v != 2_500_000 {
+		t.Errorf("LiveCounter(100) = (%d, %v), want (2500000, true)", v, ok)
+	}
+	if v, ok := s.LiveCounter("999"); ok || v != 0 {
+		t.Errorf("LiveCounter(unknown) = (%d, %v), want (0, false)", v, ok)
+	}
+}
+
+func TestLiveCounterFalseAfterVMStops(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	mustTick(t, s)
+	advanceTwoVMs(f)
+	mustTick(t, s)
+	if err := os.RemoveAll(f.vmDir("100")); err != nil {
+		t.Fatal(err)
+	}
+	mustTick(t, s)
+	if v, ok := s.LiveCounter("100"); ok || v != 0 {
+		t.Errorf("LiveCounter(100) = (%d, %v), want (0, false) once stopped", v, ok)
+	}
+	if got := s.Counters()["100"]; got != 2_500_000 {
+		t.Errorf("Counters()[100] = %d, want 2500000 (never pruned)", got)
+	}
+	if _, ok := s.LiveCounter("101"); !ok {
+		t.Error("LiveCounter(101) = false, want true (still running)")
+	}
+}

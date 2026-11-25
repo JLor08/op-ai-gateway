@@ -64,6 +64,9 @@ type Service struct {
 	// name), so a failure a guest causes in its own share every tick is logged
 	// once, not at the tick rate.
 	failing map[string]bool
+	// live is the VM set the most recent Tick discovered; counters of stopped
+	// VMs stay in counters but are not live.
+	live map[string]bool
 }
 
 // New builds a Service; empty option fields take their defaults.
@@ -76,6 +79,7 @@ func New(opts Options) *Service {
 		prevUsage: map[string]uint64{},
 		counters:  map[string]uint64{},
 		failing:   map[string]bool{},
+		live:      map[string]bool{},
 	}
 }
 
@@ -149,6 +153,7 @@ func (s *Service) advanceBaselines(busy uint64, haveBusy bool, usage map[string]
 func (s *Service) writeTrees(vms []string) error {
 	var errs []error
 	live := make(map[string]bool, len(vms))
+	s.live = live
 	for _, vm := range vms {
 		live[vm] = true
 		s.ensureCounter(vm)
@@ -219,4 +224,16 @@ func (s *Service) Counters() map[string]uint64 {
 		out[k] = v
 	}
 	return out
+}
+
+// LiveCounter returns vmid's energy counter in microjoules only when the VM was
+// in the set the most recent Tick discovered. It reports false before the first
+// Tick and for stopped VMs, whose counters stay in Counters().
+func (s *Service) LiveCounter(vmid string) (uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.live[vmid] {
+		return 0, false
+	}
+	return s.counters[vmid], true
 }
