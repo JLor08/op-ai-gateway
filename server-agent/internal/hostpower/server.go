@@ -110,13 +110,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	h.noteAccepted(ip, mode)
 
 	energy, live := h.counters.LiveCounter(vmid)
 	if !live {
+		h.noteRejected(ip, mode, "not live")
 		plain(w, http.StatusServiceUnavailable, "not ready")
 		return
 	}
+	h.noteAccepted(ip, mode)
 	body, err := json.Marshal(collector.HostpowerEnergy{
 		VMID: vmid, EnergyUJ: energy, MaxEnergyRangeUJ: MaxEnergyRangeUJ,
 	})
@@ -131,10 +132,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // identify is the single place that decides which VM a request speaks for. A
-// presented Authorization header selects token mode exclusively (no MAC fallback);
-// without one, MAC mode applies if enabled. mode is "token", "mac" or "none".
+// present Authorization header (even an empty one) selects token mode
+// exclusively (no MAC fallback); without one, MAC mode applies if enabled. mode is "token", "mac" or "none".
 func (h *handler) identify(r *http.Request) (vmid, mode, reason string, ok bool) {
-	if auth := r.Header.Get("Authorization"); auth != "" {
+	if _, present := r.Header["Authorization"]; present {
+		auth := r.Header.Get("Authorization")
 		if !h.modes.Token {
 			return "", "token", "token mode disabled", false
 		}

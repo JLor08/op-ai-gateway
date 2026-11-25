@@ -393,3 +393,46 @@ func TestNewServerSettingsAndNoKeepAlive(t *testing.T) {
 		t.Fatalf("response not Connection: close: %+v", resp.Header)
 	}
 }
+
+func TestHandlerEmptyAuthorizationHeaderIsTokenMode(t *testing.T) {
+	rig := newRig(AuthModes{MAC: true, Token: true})
+	req := httptest.NewRequest(http.MethodGet, energyPath, nil)
+	req.RemoteAddr = "192.0.2.10:4000"
+	req.Header["Authorization"] = []string{""}
+	req = req.WithContext(context.WithValue(req.Context(), http.LocalAddrContextKey,
+		net.Addr(&net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 8080})))
+	rec := httptest.NewRecorder()
+	rig.h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if rig.resolver.callCount() != 0 {
+		t.Fatal("MAC fallback after a present but empty Authorization header")
+	}
+}
+
+func TestHandlerNotLiveIsLoggedAsItsOwnReason(t *testing.T) {
+	rig := newRig(AuthModes{MAC: true})
+	rig.resolver.vmid = "999"
+	for range 3 {
+		if rec := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", ""); rec.Code != 503 {
+			t.Fatalf("code = %d", rec.Code)
+		}
+	}
+	if n := rig.logs.count(slog.LevelWarn); n != 1 {
+		t.Fatalf("warns = %d, want 1: %v", n, rig.logs.dump())
+	}
+	if n := rig.logs.count(slog.LevelInfo); n != 0 {
+		t.Fatalf("503 counted as accepted: %v", rig.logs.dump())
+	}
+	if d := rig.logs.dump(); !strings.Contains(d[0], "reason=not live") {
+		t.Fatalf("log = %v", d)
+	}
+	rig.resolver.vmid = "101"
+	if rec := rig.do(http.MethodGet, energyPath, "192.0.2.10:4000", ""); rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	if n := rig.logs.count(slog.LevelInfo); n != 1 {
+		t.Fatalf("infos = %d, want 1 once the VM is live", n)
+	}
+}
