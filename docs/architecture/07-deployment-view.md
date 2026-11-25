@@ -117,14 +117,19 @@ guest mounts over virtiofs (`cache=never`). The recommended setup maps the VMs
 to a read-only bind mount of that directory (for example
 `/run/op-hostpower-ro`, established from fstab before PVE autostarts VMs), so a
 guest cannot write into its share, and runs the unit with `ProtectSystem=strict`,
-`ReadWritePaths` limited to the out directory, `NoNewPrivileges` and
+`ReadWritePaths` limited to the out directory (and the TLS directory below), `NoNewPrivileges` and
 `PrivateTmp`, and with `StateDirectoryMode=0700`. A guest receives its counter over
 virtiofs (Linux tree `<vmid>/intel-rapl:0`, Windows tree `<vmid>/windows/intel-rapl_0`)
 or over HTTP: with `-listen <bridge-address>:9873` the service serves `GET /v1/energy`
 on the host's address on the VM bridge (off unless set), identifying the VM by the
 `tap<vmid>i<n>` interface the connection entered (MAC mode, needs `CAP_NET_RAW`) or by
 a per-VM token whose SHA-256 sits in `/etc/op-hostpower/tokens.json` (`0600`, managed
-with `server-agent hostpower token`). It is not an enrolled agent: it has no gateway
+with `server-agent hostpower token`). With `-tls` the endpoint is HTTPS (TLS 1.3) with
+a self-signed certificate the service generates on first start under
+`/var/lib/op-hostpower-tls/` (a second `StateDirectory`, kept out of the out directory
+the guests' shares come from), and a guest with `hostpower_tls_fingerprint` accepts
+only that certificate ([ADR-118](09-architecture-decisions.md#adr-118--hostpower-http-over-tls-13-with-a-self-signed-server-certificate-the-guest-pins-by-sha-256)).
+It is not an enrolled agent: it has no gateway
 token and never contacts the gateway; its only listener is that optional HTTP endpoint
 ([ADR-115](09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs),
 [ADR-116](09-architecture-decisions.md#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token)).

@@ -13735,6 +13735,8 @@ any counter decrease as 0 J rather than as a near-full-range wraparound; a uint6
 **Context.** ADR-115 delivers a VM's CPU power share to a Linux guest only, over virtiofs. The operator wants to choose the transport per VM,
 for Linux and Windows guests alike, without any gateway or portal change, and a guest must never be able to obtain another VM's values.
 
+**Amended by [ADR-118](#adr-118--hostpower-http-over-tls-13-with-a-self-signed-server-certificate-the-guest-pins-by-sha-256) (optional TLS with a pinned certificate).** With `-tls` on the host and `hostpower_tls_fingerprint` in the guest the endpoint runs over TLS 1.3 and the guest accepts only the pinned certificate, which brings the layer-2 man-in-the-middle case below into scope; MAC-mode and token-mode identity are unchanged, and without `-tls` the decision below stands as written.
+
 **Decision.** The one `server-agent hostpower` service keeps a single in-memory counter per VM and publishes it over three transports that run
 side by side; the attribution, cadence and counter semantics of ADR-115 are unchanged.
 
@@ -13757,7 +13759,7 @@ side by side; the attribution, cadence and counter semantics of ADR-115 are unch
   a LAN device forging a VM's IP or MAC (it enters on a physical uplink, `401`), and, in MAC mode, replay (nothing secret travels). Out of scope in this version: a
   layer-2 man-in-the-middle that poisons the host's ARP cache or bridge forwarding table for a VM's address and relays that VM's traffic; it applies to
   MAC mode and token mode alike (token mode would even expose the token). Mitigation: the PVE firewall with MAC and IP filter on each VM NIC and a trusted
-  LAN segment for the bridge.
+  LAN segment for the bridge. (Closed by [ADR-118](#adr-118--hostpower-http-over-tls-13-with-a-self-signed-server-certificate-the-guest-pins-by-sha-256) when TLS and a guest pin are used.)
 - **Token mode.** Token `ophp_` + base64url of 32 random bytes; the store (`/etc/op-hostpower/tokens.json`, `0600`, directory `0700`) keeps only the
   SHA-256, written atomically, matched in constant time, reloaded on a modification-time change; `server-agent hostpower token create|revoke|list`
   manages it and prints a token once. Tokens and `Authorization` values are never logged.
@@ -13766,7 +13768,7 @@ side by side; the attribution, cadence and counter semantics of ADR-115 are unch
   token-mode guests behind one NAT address from starving each other. Rejections and `429`s are logged at Warn at most once every 10 minutes per
   (source address, reason), so mixed outcomes behind one address cannot flood the log.
 - **No TLS in this version.** Token mode is designed so TLS with a pinned certificate can be added later without changing the guest's identity model;
-  it is the follow-up that also closes the layer-2 man-in-the-middle case.
+  it is the follow-up that also closes the layer-2 man-in-the-middle case. (Added by [ADR-118](#adr-118--hostpower-http-over-tls-13-with-a-self-signed-server-certificate-the-guest-pins-by-sha-256).)
 - **Proxy-free guest client.** The guest uses its own `http.Transport` with no proxy and no redirect following, because through a proxy VM on the bridge MAC
   mode would identify the proxy and silently hand its counter to the guest.
 - **Single PVE host.** Token store, counters and the guest URL are per host; after a migration the HTTP transports report `null` until the URL points at
@@ -13784,7 +13786,7 @@ side by side; the attribution, cadence and counter semantics of ADR-115 are unch
   on a non-Linux build or without privilege the service refuses to start.
 - The HTTP listener is plain HTTP. The layer-2 man-in-the-middle case above is an accepted gap until TLS. In token mode the token itself travels in
   clear: anyone who can passively read any hop of the path (token mode is meant for routed or NAT paths) can copy and replay it, so use it only on a
-  trusted network until TLS exists.
+  trusted network until TLS exists. (Closed by [ADR-118](#adr-118--hostpower-http-over-tls-13-with-a-self-signed-server-certificate-the-guest-pins-by-sha-256) when TLS and a guest pin are used.)
 - A guest with several transports configured reports one value (collector order), so nothing is double counted.
 - In MAC mode the identity is the tap a connection entered, so a VM that routes, NATs or proxies for others (an OPNsense or pfSense VM, a
   reverse-proxy VM) lends its identity: a machine behind it receives the router VM's counter. Networks behind such a VM use token mode or block
@@ -13913,3 +13915,71 @@ reports.
   [Config env](reference/config-env.md),
   [Architecture tests](cross-cutting/architecture-tests.md),
   [Agent README](../../server-agent/README.md#privileged-helper-linux).
+
+## ADR-118 — Hostpower HTTP over TLS 1.3 with a self-signed server certificate the guest pins by SHA-256
+
+**Context.** [ADR-116](#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token)
+serves `GET /v1/energy` over plain HTTP and declares a layer-2 man-in-the-middle out of scope: a LAN device or guest that poisons the host's ARP
+cache or bridge forwarding table for a VM's address and relays that VM's traffic can read the VM's counter and, in token mode, copy and replay the
+token. The hostpower service has no gateway contact by design (ADR-115/116), so it cannot obtain a certificate from the gateway's CA, and the
+guest must be able to verify the host without any CA, host name or gateway involvement. MAC-mode identity must not change.
+
+**Decision.**
+
+- **Opt-in TLS on the existing listener.** `server-agent hostpower -listen … -tls` serves the endpoint over HTTPS, **TLS 1.3 only** (both ends are
+  this binary); `-tls` without `-listen` is a usage error. Handler, limits, keep-alive off and timeouts are unchanged; Go bounds the handshake by
+  the smallest of the server's timeouts (2 s). Connection-level errors (handshakes from scanners or mis-pinned guests) go to Debug through the
+  server's `ErrorLog`. A plain-HTTP request to the TLS port gets `400`. Without `-tls` the endpoint behaves as in ADR-116 (only its connection-level error log moved to Debug).
+- **Certificate material.** `-tls-cert` / `-tls-key` default to `/var/lib/op-hostpower-tls/tls.crt` / `tls.key`, a state directory of its own:
+  not the out directory (the source of the guests' virtiofs shares) and not `/etc/op-hostpower` (read-only for the service under
+  `ProtectSystem=strict`). Both absent: the service generates a self-signed ECDSA P-256 certificate (CN `op-hostpower`, random 128-bit serial,
+  100-year validity, `ServerAuth`, no SANs) and writes the key, then the certificate, atomically with mode `0600` into `0700` directories; a failed
+  certificate write removes the key again. Both present: loaded as a pair (symlinks to regular files allowed, so operator material such as a
+  CA-signed pair works; a key readable by group or others is warned about, not refused). Exactly one present, a dangling symlink or a non-regular
+  file: the service refuses to start (exit 2) and never overwrites half a pair. A generation that fails with `EROFS` (a unit without the second
+  state directory) carries a hint to add `StateDirectory=op-hostpower-tls` and the `ReadWritePaths` entry.
+- **The fingerprint is the operator's handle.** At startup the service logs `hostpower: tls certificate` (Info) with the path, the SHA-256
+  fingerprint of the leaf DER and whether it was generated; `server-agent hostpower tls [-tls-cert path] fingerprint` prints the same value as
+  uppercase colon-separated hex, the format `openssl x509 -noout -fingerprint -sha256` prints. The verb only reads and never generates.
+- **Guest pin.** A new option `hostpower_tls_fingerprint` / `OP_AGENT_HOSTPOWER_TLS_FINGERPRINT` / `-hostpower-tls-fingerprint` (not a secret;
+  64 hex digits, `:` optional, any case, normalised to lowercase in config). With an `https://` `hostpower_url` the guest client requires TLS 1.3
+  and accepts exactly the server whose leaf certificate has that SHA-256 (constant-time compare in `VerifyConnection`); chain, name and validity
+  are not checked (`InsecureSkipVerify` only disables the checks the pin replaces). A mismatch fails the handshake before any HTTP byte, so a
+  token never leaves the guest, and is logged at Warn once per mismatch episode (again only after a success), every attempt at Debug.
+- **Fail closed, never degrade.** A pin with an `http://` URL, or a pin that does not parse, makes every request fail without a connection, with
+  a startup warning: the pin shows TLS was intended, and a clear-text request would expose the token.
+- **`https://` without a pin stays standard TLS.** Verification against the system roots and the URL host name, as before this ADR; a
+  self-signed hostpower certificate therefore fails every request, and the configuration logs a startup warning.
+- **Threat model.** With `-tls` and a guest pin, an L2 man-in-the-middle that relays a VM's traffic sees only TLS 1.3 records: it can neither
+  read nor alter the counter, nor read a token, and cannot pose as the host without its private key. It can still drop or delay traffic (denial
+  of service; the guest reports `null`). MAC-mode identity is untouched: the handshake runs over the TCP connection whose segments the capture
+  observes, and a relay that re-originates the connection enters the host on its own port (its own counter or `401`), as before. Out of scope
+  remain a compromised host (including theft of the key file, which needs root on the host) and a guest without a pin.
+
+**Alternatives rejected.**
+- *Pinning the public key (SPKI) instead of the certificate:* it survives a re-issue only when the key is reused, which the generated case never
+  does, and the certificate fingerprint is what `openssl x509 -fingerprint` prints, so the operator can verify it with a standard tool.
+- *Trust on first use:* the first connection is unauthenticated, which is exactly the window a man-in-the-middle needs; the operator copies the
+  fingerprint once instead.
+- *Certificates issued by the gateway's internal CA:* hostpower has no gateway contact by design (ADR-115/116), and the guest would need the CA
+  bundle and a host name to verify.
+- *Mutual TLS:* identity stays the tap (MAC mode) or the token; client certificates would add a per-VM secret like a token, with the same
+  clone and template caveats, for no gain in identification.
+- *Refusing `https://` without a pin:* it would break an operator certificate signed by a CA the guest trusts, and system-root verification is
+  itself a secure configuration; a startup warning covers the self-signed mistake.
+
+**Consequences.**
+- L2 man-in-the-middle is in scope for guests that use TLS and a pin; plain HTTP keeps ADR-116's gap and mitigations (PVE firewall MAC and IP
+  filter, trusted segment).
+- The README unit gains a second state directory (`StateDirectory=op-hostpower op-hostpower-tls`, both in `ReadWritePaths`,
+  `StateDirectoryMode=0700` for both); an existing unit without it fails the first `-tls` start with the `EROFS` hint.
+- Rotation needs a restart and a guest update: the guest pins the exact certificate, so a new certificate (delete both files and restart, or
+  supply a new pair) means a new fingerprint in every guest, whose requests fail until then.
+- `InsecureSkipVerify` now has a second, pin-guarded use in the agent besides the `OP_AGENT_TLS_INSECURE` escape hatch (see
+  [Certificates & TLS §8](cross-cutting/certificates-tls.md#8-ca-trusting-outbound-transport-server-agent)).
+- Agent version 0.25.0; no new `agent.Features` entry (no agent↔gateway wire change); the portal's agent-config templates gain the key.
+- → [Certificates & TLS](cross-cutting/certificates-tls.md#12-the-hostpower-endpoints-own-certificate),
+  [Telemetry §8.2.3](cross-cutting/telemetry-usage-observability.md#823-power-draw-watts),
+  [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
+  [Config env](reference/config-env.md),
+  [Agent README](../../server-agent/README.md#https-with-a-pinned-certificate-both-modes).
