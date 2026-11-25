@@ -117,7 +117,7 @@ Behaviour:
   - `GET /v1/rapl` → `{"domains":[{"name":"package-0","energy_uj":…,"max_energy_range_uj":…}, …]}`:
     every **top-level** `intel-rapl:N` directory (no `intel-rapl:N:M`
     subdomains) whose `energy_uj` is readable. **Served from a cache refreshed
-    at most every 250 ms** (decided with the operator, see §4.5); a request
+    at most every 250 ms** (decided with the operator, see §4.4); a request
     after the cache has aged out triggers one fresh read.
     Domain identity is by `name` plus the directory index (`"zone":"intel-rapl:0"`)
     so the agent can track counters per domain across requests. An empty list
@@ -128,7 +128,7 @@ Behaviour:
     empty list plus a startup Warn, not an exit.
 - **Rate limit.** A single token bucket for the whole socket (e.g. 20 req/s,
   burst 40) — there is exactly one legitimate client. Over the limit → 429.
-  It only bounds the helper's work; it is not the side-channel defence (§4.5).
+  It only bounds the helper's work; it is not the side-channel defence (§4.4).
 - **Server hardening.** Same timeouts and header limit as `hostpower.NewServer`.
   The helper may reuse that constructor or carry its own equivalent; either way
   `internal/helper` gets an archtest rule like hostpower's: it must not import
@@ -213,7 +213,7 @@ Behaviour:
   connection shows on the helper side (Warn), on the agent side as a closed
   connection at Debug.
 
-### 4.5 Threat model: processes sharing the agent's uid
+### 4.4 Threat model: processes sharing the agent's uid
 
 The agent starts gateway-supplied runtimes as child processes under its own
 uid (`internal/runtime` sets no credential), so `SO_PEERCRED` cannot tell the
@@ -234,7 +234,7 @@ Decided with the operator:
   429s and loses watts for a while (denial of service by a process that could
   kill the agent outright).
 
-### 4.4 Deployment (README examples; the repo ships no unit files today)
+### 4.5 Deployment (README examples; the repo ships no unit files today)
 
 `/etc/systemd/system/op-agent-helper.service`, roughly:
 
