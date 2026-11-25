@@ -481,3 +481,55 @@ func TestRemoveStaleTempsSweepsWindowsTree(t *testing.T) {
 		}
 	}
 }
+
+// breakWindowsPath replaces p (windows or windows/intel-rapl_0 under vm) with
+// a FIFO or a plain file; for the domain path the windows dir is made real.
+func breakWindowsPath(t *testing.T, vm, rel, kind string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(vm, WindowsDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(vm, rel)
+	if kind == "fifo" {
+		mkfifoOrSkip(t, p)
+		return
+	}
+	if err := os.RemoveAll(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBrokenWindowsPathNeitherBlocksNorEscapes(t *testing.T) {
+	for _, rel := range []string{WindowsDir, filepath.Join(WindowsDir, WindowsDomainDir)} {
+		for _, kind := range []string{"fifo", "file"} {
+			t.Run(kind+"@"+rel, func(t *testing.T) {
+				out := t.TempDir()
+				vm := filepath.Join(out, "100")
+				if err := os.MkdirAll(vm, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				breakWindowsPath(t, vm, rel, kind)
+
+				var err error
+				within(t, func() { err = WriteTree(vm, 42) })
+				if err == nil {
+					t.Error("WriteTree succeeded on a broken Windows path")
+				}
+				if got := readFile(t, filepath.Join(vm, DomainDir, "energy_uj")); got != "42\n" {
+					t.Errorf("Linux energy_uj = %q, want 42", got)
+				}
+				within(t, func() { err = RemoveStaleTemps(out) })
+				if err != nil {
+					t.Errorf("RemoveStaleTemps: %v", err)
+				}
+				entries, _ := os.ReadDir(out)
+				if len(entries) != 1 || entries[0].Name() != "100" {
+					t.Errorf("out dir entries = %v, want only 100", entries)
+				}
+			})
+		}
+	}
+}

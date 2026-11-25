@@ -153,7 +153,6 @@ func (s *Service) advanceBaselines(busy uint64, haveBusy bool, usage map[string]
 func (s *Service) writeTrees(vms []string) error {
 	var errs []error
 	live := make(map[string]bool, len(vms))
-	s.live = live
 	for _, vm := range vms {
 		live[vm] = true
 		s.ensureCounter(vm)
@@ -163,6 +162,7 @@ func (s *Service) writeTrees(vms []string) error {
 			errs = append(errs, err)
 		}
 	}
+	s.live = live
 	for vm := range s.failing {
 		if !live[vm] {
 			delete(s.failing, vm)

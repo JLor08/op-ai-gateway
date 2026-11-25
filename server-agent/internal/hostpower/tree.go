@@ -55,7 +55,7 @@ func openVMRoot(vmDir string, create bool) (*os.Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 	name := filepath.Base(vmDir)
 	if create {
 		if err := out.MkdirAll(name, 0o755); err != nil {
@@ -72,24 +72,8 @@ func openVMRoot(vmDir string, create bool) (*os.Root, error) {
 	return out.OpenRoot(name)
 }
 
-// openSubRoot opens the directory name inside root as its own Root, creating it
-// first when create is set. name must be a real directory, not a symlink, for
-// the same reason as in openVMRoot.
-func openSubRoot(root *os.Root, name string, create bool) (*os.Root, error) {
-	if create {
-		if err := root.MkdirAll(name, 0o755); err != nil {
-			return nil, err
-		}
-	}
-	fi, err := root.Lstat(name)
-	if err != nil {
-		return nil, err
-	}
-	if !fi.IsDir() {
-		return nil, fmt.Errorf("%s is not a directory", name)
-	}
-	return root.OpenRoot(name)
-}
+// windowsDomainPath is the Windows domain directory relative to a VM root.
+var windowsDomainPath = path.Join(WindowsDir, WindowsDomainDir)
 
 // WriteTree publishes the synthetic powercap domain under vmDir. Static files
 // are rewritten only when absent or different; energy_uj is replaced every call
@@ -105,20 +89,17 @@ func WriteTree(vmDir string, energyUJ uint64) error {
 	if err != nil {
 		return fmt.Errorf("hostpower: write %s: %w", vmDir, err)
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	if err := writeDomain(root, vmDir, DomainDir, energyUJ); err != nil {
 		return err
 	}
-	// The Windows subtree is its own confined Root. Its failure is returned
-	// only after the Linux tree is written, so a guest that breaks its Windows
-	// subtree never freezes its Linux counter.
-	winDir := filepath.Join(vmDir, WindowsDir)
-	win, err := openSubRoot(root, WindowsDir, true)
-	if err != nil {
-		return fmt.Errorf("hostpower: write %s: %w", winDir, err)
-	}
-	defer win.Close()
-	return writeDomain(win, winDir, WindowsDomainDir, energyUJ)
+	// The Windows domain goes through nested paths in the same Root, never by
+	// opening windows/ as a Root of its own: Root.OpenRoot opens a leaf without
+	// O_DIRECTORY or O_NONBLOCK, so a FIFO a guest swapped in would block the
+	// tick forever. Its failure is returned only after the Linux tree is
+	// written, so a guest that breaks its Windows subtree never freezes its
+	// Linux counter.
+	return writeDomain(root, vmDir, windowsDomainPath, energyUJ)
 }
 
 // writeDomain publishes one synthetic domain directory inside root; base is
@@ -209,7 +190,7 @@ func readSmall(root *os.Root, rel string) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
 		return nil, false
 	}
@@ -228,7 +209,7 @@ func ReadCounter(vmDir string) uint64 {
 	if err != nil {
 		return 0
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	b, ok := readSmall(root, path.Join(DomainDir, "energy_uj"))
 	if !ok {
 		return 0
@@ -241,10 +222,11 @@ func ReadCounter(vmDir string) uint64 {
 }
 
 // RemoveStaleTemps deletes leftover temp files (from a crash between create
-// and rename) in both domain directories of every VM directory directly under outDir. It runs
-// once at startup, confined to each VM directory like WriteTree; a VM directory
-// or DomainDir that is missing, not a real directory or escapes is skipped. It
-// returns the joined errors of the removals it attempted.
+// and rename) in both domain directories (DomainDir and the Windows one) of
+// every VM directory directly under outDir. It runs once at startup, confined
+// to each VM directory like WriteTree; a VM directory or a domain directory
+// that is missing, not a real directory or escapes is skipped. It returns the
+// joined errors of the removals it attempted.
 func RemoveStaleTemps(outDir string) error {
 	entries, err := os.ReadDir(outDir)
 	if err != nil {
@@ -265,13 +247,8 @@ func removeStaleTempsIn(vmDir string) error {
 	if err != nil {
 		return nil
 	}
-	defer root.Close()
-	errs := []error{sweepDomain(root, DomainDir)}
-	if win, err := openSubRoot(root, WindowsDir, false); err == nil {
-		errs = append(errs, sweepDomain(win, WindowsDomainDir))
-		win.Close()
-	}
-	return errors.Join(errs...)
+	defer func() { _ = root.Close() }()
+	return errors.Join(sweepDomain(root, DomainDir), sweepDomain(root, windowsDomainPath))
 }
 
 // sweepDomain removes the temp files in domainDir inside root; a domainDir that
