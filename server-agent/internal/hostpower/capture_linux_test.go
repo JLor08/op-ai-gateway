@@ -41,6 +41,9 @@ func TestStartCaptureSeesLoopbackHandshake(t *testing.T) {
 	if err := StartCapture(ctx, dst.Port(), table, slog.New(slog.DiscardHandler)); err != nil {
 		t.Fatal(err)
 	}
+	if !table.captureHealthy() {
+		t.Fatal("capture not marked healthy after StartCapture")
+	}
 
 	conn, err := net.Dial("tcp4", dst.String())
 	if err != nil {
@@ -61,5 +64,14 @@ func TestStartCaptureSeesLoopbackHandshake(t *testing.T) {
 	}
 	if !syn || !ack {
 		t.Fatalf("want a SYN and a non-SYN observation on lo for %+v; got %+v", key, obs)
+	}
+
+	cancel()
+	deadline := time.Now().Add(2 * captureReadTimeout)
+	for table.captureHealthy() {
+		if time.Now().After(deadline) {
+			t.Fatal("capture still marked healthy after ctx ended")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

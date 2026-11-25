@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -49,6 +50,8 @@ const (
 // Reasons carried by ResolveError.
 const (
 	reasonIPv6        = "ipv6 not supported"
+	reasonCaptureDown = "capture unavailable"
+	reasonOverflow    = "observation overflow"
 	reasonNoSYN       = "no SYN observed"
 	reasonNoHandshake = "handshake not observed"
 	reasonNotVMPort   = "not a VM port"
@@ -83,12 +86,16 @@ type ConnKey struct {
 
 // Observation is one received copy of a client segment: the interface the
 // kernel received it on, the frame's Ethernet source address and whether the
-// segment was a SYN (SYN set, ACK clear).
+// segment was a SYN (SYN set, ACK clear). Earlier marks a non-tap
+// observation kept from an earlier connection attempt on the same 4-tuple:
+// it still counts for the foreign-ingress rule but is neither a SYN nor a
+// segment of the current handshake.
 type Observation struct {
-	Ifname string
-	SrcMAC net.HardwareAddr
-	SYN    bool
-	At     time.Time
+	Ifname  string
+	SrcMAC  net.HardwareAddr
+	SYN     bool
+	Earlier bool
+	At      time.Time
 }
 
 // --- frame parsing ---
@@ -101,7 +108,9 @@ const (
 	ipv4MinHeader = 20
 	ipProtoTCP    = 6
 	ipFragOffset  = 0x1fff // fragment offset bits of the flags/offset field
+	ipMoreFrags   = 0x2000 // MF flag of the flags/offset field
 	tcpMinHeader  = 20
+	tcpPortBytes  = 4 // source and destination port
 	tcpFlagSYN    = 0x02
 	tcpFlagACK    = 0x10
 )
@@ -109,9 +118,23 @@ const (
 // ParseTCPFrame reports whether frame is an Ethernet II frame (optionally
 // with one 802.1Q tag) carrying an IPv4 TCP segment with destination port
 // dstPort, and returns its 4-tuple, its source MAC and whether it is a SYN
-// (SYN set, ACK clear). The frame may end right after the TCP header. It
-// never panics; anything malformed or short yields ok == false.
+// (SYN set, ACK clear). The IPv4 total length is honoured: bytes after it
+// (Ethernet padding) are ignored, and a packet longer than the frame is
+// rejected. A first fragment (MF set, offset 0) is accepted once it carries
+// the 4 port bytes; its flags are not trusted, so it never counts as a SYN.
+// Non-first fragments carry no ports and are rejected. It never panics;
+// anything malformed or short yields ok == false.
 func ParseTCPFrame(frame []byte, dstPort uint16) (key ConnKey, src net.HardwareAddr, syn, ok bool) {
+	return parseTCPFrame(frame, len(frame), dstPort)
+}
+
+// parseTCPFrame is ParseTCPFrame for a frame of wireLen bytes of which only
+// the prefix frame was read (the capture reads headers only and learns the
+// full length from the kernel).
+func parseTCPFrame(frame []byte, wireLen int, dstPort uint16) (key ConnKey, src net.HardwareAddr, syn, ok bool) {
+	if wireLen < len(frame) {
+		frame = frame[:max(wireLen, 0)]
+	}
 	if len(frame) < ethHeaderLen {
 		return ConnKey{}, nil, false, false
 	}
@@ -133,10 +156,21 @@ func ParseTCPFrame(frame []byte, dstPort uint16) (key ConnKey, src net.HardwareA
 		return ConnKey{}, nil, false, false
 	}
 	ihl := int(ip[0]&0x0f) * 4
-	if ihl < ipv4MinHeader || ip[9] != ipProtoTCP || binary.BigEndian.Uint16(ip[6:8])&ipFragOffset != 0 {
+	frag := binary.BigEndian.Uint16(ip[6:8])
+	if ihl < ipv4MinHeader || ip[9] != ipProtoTCP || frag&ipFragOffset != 0 {
 		return ConnKey{}, nil, false, false
 	}
-	if len(ip) < ihl+tcpMinHeader {
+	firstFragment := frag&ipMoreFrags != 0
+	need := tcpMinHeader
+	if firstFragment {
+		need = tcpPortBytes
+	}
+	total := int(binary.BigEndian.Uint16(ip[2:4]))
+	if total < ihl+need || total > wireLen-l3 {
+		return ConnKey{}, nil, false, false
+	}
+	ip = ip[:min(len(ip), total)]
+	if len(ip) < ihl+need {
 		return ConnKey{}, nil, false, false
 	}
 	tcp := ip[ihl:]
@@ -148,14 +182,17 @@ func ParseTCPFrame(frame []byte, dstPort uint16) (key ConnKey, src net.HardwareA
 		Src: netip.AddrPortFrom(netip.AddrFrom4([4]byte(ip[12:16])), binary.BigEndian.Uint16(tcp[0:2])),
 		Dst: netip.AddrPortFrom(netip.AddrFrom4([4]byte(ip[16:20])), dstPort),
 	}
-	return key, bytes.Clone(frame[6:12]), tcp[13]&(tcpFlagSYN|tcpFlagACK) == tcpFlagSYN, true
+	syn = !firstFragment && tcp[13]&(tcpFlagSYN|tcpFlagACK) == tcpFlagSYN
+	return key, bytes.Clone(frame[6:12]), syn, true
 }
 
 // --- kernel packet filter ---
 
-// captureSnapLen is how much of each frame the capture reads: enough for the
-// largest Ethernet + 802.1Q + IPv4 (60) + TCP (20) header.
-const captureSnapLen = 256
+// bpfAcceptLen is the filter's accept value. It exceeds any packet, so the
+// kernel does not trim accepted frames and recvfrom with MSG_TRUNC reports
+// their full length (the capture copies only the headers), which the parser
+// checks against the IPv4 total length.
+const bpfAcceptLen = 0x40000
 
 // bpfInsn is one classic BPF instruction (struct sock_filter). It is kept
 // platform-neutral so the program is unit-tested on every build target; the
@@ -185,12 +222,13 @@ const (
 	bpfAND  = 0x50
 )
 
-// tcpPortFilter returns a classic BPF program that passes (the first
-// captureSnapLen bytes of) Ethernet frames carrying an IPv4 TCP segment to
-// port that is not a non-first fragment, untagged or with one 802.1Q tag,
-// and drops everything else. The filter is only an optimisation: the capture
-// re-checks every frame with ParseTCPFrame, so a filter that passed too much
-// would cost CPU, never correctness.
+// tcpPortFilter returns a classic BPF program that passes Ethernet frames
+// carrying an IPv4 TCP segment to port that is not a non-first fragment,
+// untagged or with one 802.1Q tag, and drops everything else. A first
+// fragment passes once it holds the 4 port bytes (the port load needs them).
+// The filter is only an optimisation: the capture re-checks every frame with
+// ParseTCPFrame, so a filter that passed too much would cost CPU, never
+// correctness.
 //
 // Jump offsets count instructions skipped after the jump; "rej" is
 // instruction 19, "acc" 20. Linux usually strips the VLAN tag into skb
@@ -221,7 +259,7 @@ func tcpPortFilter(port uint16) []bpfInsn {
 		/* 17 */ {Code: bpfLD | bpfH | bpfIND, K: 18 + 2}, // A = TCP dst port
 		/* 18 */ {Code: bpfJMP | bpfJEQ | bpfK, K: p, Jt: 1}, // port → acc, else rej
 		/* 19 rej */ {Code: bpfRET | bpfK, K: 0},
-		/* 20 acc */ {Code: bpfRET | bpfK, K: captureSnapLen},
+		/* 20 acc */ {Code: bpfRET | bpfK, K: bpfAcceptLen},
 	}
 }
 
@@ -245,11 +283,20 @@ type ObservationTable struct {
 	ttl time.Duration
 	now func() time.Time
 
+	captureOK atomic.Bool // the capture goroutine is running and reading
+
 	mu      sync.Mutex
 	entries map[ConnKey]*observedConn
 	order   []queuedKey   // insertion order, for expiry and eviction
 	changed chan struct{} // closed and replaced on every Add
 }
+
+// setCaptureHealthy records whether the capture feeding the table works. A
+// new table starts unhealthy, so resolving without a running capture fails
+// closed.
+func (t *ObservationTable) setCaptureHealthy(ok bool) { t.captureOK.Store(ok) }
+
+func (t *ObservationTable) captureHealthy() bool { return t.captureOK.Load() }
 
 // NewObservationTable returns a table whose observations expire after ttl,
 // measured with now.
@@ -268,8 +315,11 @@ func NewObservationTable(ttl time.Duration, now func() time.Time) *ObservationTa
 //
 // A SYN starts a new connection for its 4-tuple: it replaces whatever the
 // table holds for the key unless that already contains a SYN observed less
-// than synBurstWindow earlier (another copy of the same SYN). Non-SYN
-// segments are added to the key's entry, creating one if needed.
+// than synBurstWindow earlier (another copy of the same SYN). Replacement
+// only drops positive evidence: the earlier entry's observations on
+// interfaces that are not taps (foreign or transit) are kept, marked
+// Earlier, while younger than ttl, and an overflow stays an overflow.
+// Non-SYN segments are added to the key's entry, creating one if needed.
 func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	now := t.now()
 	if obs.At.IsZero() {
@@ -280,14 +330,18 @@ func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	t.purgeLocked(now)
 
 	e := t.entries[key]
+	var carried *observedConn
 	if e != nil && obs.SYN && (e.synStart.IsZero() || obs.At.Sub(e.synStart) > synBurstWindow) {
-		e = nil // a new SYN for this 4-tuple: forget the earlier segments
+		carried, e = e, nil // a new SYN for this 4-tuple
 	}
 	if e == nil {
 		for len(t.entries) >= maxObservedKeys && len(t.order) > 0 {
 			t.popOldestLocked()
 		}
 		e = &observedConn{start: obs.At}
+		if carried != nil {
+			t.carryLocked(e, carried, now)
+		}
 		t.entries[key] = e
 		t.order = append(t.order, queuedKey{key: key, start: obs.At})
 		if len(t.order) > 2*maxObservedKeys {
@@ -308,9 +362,33 @@ func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	t.changed = make(chan struct{})
 }
 
+// carryLocked copies the negative evidence of a replaced entry into its
+// successor: observations on non-tap interfaces younger than ttl, as Earlier
+// non-SYN observations, and the overflow mark.
+func (t *ObservationTable) carryLocked(dst, src *observedConn, now time.Time) {
+	dst.overflow = src.overflow
+	for _, o := range src.obs {
+		if dst.overflow {
+			return
+		}
+		if tapPortPattern.MatchString(o.Ifname) || now.Sub(o.At) > t.ttl {
+			continue
+		}
+		o.SYN, o.Earlier = false, true
+		if containsObservation(dst.obs, o) {
+			continue
+		}
+		if len(dst.obs) >= maxObservationsPerKey {
+			dst.overflow, dst.obs = true, nil
+			return
+		}
+		dst.obs = append(dst.obs, o)
+	}
+}
+
 func containsObservation(list []Observation, o Observation) bool {
 	for _, x := range list {
-		if x.Ifname == o.Ifname && x.SYN == o.SYN && bytes.Equal(x.SrcMAC, o.SrcMAC) {
+		if x.Ifname == o.Ifname && x.SYN == o.SYN && x.Earlier == o.Earlier && bytes.Equal(x.SrcMAC, o.SrcMAC) {
 			return true
 		}
 	}
@@ -361,49 +439,79 @@ func (t *ObservationTable) compactOrderLocked() {
 }
 
 // Wait returns the live observations for key once at least one non-SYN
-// segment of it has been observed, waiting up to maxWait for that; on
-// timeout or when ctx ends it returns what is there. A copy of a frame on
-// its ingress interface is always delivered before its transit copies, and a
-// connection's SYN before its later segments, so the observations returned
-// include the ingress of every segment up to the first non-SYN one. A key
-// that received more distinct copies than the table keeps yields nil.
+// segment of the current connection has been observed, waiting up to maxWait
+// for that; on timeout or when ctx ends it returns what is there. A copy of a
+// frame on its ingress interface is always delivered before its transit
+// copies, and a connection's SYN before its later segments, so the
+// observations returned include the ingress of every segment up to the
+// first non-SYN one. A key that received more distinct copies than the
+// table keeps yields nil.
 func (t *ObservationTable) Wait(ctx context.Context, key ConnKey, maxWait time.Duration) []Observation {
-	var timeout <-chan time.Time
-	if maxWait > 0 {
-		timer := time.NewTimer(maxWait)
-		defer timer.Stop()
-		timeout = timer.C
+	ctx, cancel := waitContext(ctx, maxWait)
+	defer cancel()
+	obs, _ := t.waitUntil(ctx, key, hasHandshakeSegment)
+	return obs
+}
+
+// waitContext bounds ctx by maxWait; maxWait <= 0 means do not wait.
+func waitContext(ctx context.Context, maxWait time.Duration) (context.Context, context.CancelFunc) {
+	if maxWait <= 0 {
+		ctx, cancel := context.WithCancel(ctx)
+		cancel()
+		return ctx, cancel
 	}
+	return context.WithTimeout(ctx, maxWait)
+}
+
+// waitUntil returns the live observations for key as soon as done reports
+// true for them, or what is there when ctx ends. overflow reports a key that
+// received more distinct copies than the table keeps (obs is then nil).
+func (t *ObservationTable) waitUntil(ctx context.Context, key ConnKey, done func([]Observation) bool) (obs []Observation, overflow bool) {
 	for {
-		got, changed := t.snapshot(key)
-		if timeout == nil || hasNonSYN(got) {
-			return got
+		obs, overflow, changed := t.snapshot(key)
+		if overflow || done(obs) {
+			return obs, overflow
 		}
 		select {
 		case <-changed:
-		case <-timeout:
-			got, _ = t.snapshot(key)
-			return got
 		case <-ctx.Done():
-			got, _ = t.snapshot(key)
-			return got
+			obs, overflow, _ = t.snapshot(key)
+			return obs, overflow
 		}
 	}
 }
 
-func (t *ObservationTable) snapshot(key ConnKey) ([]Observation, <-chan struct{}) {
+func (t *ObservationTable) snapshot(key ConnKey) (obs []Observation, overflow bool, changed <-chan struct{}) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	var got []Observation
-	if e := t.entries[key]; e != nil && !t.expired(e, t.now()) {
-		got = append(got, e.obs...)
+	now := t.now()
+	if e := t.entries[key]; e != nil && !t.expired(e, now) {
+		if e.overflow {
+			return nil, true, t.changed
+		}
+		for _, o := range e.obs {
+			if o.Earlier && now.Sub(o.At) > t.ttl {
+				continue
+			}
+			obs = append(obs, o)
+		}
 	}
-	return got, t.changed
+	return obs, false, t.changed
 }
 
-func hasNonSYN(obs []Observation) bool {
+func hasSYN(obs []Observation) bool {
 	for _, o := range obs {
-		if !o.SYN {
+		if o.SYN {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHandshakeSegment reports a non-SYN segment of the current connection.
+func hasHandshakeSegment(obs []Observation) bool {
+	for _, o := range obs {
+		if !o.SYN && !o.Earlier {
 			return true
 		}
 	}
@@ -437,36 +545,37 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 	if r.Table == nil {
 		return resolveFail(reasonNoSYN)
 	}
+	if !r.Table.captureHealthy() {
+		return resolveFail(reasonCaptureDown)
+	}
 	maxWait := r.MaxWait
 	if maxWait <= 0 {
 		maxWait = defaultMaxWait
 	}
-	obs := r.Table.Wait(ctx, ConnKey{Src: src, Dst: dst}, maxWait)
+	ctx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+	key := ConnKey{Src: src, Dst: dst}
 
-	var tap *Observation
-	var nic string
-	sawSYN := false
-	for i := range obs {
-		if !obs[i].SYN {
-			continue
-		}
-		sawSYN = true
-		m := tapPortPattern.FindStringSubmatch(obs[i].Ifname)
-		if m == nil {
-			continue
-		}
-		if tap != nil {
-			return resolveFail(reasonAmbiguous) // deduplicated: a second tap or a second MAC
-		}
-		tap, vmid, nic = &obs[i], m[1], m[2]
+	// The VM-port rule is decided as soon as the SYN is in, then the
+	// handshake is awaited within the same deadline and everything is
+	// evaluated again on the final observations.
+	obs, overflow := r.Table.waitUntil(ctx, key, hasSYN)
+	if overflow {
+		return resolveFail(reasonOverflow)
 	}
-	switch {
-	case !sawSYN:
-		return resolveFail(reasonNoSYN)
-	case !hasNonSYN(obs):
+	if _, _, _, reason := selectTap(obs); reason != "" {
+		return resolveFail(reason)
+	}
+	obs, overflow = r.Table.waitUntil(ctx, key, hasHandshakeSegment)
+	if overflow {
+		return resolveFail(reasonOverflow)
+	}
+	tap, vmid, nic, reason := selectTap(obs)
+	if reason != "" {
+		return resolveFail(reason)
+	}
+	if !hasHandshakeSegment(obs) {
 		return resolveFail(reasonNoHandshake)
-	case tap == nil:
-		return resolveFail(reasonNotVMPort)
 	}
 	for _, o := range obs {
 		if o.Ifname != tap.Ifname && !r.isTransit(o.Ifname) {
@@ -486,6 +595,33 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 		return resolveFail(reasonMACMismatch)
 	}
 	return vmid, nil
+}
+
+// selectTap returns the single tap device the connection's SYN entered on,
+// or the reason there is none.
+func selectTap(obs []Observation) (tap *Observation, vmid, nic, reason string) {
+	sawSYN := false
+	for i := range obs {
+		if !obs[i].SYN {
+			continue
+		}
+		sawSYN = true
+		m := tapPortPattern.FindStringSubmatch(obs[i].Ifname)
+		if m == nil {
+			continue
+		}
+		if tap != nil {
+			return nil, "", "", reasonAmbiguous // deduplicated: a second tap or a second MAC
+		}
+		tap, vmid, nic = &obs[i], m[1], m[2]
+	}
+	switch {
+	case !sawSYN:
+		return nil, "", "", reasonNoSYN
+	case tap == nil:
+		return nil, "", "", reasonNotVMPort
+	}
+	return tap, vmid, nic, ""
 }
 
 // isTransit reports whether frames received on ifname are only copies of

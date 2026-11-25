@@ -53,6 +53,9 @@ type synFrame struct {
 	flags     byte
 	setFlags  bool // use flags even when zero
 	src, dst  netip.AddrPort
+	tcpBytes  int    // TCP bytes carried (default 20: a full header)
+	totalLen  int    // IPv4 total length field (default: header + TCP bytes)
+	pad       []byte // bytes after the IP packet (Ethernet padding)
 }
 
 func (f synFrame) bytes(t *testing.T) []byte {
@@ -87,10 +90,16 @@ func (f synFrame) bytes(t *testing.T) []byte {
 	}
 	b = binary.BigEndian.AppendUint16(b, f.etherType)
 
+	if f.tcpBytes == 0 {
+		f.tcpBytes = 20
+	}
+	if f.totalLen == 0 {
+		f.totalLen = f.ihl*4 + f.tcpBytes
+	}
 	// An IHL below 5 still gets a full 20-byte header, so only the field lies.
 	ip := make([]byte, max(f.ihl, 5)*4)
 	ip[0] = 0x40 | byte(f.ihl&0x0f)
-	binary.BigEndian.PutUint16(ip[2:], uint16(f.ihl*4+20))
+	binary.BigEndian.PutUint16(ip[2:], uint16(f.totalLen))
 	binary.BigEndian.PutUint16(ip[6:], f.fragField)
 	ip[8] = 64
 	ip[9] = f.proto
@@ -108,7 +117,8 @@ func (f synFrame) bytes(t *testing.T) []byte {
 	binary.BigEndian.PutUint32(tcp[4:], 0x01020304) // sequence number
 	tcp[12] = 5 << 4                                // data offset
 	tcp[13] = f.flags
-	return append(b, tcp...)
+	b = append(b, tcp[:f.tcpBytes]...)
+	return append(b, f.pad...)
 }
 
 func TestParseTCPFrame(t *testing.T) {
@@ -120,7 +130,7 @@ func TestParseTCPFrame(t *testing.T) {
 		{"plain syn", synFrame{}, true},
 		{"vlan tagged syn", synFrame{vlan: true}, true},
 		{"ip options", synFrame{ihl: 6}, true},
-		{"first fragment", synFrame{fragField: 0x2000}, true}, // MF set, offset 0
+		{"first fragment", synFrame{fragField: 0x2000}, false}, // MF set, offset 0: never a SYN
 		{"don't fragment", synFrame{fragField: 0x4000}, true},
 		{"syn with ece/cwr", synFrame{flags: tcpSYN | 0xc0}, true},
 		{"pure ack", synFrame{flags: tcpACK}, false},
@@ -160,6 +170,85 @@ func TestParseTCPFrameCopiesMAC(t *testing.T) {
 	if src.String() != testMACA {
 		t.Errorf("src MAC aliases the frame buffer: %s", src)
 	}
+}
+
+func TestParseTCPFrameFirstFragment(t *testing.T) {
+	// A first fragment (MF set, offset 0) carries the ports, so its ingress
+	// is recorded; its flags are never trusted, so it is never a SYN.
+	for _, tc := range []struct {
+		name  string
+		frame synFrame
+	}{
+		{"8 tcp bytes", synFrame{fragField: 0x2000, tcpBytes: 8}},
+		{"4 tcp bytes", synFrame{fragField: 0x2000, tcpBytes: 4}},
+		{"vlan 8 tcp bytes", synFrame{vlan: true, fragField: 0x2000, tcpBytes: 8}},
+		{"full header with SYN flag", synFrame{fragField: 0x2000}},
+		{"4 tcp bytes padded with SYN-looking bytes", synFrame{fragField: 0x2000, tcpBytes: 4, pad: []byte{0, 0, 0, 0, 0, 0, 0, 0, 0x50, tcpSYN, 0, 0, 0, 0, 0, 0}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key, src, syn, ok := ParseTCPFrame(tc.frame.bytes(t), testPort)
+			if !ok || syn {
+				t.Fatalf("ok = %v, syn = %v; want ok, not a SYN", ok, syn)
+			}
+			if want := (ConnKey{Src: testSrc, Dst: testDst}); key != want || src.String() != testMACA {
+				t.Errorf("key = %+v, src = %s; want %+v, %s", key, src, want, testMACA)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name  string
+		frame synFrame
+		port  uint16
+	}{
+		{"3 tcp bytes", synFrame{fragField: 0x2000, tcpBytes: 3}, testPort},
+		{"3 tcp bytes padded", synFrame{fragField: 0x2000, tcpBytes: 3, pad: make([]byte, 30)}, testPort},
+		{"other port", synFrame{fragField: 0x2000, tcpBytes: 8}, testPort + 1},
+		{"non-first fragment", synFrame{fragField: 0x2001, tcpBytes: 8}, testPort},
+	} {
+		t.Run("reject "+tc.name, func(t *testing.T) {
+			if _, _, _, ok := ParseTCPFrame(tc.frame.bytes(t), tc.port); ok {
+				t.Fatal("ok = true, want false")
+			}
+		})
+	}
+}
+
+func TestParseTCPFrameTotalLength(t *testing.T) {
+	t.Run("ethernet padding after the packet is ignored", func(t *testing.T) {
+		_, _, syn, ok := ParseTCPFrame(synFrame{flags: tcpACK, pad: make([]byte, 6)}.bytes(t), testPort)
+		if !ok || syn {
+			t.Fatalf("ok = %v, syn = %v; want ok ACK", ok, syn)
+		}
+	})
+	for _, tc := range []struct {
+		name  string
+		frame synFrame
+	}{
+		{"total length shorter than ip+tcp header", synFrame{totalLen: 20 + 12}},
+		{"total length shorter than ip header", synFrame{totalLen: 16}},
+		{"total length longer than the frame", synFrame{totalLen: 20 + 20 + 1}},
+		// A 4-byte segment whose "flags" sit in the Ethernet padding.
+		{"tcp header only in the padding", synFrame{tcpBytes: 4, pad: []byte{0, 0, 0, 0, 0, 0, 0, 0, 0x50, tcpSYN, 0, 0, 0, 0, 0, 0}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, _, ok := ParseTCPFrame(tc.frame.bytes(t), testPort); ok {
+				t.Fatal("ok = true, want false")
+			}
+		})
+	}
+	t.Run("capture cut the frame after the headers", func(t *testing.T) {
+		// A data segment longer than the read buffer: the capture passes the
+		// prefix it read and the length the kernel reported.
+		frame := synFrame{flags: tcpACK | 0x08, totalLen: 20 + 20 + 1200}.bytes(t)
+		wire := len(frame) + 1200
+		key, _, syn, ok := parseTCPFrame(frame, wire, testPort)
+		if !ok || syn || key.Src != testSrc {
+			t.Fatalf("ok = %v, syn = %v, key = %+v; want ok non-SYN from %v", ok, syn, key, testSrc)
+		}
+		if _, _, _, ok := parseTCPFrame(frame, wire-1, testPort); ok {
+			t.Fatal("wire length shorter than the IPv4 total length: ok = true")
+		}
+	})
 }
 
 func TestParseTCPFrameRejects(t *testing.T) {
@@ -286,9 +375,12 @@ func TestTCPPortFilterProgram(t *testing.T) {
 		{flags: tcpACK | 0x08},
 		{flags: tcpSYN | tcpACK},
 		{ihl: 6, flags: tcpACK},
+		{fragField: 0x2000, tcpBytes: 8},
+		{fragField: 0x2000, tcpBytes: 4},
+		{vlan: true, fragField: 0x2000, tcpBytes: 4},
 	} {
-		if got := runBPF(t, prog, f.bytes(t)); got != captureSnapLen {
-			t.Errorf("accept vlan=%v ihl=%d frag=%#x flags=%#x: filter returned %d, want %d", f.vlan, f.ihl, f.fragField, f.flags, got, captureSnapLen)
+		if got := runBPF(t, prog, f.bytes(t)); got != bpfAcceptLen {
+			t.Errorf("accept vlan=%v ihl=%d frag=%#x flags=%#x tcp=%d: filter returned %d, want %d", f.vlan, f.ihl, f.fragField, f.flags, f.tcpBytes, got, bpfAcceptLen)
 		}
 	}
 	for _, tc := range []struct {
@@ -305,6 +397,8 @@ func TestTCPPortFilterProgram(t *testing.T) {
 		{"vlan udp", synFrame{vlan: true, proto: 17}, testPort},
 		{"non-first fragment", synFrame{fragField: 0x0001}, testPort},
 		{"vlan non-first fragment", synFrame{vlan: true, fragField: 0x0001}, testPort},
+		{"first fragment to other port", synFrame{fragField: 0x2000, tcpBytes: 8}, testPort + 1},
+		{"first fragment with 3 tcp bytes", synFrame{fragField: 0x2000, tcpBytes: 3}, testPort},
 	} {
 		if got := runBPF(t, tcpPortFilter(tc.port), tc.frame.bytes(t)); got != 0 {
 			t.Errorf("reject %s: filter returned %d, want 0", tc.name, got)
@@ -344,6 +438,7 @@ func newResolverFixture(t *testing.T, confs map[string]string) *resolverFixture 
 	fakeNetDev(t, sys, "vmbr0.10", "DEVTYPE=vlan", "vmbr0")
 	fakeNetDev(t, sys, "enp3s0.10", "DEVTYPE=vlan", "enp3s0")
 	table := NewObservationTable(30*time.Second, time.Now)
+	table.setCaptureHealthy(true)
 	return &resolverFixture{
 		table: table,
 		res:   &IngressResolver{Table: table, PVEConfDir: dir, SysClassNet: sys, MaxWait: 50 * time.Millisecond},
@@ -539,6 +634,188 @@ func TestResolveTransitClassification(t *testing.T) {
 			wantReason(t, vmid, err, "foreign ingress")
 		})
 	}
+}
+
+// fragmentOn records a first fragment of the connection, parsed from a frame,
+// as received on ifname.
+func (f *resolverFixture) fragmentOn(t *testing.T, mac, ifname string) {
+	t.Helper()
+	key, src, syn, ok := ParseTCPFrame(synFrame{srcMAC: mac, flags: tcpACK, fragField: 0x2000, tcpBytes: 8}.bytes(t), testPort)
+	if !ok {
+		t.Fatal("first fragment not parsed")
+	}
+	f.table.Add(key, Observation{Ifname: ifname, SrcMAC: src, SYN: syn})
+}
+
+func TestResolveFirstFragmentOnUplinkIsForeign(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.see(t, testKey, testMACA, "tap100i0", "vmbr0")
+	f.fragmentOn(t, testMACB, "enp3s0")
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+}
+
+func TestResolveFirstFragmentOnTapCountsAsSegment(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.see(t, testKey, testMACA, "tap100i0", "vmbr0")
+	f.fragmentOn(t, testMACA, "tap100i0")
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "100")
+}
+
+// clockFixture is a resolver fixture whose table runs on a settable clock.
+func clockFixture(t *testing.T, confs map[string]string, clock *time.Time) *resolverFixture {
+	t.Helper()
+	f := newResolverFixture(t, confs)
+	f.table = NewObservationTable(30*time.Second, func() time.Time { return *clock })
+	f.table.setCaptureHealthy(true)
+	f.res.Table = f.table
+	return f
+}
+
+func TestResolveForeignMarkSurvivesNewSYN(t *testing.T) {
+	clock := time.Unix(1_000_000, 0)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.ack(t, testKey, testMACB, "enp3s0", "vmbr0")
+	clock = clock.Add(time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0")
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+
+	// And after yet another SYN replacement within the TTL.
+	clock = clock.Add(time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0")
+	vmid, err = f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+}
+
+func TestResolveForeignAfterSYNSurvivesNewSYN(t *testing.T) {
+	clock := time.Unix(1_000_000, 0)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.see(t, testKey, testMACA, "tap100i0")
+	f.ack(t, testKey, testMACB, "enp3s0")
+	clock = clock.Add(time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+}
+
+func TestResolveNewSYNDropsOlderTapEvidence(t *testing.T) {
+	// Replacement drops earlier positive evidence: an old tap observation
+	// neither identifies nor taints the new connection.
+	clock := time.Unix(1_000_000, 0)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA), "101": conf(testMACB)}, &clock)
+	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0")
+	clock = clock.Add(time.Second)
+	f.handshake(t, testKey, testMACB, "tap101i0", "vmbr0")
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "101")
+}
+
+func TestResolveCarriedSegmentsDoNotCompleteHandshake(t *testing.T) {
+	// Segments of an earlier connection on the 4-tuple must not satisfy the
+	// handshake wait of the new one.
+	clock := time.Unix(1_000_000, 0)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0")
+	clock = clock.Add(time.Second)
+	f.see(t, testKey, testMACA, "tap100i0", "vmbr0")
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "handshake not observed")
+}
+
+func TestResolveForeignMarkExpires(t *testing.T) {
+	clock := time.Unix(1_000_000, 0)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.ack(t, testKey, testMACB, "enp3s0")
+	clock = clock.Add(31 * time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "100")
+}
+
+func TestResolveCaptureUnavailable(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	f.table.setCaptureHealthy(false)
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "capture unavailable")
+
+	f.table.setCaptureHealthy(true)
+	vmid, err = f.resolve()
+	wantVMID(t, vmid, err, "100")
+}
+
+func TestResolveNewTableCaptureUnavailable(t *testing.T) {
+	r := &IngressResolver{Table: NewObservationTable(30*time.Second, time.Now), MaxWait: time.Millisecond}
+	vmid, err := r.Resolve(context.Background(), testSrc, testDst)
+	wantReason(t, vmid, err, "capture unavailable")
+}
+
+func TestResolveObservationOverflow(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.see(t, testKey, testMACA, "tap100i0")
+	for i := range maxObservationsPerKey {
+		f.ack(t, testKey, testMACA, "vmbr0."+string(rune('a'+i%26))+string(rune('a'+i/26)))
+	}
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "observation overflow")
+}
+
+func TestResolveOverflowDuringHandshakeWait(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.res.MaxWait = 250 * time.Millisecond
+	f.see(t, testKey, testMACA, "tap100i0")
+	for i := range maxObservationsPerKey - 1 {
+		f.see(t, testKey, testMACA, "vmbr0."+string(rune('a'+i%26))+string(rune('a'+i/26)))
+	}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		f.ack(t, testKey, testMACA, "tap100i0") // one copy too many
+	}()
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "observation overflow")
+}
+
+func TestResolveForeignMarkExpiresAfterCarry(t *testing.T) {
+	// A carried foreign mark lives ttl from its own observation, not from
+	// the SYN that carried it.
+	clock := time.Unix(1_000_000, 0)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA)}, &clock)
+	f.ack(t, testKey, testMACB, "enp3s0")
+	clock = clock.Add(29 * time.Second)
+	f.handshake(t, testKey, testMACA, "tap100i0")
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "foreign ingress")
+	clock = clock.Add(2 * time.Second)
+	vmid, err = f.resolve()
+	wantVMID(t, vmid, err, "100")
+}
+
+func TestResolveUplinkSYNWithoutHandshake(t *testing.T) {
+	// The VM-port rule is decided as soon as the SYN is in; no handshake wait.
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
+	f.res.MaxWait = 10 * time.Second
+	f.see(t, testKey, testMACA, "enp3s0", "vmbr0")
+	start := time.Now()
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "not a VM port")
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("Resolve waited %v for a handshake of a non-VM SYN", d)
+	}
+}
+
+func TestResolveSecondTapDuringHandshakeWait(t *testing.T) {
+	f := newResolverFixture(t, map[string]string{"100": conf(testMACA), "101": conf(testMACA)})
+	f.res.MaxWait = 250 * time.Millisecond
+	f.see(t, testKey, testMACA, "tap100i0")
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		f.see(t, testKey, testMACA, "tap101i0")
+		f.ack(t, testKey, testMACA, "tap100i0")
+	}()
+	vmid, err := f.resolve()
+	wantReason(t, vmid, err, "ambiguous ingress")
 }
 
 func TestResolveVLANOverBridgeIsTransit(t *testing.T) {
@@ -797,6 +1074,7 @@ func TestResolveStaleTapObservationNotReused(t *testing.T) {
 	clock := time.Unix(1_000_000, 0)
 	f := newResolverFixture(t, map[string]string{"100": conf(testMACA)})
 	f.table = NewObservationTable(30*time.Second, func() time.Time { return clock })
+	f.table.setCaptureHealthy(true)
 	f.res.Table = f.table
 	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0")
 	clock = clock.Add(5 * time.Second)
@@ -809,7 +1087,8 @@ func TestObservationTableNewSYNReplacesEarlierSegments(t *testing.T) {
 	clock := time.Unix(1_000_000, 0)
 	table := NewObservationTable(30*time.Second, func() time.Time { return clock })
 	mac := mustMAC(t, testMACA)
-	// Segments without a SYN, then a SYN: the SYN starts the connection.
+	// Segments without a SYN, then a SYN: the SYN starts the connection; the
+	// earlier non-tap segment is kept as negative evidence only.
 	table.Add(testKey, Observation{Ifname: "enp3s0", SrcMAC: mac})
 	clock = clock.Add(time.Millisecond)
 	table.Add(testKey, Observation{Ifname: "tap100i0", SrcMAC: mac, SYN: true})
@@ -817,14 +1096,17 @@ func TestObservationTableNewSYNReplacesEarlierSegments(t *testing.T) {
 	clock = clock.Add(time.Second)                                           // later segments stay
 	table.Add(testKey, Observation{Ifname: "tap100i0", SrcMAC: mac})
 	got := table.Wait(context.Background(), testKey, 0)
-	want := []string{"tap100i0/syn", "vmbr0/syn", "tap100i0/ack"}
+	want := []string{"enp3s0/earlier", "tap100i0/syn", "vmbr0/syn", "tap100i0/ack"}
 	if len(got) != len(want) {
 		t.Fatalf("got %+v, want %v", got, want)
 	}
 	for i, o := range got {
 		kind := "ack"
-		if o.SYN {
+		switch {
+		case o.SYN:
 			kind = "syn"
+		case o.Earlier:
+			kind = "earlier"
 		}
 		if o.Ifname+"/"+kind != want[i] {
 			t.Errorf("observation %d = %s/%s, want %s", i, o.Ifname, kind, want[i])

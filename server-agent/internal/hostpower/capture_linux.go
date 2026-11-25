@@ -17,9 +17,17 @@ import (
 )
 
 const (
-	ethPAll            = 0x0003 // ETH_P_ALL: every protocol
+	// captureReadLen is how much of each frame the capture copies to
+	// userspace: enough for the largest Ethernet + 802.1Q + IPv4 (60) + TCP
+	// (20) header.
+	captureReadLen     = 256
 	captureReadTimeout = 500 * time.Millisecond
 	captureErrorPause  = 100 * time.Millisecond
+	// captureRcvBuf absorbs bursts while the read loop is descheduled. A
+	// dropped frame can only hide evidence, so drops fail closed, but they
+	// can make a VM's request fail. Counting drops via PACKET_STATISTICS is
+	// deferred.
+	captureRcvBuf = 4 << 20
 )
 
 // htons converts v to network byte order as the kernel expects it in a
@@ -32,13 +40,14 @@ func htons(v uint16) uint16 {
 
 // StartCapture opens an AF_PACKET socket on all interfaces, filters it to
 // IPv4 TCP segments for port and records every received copy in table until
-// ctx ends. It returns an error when the socket cannot be set up (no CAP_NET_RAW,
-// filter rejected); the read loop runs in its own goroutine.
+// ctx ends. It returns an error when the socket cannot be set up (no
+// CAP_NET_RAW, filter rejected); the read loop runs in its own goroutine and
+// keeps the table's capture-health flag current.
 func StartCapture(ctx context.Context, port uint16, table *ObservationTable, log *slog.Logger) error {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, int(htons(ethPAll)))
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, int(htons(syscall.ETH_P_ALL)))
 	if err != nil {
 		return fmt.Errorf("hostpower: open packet socket: %w", err)
 	}
@@ -58,38 +67,62 @@ func StartCapture(ctx context.Context, port uint16, table *ObservationTable, log
 		_ = syscall.Close(fd)
 		return fmt.Errorf("hostpower: set packet socket timeout: %w", err)
 	}
+	// SO_RCVBUFFORCE (root) ignores net.core.rmem_max; SO_RCVBUF is capped
+	// by it. A small buffer is not fatal.
+	if syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUFFORCE, captureRcvBuf) != nil {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, captureRcvBuf); err != nil {
+			log.Warn("hostpower: cannot enlarge the packet socket buffer", "err", err)
+		}
+	}
+	table.setCaptureHealthy(true)
 	go captureLoop(ctx, fd, port, table, log)
 	return nil
 }
 
-// captureLoop reads frames until ctx ends, then closes fd. SO_RCVTIMEO wakes
-// it regularly so it notices ctx.
+// captureLoop reads frames until ctx ends, then closes fd and marks the
+// capture unhealthy. SO_RCVTIMEO wakes it regularly so it notices ctx.
 func captureLoop(ctx context.Context, fd int, port uint16, table *ObservationTable, log *slog.Logger) {
-	defer func() { _ = syscall.Close(fd) }()
-	buf := make([]byte, captureSnapLen)
+	defer func() {
+		table.setCaptureHealthy(false)
+		_ = syscall.Close(fd)
+	}()
+	health := &captureHealth{table: table}
+	buf := make([]byte, captureReadLen)
 	names := make(map[int]string)
-	warned := false
 	for ctx.Err() == nil {
-		n, from, err := syscall.Recvfrom(fd, buf, 0)
+		// MSG_TRUNC: n is the frame's full length even when only
+		// captureReadLen bytes were copied.
+		n, from, err := syscall.Recvfrom(fd, buf, syscall.MSG_TRUNC)
 		if err != nil {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
-				continue
-			}
-			if !warned {
-				log.Warn("hostpower: packet capture read failed; continuing", "err", err)
-				warned = true
-			}
-			select {
-			case <-ctx.Done():
-			case <-time.After(captureErrorPause):
+			switch {
+			case errors.Is(err, syscall.EINTR):
+			case errors.Is(err, syscall.EAGAIN): // idle timeout: the socket works
+				if health.ok() {
+					log.Info("hostpower: packet capture recovered")
+				}
+			default:
+				if health.failed(time.Now()) {
+					log.Warn("hostpower: packet capture read failing; MAC mode rejects requests until it recovers", "err", err)
+				}
+				select {
+				case <-ctx.Done():
+				case <-time.After(captureErrorPause):
+				}
 			}
 			continue
+		}
+		if health.ok() {
+			log.Info("hostpower: packet capture recovered")
 		}
 		ll, ok := from.(*syscall.SockaddrLinklayer)
 		if !ok || ll.Pkttype == syscall.PACKET_OUTGOING {
 			continue
 		}
-		key, mac, syn, ok := ParseTCPFrame(buf[:n], port)
+		if ll.Hatype != syscall.ARPHRD_ETHER && ll.Hatype != syscall.ARPHRD_LOOPBACK {
+			log.Debug("hostpower: skipped captured frame: no Ethernet header", "ifindex", ll.Ifindex, "hatype", ll.Hatype)
+			continue
+		}
+		key, mac, syn, ok := parseTCPFrame(buf[:min(n, len(buf))], n, port)
 		if !ok {
 			log.Debug("hostpower: skipped captured frame: not a TCP segment for the listen port", "ifindex", ll.Ifindex, "len", n)
 			continue
