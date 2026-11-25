@@ -5,6 +5,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -2186,6 +2187,48 @@ func TestNormalizeHostpowerFingerprint(t *testing.T) {
 	}
 }
 
+func TestNormalizeHostpowerFingerprintMatchesCollector(t *testing.T) {
+	colon := func(h string) string {
+		var parts []string
+		for i := 0; i < len(h); i += 2 {
+			parts = append(parts, h[i:i+2])
+		}
+		return strings.Join(parts, ":")
+	}
+	mixed := strings.ToUpper(testFP[:32]) + testFP[32:]
+	for _, in := range []string{
+		testFP,
+		"  " + strings.ToUpper(testFP) + "\t\n",
+		strings.ToUpper(colon(testFP)),
+		colon(testFP),
+		mixed,
+		colon(mixed),
+		"",
+		"   ",
+		testFP[:63],
+		testFP + "0",
+		"zz" + testFP[2:],
+		testFP[:10] + " " + testFP[10:],
+		"sha256:" + testFP,
+		"sha256:" + colon(testFP),
+		"a:" + testFP[1:],
+		":" + testFP,
+		testFP + ":",
+		strings.Repeat(":", 5) + testFP,
+		colon(testFP[:62]),
+	} {
+		got, ok := normalizeHostpowerFingerprint(in)
+		parsed, err := collector.ParseHostpowerFingerprint(in)
+		if ok != (err == nil) {
+			t.Errorf("%q: config ok=%v, collector err=%v", in, ok, err)
+			continue
+		}
+		if ok && got != hex.EncodeToString(parsed) {
+			t.Errorf("%q: config %q, collector %q", in, got, hex.EncodeToString(parsed))
+		}
+	}
+}
+
 func TestLoadWarnsOnHostpowerTLSFingerprint(t *testing.T) {
 	base := []string{"-gateway-url=https://gw.example", "-token=x"}
 	for _, tc := range []struct {
@@ -2217,5 +2260,25 @@ func TestLoadWarnsOnHostpowerTLSFingerprint(t *testing.T) {
 				t.Errorf("%s: warning leaks the URL: %q", tc.name, w)
 			}
 		}
+	}
+}
+
+func TestHostpowerTLSFingerprintWarningCombinations(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(url, fp string) []string {
+		env := map[string]string{"OP_AGENT_HOSTPOWER_URL": url, "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT": fp}
+		cfg, err := Load(base, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Warnings
+	}
+	w := load("", "nothex")
+	if len(w) != 2 || !strings.Contains(w[0], "is not a SHA-256 fingerprint") || !strings.Contains(w[1], "fingerprint is unused") {
+		t.Errorf("malformed pin + empty URL = %v, want the invalid-format and the unused warning", w)
+	}
+	w = load("https://192.0.2.10:9873", "nothex")
+	if len(w) != 1 || strings.Contains(w[0], "without hostpower_tls_fingerprint") {
+		t.Errorf("invalid pin + https URL = %v, want only the invalid-format warning", w)
 	}
 }
