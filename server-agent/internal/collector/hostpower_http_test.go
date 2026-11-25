@@ -144,10 +144,11 @@ func TestHostpowerHTTPIdentity(t *testing.T) {
 	if c.Available() {
 		t.Fatal("Available() = true for an empty base URL")
 	}
-	assertProxyFree(t, c.client) // the nil-client fallback is proxy-free too
-	if !newHostpowerHTTPCollector("http://192.0.2.1:8080", "", nil).Available() {
+	nilClient := newHostpowerHTTPCollector("http://192.0.2.1:8080", "", nil)
+	if !nilClient.Available() {
 		t.Fatal("Available() = false for a set base URL")
 	}
+	assertProxyFree(t, nilClient.client) // the fallback client built for a nil argument
 }
 
 func TestHostpowerHTTPFirstSampleNil(t *testing.T) {
