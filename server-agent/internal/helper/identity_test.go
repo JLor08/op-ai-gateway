@@ -11,18 +11,19 @@ import (
 	"testing"
 )
 
-// nonRootUser returns a non-root account to resolve: the current user if it
-// is not root and has a passwd entry, otherwise "nobody".
+// nonRootUser returns an account ResolveIdentity accepts: the current user
+// if it is neither root nor nobody and has a passwd entry, otherwise
+// "daemon" (uid 1 on Debian and macOS).
 func nonRootUser(t *testing.T) *user.User {
 	t.Helper()
-	if os.Getuid() != 0 {
-		if u, err := user.LookupId(strconv.Itoa(os.Getuid())); err == nil {
+	if uid := os.Getuid(); uid != 0 && uid != 65534 {
+		if u, err := user.LookupId(strconv.Itoa(uid)); err == nil {
 			return u
 		}
 	}
-	u, err := user.Lookup("nobody")
+	u, err := user.Lookup("daemon")
 	if err != nil {
-		t.Skipf("no non-root account with a passwd entry: %v", err)
+		t.Skipf("no usable non-root account with a passwd entry: %v", err)
 	}
 	return u
 }
@@ -95,14 +96,39 @@ func TestResolveIdentityRefusesRoot(t *testing.T) {
 	}
 }
 
+func TestResolveIdentityRefusesNobody(t *testing.T) {
+	if _, err := ResolveIdentity("65534", "1000"); err == nil || !strings.Contains(err.Error(), "nobody") {
+		t.Fatalf("ResolveIdentity(\"65534\") error = %v; want the must-not-be-nobody error", err)
+	}
+	if u, err := user.Lookup("nobody"); err == nil && u.Uid == "65534" {
+		if _, err := ResolveIdentity("nobody", ""); err == nil {
+			t.Fatal("ResolveIdentity(\"nobody\") succeeded; want error")
+		}
+	}
+}
+
+func TestResolveIdentityRequiresCanonicalDecimal(t *testing.T) {
+	for _, in := range []string{"01000", "+1000", " 1000", "1000 ", "0x3e8", "1_000"} {
+		if id, err := ResolveIdentity(in, "1000"); err == nil {
+			t.Errorf("ResolveIdentity(%q, \"1000\") = %+v; want error", in, id)
+		}
+		if id, err := ResolveIdentity("1000", in); err == nil {
+			t.Errorf("ResolveIdentity(\"1000\", %q) = %+v; want error", in, id)
+		}
+	}
+	if _, err := ResolveIdentity("1000", "1000"); err != nil {
+		t.Fatalf("canonical control case: %v", err)
+	}
+}
+
 func TestResolveIdentityRejectsBadInput(t *testing.T) {
-	for _, in := range []string{"", "-5", "no-such-user-op-helper-x"} {
+	for _, in := range []string{"", "-5", "4294967295", "4294967296", "no-such-user-op-helper-x"} {
 		if id, err := ResolveIdentity(in, "1000"); err == nil {
 			t.Fatalf("ResolveIdentity(%q) = %+v; want error", in, id)
 		}
 	}
 	u := nonRootUser(t)
-	for _, g := range []string{"-5", "no-such-group-op-helper-x"} {
+	for _, g := range []string{"-5", "4294967295", "no-such-group-op-helper-x"} {
 		if id, err := ResolveIdentity(u.Uid, g); err == nil {
 			t.Fatalf("ResolveIdentity(%q, %q) = %+v; want error", u.Uid, g, id)
 		}

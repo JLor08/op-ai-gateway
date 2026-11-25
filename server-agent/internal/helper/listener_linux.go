@@ -26,25 +26,57 @@ const (
 	// maxDenyLogKeys caps the per-uid log state so a peer cycling through
 	// uids cannot grow it without bound.
 	maxDenyLogKeys = 1024
+	// liveProbeTimeout bounds the dial that tells a stale socket from one a
+	// running helper still listens on.
+	liveProbeTimeout = time.Second
 )
 
 // Listen prepares the socket directory, creates the Unix socket at path and
 // returns a listener that only hands out connections whose SO_PEERCRED uid
-// passes authorizePeer. The directory is created 0750 if missing, must be a
-// real directory (not a symlink) and, when running as root, owned by root; it
-// is then set to 0750 owner:id.GID. A stale socket at path is removed;
-// anything else there is an error. The socket ends up 0660 owner:id.GID.
-// When not running as root (tests) the owner is left alone and only the
-// group and the modes are set. A nil log means slog.Default().
+// passes authorizePeer. A nil log means slog.Default().
+//
+// path must be absolute and clean and live in a dedicated directory (never
+// "/"); id.UID must not be 0. The parent of the socket directory must exist;
+// it is resolved through symlinks once and every later step uses the
+// resolved path. Every directory from "/" down to that parent must be safe
+// (see checkAncestors), so no unprivileged user can swap any component
+// between the checks and the chown/chmod calls below. The socket directory
+// is created 0750 if missing, must be a real directory (not a symlink) and,
+// when running as root, owned by root and empty apart from the socket's own
+// name; it is then set to 0750 owner:id.GID. A stale socket at path is
+// removed unless another listener still answers on it; anything else there
+// is an error. The socket ends up 0660 owner:id.GID. When not running as
+// root (tests) ownership is neither checked nor changed; the group, the
+// modes and the ancestors' writability still are.
 func Listen(path string, id Identity, log *slog.Logger) (net.Listener, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("helper: socket path %q must be absolute and clean", path)
+	}
+	if filepath.Dir(path) == "/" {
+		return nil, fmt.Errorf("helper: socket path %s must be inside a dedicated directory, not /", path)
+	}
+	if id.UID == 0 {
+		return nil, errors.New("helper: refusing to serve uid 0")
+	}
+	root := os.Geteuid() == 0
 	owner := -1
-	if os.Geteuid() == 0 {
+	if root {
 		owner = 0
 	}
-	if err := prepareDir(filepath.Dir(path), owner, id.GID); err != nil {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(filepath.Dir(path)))
+	if err != nil {
+		return nil, fmt.Errorf("helper: socket directory parent: %w", err)
+	}
+	if err := checkAncestors(parent, root); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(parent, filepath.Base(filepath.Dir(path)))
+	base := filepath.Base(path)
+	path = filepath.Join(dir, base)
+	if err := prepareDir(dir, base, owner, id.GID); err != nil {
 		return nil, err
 	}
 	if err := removeStaleSocket(path); err != nil {
@@ -54,25 +86,53 @@ func Listen(path string, id Identity, log *slog.Logger) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("helper: listen on %s: %w", path, err)
 	}
-	if err := os.Chown(path, owner, id.GID); err != nil {
+	if err := secureSocket(path, owner, id.GID); err != nil {
 		_ = ln.Close()
-		return nil, fmt.Errorf("helper: chown socket: %w", err)
-	}
-	if err := os.Chmod(path, 0o660); err != nil {
-		_ = ln.Close()
-		return nil, fmt.Errorf("helper: chmod socket: %w", err)
+		return nil, err
 	}
 	return &peerListener{ln: ln, want: id, deny: newDenyLog(log, time.Now)}, nil
 }
 
+// checkAncestors walks from dir (already free of symlinks) up to "/" and
+// requires every directory to be not writable by group or others, unless it
+// carries the sticky bit (like /tmp: others may add entries but cannot rename
+// or remove ours). When root, every directory must also be owned by uid 0.
+// Together this means only root can replace any component of the path.
+// Not running as root (tests), ownership is skipped: the test's own
+// temporary directories belong to the test user.
+func checkAncestors(dir string, root bool) error {
+	for p := dir; ; p = filepath.Dir(p) {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return fmt.Errorf("helper: socket path ancestor: %w", err)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("helper: socket path ancestor %s is not a directory", p)
+		}
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("helper: socket path ancestor %s: owner unknown", p)
+		}
+		if root && st.Uid != 0 {
+			return fmt.Errorf("helper: socket path ancestor %s is owned by uid %d, not root", p, st.Uid)
+		}
+		if fi.Mode().Perm()&0o022 != 0 && fi.Mode()&fs.ModeSticky == 0 {
+			return fmt.Errorf("helper: socket path ancestor %s is writable by group or others", p)
+		}
+		if p == "/" {
+			return nil
+		}
+	}
+}
+
 // prepareDir creates and secures the socket directory. owner is 0 when
-// running as root (the directory must then already be root's) and -1
-// otherwise (ownership unchecked and unchanged). The ownership check, chown
-// and chmod go through one O_NOFOLLOW descriptor, so a swap after the Lstat
-// cannot redirect them.
-func prepareDir(dir string, owner, gid int) error {
+// running as root (the directory must then already be root's and contain
+// nothing but base) and -1 otherwise (ownership unchecked and unchanged).
+// The checks, chown and chmod go through one O_NOFOLLOW descriptor, so a
+// swap after the Lstat cannot redirect them.
+func prepareDir(dir, base string, owner, gid int) error {
 	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
+		if err := os.Mkdir(dir, 0o750); err != nil {
 			return fmt.Errorf("helper: create socket directory: %w", err)
 		}
 	}
@@ -98,12 +158,8 @@ func prepareDir(dir string, owner, gid int) error {
 		return fmt.Errorf("helper: socket directory %s changed while being secured", dir)
 	}
 	if owner == 0 {
-		st, ok := ffi.Sys().(*syscall.Stat_t)
-		if !ok {
-			return fmt.Errorf("helper: socket directory %s: owner unknown", dir)
-		}
-		if st.Uid != 0 {
-			return fmt.Errorf("helper: socket directory %s is owned by uid %d, not root", dir, st.Uid)
+		if err := checkDedicatedDir(f, ffi, dir, base); err != nil {
+			return err
 		}
 	}
 	if err := f.Chown(owner, gid); err != nil {
@@ -115,8 +171,32 @@ func prepareDir(dir string, owner, gid int) error {
 	return nil
 }
 
+// checkDedicatedDir requires the open socket directory to be root's and to
+// hold nothing but base, so Listen never re-owns a shared directory such as
+// /run (systemd's RuntimeDirectory= starts empty).
+func checkDedicatedDir(f *os.File, fi fs.FileInfo, dir, base string) error {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("helper: socket directory %s: owner unknown", dir)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("helper: socket directory %s is owned by uid %d, not root", dir, st.Uid)
+	}
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return fmt.Errorf("helper: read socket directory: %w", err)
+	}
+	for _, n := range names {
+		if n != base {
+			return fmt.Errorf("helper: socket directory %s is not dedicated: it contains %q", dir, n)
+		}
+	}
+	return nil
+}
+
 // removeStaleSocket removes a leftover socket at path; any other kind of
-// entry is refused rather than deleted.
+// entry, or a socket that still accepts connections, is refused rather than
+// deleted.
 func removeStaleSocket(path string) error {
 	fi, err := os.Lstat(path)
 	switch {
@@ -127,8 +207,33 @@ func removeStaleSocket(path string) error {
 	case fi.Mode()&fs.ModeSocket == 0:
 		return fmt.Errorf("helper: %s exists and is not a socket", path)
 	}
+	if c, err := net.DialTimeout("unix", path, liveProbeTimeout); err == nil {
+		_ = c.Close()
+		return fmt.Errorf("helper: another helper is already listening on %s", path)
+	}
 	if err := os.Remove(path); err != nil {
 		return fmt.Errorf("helper: remove stale socket: %w", err)
+	}
+	return nil
+}
+
+// secureSocket hands the new socket to owner:gid with mode 0660. Lchown never
+// follows a symlink; chmod has no such variant on Linux, so the entry is
+// re-checked to be a socket first (the directory is root's and 0750 by now,
+// so nobody else can replace it in between).
+func secureSocket(path string, owner, gid int) error {
+	if err := os.Lchown(path, owner, gid); err != nil {
+		return fmt.Errorf("helper: chown socket: %w", err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("helper: socket: %w", err)
+	}
+	if fi.Mode()&fs.ModeSocket == 0 {
+		return fmt.Errorf("helper: %s is no longer a socket", path)
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		return fmt.Errorf("helper: chmod socket: %w", err)
 	}
 	return nil
 }
