@@ -34,6 +34,8 @@ reading can coexist with an LHM-sourced system reading.
 
 **VM CPU power share (Proxmox).** A KVM guest has no RAPL, so on a Proxmox VE host the optional `server-agent hostpower` mode reads the host's RAPL package domains (`/sys/class/powercap/intel-rapl:*`), `/proc/stat` and each VM's `qemu.slice/<vmid>.scope/cpu.stat`, and attributes the package energy delta to VMs by active CPU time with the idle floor included, so the sum of shares stays at or below the package. It publishes a per-VM synthetic `intel-rapl:0` tree (`name`, `energy_uj`, `max_energy_range_uj`) that is mounted into the guest over virtiofs and read by the guest agent's ordinary RAPL collector via `powercap_root`; the host ticks at 250 ms against the guest's 1 s sampling interval, and the virtiofs device runs with `cache=never` so the guest never reads a value older than the last host tick. `max_energy_range_uj` is `0`, so a counter that ever goes backwards reads as 0 J in the guest, never as a wraparound. If RAPL becomes unreadable while the host service runs, the counters freeze and guests on any transport report a measured 0 W, not `null`, which also pulls that server's rolling-minimum idle baseline down; if the service itself stops, virtiofs guests read the frozen file (0 W) while HTTP guests get a refused connection and report `null` (or fall through to LHM). It shows as a stopped `op-hostpower` unit and, for virtiofs, an `energy_uj` that no longer changes. The same counter also reaches Windows guests over a colon-free tree (`<vmid>/windows/intel-rapl_0`, read through `powercap_root` with the pattern `intel-rapl_*`) and, when `-listen` is set, Linux and Windows guests over `GET /v1/energy` (`{"vmid","energy_uj","max_energy_range_uj":0}`): in MAC mode the host identifies the VM by the `tap<vmid>i<n>` interface the connection's SYN entered (captured with an `AF_PACKET` socket) plus the VM config's MAC, in token mode by a per-VM bearer token whose SHA-256 is stored; the layer-2 man-in-the-middle case is out of scope and TLS is deferred ([ADR-116](../09-architecture-decisions.md#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token)). Setup is in the [agent README](../../../server-agent/README.md#linux-or-windows-guest-on-a-proxmox-ve-host); the original decision is [ADR-115](../09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs).
 
+**Privileged helper (bare-metal Linux).** RAPL `energy_uj` and the SMBIOS table are root-only, but the agent starts gateway-supplied runtimes, so it is meant to run as an ordinary user. The optional root mode `server-agent helper` (package `internal/helper`) collects only: it serves `GET /v1/rapl` (every top-level `intel-rapl:N` zone, from a reading cached for 250 ms, stamped with its system-wide `CLOCK_MONOTONIC` read time `read_ns`) and `GET /v1/memory-modules` (the DIMMs, parsed once at startup with the same SMBIOS parser a root agent uses) as JSON over a Unix socket (default `/run/op-agent-helper/agent.sock`, directory `0750` and socket `0660`, both `root:<agent group>`), checks every connection with `SO_PEERCRED` so only the configured agent uid is served (root peers are denied too), limits the whole socket to 20 requests/s (burst 40) and starts no process and opens no network socket. Processes under the agent uid (the runtimes) can read it too; that is accepted, and the 250 ms cache keeps the PLATYPUS side channel coarse. An unprivileged agent picks it up through `helper_socket` (Linux default: that socket) as the `helper` power source and for the DIMM list; a root agent never asks it. Setup and the pending hardware acceptance are in the [agent README](../../../server-agent/README.md#privileged-helper-linux); the decision is [ADR-117](../09-architecture-decisions.md#adr-117--a-root-only-agent-helper-serves-rapl-counters-and-dimms-over-a-peer-checked-unix-socket-so-the-linux-agent-runs-unprivileged).
+
 ### 8.2.1 Host metrics
 
 `server-agent/internal/collector/host.go` reads gopsutil (`cpu`, `load`, `mem`,
@@ -74,13 +76,18 @@ it), and **skips Apple**, whose "total" is allocated memory rather than a ceilin
 ### 8.2.3 Power draw (watts)
 
 `DetectPowerCollector(cfg PowerConfig)` (and `DetectPowerAndTempCollectors(cfg PowerConfig)`,
-which shares the same power composition) composes the OS-native collector with the optional hostpower
-HTTP collector and an optional LHM source, first non-nil reading wins (native/virtiofs, then hostpower,
-then LHM):
+which shares the same power composition) composes the OS-native collector, on Linux the privileged
+helper and hwmon sources, the optional hostpower HTTP collector and an optional LHM source, first
+non-nil reading per metric wins (native RAPL/virtiofs, then helper, then hwmon, then hostpower, then
+LHM). The helper source is composed only on Linux, when the agent does not run as euid 0 and
+`helper_socket` is set (its Linux default), so a root agent's result is unchanged
+([ADR-117](../09-architecture-decisions.md#adr-117--a-root-only-agent-helper-serves-rapl-counters-and-dimms-over-a-peer-checked-unix-socket-so-the-linux-agent-runs-unprivileged)):
 
 | Source | File | Platform | Mechanism |
 |---|---|---|---|
-| RAPL | `rapl.go` | Linux, and Windows when `powercap_root` is set | Reads `<powercap root>/intel-rapl:*/energy_uj` (Windows: `intel-rapl_*`, only under a configured root such as a virtiofs drive; root defaults to `/sys/class/powercap`, configurable via `powercap_root`; in a Proxmox guest it is the virtiofs-mounted synthetic tree published by `server-agent hostpower`) and derives watts from the energy delta between consecutive ticks (wraparound-corrected via `max_energy_range_uj`); sums `package*` domains for CPU watts, prefers a `psys` domain for system watts, else falls back to the first readable `hwmon` `power*_input`. `energy_uj` is root-only since CVE-2020-8694, so a non-root agent gets no CPU-watt reading (best-effort, degrades to nil, never an error) |
+| RAPL | `rapl.go` | Linux, and Windows when `powercap_root` is set | Reads `<powercap root>/intel-rapl:*/energy_uj` (Windows: `intel-rapl_*`, only under a configured root such as a virtiofs drive; root defaults to `/sys/class/powercap`, configurable via `powercap_root`; in a Proxmox guest it is the virtiofs-mounted synthetic tree published by `server-agent hostpower`) and derives watts from the energy delta between consecutive ticks (wraparound-corrected via `max_energy_range_uj`); sums `package*` domains for CPU watts and uses a `psys` domain for system watts. `energy_uj` is root-only since CVE-2020-8694, so a non-root agent gets nil here (best-effort, never an error) and the helper source below fills in |
+| helper | `helper_power.go` | Linux, agent not euid 0, `helper_socket` set | GETs `/v1/rapl` from the root `server-agent helper` over its Unix socket (`helper_client.go`: always dials the helper's socket, fixed URL `http://op-agent-helper`, no proxy, no redirects, body capped at 4 KiB) and applies the RAPL rules to the served top-level zones (keyed by `zone`): `package*` summed for CPU, `psys` for system, per-zone delta with wraparound correction, nil on the first sample and after any failure (which drops every baseline). The helper serves a reading cached for 250 ms; Δt is the difference of the responses' `read_ns`, so a cached reading (unchanged `read_ns`) yields nil and keeps the baselines instead of 0 W, and the next fresh one spans the whole interval (at the 250 ms interval floor about every other helper sample carries no value and the metric falls through to the next source or stays empty; at the 1 s default every sample is fresh). A response without `read_ns` (an older helper) falls back to the agent clock. First success logged at Info, failures at Debug |
+| hwmon | `hwmon_power.go` | Linux | System watts only, from the first readable `/sys/class/hwmon/*/power*_input` (microwatts, instantaneous, world-readable); fills system watts when neither RAPL nor the helper had a `psys` domain |
 | hostpower | `hostpower_http.go` | any OS (when `hostpower_url` is set) | GETs `<hostpower_url>/v1/energy` from the Proxmox host service (1 s timeout, body capped at 4 KiB, own transport with no proxy, no redirects, `Authorization: Bearer` when `hostpower_token` is set) and derives watts from the `energy_uj` delta like RAPL (`max_energy_range_uj` 0: a decrease is 0 J); any error, non-200, a body without `vmid` or a changed `vmid` yields nil and re-baselines |
 | powermetrics | `power_darwin.go` | macOS | Runs `powermetrics --samplers cpu_power -n 1` (needs root); CPU package watts only — total system watts is not obtainable CGO-free (SMC PSTR) and stays nil |
 | LHM | `lhm_power.go` | Windows (after RAPL over a virtiofs `powercap_root` and hostpower) + Linux fallback | GETs a LibreHardwareMonitor Remote Web Server `/data.json` tree and matches a `"Power"` sensor named `"CPU Package"` (Intel) or bare `"Package"` under a CPU `SensorId` (AMD `/amdcpu/…`), excluding the Intel "System Agent" sub-rail from the system-rail match |
@@ -103,8 +110,17 @@ from `host.InfoWithContext`, and per-OS mainboard/BIOS/DIMM detail via
 `platformHardware`:
 
 - **Linux** (`hwinfo_linux.go`): mainboard/BIOS from `/sys/class/dmi/id` (`dmi.go`,
-  all `0444` world-readable files); per-DIMM detail via `dmidecode -t memory` **only
-  when running as root** (else RAM total only).
+  all `0444` world-readable files); per-DIMM detail from the raw SMBIOS table
+  `/sys/firmware/dmi/tables/DMI` (root-only), decoded in-process by
+  `ParseSMBIOSMemory` (`smbios.go`: type 17 only — size, locator, memory type,
+  rated else configured speed; never serial, asset tag, part number or UUID). An
+  agent running as root reads the table itself; otherwise it asks the privileged
+  helper's `GET /v1/memory-modules` (same parser, body capped at 64 KiB) within the
+  2 s source budget, and when that yields nothing the agent retries just this
+  fetch every 30 s until the first successful reply; a reply with modules updates
+  the report and re-sends it, an empty one just ends the retry
+  ([ADR-117](../09-architecture-decisions.md#adr-117--a-root-only-agent-helper-serves-rapl-counters-and-dimms-over-a-peer-checked-unix-socket-so-the-linux-agent-runs-unprivileged)).
+  Without either, RAM total only. `dmidecode` is not used.
 - **Windows** (`hwinfo_windows.go`): WMI queries (`Win32_BaseBoard`, `Win32_BIOS`,
   `Win32_PhysicalMemory`) needing no admin rights; no serial/UUID column is ever
   selected.
@@ -3586,6 +3602,7 @@ this measures a model right after the operator sets it up, before real use.
 | `OP_AGENT_POWERCAP_ROOT` | unset (`/sys/class/powercap` on Linux) | Powercap root the RAPL collector reads (a Proxmox hostpower virtiofs mount in a guest; a drive root on Windows); ignored on macOS |
 | `OP_AGENT_HOSTPOWER_URL` | unset (off) | Hostpower HTTP endpoint on the Proxmox host (`http://<host>:9873`) the guest reads its CPU power share from; no token means MAC mode |
 | `OP_AGENT_HOSTPOWER_TOKEN` | unset (MAC mode) | Per-VM token for the hostpower endpoint (token mode); secret, never logged |
+| `OP_AGENT_HELPER_SOCKET` | `/run/op-agent-helper/agent.sock` on Linux, else empty | Unix socket of the root `server-agent helper` an unprivileged Linux agent reads RAPL counters and memory modules from; `off` disables it; ignored (with a warning) off Linux |
 | `OP_AGENT_LHM_URL` | unset | LibreHardwareMonitor `/data.json` URL (Windows power/temp; Linux fallback) |
 | `OP_AI_GATEWAY_TELEMETRY_RETENTION_HOURS` | 168 (7d) | `server_telemetry_samples` retention |
 | `OP_AI_GATEWAY_AVAILABILITY_RETENTION_HOURS` | 720 (30d) | `server_availability_samples` retention |

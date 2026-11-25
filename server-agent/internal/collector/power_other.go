@@ -8,12 +8,14 @@ package collector
 // newNativePowerCollector returns the guest RAPL collector reading a host-provided
 // powercap tree (e.g. a virtiofs drive like Z:\ carrying the colon-free
 // intel-rapl_0 domain), or nil when powercapRoot is empty: there is no CGO-free
-// native power path on this OS (Windows RAPL is ring-0/MSR). There is no hwmon
-// root here. Without a root, Windows relies on the optional LHM-HTTP source
-// composed by DetectPowerCollector.
+// native power path on this OS (Windows RAPL is ring-0/MSR). Without a root, Windows
+// relies on the optional LHM-HTTP source composed by DetectPowerCollector.
 func newNativePowerCollector(powercapRoot string) PowerCollector {
 	if powercapRoot == "" {
 		return nil // a literal nil interface, not a typed-nil *raplCollector
 	}
-	return newRAPLCollector(powercapRoot, "", raplDomainGlobWindows)
+	return newRAPLCollector(powercapRoot, raplDomainGlobWindows)
 }
+
+// newNativeHwmonCollector returns nil: there is no hwmon on this OS.
+func newNativeHwmonCollector() PowerCollector { return nil }

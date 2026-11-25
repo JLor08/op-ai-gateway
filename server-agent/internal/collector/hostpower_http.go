@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -40,13 +41,21 @@ type HostpowerEnergy struct {
 // is a link-local/LAN peer; a proxy must never see the bearer token) and never
 // follows redirects. Other
 // transport defaults, including TLS, are kept.
-func NewHostpowerHTTPClient() *http.Client {
+func NewHostpowerHTTPClient() *http.Client { return newLocalHTTPClient(nil) }
+
+// newLocalHTTPClient builds the shared client: short timeout, a private
+// transport without proxy support, no redirects. A non-nil dial replaces the
+// transport's DialContext (the helper client dials a Unix socket).
+func newLocalHTTPClient(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.Proxy = nil
+	if dial != nil {
+		tr.DialContext = dial
+	}
 	return &http.Client{
 		Timeout:   hostpowerHTTPTimeout,
 		Transport: tr,
-		// A 3xx is a failure: no request may leave the URL hostpowerEnergyURL built.
+		// A 3xx is a failure: no request may leave the URL the caller built.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 }

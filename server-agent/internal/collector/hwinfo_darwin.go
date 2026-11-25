@@ -13,7 +13,7 @@ import (
 
 // platformHardware shells out to system_profiler (CGO-free) for mainboard/BIOS and
 // per-DIMM detail. Apple Silicon reports unified memory (no modules). Best-effort.
-func platformHardware(ctx context.Context) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
+func platformHardware(ctx context.Context, _ HardwareOptions) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
 	var board sample.Mainboard
 	var bios sample.BIOS
 	if out, err := runSystemProfiler(ctx, "SPHardwareDataType"); err == nil {

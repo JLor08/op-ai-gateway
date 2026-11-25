@@ -19,7 +19,7 @@ func (fakeGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
 }
 
 func TestCollectHardware(t *testing.T) {
-	r := CollectHardware(context.Background(), []GPUCollector{fakeGPUCollector{}}, "9.9.9")
+	r := CollectHardware(context.Background(), []GPUCollector{fakeGPUCollector{}}, "9.9.9", HardwareOptions{})
 	if r.AgentVersion != "9.9.9" {
 		t.Fatalf("agent_version = %q", r.AgentVersion)
 	}
@@ -39,5 +39,32 @@ func TestCollectHardware(t *testing.T) {
 	// GPUs slice is always non-nil (Normalize).
 	if r.GPUs == nil {
 		t.Fatal("GPUs must be non-nil")
+	}
+}
+
+func TestHelperMemoryModulesNeeded(t *testing.T) {
+	origGOOS, origEuid := helperGOOS, helperGeteuid
+	t.Cleanup(func() { helperGOOS, helperGeteuid = origGOOS, origEuid })
+	withModules := sample.SystemReport{}
+	withModules.Memory.Modules = []sample.MemoryModule{{Locator: "DIMM_A1"}}
+	cases := []struct {
+		name   string
+		goos   string
+		euid   int
+		socket string
+		report sample.SystemReport
+		want   bool
+	}{
+		{"linux unprivileged, no modules", "linux", 1000, "/s", sample.SystemReport{}, true},
+		{"modules already present", "linux", 1000, "/s", withModules, false},
+		{"root reads natively", "linux", 0, "/s", sample.SystemReport{}, false},
+		{"no socket", "linux", 1000, "", sample.SystemReport{}, false},
+		{"not linux", "darwin", 1000, "/s", sample.SystemReport{}, false},
+	}
+	for _, tc := range cases {
+		helperGOOS, helperGeteuid = tc.goos, func() int { return tc.euid }
+		if got := HelperMemoryModulesNeeded(tc.report, HardwareOptions{HelperSocket: tc.socket}); got != tc.want {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

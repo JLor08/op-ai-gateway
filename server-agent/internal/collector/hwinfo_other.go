@@ -12,6 +12,6 @@ import (
 
 // platformHardware is a no-op on unsupported OSes: CPU/RAM/OS still come from
 // gopsutil in CollectHardware; only mainboard/BIOS/DIMM detail is unavailable.
-func platformHardware(_ context.Context) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
+func platformHardware(_ context.Context, _ HardwareOptions) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
 	return sample.Mainboard{}, sample.BIOS{}, nil
 }

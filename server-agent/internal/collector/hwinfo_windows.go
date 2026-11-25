@@ -15,7 +15,7 @@ import (
 // platformHardware queries WMI (no admin) for mainboard/BIOS/DIMMs. Each query is
 // best-effort: an error leaves that section zero-valued. No serial/UUID column is
 // selected (privacy D4).
-func platformHardware(_ context.Context) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
+func platformHardware(_ context.Context, _ HardwareOptions) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
 	var bb []win32BaseBoard
 	_ = wmi.Query("SELECT Manufacturer, Product, Version FROM Win32_BaseBoard", &bb)
 	var bi []win32BIOS

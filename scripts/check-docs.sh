@@ -685,11 +685,14 @@ fi
 #
 # Flags are collected from EVERY Go binary in the repository, test stubs
 # included -- development-and-quality.md legitimately documents the stub
-# children's -ready-after and -ignore-sigterm.
+# children's -ready-after and -ignore-sigterm. Both registration shapes count:
+# fs.String("name", ...) and fs.StringVar(&dst, "name", ...) (or a pointer
+# variable as dst), whose name is the second argument (the agent's `helper`
+# mode registers its flags that way).
 echo "==> flags named in documents exist"
 FLAG_NAMES="$TMPDIR_RUN/flagnames"
 # shellcheck disable=SC2016  # the pattern is for grep, not the shell
-grep -rhoE '(flag|fs)\.(String|Bool|Int|Int64|Uint|Uint64|Float64|Duration)(Var)?\("[a-z0-9][a-z0-9-]*"' \
+grep -rhoE '(flag|fs)\.(String|Bool|Int|Int64|Uint|Uint64|Float64|Duration)(Var)?\(([&A-Za-z_][A-Za-z0-9_.]*, *)?"[a-z0-9][a-z0-9-]*"' \
   --include='*.go' . 2>/dev/null \
   | sed -E 's/.*"([a-z0-9-]+)"/\1/' | LC_ALL=C sort -u >"$FLAG_NAMES" || true
 

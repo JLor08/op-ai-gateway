@@ -122,15 +122,25 @@ type PowerConfig struct {
 	HostpowerURL string
 	// HostpowerToken is that endpoint's optional per-VM token (a secret).
 	HostpowerToken string
+	// HelperSocket is the privileged helper's Unix socket; empty disables the
+	// helper power source.
+	HelperSocket string
 }
 
 // nativeAndHostpowerSubs returns the leading power sub-collectors shared by both
-// Detect* entry points: native first, then the hostpower HTTP source (when
+// Detect* entry points: native RAPL, the privileged helper (Linux, non-root,
+// socket configured), hwmon (Linux), then the hostpower HTTP source (when
 // HostpowerURL != ""). The LHM source follows in the callers.
 func nativeAndHostpowerSubs(cfg PowerConfig) []PowerCollector {
 	var subs []PowerCollector
 	if native := newNativePowerCollector(cfg.PowercapRoot); native != nil { //nolint:staticcheck // newNativePowerCollector returns nil only on the !linux && !darwin build (power_other.go); always-true on this build is an intentional cross-platform guard
 		subs = append(subs, native)
+	}
+	if helperEnabled(cfg.HelperSocket) {
+		subs = append(subs, newHelperPowerCollector(NewHelperHTTPClient(cfg.HelperSocket)))
+	}
+	if hw := newNativeHwmonCollector(); hw != nil { //nolint:staticcheck // nil only off Linux; always-true on this build is an intentional cross-platform guard
+		subs = append(subs, hw)
 	}
 	if hp := strings.TrimSpace(cfg.HostpowerURL); hp != "" {
 		subs = append(subs, newHostpowerHTTPCollector(hp, cfg.HostpowerToken, NewHostpowerHTTPClient()))
@@ -138,10 +148,12 @@ func nativeAndHostpowerSubs(cfg PowerConfig) []PowerCollector {
 	return subs
 }
 
-// DetectPowerCollector composes the OS-native power collector (if any), the
-// optional hostpower HTTP source (when HostpowerURL != "") and the optional
-// LHM-HTTP source (when LHMURL != ""), in that order. The result is always
-// non-nil (an empty composite when nothing applies) and safe to Collect.
+// DetectPowerCollector composes, in this order: the OS-native collector (RAPL
+// on Linux, powermetrics on macOS, a host-provided powercap tree elsewhere when
+// PowercapRoot is set), the privileged helper (Linux, non-root agent,
+// HelperSocket set), hwmon (Linux), the hostpower HTTP source (HostpowerURL
+// set) and the LHM-HTTP source (LHMURL set). The result is always non-nil (an
+// empty composite when nothing applies) and safe to Collect.
 func DetectPowerCollector(cfg PowerConfig) PowerCollector {
 	subs := nativeAndHostpowerSubs(cfg)
 	if strings.TrimSpace(cfg.LHMURL) != "" {

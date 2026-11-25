@@ -51,6 +51,7 @@ var allowedDeps = map[string][]string{
 		"internal/client",
 		"internal/collector",
 		"internal/config",
+		"internal/helper",
 		"internal/hostpower",
 		"internal/proxy",
 		"internal/runtime",
@@ -82,6 +83,7 @@ var allowedDeps = map[string][]string{
 		"internal/wslentry",
 	},
 	"internal/gwapi":     {},
+	"internal/helper":    {"internal/collector", "internal/sample"},
 	"internal/hostpower": {"internal/collector"},
 	"internal/proxy": {
 		"internal/certfiles",
@@ -211,6 +213,23 @@ func TestForbiddenEdges(t *testing.T) {
 		for _, e := range graph["internal/hostpower"] {
 			if toSet[e] {
 				t.Errorf("forbidden edge internal/hostpower -> %s: the hostpower mode runs on a hypervisor host without gateway contact and must not depend on the agent's orchestration, transport, config or runtime layers", e)
+			}
+		}
+	})
+
+	t.Run("helper does not import agent, client, config, proxy, runtime, trust or hostpower", func(t *testing.T) {
+		toSet := map[string]bool{
+			"internal/agent":     true,
+			"internal/client":    true,
+			"internal/config":    true,
+			"internal/proxy":     true,
+			"internal/runtime":   true,
+			"internal/trust":     true,
+			"internal/hostpower": true,
+		}
+		for _, e := range graph["internal/helper"] {
+			if toSet[e] {
+				t.Errorf("forbidden edge internal/helper -> %s: the root helper must stay minimal and not depend on the agent's orchestration, transport, config or runtime layers", e)
 			}
 		}
 	})

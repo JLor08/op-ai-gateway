@@ -468,7 +468,15 @@ import (
 // HTTP power collector between the native and LHM collectors, and reads
 // powercap_root on Windows. This is the ONE bump for the whole branch; later
 // commits on it do not bump again.
-const Version = "0.23.0"
+//
+// 0.23.0 -> 0.24.0 is the single bump for the privileged helper. MINOR: a new
+// `server-agent helper` mode runs as root and serves the RAPL counters and
+// SMBIOS memory modules over a peer-checked Unix socket, and the agent gains
+// the helper_socket option so an unprivileged Linux agent reads CPU/system
+// watts and memory modules from it. No wire change: the samples and system
+// reports keep their shape, so no agent.Features entry. This is the ONE bump
+// for the whole branch; later commits on it do not bump again.
+const Version = "0.24.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -810,6 +818,25 @@ func tempLog(v *float64) any {
 // sources are individually bounded inside collector.CollectHardware).
 const hardwareCollectBudget = 15 * time.Second
 
+// defaultMemoryRetryInterval is how often Run retries the helper's memory
+// modules after the startup inventory came without them (the helper may start
+// seconds after the agent). Far below the 30 min system-report cadence on
+// purpose: that one would leave the inventory incomplete for half an hour.
+const defaultMemoryRetryInterval = 30 * time.Second
+
+// memoryRetryTimeout bounds one retried helper fetch. It runs on Run's
+// goroutine, so a wedged helper delays telemetry by at most this much.
+const memoryRetryTimeout = 2 * time.Second
+
+// memoryRetryInterval is defaultMemoryRetryInterval; a variable so tests need
+// no real 30 s waits.
+var memoryRetryInterval = defaultMemoryRetryInterval
+
+// helperMemoryModulesNeeded decides whether Run retries the helper fetch; a
+// variable so tests can drive the retry on a host that is not unprivileged
+// Linux.
+var helperMemoryModulesNeeded = collector.HelperMemoryModulesNeeded
+
 // Agent composes the host + GPU collectors, an optional scraper, and a poster
 // into a periodic telemetry loop.
 type Agent struct {
@@ -823,6 +850,13 @@ type Agent struct {
 	poster  poster
 	report  reporter
 	hw      *sample.SystemReport
+	// hwOpts carries the settings the hardware inventory depends on.
+	hwOpts collector.HardwareOptions
+	// fetchMemoryModules asks the privileged helper for the memory modules;
+	// nil without a helper socket. Run uses it to fill a.hw when the helper
+	// was not ready at startup. a.hw is touched only on Run's goroutine, so
+	// the retry runs there too.
+	fetchMemoryModules func(context.Context) ([]sample.MemoryModule, error)
 
 	// certSync is the Phase 2 certificate installer/syncer; nil when the
 	// caller has none to offer (every pre-Phase-2 test construction in this
@@ -1090,6 +1124,13 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		gatewayFeatures: d.GatewayFeatures,
 		now:             time.Now,
 		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries, wslProbeConfig{Exe: cfg.RuntimeWSLExe, User: cfg.RuntimeWSLUser}),
+		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket},
+	}
+	if cfg.HelperSocket != "" {
+		helper := collector.NewHelperHTTPClient(cfg.HelperSocket)
+		a.fetchMemoryModules = func(ctx context.Context) ([]sample.MemoryModule, error) {
+			return collector.FetchHelperMemoryModules(ctx, helper)
+		}
 	}
 	if r, ok := d.Poster.(reporter); ok {
 		a.report = r
@@ -1186,7 +1227,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.binaries != nil {
 		go a.binaries.run(ctx)
 	}
-	hw := collectHardware(ctx, a.gpus)
+	hw := collectHardware(ctx, a.gpus, a.hwOpts)
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
 	// so the pinned/force_running specs it admits at boot already see their
@@ -1238,6 +1279,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	if logTicker != nil {
 		defer logTicker.Stop()
 	}
+	memRetry, memRetryC := a.newMemoryRetryTicker()
+	if memRetry != nil {
+		defer memRetry.Stop()
+	}
 
 	for {
 		select {
@@ -1274,6 +1319,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.runtimeLogPort.SetLogWatch(data)
 		case <-logTickerC:
 			a.flushRuntimeLogs(ctx)
+		case <-memRetryC:
+			if a.retryMemoryModules(ctx) {
+				memRetry.Stop()
+				memRetryC = nil
+			}
 		case <-a.runtimeTransitions:
 			// A member that started, stopped or began draining gains or
 			// loses its relay first: a drain must close the head's session
@@ -1594,10 +1644,47 @@ func (a *Agent) seedCertReport() {
 }
 
 // collectHardware gathers the static inventory once, bounded by hardwareCollectBudget.
-func collectHardware(ctx context.Context, gpus []collector.GPUCollector) sample.SystemReport {
+func collectHardware(ctx context.Context, gpus []collector.GPUCollector, opts collector.HardwareOptions) sample.SystemReport {
 	cctx, cancel := context.WithTimeout(ctx, hardwareCollectBudget)
 	defer cancel()
-	return collector.CollectHardware(cctx, gpus, Version)
+	return collector.CollectHardware(cctx, gpus, Version, opts)
+}
+
+// newMemoryRetryTicker starts the helper memory-module retry when the startup
+// inventory lacks modules the helper could supply; nil ticker and channel
+// otherwise (a nil channel never fires in Run's select).
+func (a *Agent) newMemoryRetryTicker() (*time.Ticker, <-chan time.Time) {
+	if a.fetchMemoryModules == nil || a.hw == nil || !helperMemoryModulesNeeded(*a.hw, a.hwOpts) {
+		return nil, nil
+	}
+	t := time.NewTicker(memoryRetryInterval)
+	return t, t.C
+}
+
+// retryMemoryModules fetches the memory modules from the helper once and
+// reports whether the retry is done. A failure is logged at Debug (the helper
+// may not be installed) and keeps the retry going. A success ends it; when it
+// carries modules they replace the cached inventory's, which is sent again.
+func (a *Agent) retryMemoryModules(ctx context.Context) bool {
+	fctx, cancel := context.WithTimeout(ctx, memoryRetryTimeout)
+	defer cancel()
+	mods, err := a.fetchMemoryModules(fctx)
+	if err != nil {
+		slog.Debug("helper memory modules not available yet", "err", err)
+		return false
+	}
+	if len(mods) == 0 {
+		slog.Info("helper reports no memory modules")
+		return true
+	}
+	// A fresh copy rather than an in-place edit: the reporter got the old
+	// pointer and must not see it change under it.
+	hw := *a.hw
+	hw.Memory.Modules = mods
+	a.hw = &hw
+	slog.Info("memory modules received from the helper", "modules", len(mods))
+	a.sendSystemReport(ctx)
+	return true
 }
 
 // sendSystemReport pushes the cached inventory (best-effort; a failure is logged).

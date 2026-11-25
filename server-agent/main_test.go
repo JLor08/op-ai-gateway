@@ -149,3 +149,10 @@ func TestResolvedConfigAttrsNeverCarryToken(t *testing.T) {
 		}
 	}
 }
+
+func TestResolvedConfigAttrsCarryHelperSocket(t *testing.T) {
+	attrs := fmt.Sprint(resolvedConfigAttrs(config.Config{HelperSocket: "/run/op-agent-helper/agent.sock"}))
+	if !strings.Contains(attrs, "helper_socket /run/op-agent-helper/agent.sock") {
+		t.Fatalf("attrs %q lack helper_socket", attrs)
+	}
+}
