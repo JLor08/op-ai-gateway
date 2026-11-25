@@ -86,29 +86,28 @@ func (c *helperPowerCollector) Collect(ctx context.Context) (*float64, *float64,
 	if body.ReadNS != 0 && body.ReadNS == c.prevNS {
 		return nil, nil, nil // the helper's cached reading: nothing new, keep the baselines
 	}
-	now := c.now()
-	cur := make(map[string]raplReading, len(body.Domains))
+	cur, cpu, psys := c.sumWatts(body.Domains, body.ReadNS, c.now())
+	c.prev = cur // zones absent from this response lose their baseline
+	c.prevNS = body.ReadNS
+	return cpu, psys, nil
+}
+
+// sumWatts records the current reading of every package* and psys zone and
+// derives watts for the zones that have a baseline: package zones sum to cpu,
+// psys is system.
+func (c *helperPowerCollector) sumWatts(domains []HelperRAPLDomain, readNS uint64, now time.Time) (cur map[string]raplReading, cpu, psys *float64) {
+	cur = make(map[string]raplReading, len(domains))
 	var pkgWatts float64
 	havePkg := false
-	var psysWatts *float64
-	for _, d := range body.Domains {
+	for _, d := range domains {
 		isPkg := strings.HasPrefix(d.Name, "package")
-		isPsys := d.Name == "psys"
-		if !isPkg && !isPsys {
+		if !isPkg && d.Name != "psys" {
 			continue
 		}
 		r := raplReading{energyUJ: d.EnergyUJ, maxUJ: d.MaxEnergyRangeUJ, at: now}
 		cur[d.Zone] = r
-		prev, seen := c.prev[d.Zone]
-		if !seen {
-			continue
-		}
-		dt := c.deltaSeconds(prev.at, now, body.ReadNS)
-		if dt <= 0 {
-			continue
-		}
-		watts := raplDeltaJoules(prev.energyUJ, r.energyUJ, prev.maxUJ) / dt
-		if watts < 0 {
+		watts, ok := c.zoneWatts(d.Zone, r, readNS)
+		if !ok {
 			continue
 		}
 		if isPkg {
@@ -116,17 +115,28 @@ func (c *helperPowerCollector) Collect(ctx context.Context) (*float64, *float64,
 			havePkg = true
 		} else {
 			w := watts
-			psysWatts = &w
+			psys = &w
 		}
 	}
-	c.prev = cur // zones absent from this response lose their baseline
-	c.prevNS = body.ReadNS
-
-	var cpu *float64
 	if havePkg {
 		cpu = &pkgWatts
 	}
-	return cpu, psysWatts, nil
+	return cur, cpu, psys
+}
+
+// zoneWatts is the average power of one zone since its baseline; ok is false
+// without a baseline, a positive time delta or a non-negative rate.
+func (c *helperPowerCollector) zoneWatts(zone string, r raplReading, readNS uint64) (float64, bool) {
+	prev, seen := c.prev[zone]
+	if !seen {
+		return 0, false
+	}
+	dt := c.deltaSeconds(prev.at, r.at, readNS)
+	if dt <= 0 {
+		return 0, false
+	}
+	watts := raplDeltaJoules(prev.energyUJ, r.energyUJ, prev.maxUJ) / dt
+	return watts, watts >= 0
 }
 
 // deltaSeconds is the time between the previous and the current reading: from
