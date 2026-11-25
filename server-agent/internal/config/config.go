@@ -150,6 +150,12 @@ type Config struct {
 	// of the host CPU package power. Empty = the platform default. Linux only;
 	// ignored elsewhere.
 	PowercapRoot string
+	// HostpowerURL optionally points the guest at the hostpower HTTP endpoint on
+	// the Proxmox host (e.g. http://<host>:9873). Empty disables it.
+	HostpowerURL string
+	// HostpowerToken is the optional per-VM bearer token for that endpoint
+	// (token mode); empty selects MAC mode. A secret: never logged.
+	HostpowerToken string
 
 	// CertMode selects the certificate behavior: CertModeOff (default, never
 	// fetch), CertModeFiles (write files + run CertReloadCommand on change), or
@@ -451,6 +457,8 @@ type fileConfig struct {
 	ModelStatusFormat    string       `json:"model_status_format"`
 	LHMURL               string       `json:"lhm_url"`
 	PowercapRoot         string       `json:"powercap_root"`
+	HostpowerURL         string       `json:"hostpower_url"`
+	HostpowerToken       string       `json:"hostpower_token"`
 	CertMode             string       `json:"cert_mode"`
 	CertDir              string       `json:"cert_dir"`
 	CertReloadCommand    string       `json:"cert_reload_command"`
@@ -503,6 +511,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	modelStatusURL := fs.String("model-status-url", "", "optional model-status URL to poll for loaded models (env OP_AGENT_MODEL_STATUS_URL / config model_status_url)")
 	modelStatusFormat := fs.String("model-status-format", "", "model-status response format: openai|llama_swap|llama_cpp|litellm|auto (env OP_AGENT_MODEL_STATUS_FORMAT / config model_status_format)")
 	powercapRoot := fs.String("powercap-root", "", "optional powercap sysfs root for CPU power, e.g. a Proxmox hostpower virtiofs mount (env OP_AGENT_POWERCAP_ROOT / config powercap_root); Linux only, ignored elsewhere")
+	hostpowerURL := fs.String("hostpower-url", "", "optional hostpower HTTP endpoint on the Proxmox host, e.g. http://<host>:9873 (env OP_AGENT_HOSTPOWER_URL / config hostpower_url)")
+	hostpowerToken := fs.String("hostpower-token", "", "optional per-VM token for the hostpower HTTP endpoint (secret; env OP_AGENT_HOSTPOWER_TOKEN / config hostpower_token)")
 	lhmURL := fs.String("lhm-url", "", "optional LibreHardwareMonitor /data.json URL for CPU/system power (env OP_AGENT_LHM_URL / config lhm_url)")
 	certMode := fs.String("cert-mode", "", "certificate mode: off|files|proxy (proxy also runs the agent-side TLS proxy) (env OP_AGENT_CERT_MODE / config cert_mode)")
 	certDir := fs.String("cert-dir", "", "directory certificate files are written into; required unless cert-mode=off (env OP_AGENT_CERT_DIR / config cert_dir)")
@@ -580,6 +590,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		ModelStatusFormat:    strings.TrimSpace(resolveStr("model-status-format", *modelStatusFormat, "OP_AGENT_MODEL_STATUS_FORMAT", file.ModelStatusFormat)),
 		LHMURL:               strings.TrimSpace(resolveStr("lhm-url", *lhmURL, "OP_AGENT_LHM_URL", file.LHMURL)),
 		PowercapRoot:         strings.TrimSpace(resolveStr("powercap-root", *powercapRoot, "OP_AGENT_POWERCAP_ROOT", file.PowercapRoot)),
+		HostpowerURL:         strings.TrimSpace(resolveStr("hostpower-url", *hostpowerURL, "OP_AGENT_HOSTPOWER_URL", file.HostpowerURL)),
+		HostpowerToken:       strings.TrimSpace(resolveStr("hostpower-token", *hostpowerToken, "OP_AGENT_HOSTPOWER_TOKEN", file.HostpowerToken)),
 		CertMode:             strings.ToLower(strings.TrimSpace(resolveStr("cert-mode", *certMode, "OP_AGENT_CERT_MODE", file.CertMode))),
 		CertDir:              strings.TrimSpace(resolveStr("cert-dir", *certDir, "OP_AGENT_CERT_DIR", file.CertDir)),
 		CertReloadCommand:    strings.TrimSpace(resolveStr("cert-reload-command", *certReloadCommand, "OP_AGENT_CERT_RELOAD_COMMAND", file.CertReloadCommand)),

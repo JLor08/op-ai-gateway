@@ -44,6 +44,15 @@
   // Empty = the platform default (/sys/class/powercap). Linux only.
   "powercap_root": "",
 
+  // Optional hostpower HTTP endpoint on the Proxmox host (e.g.
+  // http://<host>:9873). Empty disables it. Without a token the host
+  // identifies this VM by its network port (MAC mode).
+  "hostpower_url": "",
+
+  // Optional per-VM token for the hostpower HTTP endpoint (token mode).
+  // Create it on the host with: server-agent hostpower token create <vmid>
+  "hostpower_token": "",
+
   // Certificate installation mode: "off" (default, never fetch a certificate),
   // "files" (write fullchain/cert/chain/ca/privkey into cert_dir and run
   // cert_reload_command on change), or "proxy" (everything "files" does, and

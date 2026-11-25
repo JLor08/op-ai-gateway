@@ -1940,3 +1940,38 @@ func TestRuntimeAllowlistWarningsLookAlikes(t *testing.T) {
 		t.Errorf("containment clause wrong: %v", w)
 	}
 }
+
+func TestHostpowerOptionsResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	env := func(k string) string {
+		switch k {
+		case "OP_AGENT_HOSTPOWER_URL":
+			return " http://192.0.2.1:9873 "
+		case "OP_AGENT_HOSTPOWER_TOKEN":
+			return " ophp_env "
+		}
+		return ""
+	}
+
+	if cfg, err := Load(base, noenv); err != nil || cfg.HostpowerURL != "" || cfg.HostpowerToken != "" {
+		t.Fatalf("defaults = %q/%q (err %v), want empty", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	if cfg, err := Load(append([]string{"-hostpower-url=http://flag:1", "-hostpower-token=ophp_flag"}, base...), noenv); err != nil || cfg.HostpowerURL != "http://flag:1" || cfg.HostpowerToken != "ophp_flag" {
+		t.Fatalf("flags = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	if cfg, err := Load(base, env); err != nil || cfg.HostpowerURL != "http://192.0.2.1:9873" || cfg.HostpowerToken != "ophp_env" {
+		t.Fatalf("env = %q/%q (err %v), want trimmed values", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","hostpower_url":" http://file:2 ","hostpower_token":"ophp_file"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.HostpowerURL != "http://file:2" || cfg.HostpowerToken != "ophp_file" {
+		t.Fatalf("file = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	flags := []string{"-config", path, "-hostpower-url=http://flag:1", "-hostpower-token=ophp_flag"}
+	if cfg, err := Load(flags, env); err != nil || cfg.HostpowerURL != "http://flag:1" || cfg.HostpowerToken != "ophp_flag" {
+		t.Fatalf("flag over env/file = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.HostpowerURL != "http://192.0.2.1:9873" || cfg.HostpowerToken != "ophp_env" {
+		t.Fatalf("env over file = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+}
