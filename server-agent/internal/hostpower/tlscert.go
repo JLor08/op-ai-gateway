@@ -48,12 +48,13 @@ var writeFileAtomic = writePrivateFileAtomic
 // they are loaded as a pair (a key/certificate mismatch is an error, a key file
 // readable by group or others is only warned about). When neither exists a
 // self-signed ECDSA P-256 certificate is generated and written (key first) with
-// mode 0600 into 0700 parent directories; created reports this case. Exactly
-// one existing file, or a path that is not a regular file, is an error and
-// nothing is written. Existing paths may be symlinks to regular files (an
-// operator's own material, such as a certbot live/ link); a dangling symlink or
-// one to anything else is an error, and only two absent paths (per Lstat) lead
-// to generation. A nil log means slog.Default().
+// mode 0600; missing parent directories are created 0700, existing ones keep
+// their mode. created reports this case. Exactly one existing file, or a path
+// that is not a regular file, is an error and nothing is written. Existing
+// paths may be symlinks to regular files (an operator's own material, such as
+// a certbot live/ link); a dangling symlink or one to anything else is an
+// error, and only two absent paths (per Lstat) lead to generation. A nil log
+// means slog.Default().
 func LoadOrCreateCert(certPath, keyPath string, now func() time.Time, log *slog.Logger) (cert tls.Certificate, created bool, err error) {
 	if log == nil {
 		log = slog.Default()
@@ -152,8 +153,11 @@ func generateCert(certPath, keyPath string, now time.Time) (tls.Certificate, err
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 
+	// Missing parents are created 0700; an existing one keeps its mode, since
+	// operator paths may sit in a shared directory (/etc/ssl/certs) that must
+	// stay readable. The files themselves are 0600 either way.
 	for _, dir := range []string{filepath.Dir(keyPath), filepath.Dir(certPath)} {
-		if err := ensurePrivateDir(dir); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return tls.Certificate{}, err
 		}
 	}

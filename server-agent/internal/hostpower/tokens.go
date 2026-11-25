@@ -118,8 +118,9 @@ func ensurePrivateDir(dir string) error {
 }
 
 // writePrivateFileAtomic replaces path with data through a temp file in the
-// same directory that is chmod'ed to 0600 before the rename, so readers see
-// either the old or the new content and never a group/other-readable file.
+// same directory that is synced and chmod'ed to 0600 before the rename, so
+// readers see either the old or the new content and never a group/other-
+// readable file; the directory is synced after the rename.
 func writePrivateFileAtomic(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
@@ -128,6 +129,11 @@ func writePrivateFileAtomic(path string, data []byte) error {
 	name := tmp.Name()
 	cleanup := func() { _ = os.Remove(name) }
 	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		cleanup()
 		return err
@@ -144,7 +150,20 @@ func writePrivateFileAtomic(path string, data []byte) error {
 		cleanup()
 		return err
 	}
+	syncDir(filepath.Dir(path))
 	return nil
+}
+
+// syncDir flushes dir's entries so a completed rename survives a crash. It is
+// best-effort: some platforms (Windows) cannot sync a directory, and the file
+// content itself was already synced.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // CreateToken creates or replaces vmid's token and returns the plaintext,

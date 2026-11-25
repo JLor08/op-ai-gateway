@@ -244,11 +244,14 @@ func TestLoadOrCreateCertNotRegular(t *testing.T) {
 	}
 }
 
-func TestLoadOrCreateCertTightensParent(t *testing.T) {
+// An existing parent keeps its mode: operator paths such as
+// /etc/ssl/certs/op.crt must not re-mode a shared directory (the host's CA
+// bundle). The generated files are 0600 regardless.
+func TestLoadOrCreateCertKeepsExistingParentMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX mode bits")
 	}
-	dir := filepath.Join(t.TempDir(), "state")
+	dir := filepath.Join(t.TempDir(), "certs")
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -263,8 +266,17 @@ func TestLoadOrCreateCertTightensParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if di.Mode().Perm() != 0o700 {
-		t.Fatalf("dir mode = %v, want 0700", di.Mode().Perm())
+	if di.Mode().Perm() != 0o755 {
+		t.Fatalf("dir mode = %v, want 0755 (unchanged)", di.Mode().Perm())
+	}
+	for _, p := range []string{certPath, keyPath} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Errorf("%s mode = %v, want 0600", p, fi.Mode().Perm())
+		}
 	}
 }
 
