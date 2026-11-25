@@ -26,6 +26,7 @@
 - New ADR number: the next free one on main (currently ADR-116; recheck).
 - Repo-facing text English; no LAN host names, VM names or IPs (use `<vmid>`, `<node>`, `192.0.2.x` documentation addresses).
 - CI gates: `golangci-lint fmt --diff` + `golangci-lint run` per module (`make fmt` then `git diff --exit-code`, `make lint-go`), frontend `npm run format:check`, `make lint-docs`, archtest, README config guard tests.
+- Follow-up seam (spec §4.3/§4.6): a later branch adds a local privileged helper over a Unix socket. Keep the server on a caller-created `net.Listener`, the caller identity in one internal step of the handler, the guest request URL built in one function and the guest client built in `NewHostpowerHTTPClient` only — no Unix-socket code in this branch.
 - `docs/superpowers/**` is branch-local; removed before the PR.
 
 ## Review Focus

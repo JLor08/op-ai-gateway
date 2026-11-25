@@ -64,6 +64,10 @@ Non-goals (this version)
   (token mode covers them).
 - LXC containers, macOS guests (the guest collector builds everywhere but is
   documented for Linux and Windows only).
+- A local privileged helper for bare-metal Linux (the root part serving RAPL
+  and `dmidecode` data over a Unix socket to an unprivileged agent). Agreed
+  as a separate follow-up branch on top of this one. This branch must not
+  preclude it (see §4.3 and §4.6 "Follow-up seam").
 - PVE clusters and live migration. The operator runs a single PVE host.
   Token store, counter and guest URL are per host; after a migration to
   another node the HTTP transports report null until the guest's URL points
@@ -200,6 +204,11 @@ Rules:
 - The handler reads the counter from the service under its existing mutex
   (a snapshot accessor; no map escapes the lock).
 
+Follow-up seam (host): the server is started on a `net.Listener` the caller
+creates, and the handler obtains the caller's identity through one internal
+step (token, else MAC) that a later Unix-socket peer-credential identity can
+join without restructuring the handler.
+
 ### 4.4 MAC mode: identifying the VM from the network
 
 For a request from remote address `ip` (IPv4 only; an IPv4-mapped IPv6
@@ -282,6 +291,9 @@ New agent options, all three forms like the existing ones:
   First successful response → nil (no delta yet).
 - Any error, non-200, unparsable body, or a changed `vmid` between responses
   → nil and drop the previous reading (re-baseline next time).
+- Follow-up seam (guest): the request URL is built in one place from
+  `hostpower_url`, and the HTTP client is constructed in one function, so a
+  later `unix://` scheme (custom dialer) is a local change.
 - The token is a secret: never logged; the startup diagnostic logs only
   `hostpower_url` and whether a token is set.
 - The gateway's downloadable agent-config templates (Go + TSX) and the shared
