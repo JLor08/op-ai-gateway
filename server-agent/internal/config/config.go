@@ -747,6 +747,14 @@ func hostpowerWarnings(cfg Config) []string {
 	return w
 }
 
+// ValidHostpowerFingerprint reports whether s is a SHA-256 certificate
+// fingerprint as hostpower_tls_fingerprint accepts it (64 hex digits, ':'
+// separators allowed, any case, surrounding whitespace ignored).
+func ValidHostpowerFingerprint(s string) bool {
+	_, ok := normalizeHostpowerFingerprint(s)
+	return ok
+}
+
 // normalizeHostpowerFingerprint trims s, drops ':' separators and lowercases
 // it; ok is true only for exactly 64 hex digits. It mirrors
 // collector.ParseHostpowerFingerprint (config may not import collector).

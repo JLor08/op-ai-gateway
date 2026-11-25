@@ -2184,6 +2184,9 @@ func TestNormalizeHostpowerFingerprint(t *testing.T) {
 		if ok != tc.ok || (ok && got != tc.want) {
 			t.Errorf("normalize(%q) = %q,%v want %q,%v", tc.in, got, ok, tc.want, tc.ok)
 		}
+		if v := ValidHostpowerFingerprint(tc.in); v != tc.ok {
+			t.Errorf("ValidHostpowerFingerprint(%q) = %v, want %v", tc.in, v, tc.ok)
+		}
 	}
 }
 
