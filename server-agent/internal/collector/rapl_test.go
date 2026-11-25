@@ -170,3 +170,28 @@ func TestRAPLCollectorCustomRootAppearsLater(t *testing.T) {
 		t.Fatalf("CPU watts = %v, want 15", *cpu)
 	}
 }
+
+// TestRAPLZeroRangeCounterDecreaseIsZeroWatts pins the guest-side behaviour the
+// hostpower service relies on by publishing max_energy_range_uj = 0: a counter
+// that goes backwards (a host-side regression) reads as 0 W, never as a
+// near-full-range wraparound.
+func TestRAPLZeroRangeCounterDecreaseIsZeroWatts(t *testing.T) {
+	root := t.TempDir()
+	pkg := filepath.Join(root, "intel-rapl:0")
+	writeSysfs(t, pkg, "name", "package-0\n")
+	writeSysfs(t, pkg, "max_energy_range_uj", "0\n")
+	writeSysfs(t, pkg, "energy_uj", "5000000\n")
+
+	c := newRAPLCollector(root, filepath.Join(root, "nohwmon"))
+	base := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return base }
+	if _, _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("seed Collect: %v", err)
+	}
+	writeSysfs(t, pkg, "energy_uj", "1000000\n")
+	c.now = func() time.Time { return base.Add(time.Second) }
+	cpu, _, _ := c.Collect(context.Background())
+	if cpu == nil || *cpu != 0 {
+		t.Fatalf("decreasing counter with range 0: CPU watts = %v, want 0", cpu)
+	}
+}
