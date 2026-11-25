@@ -122,6 +122,10 @@ type PowerConfig struct {
 	HostpowerURL string
 	// HostpowerToken is that endpoint's optional per-VM token (a secret).
 	HostpowerToken string
+	// HostpowerTLSFingerprint optionally pins the hostpower server certificate
+	// (SHA-256, as ParseHostpowerFingerprint accepts it) for an https://
+	// HostpowerURL. Empty: standard TLS verification. Not a secret.
+	HostpowerTLSFingerprint string
 	// HelperSocket is the privileged helper's Unix socket; empty disables the
 	// helper power source.
 	HelperSocket string
@@ -143,7 +147,7 @@ func nativeAndHostpowerSubs(cfg PowerConfig) []PowerCollector {
 		subs = append(subs, hw)
 	}
 	if hp := strings.TrimSpace(cfg.HostpowerURL); hp != "" {
-		subs = append(subs, newHostpowerHTTPCollector(hp, cfg.HostpowerToken, NewHostpowerHTTPClient()))
+		subs = append(subs, newHostpowerHTTPCollector(hp, cfg.HostpowerToken, cfg.HostpowerTLSFingerprint, nil))
 	}
 	return subs
 }

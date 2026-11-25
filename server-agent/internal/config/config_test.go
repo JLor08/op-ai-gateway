@@ -5,6 +5,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -1984,7 +1985,7 @@ func TestLoadWarnsOnHostpowerOptions(t *testing.T) {
 		want             string // substring of the one warning; "" = no warning
 	}{
 		{"url only", "http://192.0.2.10:9873", "", ""},
-		{"https with token", "https://192.0.2.10:9873/", "ophp_tok", ""},
+		{"https with token", "https://192.0.2.10:9873/", "ophp_tok", "without hostpower_tls_fingerprint"},
 		{"nothing", "", "", ""},
 		{"token without url", "", "ophp_tok", "hostpower_url is empty"},
 		{"no scheme", "192.0.2.10:9873", "", "http:// or https://"},
@@ -2120,5 +2121,167 @@ func TestHelperSocketNonLinuxWarns(t *testing.T) {
 		if cfg, err := Load(args, noenv); err != nil || cfg.HelperSocket != "" || len(cfg.Warnings) != 0 {
 			t.Errorf("%v: HelperSocket = %q, warnings %v (err %v), want empty, none", args, cfg.HelperSocket, cfg.Warnings, err)
 		}
+	}
+}
+
+const testFP = "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12"
+
+func TestHostpowerTLSFingerprintResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	other := "11" + testFP[2:]
+	third := "22" + testFP[2:]
+	env := func(k string) string {
+		if k == "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT" {
+			return " " + strings.ToUpper(testFP) + " "
+		}
+		return ""
+	}
+	if cfg, err := Load(base, noenv); err != nil || cfg.HostpowerTLSFingerprint != "" {
+		t.Fatalf("default = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+	if cfg, err := Load(base, env); err != nil || cfg.HostpowerTLSFingerprint != testFP {
+		t.Fatalf("env = %q (err %v), want normalised", cfg.HostpowerTLSFingerprint, err)
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","hostpower_tls_fingerprint":"`+other+`"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.HostpowerTLSFingerprint != other {
+		t.Fatalf("file = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.HostpowerTLSFingerprint != testFP {
+		t.Fatalf("env over file = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+	if cfg, err := Load([]string{"-config", path, "-hostpower-tls-fingerprint=" + third}, env); err != nil || cfg.HostpowerTLSFingerprint != third {
+		t.Fatalf("flag over env/file = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+}
+
+// The accept/reject table mirrors collector.ParseHostpowerFingerprint (config
+// may not import collector).
+func TestNormalizeHostpowerFingerprint(t *testing.T) {
+	colon := ""
+	for i := 0; i < len(testFP); i += 2 {
+		if i > 0 {
+			colon += ":"
+		}
+		colon += testFP[i : i+2]
+	}
+	for _, tc := range []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{testFP, testFP, true},
+		{"  " + strings.ToUpper(testFP) + "\n", testFP, true},
+		{colon, testFP, true},
+		{strings.ToUpper(colon), testFP, true},
+		{"", "", false},
+		{testFP[:62], "", false},
+		{testFP + "00", "", false},
+		{"zz" + testFP[2:], "", false},
+		{"ab 12" + testFP[5:], "", false},
+	} {
+		got, ok := normalizeHostpowerFingerprint(tc.in)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("normalize(%q) = %q,%v want %q,%v", tc.in, got, ok, tc.want, tc.ok)
+		}
+		if v := ValidHostpowerFingerprint(tc.in); v != tc.ok {
+			t.Errorf("ValidHostpowerFingerprint(%q) = %v, want %v", tc.in, v, tc.ok)
+		}
+	}
+}
+
+func TestNormalizeHostpowerFingerprintMatchesCollector(t *testing.T) {
+	colon := func(h string) string {
+		var parts []string
+		for i := 0; i < len(h); i += 2 {
+			parts = append(parts, h[i:i+2])
+		}
+		return strings.Join(parts, ":")
+	}
+	mixed := strings.ToUpper(testFP[:32]) + testFP[32:]
+	for _, in := range []string{
+		testFP,
+		"  " + strings.ToUpper(testFP) + "\t\n",
+		strings.ToUpper(colon(testFP)),
+		colon(testFP),
+		mixed,
+		colon(mixed),
+		"",
+		"   ",
+		testFP[:63],
+		testFP + "0",
+		"zz" + testFP[2:],
+		testFP[:10] + " " + testFP[10:],
+		"sha256:" + testFP,
+		"sha256:" + colon(testFP),
+		"a:" + testFP[1:],
+		":" + testFP,
+		testFP + ":",
+		strings.Repeat(":", 5) + testFP,
+		colon(testFP[:62]),
+	} {
+		got, ok := normalizeHostpowerFingerprint(in)
+		parsed, err := collector.ParseHostpowerFingerprint(in)
+		if ok != (err == nil) {
+			t.Errorf("%q: config ok=%v, collector err=%v", in, ok, err)
+			continue
+		}
+		if ok && got != hex.EncodeToString(parsed) {
+			t.Errorf("%q: config %q, collector %q", in, got, hex.EncodeToString(parsed))
+		}
+	}
+}
+
+func TestLoadWarnsOnHostpowerTLSFingerprint(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	for _, tc := range []struct {
+		name, url, fp string
+		want          string
+	}{
+		{"https with pin", "https://192.0.2.10:9873", testFP, ""},
+		{"invalid format", "https://192.0.2.10:9873", "nothex", "is not a SHA-256 fingerprint"},
+		{"pin with http", "http://192.0.2.10:9873", testFP, "requires an https:// hostpower_url; every hostpower request will fail"},
+		{"pin without url", "", testFP, "hostpower_tls_fingerprint is set but hostpower_url is empty: the fingerprint is unused and the hostpower HTTP source stays off"},
+		{"https without pin", "https://192.0.2.10:9873", "", "hostpower_url is https:// without hostpower_tls_fingerprint: the certificate must chain to a system CA and match the host name; a self-signed hostpower certificate fails every request"},
+	} {
+		env := map[string]string{"OP_AGENT_HOSTPOWER_URL": tc.url, "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT": tc.fp}
+		cfg, err := Load(base, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if tc.want == "" {
+			if len(cfg.Warnings) != 0 {
+				t.Errorf("%s: Warnings = %v, want none", tc.name, cfg.Warnings)
+			}
+			continue
+		}
+		if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], tc.want) {
+			t.Errorf("%s: Warnings = %v, want one containing %q", tc.name, cfg.Warnings, tc.want)
+		}
+		for _, w := range cfg.Warnings {
+			if strings.Contains(w, "192.0.2.10") {
+				t.Errorf("%s: warning leaks the URL: %q", tc.name, w)
+			}
+		}
+	}
+}
+
+func TestHostpowerTLSFingerprintWarningCombinations(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(url, fp string) []string {
+		env := map[string]string{"OP_AGENT_HOSTPOWER_URL": url, "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT": fp}
+		cfg, err := Load(base, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Warnings
+	}
+	w := load("", "nothex")
+	if len(w) != 2 || !strings.Contains(w[0], "is not a SHA-256 fingerprint") || !strings.Contains(w[1], "fingerprint is unused") {
+		t.Errorf("malformed pin + empty URL = %v, want the invalid-format and the unused warning", w)
+	}
+	w = load("https://192.0.2.10:9873", "nothex")
+	if len(w) != 1 || strings.Contains(w[0], "without hostpower_tls_fingerprint") {
+		t.Errorf("invalid pin + https URL = %v, want only the invalid-format warning", w)
 	}
 }

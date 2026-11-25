@@ -476,7 +476,15 @@ import (
 // watts and memory modules from it. No wire change: the samples and system
 // reports keep their shape, so no agent.Features entry. This is the ONE bump
 // for the whole branch; later commits on it do not bump again.
-const Version = "0.24.0"
+//
+// 0.24.0 -> 0.25.0 is the single bump for hostpower TLS. MINOR: the hostpower
+// service gains -tls, -tls-cert and -tls-key (TLS 1.3 with a self-generated or
+// operator-provided certificate) and a `hostpower tls fingerprint` subcommand;
+// the agent gains the hostpower_tls_fingerprint option, which pins the
+// hostpower endpoint's certificate by SHA-256. No wire change, so no
+// agent.Features entry. This is the ONE bump for the whole branch; later
+// commits on it do not bump again.
+const Version = "0.25.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

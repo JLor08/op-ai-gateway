@@ -39,9 +39,20 @@ type HostpowerEnergy struct {
 // NewHostpowerHTTPClient returns the HTTP client for the guest collector: a short
 // timeout and its own transport that ignores proxy environment variables (the host
 // is a link-local/LAN peer; a proxy must never see the bearer token) and never
-// follows redirects. Other
-// transport defaults, including TLS, are kept.
-func NewHostpowerHTTPClient() *http.Client { return newLocalHTTPClient(nil) }
+// follows redirects.
+//
+// A nil pin keeps the transport's TLS defaults (verification against the system
+// roots and the URL host name). A non-nil pin (a 32-byte SHA-256 digest from
+// ParseHostpowerFingerprint) requires TLS 1.3 and accepts exactly the server
+// whose leaf certificate has that digest; chain, name and validity are not
+// checked, and a mismatch fails the handshake with a *HostpowerPinError.
+func NewHostpowerHTTPClient(pin []byte) *http.Client {
+	c := newLocalHTTPClient(nil)
+	if pin != nil {
+		c.Transport.(*http.Transport).TLSClientConfig = hostpowerPinnedTLSConfig(pin)
+	}
+	return c
+}
 
 // newLocalHTTPClient builds the shared client: short timeout, a private
 // transport without proxy support, no redirects. A non-nil dial replaces the
@@ -72,10 +83,13 @@ func hostpowerEnergyURL(baseURL string) string {
 // Logging: every failed request at Debug with the URL and the status code or
 // error; the VM ID the host serves at Info on the first success and whenever
 // it changes, so a misattribution (MAC mode behind a NAT or proxy VM) is
-// visible. The token and request headers are never logged.
+// visible; a certificate pin mismatch at Warn once when it begins (and again
+// after a success). The token and request headers are never logged.
 type hostpowerHTTPCollector struct {
 	baseURL string
 	token   string
+	pin     []byte // nil: no certificate pin configured
+	pinErr  error  // a configured fingerprint that does not parse: every fetch fails
 	client  *http.Client
 	now     func() time.Time
 	log     *slog.Logger // nil: slog.Default() at the time of logging
@@ -85,14 +99,28 @@ type hostpowerHTTPCollector struct {
 	prev       HostpowerEnergy
 	at         time.Time
 	loggedVMID string // the VM ID last logged at Info; empty before the first success
+	pinWarned  bool   // a pin mismatch was logged at Warn since the last success
 }
 
-// newHostpowerHTTPCollector builds the collector; a nil client gets the default.
-func newHostpowerHTTPCollector(baseURL, token string, client *http.Client) *hostpowerHTTPCollector {
-	if client == nil {
-		client = NewHostpowerHTTPClient()
+// newHostpowerHTTPCollector builds the collector. fingerprint is the configured
+// hostpower_tls_fingerprint as given (empty: no pin); it is parsed once, and an
+// invalid value makes every fetch fail (fail closed). A nil client gets
+// NewHostpowerHTTPClient with the parsed pin.
+func newHostpowerHTTPCollector(baseURL, token, fingerprint string, client *http.Client) *hostpowerHTTPCollector {
+	c := &hostpowerHTTPCollector{baseURL: baseURL, token: token, now: time.Now}
+	if strings.TrimSpace(fingerprint) != "" {
+		pin, err := ParseHostpowerFingerprint(fingerprint)
+		if err != nil {
+			c.pinErr = errors.New("invalid hostpower_tls_fingerprint: " + err.Error())
+		} else {
+			c.pin = pin
+		}
 	}
-	return &hostpowerHTTPCollector{baseURL: baseURL, token: token, client: client, now: time.Now}
+	if client == nil {
+		client = NewHostpowerHTTPClient(c.pin)
+	}
+	c.client = client
+	return c
 }
 
 // Name identifies this collector.
@@ -110,9 +138,16 @@ func (c *hostpowerHTTPCollector) Collect(ctx context.Context) (*float64, *float6
 	cur, err := c.fetch(ctx)
 	if err != nil {
 		c.logger().Debug("hostpower: request failed", "url", c.logURL(), "err", err.Error())
+		var pe *HostpowerPinError
+		if errors.As(err, &pe) && !c.pinWarned {
+			c.pinWarned = true
+			c.logger().Warn("hostpower: server certificate does not match hostpower_tls_fingerprint",
+				"want", pe.Want, "got", pe.Got, "url", c.logURL())
+		}
 		c.have = false
 		return nil, nil, nil
 	}
+	c.pinWarned = false
 	if c.loggedVMID == "" || cur.VMID != c.loggedVMID {
 		c.loggedVMID = cur.VMID
 		c.logger().Info("hostpower: host serves this VM's counter", "vmid", cur.VMID, "url", c.logURL())
@@ -158,6 +193,16 @@ func (e *hostpowerStatusError) Error() string { return "status " + strconv.Itoa(
 // and no header is ever part of an error.
 func (c *hostpowerHTTPCollector) fetch(ctx context.Context) (HostpowerEnergy, error) {
 	var e HostpowerEnergy
+	if c.pinErr != nil {
+		return e, c.pinErr
+	}
+	if c.pin != nil {
+		// The pin shows TLS was intended: never send a clear-text request (and
+		// with it the token) to a non-https URL.
+		if u, err := url.Parse(c.baseURL); err != nil || u.Scheme != "https" {
+			return e, errors.New("hostpower_tls_fingerprint requires an https:// hostpower_url")
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hostpowerEnergyURL(c.baseURL), nil)
 	if err != nil {
 		return e, errors.New("invalid hostpower_url")

@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
 	"strings"
 	"testing"
@@ -154,5 +155,62 @@ func TestResolvedConfigAttrsCarryHelperSocket(t *testing.T) {
 	attrs := fmt.Sprint(resolvedConfigAttrs(config.Config{HelperSocket: "/run/op-agent-helper/agent.sock"}))
 	if !strings.Contains(attrs, "helper_socket /run/op-agent-helper/agent.sock") {
 		t.Fatalf("attrs %q lack helper_socket", attrs)
+	}
+}
+
+// attrValue returns the value logged under key in a resolvedConfigAttrs list.
+func attrValue(t *testing.T, attrs []any, key string) any {
+	t.Helper()
+	for i := 0; i+1 < len(attrs); i += 2 {
+		if attrs[i] == key {
+			return attrs[i+1]
+		}
+	}
+	t.Fatalf("attrs lack %q: %v", key, attrs)
+	return nil
+}
+
+// The fingerprint is not a secret, but an invalid value may be one pasted into
+// the wrong field (a hostpower token), so only a valid fingerprint is logged.
+func TestResolvedConfigAttrsHostpowerTLSFingerprint(t *testing.T) {
+	const valid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	cases := []struct{ in, want string }{
+		{valid, valid},
+		{"", ""},
+		{"ophp_secretsecretsecret", "(invalid)"},
+		{valid[:62], "(invalid)"},
+	}
+	for _, tc := range cases {
+		attrs := resolvedConfigAttrs(config.Config{HostpowerTLSFingerprint: tc.in})
+		if got := attrValue(t, attrs, "hostpower_tls_fingerprint"); got != tc.want {
+			t.Errorf("in %q: logged %q, want %q", tc.in, got, tc.want)
+		}
+		if tc.want == "(invalid)" && strings.Contains(fmt.Sprint(attrs), tc.in) {
+			t.Errorf("in %q: attrs leak the value: %v", tc.in, attrs)
+		}
+	}
+}
+
+// powerConfig is the only place main hands config values to the power
+// collectors; every field, the TLS pin included, must arrive unchanged.
+func TestPowerConfigForwardsEveryField(t *testing.T) {
+	cfg := config.Config{
+		LHMURL:                  "http://127.0.0.1:8085/data.json",
+		PowercapRoot:            "/sys/class/powercap",
+		HostpowerURL:            "https://192.0.2.10:9873",
+		HostpowerToken:          "ophp_token",
+		HostpowerTLSFingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		HelperSocket:            "/run/op-agent-helper/agent.sock",
+	}
+	want := collector.PowerConfig{
+		LHMURL:                  cfg.LHMURL,
+		PowercapRoot:            cfg.PowercapRoot,
+		HostpowerURL:            cfg.HostpowerURL,
+		HostpowerToken:          cfg.HostpowerToken,
+		HostpowerTLSFingerprint: cfg.HostpowerTLSFingerprint,
+		HelperSocket:            cfg.HelperSocket,
+	}
+	if got := powerConfig(cfg); got != want {
+		t.Fatalf("powerConfig = %+v, want %+v", got, want)
 	}
 }

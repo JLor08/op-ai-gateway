@@ -98,13 +98,7 @@ func main() {
 	// separately) so that, when LHMURL is configured, the power and temp
 	// collectors share one lhmSource and issue a single LHM /data.json
 	// GET+parse per telemetry cycle instead of two (SA-6).
-	power, temp := collector.DetectPowerAndTempCollectors(collector.PowerConfig{
-		LHMURL:         cfg.LHMURL,
-		PowercapRoot:   cfg.PowercapRoot,
-		HostpowerURL:   cfg.HostpowerURL,
-		HostpowerToken: cfg.HostpowerToken,
-		HelperSocket:   cfg.HelperSocket,
-	})
+	power, temp := collector.DetectPowerAndTempCollectors(powerConfig(cfg))
 
 	// certInstaller is always constructed, even with cert_mode=off: Sync and
 	// Report both no-op internally for that mode (no HTTP call, no disk
@@ -492,9 +486,33 @@ func runtimeGPUVendor(gpus []collector.GPUCollector) runtimectl.GPUVendor {
 	return runtimectl.GPUVendorNone
 }
 
+// powerConfig maps the resolved config onto the power collectors' settings.
+func powerConfig(cfg config.Config) collector.PowerConfig {
+	return collector.PowerConfig{
+		LHMURL:                  cfg.LHMURL,
+		PowercapRoot:            cfg.PowercapRoot,
+		HostpowerURL:            cfg.HostpowerURL,
+		HostpowerToken:          cfg.HostpowerToken,
+		HostpowerTLSFingerprint: cfg.HostpowerTLSFingerprint,
+		HelperSocket:            cfg.HelperSocket,
+	}
+}
+
+// loggedHostpowerFingerprint is the hostpower_tls_fingerprint value of the
+// resolved-config line: a valid fingerprint as is (Load has normalised it),
+// empty as empty, and anything else as "(invalid)", since an invalid value may
+// be a token pasted into the wrong field.
+func loggedHostpowerFingerprint(fp string) string {
+	if fp == "" || config.ValidHostpowerFingerprint(fp) {
+		return fp
+	}
+	return "(invalid)"
+}
+
 // resolvedConfigAttrs returns the config-derived attributes of the Debug
 // "resolved config" line. The hostpower token is a secret and is reported only
-// as hostpower_token_set; the value never reaches a log attribute.
+// as hostpower_token_set; the value never reaches a log attribute. An invalid
+// hostpower_tls_fingerprint is logged as "(invalid)".
 func resolvedConfigAttrs(cfg config.Config) []any {
 	return []any{
 		"gateway_url", cfg.GatewayURL,
@@ -505,6 +523,7 @@ func resolvedConfigAttrs(cfg config.Config) []any {
 		"powercap_root", cfg.PowercapRoot,
 		"hostpower_url", cfg.HostpowerURL,
 		"hostpower_token_set", cfg.HostpowerToken != "",
+		"hostpower_tls_fingerprint", loggedHostpowerFingerprint(cfg.HostpowerTLSFingerprint),
 		"helper_socket", cfg.HelperSocket,
 		"cert_mode", cfg.CertMode,
 		"cert_dir", cfg.CertDir,

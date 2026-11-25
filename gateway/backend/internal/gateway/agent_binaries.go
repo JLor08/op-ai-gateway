@@ -421,6 +421,11 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
   // Create it on the host with: server-agent hostpower token create <vmid>
   "hostpower_token": "",
 
+  // Optional SHA-256 fingerprint of the hostpower TLS certificate, used
+  // with an https:// hostpower_url. Print it on the host with:
+  // server-agent hostpower tls fingerprint
+  "hostpower_tls_fingerprint": "",
+
   // Unix socket of the privileged "server-agent helper" (Linux only), which
   // lets an agent that does not run as root report CPU/system watts and
   // memory modules like a root agent. Empty = /run/op-agent-helper/agent.sock

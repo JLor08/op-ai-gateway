@@ -5,12 +5,16 @@ package collector
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -108,7 +112,7 @@ type hpStepper struct {
 func newStepper(t *testing.T, token string) *hpStepper {
 	t.Helper()
 	f := newFakeHost(t)
-	c := newHostpowerHTTPCollector(f.srv.URL, token, NewHostpowerHTTPClient())
+	c := newHostpowerHTTPCollector(f.srv.URL, token, "", NewHostpowerHTTPClient(nil))
 	s := &hpStepper{t: t, f: f, c: c, base: time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)}
 	s.cur = s.base
 	c.now = func() time.Time { return s.cur }
@@ -144,14 +148,14 @@ func wantWatts(t *testing.T, label string, v *float64, want float64) {
 }
 
 func TestHostpowerHTTPIdentity(t *testing.T) {
-	c := newHostpowerHTTPCollector("", "", NewHostpowerHTTPClient())
+	c := newHostpowerHTTPCollector("", "", "", NewHostpowerHTTPClient(nil))
 	if c.Name() != "hostpower" {
 		t.Fatalf("Name() = %q", c.Name())
 	}
 	if c.Available() {
 		t.Fatal("Available() = true for an empty base URL")
 	}
-	nilClient := newHostpowerHTTPCollector("http://192.0.2.1:8080", "", nil)
+	nilClient := newHostpowerHTTPCollector("http://192.0.2.1:8080", "", "", nil)
 	if !nilClient.Available() {
 		t.Fatal("Available() = false for a set base URL")
 	}
@@ -238,7 +242,7 @@ func TestHostpowerHTTPSendsTokenOnlyWhenSet(t *testing.T) {
 func TestHostpowerHTTPBaseURLForms(t *testing.T) {
 	for suffix, want := range map[string]string{"/": "/v1/energy", "/hp": "/hp/v1/energy", "/hp/": "/hp/v1/energy", "": "/v1/energy"} {
 		f := newFakeHost(t)
-		c := newHostpowerHTTPCollector(f.srv.URL+suffix, "", NewHostpowerHTTPClient())
+		c := newHostpowerHTTPCollector(f.srv.URL+suffix, "", "", NewHostpowerHTTPClient(nil))
 		if _, _, err := c.Collect(context.Background()); err != nil {
 			t.Fatalf("Collect: %v", err)
 		}
@@ -292,7 +296,7 @@ func assertProxyFree(t *testing.T, c *http.Client) {
 }
 
 func TestHostpowerHTTPClientSettings(t *testing.T) {
-	assertProxyFree(t, NewHostpowerHTTPClient())
+	assertProxyFree(t, NewHostpowerHTTPClient(nil))
 }
 
 func TestHostpowerHTTPDoesNotFollowRedirects(t *testing.T) {
@@ -355,7 +359,7 @@ func TestHostpowerHTTPLogsFailuresWithoutToken(t *testing.T) {
 }
 
 func TestHostpowerHTTPLogsTransportError(t *testing.T) {
-	c := newHostpowerHTTPCollector("http://user:pw-secret@127.0.0.1:1", "ophp_guestsecret", NewHostpowerHTTPClient())
+	c := newHostpowerHTTPCollector("http://user:pw-secret@127.0.0.1:1", "ophp_guestsecret", "", NewHostpowerHTTPClient(nil))
 	logs := recordLogs(c)
 	if cpu, _, err := c.Collect(context.Background()); cpu != nil || err != nil {
 		t.Fatalf("Collect = %v, %v", cpu, err)
@@ -416,4 +420,201 @@ func TestHostpowerHTTPResponseWithoutVMIDIsFailure(t *testing.T) {
 	s.collect("novmid", 11_000_000, 11*time.Second)
 	cpu, _ := s.collect("ok", 12_000_000, 12*time.Second)
 	wantNil(t, "cpu after vmid-less body", cpu)
+}
+
+// tlsHost is an httptest TLS hostpower endpoint (self-signed certificate) that
+// counts handler hits and serves a counter growing 15 J per request.
+type tlsHost struct {
+	srv  *httptest.Server
+	mu   sync.Mutex
+	hits int
+}
+
+func newTLSHost(t *testing.T) *tlsHost {
+	t.Helper()
+	h := &tlsHost{}
+	h.srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		h.mu.Lock()
+		h.hits++
+		n := h.hits
+		h.mu.Unlock()
+		_, _ = fmt.Fprintf(w, `{"vmid":"100","energy_uj":%d}`, n*15_000_000)
+	}))
+	t.Cleanup(h.srv.Close)
+	return h
+}
+
+func (h *tlsHost) handlerHits() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.hits
+}
+
+// wrongPin is a well-formed fingerprint no test certificate has.
+const wrongPin = "00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF"
+
+// pinnedCollector builds a collector with a nil client (so it builds its own
+// pinned client) and a stepping clock.
+func pinnedCollector(baseURL, pin string) *hostpowerHTTPCollector {
+	c := newHostpowerHTTPCollector(baseURL, "ophp_pinsecret", pin, nil)
+	at := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { at = at.Add(time.Second); return at }
+	return c
+}
+
+func TestHostpowerHTTPPinnedMatch(t *testing.T) {
+	h := newTLSHost(t)
+	c := pinnedCollector(h.srv.URL, FormatHostpowerFingerprint(h.srv.Certificate().Raw))
+	if cpu, _, err := c.Collect(context.Background()); cpu != nil || err != nil {
+		t.Fatalf("first Collect = %v, %v; want nil, nil", cpu, err)
+	}
+	cpu, _, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	wantWatts(t, "pinned cpu", cpu, 15)
+}
+
+func TestHostpowerHTTPPinnedMismatch(t *testing.T) {
+	h := newTLSHost(t)
+	c := pinnedCollector(h.srv.URL, wrongPin)
+	logs := recordLogs(c)
+	warns := func() int {
+		return strings.Count(logs.String(), `level=WARN msg="hostpower: server certificate does not match hostpower_tls_fingerprint"`)
+	}
+
+	_, err := c.fetch(context.Background())
+	var pe *HostpowerPinError
+	if !errors.As(err, &pe) {
+		t.Fatalf("fetch error = %v (%T), want *HostpowerPinError", err, err)
+	}
+	actual := FormatHostpowerFingerprint(h.srv.Certificate().Raw)
+	if pe.Want != wrongPin || pe.Got != actual {
+		t.Fatalf("pin error = %+v, want Want=%s Got=%s", pe, wrongPin, actual)
+	}
+
+	for i := range 3 {
+		if cpu, _, err := c.Collect(context.Background()); cpu != nil || err != nil {
+			t.Fatalf("Collect %d = %v, %v; want nil, nil", i, cpu, err)
+		}
+	}
+	if n := warns(); n != 1 {
+		t.Fatalf("warns = %d over 3 mismatches, want 1:\n%s", n, logs.String())
+	}
+	out := logs.String()
+	for _, want := range []string{"want=" + wrongPin, "got=" + actual, "url=" + h.srv.URL + "/v1/energy"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("warn lacks %q:\n%s", want, out)
+		}
+	}
+	if n := strings.Count(out, `msg="hostpower: request failed"`); n != 3 {
+		t.Fatalf("Debug failures = %d, want 3 (one per attempt):\n%s", n, out)
+	}
+	if h.handlerHits() != 0 {
+		t.Fatalf("handler hits = %d on a pin mismatch, want 0", h.handlerHits())
+	}
+
+	// A success in between re-arms the warning.
+	mismatched := c.client
+	c.client = NewHostpowerHTTPClient(mustParsePin(t, actual))
+	if _, _, err := c.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect with the matching pin: %v", err)
+	}
+	c.client = mismatched
+	for range 2 {
+		_, _, _ = c.Collect(context.Background())
+	}
+	if n := warns(); n != 2 {
+		t.Fatalf("warns = %d after a success and two more mismatches, want 2:\n%s", n, logs.String())
+	}
+	if strings.Contains(logs.String(), "ophp_pinsecret") {
+		t.Fatalf("log leaks the token:\n%s", logs.String())
+	}
+}
+
+func mustParsePin(t *testing.T, s string) []byte {
+	t.Helper()
+	pin, err := ParseHostpowerFingerprint(s)
+	if err != nil {
+		t.Fatalf("ParseHostpowerFingerprint(%q): %v", s, err)
+	}
+	return pin
+}
+
+func TestHostpowerHTTPSWithoutPinUsesSystemRoots(t *testing.T) {
+	h := newTLSHost(t)
+	c := pinnedCollector(h.srv.URL, "")
+	_, err := c.fetch(context.Background())
+	if err == nil {
+		t.Fatal("fetch succeeded against a self-signed certificate without a pin")
+	}
+	var pe *HostpowerPinError
+	if errors.As(err, &pe) {
+		t.Fatalf("fetch error = %v, want a system-root verification error, not a pin error", err)
+	}
+	if h.handlerHits() != 0 {
+		t.Fatalf("handler hits = %d, want 0", h.handlerHits())
+	}
+}
+
+func TestHostpowerHTTPPinRequiresHTTPS(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accepts atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepts.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	c := pinnedCollector("http://"+ln.Addr().String(), wrongPin)
+	_, ferr := c.fetch(context.Background())
+	_ = ln.Close()
+	<-done
+	if ferr == nil || !strings.Contains(ferr.Error(), "hostpower_tls_fingerprint requires an https:// hostpower_url") {
+		t.Fatalf("fetch error = %v, want the https-required error", ferr)
+	}
+	if n := accepts.Load(); n != 0 {
+		t.Fatalf("accepts = %d, want 0 (nothing, and so no token, may leave in clear text)", n)
+	}
+}
+
+func TestHostpowerHTTPInvalidPinFailsClosed(t *testing.T) {
+	h := newTLSHost(t)
+	c := pinnedCollector(h.srv.URL, "nope")
+	for range 2 {
+		_, err := c.fetch(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "invalid hostpower_tls_fingerprint") {
+			t.Fatalf("fetch error = %v, want the invalid-fingerprint error", err)
+		}
+	}
+	if cpu, _, err := c.Collect(context.Background()); cpu != nil || err != nil {
+		t.Fatalf("Collect = %v, %v; want nil, nil", cpu, err)
+	}
+	if h.handlerHits() != 0 {
+		t.Fatalf("handler hits = %d, want 0", h.handlerHits())
+	}
+}
+
+func TestHostpowerHTTPPinnedClientSettings(t *testing.T) {
+	c := NewHostpowerHTTPClient(mustParsePin(t, wrongPin))
+	assertProxyFree(t, c)
+	if c.CheckRedirect == nil {
+		t.Fatal("pinned client follows redirects")
+	}
+	cfg := c.Transport.(*http.Transport).TLSClientConfig
+	if cfg == nil || cfg.MinVersion != tls.VersionTLS13 || cfg.VerifyConnection == nil {
+		t.Fatalf("TLSClientConfig = %#v, want TLS 1.3 minimum and a VerifyConnection pin check", cfg)
+	}
+	if plain := NewHostpowerHTTPClient(nil).Transport.(*http.Transport).TLSClientConfig; plain != nil && (plain.InsecureSkipVerify || plain.VerifyConnection != nil) {
+		t.Fatalf("unpinned TLSClientConfig = %#v, want default verification", plain)
+	}
 }

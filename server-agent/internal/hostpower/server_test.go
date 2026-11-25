@@ -5,6 +5,7 @@ package hostpower
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -467,6 +468,38 @@ func TestParseAuthModes(t *testing.T) {
 		if _, err := ParseAuthModes(in); err == nil {
 			t.Fatalf("%q: expected error", in)
 		}
+	}
+}
+
+// TLS handshake errors (scanners, mis-pinned guests) go to Debug so they cannot
+// flood the log; every other net/http server error, such as a recovered
+// handler panic or an accept retry, stays visible at Warn.
+func TestNewServerErrorLogRoutesByKind(t *testing.T) {
+	cases := []struct {
+		name, line, level string
+	}{
+		{"handshake", "http: TLS handshake error from 192.0.2.1:1234: EOF", "level=DEBUG"},
+		{"panic", "http: panic serving 192.0.2.1:1234: boom", "level=WARN"},
+		{"accept", "http: Accept error: too many open files; retrying in 5ms", "level=WARN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := slog.Default()
+			t.Cleanup(func() { slog.SetDefault(orig) })
+			var logs bytes.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			srv := NewServer("127.0.0.1:0", http.NotFoundHandler())
+			if srv.ErrorLog == nil {
+				t.Fatal("ErrorLog is nil")
+			}
+			srv.ErrorLog.Printf("%s", tc.line)
+			out := logs.String()
+			want := fmt.Sprintf("err=%q", tc.line)
+			if strings.Count(out, "\n") != 1 || !strings.Contains(out, tc.level) ||
+				!strings.Contains(out, `msg="hostpower: http server"`) || !strings.Contains(out, want) {
+				t.Fatalf("log = %q, want one %s record with %s", out, tc.level, want)
+			}
+		})
 	}
 }
 

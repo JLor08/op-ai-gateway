@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -338,7 +339,24 @@ func NewServer(listen string, h http.Handler) *http.Server {
 		WriteTimeout:      5 * time.Second,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    4096,
+		ErrorLog:          log.New(serverErrorWriter{log: slog.Default()}, "", 0),
 	}
 	srv.SetKeepAlivesEnabled(false)
 	return srv
+}
+
+// serverErrorWriter routes net/http's server error log into slog. TLS
+// handshake errors (scanners, guests with a wrong pin) go to Debug so they
+// cannot flood the log; everything else (a recovered handler panic, an accept
+// retry) is logged at Warn.
+type serverErrorWriter struct{ log *slog.Logger }
+
+func (w serverErrorWriter) Write(p []byte) (int, error) {
+	line := strings.TrimSpace(string(p))
+	level := slog.LevelWarn
+	if strings.Contains(line, "TLS handshake error") {
+		level = slog.LevelDebug
+	}
+	w.log.Log(context.Background(), level, "hostpower: http server", "err", line)
+	return len(p), nil
 }

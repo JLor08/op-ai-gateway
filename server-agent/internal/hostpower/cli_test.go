@@ -9,8 +9,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"op-ai-server-agent/internal/collector"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -162,15 +164,121 @@ func TestParseArgsBadAuth(t *testing.T) {
 	}
 }
 
+func TestParseArgsTLSNeedsListen(t *testing.T) {
+	_, err := ParseArgs([]string{"-tls"})
+	if err == nil || err.Error() != "hostpower: -tls needs -listen" {
+		t.Fatalf("err = %v", err)
+	}
+	var buf bytes.Buffer
+	if code := Main([]string{"-tls"}, io.Discard, &buf); code != 2 || !strings.Contains(buf.String(), "-tls needs -listen") {
+		t.Fatalf("code = %d stderr=%q", code, buf.String())
+	}
+	// The path flags alone are only read with -tls.
+	if _, err := ParseArgs([]string{"-tls-cert", "/x.crt", "-tls-key", "/x.key"}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestParseArgsTLSDefaults(t *testing.T) {
+	cfg, err := ParseArgs([]string{"-listen", "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS || cfg.TLSCert != DefaultTLSCertPath || cfg.TLSKey != DefaultTLSKeyPath {
+		t.Fatalf("without -tls: %+v", cfg)
+	}
+	cfg, err = ParseArgs([]string{"-listen", "127.0.0.1:0", "-tls"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TLS || cfg.TLSCert != DefaultTLSCertPath || cfg.TLSKey != DefaultTLSKeyPath {
+		t.Fatalf("-tls: %+v", cfg)
+	}
+	cfg, err = ParseArgs([]string{"-listen", "127.0.0.1:0", "-tls", "-tls-cert", "/x.crt", "-tls-key", "/x.key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TLS || cfg.TLSCert != "/x.crt" || cfg.TLSKey != "/x.key" {
+		t.Fatalf("custom paths: %+v", cfg)
+	}
+}
+
+// The out directory is the guests' virtiofs share: a TLS key or certificate in
+// it would be readable by every guest.
+func TestParseArgsTLSPathsOutsideOut(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	sibling := filepath.Join(filepath.Dir(out), "out-tls")
+	cases := []struct {
+		name, cert, key, bad string
+	}{
+		{"key inside", filepath.Join(sibling, "tls.crt"), filepath.Join(out, "tls.key"), "-tls-key"},
+		{"cert inside", filepath.Join(out, "100", "tls.crt"), filepath.Join(sibling, "tls.key"), "-tls-cert"},
+		{"cert via dot-dot", filepath.Join(sibling, "..", "out", "tls.crt"), filepath.Join(sibling, "tls.key"), "-tls-cert"},
+		{"dot-dot file name inside", filepath.Join(sibling, "tls.crt"), filepath.Join(out, "..tls.key"), "-tls-key"},
+		{"sibling with shared prefix", filepath.Join(sibling, "tls.crt"), filepath.Join(sibling, "tls.key"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{"-out", out, "-listen", "127.0.0.1:0", "-tls-cert", tc.cert, "-tls-key", tc.key}
+			if _, err := ParseArgs(args); err != nil {
+				t.Fatalf("without -tls: %v", err)
+			}
+			_, err := ParseArgs(append(args, "-tls"))
+			if tc.bad == "" {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.bad) || !strings.Contains(err.Error(), "-out") {
+				t.Fatalf("err = %v, want one naming %s and -out", err, tc.bad)
+			}
+		})
+	}
+}
+
+func TestParseArgsTLSRelativePathInsideOut(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	_, err := ParseArgs([]string{
+		"-out", filepath.Join(dir, "out"), "-listen", "127.0.0.1:0", "-tls",
+		"-tls-cert", filepath.Join("out", "tls.crt"), "-tls-key", filepath.Join(dir, "tls", "tls.key"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "-tls-cert") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestMainTLSKeyInsideOutExits2(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	var buf bytes.Buffer
+	code := Main([]string{
+		"-out", out, "-listen", "127.0.0.1:0", "-auth", "token", "-tokens", filepath.Join(dir, "tokens.json"),
+		"-tls", "-tls-cert", filepath.Join(dir, "tls", "tls.crt"), "-tls-key", filepath.Join(out, "tls.key"),
+	}, io.Discard, &buf)
+	if code != 2 {
+		t.Fatalf("code = %d stderr=%q", code, buf.String())
+	}
+	if !strings.HasPrefix(buf.String(), "server-agent: hostpower: -tls-key ") || strings.Contains(buf.String(), "hostpower: serving") {
+		t.Fatalf("stderr = %q", buf.String())
+	}
+	if _, err := os.Lstat(out); err == nil {
+		t.Fatal("out directory created before the check")
+	}
+}
+
 func TestMainHelpListsAllFlags(t *testing.T) {
 	var buf bytes.Buffer
 	if code := Main([]string{"-h"}, io.Discard, &buf); code != 0 {
 		t.Fatalf("code = %d", code)
 	}
 	for _, want := range []string{
-		"usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-v]",
+		"usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-tls] [-tls-cert path] [-tls-key path] [-v]",
 		"       server-agent hostpower token [-tokens path] create|revoke|list [vmid]",
-		"-listen", "-auth", "-tokens",
+		"       server-agent hostpower tls [-tls-cert path] fingerprint",
+		"-listen", "-auth", "-tokens", "-tls-cert", "-tls-key",
+		"serve the -listen endpoint over HTTPS (TLS 1.3)",
 	} {
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("usage lacks %q:\n%s", want, buf.String())
@@ -186,6 +294,112 @@ func TestMainTokenSubcommand(t *testing.T) {
 	}
 	if !strings.HasPrefix(strings.TrimSpace(out.String()), "ophp_") {
 		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestMainTLSFingerprint(t *testing.T) {
+	certPath, keyPath := certPaths(t.TempDir())
+	cert, _, err := LoadOrCreateCert(certPath, keyPath, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := Main([]string{"tls", "-tls-cert", certPath, "fingerprint"}, &out, &errb); code != 0 {
+		t.Fatalf("code = %d stderr=%q", code, errb.String())
+	}
+	if want := collector.FormatHostpowerFingerprint(cert.Certificate[0]) + "\n"; out.String() != want {
+		t.Fatalf("stdout = %q, want %q", out.String(), want)
+	}
+}
+
+func TestMainTLSFingerprintSymlinkedCert(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	certPath, keyPath := certPaths(t.TempDir())
+	cert, _, err := LoadOrCreateCert(certPath, keyPath, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "live.crt")
+	if err := os.Symlink(certPath, link); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := Main([]string{"tls", "-tls-cert", link, "fingerprint"}, &out, &errb); code != 0 {
+		t.Fatalf("code = %d stderr=%q", code, errb.String())
+	}
+	if want := collector.FormatHostpowerFingerprint(cert.Certificate[0]) + "\n"; out.String() != want {
+		t.Fatalf("stdout = %q, want %q", out.String(), want)
+	}
+}
+
+func TestMainTLSFingerprintNonRegularExits1(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFOs and symlinks")
+	}
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo.crt")
+	if err := mkfifo(fifo); err != nil {
+		t.Fatal(err)
+	}
+	fifoLink := filepath.Join(dir, "fifo-link.crt")
+	dangling := filepath.Join(dir, "dangling.crt")
+	for link, target := range map[string]string{fifoLink: fifo, dangling: filepath.Join(dir, "missing.crt")} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{fifo, fifoLink, dangling} {
+		var out, errb bytes.Buffer
+		done := make(chan int, 1)
+		go func() { done <- Main([]string{"tls", "-tls-cert", path, "fingerprint"}, &out, &errb) }()
+		select {
+		case code := <-done:
+			if code != 1 || !strings.Contains(errb.String(), path) {
+				t.Errorf("%s: code = %d stderr=%q", path, code, errb.String())
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: fingerprint blocked on a non-regular file", path)
+		}
+	}
+}
+
+func TestMainTLSFingerprintUnreadableExits1(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.crt")
+	garbage := filepath.Join(dir, "garbage.crt")
+	if err := os.WriteFile(garbage, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{missing, garbage} {
+		var out, errb bytes.Buffer
+		if code := Main([]string{"tls", "-tls-cert", path, "fingerprint"}, &out, &errb); code != 1 {
+			t.Errorf("%s: code = %d, want 1", path, code)
+		}
+		if out.Len() != 0 || !strings.Contains(errb.String(), path) {
+			t.Errorf("%s: stdout=%q stderr=%q", path, out.String(), errb.String())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tls.key")); err == nil {
+		t.Fatal("fingerprint verb generated a key")
+	}
+}
+
+func TestMainTLSUsageErrorsExit2(t *testing.T) {
+	for _, args := range [][]string{
+		{"tls"},
+		{"tls", "frob"},
+		{"tls", "fingerprint", "extra"},
+		{"tls", "-nosuchflag", "fingerprint"},
+	} {
+		var out, errb bytes.Buffer
+		if code := Main(args, &out, &errb); code != 2 {
+			t.Errorf("%v: code = %d, want 2", args, code)
+		}
+		if out.Len() != 0 || !strings.Contains(errb.String(), "usage: server-agent hostpower tls") {
+			t.Errorf("%v: stdout=%q stderr=%q", args, out.String(), errb.String())
+		}
 	}
 }
 
@@ -249,24 +463,16 @@ func TestRunServesTokenModeEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Reserve a free port, release it and let run bind it (the listen address is
-	// the only handle the test has).
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	probe.Close()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	var stderr lockedBuffer
 	done := make(chan int, 1)
 	go func() {
 		done <- run(ctx, []string{
 			"-out", filepath.Join(dir, "out"), "-interval", "100ms",
-			"-listen", addr, "-auth", "token", "-tokens", tokens,
+			"-listen", "127.0.0.1:0", "-auth", "token", "-tokens", tokens,
 		}, io.Discard, &stderr)
 	}()
+	addr := servingAddr(t, &stderr)
 
 	get := func(auth string) int {
 		req, _ := http.NewRequest(http.MethodGet, "http://"+addr+"/v1/energy", nil)
@@ -307,6 +513,153 @@ func TestRunServesTokenModeEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "hostpower: serving") {
 		t.Fatalf("no serving log: %s", stderr.String())
+	}
+}
+
+// servingAddr waits for run's "hostpower: serving" line and returns the bound
+// listen address from it, so tests can listen on port 0 instead of releasing a
+// probed port for run to rebind.
+func servingAddr(t *testing.T, stderr *lockedBuffer) string {
+	t.Helper()
+	re := regexp.MustCompile(`msg="hostpower: serving" listen=(\S+)`)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if m := re.FindStringSubmatch(stderr.String()); m != nil {
+			return m[1]
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no serving log: %s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestServeTLSTokenMode(t *testing.T) {
+	dir := t.TempDir()
+	tokens := filepath.Join(dir, "tokens.json")
+	token, err := CreateToken(tokens, "100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath := certPaths(filepath.Join(dir, "tls"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stderr lockedBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-out", filepath.Join(dir, "out"), "-interval", "100ms",
+			"-listen", "127.0.0.1:0", "-auth", "token", "-tokens", tokens,
+			"-tls", "-tls-cert", certPath, "-tls-key", keyPath,
+		}, io.Discard, &stderr)
+	}()
+	addr := servingAddr(t, &stderr)
+
+	// The certificate is written before the listener opens.
+	der, err := readCertDER(certPath)
+	if err != nil {
+		t.Fatalf("no certificate: %v; stderr=%s", err, stderr.String())
+	}
+	fp := collector.FormatHostpowerFingerprint(der)
+	pin, err := collector.ParseHostpowerFingerprint(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	do := func(client *http.Client, url string) int {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				return resp.StatusCode
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: %v; stderr=%s", url, err, stderr.String())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if code := do(collector.NewHostpowerHTTPClient(pin), "https://"+addr+"/v1/energy"); code != http.StatusServiceUnavailable && code != http.StatusOK {
+		t.Fatalf("pinned https: code = %d", code)
+	}
+	if code := do(http.DefaultClient, "http://"+addr+"/v1/energy"); code != http.StatusBadRequest {
+		t.Fatalf("plain http: code = %d, want 400", code)
+	}
+
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit = %d stderr=%s", code, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after cancel")
+	}
+	logs := stderr.String()
+	for _, want := range []string{
+		"hostpower: tls certificate", "cert=" + certPath, "sha256=" + fp, "generated=true",
+		"hostpower: serving", "tls=true",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("log lacks %q:\n%s", want, logs)
+		}
+	}
+}
+
+func TestServePlainLogsTLSFalse(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	var stderr lockedBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-out", filepath.Join(dir, "out"), "-interval", "100ms",
+			"-listen", "127.0.0.1:0", "-auth", "token", "-tokens", filepath.Join(dir, "tokens.json"),
+		}, io.Discard, &stderr)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stderr.String(), "hostpower: serving") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no serving log: %s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("exit = %d stderr=%s", code, stderr.String())
+	}
+	if logs := stderr.String(); !strings.Contains(logs, "tls=false") || strings.Contains(logs, "hostpower: tls certificate") {
+		t.Fatalf("log = %s", logs)
+	}
+}
+
+func TestServeTLSCertFailureExits2BeforeListening(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := certPaths(filepath.Join(dir, "tls"))
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("half a pair"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	code := Main([]string{
+		"-out", filepath.Join(dir, "out"), "-listen", "127.0.0.1:0", "-auth", "token",
+		"-tokens", filepath.Join(dir, "tokens.json"), "-tls", "-tls-cert", certPath, "-tls-key", keyPath,
+	}, io.Discard, &buf)
+	if code != 2 {
+		t.Fatalf("code = %d stderr=%q", code, buf.String())
+	}
+	if !strings.Contains(buf.String(), "server-agent: hostpower: tls key ") || !strings.Contains(buf.String(), certPath) ||
+		strings.Contains(buf.String(), "hostpower: serving") {
+		t.Fatalf("stderr = %q", buf.String())
+	}
+	if _, err := os.Lstat(certPath); err == nil {
+		t.Fatal("certificate written next to a lone key")
 	}
 }
 

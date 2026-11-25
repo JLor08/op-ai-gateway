@@ -52,6 +52,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap root the RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower` on Linux, a drive root such as `Z:\` on Windows). Empty uses the platform default (Linux) or disables it (Windows); ignored on macOS. See [Linux or Windows guest on a Proxmox VE host](#linux-or-windows-guest-on-a-proxmox-ve-host). |
 | `OP_AGENT_HOSTPOWER_URL` | `-hostpower-url` | `hostpower_url` | — | Optional hostpower HTTP endpoint on the Proxmox host (e.g. `http://<host>:9873`) the guest reads its share of host CPU power from. Empty disables it. Without a token the host identifies the VM by its network port (MAC mode). A value without an `http://` or `https://` scheme or without a host logs a startup warning. |
 | `OP_AGENT_HOSTPOWER_TOKEN` | `-hostpower-token` | `hostpower_token` | — | Optional per-VM token for the hostpower HTTP endpoint (token mode; secret; never logged). Create it on the host with `server-agent hostpower token create <vmid>`. Set without `hostpower_url`, it logs a startup warning. |
+| `OP_AGENT_HOSTPOWER_TLS_FINGERPRINT` | `-hostpower-tls-fingerprint` | `hostpower_tls_fingerprint` | — | Optional SHA-256 fingerprint of the hostpower TLS certificate (64 hex digits, `:` separators allowed). With an `https://` `hostpower_url` the guest accepts only that certificate. Print it on the host with `server-agent hostpower tls fingerprint`. An invalid value, or one set with an `http://` URL, logs a startup warning and every hostpower request fails; set without `hostpower_url`, it logs a startup warning. |
 | `OP_AGENT_HELPER_SOCKET` | `-helper-socket` | `helper_socket` | `/run/op-agent-helper/agent.sock` (Linux) | Unix socket of the privileged `server-agent helper`, from which an agent that does not run as root reads RAPL counters (CPU and system watts) and memory modules. Linux only: on macOS and Windows it is empty, and a configured path logs a startup warning and is ignored. `off` disables it (an empty env var means unset). A relative path logs a startup warning and turns the helper off. A root agent reads both natively and never uses it. Without a helper installed, set `off` to stop the per-sample attempts and the 30 s memory-module retry (both logged at Debug). See [Privileged helper (Linux)](#privileged-helper-linux). |
 | `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. A Windows CPU-watt path (alongside `powercap_root` and `hostpower_url`); a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
@@ -938,10 +939,10 @@ After=network-online.target
 ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower
 Restart=always
 RestartSec=5s
-StateDirectory=op-hostpower
+StateDirectory=op-hostpower op-hostpower-tls
 StateDirectoryMode=0700
 ProtectSystem=strict
-ReadWritePaths=/var/lib/op-hostpower
+ReadWritePaths=/var/lib/op-hostpower /var/lib/op-hostpower-tls
 NoNewPrivileges=yes
 PrivateTmp=yes
 
@@ -958,20 +959,24 @@ ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower -list
 
 `ProtectSystem=strict` makes the whole file system read-only for the service
 except `/dev`, `/proc` and `/sys`, which it only reads; `ReadWritePaths`
-leaves the out directory as its only writable path, and `StateDirectory`
-creates `/var/lib/op-hostpower` before the unit starts (a missing
-`ReadWritePaths` directory fails the start). `network-online.target` and
+leaves the out directory and the TLS directory `/var/lib/op-hostpower-tls`
+as its only writable paths, and `StateDirectory` creates both under
+`/var/lib` before the unit starts (a missing `ReadWritePaths` directory fails
+the start). The TLS directory is used only with `-tls` (see
+[HTTPS with a pinned certificate](#https-with-a-pinned-certificate-both-modes));
+it is a directory of its own because the out directory is the source of the
+guests' shares and must never hold the private key. `network-online.target` and
 `RestartSec=5s` matter with `-listen`: if the unit starts before the bridge
 address exists, the listen fails and the service exits with 2, and with the
 default 100 ms restart delay it would hit systemd's start limit and stay failed,
 which also stops every virtiofs counter. If the PVE datacenter or host
-firewall is on, allow TCP 9873 inbound on the host from the VMs. `StateDirectoryMode=0700` keeps
-the per-VM trees readable by root only; guests are unaffected because virtiofsd
-runs as root. The service creates the out directory `0700` when it creates it
-itself.
+firewall is on, allow TCP 9873 inbound on the host from the VMs. `StateDirectoryMode=0700` applies to
+both directories: it keeps the per-VM trees and the TLS key readable by root
+only; guests are unaffected because virtiofsd runs as root. The service creates the out directory `0700` when it creates it itself.
 
 Usage: `server-agent hostpower [-out dir] [-interval duration]
-[-listen host:port] [-auth mac,token] [-tokens path] [-v]`.
+[-listen host:port] [-auth mac,token] [-tokens path] [-tls]
+[-tls-cert path] [-tls-key path] [-v]`.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -980,6 +985,9 @@ Usage: `server-agent hostpower [-out dir] [-interval duration]
 | `-listen host:port` | empty (HTTP off) | Serve the HTTP endpoint on this address |
 | `-auth mac,token` | `mac,token` | Enabled HTTP identification modes |
 | `-tokens PATH` | `/etc/op-hostpower/tokens.json` | Token store for token mode |
+| `-tls` | off | Serve the `-listen` endpoint over HTTPS (TLS 1.3 only); needs `-listen` |
+| `-tls-cert PATH` | `/var/lib/op-hostpower-tls/tls.crt` | TLS certificate (PEM); generated together with the key when both are absent |
+| `-tls-key PATH` | `/var/lib/op-hostpower-tls/tls.key` | TLS private key (PEM) |
 | `-v` | off | Debug logging |
 
 Cadence rule: keep `-interval` at most a quarter of the guest's
@@ -1120,14 +1128,22 @@ served at Info (`hostpower: host serves this VM's counter`, with `vmid` and
 another VM's counter shows it in its log.
 
 Threat model. In scope and safe: a VM forging another VM's IP or MAC, a LAN
-device forging a VM's IP or MAC, and replay. Out of scope in this version: a
-layer-2 man-in-the-middle, where a LAN device or a guest poisons the host's
-ARP cache or bridge forwarding table for a VM's address and then relays that
-VM's traffic. This holds for MAC mode and token mode alike (token mode would
-even expose the token). Mitigations: enable the PVE firewall with MAC filter
-and IP filter on each VM NIC (this stops the guest variant), and keep the
-host's bridge on a trusted LAN segment. TLS with a pinned certificate is the
-possible follow-up.
+device forging a VM's IP or MAC, and replay. A layer-2 man-in-the-middle, where
+a LAN device or a guest poisons the host's ARP cache or bridge forwarding
+table for a VM's address and then relays that VM's traffic, can read the VM's
+counter over plain HTTP (in token mode it can also copy the token); this holds
+for MAC mode and token mode alike. With
+[HTTPS and a pinned certificate](#https-with-a-pinned-certificate-both-modes)
+that case is in scope: the relay sees only TLS 1.3 records, so it can neither
+read nor alter the counter nor read a token, and without the host's private
+key it cannot pose as the host. It can still drop or delay the traffic (the
+guest then reports `null`). TLS does not change who is identified: a relay that
+re-originates the connection enters the host on its own port, so it gets its
+own counter or `401`, as without TLS. Out of scope remain a compromised host
+(including theft of the key file, which needs root on the host) and a guest
+without a pin. Mitigations without TLS, still useful with it: enable the PVE
+firewall with MAC filter and IP filter on each VM NIC (this stops the guest
+variant), and keep the host's bridge on a trusted LAN segment.
 
 #### HTTP, token mode (routed networks, NAT, Open vSwitch, IPv6)
 
@@ -1153,9 +1169,114 @@ disk gives every clone the original VM's identity. Create a VM's token after
 cloning, never put `hostpower_token` into a template, and revoke the token when
 the VM is destroyed or its vmid is reused.
 
-The HTTP transport is plain HTTP: anyone who can read the traffic on the path
-can read the token and the values, so use it only on a trusted segment (see
-the threat model above).
+Over plain HTTP anyone who can read the traffic on the path can read the
+token and the values, and copy and replay the token, so use plain HTTP only on
+a trusted segment (see the threat model above). With
+[HTTPS and a pinned certificate](#https-with-a-pinned-certificate-both-modes)
+the token and the values travel encrypted, and a guest that is presented any
+other certificate fails the handshake before the token is sent.
+
+#### HTTPS with a pinned certificate (both modes)
+
+Either HTTP mode can run over HTTPS. The service then presents a TLS
+certificate, and the guest accepts exactly that certificate, identified by its
+SHA-256 fingerprint (the pin). Identity does not change: MAC mode still
+identifies the VM by the tap the TCP connection entered, token mode by the
+token. TLS adds confidentiality and integrity, which closes the layer-2
+man-in-the-middle case of the threat model above.
+
+*On the host.* Add `-tls` to the listen line:
+
+```
+ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower -listen 192.0.2.10:9873 -tls
+```
+
+The unit needs the TLS state directory, as in the example unit above
+(`StateDirectory=op-hostpower op-hostpower-tls` and
+`/var/lib/op-hostpower-tls` in `ReadWritePaths`). With a unit that lacks it,
+`ProtectSystem=strict` keeps the directory read-only, and the first start
+fails (exit 2) with a read-only file system error and a hint to add both
+lines. The service reads `-tls-cert` and `-tls-key` once at start:
+
+- Both absent: it generates a self-signed ECDSA P-256 certificate (subject
+  `CN=op-hostpower`, valid for 100 years, no host names) and writes the key,
+  then the certificate, each `0600`. A missing directory is created `0700`;
+  an existing one keeps its mode. If the certificate cannot be written, the key is removed again, so the next start
+  generates afresh.
+- Both present: it loads them as a pair (a key that does not belong to the
+  certificate fails the start). They may be your own files, for example a pair
+  signed by your CA, and may be symlinks to regular files. A key file readable
+  by group or others is used, with a Warn.
+- Exactly one present, a dangling symlink, or a path that is not a regular
+  file: the service refuses to start (exit 2) and writes nothing; it never
+  completes half a pair.
+
+Neither path may lie inside the `-out` directory, which guests read over
+virtiofs; the service refuses to start (exit 2) if one does. The check compares
+the cleaned absolute paths and does not resolve symlinks.
+
+The endpoint offers TLS 1.3 only, and a handshake must finish within 2 s.
+Handshake errors (scanners, a guest with a wrong pin) are logged at Debug
+only; other HTTP server errors, such as a failed accept, at Warn. A plain-HTTP request to the TLS port gets `400`. At
+startup the service logs `hostpower: tls certificate` at Info with `cert` (the
+path), `sha256` (the fingerprint) and `generated` (whether it was just
+created), and its `hostpower: serving` line carries `tls=true`.
+
+Print the fingerprint as root (flags go before the verb):
+
+```
+server-agent hostpower tls [-tls-cert path] fingerprint
+```
+
+It prints the SHA-256 of the certificate as uppercase hex with `:` between
+bytes, the same value as
+`openssl x509 -noout -fingerprint -sha256 -in /var/lib/op-hostpower-tls/tls.crt`
+prints after its `Fingerprint=` prefix, so you can cross-check it. The verb
+only reads (exit 1 when the certificate cannot be read or parsed, for example
+before the first start with `-tls`; exit 2 on a usage error), never generates
+a certificate, and is safe next to the running service.
+
+*In the guest.* Point the agent at the HTTPS URL and paste the fingerprint as
+printed:
+
+```
+OP_AGENT_HOSTPOWER_URL=https://192.0.2.10:9873
+OP_AGENT_HOSTPOWER_TLS_FINGERPRINT=<the printed fingerprint>
+```
+
+(or `-hostpower-tls-fingerprint` or `hostpower_tls_fingerprint` in the config
+file), next to `hostpower_token` in token mode. The value is 64 hex digits,
+with or without `:` separators, in any case; surrounding whitespace is
+ignored. It is not a secret: the resolved value, normalised to 64 lowercase
+hex digits, is logged at Debug with the other settings; an invalid value is
+logged as `(invalid)`, since it may be a token pasted into the wrong field.
+
+| `hostpower_url` | `hostpower_tls_fingerprint` | Behaviour |
+|---|---|---|
+| `http://` | empty | Plain HTTP, as before |
+| `https://` | valid | TLS 1.3; only a server certificate with this SHA-256 is accepted; its chain, host names and validity dates are not checked. Any other certificate fails the handshake before a byte of HTTP is sent, so a token never leaves the guest |
+| `https://` | empty | Standard verification against the guest's system roots (not the agent's `ca_file` or `ca_pem`) and the URL's host name, for a certificate signed by a CA the guest trusts. A self-signed hostpower certificate fails every request. Startup warning |
+| `http://` | set | Fail closed: every request fails without a connection, because the pin shows TLS was intended and a clear-text request would expose the token. Startup warning |
+| any | invalid | Fail closed: every request fails. Startup warning |
+
+A fingerprint set without `hostpower_url` is unused and logs a startup
+warning.
+
+*Rotation.* The guest pins the exact certificate, so every certificate change
+needs the new fingerprint in every guest; until then that guest's requests fail
+and `cpu_power_w` is `null`. To replace the generated certificate, delete both
+files and restart the service, then copy the new fingerprint (from the startup
+log or the `tls fingerprint` verb) into every guest. To use your own pair, put
+both files in place (or point `-tls-cert` and `-tls-key` at them) and restart.
+
+*Troubleshooting.* With a wrong or outdated pin the guest logs at Warn
+`hostpower: server certificate does not match hostpower_tls_fingerprint`, with
+`want`, `got` (the fingerprint the server presented) and `url`, once when the
+mismatch begins and again only after a success in between; every failed
+request is also logged at Debug as `hostpower: request failed` (see below). If
+`got` is the host's current fingerprint, update the guest; if it is not,
+something between guest and host presents another certificate. On the host,
+failed handshakes are visible only with `-v`.
 
 #### The HTTP endpoint (both modes)
 

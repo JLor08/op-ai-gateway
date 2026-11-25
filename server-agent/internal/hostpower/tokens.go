@@ -91,28 +91,49 @@ func loadForWrite(path string) (map[string]tokenRecord, error) {
 }
 
 func writeTokenFile(path string, recs map[string]tokenRecord) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(filepath.Dir(path)); err != nil {
 		return err
-	}
-	if di, err := os.Stat(dir); err != nil {
-		return err
-	} else if di.Mode().Perm()&^0o700 != 0 {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
-		}
 	}
 	data, err := json.MarshalIndent(recs, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".tokens-*.tmp")
+	return writePrivateFileAtomic(path, append(data, '\n'))
+}
+
+// ensurePrivateDir creates dir (and its parents) with mode 0700, or tightens
+// an existing dir that grants group or other permissions to 0700.
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	di, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if di.Mode().Perm()&^0o700 != 0 {
+		return os.Chmod(dir, 0o700)
+	}
+	return nil
+}
+
+// writePrivateFileAtomic replaces path with data through a temp file in the
+// same directory that is synced and chmod'ed to 0600 before the rename, so
+// readers see either the old or the new content and never a group/other-
+// readable file; the directory is synced after the rename.
+func writePrivateFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
 	cleanup := func() { _ = os.Remove(name) }
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		cleanup()
 		return err
@@ -129,7 +150,20 @@ func writeTokenFile(path string, recs map[string]tokenRecord) error {
 		cleanup()
 		return err
 	}
+	syncDir(filepath.Dir(path))
 	return nil
+}
+
+// syncDir flushes dir's entries so a completed rename survives a crash. It is
+// best-effort: some platforms (Windows) cannot sync a directory, and the file
+// content itself was already synced.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // CreateToken creates or replaces vmid's token and returns the plaintext,
