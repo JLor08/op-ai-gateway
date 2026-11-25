@@ -162,8 +162,8 @@ Behaviour:
   in-process with the same parser instead of running `dmidecode`, so root and
   unprivileged agents cannot drift and the agent no longer needs `dmidecode`
   installed. `parseDmidecodeMemory` and the `dmidecode` exec are removed.
-  Fixtures must show the new parser returns what `dmidecode` returned for the
-  same table (capture both from real machines). *(My call.)*
+  The hardware-acceptance checklist compares the parser with `dmidecode` on a
+  real machine. *(My call.)*
 
 ### 4.3 Agent side
 
@@ -204,8 +204,8 @@ Behaviour:
   Plumbing the socket path into the hardware collector is the builder's call.
 - **Helper not ready at agent start.** The inventory is collected once at
   start (`collectHardware` in `agent.Run`). When the helper is configured and
-  the memory-module fetch failed, the agent retries just that fetch on the
-  system-report cadence until the first success, then updates the cached
+  the memory-module fetch failed, the agent retries just that fetch every 30 s
+  (the system-report cadence defaults to 30 min, too slow) until the first success, then updates the cached
   report and re-sends it. The units add `After=`/`Wants=` ordering, but the
   retry is what makes a helper restart or late start harmless. *(My call.)*
 - **Logging.** First success from the helper at Info (once), failures at Debug,
@@ -287,8 +287,10 @@ render`), proxy mode on a port below 1024 (`AmbientCapabilities=CAP_NET_BIND_SER
 - Startup refusals: missing `-agent-user`, uid 0, non-Linux.
 - Endpoints: `/v1/rapl` over a synthetic powercap tree (top-level only,
   unreadable domain skipped), `/v1/memory-modules`, 404/405/429.
-- SMBIOS parser: fixtures from real tables (at least DDR4 server board and a
-  DDR5 desktop; plus an extended-size module and an empty slot), malformed and
+- SMBIOS parser: tables built by an in-test encoder with real-world values
+  (no Linux box is available: DDR4 server module, DDR5 desktop module, an
+  extended-size module, an empty slot, a short 2.6-era structure); a real table
+  from the container run is added when it can be captured, malformed and
   truncated input, a fuzz test; no serial/asset fields in the output type.
 - Agent: unix:// client against an `httptest`-style server on a Unix socket;
   helper power sub-collector deltas, wraparound, failure reset, ordering in the
