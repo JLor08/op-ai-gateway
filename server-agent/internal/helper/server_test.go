@@ -21,25 +21,31 @@ func get(h http.Handler, method, path string) *httptest.ResponseRecorder {
 }
 
 func TestHelperRAPLCache(t *testing.T) {
-	now := time.Unix(1000, 0)
+	start := time.Unix(1000, 0)
+	now := start
 	calls := 0
 	h := newHandler(func() []collector.HelperRAPLDomain {
 		calls++
 		return []collector.HelperRAPLDomain{{Zone: "intel-rapl:0", Name: "package-0", EnergyUJ: uint64(calls)}}
 	}, nil, func() time.Time { return now }, nil)
-	for range 5 {
-		now = now.Add(10 * time.Millisecond)
-		if rec := get(h, "GET", collector.HelperRAPLPath); rec.Code != 200 {
+	read := func(offset time.Duration) *httptest.ResponseRecorder {
+		now = start.Add(offset)
+		rec := get(h, "GET", collector.HelperRAPLPath)
+		if rec.Code != 200 {
 			t.Fatalf("status %d", rec.Code)
 		}
+		return rec
+	}
+	read(0)
+	for _, off := range []time.Duration{10, 100, 200, 250} {
+		read(off * time.Millisecond)
 	}
 	if calls != 1 {
-		t.Fatalf("rapl called %d times within the window, want 1", calls)
+		t.Fatalf("rapl called %d times up to +250ms, want 1", calls)
 	}
-	now = now.Add(251 * time.Millisecond)
-	rec := get(h, "GET", collector.HelperRAPLPath)
+	rec := read(251 * time.Millisecond)
 	if calls != 2 {
-		t.Fatalf("rapl called %d times after the window, want 2", calls)
+		t.Fatalf("rapl called %d times at +251ms, want 2", calls)
 	}
 	if rec.Header().Get("Cache-Control") != "no-store" || !strings.Contains(rec.Body.String(), "package-0") {
 		t.Fatalf("headers %v body %s", rec.Header(), rec.Body)

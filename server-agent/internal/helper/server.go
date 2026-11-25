@@ -83,8 +83,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Debug("helper: write response", "err", err)
 		return
 	}
-	uid, _ := peerUIDFrom(r.Context())
-	h.log.Debug("request served", "path", r.URL.Path, "peer_uid", uid)
+	if uid, ok := peerUIDFrom(r.Context()); ok {
+		h.log.Debug("request served", "path", r.URL.Path, "peer_uid", uid)
+	} else {
+		h.log.Debug("request served", "path", r.URL.Path)
+	}
 }
 
 // allow takes one token from the bucket.

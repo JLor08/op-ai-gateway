@@ -6,6 +6,7 @@ package helper
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -30,5 +31,8 @@ func TestMainRefusesRoot(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := run(context.Background(), []string{"-agent-user", "0"}, &out, &errb); code != 2 {
 		t.Fatalf("exit %d, stderr %s", code, errb.String())
+	}
+	if !strings.Contains(errb.String(), "must not be root") {
+		t.Fatalf("stderr lacks the root refusal: %s", errb.String())
 	}
 }

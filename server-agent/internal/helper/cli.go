@@ -61,12 +61,12 @@ func ParseArgs(args []string) (Config, error) {
 
 // Main runs the helper mode and returns the process exit code.
 func Main(args []string, stdout, stderr io.Writer) int {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	return run(ctx, args, stdout, stderr)
+	return run(context.Background(), args, stdout, stderr)
 }
 
-func run(ctx context.Context, args []string, _, stderr io.Writer) int {
+func run(parent context.Context, args []string, _, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	cfg, err := ParseArgs(args)
 	if errors.Is(err, flag.ErrHelp) {
 		fs, _ := newFlagSet()
@@ -99,8 +99,8 @@ func run(ctx context.Context, args []string, _, stderr io.Writer) int {
 	if len(collector.ReadTopLevelRAPLDomains(cfg.PowercapRoot)) == 0 {
 		log.Warn("helper: no readable RAPL zone", "powercap_root", cfg.PowercapRoot)
 	}
-	ln, err := listen(cfg.Socket, id, log)
-	if err != nil {
+	ln, err := Listen(cfg.Socket, id, log) //nolint:staticcheck // SA4023: the non-Linux stub always fails; the Linux build can succeed
+	if err != nil {                        //nolint:staticcheck // SA4023: see above
 		fmt.Fprintf(stderr, "server-agent: %v\n", err)
 		return 2
 	}
@@ -114,6 +114,7 @@ func run(ctx context.Context, args []string, _, stderr io.Writer) int {
 	code := 0
 	select {
 	case <-ctx.Done():
+		stop() // a second SIGINT/SIGTERM during shutdown kills the process
 	case err := <-errc:
 		if !errors.Is(err, http.ErrServerClosed) {
 			fmt.Fprintf(stderr, "server-agent: helper: serve: %v\n", err)
@@ -122,22 +123,9 @@ func run(ctx context.Context, args []string, _, stderr io.Writer) int {
 	}
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// Shutdown closes the listener, and Go's unix listener unlinks its socket
+	// on Close; inside the dedicated root-owned directory only root could have
+	// replaced the entry, so no explicit removal is needed.
 	_ = srv.Shutdown(shutCtx)
-	removeSocket(cfg.Socket, log)
 	return code
-}
-
-// listen is a variable so static analysis on non-Linux builds, where Listen
-// always fails, does not flag the error check as constant.
-var listen = Listen
-
-// removeSocket deletes path only when it is still a socket.
-func removeSocket(path string, log *slog.Logger) {
-	fi, err := os.Lstat(path)
-	if err != nil || fi.Mode()&os.ModeSocket == 0 {
-		return
-	}
-	if err := os.Remove(path); err != nil {
-		log.Warn("helper: removing socket", "err", err)
-	}
 }
