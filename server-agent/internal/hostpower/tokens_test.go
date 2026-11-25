@@ -5,6 +5,7 @@ package hostpower
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -159,6 +160,9 @@ func TestTokenStoreLookupDuplicateDigestNoMatch(t *testing.T) {
 	if err := os.WriteFile(path, []byte(dup), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if l, err := ListTokens(path); err != nil || len(l) != 2 {
+		t.Fatalf("positive control: ListTokens = %v, %v; want 2 entries", l, err)
+	}
 	s, _, _ := newTestStore(path)
 	if _, ok := s.Lookup(tok); ok {
 		t.Fatal("ambiguous digest matched")
@@ -283,7 +287,13 @@ func TestTokenMainCreatePrintsTokenOnly(t *testing.T) {
 	if code := TokenMain([]string{"-tokens", path, "list"}, &out, &errb); code != 0 {
 		t.Fatalf("list exit %d", code)
 	}
-	if !strings.HasPrefix(out.String(), "100\t") || strings.Contains(out.String(), "sha256") {
+	stored, _ := os.ReadFile(path)
+	var recs map[string]tokenRecord
+	if err := json.Unmarshal(stored, &recs); err != nil || len(recs["100"].SHA256) != 64 {
+		t.Fatalf("stored digest not found: %v", err)
+	}
+	if !strings.HasPrefix(out.String(), "100\t") || strings.Contains(out.String(), "sha256") ||
+		strings.Contains(out.String(), recs["100"].SHA256) {
 		t.Fatalf("list output %q", out.String())
 	}
 	if code := TokenMain([]string{"-tokens", path, "revoke", "100"}, &out, &errb); code != 0 {
@@ -329,6 +339,78 @@ func TestTokenMainIOErrorExit1(t *testing.T) {
 	}
 	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := TokenMain([]string{"-tokens", path, "list"}, &out, &errb); code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+}
+
+func TestTokenStoreDetectsSameSizeSameMtimeRewrite(t *testing.T) {
+	path := tokenPath(t)
+	old, _ := CreateToken(path, "100")
+	fi, _ := os.Stat(path)
+	s, clk, _ := newTestStore(path)
+	if _, ok := s.Lookup(old); !ok {
+		t.Fatal("old token")
+	}
+	fresh, _ := CreateToken(path, "100") // same size, new inode
+	if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	nfi, _ := os.Stat(path)
+	if nfi.Size() != fi.Size() || !nfi.ModTime().Equal(fi.ModTime()) {
+		t.Fatal("test setup: size or mtime differ")
+	}
+	clk.t = clk.t.Add(time.Second)
+	if _, ok := s.Lookup(old); ok {
+		t.Fatal("old token still valid after rewrite")
+	}
+	if v, ok := s.Lookup(fresh); !ok || v != "100" {
+		t.Fatalf("new token: %q %v", v, ok)
+	}
+}
+
+func TestCreateAndRevokeTightenLooseDirectory(t *testing.T) {
+	for _, op := range []string{"create", "revoke"} {
+		dir := filepath.Join(t.TempDir(), "cfg")
+		path := filepath.Join(dir, "tokens.json")
+		if _, err := CreateToken(path, "100"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		if op == "create" {
+			_, err = CreateToken(path, "101")
+		} else {
+			err = RevokeToken(path, "100")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		di, _ := os.Stat(dir)
+		if di.Mode().Perm() != 0o700 {
+			t.Fatalf("%s: dir mode %v", op, di.Mode().Perm())
+		}
+	}
+}
+
+func TestListTokensRejectsBadCreatedTime(t *testing.T) {
+	path := tokenPath(t)
+	if _, err := CreateToken(path, "100"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	i := strings.Index(string(raw), `"created": "`) + len(`"created": "`)
+	j := i + strings.Index(string(raw[i:]), `"`)
+	bad := string(raw[:i]) + "yesterday" + string(raw[j:])
+	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ListTokens(path); err == nil {
+		t.Fatal("expected error")
 	}
 	var out, errb bytes.Buffer
 	if code := TokenMain([]string{"-tokens", path, "list"}, &out, &errb); code != 1 {

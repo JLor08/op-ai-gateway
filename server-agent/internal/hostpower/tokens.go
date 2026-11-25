@@ -63,16 +63,11 @@ func tokenDigest(token string) [sha256.Size]byte {
 }
 
 func readTokenFile(path string) (map[string]tokenRecord, error) {
-	f, err := os.Open(path)
+	data, ok, err := readCapped(path, maxTokenStoreBytes)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, maxTokenStoreBytes+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxTokenStoreBytes {
+	if !ok {
 		return nil, errors.New("token store too large")
 	}
 	recs := map[string]tokenRecord{}
@@ -99,6 +94,13 @@ func writeTokenFile(path string, recs map[string]tokenRecord) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
+	}
+	if di, err := os.Stat(dir); err != nil {
+		return err
+	} else if di.Mode().Perm()&^0o700 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
 	}
 	data, err := json.MarshalIndent(recs, "", "  ")
 	if err != nil {
@@ -180,7 +182,10 @@ func ListTokens(path string) ([]TokenInfo, error) {
 	}
 	out := make([]TokenInfo, 0, len(recs))
 	for vmid, r := range recs {
-		created, _ := time.Parse(time.RFC3339, r.Created)
+		created, err := time.Parse(time.RFC3339, r.Created)
+		if err != nil {
+			return nil, fmt.Errorf("token entry %s: bad created time: %w", vmid, err)
+		}
 		out = append(out, TokenInfo{VMID: vmid, Created: created})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -208,9 +213,7 @@ type TokenStore struct {
 
 	mu        sync.Mutex
 	checked   time.Time
-	haveStat  bool
-	modTime   time.Time
-	size      int64
+	prev      os.FileInfo
 	entries   []tokenEntry
 	warned    bool
 	everCheck bool
@@ -268,18 +271,18 @@ func (s *TokenStore) refreshLocked() {
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			s.entries = nil
-			s.haveStat = false
+			s.prev = nil
 			s.warned = false
 			return
 		}
 		s.warnLocked()
 		return
 	}
-	if s.haveStat && fi.ModTime().Equal(s.modTime) && fi.Size() == s.size {
+	if s.prev != nil && os.SameFile(s.prev, fi) && fi.ModTime().Equal(s.prev.ModTime()) && fi.Size() == s.prev.Size() {
 		return
 	}
 	recs, err := readTokenFile(s.path)
-	s.haveStat, s.modTime, s.size = true, fi.ModTime(), fi.Size()
+	s.prev = fi
 	if err != nil {
 		s.warnLocked()
 		return

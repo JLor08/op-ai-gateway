@@ -5,7 +5,6 @@ package hostpower
 
 import (
 	"bytes"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -64,24 +63,6 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
-}
-
-// readCapped reads at most limit bytes of a host-owned file. ok is false when
-// the file is larger than limit.
-func readCapped(path string, limit int64) (data []byte, ok bool, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, false, err
-	}
-	defer func() { _ = f.Close() }()
-	data, err = io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
-		return nil, false, err
-	}
-	if int64(len(data)) > limit {
-		return nil, false, nil
-	}
-	return data, true, nil
 }
 
 // Resolve returns the ID of the VM that owns remote, or a *ResolveError.
