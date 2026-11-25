@@ -49,6 +49,7 @@ func (o Options) withDefaults() Options {
 type Service struct {
 	opts   Options
 	energy *collector.PackageEnergyReader
+	log    *slog.Logger
 
 	mu        sync.Mutex
 	prevBusy  uint64
@@ -58,6 +59,10 @@ type Service struct {
 	// vanished VM's counter is deliberately never pruned, so a VM that stops and
 	// starts again continues from its previous value instead of jumping.
 	counters map[string]uint64
+	// writeErr holds each VM's last logged write error, so a failure that
+	// repeats every tick (a guest can cause one in its own share) is logged
+	// once, not at the tick rate.
+	writeErr map[string]string
 }
 
 // New builds a Service; empty option fields take their defaults.
@@ -66,8 +71,10 @@ func New(opts Options) *Service {
 	return &Service{
 		opts:      opts,
 		energy:    collector.NewPackageEnergyReader(opts.PowercapRoot),
+		log:       slog.Default(),
 		prevUsage: map[string]uint64{},
 		counters:  map[string]uint64{},
+		writeErr:  map[string]string{},
 	}
 }
 
@@ -101,7 +108,7 @@ func (s *Service) Tick() error {
 			s.counters[vm] += AttributeUJ(joules, share)
 		}
 	} else {
-		slog.Debug("hostpower: nothing to attribute this tick",
+		s.log.Debug("hostpower: nothing to attribute this tick",
 			"energy_delta", haveEnergy, "busy_read", haveBusy, "busy_baseline", s.hasBusy)
 	}
 
@@ -115,13 +122,36 @@ func (s *Service) Tick() error {
 	s.prevUsage = usage // unreadable and vanished VMs drop out and re-baseline
 
 	var errs []error
+	live := make(map[string]bool, len(vms))
 	for _, vm := range vms {
+		live[vm] = true
 		s.ensureCounter(vm)
-		if err := WriteTree(filepath.Join(s.opts.OutDir, vm), s.counters[vm]); err != nil {
+		err := WriteTree(filepath.Join(s.opts.OutDir, vm), s.counters[vm])
+		s.logWriteResult(vm, err)
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}
+	for vm := range s.writeErr {
+		if !live[vm] {
+			delete(s.writeErr, vm)
+		}
+	}
 	return errors.Join(errs...)
+}
+
+// logWriteResult logs a VM's write failure at Warn when it first occurs or its
+// message changes, and once at Info when the VM's writes recover.
+func (s *Service) logWriteResult(vm string, err error) {
+	last, failing := s.writeErr[vm]
+	switch {
+	case err != nil && (!failing || last != err.Error()):
+		s.writeErr[vm] = err.Error()
+		s.log.Warn("hostpower: write failed", "vm", vm, "err", err)
+	case err == nil && failing:
+		delete(s.writeErr, vm)
+		s.log.Info("hostpower: write recovered", "vm", vm)
+	}
 }
 
 func (s *Service) readBusy() (uint64, bool) {
@@ -139,7 +169,8 @@ func (s *Service) ensureCounter(vm string) {
 	}
 }
 
-// Run ticks every interval until ctx is done; a Tick error is logged, never fatal.
+// Run ticks every interval until ctx is done. A Tick error is never fatal and
+// is not logged here: Tick already logs each VM's write failure on change.
 func (s *Service) Run(ctx context.Context, interval time.Duration) error {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -148,9 +179,7 @@ func (s *Service) Run(ctx context.Context, interval time.Duration) error {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			if err := s.Tick(); err != nil {
-				slog.Warn("hostpower: tick failed", "err", err)
-			}
+			_ = s.Tick()
 		}
 	}
 }

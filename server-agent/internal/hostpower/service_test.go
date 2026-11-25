@@ -4,11 +4,14 @@
 package hostpower
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -327,5 +330,70 @@ func TestTickVanishedScopeReturnsAndContinuesCounter(t *testing.T) {
 	mustTick(t, s)
 	if c := s.Counters()["101"]; c != 10_000_000 {
 		t.Errorf("counter = %d, want 10000000", c)
+	}
+}
+
+// recordingHandler is a slog.Handler that keeps every record's level and message.
+type recordingHandler struct {
+	mu   sync.Mutex
+	recs []string
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler            { return h }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.recs = append(h.recs, r.Level.String()+" "+r.Message)
+	return nil
+}
+
+func (h *recordingHandler) count(entry string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.recs {
+		if r == entry {
+			n++
+		}
+	}
+	return n
+}
+
+func TestTickLogsARepeatedWriteFailureOnce(t *testing.T) {
+	f := newFixture(t, "100", "101")
+	s := f.service()
+	h := &recordingHandler{}
+	s.log = slog.New(h)
+	mustTick(t, s)
+
+	link := filepath.Join(f.root, "out", "100", DomainDir)
+	if err := os.RemoveAll(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := s.Tick(); err == nil {
+			t.Fatalf("tick %d: Tick returned nil for an escaping tree", i)
+		}
+	}
+	if n := h.count("WARN hostpower: write failed"); n != 1 {
+		t.Fatalf("write failed logged %d times over 5 identical failures, want 1 (records %v)", n, h.recs)
+	}
+
+	// Recovery is logged once at Info.
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	mustTick(t, s)
+	mustTick(t, s)
+	if n := h.count("INFO hostpower: write recovered"); n != 1 {
+		t.Fatalf("write recovered logged %d times, want 1 (records %v)", n, h.recs)
+	}
+	if n := h.count("WARN hostpower: write failed"); n != 1 {
+		t.Fatalf("write failed logged %d times after recovery, want 1", n)
 	}
 }
