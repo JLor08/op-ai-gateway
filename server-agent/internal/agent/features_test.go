@@ -615,7 +615,7 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.21.1" {
+	if Version != "0.22.0" {
 		t.Fatalf("Version = %q, want 0.21.1; runtime_stop keeps Since 0.17.0", Version)
 	}
 }
@@ -639,7 +639,7 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.21.1" {
+	if Version != "0.22.0" {
 		t.Fatalf("Version = %q, want 0.21.1; rpc_cluster keeps Since 0.18.0", Version)
 	}
 }
@@ -696,7 +696,7 @@ func TestFeaturesDeclareRealtimeProxy(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "realtime_proxy") {
 		t.Fatal("FeatureNames() does not carry realtime_proxy, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.21.1" {
+	if Version != "0.22.0" {
 		t.Fatalf("Version = %q, want 0.21.1; realtime_proxy keeps Since 0.20.0", Version)
 	}
 }
@@ -725,7 +725,7 @@ func TestFeaturesDeclareStrataFlags(t *testing.T) {
 			t.Fatalf("FeatureNames() does not carry %s", name)
 		}
 	}
-	if Version != "0.21.1" {
-		t.Fatalf("Version = %q, want 0.21.1", Version)
+	if Version != "0.22.0" {
+		t.Fatalf("Version = %q, want 0.22.0", Version)
 	}
 }

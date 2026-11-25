@@ -13682,3 +13682,33 @@ a token with a server override, a prefix override or generated Claude aliases of
   [Security, Auth & RBAC §5](cross-cutting/security-auth-rbac.md),
   [HTTP API surface](reference/api-surface.md),
   [Data model](reference/data-model.md#4-migration-history-115-migrations).
+
+## ADR-115 — VM CPU power via a host-attributed synthetic RAPL tree over virtiofs
+
+**Context.** A Linux guest on a Proxmox VE host has no RAPL (the MSRs are not passed through and `/sys/class/powercap` is empty), so its
+agent never reports `cpu_power_w` and the energy engine falls back to the operator-estimated tier. The host can measure the CPU package, but the
+guest must be told its own share without any change to the wire format, gateway or portal.
+
+**Decision.** A host-side `server-agent hostpower` mode (root, systemd, no token, no gateway contact, no listener) reads the RAPL package
+domains, `/proc/stat` and each VM's `qemu.slice/<vmid>.scope/cpu.stat`, and attributes the package energy delta to VMs by **active CPU time with the
+idle floor included**, so the sum of shares stays at or below the package. For each VM it writes an atomic synthetic `intel-rapl:0` tree
+(`name`, `energy_uj`, `max_energy_range_uj`) under `<out>/<vmid>/`, and persists the counter in `energy_uj` so it survives restarts. The tree reaches
+the guest through a PVE directory mapping and a virtiofs device; the guest agent's unchanged RAPL collector reads it through the new
+`powercap_root` option (`OP_AGENT_POWERCAP_ROOT`). The host ticks every 250 ms against the guest's 1 s cadence, so each guest delta spans several host
+updates and stays inside the Tier-1 measured-power gap rule (2 s).
+
+**Alternatives rejected.**
+- *An HTTP exporter on the host with VM identification by SMBIOS UUID:* it needs a listener, authentication and a network path between guest and host,
+  plus an identity convention, where a mapped directory is already per-VM by construction.
+- *vsock:* a bespoke transport and protocol on both sides for what a read-only file tree already carries, and it would not reuse the guest's RAPL collector.
+
+**Consequences.**
+- A VM with a virtiofs device cannot be live-migrated, snapshotted with RAM state or hibernated, and does not support memory hotplug (PVE
+  limitations, accepted).
+- The host service runs as root because RAPL `energy_uj` is root-only.
+- Shares are attributions of the package energy, not per-VM measurements; their sum is at most the package. `system_power_w` stays `null` in a guest.
+- Windows guests and LXC containers are out of scope.
+- → [Telemetry](cross-cutting/telemetry-usage-observability.md),
+  [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
+  [Config env](reference/config-env.md),
+  [Agent README](../../server-agent/README.md#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share).

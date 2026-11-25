@@ -49,6 +49,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_MODEL_STATUS_URL` | `-model-status-url` | `model_status_url` | — | Optional endpoint polled each cycle for the models currently **loaded**, e.g. `/running` (llama-swap), `/props` (llama.cpp), `/v1/models` (vLLM). Empty disables it. |
 | `OP_AGENT_MODEL_STATUS_FORMAT` | `-model-status-format` | `model_status_format` | — (auto) | How to parse `model_status_url`: `openai`, `llama_swap`, `llama_cpp`, `litellm`, or empty / `auto` (a tolerant union of all shapes). |
 | `OP_AGENT_TLS_INSECURE` | `-tls-insecure`  | `tls_insecure` | `false` | Skip TLS certificate verification (self-signed dev gateways). `true`/`1`. |
+| `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap sysfs root the Linux RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower`). Empty uses the platform default; ignored on other OSes. See [Linux guest on a Proxmox VE host](#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share). |
 | `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. The only Windows CPU-watt path; a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
 | `OP_AGENT_CERT_DIR`     | `-cert-dir`      | `cert_dir`     | —       | Directory certificate files are written into. **Required** when `cert_mode` is not `off`. |
@@ -882,6 +883,58 @@ Per-platform prerequisites:
   enabled, embed credentials in the URL. The agent ships/links nothing from LHM — the
   operator installs it. Unset/unreachable → power `null` (no chart). Per metric, the
   native reading wins and LHM fills gaps (native first).
+
+- **Linux guest, host-attributed (opt-in).** Set `OP_AGENT_POWERCAP_ROOT` to a
+  mounted `server-agent hostpower` tree; see
+  [below](#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share).
+
+### Linux guest on a Proxmox VE host (virtiofs-attributed share)
+
+A KVM guest has no RAPL: the MSRs are not passed through and
+`/sys/class/powercap` is empty, so `cpu_power_w` stays `null` there. Instead, a
+small service on the Proxmox VE (PVE 9.2) host measures the host's RAPL package
+energy, attributes it to each VM by CPU time, and publishes the result as a
+per-VM synthetic powercap tree that the guest mounts over virtiofs. The
+guest's agent reads it with its normal RAPL collector.
+
+**1. Host service (once per host).** Install virtiofsd (`apt install virtiofsd`),
+download the Linux agent binary to `/usr/local/bin/server-agent`, and run it
+in `hostpower` mode as root (RAPL `energy_uj` is root-only) under systemd,
+for example `op-hostpower.service` with
+`ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower`
+and `Restart=always`. Options: `-out DIR` (default `/var/lib/op-hostpower`),
+`-interval D` (default `250ms`, minimum `100ms`; keep it at most a quarter of
+the guest's `OP_AGENT_INTERVAL`), `-v`. The service needs no token, contacts no
+gateway and opens no listener. It warns at startup when the host has no RAPL
+domain or no `qemu.slice`, and keeps running.
+
+**2. Per VM (on the host).** The service must have run once so
+`/var/lib/op-hostpower/<vmid>` exists. Then map and attach it:
+
+```
+pvesh create /cluster/mapping/dir --id hostpower-<vmid> --map node=<node>,path=/var/lib/op-hostpower/<vmid>
+qm set <vmid> --virtiofs0 dirid=hostpower-<vmid>
+```
+
+**3. In the guest.** Mount the share read-only, for example with the fstab
+line `hostpower-<vmid> /run/op-hostpower virtiofs ro,nofail 0 0`, and point the
+agent at it with `OP_AGENT_POWERCAP_ROOT=/run/op-hostpower` (or `-powercap-root`
+or `powercap_root` in the config file). The startup diagnostic then lists
+`rapl` in `power_sources` and logs `powercap_root`. The first sample after
+start is `null` (RAPL delta), as on bare metal.
+
+**How the share is computed.** Per interval the service takes the host's
+RAPL package energy delta and splits it across VMs by active CPU time (from
+each VM's `qemu.slice/<vmid>.scope/cpu.stat` against `/proc/stat`), with the
+idle floor included in the attribution, so the sum of all VM shares never
+exceeds the package energy. Each VM gets `<out>/<vmid>/intel-rapl:0/` with
+`name`, `energy_uj` and `max_energy_range_uj`, written atomically;
+`energy_uj` persists across service restarts.
+
+**Limitations.** A PVE VM with a virtiofs device cannot be live-migrated,
+snapshotted with RAM state or hibernated, and does not support memory
+hotplug. `system_power_w` stays `null` in a guest. Windows guests and LXC
+containers are out of scope.
 
 ## Resilience
 

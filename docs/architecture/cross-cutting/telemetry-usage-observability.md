@@ -32,6 +32,8 @@ optional LibreHardwareMonitor (LHM) HTTP source, taking the first non-nil readin
 per metric — CPU and system watts are resolved independently, so a native CPU
 reading can coexist with an LHM-sourced system reading.
 
+**VM CPU power share (Proxmox).** A KVM guest has no RAPL, so on a Proxmox VE host the optional `server-agent hostpower` mode reads the host's RAPL package domains (`/sys/class/powercap/intel-rapl:*`), `/proc/stat` and each VM's `qemu.slice/<vmid>.scope/cpu.stat`, and attributes the package energy delta to VMs by active CPU time with the idle floor included, so the sum of shares stays at or below the package. It publishes a per-VM synthetic `intel-rapl:0` tree (`name`, `energy_uj`, `max_energy_range_uj`) that is mounted into the guest over virtiofs and read by the guest agent's ordinary RAPL collector via `powercap_root`; the host ticks at 250 ms against the guest's 1 s sampling interval. Setup is in the [agent README](../../../server-agent/README.md#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share); the decision is [ADR-115](../09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs).
+
 ### 8.2.1 Host metrics
 
 `server-agent/internal/collector/host.go` reads gopsutil (`cpu`, `load`, `mem`,
@@ -76,7 +78,7 @@ source:
 
 | Source | File | Platform | Mechanism |
 |---|---|---|---|
-| RAPL | `rapl.go` | Linux | Reads `/sys/class/powercap/intel-rapl:*/energy_uj` and derives watts from the energy delta between consecutive ticks (wraparound-corrected via `max_energy_range_uj`); sums `package*` domains for CPU watts, prefers a `psys` domain for system watts, else falls back to the first readable `hwmon` `power*_input`. `energy_uj` is root-only since CVE-2020-8694, so a non-root agent gets no CPU-watt reading (best-effort, degrades to nil, never an error) |
+| RAPL | `rapl.go` | Linux | Reads `<powercap root>/intel-rapl:*/energy_uj` (root defaults to `/sys/class/powercap`, configurable via `powercap_root`; in a Proxmox guest it is the virtiofs-mounted synthetic tree published by `server-agent hostpower`) and derives watts from the energy delta between consecutive ticks (wraparound-corrected via `max_energy_range_uj`); sums `package*` domains for CPU watts, prefers a `psys` domain for system watts, else falls back to the first readable `hwmon` `power*_input`. `energy_uj` is root-only since CVE-2020-8694, so a non-root agent gets no CPU-watt reading (best-effort, degrades to nil, never an error) |
 | powermetrics | `power_darwin.go` | macOS | Runs `powermetrics --samplers cpu_power -n 1` (needs root); CPU package watts only — total system watts is not obtainable CGO-free (SMC PSTR) and stays nil |
 | LHM | `lhm_power.go` | Windows (only native CPU-watt path) + Linux fallback | GETs a LibreHardwareMonitor Remote Web Server `/data.json` tree and matches a `"Power"` sensor named `"CPU Package"` (Intel) or bare `"Package"` under a CPU `SensorId` (AMD `/amdcpu/…`), excluding the Intel "System Agent" sub-rail from the system-rail match |
 
@@ -3578,6 +3580,7 @@ this measures a model right after the operator sets it up, before real use.
 | `OP_AGENT_TRANSPORT` | `websocket` | `post` or `websocket` |
 | `OP_AGENT_METRICS_URL` | unset | Optional **agent-wide, single-target** inference `/metrics` scrape (§8.2.6); coexists with, and is independent of, the per-`server_agent`-child probe driven by each managed spec's own resolved `metrics_path` ([Agent-Managed Model Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) |
 | `OP_AGENT_MODEL_STATUS_URL` / `_FORMAT` | unset / `auto` | Optional loaded-model poll target + response shape |
+| `OP_AGENT_POWERCAP_ROOT` | unset (`/sys/class/powercap`) | Powercap sysfs root the Linux RAPL collector reads (a Proxmox hostpower virtiofs mount in a guest); ignored on other OSes |
 | `OP_AGENT_LHM_URL` | unset | LibreHardwareMonitor `/data.json` URL (Windows power/temp; Linux fallback) |
 | `OP_AI_GATEWAY_TELEMETRY_RETENTION_HOURS` | 168 (7d) | `server_telemetry_samples` retention |
 | `OP_AI_GATEWAY_AVAILABILITY_RETENTION_HOURS` | 720 (30d) | `server_availability_samples` retention |
