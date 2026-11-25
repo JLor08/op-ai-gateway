@@ -16,7 +16,7 @@
 - `internal/hostpower` may import only `internal/collector` among module packages (archtest allowlist + forbidden-edge rule stay unchanged).
 - HTTP is off unless `-listen` is set; `-auth` default `mac,token`; `-tokens` default `/etc/op-hostpower/tokens.json`.
 - Endpoint `GET /v1/energy` → `200` JSON `{"vmid":"<id>","energy_uj":<n>,"max_energy_range_uj":0}` with `Cache-Control: no-store`; bearer present → token mode only (`401` on any failure, no MAC fallback); no header → MAC mode; identified but not live → `503`; other method `405`, other path `404`; rate limit per source IP → `429`.
-- MAC mode IPv4 only (IPv4-mapped IPv6 counts); port names `^tap(\d+)i(\d+)$` or `^fwpr(\d+)p(\d+)$`; VM config `/etc/pve/qemu-server/<vmid>.conf`, only the lines before the first `[section]` count; `net<n>:` MAC and `bridge=` must both match.
+- MAC mode (revised, spec §4.4): identity from the interface the connection's SYN entered (AF_PACKET capture, `^tap(\d+)i(\d+)$` only) plus the SYN frame's source MAC equal to the VM config's `net<n>:` MAC (lines before the first `[section]`); ARP and the bridge FDB are never used; IPv4 only (IPv4-mapped IPv6 counts); Linux only.
 - Token format `ophp_` + base64url(32 random bytes) without padding; store `{"<vmid>":{"sha256":"<hex>","created":"<RFC3339>"}}`, file mode `0600`, dir `0700`; never log a token or an `Authorization` value.
 - Windows tree: `<out>/<vmid>/windows/intel-rapl_0/{name,energy_uj,max_energy_range_uj}`, same content as the Linux tree; no `:` in any name under `windows/`.
 - State directory `<out>` is created `0700` by the service; README unit gets `StateDirectoryMode=0700`.
@@ -31,7 +31,7 @@
 
 ## Review Focus
 
-1. **Incomplete or stale ARP entry** (flags `0x0`, or no entry at all): MAC mode returns `401` with reason `no ARP entry`, never panics. → test in Task 7.
+1. **A request whose SYN observation is late or missing** (capture goroutine behind, or a frame the filter dropped): the resolver waits at most 250 ms, then `401` `no SYN observed`; malformed or truncated frames never panic the capture loop. → tests in Task 7 (`TestResolveNoObservation`, `TestResolveLateObservation`, `TestParseSYNFrameRejects`).
 2. **VM config with snapshot or `[PENDING]` sections** that carry a different `net0` MAC: only the current config (before the first `[`) is used. → test in Task 7.
 3. **Token store created after the service started** (missing at startup, then `token create`): picked up within about a second without restart. → test in Task 6.
 4. **`hostpower_url` with a trailing slash or a path prefix** (`http://192.0.2.10:9873/`, `http://192.0.2.10/hp`): the guest requests exactly `<base>/v1/energy` once. → test in Task 4.
@@ -235,41 +235,53 @@ func TestTokenMainUsageErrors(t *testing.T)               // no verb / unknown v
 
 ---
 
-### Task 7: MAC-mode resolver (host)
+### Task 7: MAC mode on ingress capture (host) — REVISED
+
+> Revised 2026-11-25 after the task review found the ARP-based resolver spoofable (spec §4.4). The first implementation (commit ab472e36, `macresolve.go`) is replaced: its ARP/FDB/brif code is deleted; its VM-config parsing (lines before the first `[`, `net<n>:`, first 6-byte MAC value) and port-name regex are reused. `readCapped` (readcap.go) stays.
 
 **Files:**
-- Create: `server-agent/internal/hostpower/macresolve.go`
-- Test: `server-agent/internal/hostpower/macresolve_test.go`
+- Rewrite: `server-agent/internal/hostpower/macresolve.go` (resolver, config check, pure frame parser — build-tag-free)
+- Create: `server-agent/internal/hostpower/capture_linux.go` (`//go:build linux`: AF_PACKET socket, BPF attach, read loop), `server-agent/internal/hostpower/capture_other.go` (`//go:build !linux`: stub returning an error)
+- Rewrite: `server-agent/internal/hostpower/macresolve_test.go`; Create: `server-agent/internal/hostpower/capture_linux_test.go` (`//go:build linux`, skipped unless root)
 
 **Interfaces:**
 - Produces:
-  - `const DefaultARPPath = "/proc/net/arp"`, `DefaultSysClassNet = "/sys/class/net"`, `DefaultPVEConfDir = "/etc/pve/qemu-server"`.
-  - `type MACResolver struct { ARPPath, SysClassNet, PVEConfDir string }` (empty fields → defaults).
-  - `func (r MACResolver) Resolve(remote netip.Addr) (vmid string, err error)`; errors are `*ResolveError{Reason string}` with reasons exactly: `ipv6 not supported`, `no ARP entry`, `not a bridge`, `no FDB entry`, `not a VM bridge port`, `no VM config`, `MAC mismatch`.
-  - Algorithm per spec §4.4: `/proc/net/arp` line with IP == remote (after `Unmap`), flags `0x2`, device D; D is a bridge iff `SysClassNet/D/bridge` exists; FDB from `SysClassNet/D/brforward` as 16-byte records `{mac[6], port_no u8, is_local u8, ageing u32, port_hi u8, pad u8, unused u16}` with port = `port_hi<<8 | port_no`, skipping `is_local != 0`; port interface = the entry of `SysClassNet/D/brif/*` whose `port_no` file (hex, e.g. `0x3`) equals port; name regex → vmid, NIC n; config `PVEConfDir/<vmid>.conf`, lines before the first line starting with `[`, `net<n>:` value split on `,`, first `model=MAC` pair whose value parses as a MAC, and `bridge=` equal to D; MAC compare case-insensitive.
-  - No caching in this task (the server may add the tuple-keyed cache later only if profiling asks for it — not planned).
+  - `type ConnKey struct { Src, Dst netip.AddrPort }` (IPv4, unmapped).
+  - `type Observation struct { Ifname string; SrcMAC net.HardwareAddr; At time.Time }`.
+  - `func ParseSYNFrame(frame []byte, dstPort uint16) (key ConnKey, src net.HardwareAddr, ok bool)` — pure: Ethernet II (optionally one 802.1Q tag, ethertype 0x8100, skipped), IPv4 (version 4, IHL ≥ 5, protocol 6, honour IHL, not a fragment with offset > 0), TCP header present (≥ 20 bytes), SYN set and ACK clear, destination port == dstPort; anything else `ok=false`. Never panics on short input.
+  - `type ObservationTable struct` with `func NewObservationTable(ttl time.Duration, now func() time.Time) *ObservationTable`, `func (t *ObservationTable) Add(key ConnKey, obs Observation)`, `func (t *ObservationTable) Wait(ctx context.Context, key ConnKey, maxWait time.Duration) []Observation` (returns the observations for key, waiting up to maxWait for the first one via a condition/notify channel; expired entries purged on Add). Goroutine-safe.
+  - `type IngressResolver struct { Table *ObservationTable; PVEConfDir string; MaxWait time.Duration }` (`PVEConfDir` empty → `DefaultPVEConfDir`; `MaxWait` zero → 250 ms).
+  - `func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrPort) (vmid string, err error)`; errors `*ResolveError{Reason}` with reasons exactly: `ipv6 not supported`, `no SYN observed`, `not a VM port`, `ambiguous ingress`, `no VM config`, `MAC mismatch`. VM ports are interface names matching `^tap(\d+)i(\d+)$` only (`fwpr`/`fwbr`/`fwln`/bridge copies of the same frame are ignored, not counted as ambiguous). The MAC compared is the SYN frame's source MAC from the tap observation.
+  - `func StartCapture(ctx context.Context, port uint16, table *ObservationTable, log *slog.Logger) error` — Linux: `syscall.Socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))`, attach a classic BPF filter (IPv4, TCP, dst port, SYN without ACK; with and without one VLAN tag) via `syscall.AttachLsf` (stdlib; add a `//nolint:staticcheck` with the reason "stdlib-only constraint; x/net/bpf not allowed" if SA1019 fires), set `SO_RCVTIMEO` (e.g. 500 ms) so the loop can observe ctx, read with `syscall.Recvfrom`, skip `PacketOutgoing`, run every frame through `ParseSYNFrame` (userspace re-check), map `Ifindex` to a name via `net.InterfaceByIndex` (cache; refresh on miss), `table.Add`. Returns an error if the socket cannot be opened (caller exits 2). The read loop runs in a goroutine started by StartCapture and ends when ctx is done. Non-Linux stub: returns `errors.New("hostpower: MAC mode needs Linux")`.
+  - Remove `MACResolver`, `DefaultARPPath`, `DefaultSysClassNet` and their tests; keep `DefaultPVEConfDir`.
 
-- [ ] **Step 1: Failing tests** (synthetic trees built by a helper `fakeNet(t, ...)` that writes `arp`, `sys/class/net/vmbr0/{bridge/, brforward, brif/<port>/port_no}`, `qemu-server/<vmid>.conf`)
+- [ ] **Step 1: Failing tests**
 
 ```go
-func TestResolveTapPort(t *testing.T)                 // 192.0.2.50 → bc:24:11:00:00:64 on tap100i0 → "100"
-func TestResolveFirewallPort(t *testing.T)            // learned on fwpr101p0 → "101"
-func TestResolveUplinkRejected(t *testing.T)          // learned on enp3s0 → "not a VM bridge port"
-func TestResolveVethRejected(t *testing.T)            // veth200i0 → "not a VM bridge port"
-func TestResolveMACMismatch(t *testing.T)             // tap100i0 but conf net0 MAC differs → "MAC mismatch"
-func TestResolveWrongNICIndex(t *testing.T)           // learned on tap100i1, conf has only net0 → "MAC mismatch"
-func TestResolveWrongBridge(t *testing.T)             // conf bridge=vmbr1 → "MAC mismatch"
-func TestResolveIncompleteARP(t *testing.T)           // Review Focus 1: flags 0x0 → "no ARP entry"; IP absent → "no ARP entry"
-func TestResolveIgnoresSnapshotSections(t *testing.T) // Review Focus 2: current net0 MAC A; [snap1] net0 MAC B; request with B → "MAC mismatch"; with A → "100"
-func TestResolveLocalFDBEntrySkipped(t *testing.T)    // only an is_local entry for the MAC → "no FDB entry"
-func TestResolveIPv6(t *testing.T)                    // 2001:db8::1 → "ipv6 not supported"; ::ffff:192.0.2.50 → resolves like IPv4
-func TestResolveNotABridge(t *testing.T)              // ARP device eth0 without bridge dir → "not a bridge"
+// macresolve_test.go (build-tag-free)
+func TestParseSYNFrame(t *testing.T)                     // hand-built frames: plain SYN to :9873 → ok, key and src MAC; VLAN-tagged SYN → ok
+func TestParseSYNFrameRejects(t *testing.T)              // SYN-ACK, pure ACK, other dst port, IPv6 ethertype, UDP, truncated at every length 0..len-1 (no panic, ok=false), IHL<5, non-first fragment
+func TestResolveSingleTap(t *testing.T)                  // obs on tap100i0 (MAC A) + vmbr0 copy; conf net0 MAC A → "100"
+func TestResolveFirewallCopiesIgnored(t *testing.T)      // obs on tap101i0, fwbr101i0, fwln101i0, fwpr101p0, vmbr0 → "101"
+func TestResolveUplinkOnly(t *testing.T)                 // obs on enp3s0 + vmbr0 → "not a VM port"
+func TestResolveTwoTaps(t *testing.T)                    // obs on tap100i0 and tap101i0 → "ambiguous ingress"
+func TestResolveMACMismatch(t *testing.T)                // tap100i0 with MAC B, conf net0 MAC A → "MAC mismatch"
+func TestResolveWrongNICIndex(t *testing.T)              // tap100i1, conf only net0 → "MAC mismatch"
+func TestResolveIgnoresSnapshotSections(t *testing.T)    // current net0 MAC A, [snap1] net0 MAC B; SYN MAC B → "MAC mismatch"; MAC A → "100"
+func TestResolveNoObservation(t *testing.T)              // empty table, MaxWait 50ms → "no SYN observed" after ≥50ms
+func TestResolveLateObservation(t *testing.T)            // Add after 20ms in a goroutine, MaxWait 250ms → resolves
+func TestResolveIPv6(t *testing.T)                       // [2001:db8::1]:5555 → "ipv6 not supported"; ::ffff:192.0.2.50 → like IPv4
+func TestResolveSpoofedIPGetsOwnVM(t *testing.T)         // VM B's SYN with src IP of A, enters tap101i0 with MAC B, conf 101 MAC B → "101" (never "100")
+func TestResolveSpoofedMACRejected(t *testing.T)         // VM B's SYN with MAC A enters tap101i0, conf 101 MAC B → "MAC mismatch"
+func TestObservationTableExpiry(t *testing.T)            // injected clock: entry older than ttl not returned; purged on next Add
+// capture_linux_test.go (//go:build linux; t.Skip unless os.Geteuid()==0)
+func TestStartCaptureSeesLoopbackSYN(t *testing.T)       // listen on 127.0.0.1:<port>, StartCapture(port), dial → table has an observation on "lo" for the 4-tuple within 1s
 ```
 
 - [ ] **Step 2: Run, expect FAIL.**
-- [ ] **Step 3: Implement** (stdlib only; read files with a size cap — `brforward` up to 1 MiB, others 64 KiB).
-- [ ] **Step 4: Run** `cd server-agent && go test -race ./internal/hostpower && GOOS=linux GOARCH=amd64 go vet ./internal/hostpower` → PASS.
-- [ ] **Step 5: Commit** `feat(agent): hostpower identifies a VM from ARP, bridge port and VM config`.
+- [ ] **Step 3: Implement** (delete the ARP/FDB code; keep the config parser and reuse it).
+- [ ] **Step 4: Run** `cd server-agent && go test -race ./internal/hostpower ./internal/archtest && GOOS=linux GOARCH=amd64 go vet ./internal/hostpower && GOOS=linux GOARCH=amd64 go test -c -o /dev/null ./internal/hostpower && GOOS=windows GOARCH=amd64 go vet ./internal/hostpower` → PASS / clean.
+- [ ] **Step 5: Commit** `feat(agent): hostpower MAC mode identifies the VM by the SYN's ingress tap` (body: why ARP was dropped, the capture design, userspace re-check).
 
 ---
 
@@ -280,10 +292,10 @@ func TestResolveNotABridge(t *testing.T)              // ARP device eth0 without
 - Test: `server-agent/internal/hostpower/server_test.go`
 
 **Interfaces:**
-- Consumes: `collector.HostpowerEnergy`, `collector.HostpowerEnergyPath` (Task 4); `(*Service).LiveCounter` (Task 2); `*TokenStore` (Task 6); `MACResolver` (Task 7).
+- Consumes: `collector.HostpowerEnergy`, `collector.HostpowerEnergyPath` (Task 4); `(*Service).LiveCounter` (Task 2); `*TokenStore` (Task 6); `IngressResolver`, `ObservationTable`, `StartCapture` (Task 7).
 - Produces:
   - `type AuthModes struct { MAC, Token bool }`; `func ParseAuthModes(s string) (AuthModes, error)` — comma list of `mac`, `token`; empty or unknown → error.
-  - `type counterSource interface { LiveCounter(string) (uint64, bool) }`, `type vmResolver interface { Resolve(netip.Addr) (string, error) }`, `type tokenLookup interface { Lookup(string) (string, bool) }`.
+  - `type counterSource interface { LiveCounter(string) (uint64, bool) }`, `type vmResolver interface { Resolve(ctx context.Context, remote, local netip.AddrPort) (string, error) }` (the handler takes remote from `r.RemoteAddr` and local from `r.Context().Value(http.LocalAddrContextKey)`), `type tokenLookup interface { Lookup(string) (string, bool) }`.
   - `func newHandler(modes AuthModes, counters counterSource, resolver vmResolver, tokens tokenLookup, log *slog.Logger, now func() time.Time) http.Handler` implementing the global-constraint rules; per-IP token bucket 10 req/s, burst 20; limiter and log-state maps evict entries idle for more than 1 minute.
   - Rejection logging: one Warn per source IP when its reason changes (`hostpower: request rejected`, attrs `remote`, `reason`), one Info when it later succeeds; never the token or header.
   - `func NewServer(listen string, h http.Handler) *http.Server` with `ReadHeaderTimeout: 2s`, `ReadTimeout: 5s`, `WriteTimeout: 5s`, `IdleTimeout: 30s`, `MaxHeaderBytes: 4096`.
@@ -320,7 +332,7 @@ func TestParseAuthModes(t *testing.T)                     // "mac,token", "token
 **Interfaces:**
 - Produces:
   - `type Config struct { Options; Interval time.Duration; Verbose bool; Listen string; Auth AuthModes; TokensPath string }`; `func ParseArgs(args []string) (Config, error)` (replaces the 4-tuple; existing tests migrate) with new flags `-listen` (default ""), `-auth` (default `mac,token`, validated by `ParseAuthModes` only when `-listen` is set), `-tokens` (default `DefaultTokensPath`).
-  - `func Main(args []string, stdout, stderr io.Writer) int` — if `args[0] == "token"` → `TokenMain(args[1:], stdout, stderr)`. Otherwise as today, plus: when `Listen != ""`, `net.Listen("tcp", Listen)` before starting the tick loop (failure → stderr message + exit 2), log Info `hostpower: serving` with `listen` and `auth`, serve in a goroutine with the handler from Task 8 (`MACResolver{}`, `NewTokenStore(TokensPath)`, the Service), and on shutdown `srv.Shutdown` with a 2 s timeout. Usage text updated.
+  - `func Main(args []string, stdout, stderr io.Writer) int` — if `args[0] == "token"` → `TokenMain(args[1:], stdout, stderr)`. Otherwise as today, plus: when `Listen != ""`, `net.Listen("tcp", Listen)` before starting the tick loop (failure → stderr message + exit 2), log Info `hostpower: serving` with `listen` and `auth`, when `Auth.MAC` is set, create `NewObservationTable(30*time.Second, time.Now)` and call `StartCapture(ctx, <listen port>, table, log)` before serving (an error → stderr message + exit 2, e.g. MAC mode on a non-Linux build or no CAP_NET_RAW); serve in a goroutine with the handler from Task 8 (`&IngressResolver{Table: table}`, `NewTokenStore(TokensPath)`, the Service), and on shutdown `srv.Shutdown` with a 2 s timeout (the capture stops with ctx). Usage text updated.
 
 - [ ] **Step 1: Failing tests**
 

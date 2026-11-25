@@ -60,8 +60,8 @@ Non-goals (this version)
 
 - TLS for the HTTP endpoint (my call, see §7; the token mode is designed so
   TLS can be added without changing the guest's identity model).
-- MAC mode over IPv6, routed networks, NAT, Open vSwitch or SDN overlays
-  (token mode covers them).
+- MAC mode over IPv6, routed networks, NAT, or setups where the VM NIC is
+  not a QEMU tap on this host (token mode covers them).
 - LXC containers, macOS guests (the guest collector builds everywhere but is
   documented for Linux and Windows only).
 - A local privileged helper for bare-metal Linux (the root part serving RAPL
@@ -199,7 +199,7 @@ Rules:
   poller, e.g. 10 requests/s burst 20) returning `429`.
 - Logging: no token, no `Authorization` header value is ever logged.
   Rejections are logged per source address on state change only (as the
-  write-failure logging), at Warn, with the reason (`no ARP entry`,
+  write-failure logging), at Warn, with the reason (`no SYN observed`,
   `not a VM bridge port`, `MAC mismatch`, `unknown token`, ...).
 - The handler reads the counter from the service under its existing mutex
   (a snapshot accessor; no map escapes the lock).
@@ -209,43 +209,67 @@ creates, and the handler obtains the caller's identity through one internal
 step (token, else MAC) that a later Unix-socket peer-credential identity can
 join without restructuring the handler.
 
-### 4.4 MAC mode: identifying the VM from the network
+### 4.4 MAC mode: identifying the VM by the port its connection entered
 
-For a request from remote address `ip` (IPv4 only; an IPv4-mapped IPv6
-address counts as IPv4; any other IPv6 → `401` in MAC mode):
+Revised after the task review of the first resolver (2026-11-25, operator
+decision "capture the ingress port"). The first design read the requester's
+MAC from the host's ARP cache. That cache is filled from ARP *payloads*, so
+an attacker (another VM or a LAN device) could announce "my IP is at VM A's
+MAC", get VM A's identity, and receive A's counter after re-announcing its
+own MAC (TCP retransmits the response). ARP and the bridge FDB are therefore
+not used at all.
 
-1. **MAC:** look up `ip` in `/proc/net/arp`; require a complete entry
-   (flags `0x2`) whose device is a Linux bridge. Result: `mac`, `bridge`.
-   The entry is fresh because the host has just answered the guest's TCP
-   handshake.
-2. **Bridge port:** find the forwarding-database entry for `mac` on
-   `bridge` and the port interface it was learned on (sysfs
-   `/sys/class/net/<bridge>/brforward` plus `brif/<port>/port_no`, or an
-   equivalent stdlib-only source the builder verifies on PVE 9.2).
-   Local (host-owned) entries never match.
-3. **VM ID:** the port name must match `^tap(\d+)i(\d+)$` or
-   `^fwpr(\d+)p(\d+)$` → `vmid`, NIC index `n`. Anything else (physical
-   uplink, `veth…` of LXC, bonds) → `401`.
-4. **Config check:** `/etc/pve/qemu-server/<vmid>.conf` must contain
-   `net<n>:` whose MAC equals `mac` (case-insensitive) and whose `bridge=`
-   equals `bridge`. Mismatch → `401`.
-5. The VM must be a running QEMU VM (present in the service's VM set).
+**Ingress capture.** When MAC mode is enabled, the service opens one Linux
+`AF_PACKET` raw socket (all interfaces, `ETH_P_ALL`, outgoing frames
+ignored) with a classic BPF filter that passes only IPv4 TCP segments with
+SYN set and ACK clear whose destination port is the listen port. For every
+such frame it records an observation keyed by the TCP 4-tuple (source IP,
+source port, destination IP, destination port): the receiving interface
+(`sll_ifindex` → name via `net.InterfaceByIndex`, refreshed on a miss) and
+the frame's Ethernet source MAC. A frame from a VM is seen on several
+interfaces (its `tap<vmid>i<n>`, with the PVE firewall also `fwbr…`,
+`fwln…`, `fwpr<vmid>p<n>`, and finally the bridge); only interfaces named
+`^tap(\d+)i(\d+)$` count as VM ingress ports. The BPF filter is only an
+optimisation: userspace re-parses every received frame and re-checks IPv4,
+TCP, SYN-without-ACK and the destination port, so a wrong filter can cost
+CPU but never correctness. Observations expire after 30 s.
 
-Why this is safe (to be restated in the ADR): a VM that fakes another VM's
-IP and poisons the host's ARP cache still has its frames learned on its own
-port, so steps 2–4 resolve to itself and it gets its own values; a VM that
-fakes another VM's MAC is learned on its own port, whose configured MAC
-differs → `401`; a LAN device is learned on the physical uplink → `401`;
-nothing secret travels, so nothing can be sniffed and replayed. The PVE
-firewall's MAC filter, if enabled, blocks spoofed source MACs earlier still.
+**Resolution** for a request on connection (remote `ip:port`, local
+`ip:port`), IPv4 only (IPv4-mapped IPv6 counts; other IPv6 → `401`):
 
-All paths (`/proc/net/arp`, `/sys/class/net`, `/etc/pve/qemu-server`) are
-`Options` fields with these defaults so tests run against synthetic trees.
-A short cache of a successful resolution (a few seconds) is allowed only if
-it is keyed on the full tuple (IP, MAC, bridge port) re-read from ARP and the
-FDB on every request, so a VM that takes over a cached IP never inherits
-another VM's identity; caching only skips re-reading the VM config. Any
-lookup failure is not cached. (Designer's call after the builder check.)
+1. Look up the observations for the connection's 4-tuple. If none exists
+   yet, wait up to 250 ms for the capture goroutine to deliver it (the SYN
+   always precedes the request; this only covers scheduling delay).
+2. The observations must contain exactly one distinct VM ingress port
+   (`tap<vmid>i<n>`). None (only a physical uplink, `veth`, bond or bridge
+   seen) → `401` `not a VM port`. More than one distinct VM port → `401`
+   `ambiguous ingress`.
+3. `/etc/pve/qemu-server/<vmid>.conf`, lines before the first `[` section,
+   must contain `net<n>:` whose MAC (first `key=value` that parses as a
+   6-byte MAC) equals the SYN frame's source MAC → otherwise `401`
+   `MAC mismatch`.
+4. The VM must be live (`LiveCounter`), else `503`.
+
+**Why this is safe** (to be restated in the ADR): the kernel reports the
+interface a frame physically entered, and a guest's frames can only enter
+through its own tap device. A VM that fakes another VM's IP or MAC still
+enters on its own tap, so it resolves to itself (own values) or fails the
+MAC check (`401`). A LAN device enters on the physical uplink and never on a
+`tap` (`401`). Nothing secret travels, so nothing can be sniffed and
+replayed. A different machine cannot ride on an established connection
+without the TCP sequence numbers.
+
+**Requirements and limits:** Linux only (CAP_NET_RAW, which the root
+service has); the VM's NIC must be a QEMU tap on the host (bridge, VLAN
+or firewall setups all keep the tap); IPv4 only in this version. On other
+build targets MAC mode is unavailable: `-auth` containing `mac` fails at
+startup with a clear message.
+
+All paths (`/etc/pve/qemu-server`) are `Options` fields; the capture is
+behind a small interface so the resolver and handler are unit-tested with
+synthetic observations, and the frame parser is a pure function tested
+with hand-built frames. A real capture test runs only as root on Linux and
+is skipped otherwise; the real-socket check is part of the PVE acceptance.
 
 ### 4.5 Token mode
 
@@ -328,10 +352,12 @@ New agent options, all three forms like the existing ones:
 
 ### 4.9 Testing
 
-- MAC resolution against synthetic `/proc/net/arp`, bridge sysfs (FDB and
-  port numbers) and `qemu-server` configs: tap and fwpr ports, uplink port,
-  `veth` port, MAC mismatch, wrong NIC index, wrong bridge, incomplete ARP
-  entry, IPv6.
+- MAC mode: frame parser with hand-built Ethernet/IPv4/TCP frames (SYN,
+  SYN-ACK, wrong port, IPv6, truncated, VLAN-tagged); resolver with
+  synthetic observations: single tap, tap plus fwpr/fwbr/bridge copies,
+  uplink only, two taps, MAC mismatch, wrong NIC index, snapshot sections,
+  late observation within 250 ms, expiry; spoof cases (VM B claiming A's IP,
+  VM B with A's MAC).
 - Handler tests with `httptest` and an injected remote address: token
   precedence, `401`/`503`/`405`/`429`, `no-store`, no token in logs
   (recording slog handler).
@@ -353,7 +379,8 @@ New agent options, all three forms like the existing ones:
 
 - Package/file layout for the HTTP server, MAC resolver and token store
   inside `internal/hostpower` (one responsibility per file).
-- The exact stdlib-only way to read the bridge FDB, verified on PVE 9.2.
+- The exact BPF program (classic BPF via the stdlib `syscall` package),
+  verified on PVE 9.2 during acceptance.
 - Rate-limit implementation details and exact timeout values within the
   stated bounds.
 - How the token CLI subcommand is dispatched from `Main`.
@@ -372,7 +399,9 @@ New agent options, all three forms like the existing ones:
 
 - HTTP off by default; enabled by `-listen`.
 - Token wins over MAC when a token is sent; no fallback on a bad token.
-- MAC mode IPv4-only; identity from ARP + bridge FDB port name + VM config.
+- MAC mode IPv4-only; identity from the SYN's ingress tap interface + the
+  SYN frame's source MAC checked against the VM config (revised: ARP and
+  FDB are not used, see §4.4).
 - Tokens stored hashed; CLI on the same binary; hot reload by mtime.
 - No TLS in this version.
 - Windows virtiofs via a separate `windows/` subtree with `intel-rapl_0`,
