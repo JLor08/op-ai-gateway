@@ -129,6 +129,23 @@ token and never contacts the gateway; its only listener is that optional HTTP en
 ([ADR-115](09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs),
 [ADR-116](09-architecture-decisions.md#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token)).
 
+**Optional privileged helper on bare-metal Linux.** The agent starts gateway-supplied
+model runtimes, so on Linux it is meant to run as an ordinary user (the README's
+example unit: `User=op-agent`, `After=`/`Wants=op-agent-helper.service`). The two
+root-only sources it would then lose, RAPL `energy_uj` and the SMBIOS DIMM table, come
+from a second systemd service running the same binary as root in
+`server-agent helper -agent-user op-agent` mode (`op-agent-helper.service`). Systemd's
+`RuntimeDirectory=op-agent-helper` creates the dedicated socket directory; the helper
+sets it to `0750` and the socket `/run/op-agent-helper/agent.sock` to `0660`, both
+`root:<agent group>`, and serves only the agent uid (`SO_PEERCRED`). It starts no
+process, opens no network socket and has no gateway contact; the example unit adds
+`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateNetwork`,
+`RestrictAddressFamilies=AF_UNIX` and a system-call filter denying `execve`, whose
+capability and system-call sets are unverified until the pending hardware acceptance.
+The agent finds the socket by default (`helper_socket`); a root agent never uses it.
+On a Proxmox host it runs next to `op-hostpower.service`, independently
+([ADR-117](09-architecture-decisions.md#adr-117--a-root-only-agent-helper-serves-rapl-counters-and-dimms-over-a-peer-checked-unix-socket-so-the-linux-agent-runs-unprivileged)).
+
 **An AI server that is a llama.cpp RPC cluster member opens one more listener per
 member** ([ADR-096](09-architecture-decisions.md#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster)).
 Every other managed process binds loopback behind the agent's router; a member's

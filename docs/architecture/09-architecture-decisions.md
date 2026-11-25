@@ -173,7 +173,9 @@ this — a naive match passes locally and breaks on Linux).
 (root-only energy) + hwmon sensors (non-root); macOS `powermetrics` (sudo);
 Windows via an operator-installed LibreHardwareMonitor `/data.json` (license-clean).
 **Consequence:** several sources need privileges and are absent otherwise; the agent
-degrades gracefully.
+degrades gracefully. **Amended by [ADR-117](#adr-117--a-root-only-agent-helper-serves-rapl-counters-and-dimms-over-a-peer-checked-unix-socket-so-the-linux-agent-runs-unprivileged):**
+on Linux the root-only RAPL counters and the SMBIOS DIMM table reach an unprivileged
+agent through the root `server-agent helper`, and hwmon is its own source after it.
 
 ## ADR-014 — NetBird mesh with a gateway-managed, rotatable PAT
 **Decision:** the gateway manages NetBird peers/policies and holds a rotatable admin
@@ -13793,3 +13795,115 @@ side by side; the attribution, cadence and counter semantics of ADR-115 are unch
   [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
   [Config env](reference/config-env.md),
   [Agent README](../../server-agent/README.md#linux-or-windows-guest-on-a-proxmox-ve-host).
+
+## ADR-117 — A root-only agent helper serves RAPL counters and DIMMs over a peer-checked Unix socket, so the Linux agent runs unprivileged
+
+**Context.** On bare-metal Linux two of the agent's measurements need root: the RAPL energy counters (`energy_uj`, mode `0400` since the
+PLATYPUS / CVE-2020-8694 mitigation; without them no CPU watts and no `psys` system watts) and the per-DIMM inventory (the SMBIOS table
+`/sys/firmware/dmi/tables/DMI`, root-only; the agent used to run `dmidecode -t memory`). The same agent process starts the gateway-supplied model
+runtimes ([ADR-013](#adr-013--cross-platform-powertemperature-sources) left the choice at "run as root or lose the data"). Running a process that
+executes gateway-chosen command lines as root to obtain two numbers is the wrong trade. The operator wants a privilege split modelled on the
+Proxmox host/guest split of [ADR-115](#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs): a tiny root process
+that only collects, and the agent running as an ordinary user. No wire, gateway or portal change: the agent reports the same fields a root agent
+reports.
+
+**Decision.**
+
+- **A new root mode `server-agent helper`** (package `internal/helper`, Linux only; elsewhere it exits 2) serves HTTP over a Unix socket,
+  default `/run/op-agent-helper/agent.sock`, with flags `-agent-user` (required), `-agent-group` (default: the user's primary group), `-socket`,
+  `-powercap-root`, `-dmi-table` and `-v`. It starts no process, opens no network socket, has no gateway contact and no config file, and
+  accepts no write. An archtest rule keeps it to `collector` and `sample` (no `agent`, `client`, `config`, `proxy`, `runtime`, `trust` or
+  `hostpower`); it carries its own server with the hostpower endpoint's timeouts and header limit.
+- **Identity.** `-agent-user` is a name or a canonical decimal uid (`1000`, not `01000`); uid 0 and the overflow uid 65534 (`nobody`, also what
+  peers from an unmapped user namespace appear as) are refused, and the listener refuses uid 0 a second time. A numeric uid without a passwd entry
+  needs `-agent-group`. The group owns the socket directory and the socket and is never used for authorization.
+- **Peer authorization in one place.** Every accepted connection is checked with `SO_PEERCRED` before a byte is read; only the agent uid passes
+  (`authorizePeer`). Root peers are not implicitly allowed. A denied peer is closed without a response and logged at Warn at most once every
+  10 minutes per peer uid (the per-uid state is bounded).
+- **Socket path rules.** The path must be absolute and clean and not directly in `/`. The parent of the socket directory must exist (the helper
+  creates only the socket directory, `0750`); it is resolved through symlinks once, and every directory from there up to `/` must be owned by
+  root and not group/other-writable unless sticky (a sticky world-writable directory such as `/tmp` is accepted: others cannot rename or remove
+  root's entries in it), so only root can swap any path component between the checks and the `chown`/`chmod`. When running as root the socket
+  directory must be a real directory owned by root and **dedicated** (no entry but the socket's own name), so the helper never re-owns a shared
+  directory such as `/run`; checks, `chown` and `chmod` go through one `O_NOFOLLOW` descriptor. The directory ends `0750` and the socket `0660`,
+  both `root:<agent group>`. A leftover socket is removed only if a dial shows nobody listens on it (`another helper is already listening`
+  otherwise); any other file type at the path is an error. On shutdown Go's unlink-on-close removes the socket.
+- **Endpoints.** `GET /v1/rapl` returns every top-level `intel-rapl:N` zone (no sub-zones) with a name and a readable `energy_uj`, keyed by `zone`
+  so the agent tracks counters per zone, **from a cache refreshed at most every 250 ms**. `GET /v1/memory-modules` returns the DIMMs in the
+  inventory's `MemoryModule` shape, parsed **once at startup** (the table is static; an unreadable table logs a Warn and serves an empty list). JSON,
+  `Cache-Control: no-store`, `404`/`405` for another path or method, and one token bucket for the whole socket, 20 requests/s with burst 40, then
+  `429`: there is exactly one legitimate client, and the bucket only bounds the helper's work.
+- **The SMBIOS table is parsed in-process, by the helper and by a root agent.** `collector.ParseSMBIOSMemory` walks the raw table and decodes
+  type 17 only (size incl. the extended size, locator, memory type with dmidecode's names, `Unknown` → empty, rated speed else configured speed,
+  each with the extended field) and never decodes serial numbers, asset tags, part numbers or UUIDs. A root agent reads the table file with the
+  same parser instead of running `dmidecode`, so root and unprivileged agents cannot drift and `dmidecode` is no longer a dependency.
+- **Agent side.** A new option `helper_socket` / `OP_AGENT_HELPER_SOCKET` / `-helper-socket` defaults to the helper's socket on Linux and is
+  empty elsewhere; `off` in any source disables it (an empty env var means unset); a value that is not an absolute path is warned about and turns
+  the helper off; a value on a non-Linux OS is warned about and ignored. The helper client dials the socket for every request (fixed URL
+  `http://op-agent-helper` + path), with the hostpower client's settings (no proxy, no redirects, short timeout) and body caps of 4 KiB
+  (`/v1/rapl`) and 64 KiB (`/v1/memory-modules`). The helper is consulted only when the agent runs on Linux, not as euid 0, with a socket set.
+- **Power order.** The Linux native collector is split into its RAPL and its hwmon part, and the composite becomes **native RAPL → helper →
+  hwmon → hostpower HTTP → LibreHardwareMonitor**, first non-nil per metric. The `helper` source applies the RAPL collector's rules to the served
+  counters (sum of `package*` zones for CPU, `psys` for system, per-zone delta with wraparound correction, nil on the first sample and after any
+  failure). A root agent's result is unchanged (it never composes the helper, and RAPL `psys` still wins over hwmon); an unprivileged agent gets
+  the helper's `psys` before the world-readable hwmon sensor, exactly as a root agent would.
+- **Memory modules and the retry.** An unprivileged agent asks the helper once in the startup inventory (within the 2 s hardware-source budget).
+  When that left no modules, the agent retries just this fetch **every 30 s** on its run loop (2 s timeout each) until the first successful reply,
+  then updates the cached inventory and re-sends it; an empty successful reply also ends the retry. **Deviation from the inventory's own cadence,
+  recorded here on purpose:** the system report is re-sent every `OP_AGENT_SYSTEM_REPORT_INTERVAL` (default 30 min), which would leave a helper
+  that starts seconds after the agent invisible for half an hour. The units' `After=`/`Wants=` order the start, but the retry is what makes a late
+  start or a helper restart harmless.
+- **Logging.** The agent logs the helper's first RAPL success at Info, every failure at Debug (the helper may simply not be installed). On an
+  unprivileged Linux agent without a helper the default socket therefore costs one failed dial per sample and per 30 s retry, at Debug;
+  `helper_socket: off` silences it.
+- **Deployment.** The README carries two example units (the repo ships no unit files): `op-agent-helper.service` (root,
+  `RuntimeDirectory=op-agent-helper`, `RuntimeDirectoryMode=0750`, `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateNetwork`,
+  `RestrictAddressFamilies=AF_UNIX`, a capability bounding set and a system-call filter denying `execve`) and an unprivileged agent unit
+  (`User=op-agent`, `After=`/`Wants=op-agent-helper.service`), plus the agent features that need more than an ordinary user (GPU device groups, a
+  proxy port below 1024, `cert_dir` ownership, a `cert_reload_command` that needs sudoers or polkit). On a Proxmox host the helper runs next to
+  `op-hostpower.service`; the two are independent.
+
+**Threat model: processes sharing the agent's uid.** The agent starts the gateway-supplied runtimes as children under its own uid, so
+`SO_PEERCRED` cannot tell them from the agent: any process of the agent uid can read the helper.
+
+- **Accepted:** same-uid processes are inside the agent's trust boundary anyway (they can signal or ptrace the agent). No per-pid check is
+  built; it would be a false boundary.
+- **Side channel (PLATYPUS / CVE-2020-8694):** the attack needs RAPL samples at the counter's update rate (about 50 µs). The 250 ms cache caps
+  every reader at four distinct values per second however fast it asks (the granularity Proxmox guests get from hostpower's 250 ms tick), so a
+  runtime learns only a coarse average package power, roughly what the portal's watt chart shows. Residual risk, recorded in
+  [§11.1](11-risks-and-technical-debt.md#111-operational-risks).
+- **Out of scope:** a same-uid process flooding the socket so the agent gets `429`s and loses watts for a while (denial of service by a process
+  that could kill the agent outright), and the full fix, runtimes under a uid of their own.
+- Other local users: the directory (`0750`, `root:<agent group>`) keeps them from the socket, and `SO_PEERCRED` turns away anyone who reaches it
+  anyway, root included.
+
+**Alternatives rejected.**
+
+- *Extending `hostpower_url` with a `unix://` scheme:* the helper serves different data (the undivided counters of every top-level zone plus the
+  DIMM inventory, not one VM's attributed share), so overloading the guest option would mix two contracts under one key.
+- *One merged root daemon with `server-agent hostpower`:* a Proxmox host would run one root process with two jobs and a network listener next to
+  the agent's socket; two small units, each with its own sandbox, are easier to reason about, and `hostpower` stays untouched.
+- *Running `dmidecode` from the root helper:* the root process would spawn a child, so its unit could not forbid `exec`; parsing the table
+  in-process costs one small bounded parser, shared with the root agent.
+- *Per-pid peer checks (`/proc/<pid>/exe` and the like):* same-uid processes can manipulate one another, and a pid can be reused, so it would be a
+  false boundary that suggests protection it cannot give.
+- *Fresh RAPL reads per request:* every same-uid reader could sample as fast as the socket allows, which is what the side channel needs; the
+  250 ms cache costs the agent nothing at its 1 s default interval.
+
+**Consequences.**
+
+- An unprivileged Linux agent with the helper installed reports CPU watts, `psys` system watts and the DIMM list exactly as a root agent; a root
+  agent is unchanged except that it parses the SMBIOS table itself instead of running `dmidecode`.
+- A second root service to install on bare-metal Linux; without it an unprivileged agent degrades as before (no CPU watts, RAM total only).
+- The model runtimes can read coarse package power through the helper (accepted, see the threat model).
+- `power_sources` lists `helper` whenever the source is composed; it does not prove the helper answers (the Info log on the first success does).
+- **Hardware acceptance pending.** No Linux machine was available. Evidence so far: the Linux CI tests (a real socket with `SO_PEERCRED` accept and
+  deny, directory and socket permissions, stale and live sockets) and a local Linux-container run (helper as root, clients as uid 1000, uid 2000
+  and root). Real RAPL, a real DMI table compared with `dmidecode -t memory`, and the systemd unit under `systemd-analyze security` are a
+  step-by-step checklist in the agent README; the example unit's capability and system-call sets are **unverified** until then.
+- Agent version 0.24.0; no new `agent.Features` entry (no wire change).
+- → [Telemetry §8.2.3](cross-cutting/telemetry-usage-observability.md#823-power-draw-watts),
+  [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
+  [Config env](reference/config-env.md),
+  [Architecture tests](cross-cutting/architecture-tests.md),
+  [Agent README](../../server-agent/README.md#privileged-helper-linux).

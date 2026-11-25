@@ -52,7 +52,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap root the RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower` on Linux, a drive root such as `Z:\` on Windows). Empty uses the platform default (Linux) or disables it (Windows); ignored on macOS. See [Linux or Windows guest on a Proxmox VE host](#linux-or-windows-guest-on-a-proxmox-ve-host). |
 | `OP_AGENT_HOSTPOWER_URL` | `-hostpower-url` | `hostpower_url` | — | Optional hostpower HTTP endpoint on the Proxmox host (e.g. `http://<host>:9873`) the guest reads its share of host CPU power from. Empty disables it. Without a token the host identifies the VM by its network port (MAC mode). A value without an `http://` or `https://` scheme or without a host logs a startup warning. |
 | `OP_AGENT_HOSTPOWER_TOKEN` | `-hostpower-token` | `hostpower_token` | — | Optional per-VM token for the hostpower HTTP endpoint (token mode; secret; never logged). Create it on the host with `server-agent hostpower token create <vmid>`. Set without `hostpower_url`, it logs a startup warning. |
-| `OP_AGENT_HELPER_SOCKET` | `-helper-socket` | `helper_socket` | `/run/op-agent-helper/agent.sock` (Linux) | Unix socket of the privileged `server-agent helper`, from which an agent that does not run as root reads RAPL counters (CPU and system watts) and memory modules. Linux only: on macOS and Windows it is empty, and a configured path logs a startup warning and is ignored. `off` disables it (an empty env var means unset). A relative path logs a startup warning and turns the helper off. A root agent reads both natively and never uses it. |
+| `OP_AGENT_HELPER_SOCKET` | `-helper-socket` | `helper_socket` | `/run/op-agent-helper/agent.sock` (Linux) | Unix socket of the privileged `server-agent helper`, from which an agent that does not run as root reads RAPL counters (CPU and system watts) and memory modules. Linux only: on macOS and Windows it is empty, and a configured path logs a startup warning and is ignored. `off` disables it (an empty env var means unset). A relative path logs a startup warning and turns the helper off. A root agent reads both natively and never uses it. Without a helper installed, set `off` to stop the per-sample attempts and the 30 s memory-module retry (both logged at Debug). See [Privileged helper (Linux)](#privileged-helper-linux). |
 | `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. A Windows CPU-watt path (alongside `powercap_root` and `hostpower_url`); a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
 | `OP_AGENT_CERT_DIR`     | `-cert-dir`      | `cert_dir`     | —       | Directory certificate files are written into. **Required** when `cert_mode` is not `off`. |
@@ -843,8 +843,16 @@ total and — best-effort — per-DIMM (size/type/speed), mainboard + BIOS (vend
 product, version), GPUs (model, VRAM, driver version), and OS/kernel/arch/hostname.
 Everything is best-effort — a field the platform doesn't expose is simply blank.
 
-- **Per-DIMM detail** is free on Windows and Intel macOS; on **Linux it needs root**
-  (else RAM total only); Apple Silicon uses unified memory (total only).
+- **Per-DIMM detail** is free on Windows and Intel macOS; Apple Silicon uses unified
+  memory (total only). On **Linux** the DIMMs come from the SMBIOS table
+  `/sys/firmware/dmi/tables/DMI`, which only root can read: an agent running as root
+  parses it in-process, an agent running as an ordinary user gets the same list from
+  the [privileged helper](#privileged-helper-linux), which parses it with the same
+  code. Without either, RAM total only. `dmidecode` is not used and need not be
+  installed. If the helper does not answer when the agent starts, the agent retries
+  just this fetch every 30 s until the first successful reply (an empty reply also
+  ends the retry) and then re-sends the inventory, so a helper that starts late
+  still fills the **Hardware** view.
 - **Privacy:** the agent never collects serial numbers, board/product/chassis UUIDs,
   or MAC addresses (and the gateway stores only a canonical blob with no such fields).
 
@@ -859,15 +867,24 @@ the native path; the optional LibreHardwareMonitor source is enabled with
 
 Per-platform prerequisites:
 
-- **Linux (native RAPL).** CPU watts come from the powercap RAPL sysfs energy
-  counters (`/sys/class/powercap/intel-rapl:*/energy_uj`); system watts from a RAPL
-  `psys` domain if present, else a hwmon power sensor
-  (`/sys/class/hwmon/*/power*_input`). `energy_uj` is root-only (mode 0400) since the
-  PLATYPUS/CVE-2020-8694 mitigation, so **run the agent as root** or apply a
-  udev/`setcap` rule granting the agent's user read access to `energy_uj`. If unmet →
-  CPU watts `null` (no chart). `psys`/hwmon power sensors are often absent on rack
-  servers → system watts `null`. RAPL is an energy counter, so the **first sample
-  after start is `null`** (no delta yet).
+- **Linux (native RAPL, privileged helper, hwmon).** CPU watts come from the powercap
+  RAPL sysfs energy counters (`/sys/class/powercap/intel-rapl:*/energy_uj`, the
+  `package*` domains summed); system watts from a RAPL `psys` domain if present, else
+  a hwmon power sensor (`/sys/class/hwmon/*/power*_input`, world-readable).
+  `energy_uj` is root-only (mode 0400) since the PLATYPUS/CVE-2020-8694 mitigation.
+  An agent running as root reads it directly. An agent running as an ordinary user
+  reads the same counters from the **[privileged helper](#privileged-helper-linux)**
+  (`server-agent helper`, a small root service) over a Unix socket; `helper_socket`
+  defaults to the helper's socket on Linux, so installing the helper unit is all it
+  takes. The sources run in the order native RAPL → helper → hwmon → hostpower HTTP →
+  LibreHardwareMonitor, and the first non-null value per metric wins: a root agent (or
+  one a udev rule grants read access to `energy_uj`) is unaffected by the helper, and
+  an unprivileged agent gets the helper's `psys` before the hwmon sensor, exactly as a
+  root agent would. The helper is never consulted when the agent runs as root. If
+  neither root nor the helper is available → CPU watts `null` (no chart).
+  `psys`/hwmon power sensors are often absent on rack servers → system watts `null`.
+  RAPL is an energy counter, so the **first sample after start is `null`** (no delta
+  yet).
 
 - **macOS (native powermetrics).** CPU watts come from
   `powermetrics --samplers cpu_power`, which **requires root/sudo**. Run the agent as
@@ -1009,9 +1026,11 @@ service.
 | No network path between guest and host wanted, no migration needed | virtiofs |
 
 Use exactly one transport per guest. If several are configured the collector
-order decides (native/virtiofs first, then hostpower HTTP, then
-LibreHardwareMonitor) and only one value is reported, so nothing is double
-counted.
+order decides (native/virtiofs first, then on Linux the privileged helper and
+hwmon, then hostpower HTTP, then LibreHardwareMonitor) and only one value is
+reported, so nothing is double counted. A guest has no helper: set
+`helper_socket` to `off` in an unprivileged Linux guest (see
+[Privileged helper (Linux)](#privileged-helper-linux)).
 
 #### virtiofs (Linux and Windows guests)
 
@@ -1191,6 +1210,250 @@ hotplug. Single PVE host only: there is no cluster support, and after a
 migration the HTTP transports report `null` until the guest's URL points at
 the node that runs the VM (token mode also needs a new token on that node). `system_power_w` stays `null` in a guest. LXC
 containers and macOS guests are out of scope.
+
+## Privileged helper (Linux)
+
+On bare-metal Linux two measurements need root: the RAPL energy counters (CPU
+and `psys` system watts, `energy_uj` is mode 0400) and the SMBIOS table with
+the DIMM details (`/sys/firmware/dmi/tables/DMI`, root-only). The agent also
+starts the gateway-supplied model runtimes, so running it as root for two
+numbers is the wrong trade. Instead a second, tiny process runs as root,
+`server-agent helper`, and the agent runs as an ordinary user and reads both
+values from the helper's Unix socket. The helper only collects: it starts no
+process, opens no network socket, contacts no gateway and accepts no command;
+it answers two read-only requests, and only from the configured agent user.
+The same pair works on a Proxmox VE host, next to (not inside)
+`op-hostpower.service`; the two root services are independent.
+
+> **Hardware acceptance pending.** No Linux machine was available when the
+> helper was built. It is covered by the Linux CI tests (a real socket with
+> `SO_PEERCRED` accept and deny, directory and socket permissions) and by a run
+> in a local Linux container (helper as root, clients as uid 1000, uid 2000 and
+> root). The real-RAPL, real-DMI-table and systemd checks in the
+> [checklist](#hardware-acceptance-checklist) below are still open, and the
+> example helper unit's `CapabilityBoundingSet` and `SystemCallFilter` lines are
+> **unverified** until then.
+
+**What the agent needs.** Nothing: `helper_socket` defaults to
+`/run/op-agent-helper/agent.sock` on Linux. The agent uses the helper only when
+it does not run as root (a root agent reads RAPL and the DMI table itself and
+never asks the helper) and only for values its own reads left empty. The
+startup line's `power_sources` then lists `helper` (between `rapl` and
+`hwmon`); that only shows the source is configured. The first successful reply
+is logged at Info (`helper: serving RAPL counters`, with the number of zones);
+failures are logged at Debug only (`helper: rapl request failed`,
+`helper memory modules not available yet`; run with `-v` to see them). On an
+unprivileged Linux agent **without** a helper, for example in a VM guest, set
+`helper_socket` to `off` (`OP_AGENT_HELPER_SOCKET=off` or
+`"helper_socket": "off"`): otherwise the agent tries the missing socket on
+every sample and retries the memory modules every 30 s, at Debug level.
+
+**1. Create the agent user** (once). The examples use `op-agent`:
+
+```
+useradd --system --user-group --no-create-home --home-dir /var/lib/op-agent --shell /usr/sbin/nologin op-agent
+```
+
+**2. Helper unit** `/etc/systemd/system/op-agent-helper.service`, with the
+Linux agent binary at `/usr/local/bin/server-agent`:
+
+```
+[Unit]
+Description=OnPrem AI Gateway agent helper (privileged RAPL and DIMM reads)
+Before=op-server-agent.service
+
+[Service]
+ExecStart=/usr/local/bin/server-agent helper -agent-user op-agent
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=op-agent-helper
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @mount @module @reboot @swap @raw-io @debug execve execveat
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`RuntimeDirectory=` creates the dedicated, empty directory
+`/run/op-agent-helper` (its parent `/run` exists) and makes it writable under
+`ProtectSystem=strict`; systemd removes it when the service stops. The point of
+the hardening lines is: no exec, no network, read sysfs, manage one socket.
+`@privileged` is not denied as a whole because it contains the `chown` the
+helper needs, and `SystemCallErrorNumber=EPERM` makes a denied call fail
+instead of killing the helper. The capability and system-call sets are
+**unverified** on hardware (see above); adjust them with the checklist.
+
+**3. Agent unit** `/etc/systemd/system/op-server-agent.service`, running the
+agent as `op-agent`. Its config file holds the agent token, so keep it `0600`
+and owned by `op-agent`; relative paths in it (`ca_cache_file`,
+`runtime_cache`, `config_files_dir`, ...) resolve beside it, in the state
+directory the unit creates:
+
+```
+[Unit]
+Description=OnPrem AI Gateway server agent
+Wants=network-online.target op-agent-helper.service
+After=network-online.target op-agent-helper.service
+
+[Service]
+User=op-agent
+Group=op-agent
+ExecStart=/usr/local/bin/server-agent -config /var/lib/op-agent/server-agent.json
+Restart=on-failure
+RestartSec=5s
+StateDirectory=op-agent
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create the directory and the config file before the first start
+(`install -d -m 0700 -o op-agent -g op-agent /var/lib/op-agent`, then copy
+`server-agent.json` there with mode `0600`), then
+`systemctl daemon-reload && systemctl enable --now op-agent-helper op-server-agent`.
+`After=`/`Wants=` start the helper first, but the order is not what makes it
+work: the agent asks the helper on every sample, so after a late start or a
+restart of the helper the watts return one sample after it first answers (the
+first reading is the baseline), and the memory modules arrive with the next
+30 s retry.
+
+Agent features that need more than an ordinary user, each with its usual
+remedy and no code change:
+
+- **GPU devices.** AMD's `/dev/kfd` and `/dev/dri/renderD*` (and on some
+  distributions NVIDIA's device nodes) belong to the `render`/`video` groups:
+  add `SupplementaryGroups=video render`.
+- **Proxy mode on a port below 1024** (`cert_mode: proxy`): add
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE`. Ambient capabilities are passed
+  on to the managed model processes too, so a listen port of 1024 or above is
+  the cleaner choice.
+- **`cert_dir`** must be writable by `op-agent` (and readable by whatever
+  consumes the files).
+- **`cert_reload_command`** such as `systemctl reload nginx` needs a sudoers or
+  polkit rule that lets `op-agent` run exactly that command.
+- **Model files, runtime binaries and caches**: the managed model processes run
+  as `op-agent` too, so it must be able to read the allowlisted binaries and the
+  model directories and write the caches the runtimes use (its home is
+  `/var/lib/op-agent` with the user above).
+
+**Helper options.** Usage: `server-agent helper -agent-user user
+[-agent-group group] [-socket path] [-powercap-root dir] [-dmi-table file] [-v]`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-agent-user USER` | — (required) | The only uid allowed to use the socket: a user name or a decimal uid (canonical: `1000`, not `01000`). Root (uid 0) and `nobody` (uid 65534) are refused. A numeric uid without a passwd entry is accepted, but then `-agent-group` is required. |
+| `-agent-group GROUP` | the agent user's primary group | Group (name or decimal gid) that owns the socket directory and the socket. It grants file access only; it is never used to authorize a connection. |
+| `-socket PATH` | `/run/op-agent-helper/agent.sock` | The Unix socket; see the path rules below. |
+| `-powercap-root DIR` | `/sys/class/powercap` | Where the RAPL zones are read. |
+| `-dmi-table FILE` | `/sys/firmware/dmi/tables/DMI` | The raw SMBIOS table the DIMMs are parsed from. |
+| `-v` | off | Debug logging (one line per served request). |
+
+User and group names are looked up in `/etc/passwd` and `/etc/group` only (the
+binary is built without CGO); for accounts from a directory service give
+numeric ids. Run the helper as root. A startup error (missing or refused
+`-agent-user`, an unsafe socket path, not Linux) prints a message and exits
+with 2.
+
+**Socket path rules.** The path must be absolute and clean and must not sit
+directly in `/`. The parent of the socket directory must already exist (the
+helper creates only the socket directory itself, mode `0750`); it is resolved
+through symlinks once, and every directory from there up to `/` must be owned
+by root and not writable by group or others, unless it carries the sticky bit
+(a sticky world-writable directory such as `/tmp` is accepted, because others
+cannot rename or remove root's entries in it). The socket directory must be a
+real directory, not a symlink, owned by root and **dedicated**: it may contain
+nothing but the socket (so the helper never re-owns a shared directory such as
+`/run`; `RuntimeDirectory=` starts it empty). The helper then sets it to `0750`
+`root:<agent group>` and the socket to `0660` `root:<agent group>`. A leftover
+socket from a crash is removed; a socket another process still listens on is
+never removed (`another helper is already listening on ...`), and any other
+kind of file at the path is an error. On shutdown (SIGINT/SIGTERM) the socket
+is removed.
+
+**Who can connect.** Every connection is checked with `SO_PEERCRED` before a
+byte is read: only the configured agent uid is served. Everyone else, root
+included, is closed without a response, and the helper logs
+`helper: connection rejected` (with `peer_uid`, `peer_pid` and the reason) at
+Warn at most once every 10 minutes per peer uid. The model runtimes the agent
+starts run under the same uid, so they can read the helper too; that is
+accepted, because they are inside the agent's trust boundary anyway (they could
+signal or trace the agent). What they can learn is limited by the 250 ms cache
+below: at most four distinct RAPL values per second, a coarse average package
+power, far coarser than the counter's update rate (about 50 µs) that the
+PLATYPUS power side channel (CVE-2020-8694) relies on. Do not add other users
+to the agent's group: it would let them reach the socket, though `SO_PEERCRED`
+still turns them away.
+
+**Endpoints** (HTTP over the socket, `GET` only, JSON, `Cache-Control:
+no-store`; another path is `404`, another method `405`, more than 20 requests
+per second (burst 40) across the whole socket is `429`; timeouts and header
+limit as for the hostpower endpoint):
+
+- `GET /v1/rapl` →
+  `{"domains":[{"zone":"intel-rapl:0","name":"package-0","energy_uj":…,"max_energy_range_uj":…}, …]}`:
+  every top-level zone `intel-rapl:N` (sub-zones such as `intel-rapl:0:0` are
+  left out) with a name and a readable `energy_uj`, sorted by zone. The reading
+  is cached and refreshed at most every 250 ms, however fast clients ask. An
+  empty list is valid (no RAPL); the helper warns at startup
+  (`helper: no readable RAPL zone`) and keeps running.
+- `GET /v1/memory-modules` → `{"modules":[{"locator":…,"size_bytes":…,"type":…,"speed_mhz":…}, …]}`,
+  the inventory's DIMM shape. The table is parsed once at startup; an unreadable
+  table logs `helper: DMI table not readable; serving no memory modules` at Warn
+  and serves an empty list. Serial numbers, asset tags, part numbers and UUIDs
+  are never decoded.
+
+To query it by hand (as `op-agent`):
+`curl --unix-socket /run/op-agent-helper/agent.sock http://op-agent-helper/v1/rapl`.
+
+### Hardware acceptance checklist
+
+Status: **pending** (no Linux machine was available). On a bare-metal Linux
+server with Intel or AMD RAPL:
+
+1. Install both units as above and start them. `journalctl -u op-agent-helper`
+   shows `helper: serving` with the socket, `agent_uid` and `agent_gid`, and
+   neither `helper: no readable RAPL zone` nor
+   `helper: DMI table not readable; serving no memory modules`.
+2. `ls -ld /run/op-agent-helper /run/op-agent-helper/agent.sock` shows
+   `drwxr-x--- root op-agent` and `srw-rw---- root op-agent`.
+3. `sudo -u op-agent curl --unix-socket /run/op-agent-helper/agent.sock http://op-agent-helper/v1/rapl`
+   lists the same zones as `grep . /sys/class/powercap/intel-rapl:*/name`
+   (top level only), and `energy_uj` rises between two calls more than 250 ms
+   apart.
+4. The same `curl` as root gets no HTTP response (curl reports an empty reply
+   or a send/receive failure), and the helper logs
+   `helper: connection rejected` with `peer_uid` 0; as another ordinary user
+   it cannot connect at all (permission denied on the socket directory).
+5. The agent's startup line lists `helper` in `power_sources`, the agent logs
+   `helper: serving RAPL counters`, and from the second sample the portal shows
+   CPU watts (and system watts where a `psys` zone exists). Under steady load
+   they match what the same agent reports when run as root.
+6. The portal's **Hardware** view lists the DIMMs. Compare them with
+   `dmidecode -t memory` on the same machine: locator, size, type and speed
+   (the rated speed, else the configured speed) must agree for every populated
+   slot. Run the agent once as root and confirm the same list (its in-process
+   parse of the table).
+7. Late start: stop the helper, restart the agent, start the helper. Within
+   30 s the agent logs `memory modules received from the helper` and the
+   **Hardware** view fills in; the watts return from the second sample after
+   the helper is up.
+8. `systemd-analyze security op-agent-helper.service`, and the journal for
+   denied system calls or capability errors over a day of operation; then
+   tighten or correct `CapabilityBoundingSet` and `SystemCallFilter` (for
+   example whether `CAP_DAC_READ_SEARCH` and `CAP_FOWNER` are needed at all)
+   and record the verified sets here.
 
 ## Resilience
 

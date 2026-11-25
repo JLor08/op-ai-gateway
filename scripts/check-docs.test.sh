@@ -498,6 +498,25 @@ expect "a flag at column 1 is found (the boundary test must not need a preceding
   "names the flag -runtime-log-buffer-bytes"
 
 build
+# A Var registration takes the destination pointer first; the flag name is the
+# second argument (the agent helper registers its flags this way).
+cat >"$FIX/tools/stub/vars.go" <<'GO'
+package main
+
+func vars(cfg *config) {
+	fs.StringVar(&cfg.AgentUser, "agent-user", "", "the agent user")
+	flag.BoolVar(&cfg.dryRun, "dry-run", false, "print only")
+}
+GO
+printf '
+Start it with `-agent-user op-agent -dry-run`.
+' \
+  >>"$FIX/docs/architecture/reference/config-env.md"
+run
+expect "a flag registered with a *Var function (pointer first) counts as registered" 0 \
+  "!names the flag -agent-user" "!names the flag -dry-run"
+
+build
 for f in "$FIX/server-agent/internal/config/config.go" "$FIX/tools/stub/main.go"; do
   sed 's/fs\.String(/fs.StringRenamed(/; s/fs\.Bool(/fs.BoolRenamed(/; s/flag\.Duration(/flag.DurationRenamed(/' \
     "$f" >"$FIX/t" && mv "$FIX/t" "$f"
