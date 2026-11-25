@@ -309,11 +309,18 @@ render`), proxy mode on a port below 1024 (`AmbientCapabilities=CAP_NET_BIND_SER
 
 ## 7. Done when
 
-- An unprivileged agent shows CPU watts and DIMM detail on a Linux box with the
-  helper running as root. Hardware acceptance: by default the operator runs a
-  step-by-step checklist I write (install units, check `power_sources`, watts,
-  DIMMs, a denied foreign uid, `systemd-analyze security`); if the operator
-  gives SSH access to a RAPL box, I run it myself.
+- **No Linux box is available now** (operator, 2026-11-25). Substitute
+  evidence in this change: the Linux CI runs the real-socket tests
+  (`SO_PEERCRED` accept/deny, permissions), and a local Linux-container run
+  (only with the operator's OK to start Docker) starts the helper as root
+  against a synthetic powercap tree and a captured DMI table and an agent
+  binary as a non-root uid, showing `power_sources` with `helper`, CPU watts
+  from the synthetic counters, the DIMM list, and a foreign uid denied.
+- The hardware acceptance (real RAPL, real DMI table, the systemd unit under
+  `systemd-analyze security`) is written as a step-by-step checklist in the
+  README and recorded as **pending** in the ADR and the risk table, as the repo
+  does for other hardware-pending items. The example unit's capability and
+  syscall sets are marked unverified until then.
 - Tests above exist and pass with `-race`; `make fmt`, `make lint-go`,
   `make lint-docs` and the local Sonar gate are green; frontend gates only if
   templates change (not expected).
