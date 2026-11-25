@@ -641,6 +641,9 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"RaiseVendorAccountShareLevel": "raise",
 		"LowerVendorAccountShareLevel": "lower",
 		"SetVendorAccountShareLevel":   "share-level",
+		// The usage opt-in (service_vendor_sharing.go) is the raise gate's owner check
+		// without the admin role, pinned by TestSetVendorAccountShareUsage.
+		"SetVendorAccountShareUsage": "share-usage",
 		// Management-group assignment (service_vendor_sharing.go) is the spec's
 		// "owner-only at `shared`, owner + CM at `full`" row: the credential gate's
 		// shape, but not a credential write (it opens no credential and sends nothing
@@ -670,6 +673,14 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		// sends nothing upstream (the sealed key is only carried to the dispatch edge,
 		// inside the resolved Target), so it is neither of the write gates.
 		"VendorAccountsForRouting": "routing-grant",
+		// The usage-figure predicate (#407): a read-only yes/no on the management arm of
+		// authorizeVendorAccountRead (system scope, or a CM of a shared/full account). It
+		// writes nothing and opens no credential.
+		"VendorAccountUsageManager": "usage-reader",
+		// Validates a chat-session vendor-access policy against the accounts the USER
+		// can route to (the same advisory check a user token's policy gets). It reads
+		// reach only: it writes nothing, opens no credential, calls no account.
+		"EncodeChatSessionVendorAccess": "policy-validation",
 		// Operate gate (authorizeVendorAccountOperate).
 		"TestVendorAccountConnection": "operate",
 		"RefreshVendorAccountModels":  "operate",
@@ -689,6 +700,21 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"VendorOpenAICodexClientVersion":   "setting",
 		// The injection point of the dispatch-time token refresher: wiring, no account.
 		"SetVendorTokenRefresher": "wiring",
+		// Likewise the limit-cooldown registry the group member status reads.
+		"SetVendorLimitCooldowns": "wiring",
+		// The resolver's group-triggered usage pull: system-initiated and throttled,
+		// it reads a credential to ask the vendor but takes no principal and writes
+		// only the usage snapshot.
+		"RequestVendorUsagePull": "system",
+		// Vendor account groups (service_vendor_groups.go, pinned by
+		// service_vendor_groups_test.go): personal, owner-only, never a credential
+		// write. They only link accounts the owner can already reach.
+		"ListVendorAccountGroups":      "group",
+		"GetVendorAccountGroup":        "group",
+		"CreateVendorAccountGroup":     "group",
+		"UpdateVendorAccountGroup":     "group",
+		"DeleteVendorAccountGroup":     "group",
+		"SetVendorAccountGroupMembers": "group",
 	}
 
 	typ := reflect.TypeFor[*Service]()

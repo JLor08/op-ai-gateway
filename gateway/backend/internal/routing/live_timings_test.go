@@ -66,6 +66,8 @@ func TestLiveTimingsCapableKind(t *testing.T) {
 		{ProviderLlamaSwap, false},
 		{ProviderLiteLLM, false},
 		{ProviderServerAgent, false},
+		{ProviderStrata, false},
+		{string(RuntimeSpecTypeStrata), false},
 		{string(RuntimeSpecTypeTGI), false},
 		{string(RuntimeSpecTypeOllama), false},
 		{string(RuntimeSpecTypeCustom), false},

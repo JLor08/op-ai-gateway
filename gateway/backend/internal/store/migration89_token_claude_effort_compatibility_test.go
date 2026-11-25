@@ -27,7 +27,7 @@ func TestMigration89AddsTokenClaudeEffortCompatibility(t *testing.T) {
 			t.Fatalf("api_tokens already has claude_effort_compatibility at v88: %v", cols)
 		}
 
-		if err := s.CreateUser(ctx, newTestUser("u_m89", "m89@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m89", "m89@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		// Seed a pre-upgrade token that cannot name claude_effort_compatibility

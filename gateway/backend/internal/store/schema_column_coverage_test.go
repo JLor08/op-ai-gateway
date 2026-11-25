@@ -119,7 +119,7 @@ func TestUsageEventsSchemaColumnsAllCovered(t *testing.T) {
 				"requested_model", "route_id", "server_name", "service_id",
 				"service_name", "session_id", "session_source", "status",
 				"token_id", "token_name", "tokens_per_second", "total_tokens",
-				"user_id",
+				"user_id", "vendor_group_id",
 			},
 			ignored: map[string]string{
 				"request_id": "written by Record's INSERT but never selected back by any reader (id already identifies the row; usageEventColumns, ByUser and All all omit it)",

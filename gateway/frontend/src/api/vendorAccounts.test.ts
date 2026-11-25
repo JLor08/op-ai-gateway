@@ -456,6 +456,22 @@ describe('vendorAccountsApi', () => {
     expect(JSON.parse(init.body)).toEqual({ level: 'none' });
   });
 
+  it('PUTs .../share-usage with the enabled flag and returns the account', async () => {
+    const fetcher = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ id: 'va/1', share_usage_with_members: true }));
+    const api = createPortalApi(fetcher);
+
+    const resp = await api.setVendorAccountShareUsage('va/1', true);
+
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/vendor-accounts/va%2F1/share-usage');
+    expect(init.method).toBe('PUT');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
+    expect(JSON.parse(init.body)).toEqual({ enabled: true });
+    expect(resp).toMatchObject({ share_usage_with_members: true });
+  });
+
   it('PUTs .../admin-groups with the full replacement set and returns the account', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({ id: 'va/1' }));
     const api = createPortalApi(fetcher);

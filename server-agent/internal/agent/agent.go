@@ -441,7 +441,17 @@ import (
 // WebSocket to a managed child's /v1/realtime and holds the spec admitted for
 // the session. This is the ONE bump for the whole branch; later commits on it
 // do not bump again.
-const Version = "0.20.1"
+//
+// 0.20.1 -> 0.21.0 is the single bump for Strata support (#424). MINOR:
+// agent.Features gains the runtime_gpu_main_last entry (the
+// ${HOST_GPU_IDS_MAIN_LAST} placeholder) and the runtime_process_tree_job
+// entry (process-tree job supervision). This is the ONE bump for the whole
+// branch; later commits on it do not bump again.
+//
+// 0.21.0 -> 0.21.1 is a PATCH: the AMD Linux VRAM telemetry fix (#432) reads
+// rocm-smi 4.x output and adds a KFD per-process VRAM measurer. Hardware
+// capability, not a negotiated feature, so no agent.Features entry.
+const Version = "0.21.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1766,8 +1776,14 @@ type runtimeCapabilityEntry struct {
 //     literal copies of its type strings.)
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
+	// A spec with a token authenticates every probe below (#424): a keyed
+	// child (Strata, an api-key'd llama-server) answers 401 on everything but
+	// its health path otherwise. The context and capability probes read the
+	// credential from ctx; the metrics scrape takes the same pair explicitly.
+	authHeader, authValue := childProbeAuth(st)
+	ctx = collector.WithProbeAuth(ctx, authHeader, authValue)
 
-	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
+	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, authHeader, authValue, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
 	if st.Type == "vllm_sr" || st.Type == "sglang" || st.Type == "sglang_omni" {
 		// No capability probe: the vLLM Semantic Router worker and the SGLang
@@ -1776,6 +1792,22 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 		return
 	}
 	a.probeRuntimeChildProps(ctx, client, base, st, rs)
+}
+
+// childProbeAuth is the credential header the agent's own probes of st's
+// child send: none for a spec without a token (today's behaviour), else the
+// token in the spec's effective header -- "Authorization: Bearer <token>" when
+// the spec names no header, the raw token under a named one, exactly as the
+// gateway authenticates its own requests to the child (provider's
+// setUpstreamAuth).
+func childProbeAuth(st runtimectl.Status) (header, value string) {
+	if st.APIToken == "" {
+		return "", ""
+	}
+	if st.APITokenHeader != "" {
+		return st.APITokenHeader, st.APIToken
+	}
+	return "Authorization", "Bearer " + st.APIToken
 }
 
 // probeRuntimeChildMetrics runs probeRuntimeChild's metrics-scrape half and
@@ -1790,7 +1822,10 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 // could re-parse the URL's Host off-loopback. Skip the probe rather than dial
 // it, and report it as unreachable: a path IS configured, it just cannot be
 // used.
-func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
+//
+// authHeader/authValue are the credential probeRuntimeChild computed once
+// (childProbeAuth); an empty header sends none.
+func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base, authHeader, authValue string, st runtimectl.Status, rs *sample.RuntimeSample) string {
 	if st.MetricsPath == "" {
 		return "na"
 	}
@@ -1799,7 +1834,7 @@ func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base str
 		return "unreachable"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
+	active, queue, err := collector.NewPromScraper(base+st.MetricsPath, client, authHeader, authValue).Scrape(cctx)
 	cancel()
 	if err != nil {
 		slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)

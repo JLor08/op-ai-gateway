@@ -318,6 +318,7 @@ const de = {
   chatRunAsTokenLabel: 'Als Token senden',
   chatRunAsNone: 'Ohne Token (Session)',
   chatModelFromToken: 'Model durch Token vorgegeben',
+  chatModelsLoadingForToken: 'Modelle des Tokens werden geladen…',
   chatModelUnavailable: 'Modell derzeit nicht verfügbar',
   chatModelLoaded: 'Geladen (sofort verfügbar)',
   chatModelLoadedOn: 'Geladen auf',
@@ -995,6 +996,8 @@ const de = {
     'audio.cpp bedient nur Sprachsynthese-Anfragen. Das Timeout ist standardmäßig 10 Minuten statt 30 Sekunden, weil eine Synthese deutlich länger dauern kann als eine Text-Antwort; und die API-Variante ist standardmäßig nur „openai_audio“ statt openai/anthropic, damit dieser Server nicht als Text-Kandidat angeboten wird. Der Health-Check-Modus bleibt bei „Health-Pfad prüfen“, aber der Health-Pfad ist standardmäßig /health statt /v1/health, weil der Server /health beantwortet und /v1/health mit 404.',
   applicationTypeVllmSrNote:
     'vLLM Semantic Router wird hier nur im Engine-Modus unterstützt (vllm-sr serve <Modell> --engine); der Router-Modus wird nicht unterstützt. Jedes Modell muss am Listener freigegeben sein (listeners[].apis.systemone.models), und die api_keys des Listeners müssen auf den API-Schlüssel dieser Anwendung gesetzt sein. Der Listener beantwortet eine Anfrage, die länger als 30 s läuft, mit 504, sofern der Client nicht options.deadline_ms sendet. Die Gesundheit wird über /v1/systemone/models geprüft, weil /health am Verwaltungsport des Containers liegt. Der Standard-Port ist 8899, das Timeout 10 Minuten, die API-Variante nur „decisions“; Decisions-Durchreichen wird nicht angeboten. Ein nicht freigegebenes Modell beantwortet der Listener mit 404 systemone_not_published, was die Prüfung als „decision: no“ festhält; wird das Modell später freigegeben, das Urteil im Portal löschen (oder das Gateway neu starten), damit es erneut geprüft wird.',
+  applicationTypeStrataNote:
+    'Strata (Niko1221/Strata). Funktioniert mit `strata serve` und mit der LAN-Freigabe der Desktop-App (App-Port + 1). Den Strata-API-Schlüssel als Token dieser Anwendung setzen – die Freigabe verlangt ihn, und ein Strata ohne Schlüssel lehnt Hostnamen ab. Ein Modell pro Strata-Prozess. Ältere Strata-Versionen beantworten /v1/responses mit 404: dann den Responses-Modus auf „Umwandlung“ stellen.',
   applicationPort: 'Port',
   applicationScheme: 'Schema',
   applicationFlavors: 'API-Varianten',
@@ -1281,6 +1284,7 @@ const de = {
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeSglang: 'SGLang',
   runtimeSpecTypeSglangOmni: 'sglang-omni',
+  runtimeSpecTypeStrata: 'Strata',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Benutzerdefiniert',
   runtimeSpecMetricsPath: 'Metrics-Pfad (Override)',
@@ -1498,9 +1502,9 @@ const de = {
     'Ohne diese Option sind die GPU-Zeilen unten nur eine Angabe: Sie steuern die Zulassungs-Rechnung und die VRAM-Messung, hindern den Prozess aber nicht daran, auf einer anderen Karte zu landen – die Buchhaltung ist dann falsch, ohne dass irgendetwas warnt. Aktiviert setzt der Agent die zur erkannten Hardware passende Variable (CUDA_VISIBLE_DEVICES bei NVIDIA, ROCR_VISIBLE_DEVICES bei AMD; bei Apple oder ohne erkannte GPU nichts) auf genau diese Indizes. Wichtig: Der Kindprozess nummeriert danach ab 0 – bei den Karten 3 und 4 sieht er die Geräte 0 und 1. Argumente, die eine Gerätenummer nennen (--main-gpu, --tensor-split), beziehen sich ab dann auf diese Nummerierung, die GPU-Zeilen hier dagegen weiterhin auf die des Hosts.',
   runtimeSpecVisibleDevicesMode: 'Sichtbarkeit erzwingen über',
   runtimeSpecVisibleDevicesModeEnv: 'Umgebungsvariable',
-  runtimeSpecVisibleDevicesModeArgs: 'Argumente (--device)',
+  runtimeSpecVisibleDevicesModeArgs: 'Per Argument oder Config-Datei',
   runtimeSpecVisibleDevicesModeArgsHint:
-    'Im Argument-Modus setzt der Agent keine Sichtbarkeits-Variable. Schreiben Sie stattdessen einen Geräte-Platzhalter in die Argumente – je nach llama.cpp-Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}, oder das allgemeine ${DEVICES}, das mit dem Geräte-Backend der Spezifikation gerendert wird (auf einem Cluster-Head die RPC-Geräte zuerst). Der Platzhalter wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3); mindestens einer der vier muss vorhanden sein. ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen nur das erste Gerät (für -mmdev) und zählen hier nicht.',
+    'In diesem Modus setzt der Agent keine Sichtbarkeits-Variable; die Spezifikation selbst schränkt die Karten ein. Schreiben Sie dazu einen Geräte-Platzhalter in die Argumente oder in eine Config-Datei – für llama.cpp je nach Build ${CUDA_DEVICES}, ${VULKAN_DEVICES} oder ${METAL_DEVICES}, oder das allgemeine ${DEVICES}, das mit dem Geräte-Backend der Spezifikation gerendert wird (auf einem Cluster-Head die RPC-Geräte zuerst); es wird zu den ausgewählten Karten in der angegebenen Reihenfolge expandiert (z. B. CUDA2,CUDA3). Für einen Server, der seine Kartenliste selbst nimmt (etwa Strata mit "gpu" in der Config-Datei), zählen auch ${HOST_GPU_IDS} und ${HOST_GPU_IDS_MAIN_LAST} (Host-Nummerierung). Mindestens einer dieser Platzhalter muss vorhanden sein. ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen nur das erste Gerät (für -mmdev) und zählen hier nicht.',
   // Runtime-Spec API Token: the MODE controls only -- the header-source
   // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API-Token-Modus',
@@ -1555,6 +1559,10 @@ const de = {
   runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
   runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
   runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowStrataBackend: 'Strata (`strata serve`)',
+  runtimeSpecApiTokenRowStrataEnv: 'STRATA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataClient: 'Authorization: Bearer (oder x-api-key)',
   runtimeSpecApiTokenArgsLeakWarning:
     'Der Token steht damit als Klartext in der Prozessliste (ps aux, /proc/<pid>/cmdline) und unter Umständen in den Startprotokollen des Modellservers selbst — verwende stattdessen die Umgebungsvariable (Env).',
   runtimeSpecApiTokenBackendBanner:
@@ -1601,7 +1609,7 @@ const de = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} funktioniert nur auf einem macOS-Host; der verbundene Agent läuft auf einem anderen Betriebssystem.',
   runtimeSpecEnvHint:
-    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. ${DEVICES}, ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen die GPU-Zeilen als Gerätenamen; ${RPC_SERVERS} und ${RPC_DEVICES} gibt es nur auf einem Cluster-Head. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
+    'Secrets nicht direkt eintragen – mit ${AGENT_ENV:NAME} aus der Umgebung des Agenten auflösen; ${PORT} wird durch den zugewiesenen Port ersetzt, ${MODEL} durch den Anwendungs-Modellnamen dieser Zuordnung. ${DEVICES}, ${FIRST_LOCAL_DEVICE} und ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} nennen die GPU-Zeilen als Gerätenamen; ${RPC_SERVERS} und ${RPC_DEVICES} gibt es nur auf einem Cluster-Head. ${HOST_GPU_IDS_MAIN_LAST} nennt die Kartennummern des Hosts in deklarierter Reihenfolge, die zuerst eingetragene Karte (Hauptkarte) steht zuletzt. Platzhalter gelten auch in den Argumenten. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR und ${AGENT_ENV:OP_AGENT_*} sind reserviert.',
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in jeder Schreibweise) und Verweise auf ${AGENT_ENV:OP_AGENT_*} sind reserviert und können hier nicht verwendet werden.',
   runtimeSpecPlaceholderInvalid:
@@ -1614,6 +1622,22 @@ const de = {
   runtimeSpecConfigFileContent: 'Inhalt',
   runtimeSpecConfigFileAdd: 'Datei hinzufügen',
   runtimeSpecConfigFileRemove: 'Datei entfernen',
+  strataImportOpen: 'Run-Konfiguration importieren',
+  strataImportHint:
+    'Fügen Sie die JSON-Datei ein, die `strata launch` geschrieben hat (%LOCALAPPDATA%\\Strata\\launch\\<name>.json). Sie wird zur Konfigurationsdatei strata.json; GPU-Reihenfolge, Startup-Timeout und Modellname werden vorgeschlagen.',
+  strataImportLabel: 'Run-Konfiguration (JSON)',
+  strataImportApply: 'Importieren',
+  strataImportCancel: 'Abbrechen',
+  strataImportErrorInvalidJson: 'Das ist kein gültiges JSON-Objekt.',
+  strataImportErrorMissingExe: 'Das Feld "exe" fehlt.',
+  strataImportErrorMissingArgs: 'Das Feld "args" fehlt oder ist keine Liste.',
+  strataImportWarnLayerSplit:
+    'layer_split ist positionsabhängig: Eine andere GPU-Reihenfolge ändert seine Bedeutung.',
+  strataImportWarnApiKey:
+    'api_key wurde nicht übernommen: Der Schlüssel gehört in das Token der Spec, nicht in die Datei.',
+  strataImportDone: 'Importiert: strata.json, GPU-Reihenfolge und Startup-Timeout wurden gesetzt.',
+  strataImportTooLarge: 'Die importierte Datei überschreitet das Limit von 64 KiB.',
+  strataImportNoFreeSlot: 'Es ist kein Platz für eine weitere Konfigurationsdatei (Maximum 16).',
   runtimeSpecConfigFileNameBlank: 'Der Dateiname fehlt.',
   runtimeSpecConfigFileNameInvalid: String.raw`Der Name muss ein einzelner Dateiname sein: keine Pfadtrenner (/ \), kein „.“ oder „..“, kein Doppelpunkt, keine Steuerzeichen.`,
   runtimeSpecConfigFileNameDuplicate:
@@ -1638,6 +1662,8 @@ const de = {
     'SGLang bedient Chat über /v1/chat/completions. Startvorlage: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Auf einer geteilten Karte --mem-fraction-static setzen, denn der automatische Standard belegt den Großteil des Speichers. Mit --api-key bleiben /health und /metrics offen, /v1/models verlangt dann aber den Schlüssel, sodass die Kontextabfrage nichts liest. Chat-Bilder nimmt das Gateway nur als data:-, http://- oder https://-URL an, einen Pfad auf dem Modell-Host lehnt es ab. Steht Codex (Responses-API) oder Claude Code (Anthropic Messages) auf „Durchreichen“, prüft das Gateway diese Anfragen (/v1/responses, /v1/messages) nicht; mit „Umwandlung“ gilt die Prüfung auch für sie. Unter Windows im WSL-Ausführungsmodus starten. Bei einer reinen Wheel-Installation (uv-venv ohne CUDA-Toolkit) in env CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 und LIBRARY_PATH=/usr/lib/wsl/lib setzen, build-essential und ninja-build in der Distribution installieren (PATH ist reserviert, das ninja der venv wird nicht gefunden) und die CUDA-Hinweise aus sgl-project/sglang#49209 befolgen. env-Werte expandiert keine Shell: absolute Pfade angeben.',
   runtimeSpecTypeSglangOmniNote:
     'sglang-omni bedient Chat, Sprachsynthese und Transkription. Startvorlage: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. --host 127.0.0.1 beibehalten: sglang-omni prüft keine Anmeldung und lauscht standardmäßig auf 0.0.0.0. Sprache und Transkription brauchen manuelle Fähigkeitsurteile, und an der übergeordneten server_agent-Anwendung muss „openai_audio (Sprachsynthese)“ ebenfalls angekreuzt sein. Stimmreferenzen und Chat-Bilder werden nur inline als data:-URL angenommen, eine Bildbearbeitung nur mit hochgeladener Quelldatei. Audio im Chat (input_audio, modalities/audio) reicht das Gateway nicht weiter: Den Chat von sglang-omni erreichen nur Text und Inline-Bilder. Für /v1/realtime --enable-realtime anhängen und das Fähigkeitsurteil „realtime“ auf Ja setzen. Unter Windows im WSL-Ausführungsmodus starten. Bei einer reinen Wheel-Installation (uv-venv ohne CUDA-Toolkit) in env CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 und LIBRARY_PATH=/usr/lib/wsl/lib setzen, build-essential und ninja-build in der Distribution installieren (PATH ist reserviert, das ninja der venv wird nicht gefunden) und die CUDA-Hinweise aus sgl-project/sglang#49209 befolgen. env-Werte expandiert keine Shell: absolute Pfade angeben.',
+  runtimeSpecTypeStrataNote:
+    'Strata (`strata serve`) bedient Chat über die OpenAI- und die Anthropic-API. Bei einer neuen Spezifikation setzt diese Auswahl die Startvorlage ein: serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl --shutdown-timeout 3, dazu STRATA_API_KEY=${API_TOKEN} in env. --host 127.0.0.1 beibehalten: Der Agent erreicht den Server über Loopback. Als Programm den absoluten Pfad von strata.cmd eintragen (C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd) und ihn auf dem Agent in runtime_allowed_binaries aufnehmen. Die Laufkonfiguration als Konfigurationsdatei strata.json hinterlegen, ohne api_key – der Schlüssel kommt aus env. Der Import schreibt die Kartenliste als "gpu": "${HOST_GPU_IDS_MAIN_LAST}" in strata.json (strata serve hat kein --gpu). Sichtbare Geräte ausgeschaltet lassen: gpu erwartet die Kartennummern des Hosts, die Hauptkarte zuletzt. Der Start-Timeout beträgt 960 s und liegt damit über der Zeit, die Strata selbst auf die Engine wartet (900 s); den Timeout der übergeordneten server_agent-Anwendung auf mindestens 960000 ms setzen, sonst warnt das Portal, dass ein Kaltstart abgebrochen wird. Chat-Bilder nimmt das Gateway nur als data:-, http://- oder https://-URL an.',
   runtimeSpecArgsCommandLine:
     'Diese Zeile enthält mehrere Schalter und sieht damit aus wie eine komplette Kommandozeile. Hier ist jede Zeile genau ein Argument – so eingefügt wird das Ganze als ein einziges Argument übergeben und vom Programm abgelehnt. Bitte auf je eine Zeile pro Schalter und pro Wert aufteilen',
   runtimeSpecArgsHardcodedPort:
@@ -2240,7 +2266,7 @@ const de = {
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Für „GPU-Zuweisung erzwingen“ wird mindestens eine GPU-Zeile benötigt: Ein leerer Sichtbarkeitswert bedeutet nicht „keine Einschränkung“, sondern dass der Prozess gar keine GPU sieht.',
   errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
-    'Im Argument-Modus von „GPU-Zuweisung erzwingen“ muss ein Geräte-Platzhalter in den Argumenten stehen: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} oder ${DEVICES}. Sonst setzt der Agent nichts und die Auswahl geht verloren.',
+    'Im Modus „Per Argument oder Config-Datei“ von „GPU-Zuweisung erzwingen“ muss ein Geräte-Platzhalter in den Argumenten oder einer Config-Datei stehen: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES}, ${DEVICES}, ${HOST_GPU_IDS} oder ${HOST_GPU_IDS_MAIN_LAST}. Sonst setzt der Agent nichts und die Auswahl geht verloren.',
   errorRuntimeSpecVisibleDevicesConflict:
     'Diese Variable ist bereits von Hand gesetzt. „GPU-Zuweisung erzwingen“ und ein eigener Eintrag sind zwei Quellen für denselben Wert – bitte eines von beidem entfernen.',
   errorRuntimeSpecApplicationNotServerAgent:
@@ -2419,6 +2445,20 @@ const de = {
   runtimeExecutionWSL: 'WSL2',
   runtimeStatusVRAMFromVM: 'VRAM der WSL-VM zugerechnet',
   errorRuntimeSpecExecutionModeInvalid: 'Die Ausführung muss nativ oder WSL sein.',
+  runtimeSpecProcessTree: 'Prozessbaum',
+  runtimeSpecProcessTreeDirect: 'Direkt (einzelner Prozess)',
+  runtimeSpecProcessTreeJob: 'Windows-Job (gesamter Prozessbaum)',
+  runtimeSpecProcessTreeHint:
+    'Nur Windows: Im Job-Modus startet der Agent das Programm in einem Windows-Job-Objekt und beendet beim Stoppen den gesamten Prozessbaum (z. B. strata.cmd samt Kindprozessen); RAM und VRAM werden dem ganzen Baum zugerechnet. Unter Linux und macOS hat die Einstellung keine Wirkung. Erfordert Agent 0.21.0 oder neuer.',
+  runtimeSpecAgentNoGpuMainLast:
+    'Der verbundene Agent meldet „runtime_gpu_main_last“ nicht: Er ersetzt ${HOST_GPU_IDS_MAIN_LAST} nicht, der Platzhalter bleibt wörtlich stehen.',
+  runtimeProcessTreeAgentUnsupportedWarning:
+    'Mindestens eine Spezifikation nutzt den Windows-Job-Prozessbaum, aber der Agent dieses Servers unterstützt ihn nicht (er läuft nicht unter Windows oder meldet die Fähigkeit „runtime_process_tree_job“ nicht). Er startet die Spezifikation direkt, sodass beim Stoppen Kindprozesse der Engine weiterlaufen können. Aktualisiere den Agenten oder stelle den Prozessbaum auf „direct“.',
+  runtimeProcessTreeAgentUnknownWarning:
+    'Mindestens eine Spezifikation nutzt den Windows-Job-Prozessbaum, aber für den Agenten dieses Servers liegen noch keine Fähigkeiten vor (er hat noch nichts gemeldet). Ob er den Job-Modus unterstützt, lässt sich erst nach seinem ersten Bericht prüfen.',
+  errorRuntimeSpecProcessTreeInvalid: 'Der Prozessbaum-Modus muss „direct“ oder „job“ sein.',
+  errorRuntimeSpecProcessTreeUnsupported:
+    'Der Job-Prozessbaum wird vom Agenten dieser Spezifikation nicht unterstützt: Der Agent läuft nicht unter Windows, seine Version ist älter als 0.21.0 oder er meldet die Fähigkeit „runtime_process_tree_job“ nicht. Eine bereits als Job gespeicherte Spezifikation lässt sich weiterhin speichern; nur der Wechsel in den Job-Modus wird abgelehnt.',
   errorRuntimeSpecWSLDistroInvalid: 'Der Name der WSL-Distribution ist ungültig.',
   errorRuntimeSpecWSLPathNotLinux:
     'Im WSL-Modus müssen Programmpfad und Arbeitsverzeichnis absolute Linux-Pfade sein.',
@@ -3454,10 +3494,29 @@ const de = {
   tokenDecisionsConfidenceNormalize: 'Entscheidungs-Konfidenz normalisieren',
   tokenDecisionsConfidenceNormalizeHint:
     'Meldet die Konfidenz von Entscheidungen (/v1/decisions und /v1/systemone) immer auf einer Skala von 0 bis 1, auch wenn das Modell eine andere Skala verwendet.',
+  tokenClaudeCodeUsageDisplay: 'Claude-Code-Token-Format',
+  tokenClaudeCodeUsageDisplayHint:
+    'Das Geheimnis bekommt die Form, die Claude Code braucht, damit es Nutzungslimits liest, wenn dieser Token als ANTHROPIC_AUTH_TOKEN verwendet wird. Die Limits selbst werden nur mit „Nutzungslimits senden“ gesendet. Bei einem bestehenden Token erzeugt eine Änderung ein neues Geheimnis.',
+  tokenClaudeCodeUsageRotateWarning:
+    'Beim Speichern wird der Token rotiert: Das bisherige Geheimnis funktioniert danach nicht mehr, das neue wird einmalig angezeigt.',
+  tokenClaudeCodeBadge: 'Claude Code',
+  tokenSendUsageLimits: 'Nutzungslimits senden',
+  tokenSendUsageLimitsHint:
+    'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Claude Code braucht dafür zusätzlich das Claude-Code-Token-Format. Wirkt sofort, das Geheimnis bleibt unverändert.',
+  tokenSendUsageLimitsServiceHint:
+    'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Lässt sich nur beim Anlegen des Service-Tokens setzen; Bearbeiten folgt später.',
+  tokenCodexModelSwitchPrompt: 'Codex: Wechsel auf gpt-5.4-mini anbieten',
+  tokenCodexModelSwitchPromptHint:
+    'Wirkt nur zusammen mit „Nutzungslimits senden“. Codex bietet dann bei 90 % seines Hauptfensters den Wechsel auf gpt-5.4-mini an, auch wenn das Limit des Gateways das angezeigte ist.',
+  tokenUsageLimitsBadge: 'Nutzungslimits',
   tokenLogCommunicationLabel: 'Kommunikation speichern',
   tokenSecretLabel: 'Geheim',
   chatSessionName: 'Chat-Sitzung (ohne Token)',
   chatSessionHint: 'Einstellungen für Chat ohne Token',
+  chatSessionVendorAccessNote:
+    'Wähle, welche Anbieter die Chat-Sitzung ohne Token nutzen darf. Ohne Änderung gilt: alle eigenen Anbieter, auch Gruppen.',
+  chatSessionVendorAccessUnavailable:
+    'Der Anbieter-Zugriff konnte gerade nicht gelesen werden und lässt sich nicht bearbeiten. Die beiden Optionen oben kannst du trotzdem speichern.',
   tokenModelOverrideColumn: 'Modell-Override',
   errorPortalTokenModelOverrideInvalid: 'Ausgewähltes Modell ist nicht verfügbar',
   tokenProjectLabel: 'Projekt',
@@ -3473,6 +3532,8 @@ const de = {
   tokenVendorAccessAllHint:
     'Nutzt alle eigenen Konten unter ihrem eigenen Prefix. Mit dir geteilte Anbieter gehören nicht dazu: Sie werden unten einzeln gewählt.',
   tokenVendorAccessAccountsLabel: 'Eigene Anbieter',
+  tokenVendorAccessGroupsLabel: 'Gruppen',
+  tokenVendorAccessIncludeGroups: 'inkl. Gruppen',
   tokenVendorAccessSharedLabel: 'Mit mir geteilte Anbieter',
   tokenVendorAccessSharedHint:
     'Ein geteilter Anbieter wird nie automatisch freigeschaltet, auch nicht mit „Alle eigenen Anbieter“. Nutzbar ist er nur, wenn du ihn über eine Ressourcengruppe erreichst; sonst wird das Speichern abgelehnt.',
@@ -3949,6 +4010,10 @@ const de = {
     'Dem Konto ist keine Verwaltungsgruppe zugeordnet. Zuerst unten eine Verwaltungsgruppe zuordnen.',
   vendorAccountShareReadOnlyNote: 'Die Freigabe dieses Kontos verwaltet der Besitzer.',
   vendorAccountShareSaved: 'Freigabe gespeichert.',
+  vendorAccountShareUsageLabel: 'Nutzungswerte (Ratenlimits und Ausgaben) mit Mitgliedern teilen',
+  vendorAccountShareUsageHelp:
+    'Mitglieder sehen dann die Ratenlimits und Ausgaben des Kontos im Portal (Kontoseite und Dashboard) und die Ratenlimit-Fenster in Claude Code und Codex.',
+  vendorAccountShareUsageSaved: 'Einstellung gespeichert.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as
   // personal, so nothing can be raised, lowered or reassigned.
@@ -3972,6 +4037,39 @@ const de = {
   vendorAccountResourceGroupsEmpty: 'Keine berechtigten Ressourcengruppen.',
   vendorAccountResourceGroupsJoinError: 'Anbieter-Konto konnte nicht eingetragen werden.',
   vendorAccountResourceGroupsLeaveError: 'Anbieter-Konto konnte nicht entfernt werden.',
+  vendorGroupsTitle: 'Gruppen',
+  vendorGroupsIntro:
+    'Eine Gruppe fasst mehrere Konten desselben Anbieters zusammen. Anfragen gehen an das erste nutzbare Konto der Reihenfolge; ist es erschöpft, wechselt das Gateway zum nächsten.',
+  vendorGroupsEmpty: 'Noch keine Gruppen angelegt.',
+  vendorGroupCreate: 'Gruppe anlegen',
+  vendorGroupCreateTitle: 'Neue Gruppe',
+  vendorGroupEditTitle: 'Gruppe bearbeiten',
+  vendorGroupActionEdit: 'Bearbeiten',
+  vendorGroupDeleteConfirm: 'Gruppe wirklich löschen? Die Konten bleiben erhalten.',
+  vendorGroupThresholdFiveHour: '5-Stunden-Schwelle (%)',
+  vendorGroupThresholdWeekly: 'Wochen-Schwelle (%)',
+  vendorGroupThresholdCredits: 'Guthaben-Schwelle (%)',
+  vendorGroupThresholdHint:
+    'Gilt nur, wenn das Konto diese Kategorie meldet. Ab dieser Auslastung wechselt die Gruppe zum nächsten Konto (1–100).',
+  vendorGroupThresholdInvalid: 'Schwellen müssen ganze Zahlen von 1 bis 100 sein.',
+  vendorGroupMembersTitle: 'Konten der Gruppe',
+  vendorGroupMembersEmpty: 'Noch keine Konten in der Gruppe.',
+  vendorGroupMemberPosition: (n: number) => `Position ${n}`,
+  vendorGroupMemberMoveUp: (name: string) => `${name} nach oben`,
+  vendorGroupMemberMoveDown: (name: string) => `${name} nach unten`,
+  vendorGroupMemberRemove: (name: string) => `${name} entfernen`,
+  vendorGroupMemberAddLabel: 'Konto hinzufügen',
+  vendorGroupMemberAddNone: 'Keine weiteren Konten dieses Anbieters verfügbar.',
+  vendorGroupMemberFreeAt: (when: string) => `Frei ab ${when}`,
+  vendorGroupStateActive: 'In Verwendung',
+  vendorGroupStateAvailable: 'Bereit',
+  vendorGroupStateOverThreshold: 'Über Schwelle',
+  vendorGroupStateCooldown: 'Pausiert (Limit)',
+  vendorGroupStateNotUsable: 'Nicht nutzbar',
+  vendorGroupReasonDisabled: 'Konto deaktiviert',
+  vendorGroupReasonNeedsReconnect: 'Neu verbinden',
+  vendorGroupReasonSubscriptionsDisabled: 'Abonnements deaktiviert',
+  vendorGroupReasonNotReachable: 'Nicht erreichbar',
   vendorAccountMemberTitle: 'Geteiltes Konto',
   vendorAccountMemberNote:
     'Dieses Konto wird über eine Ressourcengruppe bereitgestellt. Seine Modelle lassen sich nutzen, das Konto selbst aber nicht verwalten.',
@@ -4088,6 +4186,20 @@ const de = {
     'Zeitlimit erreicht: Der Code wurde nicht rechtzeitig bestätigt. Den Device-Code neu starten.',
   vendorUsageTitle: 'Nutzung & Limits',
   dashboardVendorUsageTitle: 'Anbieter — Nutzung & Limits',
+  dashboardVendorGroupsTitle: 'Anbieter — Gruppen',
+  dashboardVendorGroupActiveMember: (name: string) => `Aktiv: ${name}`,
+  dashboardVendorGroupNoActiveMember: 'Kein Konto nutzbar',
+  dashboardVendorGroupLineActive: 'aktiv',
+  dashboardVendorGroupLineReady: 'bereit',
+  dashboardVendorGroupLineOverThreshold: (detail: string, freeAt: string) =>
+    `über Schwelle: ${detail}, frei ab ${freeAt}`,
+  dashboardVendorGroupLineOverThresholdBare: 'über Schwelle',
+  dashboardVendorGroupLineCooldown: (until: string, model: string) =>
+    `gesperrt bis ${until} (${model})`,
+  dashboardVendorGroupLineNotUsable: (reason: string) => `nicht nutzbar: ${reason}`,
+  dashboardVendorGroupWindowFiveHour: '5h',
+  dashboardVendorGroupWindowWeekly: 'Woche',
+  dashboardVendorGroupWindowCredits: 'Guthaben',
   vendorUsageIntro:
     'Verbrauch in Prozent des Limits beim Anbieter; absolute Werte nennt der Anbieter nicht. Angezeigt werden nur die Limits, die der Anbieter für dieses Konto meldet. Der Stand wird mit jeder über das Gateway bedienten Anfrage aktualisiert.',
   vendorUsageFiveHour: '5-Stunden-Limit',
@@ -4192,6 +4304,20 @@ const de = {
     'Ungültige Basis-URL: erlaubt ist nur eine https-Adresse ohne Zugangsdaten, Query und Fragment',
   errorVendorAccountRefreshFailed: 'Die Modelle konnten nicht aktualisiert werden',
   errorVendorAccountUsageRefreshFailed: 'Die Nutzung konnte nicht aktualisiert werden',
+  errorVendorAccountGroupNotFound: 'Gruppe nicht gefunden',
+  errorVendorAccountGroupNameRequired: 'Die Gruppe braucht einen Namen',
+  errorVendorAccountGroupVendorInvalid: 'Unbekannter Anbieter für die Gruppe',
+  errorVendorAccountGroupModelPrefixInvalid:
+    'Ungültiges Modell-Präfix: erlaubt sind höchstens 64 Zeichen aus Buchstaben, Ziffern und . _ ~ : / @ + -, ohne „..“',
+  errorVendorAccountGroupStatusInvalid: 'Ungültiger Gruppenstatus',
+  errorVendorAccountGroupThresholdInvalid: 'Schwellen müssen ganze Zahlen von 1 bis 100 sein',
+  errorVendorAccountGroupMemberVendorMismatch:
+    'Ein Konto gehört zu einem anderen Anbieter als die Gruppe',
+  errorVendorAccountGroupMemberUnreachable: 'Ein Konto ist für dich nicht erreichbar',
+  errorVendorAccountGroupMemberDuplicate: 'Ein Konto ist mehrfach in der Gruppe',
+  errorVendorAccountGroupPrefixConflict:
+    'Dieses Präfix kollidiert mit einem anderen Konto oder einer anderen Gruppe',
+  errorVendorAccountGroupForbidden: 'Keine Berechtigung für diese Aktion an der Gruppe',
   errorSystemVendorOpenAICodexClientVersionInvalid:
     'Ungültige Codex-Client-Version: mit einer Ziffer beginnen, höchstens 64 Zeichen aus Buchstaben, Ziffern und . _ + -',
   // System settings: the vendor-accounts master flag and the routing precedence.
@@ -4617,6 +4743,7 @@ const en: PortalMessages = {
   chatRunAsTokenLabel: 'Send as token',
   chatRunAsNone: 'Without token (session)',
   chatModelFromToken: 'Model set by token',
+  chatModelsLoadingForToken: "Loading the token's models…",
   chatModelUnavailable: 'Model currently unavailable',
   chatModelLoaded: 'Loaded (available immediately)',
   chatModelLoadedOn: 'Loaded on',
@@ -5076,6 +5203,8 @@ const en: PortalMessages = {
     'audio.cpp serves speech synthesis requests only. The timeout defaults to 10 minutes instead of 30 seconds, because a synthesis can take far longer than a text reply; and the API flavor defaults to "openai_audio" only, instead of openai/anthropic, so this server is never offered as a text candidate. The health check mode stays at "Check health path", but the health path defaults to /health instead of /v1/health, because the server answers /health and returns 404 for /v1/health.',
   applicationTypeVllmSrNote:
     'vLLM Semantic Router is supported here in Engine mode only (vllm-sr serve <model> --engine); Router mode is not supported. Grant each model on the listener (listeners[].apis.systemone.models), and set the listener api_keys to this application\'s API key. The listener answers a request that runs longer than 30 s with 504 unless the client sends options.deadline_ms. Health is checked via /v1/systemone/models, because /health is on the container\'s management port. The default port is 8899, the timeout 10 minutes, and the API flavor only "decisions"; decisions passthrough is not offered. The listener answers a model it does not grant with 404 systemone_not_published, which the probe records as "decision: no"; if you grant the model later, clear the verdict in the portal (or restart the gateway) so it is probed again.',
+  applicationTypeStrataNote:
+    "Strata (Niko1221/Strata). Works with `strata serve` and with the desktop app's LAN share (app port + 1). Set the Strata API key as the application token — the share requires it, and a keyless Strata refuses host names. One model per Strata process. Older Strata releases answer 404 on /v1/responses: set the Responses mode to translate.",
   applicationPort: 'Port',
   applicationScheme: 'Scheme',
   applicationFlavors: 'API flavors',
@@ -5347,6 +5476,7 @@ const en: PortalMessages = {
   runtimeSpecTypeVllmSr: 'vLLM Semantic Router',
   runtimeSpecTypeSglang: 'SGLang',
   runtimeSpecTypeSglangOmni: 'sglang-omni',
+  runtimeSpecTypeStrata: 'Strata',
   runtimeSpecTypeAudioCpp: 'audio.cpp',
   runtimeSpecTypeCustom: 'Custom',
   runtimeSpecMetricsPath: 'Metrics path (override)',
@@ -5545,9 +5675,9 @@ const en: PortalMessages = {
     "Without this, the GPU rows below are only a declaration: they drive the admission arithmetic and the VRAM measurement, but nothing stops the process from landing on a different card — after which the accounting is wrong and nothing warns. Switched on, the agent sets the variable its detected hardware uses (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD; nothing on Apple or a host with no recognised GPU) to exactly these indices. Note that the child then renumbers from 0 — given cards 3 and 4 it sees devices 0 and 1 — so any argument naming a device number (--main-gpu, --tensor-split) refers to that numbering from then on, while the GPU rows here stay in the host's.",
   runtimeSpecVisibleDevicesMode: 'Enforce visibility via',
   runtimeSpecVisibleDevicesModeEnv: 'Environment variable',
-  runtimeSpecVisibleDevicesModeArgs: 'Arguments (--device)',
+  runtimeSpecVisibleDevicesModeArgs: 'Via args or config file',
   runtimeSpecVisibleDevicesModeArgsHint:
-    'In arguments mode the agent sets no visibility variable. Instead write a device placeholder into the args — ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your llama.cpp build, or the generic ${DEVICES}, rendered with the device backend of the spec (on a cluster head the RPC devices first). It expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3); at least one of the four must be present. ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name only the first device (for -mmdev) and do not count here.',
+    'In this mode the agent sets no visibility variable; the spec itself restricts the cards. Write a device placeholder into the args or into a config file — for llama.cpp ${CUDA_DEVICES}, ${VULKAN_DEVICES} or ${METAL_DEVICES}, depending on your build, or the generic ${DEVICES}, rendered with the device backend of the spec (on a cluster head the RPC devices first); it expands to the selected cards in the chosen order (e.g. CUDA2,CUDA3). For a server that takes its card list itself (such as Strata with "gpu" in its config file), ${HOST_GPU_IDS} and ${HOST_GPU_IDS_MAIN_LAST} (host numbering) count too. At least one of these placeholders must be present. ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name only the first device (for -mmdev) and do not count here.',
   // Runtime-Spec API Token: the MODE controls only -- the header-source
   // select + inherited-header display is below.
   runtimeSpecApiTokenMode: 'API token mode',
@@ -5601,6 +5731,10 @@ const en: PortalMessages = {
   runtimeSpecApiTokenRowTgiEnv: 'API_KEY=${API_TOKEN}',
   runtimeSpecApiTokenRowTgiArgs: '--api-key ${API_TOKEN}',
   runtimeSpecApiTokenRowTgiClient: 'Authorization: Bearer',
+  runtimeSpecApiTokenRowStrataBackend: 'Strata (`strata serve`)',
+  runtimeSpecApiTokenRowStrataEnv: 'STRATA_API_KEY=${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataArgs: '--api-key ${API_TOKEN}',
+  runtimeSpecApiTokenRowStrataClient: 'Authorization: Bearer (or x-api-key)',
   runtimeSpecApiTokenArgsLeakWarning:
     "This puts the token in plaintext in the process listing (ps aux, /proc/<pid>/cmdline) and possibly in the model server's own startup logs — use the environment variable (Env) instead.",
   runtimeSpecApiTokenBackendBanner:
@@ -5639,7 +5773,7 @@ const en: PortalMessages = {
   runtimeSpecMetalNonMacos:
     '${METAL_DEVICES} only works on a macOS host; the connected agent runs on a different operating system.',
   runtimeSpecEnvHint:
-    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. ${DEVICES}, ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name the GPU rows as device names; ${RPC_SERVERS} and ${RPC_DEVICES} exist only on a cluster head. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
+    "Don't put secrets in directly – resolve them from the agent's own environment with ${AGENT_ENV:NAME}; ${PORT} is replaced with the assigned port and ${MODEL} with this mapping's application model name. ${DEVICES}, ${FIRST_LOCAL_DEVICE} and ${CUDA_FIRST_DEVICE}/${VULKAN_FIRST_DEVICE}/${METAL_FIRST_DEVICE} name the GPU rows as device names; ${RPC_SERVERS} and ${RPC_DEVICES} exist only on a cluster head. ${HOST_GPU_IDS_MAIN_LAST} lists the host's card numbers in declared order, with the first declared card (the main card) moved last. Placeholders work in args too. PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR, and ${AGENT_ENV:OP_AGENT_*} are reserved.",
   runtimeSpecEnvReserved:
     'PATH, HOME, USERPROFILE, LOCALAPPDATA, SYSTEMROOT, WINDIR (in any capitalisation), and references to ${AGENT_ENV:OP_AGENT_*} are reserved and cannot be used here.',
   runtimeSpecPlaceholderInvalid:
@@ -5652,6 +5786,21 @@ const en: PortalMessages = {
   runtimeSpecConfigFileContent: 'Content',
   runtimeSpecConfigFileAdd: 'Add file',
   runtimeSpecConfigFileRemove: 'Remove file',
+  strataImportOpen: 'Import run config',
+  strataImportHint:
+    'Paste the JSON file `strata launch` wrote (%LOCALAPPDATA%\\Strata\\launch\\<name>.json). It becomes the config file strata.json; the GPU order, startup timeout and model name are proposed.',
+  strataImportLabel: 'Run config (JSON)',
+  strataImportApply: 'Import',
+  strataImportCancel: 'Cancel',
+  strataImportErrorInvalidJson: 'This is not a valid JSON object.',
+  strataImportErrorMissingExe: 'The "exe" field is missing.',
+  strataImportErrorMissingArgs: 'The "args" field is missing or not a list.',
+  strataImportWarnLayerSplit: 'layer_split is positional: reordering the GPUs changes its meaning.',
+  strataImportWarnApiKey:
+    'api_key was not imported: the key belongs in the spec token, not in the file.',
+  strataImportDone: 'Imported: strata.json, the GPU order and the startup timeout were set.',
+  strataImportTooLarge: 'The imported file exceeds the 64 KiB limit.',
+  strataImportNoFreeSlot: 'There is no room for another config file (maximum 16).',
   runtimeSpecConfigFileNameBlank: 'The file name is missing.',
   runtimeSpecConfigFileNameInvalid: String.raw`The name must be a single file name: no path separators (/ \), no "." or "..", no colon, no control characters.`,
   runtimeSpecConfigFileNameDuplicate:
@@ -5676,6 +5825,8 @@ const en: PortalMessages = {
     "SGLang serves chat over /v1/chat/completions. Launch template: serve ${MODEL} --host 127.0.0.1 --port ${PORT} --enable-metrics. Set --mem-fraction-static when the card is shared, because the automatic default takes most of it. With --api-key, /health and /metrics stay open, but /v1/models then needs the key, so the context probe reads nothing. The gateway accepts chat images only as data:, http:// or https:// URLs and refuses a path on the model host. While Codex (Responses API) or Claude Code (Anthropic Messages) is set to Pass-through, the gateway does not check those requests (/v1/responses, /v1/messages); with Translate the check covers them too. On Windows, run it in the WSL execution mode. For a wheel-only install (a uv venv without the CUDA toolkit), set CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 and LIBRARY_PATH=/usr/lib/wsl/lib in env, install build-essential and ninja-build in the distro (PATH is reserved, so the venv's ninja is not found) and apply the CUDA fixes from sgl-project/sglang#49209. No shell expands env values: use absolute paths.",
   runtimeSpecTypeSglangOmniNote:
     'sglang-omni serves chat, speech and transcription. Launch template: serve --model-path ${MODEL} --model-name ${MODEL} --host 127.0.0.1 --port ${PORT}. Keep --host 127.0.0.1: sglang-omni authenticates nothing and listens on 0.0.0.0 by default. Speech and transcription need manual capability verdicts, and the parent server_agent application needs "openai_audio (speech synthesis)" ticked too. Voice references and chat images are accepted only inline, as data: URLs, and an image edit only with an uploaded source file. The gateway does not relay chat audio (input_audio, modalities/audio): only text and inline images reach sglang-omni chat. For /v1/realtime, add --enable-realtime and set the realtime capability verdict to yes. On Windows, run it in the WSL execution mode. For a wheel-only install (a uv venv without the CUDA toolkit), set CUDA_HOME=<venv>/lib/python3.12/site-packages/nvidia/cu13 and LIBRARY_PATH=/usr/lib/wsl/lib in env, install build-essential and ninja-build in the distro (PATH is reserved, so the venv\'s ninja is not found) and apply the CUDA fixes from sgl-project/sglang#49209. No shell expands env values: use absolute paths.',
+  runtimeSpecTypeStrataNote:
+    'Strata (`strata serve`) serves chat over the OpenAI and the Anthropic API. On a new spec, choosing this type fills in the launch template: serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl --shutdown-timeout 3, with STRATA_API_KEY=${API_TOKEN} in env. Keep --host 127.0.0.1: the agent reaches the server on loopback. As the binary, enter the absolute path of strata.cmd (C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd) and add it to runtime_allowed_binaries on the agent. Put the run config into the config file strata.json, without api_key: the key comes from env. The import writes the card list into strata.json as "gpu": "${HOST_GPU_IDS_MAIN_LAST}" (strata serve has no --gpu flag). Leave the visible devices off: gpu takes the host\'s card numbers, the main card last. The startup timeout is 960 s, above Strata\'s own engine wait of 900 s; set the parent server_agent application\'s timeout to at least 960000 ms, or the portal warns that a cold start is cut short. The gateway accepts chat images only as data:, http:// or https:// URLs.',
   runtimeSpecArgsCommandLine:
     'This line holds several flags, so it looks like a whole command line. Here every line is exactly one argument — pasted like this the lot is handed over as a single argument and the program rejects it. Split it into one line per flag and one per value',
   runtimeSpecArgsHardcodedPort:
@@ -6221,7 +6372,7 @@ const en: PortalMessages = {
   errorRuntimeSpecVisibleDevicesNoGpus:
     'Enforcing GPU assignment needs at least one GPU row: an empty visibility value does not mean "no restriction", it means the process sees no GPU at all.',
   errorRuntimeSpecVisibleDevicesArgsNoPlaceholder:
-    'In arguments mode, enforcing GPU assignment needs a device placeholder in the args: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES} or ${DEVICES}. Otherwise the agent sets nothing and the selection is lost.',
+    'In the "Via args or config file" mode, enforcing GPU assignment needs a device placeholder in the args or a config file: ${CUDA_DEVICES}, ${VULKAN_DEVICES}, ${METAL_DEVICES}, ${DEVICES}, ${HOST_GPU_IDS} or ${HOST_GPU_IDS_MAIN_LAST}. Otherwise the agent sets nothing and the selection is lost.',
   errorRuntimeSpecVisibleDevicesConflict:
     'This variable is already set by hand. Enforcing GPU assignment and your own entry are two sources for one value — remove one of them.',
   errorRuntimeSpecApplicationNotServerAgent: 'Runtime specs require a server_agent application',
@@ -6385,6 +6536,20 @@ const en: PortalMessages = {
   runtimeExecutionWSL: 'WSL2',
   runtimeStatusVRAMFromVM: 'VRAM attributed from the WSL VM',
   errorRuntimeSpecExecutionModeInvalid: 'The execution mode must be native or WSL.',
+  runtimeSpecProcessTree: 'Process tree',
+  runtimeSpecProcessTreeDirect: 'Direct (single process)',
+  runtimeSpecProcessTreeJob: 'Windows job (whole process tree)',
+  runtimeSpecProcessTreeHint:
+    'Windows only: in job mode the agent starts the program inside a Windows job object and stops the whole process tree (e.g. strata.cmd and its children); RAM and VRAM are attributed to the whole tree. Has no effect on Linux and macOS. Requires agent 0.21.0 or newer.',
+  runtimeSpecAgentNoGpuMainLast:
+    'The connected agent does not report "runtime_gpu_main_last": it does not expand ${HOST_GPU_IDS_MAIN_LAST}, so the placeholder stays literal.',
+  runtimeProcessTreeAgentUnsupportedWarning:
+    'At least one spec uses the Windows job process tree, but this server\'s agent does not support it (it is not running on Windows or does not report the "runtime_process_tree_job" capability). It starts the spec directly, so child processes of the engine can outlive a stop. Update the agent or set the process tree to "direct".',
+  runtimeProcessTreeAgentUnknownWarning:
+    "At least one spec uses the Windows job process tree, but no capabilities are known yet for this server's agent (it has not reported). Whether it supports job mode can only be checked after its first report.",
+  errorRuntimeSpecProcessTreeInvalid: 'The process tree mode must be "direct" or "job".',
+  errorRuntimeSpecProcessTreeUnsupported:
+    'This spec\'s agent does not support the job process tree: the agent is not running on Windows, its version is older than 0.21.0, or it does not report the "runtime_process_tree_job" capability. A spec already stored as job can still be saved; only the switch into job mode is refused.',
   errorRuntimeSpecWSLDistroInvalid: 'The WSL distro name is invalid.',
   errorRuntimeSpecWSLPathNotLinux:
     'In WSL mode the binary path and working directory must be absolute Linux paths.',
@@ -7375,10 +7540,29 @@ const en: PortalMessages = {
   tokenDecisionsConfidenceNormalize: 'Normalize decision confidence',
   tokenDecisionsConfidenceNormalizeHint:
     'Reports the confidence of decisions (/v1/decisions and /v1/systemone) on a 0 to 1 scale whatever scale the model uses itself.',
+  tokenClaudeCodeUsageDisplay: 'Claude Code token format',
+  tokenClaudeCodeUsageDisplayHint:
+    'Gives the secret the shape Claude Code needs before it reads usage limits when this token is used as ANTHROPIC_AUTH_TOKEN. The limits themselves are sent only with "Send usage limits". On an existing token, changing it creates a new secret.',
+  tokenClaudeCodeUsageRotateWarning:
+    'Saving rotates the token: the current secret stops working and the new one is shown once.',
+  tokenClaudeCodeBadge: 'Claude Code',
+  tokenSendUsageLimits: 'Send usage limits',
+  tokenSendUsageLimitsHint:
+    'Clients (Claude Code, Codex CLI) then show the remaining usage. Claude Code also needs the Claude Code token format. Takes effect immediately; the secret stays unchanged.',
+  tokenSendUsageLimitsServiceHint:
+    'Clients (Claude Code, Codex CLI) then show the remaining usage. It can only be set when the service token is created; editing comes later.',
+  tokenCodexModelSwitchPrompt: 'Codex: offer switching to gpt-5.4-mini',
+  tokenCodexModelSwitchPromptHint:
+    'Only takes effect together with "Send usage limits". Codex then offers the switch to gpt-5.4-mini at 90 % of its main window, also when the gateway\'s own limit is the one shown.',
+  tokenUsageLimitsBadge: 'Usage limits',
   tokenLogCommunicationLabel: 'Save communication',
   tokenSecretLabel: 'Secret',
   chatSessionName: 'Chat session (no token)',
   chatSessionHint: 'Settings for token-less chat',
+  chatSessionVendorAccessNote:
+    'Choose which providers the token-less chat session may use. Unchanged, it uses all your own providers, including groups.',
+  chatSessionVendorAccessUnavailable:
+    'The provider access could not be read right now and cannot be edited. You can still save the two options above.',
   tokenModelOverrideColumn: 'Model override',
   errorPortalTokenModelOverrideInvalid: 'Selected model is not available',
   tokenProjectLabel: 'Project',
@@ -7394,6 +7578,8 @@ const en: PortalMessages = {
   tokenVendorAccessAllHint:
     'Uses every own account under its own prefix. Providers shared with you are not part of it: you pick them one by one below.',
   tokenVendorAccessAccountsLabel: 'Own providers',
+  tokenVendorAccessGroupsLabel: 'Groups',
+  tokenVendorAccessIncludeGroups: 'incl. groups',
   tokenVendorAccessSharedLabel: 'Providers shared with me',
   tokenVendorAccessSharedHint:
     'A shared provider is never enabled automatically, not even by "All own providers". It is usable only when you reach it through a resource group; otherwise saving is refused.',
@@ -7867,6 +8053,10 @@ const en: PortalMessages = {
     'The account has no management group. Assign a management group below first.',
   vendorAccountShareReadOnlyNote: "This account's sharing is managed by its owner.",
   vendorAccountShareSaved: 'Sharing saved.',
+  vendorAccountShareUsageLabel: 'Share usage figures (rate limits and spend) with members',
+  vendorAccountShareUsageHelp:
+    "Members then see the account's rate limits and spend in the portal (account page and dashboard), and its rate-limit windows in Claude Code and Codex.",
+  vendorAccountShareUsageSaved: 'Setting saved.',
   // Shown in place of the sharing controls while sharing is switched off (the
   // vendor_account_sharing_enabled system setting): every account behaves as
   // personal, so nothing can be raised, lowered or reassigned.
@@ -7890,6 +8080,39 @@ const en: PortalMessages = {
   vendorAccountResourceGroupsEmpty: 'No eligible resource groups.',
   vendorAccountResourceGroupsJoinError: 'Could not add the provider account.',
   vendorAccountResourceGroupsLeaveError: 'Could not remove the provider account.',
+  vendorGroupsTitle: 'Groups',
+  vendorGroupsIntro:
+    'A group bundles several accounts at the same provider. Requests go to the first usable account in order; once it is exhausted the gateway switches to the next.',
+  vendorGroupsEmpty: 'No groups yet.',
+  vendorGroupCreate: 'Add group',
+  vendorGroupCreateTitle: 'New group',
+  vendorGroupEditTitle: 'Edit group',
+  vendorGroupActionEdit: 'Edit',
+  vendorGroupDeleteConfirm: 'Really delete this group? The accounts are kept.',
+  vendorGroupThresholdFiveHour: '5-hour threshold (%)',
+  vendorGroupThresholdWeekly: 'Weekly threshold (%)',
+  vendorGroupThresholdCredits: 'Credits threshold (%)',
+  vendorGroupThresholdHint:
+    'Applies only where the account reports this category. From this usage on the group switches to the next account (1–100).',
+  vendorGroupThresholdInvalid: 'Thresholds must be whole numbers from 1 to 100.',
+  vendorGroupMembersTitle: 'Group accounts',
+  vendorGroupMembersEmpty: 'No accounts in the group yet.',
+  vendorGroupMemberPosition: (n: number) => `Position ${n}`,
+  vendorGroupMemberMoveUp: (name: string) => `Move ${name} up`,
+  vendorGroupMemberMoveDown: (name: string) => `Move ${name} down`,
+  vendorGroupMemberRemove: (name: string) => `Remove ${name}`,
+  vendorGroupMemberAddLabel: 'Add account',
+  vendorGroupMemberAddNone: 'No further accounts of this provider available.',
+  vendorGroupMemberFreeAt: (when: string) => `Free from ${when}`,
+  vendorGroupStateActive: 'In use',
+  vendorGroupStateAvailable: 'Ready',
+  vendorGroupStateOverThreshold: 'Over threshold',
+  vendorGroupStateCooldown: 'Paused (limit)',
+  vendorGroupStateNotUsable: 'Not usable',
+  vendorGroupReasonDisabled: 'Account disabled',
+  vendorGroupReasonNeedsReconnect: 'Reconnect needed',
+  vendorGroupReasonSubscriptionsDisabled: 'Subscriptions disabled',
+  vendorGroupReasonNotReachable: 'Not reachable',
   vendorAccountMemberTitle: 'Shared account',
   vendorAccountMemberNote:
     'This account is provided through a resource group. Its models can be used, but the account itself cannot be managed.',
@@ -8001,6 +8224,20 @@ const en: PortalMessages = {
     'Timed out: the code was not confirmed in time. Start the device code again.',
   vendorUsageTitle: 'Usage & limits',
   dashboardVendorUsageTitle: 'Providers — usage & limits',
+  dashboardVendorGroupsTitle: 'Providers — groups',
+  dashboardVendorGroupActiveMember: (name: string) => `Active: ${name}`,
+  dashboardVendorGroupNoActiveMember: 'No account usable',
+  dashboardVendorGroupLineActive: 'active',
+  dashboardVendorGroupLineReady: 'ready',
+  dashboardVendorGroupLineOverThreshold: (detail: string, freeAt: string) =>
+    `over threshold: ${detail}, free from ${freeAt}`,
+  dashboardVendorGroupLineOverThresholdBare: 'over threshold',
+  dashboardVendorGroupLineCooldown: (until: string, model: string) =>
+    `blocked until ${until} (${model})`,
+  dashboardVendorGroupLineNotUsable: (reason: string) => `not usable: ${reason}`,
+  dashboardVendorGroupWindowFiveHour: '5h',
+  dashboardVendorGroupWindowWeekly: 'week',
+  dashboardVendorGroupWindowCredits: 'credits',
   vendorUsageIntro:
     'Usage as a percentage of the provider limit; the provider does not publish absolute values. Only the limits the provider reports for this account are shown. The figures are refreshed with every request the gateway serves.',
   vendorUsageFiveHour: '5-hour limit',
@@ -8102,6 +8339,19 @@ const en: PortalMessages = {
     'Invalid base URL: only an https address without credentials, query or fragment is allowed',
   errorVendorAccountRefreshFailed: 'The models could not be refreshed',
   errorVendorAccountUsageRefreshFailed: 'The usage could not be refreshed',
+  errorVendorAccountGroupNotFound: 'Group not found',
+  errorVendorAccountGroupNameRequired: 'The group needs a name',
+  errorVendorAccountGroupVendorInvalid: 'Unknown provider for the group',
+  errorVendorAccountGroupModelPrefixInvalid:
+    'Invalid model prefix: at most 64 characters of letters, digits and . _ ~ : / @ + -, without ".."',
+  errorVendorAccountGroupStatusInvalid: 'Invalid group status',
+  errorVendorAccountGroupThresholdInvalid: 'Thresholds must be whole numbers from 1 to 100',
+  errorVendorAccountGroupMemberVendorMismatch:
+    'An account belongs to a different provider than the group',
+  errorVendorAccountGroupMemberUnreachable: 'An account is not reachable for you',
+  errorVendorAccountGroupMemberDuplicate: 'An account is in the group more than once',
+  errorVendorAccountGroupPrefixConflict: 'This prefix collides with another account or group',
+  errorVendorAccountGroupForbidden: 'You are not allowed to do this on the group',
   errorSystemVendorOpenAICodexClientVersionInvalid:
     'Invalid Codex client version: start with a digit, at most 64 characters of letters, digits and . _ + -',
   // System settings: the vendor-accounts master flag and the routing precedence.

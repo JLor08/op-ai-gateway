@@ -37,7 +37,7 @@ func TestMigration90AddsCanManageVendorAccountsColumn(t *testing.T) {
 		}
 
 		for _, id := range []string{"u_m90_pre", "u_m90_post"} {
-			if err := s.CreateUser(ctx, newTestUser(id, id+"@example.test", now)); err != nil {
+			if err := createUserAtBaseline(ctx, s, newTestUser(id, id+"@example.test", now)); err != nil {
 				t.Fatalf("seed user %s: %v", id, err)
 			}
 		}

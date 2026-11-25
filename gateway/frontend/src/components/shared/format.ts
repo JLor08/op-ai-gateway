@@ -202,6 +202,8 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'runtime_spec.device_backend_invalid': 'errorRuntimeSpecDeviceBackendInvalid',
   'runtime_spec.execution_mode_invalid': 'errorRuntimeSpecExecutionModeInvalid',
   'runtime_spec.wsl_distro_invalid': 'errorRuntimeSpecWSLDistroInvalid',
+  'runtime_spec.process_tree_invalid': 'errorRuntimeSpecProcessTreeInvalid',
+  'runtime_spec.process_tree_unsupported': 'errorRuntimeSpecProcessTreeUnsupported',
   'runtime_spec.wsl_path_not_linux': 'errorRuntimeSpecWSLPathNotLinux',
   'runtime_spec.wsl_cluster_unsupported': 'errorRuntimeSpecWSLClusterUnsupported',
   'runtime_spec.member_flag_reserved': 'errorRuntimeSpecMemberFlagReserved',
@@ -340,6 +342,18 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // connect_upstream_failed above: the latter is transient (keep polling).
   'vendor_account.device_not_supported': 'errorVendorAccountDeviceNotSupported',
   'vendor_account.device_connect_state': 'errorVendorAccountDeviceConnectState',
+  // Vendor account groups (portal_vendor_group_endpoints.go).
+  'vendor_account_group.not_found': 'errorVendorAccountGroupNotFound',
+  'vendor_account_group.name_required': 'errorVendorAccountGroupNameRequired',
+  'vendor_account_group.vendor_invalid': 'errorVendorAccountGroupVendorInvalid',
+  'vendor_account_group.model_prefix_invalid': 'errorVendorAccountGroupModelPrefixInvalid',
+  'vendor_account_group.status_invalid': 'errorVendorAccountGroupStatusInvalid',
+  'vendor_account_group.threshold_invalid': 'errorVendorAccountGroupThresholdInvalid',
+  'vendor_account_group.member_vendor_mismatch': 'errorVendorAccountGroupMemberVendorMismatch',
+  'vendor_account_group.member_unreachable': 'errorVendorAccountGroupMemberUnreachable',
+  'vendor_account_group.member_duplicate': 'errorVendorAccountGroupMemberDuplicate',
+  'vendor_account_group.prefix_conflict': 'errorVendorAccountGroupPrefixConflict',
+  'vendor_account_group.forbidden': 'errorVendorAccountGroupForbidden',
   // The master flag is off (writePortalVendorAccountError's 409 row). Mapped
   // although the portal hides the area in that state: a stale tab or a flag
   // flipped mid-session still reaches it.

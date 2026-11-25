@@ -296,7 +296,13 @@ reports success on a broken corpus is worse than no checker.
   reads `window` — so a surviving root can fail the whole job with an uncaught
   `ReferenceError` while every test passes, which `retry` cannot rescue
   because no test failed. `src/vitest.setup.test.tsx` pins this as an ordered
-  pair of tests.
+  pair of tests. **`RuntimeAdminSection.test.tsx` sets one per-test timeout
+  for the whole file** (`vi.setConfig({ testTimeout: 30_000 })`, which applies
+  to that file only). Its tests query the portal's largest form, where one
+  `getByLabelText` costs 70-110 ms. A shared CI runner runs the file 3-4.5
+  times slower, and that pushed one test after another past vitest's 5 s
+  default (#175). A new test there needs no timeout of its own; the file's
+  budget covers it.
 - **Architecture tests**: dependency-rule tests in both Go modules
   (`internal/archtest`) and the frontend (`src/arch.test.ts`) run as part of
   the normal `go test` / `vitest` invocations — see

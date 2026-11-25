@@ -950,6 +950,15 @@ sequenceDiagram
    acknowledge a document that carries their part of this cluster (the head's
    spec with this cluster's `generation`, each member's spec), within 30 s. A
    plan the documents moved past meanwhile is read again rather than waited out.
+   An agent that applied another document than the one that carries its part
+   now is sent that document, and sent it again only when it reports another
+   applied document (or the plan is read again): a few writes change
+   a document and deliberately push nothing (a member's usage rise during a
+   formed run, the agent's VRAM write-back, the capability writers), so without
+   it a start that reaches this step during a run -- a manual start of a formed
+   cluster whose telemetry does not yet show the head running -- would wait out
+   the 30 s for an acknowledgement nothing sends and fail
+   `runtime.cluster_config_unacknowledged`.
 2. **Members, in parallel**, each within its startup timeout plus 10 s, arming
    a reservation that lasts the head's bound plus 60 s (plus the policy settle
    of step 3 when one is pending). In direct transport a

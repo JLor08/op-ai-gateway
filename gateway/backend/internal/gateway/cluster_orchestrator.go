@@ -27,7 +27,9 @@ import (
 //
 //  1. Configuration applied: the head's and every member's agent acknowledge
 //     a runtime document that carries its part of the cluster (for a mesh
-//     cluster after the RPC NetBird policies were reconciled), bounded.
+//     cluster after the RPC NetBird policies were reconciled), bounded. An
+//     agent that applied another document than that one is pushed it: a few
+//     writes change a document and push nothing (checkConfigGate).
 //  2. Members, in parallel: each is ensured through the agent's member route
 //     within its startup timeout plus a margin, arming a reservation that
 //     outlasts the head's start. In direct transport a member that still
@@ -249,6 +251,11 @@ type clusterOrchestratorDeps struct {
 	// runs, when set, is told where each run of a head begins and ends (the
 	// member usage's peak rule) and keeps the member sessions.
 	runs clusterRunObserver
+	// push, when set, pushes a server's current runtime document to its agent
+	// (Server.PushRuntimeConfig). Step one pushes the document of an agent
+	// that applied another one than the document that carries its part now
+	// (checkConfigGate).
+	push func(serverID string)
 }
 
 // clusterTimings are the orchestration's bounds.
@@ -1139,6 +1146,15 @@ func configGates(plan portal.ClusterPlan) []*configGate {
 // new to g, derives g's document once to see whether it carries g's part of
 // plan. acked reports that the applied ETag is one found to carry it; stale
 // that the head's document does not carry plan's cluster at all.
+//
+// When the document that carries g's part is not the one the agent applied,
+// it is pushed to the agent, once per applied ETag evaluated. Every document
+// change is pushed but those of a few writes that deliberately push nothing,
+// the agent's 60 s poll being their backstop (a member's usage rise during a
+// formed run, the agent's VRAM write-back, the capability writers): without
+// the push, step one would wait out its bound for an acknowledgement nothing
+// sends. The push is the ordinary one, so an agent it does not reach (file
+// mode, a held document) still fails the start within the bound.
 func (o *clusterOrchestrator) checkConfigGate(cctx context.Context, g *configGate, plan portal.ClusterPlan) (acked, stale bool) {
 	reported := o.deps.statuses.AppliedConfigETag(g.serverID)
 	if reported != "" && !g.accepted[reported] && reported != g.evaluated {
@@ -1149,6 +1165,9 @@ func (o *clusterOrchestrator) checkConfigGate(cctx context.Context, g *configGat
 			}
 			if carries {
 				g.accepted[doc.ETag] = true
+				if doc.ETag != reported && o.deps.push != nil {
+					o.deps.push(g.serverID)
+				}
 			}
 			g.evaluated = reported
 		}

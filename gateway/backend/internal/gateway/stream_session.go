@@ -6,6 +6,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -139,29 +140,45 @@ func (s *Server) beginStream(w http.ResponseWriter, r *http.Request, token auth.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	if req.APIFlavor == inference.APIFlavorAnthropicMessages {
+		// #407's cached subscription windows, then the principal's own limit standing.
+		s.attachTranslatedUsageLimits(r, token, target, w.Header())
+	}
+	if req.APIFlavor == inference.APIFlavorOpenAIResponses {
+		// The Codex windows last observed for the caller (unless the gateway's own limit takes over from 75 %), then the principal's own limit standing.
+		s.attachTranslatedCodexUsageLimits(r, token, target, w.Header())
+	}
 	w.WriteHeader(http.StatusOK)
 
 	if idle > 0 {
 		ss.watchdog = time.AfterFunc(idle, func() { ss.idledOut.Store(true); cancel() })
 	}
-	// Thread a capture sink so the provider records the upstream response headers.
-	// When capturing, it keeps the full translated request + raw upstream response.
-	// For a vendor-account target that is NOT capturing, a header-only sink (respCap
-	// 0, no body buffered) is still attached so the best-effort vendor rate-limit
-	// scrape can read the upstream headers off a normal (uncaptured) stream.
-	switch {
-	case capturing:
-		ss.captureSink = provider.NewCaptureSink(s.captureMaxBytes)
-	case target.VendorAccountID != "":
-		ss.captureSink = provider.NewCaptureSink(0)
-	}
-	if ss.captureSink != nil {
-		ss.ctx = provider.WithCaptureSink(ss.ctx, ss.captureSink)
-	}
-	ss.baseCtx = ss.ctx
+	ss.baseCtx = ss.withCaptureSink(ss.ctx)
 	// Attach the resolved application's per-app upstream credential (fail-open).
 	ss.ctx = s.upstreamAuthCtx(ss.baseCtx, target)
 	return ss, true
+}
+
+// withCaptureSink gives the session a fresh capture sink for its current target and
+// returns ctx carrying it, so the provider records the upstream response headers.
+// When capturing, it keeps the full translated request + raw upstream response. For
+// a vendor-account target that is NOT capturing, a header-only sink (respCap 0, no
+// body buffered) is still attached so the best-effort vendor rate-limit scrape can
+// read the upstream headers off a normal (uncaptured) stream. A vendor group's
+// failover attempt gets a sink of its own (vendorFailover): the refused attempt's
+// headers and body must not be scraped into, or captured as, the member that
+// answers.
+func (ss *streamSession) withCaptureSink(ctx context.Context) context.Context {
+	switch {
+	case ss.capturing:
+		ss.captureSink = provider.NewCaptureSink(ss.capBytes)
+	case ss.target.VendorAccountID != "":
+		ss.captureSink = provider.NewCaptureSink(0)
+	default:
+		ss.captureSink = nil
+		return ctx
+	}
+	return provider.WithCaptureSink(ctx, ss.captureSink)
 }
 
 // register (re)registers the stream in the active registry under its one id, for
@@ -214,7 +231,10 @@ func (ss *streamSession) emit(frame string) error {
 //
 // A stream whose instance turns out to be gone before it delivered a single event
 // is re-selected once onto another instance (reselect) and started there; the
-// client, which has had the response headers and nothing else, sees one stream.
+// client, which has had the response headers and nothing else, sees one stream. A
+// vendor group member's limit answer before the first event moves the stream to the
+// group's next member the same way (vendorFailover), once per member; after the
+// first event the stream stays where it is and ends with its error.
 func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error {
 	delivered := false
 	onEvent := func(ev inference.StreamEvent) error {
@@ -238,6 +258,9 @@ func (ss *streamSession) stream(handler func(inference.StreamEvent) error) error
 		}
 	}
 	if err != nil && !delivered && ss.reselect(err) {
+		err = ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, onEvent)
+	}
+	for err != nil && !delivered && ss.vendorFailover(err) {
 		err = ss.streamer.CompleteStream(ss.ctx, ss.target, ss.providerReq, onEvent)
 	}
 	return err
@@ -301,6 +324,39 @@ func (ss *streamSession) reselect(err error) bool {
 	slog.Info("inference stream: the routed instance is gone; re-selected once", "path", ss.r.URL.Path, "model", ss.req.Model, "lost", ss.target.InstanceKey, "instance", target.InstanceKey)
 	ss.req, ss.token, ss.target = req, token, target
 	ss.providerReq = ss.s.upstreamRequest(ss.r.Context(), target, req)
+	ss.ctx = ss.s.upstreamAuthCtx(ss.baseCtx, target)
+	ss.register()
+	return true
+}
+
+// vendorFailover moves the session onto the next member of its vendor group when err
+// is a group member's limit answer (vendor_group_failover.go), and reports whether
+// it did. The caller calls it only while nothing was delivered. The idle watchdog is
+// held while the re-resolve runs and armed afresh after it, as reselect does, so the
+// next member gets the whole first-byte budget; a watchdog that has already fired has
+// ended the stream, which then does not fail over. The session's request, token,
+// target, upstream request, capture sink and credential context become the new
+// attempt's, and it is registered again under its id; the usage row finish records
+// is that attempt's.
+func (ss *streamSession) vendorFailover(err error) bool {
+	var limit *provider.LimitError
+	if ss.target.VendorGroupID == "" || !errors.As(err, &limit) {
+		return false
+	}
+	if ss.watchdog != nil {
+		if !ss.watchdog.Stop() {
+			return false
+		}
+		defer ss.watchdog.Reset(ss.idle)
+	}
+	token := ss.token
+	req, target, ok := ss.s.vendorGroupFailover(&token, ss.req, ss.target, limit.Header, limit.RetryAfter, ss.s.translateTargetResolver(ss.r))
+	if !ok {
+		return false
+	}
+	ss.req, ss.token, ss.target = req, token, target
+	ss.providerReq = ss.s.upstreamRequest(ss.r.Context(), target, req)
+	ss.baseCtx = ss.withCaptureSink(ss.baseCtx)
 	ss.ctx = ss.s.upstreamAuthCtx(ss.baseCtx, target)
 	ss.register()
 	return true

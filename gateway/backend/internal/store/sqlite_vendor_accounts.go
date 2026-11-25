@@ -19,22 +19,28 @@ import (
 // string) whatever the routing.VendorAccount carries -- a zero-value struct must
 // not write an empty string into share_level and bypass the DEFAULT. The two
 // columns are changed only by their narrow writers (UpdateVendorAccountShareLevel,
-// UpdateVendorAccountSystemGroup, ClearVendorAccountSharing).
+// UpdateVendorAccountSystemGroup, ClearVendorAccountSharing). share_usage_with_members
+// is the exception: the create decides its initial value, so it is written from the struct.
 const vendorAccountInsertColumns = `id, owner_user_id, vendor, auth_type, name, status, api_key, oauth_tokens, model_prefix, base_url, created_at, updated_at`
+
+// vendorAccountCreateColumns is vendorAccountInsertColumns plus the usage opt-in,
+// the one sharing column a create writes.
+const vendorAccountCreateColumns = vendorAccountInsertColumns + `, share_usage_with_members`
 
 // vendorAccountColumns is the single column list every vendor_accounts reader
 // selects, in the order scanVendorAccount scans them: the insert columns, then
-// the two sharing columns the narrow writers own.
-const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id`
+// the three sharing columns the narrow writers own.
+const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id, share_usage_with_members`
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
 // exactly as given -- the caller seals them first. ShareLevel and SystemGroupID
-// are ignored: the account starts at the column DEFAULTs (private). A duplicate id
+// are ignored: the account starts at the column DEFAULTs (private).
+// ShareUsageWithMembers is stored as given. A duplicate id
 // is ErrConflict.
 func (s *SQLiteStore) CreateVendorAccount(ctx context.Context, a routing.VendorAccount) error {
-	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountInsertColumns+`)
-		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.BaseURL, a.CreatedAt, a.UpdatedAt)
+	_, err := s.exec(ctx, `insert into vendor_accounts (`+vendorAccountCreateColumns+`)
+		values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.OwnerUserID, a.Vendor, a.AuthType, a.Name, a.Status, a.APIKey, a.OAuthTokens, a.ModelPrefix, a.BaseURL, a.CreatedAt, a.UpdatedAt, a.ShareUsageWithMembers)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
 			return ErrConflict
@@ -168,6 +174,17 @@ func (s *SQLiteStore) UpdateVendorAccountShareLevel(ctx context.Context, id, lev
 	result, err := s.exec(ctx, `update vendor_accounts set share_level = ? where id = ?`, level, id)
 	if err != nil {
 		return fmt.Errorf("update vendor account share level: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateVendorAccountShareUsage writes only share_usage_with_members (migration
+// 110) with a targeted UPDATE of that one column, like UpdateVendorAccountShareLevel
+// (updated_at is left alone). An unknown id is ErrNotFound.
+func (s *SQLiteStore) UpdateVendorAccountShareUsage(ctx context.Context, id string, enabled bool) error {
+	result, err := s.exec(ctx, `update vendor_accounts set share_usage_with_members = ? where id = ?`, enabled, id)
+	if err != nil {
+		return fmt.Errorf("update vendor account share usage: %w", err)
 	}
 	return requireAffected(result)
 }
@@ -451,7 +468,7 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
-	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID)
+	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID, &a.ShareUsageWithMembers)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccount{}, ErrNotFound
 	}

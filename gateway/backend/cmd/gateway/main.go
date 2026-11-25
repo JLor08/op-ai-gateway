@@ -448,6 +448,11 @@ func buildGatewayServer(cfg config.Config) (*gateway.Server, func() error, error
 	if deps.SetVendorTokenRefresher != nil {
 		deps.SetVendorTokenRefresher(srv.RefreshVendorSubscriptionTokens)
 	}
+	// The vendor limit-cooldown registry is the Server's too (the resolver reads the
+	// same one); the portal shows it in the group member status.
+	if deps.SetVendorLimitCooldowns != nil {
+		deps.SetVendorLimitCooldowns(srv.VendorLimitCooldowns())
+	}
 	// And for the cluster orchestration's state, which a cluster head's
 	// runtime spec shows read-only: the orchestration belongs to srv.
 	if deps.SetClusterStatusReader != nil {
@@ -1147,6 +1152,7 @@ func buildRuntime(cfg config.Config, b depsBackend) (gateway.ServerDeps, func() 
 		SetRuntimeConfigChangedHook:     portalService.SetRuntimeConfigChangedHook,
 		SetBenchmarkReservationHook:     portalService.SetBenchmarkReservationHook,
 		SetVendorTokenRefresher:         portalService.SetVendorTokenRefresher,
+		SetVendorLimitCooldowns:         portalService.SetVendorLimitCooldowns,
 		SetClusterStatusReader:          portalService.SetClusterStatusReader,
 		SetSpeechRateTrigger:            speechRate.set,
 		SetAudioBenchmarkTrigger:        audioBenchmark.set,
@@ -1383,6 +1389,9 @@ func providerClients(mockDelay time.Duration, mockUnreachable bool, appHTTPClien
 		// through the same OpenAI-compatible client (System One probe, model
 		// discovery).
 		routing.ProviderVllmSR: openAICompatible,
+		// ProviderStrata: Strata serves the OpenAI-compatible dialect and
+		// shares this client.
+		routing.ProviderStrata: openAICompatible,
 		// ProviderVendorOpenAI: api.openai.com speaks the OpenAI-compatible
 		// dialect, so a vendor-account target reuses the same client.
 		routing.ProviderVendorOpenAI: openAICompatible,

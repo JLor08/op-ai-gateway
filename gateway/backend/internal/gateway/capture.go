@@ -61,7 +61,9 @@ type captureInput struct {
 	// actually sent to the Chat-Completions upstream + the raw upstream response),
 	// populated only on the translate path when capturing. Empty on native
 	// passthrough and on plain same-protocol requests. Request headers are
-	// redacted like the client ones.
+	// redacted like the client ones. Response headers are stored as received,
+	// except that recordUsage first removes a vendor account's usage-limit headers
+	// (redactCapturedAccountHeaders) for a principal not entitled to its figures.
 	//
 	// Empty on native passthrough because that path attaches no sink, NOT because
 	// its captured bytes are the upstream's. They are not, and have not been since
@@ -161,8 +163,9 @@ func redactCaptureHeaders(h http.Header) map[string][]string {
 	return out
 }
 
-// cloneHeader copies h into a plain map. Response headers are stored verbatim; only
-// request headers are redacted.
+// cloneHeader copies h into a plain map. It does no redaction of its own: request headers
+// are redacted by the caller, and response headers arrive already filtered by
+// recordUsage (redactCapturedAccountHeaders).
 func cloneHeader(h http.Header) map[string][]string {
 	out := make(map[string][]string, len(h))
 	for name, values := range h {
@@ -278,7 +281,8 @@ func captureResponseBody(in *captureInput, maxBytes int) (string, bool) {
 
 // buildCaptureEnvelope redacts request headers and clips both bodies to maxBytes.
 // When the translate path collected the upstream exchange, its request headers are
-// redacted (an upstream API key never leaks), its response headers stored verbatim,
+// redacted (an upstream API key never leaks), its response headers stored as given (recordUsage has
+// already removed the vendor usage-limit headers a principal may not see),
 // and both translated bodies clipped to maxBytes.
 //
 // A multipart/form-data REQUEST body (an image edit) is not stored as bytes: it is

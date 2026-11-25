@@ -86,6 +86,7 @@ function makeAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
     system_group_name: '',
     is_owner: true,
     shared_by: '',
+    share_usage_with_members: false,
     ...overrides,
   };
 }
@@ -95,14 +96,15 @@ const dashboard: DashboardResponse = {
   routes: [],
 };
 
-type UsageApi = Pick<PortalApi, 'vendorAccounts'>;
+type UsageApi = Pick<PortalApi, 'vendorAccounts' | 'vendorAccountGroups'>;
 
 function makeApi(accounts: VendorAccount[]): {
   api: UsageApi;
   vendorAccounts: ReturnType<typeof vi.fn>;
 } {
   const vendorAccounts = vi.fn().mockResolvedValue({ data: accounts });
-  return { api: { vendorAccounts } as unknown as UsageApi, vendorAccounts };
+  const vendorAccountGroups = vi.fn().mockResolvedValue({ groups: [] });
+  return { api: { vendorAccounts, vendorAccountGroups } as unknown as UsageApi, vendorAccounts };
 }
 
 function renderDashboard(
@@ -168,6 +170,32 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(within(claude).getAllByText(new RegExp(updatedPrefix(t)))).toHaveLength(1);
 
       expect(within(section).getAllByRole('listitem')).toHaveLength(2);
+    });
+
+    it('lists a member-only row that carries usage (the owner opted in)', async () => {
+      // The member view: not the owner, share_level withheld, the opt-in on and the
+      // snapshot present. canReportUsage must accept it.
+      const { api } = makeApi([
+        makeAccount({
+          id: 'va_member',
+          vendor: 'anthropic',
+          auth_type: 'subscription',
+          name: 'Shared Claude Max',
+          api_key_set: false,
+          subscription_connected: true,
+          is_owner: false,
+          shared_by: 'Olga Owner',
+          share_level: '',
+          share_usage_with_members: true,
+          usage: makeUsage({ five_hour_pct: 55 }),
+        }),
+      ]);
+      renderDashboard(t, { api, vendorAccountsEnabled: true });
+
+      await screen.findByRole('region', { name: t.dashboardVendorUsageTitle });
+      const card = cardOf('Shared Claude Max');
+      expect(within(card).getByText(t.vendorUsageFiveHour)).toBeInTheDocument();
+      expect(within(card).getByText(t.vendorUsagePercentUsed(55))).toBeInTheDocument();
     });
 
     it('draws the bars of a card dense (6px)', async () => {
@@ -309,7 +337,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
     it('hides the section, and leaves the dashboard standing, when the read fails', async () => {
       const vendorAccounts = vi.fn().mockRejectedValue(new Error('boom'));
-      const api = { vendorAccounts } as unknown as UsageApi;
+      const api = {
+        vendorAccounts,
+        vendorAccountGroups: vi.fn().mockResolvedValue({ groups: [] }),
+      } as unknown as UsageApi;
       renderDashboard(t, { api, vendorAccountsEnabled: true });
       await waitFor(() => expect(vendorAccounts).toHaveBeenCalled());
       await act(async () => {
@@ -335,7 +366,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         .mockResolvedValue({
           data: [makeAccount({ usage: makeUsage({ five_hour_pct: 55 }) })],
         });
-      const api = { vendorAccounts, refreshUsage } as unknown as UsageApi;
+      const api = {
+        vendorAccounts,
+        refreshUsage,
+        vendorAccountGroups: vi.fn().mockResolvedValue({ groups: [] }),
+      } as unknown as UsageApi;
       renderDashboard(t, { api, vendorAccountsEnabled: true });
 
       expect(await screen.findByText(t.vendorUsagePercentUsed(42))).toBeInTheDocument();

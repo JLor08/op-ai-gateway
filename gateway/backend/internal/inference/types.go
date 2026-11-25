@@ -159,6 +159,14 @@ type Usage struct {
 	// usage.Event field by field and has no member for it, and the client-facing
 	// bodies compat builds carry usage structs of their own.
 	LiveOutputTokens int `json:"-"`
+	// PromptPerSecondGatewayMeasured marks a PromptPerSecond the gateway derived
+	// itself (usageScanner.usage: processed prompt tokens over the time to first
+	// content, #426) rather than one the upstream reported. Such a figure is
+	// recorded on the usage row for analytics and never fed into the mapping's
+	// PromptTokensPerSecond EWMA (recordUsage): it includes queueing and network,
+	// and an upstream that reuses a prefix cache without reporting it makes it
+	// read high. Not serialized.
+	PromptPerSecondGatewayMeasured bool `json:"-"`
 }
 
 type Error struct {
@@ -310,6 +318,15 @@ type Request struct {
 	// agent cannot serve a realtime session at all. Internal only: set by the
 	// gateway when it re-selects, never parsed from a client body.
 	ExcludeInstanceKeys []string `json:"-"`
+	// ExcludeVendorAccountIDs are vendor account ids a vendor account group must
+	// not pick for this request: members already tried that answered with a limit
+	// error. Only the resolver's group step honours the list (and a non-empty one
+	// disables the group's all-blocked fallback); the single-account loop does
+	// NOT, so a re-resolve can still land on an excluded account outside the
+	// group, which is why the gateway's failover accepts only a target of the same
+	// group that is not excluded (vendorGroupFailover). Internal only: set by the
+	// gateway when it re-resolves, never parsed from a client body.
+	ExcludeVendorAccountIDs []string `json:"-"`
 	// AdmissionStart, when set, is when this request's admission began (wall
 	// clock): a bounded admission-queue timeout counts from it instead of from
 	// the resolve's own start, so one client call that resolves more than once

@@ -66,7 +66,10 @@ paths:
         Against an agent-launched `sglang_omni` target every `image_url.url`
         must be an inline `data:` URL, and against an `sglang` target a
         `data:`, `http://` or `https://` URL, else 400
-        `chat.media_url_unsupported`.
+        `chat.media_url_unsupported`. Against a `strata` target (application
+        or spec) the same rule applies with the prefixes matched lowercase
+        only, and the raw `/v1/messages` and `/v1/responses` passthrough body
+        is scanned for image references as well.
       security: [{ bearerAuth: [] }, { sessionCookie: [], csrfHeader: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -89,11 +92,35 @@ paths:
         Bearer-only, scope `gateway:use` or `llm:invoke`. Attempts native
         passthrough to an upstream that speaks the Responses API before
         falling back to translation. Alias: /openai/v1/responses.
+        A principal with a quota or budget gets its fullest limit in the
+        default `x-codex-*` headers of a success that carries no fresh
+        subscription figures, and from 75 % of that limit instead of cached
+        ones. Every x-codex-* usage header (relayed, cached
+        or the gateway's own) goes out only for a token with
+        send_usage_limits; without it only Retry-After and X-Should-Retry
+        pass, and a block keeps x-codex-promo-message.
       security: [{ bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: >
+            The rate limit: the Error envelope with code `limit.rate_limited`
+            and a Retry-After header. A request quota, token quota or cost
+            budget block (the cost budget too, not a 402): the Codex body
+            `{"error":{"type":"usage_limit_reached","code","message","resets_at"}}`
+            with `code` `limit.request_quota_exceeded`,
+            `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, the
+            limit's sentence as `message` and its reset as `resets_at` (unix
+            seconds), plus Retry-After, `X-Should-Retry: false`,
+            `x-codex-promo-message` and, only for a token with
+            send_usage_limits, the default `x-codex` primary window at 100 %
+            (credits flags only without codex_model_switch_prompt). See
+            compatibility-and-inference.md section 9.6.
+          content:
+            application/json:
+              schema: { type: object }
   /openai/v1/responses:
     post:
       tags: [inference]
@@ -103,6 +130,23 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: >
+            The rate limit: the Error envelope with code `limit.rate_limited`
+            and a Retry-After header. A request quota, token quota or cost
+            budget block (the cost budget too, not a 402): the Codex body
+            `{"error":{"type":"usage_limit_reached","code","message","resets_at"}}`
+            with `code` `limit.request_quota_exceeded`,
+            `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`, the
+            limit's sentence as `message` and its reset as `resets_at` (unix
+            seconds), plus Retry-After, `X-Should-Retry: false`,
+            `x-codex-promo-message` and, only for a token with
+            send_usage_limits, the default `x-codex` primary window at 100 %
+            (credits flags only without codex_model_switch_prompt). See
+            compatibility-and-inference.md section 9.6.
+          content:
+            application/json:
+              schema: { type: object }
   /v1/messages:
     post:
       tags: [inference]
@@ -119,6 +163,10 @@ paths:
         non-object `chat_template_kwargs` or a `chat_template_kwargs.reasoning_effort`
         that conflicts with the effort is a 400 `messages.invalid_output_config`;
         a token without the setting is never rejected for `output_config`.
+        The anthropic-ratelimit-unified-* headers (relayed, cached or the
+        gateway's own overage window, also on the 429 billing_error block)
+        go out only for a token with send_usage_limits; Retry-After,
+        X-Should-Retry and the block body always do.
       security: [{ bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -1436,11 +1484,33 @@ paths:
   /api/portal/chat-settings:
     put:
       tags: [portal]
-      summary: Own default chat run settings
+      summary: Own chat-session settings (chat run booleans and, session only, the provider policy)
+      description: >
+        The two chat run booleans may be saved by a session or a bearer. The
+        optional vendor_access (the token DTO, the token-less chat's
+        provider policy) is accepted from a SESSION caller only: absent or
+        null leaves the stored policy untouched, a value is validated like a
+        token policy (400 portal.token_vendor_access_invalid or
+        portal.token_vendor_access_conflict) and replaces it, and a bearer
+        caller sending it gets 403 portal.token_forbidden with nothing
+        stored. A save that fails is 500 portal.chat_settings_update_failed.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
-      requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+              properties:
+                vendor_access:
+                  allOf:
+                    - { $ref: '#/components/schemas/TokenVendorAccess' }
+                  nullable: true
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /api/portal/system-admin-mode:
     post:
       tags: [portal]
@@ -1506,7 +1576,16 @@ paths:
       carries the opt-in decisions_confidence_normalize flag (default false,
       always present on a read): when true, the confidence of the choice and
       score answers of /v1/decisions and /v1/systemone is recomputed from
-      their probabilities. It is NOT management-gated.
+      their probabilities. It is NOT management-gated. A token also
+      carries the opt-in claude_code_usage_display flag (default false, always
+      present on a read): when true, its secret has the Claude Code shape (a
+      JWT-looking prefix around the opaigw_ secret) so Claude Code can read usage
+      limits, which it shows only together with send_usage_limits. It is set on create and changed only by rotation. A token
+      also carries the opt-in send_usage_limits and codex_model_switch_prompt
+      flags (default false, always present on a read, not gated, no
+      rotation): without send_usage_limits no usage-limit header reaches the
+      client; codex_model_switch_prompt lets Codex offer the gpt-5.4-mini
+      switch and counts only together with send_usage_limits.
     get:
       tags: [portal]
       summary: List own API tokens (each row carries vendor_access when the token has any)
@@ -1515,9 +1594,13 @@ paths:
         '200':
           description: >
             The caller's tokens, the synthetic non-deletable chat-session row
-            first. vendor_access is omitted for a token with no vendor access
-            (and for the chat-session row, whose session always sees all of
-            the owner's accounts). Other row fields are defined by the Go DTO
+            first. vendor_access is omitted for a token with no vendor access.
+            The chat-session row carries the EFFECTIVE chat-session policy
+            whenever the user row was read (never configured reads back as
+            all=true with include_groups=true, an explicit no-providers save as
+            all=false with an empty accounts array) and omits it only when that
+            lookup failed. GET /api/admin/users/{id}/tokens returns the same
+            shape for the named user. Other row fields are defined by the Go DTO
             (see api-surface.md).
           content:
             application/json:
@@ -1535,6 +1618,9 @@ paths:
                         claude_model_aliases: { type: boolean }
                         claude_effort_compatibility: { type: boolean }
                         decisions_confidence_normalize: { type: boolean }
+                        claude_code_usage_display: { type: boolean }
+                        send_usage_limits: { type: boolean }
+                        codex_model_switch_prompt: { type: boolean }
     post:
       tags: [portal]
       summary: Create an API token (optionally with a vendor_access policy)
@@ -1561,8 +1647,9 @@ paths:
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
-                claude_effort_compatibility and
-                decisions_confidence_normalize are modeled here.
+                claude_effort_compatibility, decisions_confidence_normalize
+                claude_code_usage_display, send_usage_limits and
+                codex_model_switch_prompt are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1581,6 +1668,24 @@ paths:
                   description: >
                     Opt into recomputed decision confidence. Absent means off.
                     Not management-gated.
+                claude_code_usage_display:
+                  type: boolean
+                  description: >
+                    Give the new token's secret the Claude Code shape (a
+                    JWT-looking prefix around the opaigw_ secret) so Claude
+                    Code can read usage limits, which it shows only together
+                    with send_usage_limits. Absent means off.
+                send_usage_limits:
+                  type: boolean
+                  description: >
+                    Send usage-limit headers to the client. Absent means off.
+                    Not gated, no rotation.
+                codex_model_switch_prompt:
+                  type: boolean
+                  description: >
+                    Let Codex offer the gpt-5.4-mini switch (the gateway
+                    omits its own credits flags). Effective only with
+                    send_usage_limits. Absent means off.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1609,8 +1714,9 @@ paths:
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
-                claude_effort_compatibility and
-                decisions_confidence_normalize are modeled here.
+                claude_effort_compatibility, decisions_confidence_normalize
+                claude_code_usage_display, send_usage_limits and
+                codex_model_switch_prompt are modeled here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1631,6 +1737,23 @@ paths:
                   description: >
                     Replaces the stored flag when present (true or false);
                     absent keeps it. Not management-gated.
+                claude_code_usage_display:
+                  type: boolean
+                  description: >
+                    Accepted only with the stored value (a no-op). A different
+                    value is a 400 portal.token_claude_code_usage_display_requires_rotation:
+                    the flag shapes the secret and changes only through
+                    POST /api/portal/tokens/{id}/rotate.
+                send_usage_limits:
+                  type: boolean
+                  description: >
+                    Replaces the stored flag when present (true or false);
+                    absent keeps it. Not gated, no rotation.
+                codex_model_switch_prompt:
+                  type: boolean
+                  description: >
+                    Replaces the stored flag when present (true or false);
+                    absent keeps it. Effective only with send_usage_limits.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
@@ -1645,11 +1768,28 @@ paths:
     post:
       tags: [portal]
       summary: Rotate an own API token
+      description: >
+        Issues a fresh secret (returned once) and retires the old one. The body
+        is optional: an empty body keeps the token's secret shape, a malformed
+        one is a 400 request.invalid_json. claude_code_usage_display switches
+        the token to (true) or from (false) the Claude Code secret shape; it is
+        the only way to change that flag on an existing token.
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                claude_code_usage_display:
+                  type: boolean
+                  description: Absent keeps the stored shape.
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
   /api/portal/chats:
     get:
       tags: [portal]
@@ -1926,10 +2066,33 @@ paths:
   /api/portal/models:
     get:
       tags: [portal]
-      summary: Model catalog visible to the caller
+      summary: Model catalog visible to the caller (a session may read it as one of its own tokens)
+      description: >
+        A SESSION caller may send X-OP-Run-As-Token with one of its own API
+        token ids (the header is capture-redacted; there is no query
+        parameter) to get the listing for that token's principal: its
+        vendor-account policy and prefixes, overrides, overlays and generated
+        alias rows, with the loading counts computed for it. A bearer caller
+        sending the header is refused 403 portal.token_forbidden before any
+        lookup; a foreign, unknown or disabled token is the same 403 with an
+        identical body (no existence leak); the header together with
+        manage=1 is 400 portal.models_run_as_conflict.
+      parameters:
+        - name: X-OP-Run-As-Token
+          in: header
+          required: false
+          description: The id (not the secret) of one of the session user's own API tokens.
+          schema: { type: string }
+        - name: manage
+          in: query
+          required: false
+          description: Admin management view (system models only); mutually exclusive with X-OP-Run-As-Token.
+          schema: { type: string }
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /api/portal/model-servers:
     get:
       tags: [portal]
@@ -3372,7 +3535,10 @@ paths:
       token with it true from an inference-only bearer is a 403
       portal.principal_forbidden, while a portal session or an admin-scope
       bearer may. It takes the opt-in decisions_confidence_normalize flag on
-      create only too, ungated.
+      create only too, ungated. It takes send_usage_limits and
+      codex_model_switch_prompt (default false, ungated) on create only and
+      reads them back; changing one on an existing service token is not
+      possible until issue #421, so a token is recreated.
     get:
       tags: [portal]
       summary: List services
@@ -3710,7 +3876,7 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Vendor-account detail (includes the usage snapshot for a management view)
+      summary: Vendor-account detail (includes the usage snapshot for a management view, and for a member view when the owner opted in)
       description: >
         Rendered in the view the caller's relation to the account earns: the
         management view for the owner, a CM of a shared or full account and
@@ -3720,7 +3886,7 @@ paths:
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200':
-          description: The credential-free account, with its rate-limit usage snapshot when one has been scraped (management view only)
+          description: The credential-free account, with its rate-limit usage snapshot when one has been scraped (management view; also the member view when the owner's share_usage_with_members opt-in is on)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/VendorAccount' }
@@ -4068,6 +4234,38 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-accounts/{id}/share-usage:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Set the owner's opt-in to show a vendor account's usage to members
+      description: >
+        Body {enabled}. The owner only: 403 vendor_account.forbidden for a CM or
+        a member (who can see the account), 404 vendor_account.not_found for a
+        stranger, an unknown id and system scope. 400 request.invalid_json for a
+        malformed body or a body without enabled (nothing is written); 409 while
+        the vendor-accounts module flag is off; 500 vendor_account.share_usage_failed
+        on a store failure. Not
+        gated on the sharing switches and allowed at any share level. With the
+        opt-in on, a member's read of the account carries usage, and Claude
+        Code's responses carry the plan's rate-limit headers.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountShareUsageRequest' }
+      responses:
+        '200':
+          description: The credential-free management view with the new opt-in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-accounts/{id}/admin-groups:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -4100,6 +4298,145 @@ paths:
               schema: { $ref: '#/components/schemas/VendorAccount' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-account-groups:
+    description: >
+      Vendor account groups: a user's personal, ordered set of accounts of one
+      vendor (their own and ones shared with them), routed across as one logical
+      account. Session scope gateway:use, CSRF on writes. Every operation 409s
+      with vendor_accounts.module_disabled while the vendor_accounts_enabled
+      master flag is off (there is no separate flag). Groups are personal: only
+      the caller's own groups are visible. See api-surface.md for the DTO and
+      the stable vendor_account_group.* error codes.
+    get:
+      tags: [portal]
+      summary: List the caller's own vendor account groups with their member states
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The caller's groups in id order (never null), each with its computed member states.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+    post:
+      tags: [portal]
+      summary: Create a vendor account group
+      description: >
+        Missing thresholds default to 99, a blank status to active; the vendor is
+        fixed at create. account_ids is the member list in priority order. A
+        refused create leaves no group behind. 403 vendor_account_group.forbidden
+        for a principal that is not a user; 400 for name_required, vendor_invalid,
+        model_prefix_invalid, status_invalid, threshold_invalid,
+        member_vendor_mismatch, member_unreachable, member_duplicate or
+        prefix_conflict (all vendor_account_group.*).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountGroupCreateRequest' }
+      responses:
+        '201':
+          description: The group with its member states
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-account-groups/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [portal]
+      summary: Read one vendor account group with its member states
+      security: [{ sessionCookie: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: The group
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+    patch:
+      tags: [portal]
+      summary: Partially update a vendor account group
+      description: >
+        An absent field keeps the stored value. The vendor and the members are
+        not editable here (members: PUT .../members). 404
+        vendor_account_group.not_found for an unknown or foreign group; 400
+        vendor_account_group.* for an invalid field or a prefix_conflict.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountGroupUpdateRequest' }
+      responses:
+        '200':
+          description: The updated group
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+    delete:
+      tags: [portal]
+      summary: Delete a vendor account group
+      description: A token policy that still names the group matches nothing afterwards.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-account-groups/{id}/members:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Replace a vendor account group's member set and order
+      description: >
+        account_ids in priority order (positions 1..n). Atomic: a rejected set
+        leaves the previous one untouched. 400 member_vendor_mismatch,
+        member_unreachable, member_duplicate or prefix_conflict
+        (vendor_account_group.*).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [account_ids]
+              properties:
+                account_ids:
+                  type: array
+                  items: { type: string }
+      responses:
+        '200':
+          description: The group with its member states
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccountGroup' }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
   /api/portal/vendor-account-admin-group-candidates:
@@ -5782,9 +6119,39 @@ components:
         in both the model listing and routing.
       properties:
         all: { type: boolean }
+        include_groups:
+          type: boolean
+          description: >
+            Only meaningful with all=true (ignored without it): the token also
+            uses every active vendor account group its principal owns, groups
+            created later included, each under its own model_prefix. Omitted
+            when false.
         accounts:
           type: array
           items: { $ref: '#/components/schemas/TokenVendorAccessEntry' }
+        groups:
+          type: array
+          description: >
+            Individual vendor account groups (vag_...) the token uses, each under
+            the group's model_prefix or its prefix_override. A group the
+            principal does not own, an unknown or blank id, a repeated id or a
+            malformed enabled override is 400
+            portal.token_vendor_access_invalid; a group deleted later matches
+            nothing. Opting in to a group lets the token use its members through
+            the group even when a shared member is not named under accounts.
+            Omitted when empty.
+          items: { $ref: '#/components/schemas/TokenVendorAccessGroupEntry' }
+    TokenVendorAccessGroupEntry:
+      type: object
+      required: [group_id]
+      properties:
+        group_id: { type: string, description: 'Id of a vendor account group (vag_...) the token''s principal owns.' }
+        prefix_override:
+          type: object
+          description: Same shape and rules as TokenVendorAccessEntry.prefix_override, replacing the group's model_prefix for this token.
+          properties:
+            enabled: { type: boolean }
+            value: { type: string }
     TokenVendorAccessEntry:
       type: object
       required: [account_id]
@@ -5971,6 +6338,12 @@ components:
         subscriptions_enabled: { type: boolean, description: The vendor_subscriptions_enabled switch (default true). }
         sharing_enabled: { type: boolean, description: The vendor_account_sharing_enabled master switch (default false). }
         subscription_sharing_enabled: { type: boolean, description: The vendor_subscription_sharing_enabled switch (default false), whether a subscription account may be raised to shared. }
+    VendorAccountShareUsageRequest:
+      type: object
+      description: portal.SetVendorAccountShareUsageRequest.
+      required: [enabled]
+      properties:
+        enabled: { type: boolean, description: "Whether members may see the account's usage." }
     VendorAccountShareLevelRequest:
       type: object
       description: portal.SetVendorAccountShareLevelRequest.
@@ -6079,10 +6452,12 @@ components:
         a minimal allowlist: id, vendor, auth_type, name, status, model_prefix,
         models (gateway_model, api_flavor and display_name only), the two
         credential booleans, is_owner false and shared_by. Everything else is
-        withheld and reads as its zero value (usage is omitted): share_level,
-        admin_groups, system_group_id and system_group_name, base_url, usage, each
-        model's upstream_model and the two timestamps.
-      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by]
+        withheld and reads as its zero value: share_level, admin_groups,
+        system_group_id and system_group_name, base_url, each model's
+        upstream_model and the two timestamps. share_usage_with_members is
+        carried (the account's actual value); usage is added to the member view
+        only when it is true, and is omitted otherwise.
+      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by, share_usage_with_members]
       properties:
         id: { type: string, description: 'va_-prefixed, random hex.' }
         vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, google_native, openai_compatible] }
@@ -6129,6 +6504,12 @@ components:
         system_group_id: { type: string, description: 'The containment root, empty until the account is first raised.' }
         system_group_name: { type: string, description: "The root's name, best effort." }
         is_owner: { type: boolean, description: Whether the viewer owns the account. }
+        share_usage_with_members:
+          type: boolean
+          description: >
+            The owner's opt-in to show usage to members (PUT .../share-usage).
+            Carried in the member view too, as the account's actual value (a
+            member who sees usage reads true).
         shared_by:
           type: string
           description: >
@@ -6192,6 +6573,97 @@ components:
         detail:
           type: string
           description: Short English phrase (what happened, or why nothing was pulled). Never a credential or vendor text; key off status, not this.
+    VendorAccountGroupCreateRequest:
+      type: object
+      description: portal.CreateVendorAccountGroupRequest.
+      required: [name, vendor]
+      properties:
+        name: { type: string }
+        vendor: { type: string, description: 'The vendor id every member shares; fixed at create.' }
+        model_prefix: { type: string, maxLength: 64, pattern: '^[A-Za-z0-9._~:/@+-]*$' }
+        status: { type: string, enum: [active, disabled], description: Defaults to active. }
+        threshold_five_hour_pct: { type: integer, minimum: 1, maximum: 100, description: Defaults to 99. }
+        threshold_weekly_pct: { type: integer, minimum: 1, maximum: 100, description: Defaults to 99. }
+        threshold_credits_pct: { type: integer, minimum: 1, maximum: 100, description: Defaults to 99. }
+        account_ids:
+          type: array
+          description: Members in priority order.
+          items: { type: string }
+    VendorAccountGroupUpdateRequest:
+      type: object
+      description: portal.UpdateVendorAccountGroupRequest; an absent field keeps the stored value.
+      properties:
+        name: { type: string }
+        model_prefix: { type: string, maxLength: 64, pattern: '^[A-Za-z0-9._~:/@+-]*$' }
+        status: { type: string, enum: [active, disabled] }
+        threshold_five_hour_pct: { type: integer, minimum: 1, maximum: 100 }
+        threshold_weekly_pct: { type: integer, minimum: 1, maximum: 100 }
+        threshold_credits_pct: { type: integer, minimum: 1, maximum: 100 }
+    VendorAccountGroup:
+      type: object
+      description: portal.VendorAccountGroupDTO.
+      required: [id, vendor, name, model_prefix, status, thresholds, active_member_id, members, created_at, updated_at]
+      properties:
+        id: { type: string, description: 'vag_ plus 32 hex characters.' }
+        vendor: { type: string }
+        name: { type: string }
+        model_prefix: { type: string }
+        status: { type: string, enum: [active, disabled] }
+        thresholds:
+          type: object
+          required: [five_hour_pct, weekly_pct, credits_pct]
+          description: Percent used (1..100) at which routing moves on to the next member, per limit category.
+          properties:
+            five_hour_pct: { type: integer }
+            weekly_pct: { type: integer }
+            credits_pct: { type: integer }
+        active_member_id:
+          type: string
+          description: The member routing would pick ignoring the requested model; empty when no member is usable.
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/VendorAccountGroupMember' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    VendorAccountGroupMember:
+      type: object
+      description: portal.VendorAccountGroupMemberDTO, in priority order.
+      required: [account_id, account_name, auth_type, owner_name, position, state, reason, cooldowns]
+      properties:
+        account_id: { type: string }
+        account_name: { type: string }
+        auth_type: { type: string }
+        owner_name: { type: string, description: Set only for a member somebody else owns. }
+        position: { type: integer, description: The 1-based index in the returned order. }
+        state:
+          type: string
+          enum: [active, available, over_threshold, cooldown, not_usable]
+        reason:
+          type: string
+          description: >
+            For over_threshold the first blocking category (five_hour, weekly or
+            credits); for not_usable one of disabled, needs_reconnect,
+            subscriptions_disabled, not_reachable; empty otherwise.
+        pct:
+          type: number
+          description: The blocking category's percent used. Never set for a shared member whose owner did not switch on share_usage_with_members.
+        free_at:
+          type: string
+          format: date-time
+          description: When every block lifts, when known. For a member without the owner's usage opt-in it comes from the cooldown alone.
+        cooldowns:
+          type: array
+          description: Active limit cooldowns per upstream model.
+          items:
+            type: object
+            required: [model, until]
+            properties:
+              model: { type: string }
+              until: { type: string, format: date-time }
+        usage:
+          description: The member's usage snapshot; omitted without the owner's usage opt-in.
+          allOf:
+            - { $ref: '#/components/schemas/VendorAccountUsage' }
     VendorAccountCreateRequest:
       type: object
       description: portal.CreateVendorAccountRequest.
@@ -6214,6 +6686,11 @@ components:
           description: >
             Optional namespace for the account's model ids (trimmed; no "..").
             An invalid value is a 400 vendor_account.model_prefix_invalid.
+        share_usage_with_members:
+          type: boolean
+          description: >
+            The owner's initial usage opt-in. A missing value means true for a
+            new account (accounts created earlier keep their stored value).
         base_url:
           type: string
           description: >

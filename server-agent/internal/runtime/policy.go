@@ -321,9 +321,10 @@ type PolicySnapshot struct {
 //     re-evaluates after notPermittedRetryInterval. What can clear it
 //     is HOST-DEPENDENT -- where a measurer is installed, the
 //     housekeeping beat measures the pinned occupant and the block
-//     clears with nothing evicted, but measurement is NVIDIA-only
-//     (§5.3), so on an AMD, Apple-silicon or GPU-less host nothing
-//     clears it except an operator filling the estimate in.
+//     clears with nothing evicted, but measurement exists only for
+//     NVIDIA and for ROCm/HIP builds on AMD Linux (§5.3), so for a
+//     Vulkan build on AMD, on AMD Windows, Apple-silicon or a GPU-less
+//     host nothing clears it except an operator filling the estimate in.
 //   - StateNotPermitted: a durable operator-configuration block. Four
 //     causes reach it from here. (1) Spec's own declared demand on
 //     some GPU exceeds that GPU's budget all by itself, whatever else

@@ -3201,9 +3201,9 @@ describe('VRAM-benchmark portal i18n keys', () => {
   it('never lets "cannot verify" read as "verified", in both locales', () => {
     // The recorded fingerprint is compared against the live card before the
     // number is offered, and the three outcomes are three different facts. An
-    // empty fingerprint (GPUSample.UUID is NVIDIA-only) means the check could
-    // not be MADE -- claiming it passed would be the drift bug with a
-    // reassuring label on it.
+    // empty fingerprint (GPUSample.UUID needs NVIDIA or AMD with rocm-smi 4.x)
+    // means the check could not be MADE -- claiming it passed would be the
+    // drift bug with a reassuring label on it.
     for (const locale of ['de', 'en'] as const) {
       const m = messages[locale];
       // Each is a sentence naming what was (or was not) established, never a
@@ -4735,6 +4735,20 @@ describe('vllm_sr i18n keys', () => {
   });
 });
 
+describe('strata i18n keys', () => {
+  it('defines the application type note in de and en', () => {
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].applicationTypeStrataNote;
+      expect(typeof note).toBe('string');
+      expect(note.length).toBeGreaterThan(0);
+      expect(note).toContain('Niko1221/Strata');
+      expect(note).toContain('strata serve');
+      expect(note).toContain('/v1/responses');
+    }
+    expect(messages.en.applicationTypeStrataNote).not.toBe(messages.de.applicationTypeStrataNote);
+  });
+});
+
 describe('sglang i18n keys', () => {
   it('defines the type labels, notes and the warning in de and en', () => {
     const keys = [
@@ -4770,6 +4784,50 @@ describe('sglang i18n keys', () => {
     }
     expect(messages.de.runtimeSpecTypeSglangNote).toContain('„Umwandlung“');
     expect(messages.en.runtimeSpecTypeSglangNote).toContain('Translate');
+  });
+});
+
+describe('strata runtime spec i18n keys', () => {
+  it('defines the type label, the note and the API-token row in de and en', () => {
+    const keys = [
+      'runtimeSpecTypeStrata',
+      'runtimeSpecTypeStrataNote',
+      'runtimeSpecApiTokenRowStrataBackend',
+      'runtimeSpecApiTokenRowStrataEnv',
+      'runtimeSpecApiTokenRowStrataArgs',
+      'runtimeSpecApiTokenRowStrataClient',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.en.runtimeSpecTypeStrataNote).not.toBe(messages.de.runtimeSpecTypeStrataNote);
+    expect(messages.en.runtimeSpecApiTokenRowStrataClient).not.toBe(
+      messages.de.runtimeSpecApiTokenRowStrataClient,
+    );
+    for (const locale of ['de', 'en'] as const) {
+      const note = messages[locale].runtimeSpecTypeStrataNote;
+      // The launch template, the key, the binary allowlist, the host GPU
+      // numbering and the parent timeout the 960 s startup timeout needs.
+      expect(note).toContain('--host 127.0.0.1');
+      expect(note).toContain('STRATA_API_KEY=${API_TOKEN}');
+      expect(note).toContain('strata.json');
+      expect(note).toContain('runtime_allowed_binaries');
+      expect(note).toContain('<user>');
+      expect(note).toContain('${HOST_GPU_IDS_MAIN_LAST}');
+      expect(note).toContain('960000');
+      expect(messages[locale].runtimeSpecApiTokenRowStrataEnv).toBe('STRATA_API_KEY=${API_TOKEN}');
+    }
+  });
+});
+
+describe('main-last GPU placeholder hint', () => {
+  it('names ${HOST_GPU_IDS_MAIN_LAST} in the env hint in both locales', () => {
+    for (const locale of ['de', 'en'] as const) {
+      expect(messages[locale].runtimeSpecEnvHint).toContain('${HOST_GPU_IDS_MAIN_LAST}');
+    }
+    expect(messages.en.runtimeSpecEnvHint).not.toBe(messages.de.runtimeSpecEnvHint);
   });
 });
 

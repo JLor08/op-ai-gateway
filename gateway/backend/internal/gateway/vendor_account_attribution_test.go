@@ -252,3 +252,28 @@ func TestStreamSessionFinishToolOnlyStreamHasNoRate(t *testing.T) {
 		t.Fatalf("TokensPerSecond = %v, want 0 for a stream with no first-token stamp", events[0].TokensPerSecond)
 	}
 }
+
+// TestRecordUsageStampsVendorGroupID proves recordUsage stamps the event with the
+// vendor account group that routed the request next to the serving account, and
+// leaves it empty for a target that was not routed through a group.
+func TestRecordUsageStampsVendorGroupID(t *testing.T) {
+	srv := NewTestServer()
+	grouped := routing.Target{RouteID: "vendor:va_1:gpt-4o", Provider: routing.ProviderVendorOpenAI, VendorAccountID: "va_1", VendorGroupID: "vag_1"}
+	srv.recordUsage(time.Now(), auth.Token{ID: "tok", UserID: "usr_vg"}, inference.Request{Model: "gpt-4o"}, grouped, provider.Response{}, "", "success", usageMeta{}, "req_vg_1", nil, nil)
+	plain := routing.Target{RouteID: "vendor:va_2:gpt-4o", Provider: routing.ProviderVendorOpenAI, VendorAccountID: "va_2"}
+	srv.recordUsage(time.Now(), auth.Token{ID: "tok", UserID: "usr_vg"}, inference.Request{Model: "gpt-4o"}, plain, provider.Response{}, "", "success", usageMeta{}, "req_vg_2", nil, nil)
+
+	byRequest := map[string]usage.Event{}
+	for _, e := range srv.Usage.ByUser("usr_vg") {
+		byRequest[e.ID] = e
+	}
+	if len(byRequest) != 2 {
+		t.Fatalf("events = %d, want 2", len(byRequest))
+	}
+	if e := byRequest["req_vg_1"]; e.AccountID != "va_1" || e.VendorGroupID != "vag_1" {
+		t.Fatalf("grouped event AccountID/VendorGroupID = %q/%q, want va_1/vag_1", e.AccountID, e.VendorGroupID)
+	}
+	if e := byRequest["req_vg_2"]; e.AccountID != "va_2" || e.VendorGroupID != "" {
+		t.Fatalf("ungrouped event AccountID/VendorGroupID = %q/%q, want va_2/empty", e.AccountID, e.VendorGroupID)
+	}
+}

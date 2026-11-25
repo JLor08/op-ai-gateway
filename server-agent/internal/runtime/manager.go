@@ -361,6 +361,14 @@ type ManagerOptions struct {
 	// scope signals, the orphan sweep). nil, the production case, is
 	// execWSLRunner; a test injects one to observe or fail single calls.
 	WSLRunner wslRunner
+	// ProcessTrees registers a generation whose control can list its process
+	// tree -- the Windows job of a process_tree "job" spec (#424) -- so the
+	// RAM and VRAM measurers charge every process in the tree to the
+	// generation's root pid. It returns the unregister, which the manager
+	// calls at the reap. main.go wires collector.RegisterProcessTree, the
+	// measurers' own registry, the way it wires the measurers themselves; nil
+	// registers nothing, and every pid is measured as its own.
+	ProcessTrees func(root int, members func() []int) (unregister func())
 }
 
 // Manager is the process supervisor described in the package doc above.
@@ -497,6 +505,7 @@ func NewManager(opts ManagerOptions) *Manager {
 		wslRunner:           run,
 		wslNonce:            newWSLNonce(),
 		wslRAMReserveMB:     max(0, opts.WSLRAMReserveMB),
+		processTrees:        opts.ProcessTrees,
 		specs:               make(map[string]*specState),
 		allowedPairs:        map[[2]string]bool{},
 		logs:                m.logs,
@@ -800,11 +809,11 @@ func (m *Manager) Transitions() <-chan struct{} {
 // (main.go wires this to collector.NewVRAMMeasurer, which picks a
 // platform-appropriate one: PDH + D3DKMT on Windows, where nvidia-smi's
 // per-process query returns [N/A] under WDDM, and nvidia-smi
-// --query-compute-apps everywhere else). f may be nil to go back to estimates
-// only, which is also NewManager's default -- measurement is a hardware
-// capability, not a negotiated protocol feature, so every AMD, Apple and
-// CPU-only host simply never installs one and is entirely unaffected by
-// everything below.
+// --query-compute-apps elsewhere, with AMD KFD sysfs as the Linux fallback).
+// f may be nil to go back to estimates only, which is also NewManager's
+// default -- measurement is a hardware capability, not a negotiated protocol
+// feature, so every Apple, CPU-only, AMD-on-Windows and non-KFD AMD host
+// simply never installs one and is entirely unaffected by everything below.
 //
 // f is called from TWO places, and it must be safe for concurrent use because
 // they can overlap:
@@ -1297,6 +1306,10 @@ type runningProc struct {
 	// generation, so it identifies exactly this process inside the distro.
 	wslUnit   string
 	wslDistro string
+	// unregisterTree ends this generation's process-tree registration with
+	// the collector (#424): set at start for a control that lists its tree
+	// (procTreeLister), called by waitForExit at the reap. nil otherwise.
+	unregisterTree func()
 }
 
 // control is p.ctl, or the native control for a runningProc built without one.
@@ -1597,6 +1610,8 @@ type owner struct {
 	m      *Manager
 	policy LocalPolicy
 	getenv func(string) string
+	// processTrees is ManagerOptions.ProcessTrees, fixed at construction.
+	processTrees func(root int, members func() []int) (unregister func())
 	// gpuVendor is fixed for the process lifetime (the host's hardware does
 	// not change under a running agent), so it is a plain field read by the
 	// owner goroutine and never written after construction.
@@ -2303,6 +2318,7 @@ func sameLaunchShape(a, b Spec) bool {
 		s.Type = ""                       // reported for probes, read live
 		s.MetricsPath = ""                // "
 		s.ContextProbePath = ""           // "
+		s.APITokenHeader = ""             // the agent's own child probes, read live
 		// RAMMB is the host-RAM admission DEMAND, the spec-level twin of
 		// SpecGPU.VRAMMB below: consumed only by admission arithmetic, never
 		// baked into the child. The gateway pushes max(measured, estimate), and
@@ -2331,6 +2347,13 @@ func sameLaunchShape(a, b Spec) bool {
 		// accepts it as such), so it is normalised the same way.
 		if s.Execution != nil && (s.Execution.Mode == ExecutionModeNative || s.Execution.Mode == "") {
 			s.Execution = nil
+		}
+		// ProcessTree stays in the comparison too (#424): job mode decides how
+		// the child is created on Windows (suspended, in a job, with a console
+		// of its own), so a direct<->job edit relaunches. Only the spelling is
+		// normalised, like Execution's: absent and "direct" are one launch.
+		if s.ProcessTree == ProcessTreeDirect {
+			s.ProcessTree = ""
 		}
 		// Kind, DeviceBackend, Cluster and RPC stay in the comparison: they
 		// decide what is exec'd and how (a member's bind and port, a head's
@@ -2939,18 +2962,19 @@ func (o *owner) recordFailure(st *specState, message string, exitCode int, stder
 //
 //   - A VRAM measurer is installed. The exception exists only to CAPTURE a first
 //     measurement, so where none can be taken it must not fire. Measurement is
-//     NVIDIA-only (§5.3): on an AMD, Apple-silicon or GPU-less host "waiting for
-//     the measurement to arrive is waiting for something that will not happen",
-//     and there §5.3 is explicit that an unknown-demand spec simply WAITS behind
-//     a busy/pinned holder. Evicting a working known-demand model on such a host
-//     for an unknown spec that can never be measured is exactly the ADR-032
-//     regression the order exists to prevent -- so the bootstrap is gated on the
-//     measurer, the VRAM twin of P4a's ramMeasurerInstalled gate. It is asked
-//     PER SPEC (vramMeasurable): a wsl spec's figure is the WSL VM's growth
-//     across its start (#381), which also needs the VM's worker to be findable
-//     (SetWSLVMPIDs). A Windows NVIDIA host always has the PDH measurer, so
-//     without the per-spec question a wsl spec there would be granted an
-//     eviction for a measurement that can never arrive.
+//     NVIDIA- and AMD-Linux-only (§5.3): on an Apple-silicon or GPU-less host
+//     "waiting for the measurement to arrive is waiting for something that will
+//     not happen", and there §5.3 is explicit that an unknown-demand spec
+//     simply WAITS behind a busy/pinned holder. Evicting a working known-demand
+//     model on such a host for an unknown spec that can never be measured is
+//     exactly the ADR-032 regression the order exists to prevent -- so the
+//     bootstrap is gated on the measurer, the VRAM twin of P4a's
+//     ramMeasurerInstalled gate. It is asked PER SPEC (vramMeasurable): a wsl
+//     spec's figure is the WSL VM's growth across its start (#381), which also
+//     needs the VM's worker to be findable (SetWSLVMPIDs). A Windows NVIDIA
+//     host always has the PDH measurer, so without the per-spec question a wsl
+//     spec there would be granted an eviction for a measurement that can never
+//     arrive.
 //   - The declared VRAM demand is unknown. A known-demand candidate never runs
 //     rule 4 at all, so the grant would be meaningless.
 //   - The bootstrap is still unresolved: no measurement captured and the one shot
@@ -3667,15 +3691,16 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 // TestManagerStatusStaysResponsiveWhileAMeasurementIsInFlight.
 //
 // NO MEASURER INSTALLED IS THE FIRST CHECK, and it is the one that matters
-// most: every AMD, Apple unified-memory and CPU-only deployment lands here
-// (collector.NewVRAMMeasurer returns nil when the host cannot support the
-// platform's measurer at all -- nvidia-smi off PATH everywhere, and on
-// Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
-// NewManager's default). Those hosts take the first branch,
-// spawn nothing, allocate nothing, and behave exactly as they did before this
-// function existed. "No measurer" now means neither of the two: the host-RAM
-// measurer (SetRAMMeasurer) rides this same beat, and a host that has only that
-// one still measures RAM -- see the note on the two gates below.
+// most: every Apple unified-memory, CPU-only, AMD-on-Windows and non-KFD AMD
+// deployment lands here (collector.NewVRAMMeasurer returns nil when the host
+// cannot support the platform's measurer at all -- nvidia-smi off PATH and no
+// /sys/class/kfd/kfd/proc on Linux, and on Windows also a missing
+// pdh.dll/gdi32.dll export -- and nil is also NewManager's default). Those
+// hosts take the first branch, spawn nothing, allocate nothing, and behave
+// exactly as they did before this function existed. "No measurer" now means
+// neither of the two: the host-RAM measurer (SetRAMMeasurer) rides this same
+// beat, and a host that has only that one still measures RAM -- see the note
+// on the two gates below.
 //
 // GATED ON A SPEC DECLARING A GPU, NOT ON BUDGETS EXISTING. Skipping the
 // measurement when no GPU budget is configured was considered and rejected:
@@ -4821,7 +4846,18 @@ func (o *owner) startProcess(st *specState) {
 		vmBaseline, baselineOK = o.readVMVRAM()
 	}
 
-	if err := cmd.Start(); err != nil {
+	// A native spec starts through startNativeProc, which also picks the
+	// control that signals it: the process group everywhere, a kill-on-close
+	// job object for process_tree "job" on Windows (#424). A wsl spec's wsl.exe
+	// is started as before; its control is the scope below.
+	var nativeCtl procControl
+	var startErr error
+	if spec.IsWSL() {
+		startErr = cmd.Start()
+	} else {
+		nativeCtl, startErr = startNativeProc(cmd, spec)
+	}
+	if err := startErr; err != nil {
 		// The command is retained even though nothing ran: a spec whose exec
 		// fails prints nothing at all, so this is the only thing an operator
 		// opening the log view can be shown -- and "the binary/work_dir it
@@ -4864,7 +4900,10 @@ func (o *owner) startProcess(st *specState) {
 			specID: spec.ID,
 		}
 	} else {
-		proc.ctl = nativeControl{cmd: cmd}
+		proc.ctl = nativeCtl
+		if l, ok := nativeCtl.(procTreeLister); ok && o.processTrees != nil {
+			proc.unregisterTree = o.processTrees(proc.pid, l.pids)
+		}
 	}
 	if wslUnit != "" {
 		o.beginWSLVRAM(proc, spec, vramWindow, vmBaseline, baselineOK)
@@ -4903,6 +4942,19 @@ func (o *owner) startProcess(st *specState) {
 func (o *owner) waitForExit(proc *runningProc) {
 	defer o.m.wg.Done()
 	err := proc.cmd.Wait()
+	// A control that holds an OS resource for its generation's lifetime (the
+	// Windows job object, #424) gives it back now that the process is reaped;
+	// for a job that also ends any descendant still left in it (kill-on-close).
+	if c, ok := proc.control().(procCloser); ok {
+		if cerr := c.close(); cerr != nil {
+			slog.Debug("runtime: releasing the process control failed", "spec", proc.specID, "pid", proc.pid, "error", cerr)
+		}
+	}
+	// The tree is gone with its job; its processes are measured as their
+	// own again (none is left to measure).
+	if proc.unregisterTree != nil {
+		proc.unregisterTree()
+	}
 	close(proc.exited)
 	o.m.postCmd(cmdChildExited{proc: proc, exitErr: err})
 }
@@ -6238,6 +6290,8 @@ func (o *owner) snapshotStatus() []Status {
 			Type:             st.spec.Type,
 			MetricsPath:      st.spec.MetricsPath,
 			ContextProbePath: st.spec.ContextProbePath,
+			APIToken:         st.spec.APIToken,
+			APITokenHeader:   st.spec.APITokenHeader,
 			Kind:             st.spec.Kind,
 		}
 		if st.measuredVRAM != nil {

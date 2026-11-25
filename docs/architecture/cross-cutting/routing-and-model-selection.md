@@ -24,7 +24,7 @@ erDiagram
         string health_status "unknown/healthy/degraded/unhealthy"
     }
     APPLICATION {
-        string type "ollama/vllm/llama_cpp/llama_swap/litellm/server_agent/stable_diffusion_cpp/audio_cpp/vllm_sr/mock"
+        string type "ollama/vllm/llama_cpp/llama_swap/litellm/server_agent/stable_diffusion_cpp/audio_cpp/vllm_sr/strata/mock"
         string api_flavors "openai | anthropic | openai_images | openai_audio | decisions -- saved empty = openai + anthropic, stored empty = none"
         int port
         string scheme "http/https"
@@ -50,7 +50,7 @@ erDiagram
     MODEL_MAPPING_CAPABILITY {
         string capability "mtp | live_progress | vision | speculation_observed | ..."
         string verdict "yes | no -- absent row = unknown"
-        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | sdcpp_capabilities | audiocpp_models | systemone_probe | legacy"
+        string source "manual | vision_benchmark | llama_cpp_props | ollama_api_show | llama_cpp_timings | sdcpp_capabilities | audiocpp_models | systemone_probe | strata_models | legacy"
     }
     MODEL_GROUP {
         bool loaded_only
@@ -193,7 +193,7 @@ mode for `GET /v1/systemone/models` and the redirect's `ModelOffering.Callable` 
 stored value, no migration), and neither
 depends on the application type: the `stable_diffusion_cpp` and `audio_cpp` default tables
 below never declare `decisions` (the `vllm_sr` table does, and only it), and the type enters only through the save-time refusal of
-`decisions_mode: passthrough` and `systemone_mode: translate` on `llama_cpp` and `vllm_sr` (API surface, "Decision endpoint modes").
+`decisions_mode: passthrough` and `systemone_mode: translate` on `llama_cpp`, `vllm_sr` and `strata` (API surface, "Decision endpoint modes").
 See [API Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions).
 
 **Flavor exclusion is two-staged, by design.** Candidacy filters on the
@@ -288,7 +288,7 @@ provider dispatch mapping (`cmd/gateway/main.go: providerClients`):
 |---|---|
 | `mock` | `provider.NewMockWithDelay` (dev/test) |
 | `ollama` | `provider.NewOllamaClient` |
-| `vllm`, `llama_cpp`, `llama_swap`, `litellm`, `server_agent`, `stable_diffusion_cpp`, `audio_cpp`, `vllm_sr` | `provider.NewOpenAICompatibleClient` (shared — all eight speak the OpenAI HTTP dialect, `vllm_sr` only for its decision endpoints) |
+| `vllm`, `llama_cpp`, `llama_swap`, `litellm`, `server_agent`, `stable_diffusion_cpp`, `audio_cpp`, `vllm_sr`, `strata` | `provider.NewOpenAICompatibleClient` (shared — all nine speak the OpenAI HTTP dialect, `vllm_sr` only for its decision endpoints) |
 
 `server_agent` is a **full application type**, not a special case: it is
 creatable through the portal (`normalizeApplicationType`) and dispatches to that
@@ -399,6 +399,52 @@ probe never does (below). A mapping of the type is **decisions-only** (`routing.
 An agent-launched worker of the spec kind reports its own `api_version`, which the model-servers
 row compares with the supported major (agent-runtime-manager §3.4); an external Engine application
 reports none, so no version warning exists there.
+
+`strata` is the application type for an **operator-run Strata**
+(`routing.ProviderStrata`, [ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)):
+either a hand-started `strata serve` or the desktop app's LAN share (the app port + 1), which
+serves only `/v1/models`, `/v1/chat/completions`, `/v1/messages` and `/v1/responses`. It is
+the same string as the runtime spec kind of an agent-launched `strata serve`
+(agent-runtime-manager §3.4), dispatches to the shared client, and `viewRuntimeType` maps it to
+that kind, so its mappings get the chat role. Its defaults, which the form fills in only where a
+field still holds the previous type's default:
+
+| Field | Default for `strata` |
+|---|---|
+| `port` | 8080 |
+| `health_check_mode` / `health_check_path` | `health_path` / `/v1/models` — the one route both shapes serve; `/health` exists on `strata serve` only |
+| `loaded_models_path` / `loaded_models_format` | `/v1/models` / `openai` — one model per Strata process, always loaded |
+| `timeout_ms` | 30000, like `llama_cpp` |
+| `api_flavors` | `["openai", "anthropic"]` |
+| `responses_mode` / `messages_mode` | both `passthrough` — Codex and Claude Code reach Strata's native routes; an older Strata answers `/v1/responses` with 404, and the type note says to switch that mode to `translate` then |
+| `context_probe_path` | empty — the context comes from the listing (below) |
+
+**The API token is required on the share and recommended always.** `/v1/models` and the
+inference routes need Strata's key, which the application's token supplies in the application's token header
+(`Authorization: Bearer` by default) on the health probe, the loaded-models pass and discovery alike, and a
+keyless Strata answers 403 to a non-IP `Host` header. `/props` and `/metrics` are never
+requested for the type, so the share's 404s on them are no errors.
+
+**Context and vision come from the listing, for this type only.** The provider reads, from an
+`openai`-format listing, each entry's `context_length` (else `meta.n_ctx`) and whether its
+`architecture.input_modalities` lists `image` (`provider.LoadedModelInfoLister`, implemented by
+the shared client; a names-only lister such as Ollama's answers with names). The health loop's
+loaded pass (`recordListedModelInfos`, `cmd/gateway/app_health.go`) records them **only for an
+application of type `strata` without its own `context_probe_path`**, so two sources never
+alternate on one mapping and no other type's behaviour changes: the context through
+`UpdateMappingContextProbe` (source `probe`, active mappings matched by `AppModelName`, locked
+mappings and values above the probe cap skipped, an unchanged value not rewritten), and vision
+as a `yes` row under the source `strata_models` (`routing.CapabilitySourceStrataModels`, rank 1
+like every probe source, through the same `writeCapabilityRows` precedence as the `/props`
+pass, so `manual` and `vision_benchmark` always win). A listing without `image` writes no
+verdict, never a `no`, because nothing pins the list as exhaustive. Values are recorded only while
+the model is listed, which on Strata is always. `strata_models` is the gateway's own source: no
+agent can claim it.
+
+Strata serves no `/v1/decisions`, so `decisions_mode: passthrough` and `systemone_mode:
+translate` are refused for it, as for `llama_cpp`. Image references that Strata would read from
+the model host are refused before they reach it ([Compatibility & Inference
+§3.1](compatibility-and-inference.md#31-openai-chat-completions)).
 
 `ModelGroup` also carries five selection-setting columns, added append-only by
 migration `62`: `loaded_only`, `member_order`, `climb_speed_margin_percent`,
@@ -1228,7 +1274,7 @@ name**, handled in `capabilityRowsSatisfy` the way `image_edit` is: it holds whe
 mapping has `(decision, yes)` **or** `(decision_openai, yes)`. The `decision_openai` half
 counts only on a kind that can take a passthrough (`routing.DecisionsPassthroughCapableKind`):
 `filterCapable` and the session-pin check judge the rows for the candidate's application type
-(`capabilityRowsForKind` drops the verdict for `llama_cpp` and `vllm_sr`), so a candidate the
+(`capabilityRowsForKind` drops the verdict for `llama_cpp`, `vllm_sr` and `strata`), so a candidate the
 route would refuse after the resolve is never selected. A `server_agent` candidate's spec type
 is not known before the resolve, so for it only the post-resolve refusal applies. `POST /v1/decisions` sets
 `RequiredCapabilities = ["any_decision"]`, so the one gate funnel (`filterCapable`, the
@@ -2199,8 +2245,8 @@ gated by `metrics_locked` (a manually-pinned mapping never auto-overwrites):
 | Source | `metrics_source` | What it measures | Trigger |
 |---|---|---|---|
 | **Benchmark run** | `"benchmark"` | cold-minus-warm load time, generation/prompt tok/s (`measureMapping` / `measureSpeedTarget`). A run writes only what it measured; 0 means not measured: a 0 keeps the stored column, and a run that measured nothing writes nothing, `metrics_source` and `metrics_updated_at` included (`UpdateMappingBenchmarkMetrics`). The run's history row still records the 0 ([Risks & Technical Debt §11.1](../11-risks-and-technical-debt.md#111-operational-risks)) | manual or scheduled (below) |
-| **Opportunistic EWMA** | `"opportunistic"` | gen/prompt tok/s, blended (α=0.2) from every successful **real** inference on an app with `OpportunisticMetricsEnabled` | every live request, no explicit run |
-| **Context probe** | `"probe"` (context-size fields only — no throughput or capacity field is touched) | usable context window: via the application's `context_probe_path` (e.g. llama.cpp `/props`), **or**, for a `server_agent` mapping, the agent's per-child probe against the mapping's runtime spec's own resolved `context_probe_path` ([Agent-Managed Model Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) | during a speed run (`measureSpeedTarget`), on the application's health cadence for a loaded model (the context pass in `cmd/gateway/app_health.go`), or — the agent path — every telemetry cycle the agent reports a changed value. The standalone context probe (`startContextProbe`) only reports its answer in the run's result, and the portal fills the form field without saving, so it writes nothing. A benchmark reads two sources ([Agent-Managed Model Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)): the synchronous probe on the application's effective path, which for a `server_agent` application without one is the router's `/upstream/{model}/props` (not sent for a spec type that serves no `/props`, such as `sglang` or `sglang_omni`), and then the agent's telemetry for the mapping's spec. Only the first is written by the benchmark; the telemetry value is the agent path's own write |
+| **Opportunistic EWMA** | `"opportunistic"` | gen/prompt tok/s, blended (α=0.2) from every successful **real** inference on an app with `OpportunisticMetricsEnabled`: the upstream's own `timings` rates where it reports them, else, for generation only, the gateway-derived window rate of a streamed Anthropic or Responses native passthrough. The gateway-measured prompt rate of #426 is recorded on the usage row but never fed in: it is time-to-first-token based, errs low when the upstream reports its cache reads and reads high when an upstream reuses a prefix cache without reporting it ([Telemetry §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)) | every live request, no explicit run |
+| **Context probe** | `"probe"` (context-size fields only — no throughput or capacity field is touched) | usable context window: via the application's `context_probe_path` (e.g. llama.cpp `/props`), **or**, for a `strata` application without one, the `context_length` (else `meta.n_ctx`) of its loaded-models listing (§1), **or**, for a `server_agent` mapping, the agent's per-child probe against the mapping's runtime spec's own resolved `context_probe_path` ([Agent-Managed Model Runtime §3.4](agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation)) | during a speed run (`measureSpeedTarget`), on the application's health cadence for a loaded model (the context pass in `cmd/gateway/app_health.go`), or — the agent path — every telemetry cycle the agent reports a changed value. The standalone context probe (`startContextProbe`) only reports its answer in the run's result, and the portal fills the form field without saving, so it writes nothing. A benchmark reads two sources ([Agent-Managed Model Runtime §10](agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time)): the synchronous probe on the application's effective path, which for a `server_agent` application without one is the router's `/upstream/{model}/props` (not sent for a spec type that serves no `/props`, such as `sglang` or `sglang_omni`), and then the agent's telemetry for the mapping's spec. Only the first is written by the benchmark; the telemetry value is the agent path's own write |
 
 Every context-probe writer lands through the **same** store method
 (`UpdateMappingContextProbe`), which is why they share one `metrics_source`

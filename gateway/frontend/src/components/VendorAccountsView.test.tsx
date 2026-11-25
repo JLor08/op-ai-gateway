@@ -40,6 +40,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     system_group_name: '',
     is_owner: true,
     shared_by: '',
+    share_usage_with_members: false,
     ...overrides,
   };
 }
@@ -59,8 +60,8 @@ const SUBSCRIPTION: Partial<VendorAccount> = {
 };
 
 // A connected OpenAI subscription: one kind of account the gateway can actively ask
-// for its usage (the refresh button and the on-view refresh); an OpenRouter or Kilo
-// api key is the other.
+// for its usage (the refresh button and the on-view refresh); a connected Anthropic
+// subscription and an OpenRouter or Kilo api key are the others.
 const OPENAI_SUBSCRIPTION: Partial<VendorAccount> = {
   id: 'va_oai_sub',
   vendor: 'openai',
@@ -271,6 +272,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       setVendorAccountShareLevel: vi.fn<PortalApi['setVendorAccountShareLevel']>(async (id) =>
         makeVendorAccount({ id }),
       ),
+      setVendorAccountShareUsage: vi.fn<PortalApi['setVendorAccountShareUsage']>(async (id) =>
+        makeVendorAccount({ id }),
+      ),
       setVendorAccountAdminGroups: vi.fn<PortalApi['setVendorAccountAdminGroups']>(async (id) =>
         makeVendorAccount({ id }),
       ),
@@ -283,6 +287,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       joinVendorAccountResourceGroup: vi.fn<PortalApi['joinVendorAccountResourceGroup']>(
         async () => ({ ok: true }),
       ),
+      // The Groups section below the list reads the groups; none by default.
+      vendorAccountGroups: vi.fn<PortalApi['vendorAccountGroups']>(async () => ({ groups: [] })),
+      createVendorAccountGroup: vi.fn<PortalApi['createVendorAccountGroup']>(),
+      updateVendorAccountGroup: vi.fn<PortalApi['updateVendorAccountGroup']>(),
+      deleteVendorAccountGroup: vi.fn<PortalApi['deleteVendorAccountGroup']>(),
+      setVendorAccountGroupMembers: vi.fn<PortalApi['setVendorAccountGroupMembers']>(),
       leaveVendorAccountResourceGroup: vi.fn<PortalApi['leaveVendorAccountResourceGroup']>(
         async () => ({ ok: true }),
       ),
@@ -509,12 +519,35 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         auth_type: 'api_key',
         name: 'Work',
         api_key: 'sk-test-123',
+        share_usage_with_members: true,
       });
 
       // Back on the list with the new account; the key is nowhere in the DOM.
       expect(await screen.findByText('Work')).toBeInTheDocument();
       expect(container.innerHTML).not.toContain('sk-test-123');
       expect(screen.queryByDisplayValue('sk-test-123')).not.toBeInTheDocument();
+    });
+
+    it('offers the usage-sharing checkbox ticked and sends the choice', async () => {
+      const { fakeApi } = renderView({ accounts: [] });
+      await openCreate();
+
+      const box = screen.getByLabelText(t.vendorAccountShareUsageLabel);
+      expect(box).toBeChecked();
+      fireEvent.change(screen.getByLabelText(t.vendorAccountNameLabel), {
+        target: { value: 'Quiet' },
+      });
+      fireEvent.change(screen.getByLabelText(t.vendorAccountApiKeyLabel), {
+        target: { value: 'sk-quiet' },
+      });
+      fireEvent.click(box);
+      expect(box).not.toBeChecked();
+      fireEvent.click(screen.getByRole('button', { name: t.vendorAccountCreate }));
+
+      await waitFor(() => expect(fakeApi.createVendorAccount).toHaveBeenCalledTimes(1));
+      expect(fakeApi.createVendorAccount.mock.calls[0][0]).toMatchObject({
+        share_usage_with_members: false,
+      });
     });
 
     it('submits the chosen vendor', async () => {
@@ -580,6 +613,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         vendor: 'openai',
         auth_type: 'subscription',
         name: 'Team Claude Max',
+        share_usage_with_members: true,
       });
       expect('api_key' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
 
@@ -665,6 +699,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           auth_type: 'api_key',
           name: 'Work',
           api_key: 'sk-test-123',
+          share_usage_with_members: true,
         });
       });
 
@@ -2899,11 +2934,6 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           'va_key',
         ],
         [
-          'a connected Anthropic subscription',
-          makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true }),
-          'va_sub',
-        ],
-        [
           'an x.ai api-key account',
           makeVendorAccount({ id: 'va_key', vendor: 'xai', auth_type: 'api_key' }),
           'va_key',
@@ -3153,12 +3183,37 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         },
       );
 
+      // A connected Anthropic subscription has the Claude OAuth usage pull (the backend's
+      // hasActiveVendorUsagePull), so it gets the button and the one on-view refresh.
+      it('shows the button and fires ONE lazy refresh for a connected Anthropic subscription', async () => {
+        const account = makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true });
+        const { fakeApi } = renderView({
+          accounts: [account],
+          vendorAccount: async (id: string) =>
+            makeVendorAccount({ ...account, id, usage: makeUsage() }),
+        });
+        await openDetail();
+
+        await screen.findByRole('progressbar', { name: t.vendorUsageFiveHour });
+        const panel = screen.getByRole('region', { name: t.vendorUsageTitle });
+        expect(
+          within(panel).getByRole('button', { name: t.vendorUsageRefreshAction }),
+        ).toBeEnabled();
+        await waitFor(() => expect(fakeApi.refreshUsage).toHaveBeenCalledTimes(1));
+        expect(fakeApi.refreshUsage.mock.calls[0]).toEqual(['va_sub']);
+      });
+
+      it('hides the button for an Anthropic subscription that was never connected', async () => {
+        const { fakeApi } = renderView({ accounts: [makeVendorAccount(SUBSCRIPTION)] });
+        await openDetail();
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(usageButton()).not.toBeInTheDocument();
+        expect(fakeApi.refreshUsage).not.toHaveBeenCalled();
+      });
+
       it.each([
         ['an OpenAI api-key account', makeVendorAccount({ id: 'va_key' })],
-        [
-          'a connected Anthropic subscription',
-          makeVendorAccount({ ...SUBSCRIPTION, subscription_connected: true }),
-        ],
         [
           'an Anthropic api-key account',
           makeVendorAccount({ id: 'va_key', vendor: 'anthropic', auth_type: 'api_key' }),
@@ -3506,6 +3561,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           name: 'Work',
           api_key: 'sk-test-123',
           model_prefix: 'chatgpt/',
+          share_usage_with_members: true,
         });
       });
 
@@ -3536,6 +3592,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           auth_type: 'subscription',
           name: 'Team',
           model_prefix: 'claude/',
+          share_usage_with_members: true,
         });
         await screen.findByText(t.vendorAccountSettingsTitle);
         expect(prefixField()).toHaveValue('claude/');
@@ -4475,6 +4532,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         name: 'Custom',
         api_key: 'sk-custom',
         base_url: 'https://llm.example.com',
+        share_usage_with_members: true,
       });
     });
 
@@ -4508,6 +4566,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         auth_type: 'api_key',
         name: 'Grok',
         api_key: 'xai-key',
+        share_usage_with_members: true,
       });
       expect('base_url' in fakeApi.createVendorAccount.mock.calls[0][0]).toBe(false);
     });
@@ -4545,6 +4604,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         api_key: 'or-key',
         model_prefix: 'or/',
         base_url: 'https://proxy.example.com/or',
+        share_usage_with_members: true,
       });
     });
 
@@ -4578,6 +4638,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         name: 'Custom',
         api_key: 'sk-custom',
         base_url: 'https://llm.example.com/v1/',
+        share_usage_with_members: true,
       });
     });
 
@@ -4645,6 +4706,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         auth_type: 'api_key',
         name: 'Work',
         api_key: 'sk-test-123',
+        share_usage_with_members: true,
       });
     });
 

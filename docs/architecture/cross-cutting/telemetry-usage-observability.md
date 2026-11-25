@@ -60,7 +60,7 @@ than one GPU vendor active, e.g. none in practice, but the composition allows it
 | Vendor | File | Tool | Notes |
 |---|---|---|---|
 | NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version, PCI bus id; `[N/A]`-style sentinels map to 0 |
-| AMD | `amd.go` | `rocm-smi --json` (`--showid --showuse --showmemuse --showtemp --showpower --showdriverversion`) | Parses the `cardN`-keyed JSON object; a `"system"` entry supplies the driver version for every card |
+| AMD | `amd.go` | `rocm-smi --json` (`--showid --showproductname --showuse --showmeminfo vram --showtemp --showpower --showdriverversion --showbus --showuniqueid`) | Parses the `cardN`-keyed JSON object, in both the pre-4.0 (3.x) key spelling and rocm-smi 4.x's. Name: `Device Name`, else `Card Series`/`Card series`, else `Card Model`/`Card model`. `Unique ID` is the UUID and `PCI Bus` the `pci_bus_id`; VRAM total/used come from `--showmeminfo vram`. `N/A`-style sentinels mean "not reported". A `"system"` entry supplies the driver version for every card |
 | Apple | `apple.go` | `ioreg -r -c IOAccelerator -d 1` | Regex-scrapes the integrated-GPU text dump; always exactly one GPU (`Index 0`); memory is in-use/allocated **system** memory (Apple unified memory has no separate VRAM total) |
 
 The per-GPU `MemTotalBytes` these collectors report is also what the runtime manager's
@@ -111,18 +111,22 @@ Per GPU the report carries `index`, `name`, `uuid`, `driver_version`,
 consumer can tell "not reported" from "reported blank".
 
 **`pci_bus_id` is a display and disambiguation aid, and deliberately not an
-identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` and is therefore
-NVIDIA-only: `rocm-smi` and `ioreg` report nothing of this form and leave it
-empty rather than inventing an equivalent, so every consumer must render
-without it. It exists because 4×/8× identical cards is the normal AI-server
-build, and of the handles telemetry actually offers — an `index` that can
-renumber across reboots (which is exactly what the GPU-budget rows'
-`expected_uuid`/`expected_name` drift detection exists to catch), an opaque
-`uuid`, and live utilisation, which is not identity at all — the bus id is the
-only one that maps to a physical slot and survives renumbering. Nothing in the
-system matches or keys on it: spec GPU rows, budgets and the whole admission
-arithmetic key on `index`, and making the bus id a second identity would be a
-separate design, not a field addition.
+identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` on NVIDIA and
+from rocm-smi's `PCI Bus` on AMD. `ioreg` reports nothing of this form, so
+Apple leaves it empty rather than inventing an equivalent, as does an AMD host
+whose rocm-smi omits it (pre-4.0); every consumer must render without it. It
+exists because 4×/8× identical cards is the normal AI-server build, and of the
+handles telemetry actually offers — an `index` that can renumber across reboots
+(which is exactly what the GPU-budget rows' `expected_uuid`/`expected_name`
+drift detection exists to catch), an opaque `uuid`, and live utilisation, which
+is not identity at all — the bus id is the only one that maps to a physical slot
+and survives renumbering. Nothing keys on it: spec GPU rows, budgets and the
+whole admission arithmetic key on `index`, and making the bus id a second
+identity would be a separate design, not a field addition. Its one logical
+reader is the portal's vendor guess for the NVIDIA-only RPC-member exemptions
+(`gpuLooksNVIDIA`): a name marking the card as AMD (`amd`, `radeon`, `instinct`)
+means not NVIDIA first, and only then does a non-empty bus id count as NVIDIA,
+as a fallback for NVIDIA names without a vendor keyword.
 
 Privacy is a schema-level guarantee, documented on `sample.SystemReport`
 (`server-agent/internal/sample/system_report.go`): the struct has **no** serial,
@@ -683,8 +687,8 @@ Activity renders it as never measured. Two things make it readable:
   | Path | Window opens at | Window ends at | Derived by |
   |---|---|---|---|
   | **Translate stream** (all three client flavors served by a vendor target through `CompleteStream`) | the first Text **or** Reasoning delta (the `requestProgress` first-token stamp; `streamSession.finish` hands it to `recordUsage` as `usageMeta.GenStart`) | the moment `recordUsage` runs | `recordUsage`, on the **stored event only** |
-  | **OpenAI Responses passthrough** (vendor targets only) | the first of the four Responses content frames: `response.output_text.delta`, `response.reasoning_text.delta`, `response.reasoning_summary_text.delta`, `response.function_call_arguments.delta` | the last observed byte of the stream | `usageScanner.usage()`, which also requires the authoritative `response.completed` frame |
-  | **Anthropic Messages passthrough** | the first `content_block_delta` | the last observed byte | `usageScanner.usage()`, requiring the authoritative `message_delta`; unchanged by #182 and **not** vendor-gated |
+  | **OpenAI Responses passthrough** (every target since #426; vendor targets only before) | the first of the four Responses content frames: `response.output_text.delta`, `response.reasoning_text.delta`, `response.reasoning_summary_text.delta`, `response.function_call_arguments.delta` | the last observed byte of the stream | `usageScanner.usage()`, which also requires the authoritative `response.completed` frame |
+  | **Anthropic Messages passthrough** | the first `content_block_delta` | the last observed byte | `usageScanner.usage()`, requiring the authoritative `message_delta`; unchanged by #182 and #426, and **not** vendor-gated |
 
   The translate derivation has four guards, each load-bearing: the provider rate
   must be `0`; the target must be a **vendor** target (`VendorAccountID != ""`);
@@ -692,17 +696,17 @@ Activity renders it as never measured. Two things make it readable:
   demands zero in every token column and both rates of a non-token row); and
   `OutputTokens > 0` with a stamped `GenStart` (a tool-only translate stream, whose
   argument fragments surface only once it ends, stamps none, and neither does any
-  non-stream call site). The Responses passthrough derivation is admitted by the
-  scanner's `vendorTarget` flag (`derivesGatewayRate`), because for a
-  **self-hosted** upstream a missing rate means "the server did not say": it is
-  left at `0`, since a gateway-side figure there is a different quantity from
-  llama.cpp's own `predicted_per_second`. Reasoning is counted on both vendor paths
+  non-stream call site). The Responses passthrough derivation is no longer
+  vendor-gated (#426): it runs for a **self-hosted** upstream too, as the
+  Anthropic one always did, so a Codex request to an upstream that sends no
+  `timings` (Strata's `strata serve`) is rated; an upstream that does report
+  `predicted_per_second` still wins (see §8.4.3). Reasoning is counted on both paths
   on purpose: a reasoning model's `output_tokens` **includes** its reasoning
   tokens, so a window that opened at the first answer text would leave the
   reasoning phase out of the denominator and inflate the rate. What stays `0`: a
   non-streaming (buffered) response, a passthrough stream cut off before its
   terminal frame, a translate stream that never produced a countable delta, a
-  window under the 50 ms floor, and any self-hosted target.
+  window under the 50 ms floor, and a self-hosted target on the translate path.
 - **Where the derived figure goes — and where it does not.** The derived rate
   **does** enter the Stats tokens/s histograms (§8.4.2) and the Activity
   tokens/s sort and range filter, because both read the stored event rows. That is
@@ -716,7 +720,11 @@ Activity renders it as never measured. Two things make it readable:
   feed requires the serving application's opportunistic-metrics opt-in
   (`Target.OpportunisticMetrics`), which no vendor target carries. So a gateway
   estimate on a vendor row can never become a routing input (see "a recorded rate
-  is a routing input" in §8.4.3).
+  is a routing input" in §8.4.3). A **self-hosted** passthrough row is different
+  since #426: its derived generation rate feeds the EWMA of an opted-in
+  application exactly as the derived Anthropic generation rate always has; the
+  gateway-measured prompt rate is recorded on the row but never feeds the EWMA
+  (§8.4.3).
 - **Verify-live caveat: Responses clients that do not ask for a reasoning
   summary.** The OpenAI platform and the Codex backend stream a reasoning model's
   reasoning only as `response.reasoning_summary_text.delta`, and only when the
@@ -1334,8 +1342,8 @@ from an absent field) and exactly one of three values:
   delta would divide an exact count by ~0 and render an absurd figure for one
   poll, and the row simply keeps the em dash it was already showing. The same
   constant now floors two more sites that divide an exact output-token count
-  by a wall-clock window: the native-passthrough derived rate below (Anthropic,
-  and the OpenAI Responses shape for a vendor target), and
+  by a wall-clock window: the native-passthrough derived rates below (Anthropic
+  and the OpenAI Responses shape), and
   the benchmark runner, whose copy of this guard matters more than either —
   see "a recorded rate is a routing input" further down.
 - `""` (empty) — not measured.
@@ -1744,7 +1752,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-109-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-115-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -2248,7 +2256,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-109-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-115-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open
@@ -2662,9 +2670,9 @@ is the per-flavor table above. Everything native passthrough reports comes from
 reading the *response* rather than from asking for anything extra in the
 request: `mergePassthroughUsage` now also reads llama.cpp's `timings` object off
 the Responses shape, and — for the Anthropic shape, which carries no timings on
-any frame, and for the OpenAI Responses shape **when the target is a vendor
-account** (OpenAI's platform and the Codex backend report no `timings` either) —
-`usageScanner`
+any frame, and for the OpenAI Responses shape when the frames carried no rate
+(OpenAI's platform and the Codex backend report no `timings`, and neither does
+Strata's `strata serve`) — `usageScanner`
 derives a rate from the exact output-token count over the generation window
 (first content frame → last observed byte), mirroring the benchmark runner's
 own arithmetic — literally the same `minGatewayRateWindow` floor, not merely
@@ -2673,13 +2681,16 @@ for the same reason the live-progress cell above suppresses one (a warm pass
 whose whole completion arrives microseconds after the first byte would divide
 an exact count by ~0 and yield an implausible rate).
 
-**The Responses derivation is vendor-gated, and its window opens at the first
-token of any kind.** `newUsageScanner` is told whether the relay's target is a
-vendor account (`vendorTarget`, from `Target.VendorAccountID != ""`), and
-`derivesGatewayRate` admits the Responses flavor only then: for a **self-hosted**
-Responses upstream an absent `timings` object means "the server did not say" and
-stays `0`, because a gateway-side figure there is a different quantity from
-llama.cpp's own `predicted_per_second`. For both flavors the figure also needs
+**The Responses derivation applies to every target, and its window opens at the
+first token of any kind.** Until #426 `derivesGatewayRate` admitted the Responses
+flavor only for a vendor target and left a self-hosted upstream without `timings`
+at `0` ("the server did not say"). That left every Codex request to Strata's
+`strata serve` unrated while Claude Code to the same server was rated, so the
+gate is gone: the derived window is the same measurement the Anthropic path
+already records. An upstream that reports a rate keeps it: the derivation only
+runs when no frame reported a non-zero `predicted_per_second`
+(`takeLastNonZeroF` substitutes the frames' own rate first). Chat Completions
+derives nothing; its self-hosted upstreams report `timings`. For both flavors the figure also needs
 the authoritative terminal frame (below) and a non-streaming body derives
 nothing, since a buffered body has no content frame and so no window. The
 Responses content frames that open the window are **four**:
@@ -2864,7 +2875,36 @@ per-frame count is not one. One predicate, one definition per flavor, three
 consumers — the derived rate, the frame that freezes the recorded rate's
 capture, and the live count — so the predicate's Responses branch has three
 readers of its own (the live count, the rate capture above, and the derived rate
-that a **vendor** Responses target now takes).
+that every Responses target now takes).
+
+**A gateway-measured prompt rate (#426).** Neither Anthropic frames nor a
+`strata serve` Responses stream carry `prompt_per_second`, so for those two
+flavors `usageScanner.usage()` derives `PromptPerSecond` when no frame reported
+one: the prompt tokens the upstream actually **processed** divided by the **time
+to first content**. Processed is the canonical `InputTokens` minus the cache-read
+`CachedTokens` — fresh input plus cache creation for Anthropic (Strata's
+Claude Code turn `1 + 25` of `1 + 25 + 20855`), `input_tokens` minus
+`input_tokens_details.cached_tokens` for Responses — because a cache read costs
+no prefill. The window opens at `upstreamSentAt`, which `proxyNative` stamps
+immediately before the upstream round trip (`setUpstreamSentAt`, vendor and
+self-hosted alike), and closes at the first content frame. It needs a send
+timestamp, a content frame, the authoritative terminal frame, at least
+`minGatewayPromptRateTokens` (256) processed tokens — below that the time to
+first content is mostly fixed latency, not prefill — and the same 50 ms
+`minGatewayRateWindow` floor; a buffered body has no first-content stamp distinct
+from its end and stays `0`. An upstream `prompt_per_second` always wins.
+
+The figure is time-to-first-token based and includes network and any upstream
+queueing, so it errs **low** when the upstream reports its cache reads. An
+upstream that reuses a prefix cache **without** reporting it (vLLM without
+`--enable-prompt-tokens-details`, llama.cpp slot reuse) makes it read **high**:
+the count then includes tokens that were never processed. That is why it is
+**analytics-only**: the scanner marks it (`Usage.PromptPerSecondGatewayMeasured`,
+not serialized), `recordUsage` writes it to the usage row (Activity, Stats)
+and passes a prompt sample of `0` — "no sample" to the store — to
+`UpdateMappingOpportunisticMetrics`, so it never reaches `PromptTokensPerSecond`
+or the scorer's prompt bonus. An upstream-reported prompt rate feeds the EWMA as
+before.
 
 The gate is not cosmetic, because a **recorded rate is a routing input**. Where
 the serving application has opportunistic metrics enabled, `recordUsage` feeds
@@ -2878,10 +2918,16 @@ reports a rate, it can contribute — which is why the rate it reports must come
 from an exact, authoritative count and never from a placeholder. The window
 floor above matters here for the same reason: an implausible passthrough
 sample would blend into that EWMA and stay there until enough real samples
-diluted it back out. The vendor Responses derivation above does not widen that
-surface: the EWMA feed needs the serving application's opportunistic-metrics
-opt-in (`Target.OpportunisticMetrics`), which no vendor target carries, so a
-derived vendor rate is stored and displayed but never blended into routing.
+diluted it back out. A vendor Responses derivation does not widen that surface:
+the EWMA feed needs the serving application's opportunistic-metrics opt-in
+(`Target.OpportunisticMetrics`), which no vendor target carries, so a derived
+vendor rate is stored and displayed but never blended into routing. A
+self-hosted one does (#426): the derived Responses generation rate reaches
+`GenTokensPerSecond` of an opted-in mapping exactly as the derived Anthropic
+generation rate always has. The gateway-measured prompt rate does not: it is
+analytics-only (above), so `PromptTokensPerSecond` stays fed by upstream-reported
+rates and benchmarks alone. The usage row carries no rate-source column
+(`tokens_per_second_source` exists only on the live running-connections row).
 
 **The benchmark runner's own copy of this floor (`benchmark_runner.go`'s
 `streamOnce`) matters MORE than either of the two above, because its result
@@ -3204,6 +3250,16 @@ code, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`
 session's own consumption is not in the aggregate it reads until its one row is
 written when it ends, so the session's maximum lifetime
 (`OP_AI_GATEWAY_REALTIME_MAX_SESSION`) is what bounds its overrun.
+
+`PrincipalLimiter.Evaluate` is `Admit` with its readings kept (`Admit` is a thin wrapper). After the rate check it
+reads the aggregate of **every** configured limit through the same caches, before judging any breach, and returns an
+`Admission`: the verdict and a `LimitStanding` with one `LimitReading` per configured limit (used, cap, period, reset).
+A rate denial stops before any read and a principal with no configured quota or budget has no standing. An aggregate
+read that fails gives a `Failed` reading: admission still fails open on it as before, but it is distinguishable from
+zero used, and a standing with a failed reading is not reported to the client. The standing travels with the request, so
+the response path does no store I/O. How Claude Code displays it: [Compatibility & Inference
+§9.4](compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits); how Codex displays it: [Compatibility &
+Inference §9.6](compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits).
 
 All of that is the *configured* case. A principal with no limits never reaches
 any of it: `Admit` short-circuits on the zero `routing.LimitConfig` — no

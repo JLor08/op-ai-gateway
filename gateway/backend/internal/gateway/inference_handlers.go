@@ -115,6 +115,11 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		if handled {
 			return
 		}
+		// The principal's limit standing rides the request context to the success
+		// writers (native passthrough and the translate paths).
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
+		}
 		// Native passthrough: if the resolved application supports Codex natively,
 		// proxy the raw body to the upstream /v1/responses instead of translating.
 		if s.tryProxyNative(w, r, &token, raw, inference.APIFlavorOpenAIResponses, endpointResponses, pf) {
@@ -139,6 +144,9 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		pf, handled = s.inferencePreflight(w, r, token, raw, inferenceShape{apiFlavor: inference.APIFlavorOpenAIResponses, endpoint: endpointResponses, model: req.Model, stream: req.Stream})
 		if handled {
 			return
+		}
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
 		}
 	}
 	req = pf.mergeInto(req)
@@ -175,6 +183,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		if handled {
 			return
 		}
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
+		}
 		// Native passthrough: if the resolved application supports Claude Code natively,
 		// proxy the raw body to the upstream /v1/messages instead of translating (this
 		// is also the only way Anthropic streaming works, since the translate path
@@ -197,6 +208,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		pf, handled = s.inferencePreflight(w, r, token, raw, inferenceShape{apiFlavor: "anthropic_messages", endpoint: endpointMessages, model: req.Model, stream: req.Stream})
 		if handled {
 			return
+		}
+		if len(pf.Standing) > 0 {
+			r = r.WithContext(withLimitStanding(r.Context(), pf.Standing))
 		}
 	}
 	req = pf.mergeInto(req)
@@ -401,16 +415,22 @@ func principalFor(token auth.Token) (Principal, bool) {
 // §6.3), called at the SAME pre-Resolve choke point as modelAllowed: after
 // model-override resolution, before any Resolve/upstream call. It resolves the
 // request's Principal (principalFor) and, only when one applies, consults
-// s.Limiter.Admit; on a denial it writes the mapped HTTP response
-// (writeLimitDenied) and reports handled=true so the caller returns
-// immediately -- mirroring writeModelNotAllowed, a denied request never
-// reaches Resolve/an AI-server and is never recorded as a usage event.
+// s.Limiter.Evaluate; on a denial it writes the mapped HTTP response and
+// reports handled=true so the caller returns immediately. A quota or budget
+// denial on the Anthropic Messages flavor is answered by writeLimitBlocked (429
+// billing_error naming the limit that frees the user last) and on the OpenAI
+// Responses flavor by writeCodexLimitBlocked (429 usage_limit_reached for the
+// Codex CLI, naming the same limit); every other denial, and a block whose
+// standing lacks the reading, goes through writeLimitDenied.
+// On an allow it returns the limiter's standing for the caller to report.
+// Mirroring writeModelNotAllowed, a denied request never reaches Resolve/an
+// AI-server and is never recorded as a usage event.
 //
-// s.Limiter.Admit is itself nil-safe (a nil *PrincipalLimiter, a nil-backed
-// store, or an unconfigured principal all simply allow), so calling this
-// unconditionally at every inference entry point is the no-op invariant
-// (design spec §10): with nothing configured for anyone, behavior is
-// byte-identical to before this feature existed.
+// Evaluate is nil-safe (a nil *PrincipalLimiter, a nil-backed store, or an
+// unconfigured principal all simply allow), so calling this unconditionally at
+// every inference entry point is the no-op invariant (design spec §10): with
+// nothing configured for anyone, behavior is byte-identical to before this
+// feature existed.
 //
 // admitPrincipal has exactly ONE call site in the whole package --
 // inferencePreflight -- which itself runs exactly once per client request
@@ -422,17 +442,29 @@ func principalFor(token auth.Token) (Principal, bool) {
 // budget. Now that every caller goes through inferencePreflight, that marker
 // is unnecessary and has been removed: there is structurally only one call
 // per request, not a dedup of several.
-func (s *Server) admitPrincipal(w http.ResponseWriter, r *http.Request, token auth.Token) (handled bool) {
+func (s *Server) admitPrincipal(w http.ResponseWriter, r *http.Request, token auth.Token, apiFlavor string) (standing LimitStanding, handled bool) {
 	p, ok := principalFor(token)
 	if !ok {
-		return false
+		return nil, false
 	}
-	allow, reason, retryAfter := s.Limiter.Admit(r.Context(), p)
-	if allow {
-		return false
+	a := s.Limiter.Evaluate(r.Context(), p)
+	if a.Allow {
+		return a.Standing, false
 	}
-	writeLimitDenied(w, reason, retryAfter)
-	return true
+	if a.Reason != "rate" {
+		if reading, ok := a.Standing.Blocking(LimitKind(a.Reason)); ok {
+			switch apiFlavor {
+			case inference.APIFlavorAnthropicMessages:
+				writeLimitBlocked(w, reading, a.At, token.SendUsageLimits)
+				return nil, true
+			case inference.APIFlavorOpenAIResponses:
+				writeCodexLimitBlocked(w, reading, a.At, token.SendUsageLimits, token.CodexModelSwitchPrompt)
+				return nil, true
+			}
+		}
+	}
+	writeLimitDenied(w, a.Reason, a.RetryAfter)
+	return nil, true
 }
 
 // preflight is the outcome of a successful inferencePreflight call: the
@@ -445,6 +477,9 @@ func (s *Server) admitPrincipal(w http.ResponseWriter, r *http.Request, token au
 // passthrough (tryProxyNative) uses Req directly for Resolve.
 type preflight struct {
 	Req inference.Request
+	// Standing is the principal's quota and budget readings as admission saw them
+	// (empty when none is configured, or for a caller that skipped admission).
+	Standing LimitStanding
 }
 
 // mergeInto copies the preflight's resolved model, server-override verdict,
@@ -529,7 +564,9 @@ type inferenceShape struct {
 //  4. modelAllowed (service-account model allowlist) -- TERMINAL on failure
 //     (403), checked against the EFFECTIVE (post-override, post-redirect)
 //     model.
-//  5. admitPrincipal (rate/quota/budget) -- TERMINAL on failure (429/402).
+//  5. admitPrincipal (rate/quota/budget) -- TERMINAL on failure (429, or 402
+//     for a cost budget; a quota or budget block on /v1/messages is a 429
+//     billing_error, on /v1/responses a 429 usage_limit_reached).
 //  6. extractClientSession -- pure, never fails.
 //
 // Called EXACTLY ONCE per client request: the three translate handlers below
@@ -554,9 +591,11 @@ func (s *Server) inferencePreflight(w http.ResponseWriter, r *http.Request, toke
 	if handled {
 		return preflight{}, true
 	}
-	if s.admitPrincipal(w, r, token) {
+	standing, handled := s.admitPrincipal(w, r, token, shape.apiFlavor)
+	if handled {
 		return preflight{}, true
 	}
+	pf.Standing = standing
 	return pf, false
 }
 
@@ -649,15 +688,22 @@ const (
 	codeLimitCostBudgetExceeded   = "limit.cost_budget_exceeded"
 )
 
-// writeLimitDenied writes the HTTP response for a PrincipalLimiter.Admit
-// denial, mapping each limit reason to its stable error code and status per
-// design spec §8: rate-limit and both quotas -> 429, cost budget -> 402. Only
-// the rate-limit reason carries a Retry-After header (whole seconds, floored
-// at 1 so a sub-second computed wait never reads as "retry immediately") --
-// quota/budget denials give no concrete retry time (the period reset is
-// calendar-aligned, not a short countdown). Written BEFORE any Resolve/
-// upstream call, mirroring writeModelNotAllowed, so a denied request never
-// reaches an AI-server and leaks no principal-internal detail (a static
+// writeLimitDenied writes the HTTP response for a PrincipalLimiter denial,
+// mapping each limit reason to its stable error code and status per design
+// spec §8: rate-limit and both quotas -> 429, cost budget -> 402. Every reason
+// except the rate limit also sets X-Should-Retry: false, because a quota or
+// budget stays exhausted until its period resets and a client retry cannot help
+// (the rate limit clears in seconds and keeps the client's default). The
+// Anthropic Messages and OpenAI Responses flavors do not come through here for a
+// quota or budget denial: admitPrincipal answers them with writeLimitBlocked and
+// writeCodexLimitBlocked (429 for the cost budget too).
+//
+// Only the rate-limit reason carries a Retry-After header (whole seconds,
+// floored at 1 so a sub-second computed wait never reads as "retry
+// immediately"); quota/budget denials give no concrete retry time (the period
+// reset is calendar-aligned, not a short countdown). Written BEFORE any
+// Resolve/upstream call, mirroring writeModelNotAllowed, so a denied request
+// never reaches an AI-server and leaks no principal-internal detail (a static
 // message per reason, never a store error).
 func writeLimitDenied(w http.ResponseWriter, reason string, retryAfter time.Duration) {
 	status := http.StatusTooManyRequests
@@ -677,6 +723,8 @@ func writeLimitDenied(w http.ResponseWriter, reason string, retryAfter time.Dura
 			seconds = 1
 		}
 		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	} else {
+		w.Header().Set("X-Should-Retry", "false")
 	}
 	writeJSON(w, status, apierror.Response(code, message, ""))
 }

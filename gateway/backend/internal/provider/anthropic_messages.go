@@ -297,9 +297,9 @@ func (c *AnthropicClient) scanStream(ctx context.Context, r io.Reader, st *anthr
 // post sends the rendered body to the Messages endpoint and returns the 2xx
 // response (the caller owns closing its Body). Every failure is already mapped to
 // a provider error: ErrTimeout when ctx's deadline elapsed, ErrUnavailable for a
-// transport error, and unavailableStatus for a non-2xx status. It records the
-// outbound request and, on success, the response headers with the context's
-// capture sink.
+// transport error, and vendorStatusError for a non-2xx status (a *LimitError for
+// 429/402). It records the outbound request and, on success, the response headers
+// with the context's capture sink.
 func (c *AnthropicClient) post(ctx context.Context, target routing.Target, body []byte) (*http.Response, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(target.Endpoint, anthropicMessagesPath), bytes.NewReader(body))
 	if err != nil {
@@ -317,11 +317,13 @@ func (c *AnthropicClient) post(ctx context.Context, target routing.Target, body 
 		}
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
+	// Record the headers before the status check so a 429 (which carries the
+	// rate-limit headers) is scraped too, as OpenAIResponsesClient.post does.
+	sink.RecordResponseHeaders(httpResp.Header)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		httpResp.Body.Close()
-		return nil, unavailableStatus(httpResp.StatusCode)
+		return nil, vendorStatusError(httpResp)
 	}
-	sink.RecordResponseHeaders(httpResp.Header)
 	return httpResp, nil
 }
 

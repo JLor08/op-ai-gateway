@@ -158,6 +158,8 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 		ClaudeModelAliases:             token.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
+		SendUsageLimits:                token.SendUsageLimits,
+		CodexModelSwitchPrompt:         token.CodexModelSwitchPrompt,
 	}, secret)
 	return nil
 }
@@ -218,6 +220,8 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			ClaudeModelAliases:             token.ClaudeModelAliases,
 			ClaudeEffortCompatibility:      token.ClaudeEffortCompatibility,
 			DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
+			SendUsageLimits:                token.SendUsageLimits,
+			CodexModelSwitchPrompt:         token.CodexModelSwitchPrompt,
 		})
 	}
 	return nil
@@ -308,6 +312,8 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.ClaudeModelAliases = token.ClaudeModelAliases
 	existing.ClaudeEffortCompatibility = token.ClaudeEffortCompatibility
 	existing.DecisionsConfidenceNormalize = token.DecisionsConfidenceNormalize
+	existing.SendUsageLimits = token.SendUsageLimits
+	existing.CodexModelSwitchPrompt = token.CodexModelSwitchPrompt
 	m.tokens[token.ID] = existing
 	m.auth.UpdateToken(auth.Token{
 		ID:                 existing.ID,
@@ -339,6 +345,8 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		ClaudeModelAliases:             existing.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      existing.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   existing.DecisionsConfidenceNormalize,
+		SendUsageLimits:                existing.SendUsageLimits,
+		CodexModelSwitchPrompt:         existing.CodexModelSwitchPrompt,
 	})
 	return nil
 }
@@ -374,6 +382,28 @@ func (m *MemoryDirectory) RotateTokenSecret(ctx context.Context, id, secretHash,
 	}
 	existing.SecretHash = secretHash
 	existing.SecretPrefix = secretPrefix
+	existing.UpdatedAt = updatedAt
+	m.tokens[id] = existing
+	m.auth.RekeyToken(id, secretHash)
+	return nil
+}
+
+// RotateUserTokenSecret is RotateTokenSecret that also stores the token's
+// claude_code_usage_display flag, so the flag and the secret it shapes change
+// under one lock.
+func (m *MemoryDirectory) RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	existing, ok := m.tokens[id]
+	if !ok {
+		return store.ErrNotFound
+	}
+	existing.SecretHash = secretHash
+	existing.SecretPrefix = secretPrefix
+	existing.ClaudeCodeUsageDisplay = claudeCodeUsageDisplay
 	existing.UpdatedAt = updatedAt
 	m.tokens[id] = existing
 	m.auth.RekeyToken(id, secretHash)

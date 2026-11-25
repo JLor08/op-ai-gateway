@@ -2140,6 +2140,18 @@ func (_d *RoutingStoreWithTracing) UpdateVendorAccountShareLevel(ctx context.Con
 	return _d.Store.UpdateVendorAccountShareLevel(ctx, id, level)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateVendorAccountShareUsage(ctx context.Context, id string, enabled bool) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateVendorAccountShareUsage")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateVendorAccountShareUsage(ctx, id, enabled)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateVendorAccountSystemGroup(ctx context.Context, id string, systemGroupID string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateVendorAccountSystemGroup")
 	defer span.End()

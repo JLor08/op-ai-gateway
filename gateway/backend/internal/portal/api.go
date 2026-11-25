@@ -30,6 +30,10 @@ type API interface {
 	AgentCertificate(context.Context, string) (AgentCertificateDTO, error)
 	AgentProxyRoutes(context.Context, string) (AgentProxyRoutesDTO, error)
 	AgentRuntimeConfig(context.Context, string) (AgentRuntimeConfigDTO, error)
+	CreateVendorAccountGroup(context.Context, auth.Token, CreateVendorAccountGroupRequest) (VendorAccountGroupDTO, error)
+	DeleteVendorAccountGroup(context.Context, auth.Token, string) error
+	GetVendorAccountGroup(context.Context, auth.Token, string) (VendorAccountGroupDTO, error)
+	ListVendorAccountGroups(context.Context, auth.Token) (VendorAccountGroupListResponse, error)
 	NotifyClustersOfServer(context.Context, string)
 	KeptUpClusterHeads(context.Context) ([]string, error)
 	ReconcileRPCPolicies(context.Context) []RPCPolicyWrite
@@ -55,6 +59,9 @@ type API interface {
 	ChatBlobBytes(context.Context, auth.Token, string) ([]byte, string, error)
 	CheckpointAssistant(context.Context, auth.Token, string, AssistantTurn) error
 	ClaudeAliasTarget(context.Context, auth.Token, string) (string, bool)
+	SetVendorAccountGroupMembers(context.Context, auth.Token, string, []string) (VendorAccountGroupDTO, error)
+	UpdateVendorAccountGroup(context.Context, auth.Token, string, UpdateVendorAccountGroupRequest) (VendorAccountGroupDTO, error)
+	VendorAccountUsageManager(context.Context, auth.Token, string) (bool, error)
 	ClusterCandidates(context.Context, auth.Token, string, string, string) (ClusterCandidateList, error)
 	ClusterPlan(context.Context, string) (ClusterPlan, error)
 	CommitAssistant(context.Context, auth.Token, string, AssistantTurn, string) error
@@ -104,6 +111,7 @@ type API interface {
 	EdgeCertificateKeyPEM(context.Context) (string, error)
 	EdgeCertificateView(context.Context) (EdgeCertificateDTO, error)
 	EdgeProxyConfig(context.Context) (string, error)
+	EncodeChatSessionVendorAccess(context.Context, string, *VendorAccessDTO) (string, error)
 	EnrollGatewaySidecar(context.Context, auth.Token) (string, string, error)
 	ExternalThemeAsset(string, string) (string, bool)
 	GenerateAgentToken(context.Context, auth.Token, string) (GenerateAgentTokenResponse, error)
@@ -194,6 +202,7 @@ type API interface {
 	RemoveVendorAccountFromResourceGroup(context.Context, auth.Token, string, string) error
 	RenameGroup(context.Context, auth.Token, string, string) (UserGroupDTO, error)
 	RenewCertificateNow(context.Context, auth.Token, string) error
+	RequestVendorUsagePull(string)
 	ResolveGatewayPeerDNS(context.Context) (string, error)
 	ResolveGatewayPeerIP(context.Context) (string, error)
 	ResolveInviteAdminGroup(context.Context, auth.Token, string) (string, string, error)
@@ -207,7 +216,7 @@ type API interface {
 	RotateCertificateCA(context.Context, auth.Token) error
 	RotateNetbirdToken(context.Context, auth.Token) (RotateNetbirdTokenResult, error)
 	RotateServiceToken(context.Context, auth.Token, string, string) (CreateServiceTokenResponse, error)
-	RotateToken(context.Context, auth.Token, string) (CreateTokenResponse, error)
+	RotateToken(context.Context, auth.Token, string, RotateTokenRequest) (CreateTokenResponse, error)
 	RuntimeWarnings(context.Context, auth.Token, string) ([]string, error)
 	SMTPRuntimeConfig(context.Context) (SMTPRuntimeConfig, error)
 	SaveChat(context.Context, auth.Token, string, UpdateChatRequest) (ChatDTO, error)
@@ -245,6 +254,7 @@ type API interface {
 	SetUserPreference(context.Context, string, string, json.RawMessage) error
 	SetVendorAccountAdminGroups(context.Context, auth.Token, string, []string) (VendorAccountDTO, error)
 	SetVendorAccountShareLevel(context.Context, auth.Token, string, SetVendorAccountShareLevelRequest) (VendorAccountDTO, error)
+	SetVendorAccountShareUsage(context.Context, auth.Token, string, SetVendorAccountShareUsageRequest) (VendorAccountDTO, error)
 	SyncApplicationModels(context.Context, auth.Token, string) (SyncResultDTO, error)
 	SyncApplicationModelsForApp(context.Context, routing.AIServer, routing.Application) (SyncResultDTO, error)
 	SystemAdminModeRequirePassword(context.Context) bool

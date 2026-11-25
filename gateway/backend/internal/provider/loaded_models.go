@@ -26,8 +26,42 @@ type LoadedModelLister interface {
 	LoadedModels(ctx context.Context, target routing.Target, statusPath, format string) ([]string, error)
 }
 
+// LoadedModelInfoLister is LoadedModelLister plus what the SAME status document,
+// read in the SAME request, says about each loaded model: its context window
+// and a vision verdict. Only the "openai" format carries either today (see
+// parseLoadedModelInfos); every other format yields the names alone. The
+// health loop prefers it over LoadedModelLister so an upstream whose only
+// readable route is its /v1/models listing (a Strata LAN share, which answers
+// /props with 404) still reports its context size and vision support without a
+// second probe.
+type LoadedModelInfoLister interface {
+	// LoadedModelInfos is LoadedModels with details: one entry per loaded
+	// name, in LoadedModels' order. Only Name, ContextSize and Caps.Vision
+	// are ever set.
+	LoadedModelInfos(ctx context.Context, target routing.Target, statusPath, format string) ([]ModelInfo, error)
+}
+
 // fetchLoadedModels is the shared GET+parse used by every client's LoadedModels.
 func fetchLoadedModels(ctx context.Context, httpClient *http.Client, target routing.Target, statusPath, format string) ([]string, error) {
+	body, err := fetchLoadedModelsBody(ctx, httpClient, target, statusPath)
+	if err != nil || body == nil {
+		return nil, err
+	}
+	return parseLoadedModels(body, format), nil
+}
+
+// fetchLoadedModelInfos is the shared GET+parse used by LoadedModelInfos.
+func fetchLoadedModelInfos(ctx context.Context, httpClient *http.Client, target routing.Target, statusPath, format string) ([]ModelInfo, error) {
+	body, err := fetchLoadedModelsBody(ctx, httpClient, target, statusPath)
+	if err != nil || body == nil {
+		return nil, err
+	}
+	return parseLoadedModelInfos(body, format), nil
+}
+
+// fetchLoadedModelsBody GETs the status path (with the upstream credential)
+// and returns the raw body. A blank statusPath returns (nil, nil).
+func fetchLoadedModelsBody(ctx context.Context, httpClient *http.Client, target routing.Target, statusPath string) ([]byte, error) {
 	statusPath = strings.TrimSpace(statusPath)
 	if statusPath == "" {
 		return nil, nil
@@ -57,7 +91,7 @@ func fetchLoadedModels(ctx context.Context, httpClient *http.Client, target rout
 	if err != nil {
 		return nil, fmt.Errorf("%w: read response: %v", ErrUnavailable, err)
 	}
-	return parseLoadedModels(body, format), nil
+	return body, nil
 }
 
 // parseLoadedModels extracts loaded model names from a status response per format.
@@ -92,6 +126,99 @@ func parseLoadedModels(body []byte, format string) []string {
 		all = append(all, litellmLoadedModels(v)...)
 		return dedupNonEmpty(all)
 	}
+}
+
+// parseLoadedModelInfos is parseLoadedModels plus what the same listing says
+// about each name. The names, and their order, are exactly parseLoadedModels'.
+// Only the "openai" format is read beyond the names, from the data[] entry the
+// name came from:
+//
+//   - ContextSize: context_length (Strata's /v1/models, the OpenRouter-style
+//     field), else meta.n_ctx (the engine block Strata adds). vLLM's
+//     max_model_len is deliberately not read. A non-positive value is 0
+//     (unknown).
+//   - Caps.Vision: "yes" when architecture.input_modalities lists "image";
+//     otherwise "" (no verdict), because nothing pins that list as
+//     exhaustive.
+//
+// Every other format, and an entry without those keys, yields the name alone.
+// The parse is generic; which application types RECORD these values is the
+// health loop's decision (recordListedModelInfos in cmd/gateway).
+func parseLoadedModelInfos(body []byte, format string) []ModelInfo {
+	names := parseLoadedModels(body, format)
+	if len(names) == 0 {
+		return nil
+	}
+	entries := map[string]ModelInfo{}
+	if strings.ToLower(strings.TrimSpace(format)) == "openai" {
+		var v any
+		if err := json.Unmarshal(body, &v); err == nil {
+			entries = openaiEntryInfos(v)
+		}
+	}
+	out := make([]ModelInfo, 0, len(names))
+	for _, name := range names {
+		info := entries[name]
+		info.Name = name
+		out = append(out, info)
+	}
+	return out
+}
+
+// openaiEntryInfos maps each {"data":[...]} entry's name (the same key
+// modelNamesFromArray reads) to its context size and vision verdict, as
+// parseLoadedModelInfos documents. The first entry for a repeated name wins.
+func openaiEntryInfos(v any) map[string]ModelInfo {
+	out := map[string]ModelInfo{}
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return out
+	}
+	arr, ok := obj["data"].([]any)
+	if !ok {
+		return out
+	}
+	for _, item := range arr {
+		it, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := modelNameOf(it)
+		if name == "" {
+			continue
+		}
+		if _, seen := out[name]; seen {
+			continue
+		}
+		out[name] = openaiEntryInfo(it)
+	}
+	return out
+}
+
+// openaiEntryInfo reads one entry's context size and vision verdict.
+func openaiEntryInfo(it map[string]any) ModelInfo {
+	info := ModelInfo{ContextSize: intFromAny(it["context_length"])}
+	if info.ContextSize == 0 {
+		if meta, ok := it["meta"].(map[string]any); ok {
+			info.ContextSize = intFromAny(meta["n_ctx"])
+		}
+	}
+	if arch, ok := it["architecture"].(map[string]any); ok {
+		if mods, ok := arch["input_modalities"].([]any); ok && listsImageModality(mods) {
+			info.Caps.Vision = routing.CapabilityYes
+		}
+	}
+	return info
+}
+
+// listsImageModality reports whether a modality list names "image".
+func listsImageModality(mods []any) bool {
+	for _, m := range mods {
+		if s, ok := m.(string); ok && strings.EqualFold(strings.TrimSpace(s), "image") {
+			return true
+		}
+	}
+	return false
 }
 
 // openaiLoadedModels parses {"data":[{"id":...}]}.
@@ -196,15 +323,23 @@ func modelNamesFromArray(v any) []string {
 				out = append(out, strings.TrimSpace(it))
 			}
 		case map[string]any:
-			for _, key := range []string{"model", "id", "name"} {
-				if s, ok := it[key].(string); ok && strings.TrimSpace(s) != "" {
-					out = append(out, strings.TrimSpace(s))
-					break
-				}
+			if name := modelNameOf(it); name != "" {
+				out = append(out, name)
 			}
 		}
 	}
 	return out
+}
+
+// modelNameOf is an array item's model name: its first non-blank string among
+// "model", "id" and "name", trimmed; "" when it has none.
+func modelNameOf(it map[string]any) string {
+	for _, key := range []string{"model", "id", "name"} {
+		if s, ok := it[key].(string); ok && strings.TrimSpace(s) != "" {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 func dedupNonEmpty(in []string) []string {

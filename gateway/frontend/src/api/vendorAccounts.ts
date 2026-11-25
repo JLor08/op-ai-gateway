@@ -151,6 +151,11 @@ export type VendorAccount = {
   // for a viewer who does not ("" for the owner, or when the name is unknown).
   is_owner: boolean;
   shared_by: string;
+  // The owner's opt-in (#407) to share the account's usage figures (rate limits and spend) with the
+  // members it is shared with: they then see them in Claude Code and, as `usage`,
+  // on the account page and the dashboard. Every read carries it, the member view
+  // too (with the account's real value); only the owner may change it.
+  share_usage_with_members: boolean;
 };
 
 // One resource group the OWNER of a shared account may enter it into (spec
@@ -180,6 +185,8 @@ export type CreateVendorAccountRequest = {
   api_key?: string;
   model_prefix?: string;
   base_url?: string;
+  // The initial usage opt-in; omitted = the backend default (on for a new account).
+  share_usage_with_members?: boolean;
 };
 
 // PATCH /api/portal/vendor-accounts/{id} body -- pointer-semantics on the
@@ -357,6 +364,16 @@ export function vendorAccountsApi(fetcher: Fetcher) {
           method: 'PUT',
           body: adminGroupIds === undefined ? { level } : { level, admin_group_ids: adminGroupIds },
         },
+      ),
+    // Turns the owner's opt-in to share the account's usage figures with its
+    // members on or off (PUT .../share-usage, #407). Owner only: a co-manager or a
+    // member gets a 403, a stranger the 404 of an unknown id. Answers the
+    // credential-free account as the owner now reads it.
+    setVendorAccountShareUsage: (id: string, enabled: boolean) =>
+      request<VendorAccount>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/share-usage`,
+        { method: 'PUT', body: { enabled } },
       ),
     // Replaces the management groups of an account that is already shared (PUT
     // .../admin-groups): the owner at `shared`, the owner or a CM at `full`. >= 1

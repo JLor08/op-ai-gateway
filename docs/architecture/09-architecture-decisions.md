@@ -647,7 +647,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -703,7 +703,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -872,7 +872,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1083,7 +1083,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1298,7 +1298,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-109-migrations),
+[§4](reference/data-model.md#4-migration-history-115-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1524,7 +1524,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-109-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-115-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1671,7 +1671,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-109-migrations),
+[§4](reference/data-model.md#4-migration-history-115-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3642,7 +3642,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-109-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3662,6 +3662,12 @@ collision-checked at save like an `all: false` entry (an id the token's principa
 reach is the "unknown" `400`), so only an entry naming an **own** account goes unchecked
 and rests on the backstop, and a policy now names accounts its principal can *reach*, not
 only ones the owner owns, though it still never widens that reach.
+
+**Amended by [ADR-114](#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token) (chat-session policy).** Decision (e) no longer
+holds as written: the interactive session (and the trusted loopback chat) carries the owner's
+**stored** chat-session policy, which defaults to `all: true` plus groups when never configured,
+and may be narrowed, even to nothing, or may name a shared account. A run-as token still replaces
+that policy entirely, and a service token is as ADR-060 left it.
 
 ## ADR-051 — Anthropic translate prompt caching is flag-gated, decided at the gateway by a hybrid auto-switch, and placed by the provider
 **Context:** Anthropic caches a prompt prefix only where the request carries a
@@ -3866,7 +3872,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-109-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4898,7 +4904,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5024,7 +5030,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-109-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5114,6 +5120,9 @@ the key or hands a delegate the owner's token.
   session, which is always `all: true`), never a shared one, so borrowing another owner's
   credential is always a deliberate, named choice; an `all: true` policy may still carry
   an entry naming a non-own account, which is a live opt-in validated like any other.
+  (Amended by [ADR-114](#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token): the portal session carries the owner's stored chat-session
+  policy, `all: true` plus groups only while it is unset, so a named shared account is reachable from the
+  token-less chat.)
   The own-versus-shared line is one function (`TokenOwnsVendorAccount`). The save-time
   check validates against the **token's own principal** (the owning user, or the service),
   never the admin saving it, and is **advisory**: routing re-evaluates the grant on every
@@ -5167,7 +5176,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-109-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7681,7 +7690,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-109-migrations),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7904,7 +7913,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-109-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-115-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8045,7 +8054,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-109-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-115-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8309,7 +8318,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-109-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-115-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -10979,7 +10988,9 @@ resolve.
     spent across restarts or every exit would re-arm it and the bidirectional thrash would return one restart at a time. It resets
     only when the spec is removed and re-added; an in-place edit keeps it. A bootstrap blocked by a non-evictable toucher spends
     nothing (the flag rides only an `Evict` decision). At most one mixed pair, once, ever cold-loads the other.
-  - **(g) Measurer-gated.** Measurement is NVIDIA-only ([§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)):
+  - **(g) Measurer-gated.** (Superseded in part by [ADR-113](#adr-113--per-process-vram-on-amd-linux-kfd-sysfs-not-start-delta-attribution-or-amd-smi):
+    AMD Linux ROCm/HIP builds are measured via KFD sysfs, so an AMD Linux host now has a measurer installed.) Measurement is
+    NVIDIA-only ([§5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)):
     on an AMD, Apple or GPU-less host nothing could capture the number, and §5.3 is explicit that an unknown-demand spec there simply
     waits. Evicting a working model for a spec that can never be measured is the ADR-032 regression, so a measurer-less host never
     gets the shot.
@@ -12165,7 +12176,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-109-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-115-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -12972,3 +12983,702 @@ flavor and spread rules over the provider clients, one of which (`OpenAICompatib
 - **VERIFY-LIVE (not probed, no account available):** an OpenAI api-key target, an Anthropic api-key target, and a switch between two
   accounts of one vendor (expected to behave like probes O4/A3). The rules are shared code and covered by unit and integration tests; only
   the vendor's live answer is unverified.
+
+## ADR-106 — Claude Code shows a subscription's usage limits through an allowlisted header relay, an opt-in JWT-shaped token secret, an entitlement that follows the portal's view, and a per-principal window cache
+
+**Context.** Claude Code reads an Anthropic subscription's 5 hour and 7 day windows from the `anthropic-ratelimit-unified-*` response
+headers of `/v1/messages` and shows them in its status line, warnings and limit banners (issue #407). Verified in Claude Code 2.1.328
+and with a live end-to-end run: behind a gateway it reads them only when its bearer token (`ANTHROPIC_AUTH_TOKEN`) is a JWT whose
+payload `aud` is `claude-gateway` (decoded, never verified), and an opaque `opaigw_` token makes it ignore the headers. It also
+clears its per-window values on any `/v1/messages` response without the headers, which every answer of a local model is. The gateway
+relayed none of these headers, issued only opaque tokens, and withholds a shared account's rate-limit figures from its members.
+
+**Decision.**
+
+- **Forward an allowlist, not everything.** On the `anthropic_messages` flavor of the native passthrough, copy `anthropic-ratelimit-unified-*`,
+  `retry-after` and `x-should-retry` from the final upstream response at the point the status line is written. No `request-id`, no
+  organization headers, no `anthropic-ratelimit-requests-*` / `-tokens-*` (an API-key organization's quotas), nothing on other flavors.
+- **An opt-in JWT-shaped user-token secret.** The token option `claude_code_usage_display` (default off) issues the secret as
+  `<header>.<payload>.<opaigw_ secret>` with payload `{"aud":"claude-gateway"}`. The gateway still hashes the whole string and parses
+  nothing; the third segment carries the entropy, so `alg: none` is harmless. The setting changes only through rotation, because the
+  shape of a secret cannot change in place; PATCH refuses a different value.
+- **Entitlement follows the portal's management view.** The unified figures of a vendor account reach the owner, a community manager of a
+  `shared`/`full` account, and, when the owner has `share_usage_with_members` on (the default for accounts created since ADR-112; an
+  account created earlier keeps its stored value), every principal that may use the account. An
+  inference token never carries system scope. The opt-in also puts `usage` into the portal member view and the dashboard, so one setting
+  has one meaning. The check is cached per principal and account and fails closed. A non-entitled principal still gets `retry-after`
+  and `x-should-retry`, so Claude Code waits correctly on a 429.
+- **A per-principal window cache.** The gateway remembers a principal's last subscription windows in memory and attaches those still in
+  the future to `/v1/messages` successes of other targets, so the display stays stable when a local model answers. It never attaches a top-level
+  `rejected` and never replays overage or retry headers.
+
+**Rejected:**
+
+- **Forward every upstream header.** It would leak request and organization ids and an API-key organization's quotas.
+- **`CLAUDE_CODE_USE_GATEWAY=1`.** It does not work inside Claude Desktop's 3P mode, where the host's environment wins, and it costs
+  Messages betas such as context management.
+- **Anthropic's Claude apps gateway sign-in (device flow).** Large, brings the same beta loss, and adds no display beyond the token shape.
+- **Every token JWT-shaped.** An opt-in leaves other clients and existing tokens untouched.
+- **Showing the gateway's own principal limits in the same change.** Done separately: they reach Claude Code as the overage window, see [ADR-107](#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
+- **Forwarding Codex `x-codex-*` headers.** Rejected here; not part of this change. Done separately for the Responses flavor, see [ADR-108](#adr-108--codex-shows-an-openai-subscriptions-usage-limits-through-an-allowlisted-x-codex-relay-and-a-per-principal-window-cache).
+
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a per-token switch for every usage signal).** The relay, the cached windows and the shape's effect are no longer unconditional: a token needs `send_usage_limits` (default off; migration 112 set it on for tokens that already had the Claude Code token format) besides the JWT-shaped secret. Without it the unified headers are neither relayed, cached nor attached, and `retry-after` and `x-should-retry` still reach the client.
+
+**Consequences and limits.**
+
+- Claude Code's Desktop usage card and the `/usage` plan panel stay unreachable for any gateway. The gateway's own principal limits reach
+  Claude Code in the overage-window shape, see [ADR-107](#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
+- The window cache is per process and best effort (capped at 10 000 principals, lost on restart, not shared between replicas). Entitlement is checked at
+  observe time, and each entry remembers its account: a later response from that account to a principal who is no longer entitled drops the entry. A principal
+  whose entitlement is revoked and who then uses only other providers keeps receiving its last frozen figures on local-model replies until the windows
+  reset or the process restarts. Nothing new is disclosed.
+- The whole display rests on undocumented client behavior; see the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
+  [member view](cross-cutting/external-vendor-accounts.md#82-what-each-viewer-reads),
+  [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).
+
+## ADR-107 — The gateway's own principal limits reach Claude Code as the overage window and a 429 billing_error, from readings taken at admission
+
+**Context.** ADR-106 made a subscription's windows visible in Claude Code. The gateway's own limits (a principal's request quota, token
+quota and cost budget) stayed invisible, and a denial hurt: a quota 429 without `Retry-After` or `x-should-retry` made Claude Code retry
+with backoff (8 retries in 90 s, still going), and the cost-budget 402 printed a bare `API Error: 402 cost budget exceeded` (issue #413).
+Verified in Claude Code 2.1.328: the documented gateway contract ("Usage-limit headers — optional") describes a cap as the window-agnostic
+`overage` window and a block as a `429 billing_error`; with a JWT-shaped token the client reads that window and prints the 429's message
+verbatim after one request, with an opaque token it prints the message in `API Error: Request rejected (429) · <message>`, and the status
+line's spend-limit field and the `/usage` bar exist only in a gateway sign-in session.
+
+**Decision.**
+
+- **Describe the fullest limit as the overage window.** On a `/v1/messages` 2xx, for a principal with at least one quota or budget, write
+  the `anthropic-ratelimit-unified-overage-*` family and the top-level fields for the limit with the highest utilization (ties: later reset,
+  then fixed order). A principal with no limit gets no gateway header.
+- **Take the readings at admission, carry them to the response.** `PrincipalLimiter.Evaluate` reads every configured limit through the
+  existing cached path and returns them (`LimitStanding`); the handlers carry them on the request context to the attach points. The response
+  path does no store I/O, the figures are exactly the ones admission judged, and a failed read is a `Failed` reading that suppresses the
+  display (a partial picture could name the wrong limit) while admission still fails open.
+- **Answer a `/v1/messages` quota or budget denial with the contract's 429.** A `billing_error` body naming the limit that frees the user
+  last, one fixed sentence (which limit, reset in UTC, whom to ask), `Retry-After`, `X-Should-Retry: false` and the `rejected` headers. The
+  cost budget becomes a 429 on this endpoint only.
+- **Every other endpoint keeps its status and body** and gains `X-Should-Retry: false` on a quota or budget denial; the rate limit is
+  unchanged everywhere. `/v1/responses` later became the second exception, see
+  [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
+- **The gateway's cap owns the top-level fields** and #407's subscription windows (`5h`, `7d`, `7d_oi`) stay beside it; the subscription's
+  own top-level and overage fields are removed on such a response. A principal without limits keeps ADR-106's behavior byte for byte.
+
+**Rejected:**
+
+- **A fresh read when the response headers go out.** Those go out when the upstream answers, often after the 10 s cache, and would hold the
+  response on the store.
+- **`GET /api/oauth/usage`.** Read only in gateway sign-in sessions and USD-only, while the budget is energy-based.
+- **Emitting `representative-claim` and `overage-status` on a block.** The client then composes its own line and drops the gateway's.
+- **Changing the other endpoints' bodies or statuses**, and the contract's pool and fail-closed variants (there are no shared pools, and the
+  limiter fails open).
+
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (the overage window and the block headers are opt-in).** The overage window of a success and the unified headers of the block are written only for a token with `send_usage_limits`. Without it the block keeps the 429, `Retry-After`, `X-Should-Retry: false` and the same `billing_error` body.
+
+**Consequences and limits.**
+
+- The client takes its warning from the first window with a surpassed threshold in the order `5h`, `7d`, `7d_oi`, `overage`: while a
+  subscription window warns, the gateway's overage warning is not the one shown (both are in the `rate_limit_event`).
+- The memory driver has no `usage_events`, so a configured principal reads 0 % there.
+- The display rests on undocumented client behavior (the `aud` gate, the header names, the window order); the 429 shape and `x-should-retry`
+  are documented and help every client. See the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits),
+  [the limiter](cross-cutting/telemetry-usage-observability.md).
+
+## ADR-108 — Codex shows an OpenAI subscription's usage limits through an allowlisted x-codex relay and a per-principal window cache
+
+**Context.** The Codex CLI shows an OpenAI (ChatGPT) subscription's plan usage from the `x-codex-*` rate-limit headers of the HTTP
+`/v1/responses` stream: status-line items, `/status` bars with reset times, warnings at 75, 90 and 95 % and, on a 429
+`usage_limit_reached`, a message with the reset time (issue #416). Verified in Codex CLI 0.137.0: it parses them on every HTTP
+`/responses` stream whatever the login type or provider, so unlike Claude Code (ADR-106) it needs no token shape; custom providers use
+HTTP, not WebSocket. Each response's snapshot replaces the windows, so a response without the headers clears the display
+(`/status` then says `Limits: not available for this account`), and every answer of a local model is such a response. Codex does not read
+`retry-after`; other OpenAI SDK clients of `/v1/responses` do. The gateway relayed none of these headers on the Responses passthrough.
+
+**Decision.** ADR-106's pattern, applied to `/v1/responses`:
+
+- **Forward an allowlist, not everything.** On the `openai_responses` flavor of the native passthrough, copy `retry-after` and
+  `x-should-retry` always, plus the Codex rate-limit family from the final upstream response at the point the status line is written,
+  on any status. The family (`isCodexRateLimitHeader`) is a name starting with `x-codex-` that ends with one of `used-percent`,
+  `window-minutes`, `reset-at` or `limit-name` (after a dash), or is one of `x-codex-credits-has-credits`, `x-codex-credits-unlimited`,
+  `x-codex-credits-balance`, `x-codex-active-limit`, `x-codex-rate-limit-reached-type` or `x-codex-promo-message`. One predicate
+  drives the relay, the entitlement trigger and the capture redaction.
+- **Same entitlement as ADR-106.** The family reaches only a caller for whom `rateLimitFiguresEntitled` holds (self-hosted target; the
+  owner; a community manager of a `shared`/`full` account; anyone when the owner has `share_usage_with_members` on, the default for new accounts since ADR-112). The lookup runs
+  only when the upstream sent a family header, is cached per principal and account, and fails closed. `retry-after` and `x-should-retry`
+  still reach a non-entitled caller.
+- **A per-principal window cache for Codex.** The gateway remembers the principal's last observed family windows in memory (a second
+  `rateLimitWindowCache` instance next to the Anthropic one, so a principal using Claude Code and Codex in turn never evicts one family
+  with the other) and attaches those still in the future to `/v1/responses` successes that carry no family header of their own. Credits,
+  the 429-only headers and the retry headers are not stored.
+  **Amended by [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win) (cached windows yield from 75 %, issue #418 follow-up).** The cache is not attached while the gateway's own limit takes over; see ADR-109's amendment and [§9.6](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits).
+- **Capture redaction.** The Codex family counts as account-sensitive: a payload capture of a vendor-account target drops it unless the
+  principal is entitled, as it does the unified family.
+
+**Rejected:**
+
+- **Relaying every `x-codex-*` header.** `x-codex-turn-state` is a sticky-routing token of the vendor's backend and other names carry no
+  display value; their effect through a gateway is unverified, and a whole-prefix rule would relay whatever the vendor adds next. The
+  explicit allowlist is a conservative choice and can grow.
+- **A token opt-in.** Codex needs no token shape (ADR-106's JWT gate does not exist here), so an opt-in would only hide a working
+  feature. Entitlement is the only gate.
+- **Relaying `x-codex-turn-state`.** It is not a limit figure, and no effect of dropping it was observed.
+- **Showing the gateway's own principal limits in Codex in the same change.** Done separately, in the default family rather than as an extra
+  family, see [ADR-109](#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
+
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (a token opt-in now exists).** The "A token opt-in" rejection above no longer holds: since #420 the `x-codex-*` family is relayed, cached and attached only for a token with `send_usage_limits`. The reason it was rejected, that Codex needs no token shape, is unchanged; the opt-in is a deliberate privacy choice, not a client requirement. The popup note under Consequences changed too: a token with `codex_model_switch_prompt` lets Codex show the nudge.
+
+**Consequences and limits.**
+
+- Codex's own model-switch nudge to `gpt-5.4-mini` comes with the warning at 90 % and above; the gateway may not map that model. Codex
+  hides the nudge with `notices.hide_rate_limit_model_nudge = true`.
+- Before the first subscription response of a session, and after a gateway restart, the display is empty unless the gateway writes the principal's own limit (ADR-109): Codex's startup prefetch exists
+  only for a ChatGPT login.
+- The cache has the bounds and the revocation limit of ADR-106 (per process, capped at 10 000 principals and, per observation, at 8 families and 256 bytes per header value, lost on restart, not shared
+  between replicas; a principal whose entitlement is revoked and who then uses only other providers keeps receiving its last frozen
+  figures on local-model replies until the windows reset). Nothing new is disclosed.
+- The display rests on undocumented client behavior (the header names and the clear-on-missing rule); see the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Codex usage-limit display](cross-cutting/compatibility-and-inference.md#95-codex-usage-limit-display).
+
+## ADR-109 — The gateway's own principal limits reach Codex in the default x-codex family and as a 429 usage_limit_reached, and a subscription's figures win
+
+**Context.** ADR-107 made a principal's own request quota, token quota and cost budget visible in Claude Code, and ADR-108 relays an
+OpenAI subscription's `x-codex-*` windows to Codex on `/v1/responses`. Codex users still saw no gateway limit, and a block hurt: a quota
+429 printed `exceeded retry limit, last status: 429 Too Many Requests`, with no limit and no reset time, and the cost-budget 402 was
+retried five times in about 7 s and then printed `unexpected status 402 Payment Required: cost budget exceeded, url: …`
+([issue #418](https://github.com/JLor08/op-ai-gateway/issues/418)). Verified in Codex CLI 0.137.0 (stub runs and a code read, issue #418):
+Codex keeps one rate-limit snapshot per response, so only the response's last header family reaches the display, and an extra family
+beside the subscription's `x-codex-*` windows hides them; only the default family `x-codex` drives the status line and the warnings at 75,
+90 and 95 %, while an extra family is a `/status` row only; at 90 % of the default family Codex opens a `gpt-5.4-mini` model-switch popup
+with the switch preselected, which `x-codex-credits-has-credits: true` with `x-codex-credits-unlimited: false` and no balance suppresses;
+a 429 whose `error.type` is `usage_limit_reached` is never retried and prints the `x-codex-promo-message` sentence with the reset taken
+from `error.resets_at`, unless the active family carries a `limit-name` header, which wins and tells the user to switch models. Codex reads
+neither `retry-after` nor `x-should-retry`.
+
+**Decision.** ADR-107's data source, in Codex's shapes, on `/v1/responses`:
+
+- **The fullest limit in the default family.** On a `/v1/responses` 2xx, for a principal with a describable standing, write the limit
+  ADR-107 picks (highest utilization) as the primary window of the default `x-codex` family: an integer percent, floored and at most 99;
+  the nominal period length in minutes (60, 1440, 10080, 43200), which Codex labels `daily`, `weekly` or `monthly` (an hourly limit takes
+  its fallback label `usage`); the reset; and `x-codex-limit-name` `OP AI Gateway <request quota|token quota|cost budget>`, because one
+  window cannot say which limit it is. One window, no extra family.
+- **Suppress the model-switch popup.** Every response that carries the gateway's window also carries `x-codex-credits-has-credits: true`
+  and `x-codex-credits-unlimited: false`, without a balance, so Codex does not lead the user into a model switch that cannot help with a
+  gateway limit.
+- **The subscription wins, whole.** The gateway writes nothing when, after ADR-108's relay and cache (the cache only while the
+  amendment below leaves it attached), the client header set already
+  carries any Codex rate-limit header (`isCodexRateLimitHeader`). It also writes nothing when the standing is empty or a reading failed,
+  or when the reading's reset is not after the moment of writing.
+- **Readings from admission, as in ADR-107.** `handleOpenAIResponses` puts the admission standing on the request context, and ADR-108's
+  three attach points (native passthrough, translate JSON, translate SSE header block) read it. The response path does no store I/O and
+  changes only the client header set.
+- **Answer a `/v1/responses` quota or budget denial with Codex's 429.** Body
+  `{"error":{"type":"usage_limit_reached","code":"<limit code>","message":"<ADR-107's sentence>","resets_at":<unix seconds>}}`,
+  `Retry-After`, `X-Should-Retry: false`, the promo message
+  `OP AI Gateway <limit> reached; ask your gateway administrator to raise it`, the primary window at 100 % with its length and reset,
+  and the credits flags; no `x-codex-limit-name`. Codex prints its usage-limit line with that sentence and the reset in local time, after
+  one request. The cost budget becomes a 429 on this endpoint too.
+- **Everything else stays.** Every other flavor (`/v1/messages` as ADR-107 describes it), the rate denial everywhere, ADR-108's relay,
+  cache, entitlement and capture redaction, and a principal without a quota or budget are unchanged byte for byte.
+
+**Rejected:**
+
+- **An extra limit family** (`x-codex-<id>-*` or `x-opaigw-*`). Codex shows only a response's last family: beside the subscription's
+  windows it would hide them on every response that carries both, and on its own it is a `/status` row without status line or warnings.
+- **Documenting the popup only** (Codex's `notices.hide_rate_limit_model_nudge`). Every user would first meet a preselected switch to a
+  model the gateway may not route; the credits flag removes the popup at the source, for the gateway's window.
+- **A block with `x-codex-limit-name`.** Codex then prints `You've hit your usage limit for <name>. Switch to another model now, …`,
+  wrong advice for a gateway quota, and drops the gateway's sentence.
+- **Keeping `writeLimitDenied` on this endpoint.** Codex names no limit and no reset for its quota 429, retries its budget 402, and reads
+  no `X-Should-Retry` that could stop that.
+
+**Amended by [ADR-110](#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) (opt-in and the popup switch).** The standing on a success and the window of the block need `send_usage_limits`; without it the block keeps only the 429, `Retry-After`, `X-Should-Retry: false`, the same body and `x-codex-promo-message`. With `codex_model_switch_prompt` the gateway no longer writes its own credits flag, which this ADR used to suppress the popup.
+
+**Amended (cached windows yield from 75 %, issue #418 follow-up, [PR #423](https://github.com/JLor08/op-ai-gateway/pull/423)).** On a `/v1/responses` success whose Codex figures would come only from
+ADR-108's window cache (a local model, a translated reply, or a native vendor reply without any Codex rate-limit header, as an API-key
+account usually sends), the gateway's own fullest limit replaces them, the whole cached set included, once its written percent (floored,
+at most 99) is 75 or more, which is Codex's first warning step (`codexGatewayLimitTakesOver`, `codexGatewayTakeoverPercent`). Fresh
+relayed vendor figures still win whole. Below 75 %, for a principal without a quota or budget, with a failed reading, or with a reset not
+after the moment of writing, nothing changes: the cached windows are attached and the gateway writes nothing. Why: a local-model request
+does not consume the subscription, and with cached windows living up to 7 days a capped user's first notice was the block.
+
+**Consequences and limits.**
+
+- A principal who also uses an OpenAI subscription sees the gateway's limit on responses that carry no fresh subscription figure from
+  75 % of its fullest limit; below that the cached subscription windows are shown and Codex gives no gateway warning. Fresh relayed
+  vendor figures always win; a block still names the gateway's limit.
+- From 75 % the display alternates between the subscription (vendor replies) and the gateway (local replies). The subscription's weekly
+  (secondary) bar disappears on local replies, because the gateway writes one window, and returns with the next vendor reply. Codex keeps
+  one warning step counter per slot for the whole chat session, shared by whatever figure fills the default family's primary slot, so a
+  75 % warning already taken by the subscription's 5h window means the gateway's first warning comes at 90 %, and the other way round: a gateway warning taken first (at 80 %, say) swallows the
+  subscription's 5h warning at that step. The alternation repeats no warning (verified in Codex CLI 0.137.0).
+- Codex carries credits over between responses: once a gateway response has set `x-codex-credits-has-credits: true` (a takeover reply
+  included), a later local-model reply that carries only cached subscription windows also suppresses the subscription's popup, until the
+  next vendor response sends its own credits headers.
+- During a block the 100 % window replaces the display; `/status` labels the row `Daily limit` without the `OP AI Gateway` prefix (a block
+  carries no limit name), and a subscription user sees the gateway's 0 % until a later success carries other figures: the subscription's, relayed or cached, or the gateway's own window.
+- The figures are those of admission. A response that outlives its period's boundary carries no gateway header (ADR-107 writes the stale
+  reset there), and the next response corrects it.
+- The memory driver has no `usage_events`, so a configured principal reads 0 % there.
+- The display and the block sentence rest on undocumented client behavior (the last family wins, the credits flag's effect on the popup,
+  the promo message's precedence below a `limit-name` header, the window-minute labels). See the risk entry in
+  [Risks & Technical Debt](11-risks-and-technical-debt.md#111-operational-risks).
+- → [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
+  [the limiter](cross-cutting/telemetry-usage-observability.md).
+
+## ADR-110 — Usage-limit signals leave the gateway only for tokens that opt in, and what stops a retry survives without it
+
+**Context.** After ADR-106 to ADR-109 (#407, #413, #416, #418) every principal's responses told coding clients about usage limits: a vendor
+subscription's windows (`anthropic-ratelimit-unified-*`, `x-codex-*`), cached copies of them, and the gateway's own quota and budget
+standing. There was no token setting for it, and ADR-108 had rejected one. The owner wants it to be a deliberate per-token choice: a token
+sends nothing about usage unless its owner switched it on, except what stops a client from retrying uselessly once nothing is left. Second,
+the gateway always suppressed the Codex CLI's `Switch to gpt-5.4-mini` popup through the credits flag, which someone who only works with a
+Codex subscription may want (issue #420).
+
+**Decision.**
+
+- **Two per-token switches, both default off, on user tokens and service tokens.** `send_usage_limits` and `codex_model_switch_prompt`
+  (`api_tokens` columns, migration 112). User tokens set them on create and PATCH and read them back; they are ungated and need no rotation.
+  Service tokens set them on create and read them back; editing one is follow-up issue #421, so until then turning a switch on for a service
+  token means recreating it, and every existing service token is off after the upgrade.
+- **With `send_usage_limits` off, no usage-limit header reaches the client on any path.** That is no `anthropic-ratelimit-unified-*` and no
+  `x-codex-*` header, on the native relay (vendor credits headers included), the cached-window attach, the translate path (buffered and SSE),
+  the gateway's own standing on a success, and the blocks. The window caches neither observe nor attach for that token. With it on,
+  behavior is as before, and the vendor-account entitlement still applies on top for vendor figures.
+- **What survives without the opt-in:** the status codes, `Retry-After`, `X-Should-Retry`, and the `billing_error` and `usage_limit_reached`
+  bodies including the sentence and `resets_at`. These stop the retry, verified on the clients: Claude Code stops on `X-Should-Retry: false`;
+  Codex 0.137.0 never retries a 429 `usage_limit_reached`, ignores the retry headers, and retries a 402 five times (so the Codex block
+  stays a 429).
+- **The one exception, `X-Codex-Promo-Message` on the Codex block.** Codex 0.137.0 prints only its own `You've hit your usage limit` line plus
+  that header and never the body's `message`; without it a gateway block would read like a ChatGPT plan limit. The header carries no figure,
+  only that it is the gateway's quota and whom to ask.
+- **`codex_model_switch_prompt` is effective only together with `send_usage_limits`.** When on, the gateway never writes its own
+  `X-Codex-Credits-Has-Credits` or `X-Codex-Credits-Unlimited`, on the success standing or the block, so Codex shows the popup at 90 % of its
+  default window. The vendor's relayed credits headers are untouched.
+- **Two switches, not one.** The existing `claude_code_usage_display` option only shapes the secret (the "Claude Code token format") and
+  changes only through rotation, because a secret's shape cannot change in place. Merging it with a live switch would make a toggle
+  rotate a credential. Claude Code needs both the format and `send_usage_limits`; Codex needs only the switch.
+- **Backfill.** Migration 112 sets `send_usage_limits = 1` for user tokens with `claude_code_usage_display = 1`, so a token that already
+  showed the limits in Claude Code keeps doing so. Every other token starts off, and so does every `codex_model_switch_prompt`.
+
+**Unchanged:** capture redaction (entitlement-based), `writeLimitDenied`, the verbatim relay of vendor error bodies, status codes and error
+types of blocks, and the ServerAgent.
+
+**Rejected:**
+
+- **One switch that also shapes the secret.** See above: a toggle would have to rotate the token.
+- **Dropping `Retry-After` and `X-Should-Retry` with the figures.** They carry no usage figure and are what keeps Claude Code and the SDKs from
+  retrying into a block.
+- **Dropping `X-Codex-Promo-Message` with the rest.** A block would then read as a ChatGPT plan limit.
+- **A service-token update route in the same change.** Service tokens have no field-level update today; #421.
+- **Gating by entitlement only.** Entitlement says who may see a vendor account's figures, not whether a token's owner wants a client to
+  display them.
+
+**Consequences and limits.**
+
+- Codex carries credits over between responses: with `codex_model_switch_prompt` on, the popup also appears while the default window shows the
+  gateway's own limit, because with the switch the gateway sets no credits flag, so none carries over from its responses. A session that already received one from
+  the gateway before the switch was turned on keeps it until it restarts.
+- A token with `send_usage_limits` off observes nothing into the window caches, but a vendor response on it still purges a revoked entry of
+  its principal from that account (`Forget`), after an entitlement check that only runs when such an entry exists. An opted-in sibling token
+  therefore never keeps frozen windows beyond the observe-time limitation of ADR-106.
+- Service tokens cannot change a switch until #421; recreate the token.
+- → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
+  [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
+  [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).
+
+## ADR-111 — Strata: one type string for an application and a runtime spec, a main-last GPU placeholder and an opt-in Windows job-object process tree
+
+**Context.** [Strata](https://github.com/Niko1221/Strata) (MIT) is a local inference engine for Qwen-family models with
+OpenAI- and Anthropic-compatible APIs. The goal was to let Claude Code and Codex, with a gateway token, use a Strata model
+through the gateway with routing, usage accounting and correct RAM and per-GPU VRAM figures, like every other backend, in two
+shapes: an operator-run Strata registered by URL, and a `strata serve` the agent launches itself on a Windows NVIDIA multi-GPU
+host. The facts below were read off `Niko1221/Strata@c6f6427` (release 0.2.17, Control and engine 0.1.63); the LAN-share
+facts were measured against a running desktop app.
+
+- **Two upstream shapes.** `strata serve --config <json> --host H --port P --output jsonl [--shutdown-timeout S]`
+  runs the full route set in the foreground and binds its socket only once the engine is ready. The desktop app's LAN share
+  (the app port + 1) serves only `/v1/models`, `/v1/chat/completions`, `/v1/messages` and `/v1/responses`; everything else
+  is 404 there.
+- **Auth.** `GET /health` needs no key (`{"status":"ok","service":"strata",…}`, `strata serve` only); `/v1/models` and the
+  inference routes need it (`--api-key`, `STRATA_API_KEY` or the config's `api_key`; the client sends `Authorization:
+  Bearer` or `x-api-key`). A keyless Strata answers 403 to a request whose `Host` is not an IP literal.
+- **One model per process.** `/v1/models` lists one model whose id is the config's `model_name`; newer releases add
+  `context_length`, a `meta.n_ctx` engine block and `architecture.input_modalities`. The request's `model` is ignored.
+- **Telemetry.** `/props` (llama.cpp shape), `/metrics` (JSON unless asked for Prometheus with `?format=prometheus` or an
+  `Accept` of `text/plain`/openmetrics; the Prometheus body uses llama.cpp's metric names plus `strata:*` counters),
+  `/v1/telemetry`, `/slots` and `/v1/status` (the engine version) exist on `strata serve` only, and need the key.
+- **GPU order.** The engine's stage order puts the **main** card **last** (`"gpu": [helper…, main]`); `"gpu_order":
+  "as_given"` turns Strata's speed reordering off, and a hand-set `gpu` wins over `gpu_roles`. `gpu` takes
+  nvidia-smi (host) card numbers, as a list or a comma-separated string (`"0,1,2"` reads like `[0,1,2]`). `strata serve` has
+  **no `--gpu` flag** (only Strata's internal `serve/server.py` has one): the card list can only live in the config file.
+- **The run config is not ours to build.** `strata launch` writes a JSON run config (engine paths, context, KV, vision,
+  `layer_split`, `vram_reserve_mib`, `engine_ready_s`). `engine_ready_s` is not a measured load time: it is Strata's own
+  ceiling for waiting on the engine, 900 s by default.
+- **Windows process shape.** The Terminal installs `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd`, which runs the
+  bundled `python.exe` on `strata.py`; the engine runs as a grandchild in Strata's own kill-on-close job object, holds nearly
+  all of the VRAM and RAM, and stops gracefully on Ctrl-Break (drain, then engine quit). The agent's Windows stop was
+  kill-only and reached the root process alone; its RAM figure was the root PID's private working set, and its VRAM rows
+  were per PID.
+- **Media.** `Vision.load` turns `data:` into bytes, fetches `http://`/`https://`, and otherwise reads the reference as a path
+  on the model host (`file://` stripped first), with case-sensitive `startswith` checks. Its only guard
+  (`_no_local_images`) concerns a browser `Origin`, which a gateway request never carries.
+- **Usage.** Anthropic usage reports `input_tokens: 1` and the prompt in the cache fields. Only chat completions carry
+  llama.cpp-style `timings`. `strata serve`'s `/v1/messages` and `/v1/responses` carry none, streamed or buffered (the
+  desktop app's LAN-share listener adds top-level `timings` to a buffered `/v1/responses` body).
+
+**Decision.**
+
+- **One string, `strata`, for both namespaces.** `routing.ProviderStrata` (application type) and
+  `routing.RuntimeSpecTypeStrata` (runtime spec type) are the same string, as for `llama_cpp`, so the kind checks keyed on
+  `Target.EffectiveKind` cover a static application and an agent-launched spec with one comparison. The application
+  dispatches to the shared OpenAI-compatible client (`providerClients`), `viewRuntimeType` maps it to the spec kind, and
+  `routing.DeriveRole` falls back to chat for it. Strata serves no `/v1/decisions`, so it joins `llama_cpp` and `vllm_sr` in
+  `routing.DecisionsPassthroughCapableKind` (`decisions_mode: passthrough` and `systemone_mode: translate` are refused at
+  save). Live timings stay off until measured. Types are plain text columns, so the type itself needs no migration.
+- **The application type works against both upstream shapes.** Defaults: port 8080, flavors `openai` and `anthropic`,
+  `responses_mode` and `messages_mode` both `passthrough` (Claude Code and Codex speak Strata's native routes), health check
+  `health_path` with the path `/v1/models` and loaded models `/v1/models` in the `openai` format (the one route both shapes
+  serve; the application token goes out in the application's token header, `Authorization: Bearer` by default, on every probe, which needed no change), no context
+  probe path, `timeout_ms` 30000 like `llama_cpp`. `/props` and `/metrics` are never requested for it, so the share's 404s
+  are not errors.
+- **Context and vision come from `/v1/models`, for `strata` only.** The provider parses `context_length`, else
+  `meta.n_ctx`, and an `architecture.input_modalities` that lists `image` from an `openai`-format listing
+  (`provider.LoadedModelInfoLister`, generic plumbing). The health loop's loaded pass records them
+  (`recordListedModelInfos`) only for an application of type `strata` without its own `context_probe_path`, so no other
+  type's behaviour changes: the context through `UpdateMappingContextProbe` (source `probe`, the lock and the size cap
+  apply), vision as `yes` under the new probe-rank source `strata_models`. A listing without `image` writes no verdict,
+  never a `no`, because nothing pins the list as exhaustive.
+- **The spec type launches `strata serve`.** Detection matches the binary's basename exactly (`strata`, `strata.cmd`,
+  `strata.exe`, or a `strata-<name>[.exe]` engine helper; case-insensitive), checked last, so it shadows no existing row
+  and a name that merely contains the word stays `custom`. Probe paths: metrics `/metrics?format=prometheus` (the existing running/queued parser
+  reads llama.cpp's names) and context `/props` (`default_generation_settings.n_ctx`, the llama.cpp extractor); the agent's
+  `/props` capability probe runs as for llama.cpp, and the router's `/upstream/{model}/props` context probe is kept. The
+  health path is `/health`, which answers without a key. The portal template, filled into a new spec when the type is
+  chosen: binary hint `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd` (the operator enters and allowlists the
+  absolute path), args `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl
+  --shutdown-timeout 3`, env `STRATA_API_KEY=${API_TOKEN}` (masked in the reported
+  command, never in a file), `set_visible_devices` **on in `args` mode** (a visibility variable would renumber the cards
+  and break the config's host-numbered `gpu`; in `args` mode the agent injects none, and the config's
+  `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` is the enforcement — the args-mode placeholder rule of ADR-034 now accepts the
+  card-list placeholder in a config file's content and counts `${HOST_GPU_IDS}`/`${HOST_GPU_IDS_MAIN_LAST}` as card
+  lists; no new mode value, since an agent degrades an unknown mode to `env`), startup timeout 960 s, flavors and
+  modes as the application type, `process_tree` `job`. `--host 127.0.0.1` because the agent reaches every child on loopback,
+  as the other templates do. **Correction (found on hardware, 2026-11-23):** the original template passed `--gpu ${HOST_GPU_IDS_MAIN_LAST}`, which `strata serve` rejects (exit 2, "unrecognized arguments"); the card list now lives in the config file as `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"`, written by the run-config import.
+- **The run config is imported, not rebuilt.** The Strata spec form's "Import run config" takes the pasted `strata launch`
+  JSON and writes it as the config file `strata.json`: it keeps every key except launcher bookkeeping (`args_written`,
+  `port`, `host`, `open_browser`, `gpus_asked`, `gpu`, `gpu_roles`, `gpu_cards`, `gpu_order`, every `ui_*` key and
+  `api_key`), keeps `engine_ready_s`, sets `model_name` to `${MODEL}` and `gpu_order` to `as_given`, proposes the GPU rows
+  (main first, from `gpu_roles`, else from the legacy `gpu` list rotated so its last entry comes first), proposes the
+  startup timeout `max(engine_ready_s, 900) + 60` and fills an empty upstream model name. It refuses a body that is no JSON
+  object or lacks `exe` or an `args` list, warns on a dropped `api_key` and on a positional `layer_split` (reordering GPUs
+  changes its meaning), and respects the 16-file and 64 KiB limits. It is a pure frontend transform; the stored file is an
+  ordinary config file afterwards.
+- **`${HOST_GPU_IDS_MAIN_LAST}`** is a new exact-match, non-secret placeholder, a sibling of `${HOST_GPU_IDS}`: the spec's
+  declared, deduplicated host indices with the first (the main card) moved last (`2,0,1` → `0,1,2`; one GPU is itself),
+  allowed in args, env and config-file content, a hard `not_permitted` error on a spec without GPUs. The name is generic, not
+  Strata's: it says what it renders. GPU roles are therefore the operator's row order: **position 1 is main, the rest are
+  helpers.**
+- **Host paths are refused for a Strata target, on both paths.** On the translate path `mediaURLsRefused` accepts only an
+  image reference that starts with lowercase `data:`, `http://` or `https://` (Strata's own checks are case-sensitive, so
+  `HTTP://x` would reach its path branch). Because Strata's default modes are passthrough, the raw `/v1/messages` and
+  `/v1/responses` body is scanned too, before it is relayed (`strataPassthroughMediaRefused`, from
+  `relayPassthroughTarget`): every Anthropic `image`/`document` block at any depth (a `base64` source passes; any
+  `source.url`, `source.path` or string source is checked, and a `url`/`path` source with no reference is refused) and every
+  `input_image`/`image_url` part. A refusal is 400 `chat.media_url_unsupported`, logged at Warn, with a usage row and no
+  upstream call. Malformed JSON is left to the relay's own handling. **http(s) stays allowed**, as for SGLang and vLLM:
+  Strata fetches the URL from the model host, so a key holder can make that host fetch a URL it can reach. That is the
+  accepted posture of every vision backend here; blocking it breaks ordinary vision use.
+- **Token counts need no code change, and are pinned.** The passthrough scan already folds Anthropic's cache buckets in; the
+  recorded split is disjoint (`input + cached + cache_write + output = total`), so Strata's `input_tokens: 1` with 53 cache
+  reads and 4 cache writes records input 1, cached 53, cache write 4. Chat completions (buffered and streamed) and a
+  buffered `/v1/responses` that carries `timings` record prompt and generation tokens per second from them.
+- **Tokens per second without `timings` are gateway-measured (#426).** For a streamed `/v1/messages` and `/v1/responses`
+  whose frames report no rate, the passthrough scan derives both. The generation rate is the output tokens over the window
+  from the first content frame to the last byte. It was already derived for Anthropic, and for Responses on vendor targets
+  only; the vendor gate is gone, so a Codex request to `strata serve` is rated like a Claude Code one. The prompt rate is
+  new: the processed prompt tokens (fresh input plus cache creation, cache reads excluded) over the time from the upstream
+  send (`proxyNative` stamps it right before the round trip) to the first content frame, floored at 50 ms and at 256
+  processed tokens. It is time-to-first-token based and includes network and queueing, so it errs low when the upstream
+  reports its cache reads; an upstream that reuses a prefix cache without reporting it (vLLM without
+  `--enable-prompt-tokens-details`, llama.cpp slot reuse) makes it read high. It is therefore analytics-only: recorded on the
+  usage row, never fed into the mapping's `PromptTokensPerSecond` EWMA. Upstream `timings` always win, Chat Completions is
+  unchanged, and a buffered response derives neither rate. The derived generation rate feeds an opted-in mapping's
+  `GenTokensPerSecond` EWMA as the derived Anthropic generation rate already did
+  ([Telemetry §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests)).
+  Rejected: deriving only for a `strata` target (the same gap exists for any self-hosted Responses upstream without
+  `timings`), and waiting for Strata to attach `timings` upstream (still worth asking; an upstream figure would then win
+  unchanged).
+- **The agent authenticates its own child probes.** A keyed child (Strata, or a llama-server with `--api-key`) answers 401
+  on everything but its health path, so the agent's metrics scrape, context probe and `/props`-shaped capability probes read
+  nothing from it. The gateway now pushes `api_token_header` beside a non-empty `api_token` (the effective header from
+  `routing.SpecUpstreamAuth`; empty means `Authorization: Bearer`), and the agent attaches the credential to those probes
+  (`collector.NewPromScraper`, `collector.WithProbeAuth`). An authenticated probe follows no redirect; the token is never
+  logged, never in a reported URL, and held in memory only. A token-less spec's document and probes are unchanged.
+- **`process_tree`: an opt-in Windows job-object mode.** A runtime spec gets `process_tree`, `direct` (default, unchanged
+  behaviour) or `job` (migration 113, `text not null default 'direct'`; 400 `runtime_spec.process_tree_invalid` for any
+  other value). The push carries `process_tree: "job"` and omits it for `direct`, so existing documents and ETags are
+  byte-identical, and the field is launch-affecting. For a **native** spec on **Windows** with `job`, the agent:
+  - creates a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, starts the child `CREATE_SUSPENDED |
+    CREATE_NEW_PROCESS_GROUP` (plus a hidden console of its own when the agent has none, as a service), assigns it to the job
+    and only then resumes it, so no grandchild escapes; Strata's own job nests inside it (Windows 8 and later);
+  - stops it gracefully with `CTRL_BREAK_EVENT` to the child's group (directly on a shared console, else by briefly
+    attaching to the child's console with its own Ctrl handling disabled), waiting at most 1 s for the delivery; a failed or
+    hung delivery is logged and falls straight through to the kill;
+  - kills with `TerminateJobObject`, the whole tree, after the unchanged 5 s kill grace (the 10 s drain grace before the
+    stop signal is unchanged too, which is why the template passes `--shutdown-timeout 3`);
+  - closes the job handle as soon as the root exits and again at reap, so leftover descendants die at once, with no grace,
+    and a grandchild holding the stdout pipe cannot keep the reap open. Because the agent holds the only handle, the tree also
+    dies when the agent process dies;
+  - measures the tree: a registry of managed trees (`collector.RegisterProcessTree`, injected through
+    `ManagerOptions.ProcessTrees` so the runtime package does not import the collector) charges the root the summed private
+    working set of the job's processes, and rewrites PDH per-process GPU memory rows of tree members to the root before
+    the per-GPU sum. A PID in no managed tree keeps per-PID attribution.
+
+  `direct`, every non-Windows platform and every `wsl` spec (stored `job` is inert there; the portal hides the control) are
+  unchanged. **Verified on hardware (2026-11-23):** the job-mode start (suspended start, job, resume) works with `strata.cmd` as the binary; `${HOST_GPU_IDS_MAIN_LAST}` resolved to `0,1,2` for GPUs declared `2,0,1` and Strata logged a layer split across GPUs `[0, 1, 2]` (main card last); ready in 38 s; the live log shows the server's output including its JSONL `starting`/`ready` events; the agent's authenticated metrics and context probes both succeeded (context 262144); per-GPU VRAM is attributed over the whole tree (the engine is a grandchild, so per-root attribution would read about 0); a chat completion through the gateway answered. **Stop verified on hardware (2026-11-23, agent 0.21.0, 3 GPUs):** the portal's stop delivered Ctrl-Break and Strata logged `stopping` (`reason: "sigbreak"`), `draining` (0 pending, 3 s deadline) and `stopped` (`drained: true`, `cancelled_requests: 0`, `exit_code: 0`) about 2.7 s after the stop, inside the 5 s kill grace; cmd.exe then printed its localized "Terminate batch job (Y/N)?" prompt to the live log and the root exited about 0.1 s later with exit code -1, and the spec state became `stopped` (intentional stop, restarts 0). The prompt does not block the stop; its only side effects are a cosmetic log line and a root exit code of -1 instead of 0. VRAM was freed on all three GPUs within about 2 s (host totals 24.5/32.9/33.3 GB to 0.3/0.0/0.0 GB) and host RAM in use fell from 22.1 to 10.6 GB, so the engine and vision processes ended; leftover non-GPU processes (cmd.exe, python.exe) were not inspected in Task Manager. `strata.cmd` stays the documented binary and the `python.exe` fallback is not needed. **Known RAM under-count:** the spec's measured RAM (private working set summed over the job) read 7.7 GB while host RAM in use fell by about 11.5 GB at stop; pages that are not private working set (locked or mapped model pages, the file cache, driver allocations) are not counted. **Still pending:** the RAM figure against Task Manager beyond the above, Claude Code and Codex round trips, the Windows-tagged unit tests and the console-less (service) agent path. The template keeps `strata.cmd`; no fallback to the bundled `python.exe` is needed.
+- **The gateway refuses a move into `job` it knows cannot be honoured.** An operator's spec PUT that moves a spec into
+  `job` (a new spec, or one not stored as `job`) is refused with 400 `runtime_spec.process_tree_unsupported` when the
+  server's reported OS is not Windows, or its agent has declared its features since the gateway started and
+  `runtime_process_tree_job` is not among them. When either fact is still unknown and neither known fact refuses, the save
+  succeeds and the runtime warnings carry `process_tree_agent_unknown`. Silently running a job spec as `direct` would leave
+  the engine alive on stop. A re-save of a spec already stored as `job` is not refused: the portal's Stop/Start/Pin/Clear
+  overrides re-send the whole spec, and refusing them would lock the operator out. On an agent known to lack support such
+  a spec draws the runtime warning `process_tree_agent_unsupported` instead; there is no push-time withhold.
+- **Agent `0.20.1` → `0.21.0`, MINOR, one bump for the branch.** Two flags on the agent's list only, both `Since: "0.21.0"`:
+  `runtime_gpu_main_last` (resolves the new placeholder; the portal warns when a spec uses it and the agent lacks the flag)
+  and `runtime_process_tree_job` (honours `job`). The latter is declared on every OS, as `runtime_exec_wsl` is, because the
+  features registry has no per-OS mechanism; the gateway checks the reported OS separately. The authenticated child probes
+  and the Strata context extractor need no flag.
+- **The 960 s startup timeout stays, and its warning is truthful.** 960 s is `max(engine_ready_s, 900) + 60` for the default
+  engine wait, so the agent never gives up before Strata does. Against the default `server_agent` `timeout_ms` of 600000 it
+  raises `timeout_ms_below_startup_timeout`, correctly: a cold start longer than 600 s would be cut short. The spec type note
+  tells the operator to raise the parent application's timeout to at least 960000 ms.
+- **The supported Windows setup is the agent running under the account that installed Strata.** `%LOCALAPPDATA%`-relative
+  installs and the run config's `component:` references resolve per user, so an agent under LocalSystem or another account
+  is unsupported for Strata. Ctrl-Break delivery still cannot hang there: it falls back to the job kill.
+
+**Rejected:**
+
+- **Two type strings** (`strata` and `strata_serve`). Several kind checks compare one string across both namespaces; a second
+  name would have to be added to each.
+- **Coercing passthrough to translate for Strata** (the `sglang_omni` route). Claude Code and Codex should reach Strata's native
+  routes; scanning the raw body closes the bypass without losing them. The cost is a scan miss on a field nobody foresaw,
+  mitigated by checking every image source field at any depth.
+- **Recording `/v1/models` context for every type.** It would change existing applications whose listings start carrying
+  `context_length`. Gated on `strata`; widening later is easy.
+- **A 600 s template timeout, or a higher global `server_agent` default.** The first undercuts Strata's own engine wait; the
+  second changes every existing application.
+- **A push-time withhold of `job` specs** from an agent that lacks the flag (as for `wsl`). The save refusal covers the normal
+  path; after an agent downgrade a stored job spec runs `direct` until it is saved again, which the portal's refusal message
+  names.
+- **A longer stop grace for job mode.** In-flight requests are drained by the agent before the signal; the engine's own unmap
+  may be cut short by the job kill, which frees the VRAM immediately.
+- **Job mode by default.** It changes stop and agent-crash behaviour for every Windows spec; the operator opts in per spec.
+- **Blocking http(s) image URLs.** As for SGLang and vLLM: it breaks ordinary use, and the model host fetching a URL is the
+  accepted posture.
+
+**Consequence:**
+
+- A Strata model is reachable through the gateway from Claude Code, Codex and the OpenAI and Anthropic APIs, as a static
+  application (`strata serve` or the desktop share) or as an agent-launched spec, with context and vision verdicts where the
+  listing states them.
+- A client sending a host path or `file://` image reference to a Strata target gets a 400. A Strata target still fetches any
+  http(s) URL it is given.
+- Streamed Claude Code and Codex requests to Strata record gateway-measured generation and prompt tokens per second; the
+  prompt figure is time-to-first-token based, needs 256 processed tokens (a turn served mostly from Strata's cache records
+  none) and is analytics-only. Buffered ones record none. Strata's `/v1/telemetry`,
+  `/slots`, `/v1/status` and the `strata:*` counters are reachable with the spec token but not read yet; what the portal
+  shows from them is a follow-up.
+- On Windows, a `job` spec's stop reaches the whole tree, its RAM and per-GPU VRAM cover the whole tree, and its tree dies with
+  the agent. A `direct` spec is unchanged: kill-only, root process only, children outlive an agent crash.
+- An older Strata answers 404 on `/v1/responses`; the application type note says to set `responses_mode` to `translate`
+  then.
+- → [Agent-Managed Model Runtime §3.4](cross-cutting/agent-runtime-manager.md#34-runtime-server-kind-and-per-kind-probe-path-derivation),
+  [§3.9](cross-cutting/agent-runtime-manager.md#39-the-windows-process-tree-process_tree),
+  [Routing & Model Selection §1](cross-cutting/routing-and-model-selection.md#1-data-model),
+  [Compatibility & Inference §3.1](cross-cutting/compatibility-and-inference.md#31-openai-chat-completions).
+
+## ADR-112 — Vendor account groups are personal, ordered same-vendor sets that shadow their members, fail over per account and model on status-only limit errors and skip thresholds for members whose usage is not shared
+
+**Context.** A token reached a vendor model through exactly one vendor account, so when that account's subscription window was used up,
+Claude Code or Codex stopped until the window reset. The user wants to keep working: a typical set is "my Claude subscription first, a
+subscription shared with me second, a paid API key as the reserve". The design had to avoid widening reach, switching mid-stream,
+inventing usage figures and hammering a vendor's rate-limited usage endpoint, and it touched the entitlement of ADR-106.
+
+**Decision.**
+
+- **A group is a personal, ordered set of accounts of one vendor.** Table `vendor_account_groups` (owner, vendor fixed at create, name,
+  `model_prefix`, `active`/`disabled`, three thresholds, default 99) plus the member link table; positions are a strict priority, not a load
+  balance. Members mix auth types and mix the owner's own accounts with accounts shared with the owner. Groups are not shareable, and a
+  service owns none. Cross-vendor groups are out of scope because model ids differ across vendors, so no failover by model name could work.
+- **A group never widens reach.** The member must be reachable by the owner at save time, and routing re-reads the grant on every request,
+  so a revoked share drops the member silently. A group whose every member is unreachable resolves as "not served by this group" and falls
+  through to the accounts and the standard path, never as an error. A token opted into a group uses its members through the group even when a
+  shared member is not named under `accounts`: putting the account into the group is itself the user's named choice.
+- **A group shadows its own members.** When a token uses a group and one of its members under the same effective name (own subscription with
+  an empty prefix, a group with an empty prefix starting with it, a token with "all + incl. groups"), the group answers. Safe because the
+  group serves that member first anyway; it is what makes plain names like `claude-opus-4-5` fail over without extra setup. Every other
+  collision is a save-time `400` (group claim versus another group or an account outside the group); the routing backstop is own groups
+  (id order), then own accounts, then shared accounts.
+- **Selection** per request, by position: reachable now, active (and subscriptions switched on), serves `(model, dialect)`, not over a threshold,
+  not in cooldown. A category is over only when the percent is known and at or above the threshold and its reset time is unknown or in the future;
+  a snapshot past its own reset counts as renewed. When all usable members are blocked, the one that frees up soonest (the latest reset among its
+  blocks; unknown sorts last) serves, so the vendor's own answer reaches the client under the existing header rules. A failover pass
+  (`ExcludeVendorAccountIDs` non-empty) never falls back to a blocked member.
+- **Thresholds are skipped for a shared member whose owner has not switched on `share_usage_with_members`.** The borrower is not entitled to those
+  figures, and skipping at 99 % would reveal them. Such a member is used until the vendor answers a limit, and failover then moves on. The
+  group status view applies the same rule: such a member shows only active, cooldown (its end from `Retry-After` or the default, never a scraped
+  reset) or not usable.
+- **`share_usage_with_members` defaults to on for accounts created from now on** (the create path decides; the column default stays 0), so
+  shared members normally take part in thresholds. Existing accounts keep their stored value because a stored off cannot be told from a
+  deliberate choice. This amends the ADR-106 and ADR-108 entitlement wording from "opted in" to "has it on".
+- **Failover on vendor limit errors, decided by status only.** HTTP 429 and 402 are limit errors (OpenAI `insufficient_quota` and Codex
+  `usage_limit_reached` arrive as 429, so no body parsing); 5xx and 529 are not. On a limit the gateway scrapes the response headers into the
+  member's snapshot, cools the member down, re-resolves with it excluded and retries on the next member; each member is tried at most once per
+  request, and with none left the client gets the last vendor answer (verbatim on passthrough, the translate path's `502 provider.unavailable`
+  unchanged). Only a target that came from a group fails over, and only when the re-resolve returns a different member of the **same group**: the
+  own-account step ignores exclusions, so a re-resolve that lands outside the group ends the failover and the original answer is relayed.
+- **The cooldown is per `(account, upstream model)`, in memory.** The end is the earliest of `Retry-After`, the scraped Anthropic reset and the reset
+  of a Codex window at 100 %, each only when in the future (a reset already past would create a zero-length cooldown and is ignored); with none
+  known it is 60 s. A per-model weekly window can be days away, and an account-wide block would push other models to the paid reserve while the
+  subscription still has room; account-wide exhaustion is what the thresholds cover. A restart forgets it, which at worst costs one rejected attempt.
+  Each entry keeps a second, public end from `Retry-After` or the 60 s default alone; routing honours the precise end, and the group status view
+  shows the public one for a member whose usage the viewer is not entitled to, so the process-wide entry cannot leak a scraped reset to a borrower.
+- **No mid-stream switch.** Failover happens before the first upstream byte. On the translate stream the gateway's own opening frames
+  (`response.created`, `message_start`) do not count: they are member-independent, so the request may still move on after them; the first
+  upstream event ends the window. Passthrough peeks the status before writing anything. Once a byte of the member's response reached the client,
+  the client keeps the stream it has.
+- **A usage pull for Anthropic subscriptions and a throttled group pull.** `GET api/oauth/usage` (VERIFY-LIVE, undocumented, ToS-restricted
+  like the whole subscription path) fills the five-hour and weekly windows with their reset times. For a group member skipped by a threshold
+  whose reset is unknown, the resolver asks for a pull; it is asynchronous (never on the request path), at most once per 15 minutes per account,
+  with exponential backoff after a 429 from the endpoint, capped at 4 hours.
+- **The client-facing window cache drops, it does not mix.** A response served by a group member that reports no windows (an API-key reserve) attaches
+  nothing and drops the principal's cached entry, so the client never shows or blocks itself on the windows of a member the group skipped. There is no
+  aggregation across members.
+- **Attribution.** A usage event keeps `account_id` as the member that served and gains `vendor_group_id` (empty outside a group; migration 114).
+- **No new flag.** Everything sits behind `vendor_accounts_enabled`; token policy and ServerAgent are unchanged apart from the policy's `groups` and
+  `include_groups` fields (stored in the existing JSON column; old rows read as no groups).
+
+**Rejected:**
+
+- **Shareable groups.** A shared group would need its own authorization story; the first need is the owner's own continuity.
+- **An account-wide cooldown.** It would cost the user the models that still have room.
+- **Body-based limit detection.** The status already separates the cases that matter, and bodies differ per vendor and change.
+- **Thresholds for every shared member regardless of the owner's opt-in.** A skip at the threshold would leak the figure the entitlement withholds.
+- **Flipping `share_usage_with_members` for existing accounts.** An old off may be deliberate.
+- **Failing over to 5xx or `overloaded`.** Those are not exhausted quotas, and moving to a paid reserve for a vendor outage is a cost decision the user
+  did not make.
+- **Mid-stream failover.** It would corrupt the client's stream.
+
+**Consequences and limits.**
+
+- A translate stream that fails over after the gateway's opening frames can show one stream whose content came from the second member; a client
+  that keys on frame ids sees no corruption, only one id sequence.
+- The cooldown and the pull throttle are per process; a cluster of gateways learns from its own traffic.
+- The Anthropic usage endpoint is unverified against a real account and rate-limits hard; a wrong shape or a persistent 429 leaves only the
+  header scrape and the limit-error failover, which still keep the group working.
+- A per-model window (Anthropic Opus or Sonnet weekly) is not a threshold; the member is skipped through its limit error and cooldown.
+- A skipped member's cached window entry is dropped only on the attach path, so a Codex takeover or the `send_usage_limits` gate can leave it until the
+  next observation.
+- → [External Vendor Accounts §12](cross-cutting/external-vendor-accounts.md#12-vendor-account-groups),
+  [HTTP API surface](reference/api-surface.md#vendor-account-groups),
+  [Data model](reference/data-model.md#external-vendor-accounts-anbieter).
+
+## ADR-113 — Per-process VRAM on AMD Linux: KFD sysfs, not start-delta attribution or amd-smi
+
+**Context.** On AMD Linux hosts the runtime manager never measured a spec's VRAM, so an unfilled `vram_estimate_mb` waited forever and the
+benchmark reported only the per-GPU delta (#432). Two causes stacked: the agent's `rocm-smi` collector asked for flags and read keys of the pre-4.0
+(3.x) output, while rocm-smi 4.x spells them differently, so on such a host the device name, total VRAM, UUID and PCI bus all read empty or 0; and no
+per-process measurer existed for AMD at all. With the total at 0, the auto-detected budgets of
+[ADR-083](#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides) were silently
+absent on those hosts.
+
+**Decision.** The collector requests `--showproductname --showmeminfo vram --showbus --showuniqueid` and reads both key spellings (name from
+`Device Name`, then `Card Series`/`Card series`, then `Card Model`/`Card model`; `Unique ID` as UUID; `PCI Bus` as `pci_bus_id`), treating
+`N/A`-style sentinels as "not reported". A new KFD measurer reads `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes), maps each `gpu_id` to
+its rank among the topology's GPU nodes in numeric node order (the CPU node is skipped), attributes through the process-group leader as the NVIDIA
+path does, sums and floors to MiB, and returns nil on any failure. On Linux the selector prefers NVIDIA compute-apps, then KFD, else installs
+nothing; other non-Windows hosts keep NVIDIA-or-nil and Windows keeps PDH. On the test host (two RX 6900 XT, kernel 6.8, ROCm 10.2,
+rocm-smi 4.0.0) a 4B llama.cpp model measured 3949375488 B on GPU 0 and a 12B model 9405710336 B on GPU 1, the card totals matched, and the KFD node
+rank equalled the rocm-smi card order.
+
+**Alternatives rejected.**
+- *Start-delta attribution like the WSL path* ([§3.8](cross-cutting/agent-runtime-manager.md#38-execution-modes-wsl2)): needless where the kernel
+  already reports a per-process figure, and it would add the serialisation and noise the delta approach carries.
+- *`amd-smi process`*: it works, but costs a subprocess and a JSON format to pin, for the same figure a world-readable sysfs read gives. (The earlier
+  belief that consumer parts lack it came from calling a non-existent `process list` subcommand.)
+- *DRM fdinfo `drm-memory-vram`*: reading another user's fds needs privileges, and it counts graphics clients too. It stays the candidate route for
+  Vulkan builds, which the KFD cannot see.
+
+**Consequences.**
+- The ordinal is an assumption, not a contract: KFD node rank is taken to equal the rocm-smi card index. Verified on the test host, recorded as a
+  risk in [§11.1](11-risks-and-technical-debt.md#111-operational-risks).
+- Visibility is ROCm/HIP only; a Vulkan engine on AMD still reads as absent and falls back to the estimate.
+- On a mixed NVIDIA and AMD Linux host NVIDIA has priority and the KFD measurer is not installed.
+- With real device totals, ADR-083's auto-detected VRAM budgets now apply on AMD hosts running rocm-smi 4.x.
+- → [Agent Runtime Manager §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
+  [Telemetry](cross-cutting/telemetry-usage-observability.md).
+## ADR-114 — The token-less chat session carries a stored per-user vendor policy, and the models listing can be read as a run-as token
+
+**Context.** ADR-050 (e) fixed the owner's interactive session at `all: true`, because the session has no `api_tokens` row to opt in on. Two
+needs collided with it. A user wanted the token-less portal chat to stop offering some or all vendor accounts (and to reach a shared account
+without minting a token). And once a chat run goes through a token, the picker still showed the session's models, not the ones that token can use:
+a token with a server override, a prefix override or generated Claude aliases offered names the run could not route, or hid the ones it could.
+
+**Decision.**
+
+- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-115-migrations))
+  holds the same JSON as `api_tokens.vendor_provider_access` and goes through the same codec, validated like a token policy against the user's own
+  reach. `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}` (`store.ChatSessionVendorAccess`), so every existing user keeps
+  today's behavior with no backfill. An explicit save whose encoding would be `''` is stored as `{"all":false}`, so "no providers" never collapses into
+  *unset*. `sessionPrincipal` decodes it tolerantly (an entry naming a deleted account or group matches nothing) and both callers, the cookie
+  session and the trusted loopback chat, inherit it, so the chat, the session's listings and session-cookie inference follow one rule: the session behaves
+  like a token holding the stored policy. A run-as token still replaces the whole policy.
+- **The save is session-only.** `PUT /api/portal/chat-settings` takes an optional `vendor_access`: absent or `null` leaves the stored policy untouched (an
+  older client that sends only the two booleans changes nothing), a value is validated (`portal.token_vendor_access_invalid` / `_conflict`) and stored. A
+  bearer token sending it is refused `403 portal.token_forbidden`, so a `gateway:use` key cannot rewrite the session's provider policy. The two booleans
+  keep their session-or-bearer rule.
+- **The read-back is the effective policy.** The synthetic chat-session row of the token list carries `vendor_access` whenever the user row was read
+  (unset as `{all: true, include_groups: true}`, explicit zero as `{all: false}` with no accounts) and omits it when that lookup fails, in which case the
+  chat card disables the editor and sends no policy; the same applies when `vendor_accounts_enabled` is off. Admins see each user's chat policy through
+  `GET /api/admin/users/{id}/tokens`, as they see token policies; the admin PATCH surface does not expose it (`account.UserUpdate.ChatVendorAccess` is
+  pre-validated encoded JSON produced only by the portal encoder).
+- **The listing can be read as a run-as token.** `GET /api/portal/models` accepts the existing capture-redacted `X-OP-Run-As-Token` header from a session
+  caller and computes the listing for that token's principal through the same gate as a chat run (`AuthorizeRunAsToken`), so prefixes, overrides, overlays and
+  generated Claude aliases (with `original_model_id`) come from the existing listing code, and the loading counts use the run-as principal. A bearer caller
+  sending the header is refused `403 portal.token_forbidden` before any lookup (inference endpoints silently ignore the header for bearers; here a silent
+  ignore would return the bearer's own list as if it were the answer). A foreign, unknown or disabled token gets the gate's own `403
+  portal.token_forbidden` with an identical body, so there is no existence leak. With `?manage=1` the header is `400 portal.models_run_as_conflict`; that check runs before the bearer refusal, so a bearer sending both gets the 400 (the 403 still precedes any token lookup).
+- **The chat picker follows the selected token.** The whole chat list (voice pickers included) swaps to the token-scoped list while a token is selected, never
+  showing the session's models during the load; the first failed scoped fetch leaves the picker empty with the error surfaced, never the session list. A
+  generated alias is labelled `id (original_model_id)`. Picking an **offered** manual alias (a `model_override_map` key with `offer: true`) that is in the scoped list skips the client-side override remap, since the
+  backend remaps through the run-as token; the catch-all `model_override` and `offer: false` keys still remap client-side. A token with a `server_override` keeps the server-locked picker (an accepted exception: its picker shows the
+  raw server model names).
+
+**Rejected:**
+
+- **A separate chat-policy table.** One atomic value per user sits next to the token's own column, and a link table would add orphan cleanup for it.
+- **Scoping only the chat.** A policy applied to the chat alone would leave the session's listings and cookie inference on a different rule; one rule for
+  the principal is easier to reason about.
+- **A new endpoint for the token-scoped listing.** The existing listing already computes everything from a principal.
+- **A query parameter for the run-as token.** It would put token ids into reverse-proxy access logs; the header is already redacted by capture.
+- **The inference rule (silently ignore the header for a bearer).** On a listing endpoint it would answer with the wrong set instead of an error.
+- **Treating an absent `vendor_access` as clearing.** It would reset the policy for every older client that saves only the booleans.
+
+**Consequences and limits.**
+
+- Narrowing the policy narrows the session's own `/v1/models`, the Models page and the dashboard's live routes too (intended: like a token), and a
+  default user is unaffected.
+- The token editor's override and fallback model-target pickers are fed the session listing, so a narrowed chat policy narrows their choices too;
+  this is accepted (a follow-up may feed the editor an unrestricted own listing).
+- A token with a server override still shows raw server model names in the chat picker.
+- The users table exists only on the SQL store (SQLite and PostgreSQL), so there is no in-memory implementation of the column.
+- → [External Vendor Accounts §11.4](cross-cutting/external-vendor-accounts.md#114-who-is-restricted-api-tokens-and-the-owners-chat-session-policy),
+  [Security, Auth & RBAC §5](cross-cutting/security-auth-rbac.md),
+  [HTTP API surface](reference/api-surface.md),
+  [Data model](reference/data-model.md#4-migration-history-115-migrations).

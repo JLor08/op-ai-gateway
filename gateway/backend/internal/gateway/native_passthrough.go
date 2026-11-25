@@ -431,6 +431,32 @@ type passthroughRequest struct {
 	pf        preflight
 }
 
+// passthroughModeFor is the upstream path and the mode in which relayPassthroughTarget
+// serves apiFlavor's endpoint on target (failoverPassthrough asks it too).
+//
+// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
+// AND mode != disabled. endpointModeFor only ever answers the mode half;
+// for a coding-agent endpoint (path != "") whose coarse flavor the resolved
+// target no longer serves, treat it as disabled here — the one place a
+// server_agent app's per-model spec flavor is enforceable for these two
+// endpoints (candidacy only checked the app-level flavor; see
+// targetServesFlavor). It runs BEFORE the mode decides anything, so it holds
+// a translate-mode endpoint to the full rule too -- but only for the target
+// it judged: a request it finds lacking its flavor never reaches the
+// translate dispatch. What does reach that dispatch unjudged (a body whose
+// model the routing probe could not read, a request whose resolve failed in
+// tryProxyNative, and every translate-path re-resolve) is checked there only by
+// targetIsImagesOnly and targetIsAudioOnly (resolveTranslateTarget), with
+// neither this flavor check nor the mode read. A no-op for an ordinary app, whose flavor-less
+// state already excluded it at candidacy.
+func passthroughModeFor(target routing.Target, apiFlavor string) (string, routing.EndpointMode) {
+	path, mode := endpointModeFor(target, apiFlavor)
+	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
+		mode = routing.EndpointModeDisabled
+	}
+	return path, mode
+}
+
 // relayPassthroughTarget is tryProxyNative past its resolve: it relays pr's request to
 // target, already resolved, when target passes this endpoint through, refuses it when
 // the endpoint is disabled there, and returns false -- having written nothing -- when
@@ -439,27 +465,18 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 	token, raw, apiFlavor := pr.token, pr.raw, pr.apiFlavor
 	req := pr.pf.Req
 	model := req.Model
-	path, mode := endpointModeFor(target, apiFlavor)
-	// The effective-served rule is a CONJUNCT (§6 / ADR-033): flavor ∈ APIFlavors
-	// AND mode != disabled. endpointModeFor above only ever answers the mode half;
-	// for a coding-agent endpoint (path != "") whose coarse flavor the resolved
-	// target no longer serves, treat it as disabled here — the one place a
-	// server_agent app's per-model spec flavor is enforceable for these two
-	// endpoints (candidacy only checked the app-level flavor; see
-	// targetServesFlavor). It runs BEFORE the mode decides anything, so it holds
-	// a translate-mode endpoint to the full rule too -- but only for the target
-	// it judged: a request it finds lacking its flavor never reaches the
-	// translate dispatch. What does reach that dispatch unjudged (a body whose
-	// model the routing probe could not read, a request whose resolve failed
-	// above, and every translate-path re-resolve) is checked there only by
-	// targetIsImagesOnly and targetIsAudioOnly (resolveTranslateTarget), with
-	// neither this flavor check nor the mode read. A no-op for an ordinary app, whose flavor-less
-	// state already excluded it at candidacy.
-	if path != "" && mode != routing.EndpointModeDisabled && !targetServesFlavor(target, apiFlavor) {
-		mode = routing.EndpointModeDisabled
-	}
+	path, mode := passthroughModeFor(target, apiFlavor)
 	switch mode {
 	case routing.EndpointModePassthrough:
+		// The raw body reaches the upstream unexamined, so a strata target's image
+		// references are checked here (the translate path's guard never runs).
+		if isStrataTarget(target) && strataPassthroughMediaRefused(raw) {
+			slog.Warn("native passthrough rejected: image reference this target would resolve on the model host",
+				"path", r.URL.Path, "api_flavor", apiFlavor, "model", model,
+				"server", s.serverName(target.ServerID), "route_id", target.RouteID)
+			s.failPassthrough(w, r, pr, start, target, errMediaPathUnsupported)
+			return true
+		}
 		s.proxyNative(w, r, nativeRelay{
 			token:    *token,
 			target:   target,
@@ -469,6 +486,9 @@ func (s *Server) relayPassthroughTarget(w http.ResponseWriter, r *http.Request, 
 			endpoint: pr.endpoint,
 			reselect: func(lost routing.Target, gone error) {
 				s.reselectPassthrough(w, r, pr, lost, gone)
+			},
+			vendorFailover: func(lost routing.Target, h http.Header, retryAfter time.Duration, release func()) bool {
+				return s.failoverPassthrough(w, r, pr, lost, h, retryAfter, release)
 			},
 		})
 		return true
@@ -531,6 +551,33 @@ func (s *Server) reselectPassthrough(w http.ResponseWriter, r *http.Request, pr 
 	}
 	slog.Warn("native passthrough: the routed instance is gone and the instance re-selected serves this endpoint by translate only", "path", r.URL.Path, "api_flavor", again.apiFlavor, "model", again.pf.Req.Model, "lost", lost.InstanceKey, "instance", target.InstanceKey)
 	s.failPassthrough(w, r, again, start, lost, gone)
+}
+
+// failoverPassthrough is the vendorFailover hook of a /v1/responses or /v1/messages
+// passthrough: lost, a vendor group member, answered pr's request with a limit (h its
+// headers, retryAfter its Retry-After). It fails the request over (vendorGroupFailover,
+// resolving like tryProxyNative) and, when another member of the group takes it and
+// passes this endpoint through as lost did, ends the refused attempt (release) and
+// relays the request there through relayPassthroughTarget, reporting true. A member
+// that would serve the endpoint by translate cannot take a relay that has already
+// chosen to pass the client's body through, so it is no failover either: on false
+// nothing was written and the caller relays lost's refusal.
+func (s *Server) failoverPassthrough(w http.ResponseWriter, r *http.Request, pr passthroughRequest, lost routing.Target, h http.Header, retryAfter time.Duration, release func()) bool {
+	resolve := func(token *auth.Token, req inference.Request) (routing.Target, error) {
+		return s.resolveTarget(r.Context(), token, req)
+	}
+	next, target, ok := s.vendorGroupFailover(pr.token, pr.pf.Req, lost, h, retryAfter, resolve)
+	if !ok {
+		return false
+	}
+	if _, mode := passthroughModeFor(target, pr.apiFlavor); mode != routing.EndpointModePassthrough {
+		slog.Warn("native passthrough: the vendor group member failed over to does not pass this endpoint through; relaying the limit answer", "path", r.URL.Path, "api_flavor", pr.apiFlavor, "model", pr.pf.Req.Model, "group", lost.VendorGroupID, "lost", lost.VendorAccountID, "account", target.VendorAccountID, "mode", string(mode))
+		return false
+	}
+	release()
+	again := pr
+	again.pf.Req = next
+	return s.relayPassthroughTarget(w, r, again, target, time.Now())
 }
 
 // failPassthrough answers a /v1/responses or /v1/messages request that ends before any
@@ -832,6 +879,9 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// merged with the target's own (anthropicPassthroughHeaderOverrides is nil
 	// everywhere else, which leaves the call exactly as upstreamAuthCtx builds it).
 	ctx = s.upstreamAuthCtxWithHeaders(ctx, rel.target, anthropicPassthroughHeaderOverrides(rel.target, r.Header))
+	// The send timestamp opens the time-to-first-content window of the
+	// gateway-measured prompt rate (usageScanner.setUpstreamSentAt, #426).
+	upstreamSentAt := time.Now()
 	resp, err := proxyClient.ProxyNative(ctx, rel.target, rel.path, upstreamBody, relayContentType)
 	if err != nil {
 		// Pre-response failure: nothing written to the client yet, so return a JSON error.
@@ -863,6 +913,28 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 		}
 		s.failNativeExchange(w, r, ex, gone)
 		return
+	}
+
+	// A vendor group member that answered a limit (vendor_group_failover.go): nothing
+	// has been written to the client and nothing recorded. rel.vendorFailover moves the
+	// request to the group's next member; it ends this attempt first (release: the
+	// refusal's body closed, the watchdog stopped, the upstream context cancelled, the
+	// active row removed -- the new attempt registers its own), then that member
+	// answers and records in this attempt's place. When no member can take it, nothing
+	// has changed and the refusal is relayed below as it came, header allowlist and
+	// entitlement included.
+	if rel.vendorFailover != nil && rel.target.VendorGroupID != "" && provider.IsLimitStatus(resp.StatusCode) {
+		release := func() {
+			_ = resp.Body.Close()
+			if watchdog != nil {
+				watchdog.Stop()
+			}
+			cancel()
+			s.Active.Remove(id)
+		}
+		if rel.vendorFailover(rel.target, resp.Header, provider.ParseRetryAfter(resp.Header, time.Now()), release) {
+			return
+		}
 	}
 
 	// A STREAMED audio request (bufferedRetry is set only for a transcription or a speech
@@ -1143,6 +1215,63 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 			w.Header().Set(contentLengthHeader, strconv.FormatInt(n, 10))
 		}
 	}
+	if rel.pfReq.APIFlavor == inference.APIFlavorAnthropicMessages {
+		// The unified family reaches the client only when the token opts in
+		// (send_usage_limits, #420) and, for vendor figures, is entitled. The switch is
+		// checked first so the entitlement lookup stays lazy. Retry-After and
+		// X-Should-Retry always pass.
+		sendUsage := rel.token.SendUsageLimits
+		var gated func(string) bool
+		if sendUsage && hasUnifiedRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
+			gated = isUnifiedRateLimitHeader
+		}
+		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
+		// A success from a provider that reports no subscription windows of its own
+		// (a local model) carries the caller's last observed ones, so Claude Code
+		// keeps its usage display -- unless a vendor group member served it, which
+		// drops them instead (attachRateLimitWindows). Fresh upstream windows are
+		// never overlaid.
+		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.Header.Get(unifiedRateLimitPrefix+"status") == "" {
+			s.attachRateLimitWindows(rel.token, rel.target, w.Header())
+		}
+		// A principal with quotas or budgets then has its own fullest limit laid over
+		// the top-level fields, on any 2xx whatever the upstream sent. It writes the
+		// client header set only: resp.Header stays what recordUsage and the window
+		// cache observe.
+		if sendUsage && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			attachPrincipalLimitStanding(r.Context(), w.Header())
+		}
+	} else if rel.pfReq.APIFlavor == inference.APIFlavorOpenAIResponses {
+		// The Codex family is gated like the unified one: it reaches the client only
+		// when the token opts in (send_usage_limits, #420) and, for vendor figures, is
+		// entitled; the lookup runs only when the upstream sent a family header.
+		// retry-after and x-should-retry always pass.
+		sendUsage := rel.token.SendUsageLimits
+		var gated func(string) bool
+		if sendUsage && hasCodexRateLimitHeader(resp.Header) && s.rateLimitFiguresEntitled(r.Context(), rel.token, rel.target) {
+			gated = isCodexRateLimitHeader
+		}
+		forwardRateLimitHeaders(w.Header(), resp.Header, gated)
+		// A success from a provider that reports no Codex windows of its own (a local
+		// model) carries the caller's last observed ones, so the Codex CLI keeps its
+		// usage display, unless the gateway's own limit takes over (written percent at
+		// codexGatewayTakeoverPercent or more): then the cached windows are skipped and
+		// the standing below is the only figure. A vendor group member's success drops
+		// them instead (attachCodexRateLimitWindows). Fresh upstream windows are never
+		// overlaid, and an error response keeps exactly what the upstream said.
+		now := time.Now()
+		success := resp.StatusCode >= 200 && resp.StatusCode < 300
+		if sendUsage && success && !hasCodexRateLimitHeader(resp.Header) && !codexGatewayLimitTakesOver(r.Context(), now) {
+			s.attachCodexRateLimitWindows(rel.token, rel.target, w.Header())
+		}
+		// A principal with quotas or budgets then has its own fullest limit written in
+		// the default x-codex family on any 2xx that carries no Codex figures yet
+		// (including a vendor family withheld from a non-entitled caller, and the
+		// cached windows a takeover skipped). It writes the client header set only.
+		if sendUsage && success {
+			attachCodexPrincipalLimitStanding(r.Context(), w.Header(), now, rel.token.CodexModelSwitchPrompt)
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
@@ -1173,7 +1302,8 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	// above instead).
 	imgCounter := newImagesDataCounter(rel.pfReq.APIFlavor)
 	var respBuf bytes.Buffer
-	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress, rel.target.VendorAccountID != "")
+	scanner := newUsageScanner(rel.pfReq.APIFlavor, s.captureMaxBytes, progress)
+	scanner.setUpstreamSentAt(upstreamSentAt)
 	// The transcription endpoint is the one openai_audio endpoint that streams a
 	// 2xx through here, and the only one with a scan of its own: it reads the event
 	// stream for the completion that bills it and the transcript that is captured
@@ -1188,12 +1318,23 @@ func (s *Server) proxyNative(w http.ResponseWriter, r *http.Request, rel nativeR
 	if transcriptScan != nil || speechScan != nil {
 		teeBuf = nil
 	}
-	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan, speechWav: speechTally}
+	// A streamed relay to an agent-managed target gets the filter that turns the
+	// agent's terminal error frame into the client flavor's error event (nil, and
+	// so inert, for every other relay); see agentStreamErrorFilter.
+	agentErrors := newAgentStreamErrorFilter(rel.target, rel.pfReq.APIFlavor, rel.pfReq.Stream, id)
+	copier := &nativeCopier{w: w, rc: rc, flusher: flusher, watchdog: watchdog, idle: idle, respBuf: teeBuf, capBytes: s.captureMaxBytes, scanner: scanner, imgCounter: imgCounter, transcript: transcriptScan, speech: speechScan, speechWav: speechTally, agentErrors: agentErrors}
 	// relayBody is resp.Body for every relay but the pcm strip, which already consumed the
 	// WAV header above and hands the copier only the data chunk (io.LimitReader).
 	copyErr := copier.run(relayBody)
 
 	status, errorCode := s.nativeTerminalStatus(r, resp.StatusCode, rel.pfReq, serverName, idledOut.Load(), copyErr, start)
+	// The agent ended an otherwise clean stream with its terminal error frame: the
+	// request failed, under the agent's own code, though the wire status stays the
+	// 200 the agent had already committed.
+	if failure := agentErrors.recordedFailure(); failure != nil && status == "success" {
+		status, errorCode = "error", failure.code
+		slog.Warn("inference native passthrough agent stream failure", "path", r.URL.Path, "api_flavor", rel.pfReq.APIFlavor, "model", rel.pfReq.Model, "server", serverName, "code", failure.code, "message", failure.message)
+	}
 
 	usg := scanner.usage()
 	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: resp.StatusCode, ContentType: contentType, BillingUnit: billingUnitFor(rel.pfReq.APIFlavor), Endpoint: rel.endpoint}
@@ -1353,6 +1494,18 @@ type nativeRelay struct {
 	// cannot take. Set by every relay caller; nil for a relay that is never re-selected,
 	// whose gone refusal proxyNative answers with gone's error itself.
 	reselect func(lost routing.Target, gone error)
+	// vendorFailover moves the request to the next member of its vendor group when
+	// the upstream answered a group target (VendorGroupID set) with a limit (429 or
+	// 402) before anything was written (vendor_group_failover.go): lost is the
+	// refusing member, h the refusal's headers, retryAfter its parsed Retry-After.
+	// When another member can take the request it first calls release, which ends
+	// this attempt -- the refusal's body closed, the watchdog stopped, the upstream
+	// context cancelled, the active row removed -- then relays the request to that
+	// member, which answers and records the usage row, and returns true. On false it
+	// has written nothing and called nothing, and proxyNative relays the refusal as it
+	// came. Set by relayPassthroughTarget (/v1/messages and /v1/responses); nil on
+	// every other relay.
+	vendorFailover func(lost routing.Target, h http.Header, retryAfter time.Duration, release func()) bool
 	// decisionsRewrite hands a decisions response to the buffered
 	// relayDecisionsResponse instead of the streaming copier: set on every
 	// translated /v1/decisions or /v1/systemone relay (the answer must be
@@ -1459,6 +1612,10 @@ type nativeCopier struct {
 	// speechWav measures a one-shot speech body for billing when the upstream sends no
 	// duration header (nil for every other relay).
 	speechWav *speechWavTally
+	// agentErrors translates an agent-managed target's terminal error frame into
+	// the client flavor's error event (nil for every other relay); run passes each
+	// upstream chunk through it before writeChunk.
+	agentErrors *agentStreamErrorFilter
 	// written counts every body byte the client's writer took, past the capture
 	// cap too (respBuf stops growing there), so a capture that does not store the
 	// body can still say how large it was.
@@ -1472,7 +1629,9 @@ type nativeCopier struct {
 // terminates before the read error is inspected); the one thing it adds is that end
 // frame, written at a clean EOF and only for an sglang-omni speech event stream that
 // asks for it (speechStreamScan.endFrame), so every other relay's bytes are exactly
-// what proxyNative relayed before. The deferred
+// what proxyNative relayed before -- apart from a streamed relay to an agent-managed
+// target, whose chunks pass through its agentStreamErrorFilter (relayChunk) and whose
+// agent terminal error frame becomes the client flavor's error event. The deferred
 // scanner.finish call runs exactly once no matter how run() returns, so the
 // final frame — which, for a buffered non-streaming response, normally never
 // gets its own trailing newline — is still scanned; see usageScanner.finish.
@@ -1486,11 +1645,18 @@ func (c *nativeCopier) run(body io.Reader) error {
 	for {
 		n, readErr := body.Read(buf)
 		if n > 0 {
-			if writeErr := c.writeChunk(buf[:n]); writeErr != nil {
+			if writeErr := c.relayChunk(buf[:n]); writeErr != nil {
 				return writeErr
 			}
 		}
 		if readErr != nil {
+			// A partial event the agent filter still holds when the body ends is
+			// relayed as it stands, as the bytes before a read error always were.
+			if held := c.agentErrors.flush(); len(held) > 0 {
+				if writeErr := c.writeChunk(held); writeErr != nil {
+					return writeErr
+				}
+			}
 			if readErr != io.EOF {
 				return readErr
 			}
@@ -1506,6 +1672,23 @@ func (c *nativeCopier) run(body io.Reader) error {
 			return nil
 		}
 	}
+}
+
+// relayChunk forwards one upstream chunk: straight to writeChunk, or, on a relay
+// with an agent error filter, the bytes the filter releases. A chunk the filter
+// holds whole still counts as upstream activity for the idle watchdog.
+func (c *nativeCopier) relayChunk(chunk []byte) error {
+	if c.agentErrors == nil {
+		return c.writeChunk(chunk)
+	}
+	out := c.agentErrors.push(chunk)
+	if len(out) == 0 {
+		if c.watchdog != nil {
+			c.watchdog.Reset(c.idle)
+		}
+		return nil
+	}
+	return c.writeChunk(out)
 }
 
 // writeChunk forwards one chunk to the client -- an upstream chunk, or the end frame

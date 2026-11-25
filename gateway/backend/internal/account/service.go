@@ -532,6 +532,11 @@ type UserUpdate struct {
 	PreferredLanguage    *string
 	ChatLogCommunication *bool
 	ChatSecret           *bool
+	// ChatVendorAccess is the token-less chat session's vendor-access policy,
+	// already validated and encoded by portal.EncodeChatSessionVendorAccess
+	// (the only producer). The service stores it verbatim; the admin user PATCH
+	// surface never sets it.
+	ChatVendorAccess *string
 }
 
 func validRole(role string) bool {
@@ -640,6 +645,9 @@ func (s *Service) UpdateUser(ctx context.Context, userID string, update UserUpda
 	if update.ChatSecret != nil {
 		user.ChatSecret = *update.ChatSecret
 	}
+	if update.ChatVendorAccess != nil {
+		user.ChatVendorAccess = *update.ChatVendorAccess
+	}
 	if update.Role != nil {
 		user.Role = *update.Role
 	}
@@ -710,6 +718,9 @@ func (s *Service) UpdateOwnProfile(ctx context.Context, userID string, update Us
 	}
 	if update.ChatSecret != nil {
 		user.ChatSecret = *update.ChatSecret
+	}
+	if update.ChatVendorAccess != nil {
+		user.ChatVendorAccess = *update.ChatVendorAccess
 	}
 	user.UpdatedAt = s.clock().UTC()
 	if err := s.users.UpdateUser(ctx, user); err != nil {

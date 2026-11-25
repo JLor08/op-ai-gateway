@@ -235,21 +235,26 @@ func main() {
 		// admitted against. Operator-owned (OP_AGENT_WSL_RAM_RESERVE_MB,
 		// default 1024), never gateway-supplied.
 		WSLRAMReserveMB: cfg.WSLRAMReserveMB,
+		// A process_tree "job" generation's tree (#424, Windows) is
+		// registered with the measurers' registry, so its RAM and per-GPU
+		// VRAM are charged to the root pid the manager asks about.
+		ProcessTrees: collector.RegisterProcessTree,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
 	// Per-process VRAM measurement is a HARDWARE capability, not a negotiated
 	// feature (design spec §5): NewVRAMMeasurer returns nil on hosts that
-	// cannot measure (AMD, Apple unified memory, no GPU at all, no nvidia-smi),
-	// and SetMeasurer(nil) is exactly NewManager's own default -- operator VRAM
-	// estimates stand.
+	// cannot measure (Apple unified memory, no GPU at all, neither nvidia-smi
+	// nor AMD's KFD sysfs), and SetMeasurer(nil) is exactly NewManager's own
+	// default -- operator VRAM estimates stand.
 	//
 	// The measurer is chosen per PLATFORM, inside the collector package: every
-	// non-Windows host gets the nvidia-smi compute-apps measurer it always had,
-	// while Windows gets the PDH one or none, never compute-apps -- which under
-	// WDDM reports `[N/A]` per process, parses to 0, and would override every
-	// operator estimate with a measured zero. Do not call a specific measurer's
-	// constructor from here; that routes around the split.
+	// non-Windows host gets the nvidia-smi compute-apps measurer when nvidia-smi
+	// exists, AMD Linux hosts fall back to KFD sysfs, while Windows gets the
+	// PDH one or none, never compute-apps -- which under WDDM reports `[N/A]`
+	// per process, parses to 0, and would override every operator estimate
+	// with a measured zero. Do not call a specific measurer's constructor from
+	// here; that routes around the split.
 	mgr.SetMeasurer(collector.NewVRAMMeasurer())
 	// Per-process host-RAM measurement is the same kind of hardware capability
 	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the

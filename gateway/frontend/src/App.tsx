@@ -212,6 +212,12 @@ export default function App() {
       .catch(() => {});
   }, [api]);
 
+  // The chat picker's token-scoped listing (the models as the chosen run-as token sees them).
+  const fetchTokenModels = useCallback(
+    (runAsTokenId: string) => api.models(runAsTokenId).then((res) => res.data),
+    [api],
+  );
+
   const handleActivityAuthError = useCallback(() => {
     setAuthState('login');
   }, []);
@@ -485,6 +491,7 @@ export default function App() {
           servers={servers}
           onRefresh={refreshPortalDataSilently}
           refreshModels={refreshModels}
+          fetchModels={fetchTokenModels}
           t={t}
           locale={locale}
         >

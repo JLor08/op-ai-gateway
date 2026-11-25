@@ -293,7 +293,7 @@ func TestRotateToken_PreservesProjectAssignment(t *testing.T) {
 		t.Fatalf("CreateToken returned %v", err)
 	}
 
-	rotated, err := e.svc.RotateToken(e.ctx, owner, created.Token.ID)
+	rotated, err := e.svc.RotateToken(e.ctx, owner, created.Token.ID, RotateTokenRequest{})
 	if err != nil {
 		t.Fatalf("RotateToken returned %v", err)
 	}

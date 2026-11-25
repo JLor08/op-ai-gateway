@@ -490,6 +490,7 @@ func TestVendorAccountAPIKeyTranslateFlavorsLeaveResponsesModeZero(t *testing.T)
 // cannot be silently forgotten here. It describes the openai_responses
 // (passthrough) shape, so ResponsesMode is deliberately absent.
 var vendorTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
@@ -505,6 +506,7 @@ var vendorTargetMayBeZero = map[string]bool{
 	"APITokenHeader":              true, // "" for an OpenAI vendor (Bearer default); set for Anthropic
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
+	"VendorShareUsageWithMembers": true, // the owner's opt-in; these fixtures leave it off
 	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
 	"OpenAIPathPrefix":            true, // empty => /v1; the api.openai.com vendor target uses the default (only an OpenAI-compatible preset sets it)
 }
@@ -517,6 +519,7 @@ var vendorTargetMayBeZero = map[string]bool{
 // is zero-OK (an Anthropic upstream has no Responses surface). ExtraHeaders stays
 // zero-OK: AnthropicClient.ProxyNative guarantees anthropic-version itself.
 var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
@@ -531,6 +534,7 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 	"InstancePool":                true, // a vendor target is not selected from a pool of instances
 	"ExtraHeaders":                true, // ProxyNative sets anthropic-version itself; an API-KEY target carries no static headers
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only); the relay is verbatim
+	"VendorShareUsageWithMembers": true, // the owner's opt-in; these fixtures leave it off
 	"Subscription":                true, // false on the API-KEY path -- its x-api-key rides in APIToken, not resolved at dispatch
 	"OpenAIPathPrefix":            true, // an Anthropic upstream speaks /v1/messages, not the OpenAI dialect; the prefix is N/A
 }
@@ -542,6 +546,7 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 // endpoint modes are zero by design: the compat vendors are translate-only and never
 // enter the OpenAI-Responses / Anthropic-Messages passthrough branches.
 var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
@@ -558,6 +563,7 @@ var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
 	"APITokenHeader":              true, // "" == Authorization: Bearer, which every compat vendor uses
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
+	"VendorShareUsageWithMembers": true, // the owner's opt-in; these fixtures leave it off
 	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
 }
 
@@ -566,6 +572,7 @@ var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
 // model mark are non-zero (the whole point), so they are NOT listed;
 // ResponsesMode is zero-OK (a decision request is no Responses request).
 var vendorDecisionTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; a decision request is no Responses request
 	"MessagesMode":                true, // zero == translate (the OpenAI shape has no messages passthrough)
@@ -579,6 +586,7 @@ var vendorDecisionTargetMayBeZero = map[string]bool{
 	"APITokenHeader":              true, // "" for an OpenAI vendor (Bearer default)
 	"ExtraHeaders":                true, // an API-KEY vendor target needs no static extra headers (subscription-only)
 	"Masquerade":                  true, // no Claude-Code disguise on the API-KEY path (subscription-only)
+	"VendorShareUsageWithMembers": true, // the owner's opt-in; these fixtures leave it off
 	"Subscription":                true, // false on the API-KEY path -- its bearer rides in APIToken, not resolved at dispatch
 	"OpenAIPathPrefix":            true, // empty => /v1; the api.openai.com vendor target uses the default
 }
@@ -777,5 +785,47 @@ func TestVendorAccountTargetShimGoogleUnchanged(t *testing.T) {
 	}
 	if tgt.Endpoint != acc.BaseURL {
 		t.Fatalf("endpoint = %q, want the account base URL", tgt.Endpoint)
+	}
+}
+
+// TestVendorTargetCarriesUsageSharingFacts pins the two facts every vendor target
+// carries so the usage-limit header gate can decide without a store read: the
+// owning user and the owner's share-usage opt-in. It holds for the api-key target
+// and for both subscription targets.
+func TestVendorTargetCarriesUsageSharingFacts(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	base := VendorAccount{
+		ID: "acc_su", OwnerUserID: "u-owner", Status: VendorAccountStatusActive,
+		ShareUsageWithMembers: true, CreatedAt: now, UpdatedAt: now,
+	}
+	m := VendorAccountModel{AccountID: "acc_su", GatewayModel: "m", UpstreamModel: "m", APIFlavor: APIFlavorAnthropic}
+	apiKey, sub := base, base
+	apiKey.Vendor, apiKey.AuthType = VendorAnthropic, VendorAuthAPIKey
+	sub.Vendor, sub.AuthType = VendorAnthropic, VendorAuthSubscription
+	subOpenAI := sub
+	subOpenAI.Vendor = VendorOpenAI
+
+	cases := []struct {
+		name   string
+		target Target
+	}{
+		{"api_key", vendorAccountTarget(apiKey, m, "m", APIFlavorAnthropic, "anthropic_messages")},
+		{"subscription_anthropic", vendorSubscriptionAnthropicTarget(sub, m, "m", APIFlavorAnthropic, "anthropic_messages")},
+		{"subscription_openai", vendorSubscriptionOpenAITarget(subOpenAI, m, "m", APIFlavorOpenAI, "openai_chat")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.target.VendorAccountOwnerUserID != "u-owner" {
+				t.Errorf("VendorAccountOwnerUserID = %q, want u-owner", tc.target.VendorAccountOwnerUserID)
+			}
+			if !tc.target.VendorShareUsageWithMembers {
+				t.Error("VendorShareUsageWithMembers = false, want true")
+			}
+		})
+	}
+	off := apiKey
+	off.ShareUsageWithMembers = false
+	if vendorAccountTarget(off, m, "m", APIFlavorAnthropic, "anthropic_messages").VendorShareUsageWithMembers {
+		t.Error("an account without the opt-in stamped VendorShareUsageWithMembers = true")
 	}
 }

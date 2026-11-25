@@ -21,20 +21,26 @@ import {
 // x.ai, Google and a user-supplied OpenAI-compatible endpoint offer no such query.
 const API_KEY_USAGE_VENDORS: ReadonlySet<string> = new Set(['openrouter', 'kilo']);
 
+// Vendors whose subscription usage endpoint the gateway pulls with the account's
+// token (mirrors the backend's hasActiveVendorUsagePull): the ChatGPT backend's for
+// OpenAI, the Claude OAuth usage endpoint for Anthropic.
+const SUBSCRIPTION_USAGE_VENDORS: ReadonlySet<string> = new Set(['openai', 'anthropic']);
+
 /**
  * Whether the gateway can ASK the vendor for this account's usage, as opposed to
- * only learning it passively from the responses it serves: a connected OpenAI
- * subscription (the account whose usage endpoint the gateway pulls) and an api-key
- * account of a vendor with a usage/credits query (OpenRouter, Kilo) whose key is
- * stored. Every other account -- another vendor's api key, an Anthropic
- * subscription -- has no active pull (the backend answers "unsupported"), so it
- * gets neither the refresh button nor the on-view refresh.
+ * only learning it passively from the responses it serves: a connected OpenAI or
+ * Anthropic subscription (whose usage endpoint the gateway pulls with the account's
+ * token) and an api-key account of a vendor with a usage/credits query (OpenRouter,
+ * Kilo) whose key is stored. Every other account -- another vendor's api key, a
+ * subscription that is not connected -- has no active pull (the backend answers
+ * "unsupported" for the former), so it gets neither the refresh button nor the
+ * on-view refresh.
  */
 export function hasActiveUsagePull(
   account: Pick<VendorAccount, 'vendor' | 'auth_type' | 'subscription_connected' | 'api_key_set'>,
 ): boolean {
   if (account.auth_type === 'subscription') {
-    return account.vendor === 'openai' && account.subscription_connected;
+    return SUBSCRIPTION_USAGE_VENDORS.has(account.vendor) && account.subscription_connected;
   }
   return account.api_key_set && API_KEY_USAGE_VENDORS.has(account.vendor);
 }
@@ -267,7 +273,7 @@ export function VendorAccountUsage({
  * connected has served nothing, so it has no usage to show and renders nothing;
  * every other account (an api key, a connected subscription) gets the usage panel.
  * Only an account the gateway can actively ask (hasActiveUsagePull: a connected
- * OpenAI subscription, an OpenRouter or Kilo api key) is handed `onRefresh`, which
+ * OpenAI or Anthropic subscription, an OpenRouter or Kilo api key) is handed `onRefresh`, which
  * gives it the refresh button and the one on-view refresh; the others only learn
  * their usage from the requests they serve. The panel is keyed by the account id,
  * so another account never inherits the previous one's snapshot, outcome or

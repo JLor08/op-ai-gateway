@@ -2,6 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { type Fetcher, request } from './transport';
+import type { VendorAccessDTO } from './tokens';
 
 export type CurrentUser = {
   id: string;
@@ -61,8 +62,13 @@ export function authApi(fetcher: Fetcher) {
       }),
     updatePreferredLanguage: (language: string) =>
       request<CurrentUser>(fetcher, '/api/portal/language', { method: 'PUT', body: { language } }),
-    updateChatSettings: (body: { log_communication: boolean; secret: boolean }) =>
-      request<CurrentUser>(fetcher, '/api/portal/chat-settings', { method: 'PUT', body }),
+    // vendor_access is optional: absent leaves the stored provider policy untouched
+    // (send an explicit object, never null, to change it).
+    updateChatSettings: (body: {
+      log_communication: boolean;
+      secret: boolean;
+      vendor_access?: VendorAccessDTO;
+    }) => request<CurrentUser>(fetcher, '/api/portal/chat-settings', { method: 'PUT', body }),
     me: () => request<CurrentUser>(fetcher, '/api/portal/me'),
     // System-admin step-up: enter (optionally re-entering the password) or leave
     // the elevated system-admin mode; both return the fresh CurrentUser.

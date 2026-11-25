@@ -323,6 +323,14 @@ type ServerDeps struct {
 	// it at its own construction. Server never stores or reads this field. nil is
 	// correct for any Server built without cmd/gateway.
 	SetVendorTokenRefresher func(portal.VendorTokenRefresher)
+	// SetVendorLimitCooldowns is the same wiring conduit for the vendor limit-cooldown
+	// registry: it is portal.Service.SetVendorLimitCooldowns itself, called ONCE by
+	// cmd/gateway's buildGatewayServer with the just-built Server's registry (the one
+	// the resolver reads), so a group's member status shows the cooldowns routing
+	// applies. The registry belongs to the Server, which does not exist until
+	// gateway.New returns. Server never stores or reads this field. nil is correct
+	// for any Server built without cmd/gateway (the group view then shows none).
+	SetVendorLimitCooldowns func(*routing.VendorLimitCooldowns)
 	// SetClusterStatusReader is the same wiring conduit for the cluster
 	// orchestration's state: it is portal.Service.SetClusterStatusReader
 	// itself, called ONCE by cmd/gateway's buildGatewayServer with the
@@ -840,6 +848,20 @@ type Server struct {
 	// varies per call (GetTTL), shorter for an error-derived miss so a transient
 	// NetBird blip self-heals fast.
 	sourcePeerIP settingCache[string]
+	// rateLimitEntitlements caches the portal's per-principal, per-account answer
+	// behind rateLimitFiguresEntitled (ratelimit_headers.go); zero value ready.
+	rateLimitEntitlements rateLimitEntitlementCache
+	// rateLimitWindows remembers each principal's last subscription rate-limit
+	// windows so they can ride along on /v1/messages responses from other providers
+	// (ratelimit_window_cache.go). Nil in a bare &Server{}; the helpers tolerate that.
+	rateLimitWindows *rateLimitWindowCache
+	// vendorCooldowns is the process-local registry of vendor limit cooldowns,
+	// shared with the resolver so a group skips a member that just hit a limit, and
+	// with the portal service so the group view shows the cooldowns.
+	vendorCooldowns *routing.VendorLimitCooldowns
+	// codexRateLimitWindows is the Codex-family counterpart on /v1/responses, kept
+	// apart so one principal using both clients never has one family evict the other.
+	codexRateLimitWindows *rateLimitWindowCache
 	// vendorEnabledCache / vendorRoutingModeCache are the TTL caches
 	// (settingCache, invalidatable mode -- ttlcache.go) backing the resolver's
 	// injected vendor-account accessors (SetVendorAccountAccessors), so the
@@ -1178,11 +1200,17 @@ func New(deps ServerDeps) *Server {
 			// the OPPOSITE meaning of nil: without a portal the resolver falls back
 			// to OWNER-ONLY vendor accounts, never allow-all.
 			resolver.SetVendorAccountEnumerator(portalVendorAccountEnumerator{api: deps.Portal})
+			// The group failover's on-demand usage pull: the portal service throttles
+			// it and runs it off the resolve path. A genuinely nil seam without a
+			// portal, like the two above.
+			resolver.SetVendorUsagePuller(deps.Portal)
 		}
 		// SetModelWarmer is deferred until after s is built (the warmer needs the fully-
 		// assembled Server for its provider/routes/upstream-auth); see below.
 	}
 	s := &Server{
+		rateLimitWindows:            newRateLimitWindowCache(10000),
+		codexRateLimitWindows:       newRateLimitWindowCache(10000),
 		Tokens:                      deps.Tokens,
 		Usage:                       deps.Usage,
 		UsageEvents:                 broker,
@@ -1259,6 +1287,7 @@ func New(deps ServerDeps) *Server {
 		voiceCoLoadTimeout:             voiceCoLoadTimeout,
 		voiceTiming:                    voiceTiming,
 		voicePrewarm:                   deps.VoicePrewarmEnabled,
+		vendorCooldowns:                routing.NewVendorLimitCooldowns(),
 	}
 	if s.newMailer == nil {
 		s.newMailer = func(cfg mail.Config) Mailer { return mail.New(cfg) }
@@ -1267,6 +1296,7 @@ func New(deps ServerDeps) *Server {
 	// upstream-auth), so it is wired here rather than in the pre-s resolver-checker block.
 	if resolver != nil {
 		resolver.SetModelWarmer(newModelWarmer(s))
+		resolver.SetVendorLimitCooldowns(s.vendorCooldowns)
 		// The per-user vendor-account branch reads the vendor_accounts_enabled
 		// master flag and the vendor_account_routing_mode through these cached
 		// accessors (invalidated on a settings PUT), so it never hits the
@@ -1348,6 +1378,9 @@ func New(deps ServerDeps) *Server {
 			// A start's end wakes every request parked for the head's server.
 			wake: admission.releaseAll,
 			runs: runs,
+			// Step one sends an agent the document it waits for when the
+			// agent applied another one (checkConfigGate).
+			push: s.PushRuntimeConfig,
 		}, defaultClusterTimings())
 	}
 	s.routes()
@@ -1810,6 +1843,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/portal/vendor-accounts", s.handlePortalVendorAccounts)
 	s.mux.HandleFunc("/api/portal/vendor-accounts/enabled", s.handlePortalVendorAccountsEnabled)
 	s.mux.HandleFunc("/api/portal/vendor-accounts/", s.handlePortalVendorAccountItem)
+	s.mux.HandleFunc(pathPortalVendorGroups, s.handlePortalVendorGroups)
+	s.mux.HandleFunc(pathPortalVendorGroups+"/", s.handlePortalVendorGroupItem)
 	s.mux.HandleFunc("/api/portal/vendor-account-admin-group-candidates", s.handleVendorAccountAdminGroupCandidates)
 	s.mux.HandleFunc("/api/portal/server-admin-group-candidates", s.handleServerAdminGroupCandidates)
 	s.mux.HandleFunc("/api/portal/service-admin-group-candidates", s.handleServiceAdminGroupCandidates)
