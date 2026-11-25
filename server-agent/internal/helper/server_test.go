@@ -4,6 +4,7 @@
 package helper
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,8 @@ func get(h http.Handler, method, path string) *httptest.ResponseRecorder {
 	return rec
 }
 
+func monoZero() uint64 { return 0 }
+
 func TestHelperRAPLCache(t *testing.T) {
 	start := time.Unix(1000, 0)
 	now := start
@@ -27,7 +30,7 @@ func TestHelperRAPLCache(t *testing.T) {
 	h := newHandler(func() []collector.HelperRAPLDomain {
 		calls++
 		return []collector.HelperRAPLDomain{{Zone: "intel-rapl:0", Name: "package-0", EnergyUJ: uint64(calls)}}
-	}, nil, func() time.Time { return now }, nil)
+	}, nil, func() time.Time { return now }, monoZero, nil)
 	read := func(offset time.Duration) *httptest.ResponseRecorder {
 		now = start.Add(offset)
 		rec := get(h, "GET", collector.HelperRAPLPath)
@@ -52,13 +55,50 @@ func TestHelperRAPLCache(t *testing.T) {
 	}
 }
 
+// TestHelperRAPLReadNS: every cached response repeats the read_ns of the refresh
+// that produced it; a refresh stamps a new one from the monotonic clock.
+func TestHelperRAPLReadNS(t *testing.T) {
+	start := time.Unix(1000, 0)
+	now := start
+	mono := uint64(5_000_000_000)
+	h := newHandler(func() []collector.HelperRAPLDomain {
+		return []collector.HelperRAPLDomain{{Zone: "intel-rapl:0", Name: "package-0"}}
+	}, nil, func() time.Time { return now }, func() uint64 { return mono }, nil)
+	readNS := func(offset time.Duration) uint64 {
+		t.Helper()
+		now = start.Add(offset)
+		mono += 1_000_000 // the monotonic clock moves on between requests
+		rec := get(h, "GET", collector.HelperRAPLPath)
+		var body collector.HelperRAPL
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != 200 {
+			t.Fatalf("code %d body %s err %v", rec.Code, rec.Body, err)
+		}
+		if !strings.HasPrefix(rec.Body.String(), `{"read_ns":`) {
+			t.Fatalf("read_ns not on the top level first: %s", rec.Body)
+		}
+		return body.ReadNS
+	}
+	first := readNS(0)
+	if first != 5_001_000_000 {
+		t.Fatalf("first read_ns = %d, want 5001000000", first)
+	}
+	for _, off := range []time.Duration{100, 250} {
+		if got := readNS(off * time.Millisecond); got != first {
+			t.Fatalf("cached read_ns at +%dms = %d, want %d", off, got, first)
+		}
+	}
+	if got := readNS(251 * time.Millisecond); got != 5_004_000_000 {
+		t.Fatalf("refreshed read_ns = %d, want 5004000000", got)
+	}
+}
+
 func TestHelperMemoryModulesEndpoint(t *testing.T) {
 	now := func() time.Time { return time.Unix(1, 0) }
-	empty := newHandler(func() []collector.HelperRAPLDomain { return nil }, nil, now, nil)
+	empty := newHandler(func() []collector.HelperRAPLDomain { return nil }, nil, now, monoZero, nil)
 	if b, _ := io.ReadAll(get(empty, "GET", collector.HelperMemoryModulesPath).Body); strings.TrimSpace(string(b)) != `{"modules":[]}` {
 		t.Fatalf("empty body %s", b)
 	}
-	h := newHandler(func() []collector.HelperRAPLDomain { return nil }, []sample.MemoryModule{{}}, now, nil)
+	h := newHandler(func() []collector.HelperRAPLDomain { return nil }, []sample.MemoryModule{{}}, now, monoZero, nil)
 	rec := get(h, "GET", collector.HelperMemoryModulesPath)
 	if rec.Code != 200 || !strings.HasPrefix(rec.Body.String(), `{"modules":[{`) {
 		t.Fatalf("code %d body %s", rec.Code, rec.Body)
@@ -66,7 +106,7 @@ func TestHelperMemoryModulesEndpoint(t *testing.T) {
 }
 
 func TestHelperMethodAndPath(t *testing.T) {
-	h := newHandler(func() []collector.HelperRAPLDomain { return nil }, nil, time.Now, nil)
+	h := newHandler(func() []collector.HelperRAPLDomain { return nil }, nil, time.Now, monoZero, nil)
 	rec := get(h, "POST", collector.HelperRAPLPath)
 	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET" {
 		t.Fatalf("POST: %d %v", rec.Code, rec.Header())
@@ -78,7 +118,7 @@ func TestHelperMethodAndPath(t *testing.T) {
 
 func TestHelperRateLimit(t *testing.T) {
 	now := time.Unix(1, 0)
-	h := newHandler(func() []collector.HelperRAPLDomain { return nil }, nil, func() time.Time { return now }, nil)
+	h := newHandler(func() []collector.HelperRAPLDomain { return nil }, nil, func() time.Time { return now }, monoZero, nil)
 	limited := 0
 	for range 41 {
 		if get(h, "GET", collector.HelperRAPLPath).Code == http.StatusTooManyRequests {

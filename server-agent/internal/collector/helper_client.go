@@ -35,8 +35,12 @@ type HelperRAPLDomain struct {
 	MaxEnergyRangeUJ uint64 `json:"max_energy_range_uj"`
 }
 
-// HelperRAPL is the JSON body of GET HelperRAPLPath.
+// HelperRAPL is the JSON body of GET HelperRAPLPath. ReadNS is the system-wide
+// CLOCK_MONOTONIC time in nanoseconds at which the helper read the counters; a
+// cached reading repeats it. Zero or absent (an older helper): the agent times
+// deltas with its own clock.
 type HelperRAPL struct {
+	ReadNS  uint64             `json:"read_ns,omitempty"`
 	Domains []HelperRAPLDomain `json:"domains"`
 }
 

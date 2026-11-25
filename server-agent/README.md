@@ -1417,11 +1417,18 @@ per second (burst 40) across the whole socket is `429`; timeouts and header
 limit as for the hostpower endpoint):
 
 - `GET /v1/rapl` →
-  `{"domains":[{"zone":"intel-rapl:0","name":"package-0","energy_uj":…,"max_energy_range_uj":…}, …]}`:
+  `{"read_ns":…,"domains":[{"zone":"intel-rapl:0","name":"package-0","energy_uj":…,"max_energy_range_uj":…}, …]}`:
   every top-level zone `intel-rapl:N` (sub-zones such as `intel-rapl:0:0` are
   left out) with a name and a readable `energy_uj`, sorted by zone. The reading
-  is cached and refreshed at most every 250 ms, however fast clients ask. An
-  empty list is valid (no RAPL); the helper warns at startup
+  is cached and refreshed at most every 250 ms, however fast clients ask.
+  `read_ns` is the system-wide `CLOCK_MONOTONIC` time in nanoseconds at which
+  the counters were read; a cached response repeats it. The agent divides the
+  energy delta by the difference of two `read_ns` values, so a cached reading
+  is never misread as 0 W: it yields no value and the next fresh one covers the
+  whole span. At the 250 ms interval floor about every other helper sample is
+  therefore empty; at the 1 s default every sample is fresh. Against a helper
+  without `read_ns` the agent times the delta with its own clock. An empty
+  list is valid (no RAPL); the helper warns at startup
   (`helper: no readable RAPL zone`) and keeps running.
 - `GET /v1/memory-modules` → `{"modules":[{"locator":…,"size_bytes":…,"type":…,"speed_mhz":…}, …]}`,
   the inventory's DIMM shape. The table is parsed once at startup; an unreadable

@@ -36,6 +36,12 @@ func helperEnabled(socket string) bool {
 // nothing. A failed fetch or a vanished zone drops its previous reading so no
 // delta ever spans a gap.
 //
+// Δt is the difference of the helper's read_ns timestamps, so a reading served
+// from the helper's 250 ms cache (same read_ns as the previous one) yields nil
+// and keeps the baselines instead of a false 0 W followed by a doubled value.
+// When either response lacks read_ns (an older helper), the agent clock times
+// the delta.
+//
 // Logging: failures at Debug only (the helper may simply not be installed);
 // Info once on the first success.
 type helperPowerCollector struct {
@@ -45,6 +51,7 @@ type helperPowerCollector struct {
 
 	mu     sync.Mutex
 	prev   map[string]raplReading // keyed by zone
+	prevNS uint64                 // read_ns of the response prev came from; 0: none
 	logged bool
 }
 
@@ -68,6 +75,7 @@ func (c *helperPowerCollector) Collect(ctx context.Context) (*float64, *float64,
 	if err := fetchHelperJSON(ctx, c.client, HelperRAPLPath, helperRAPLMaxBody, &body); err != nil {
 		c.logger().Debug("helper: rapl request failed", "err", err.Error())
 		clear(c.prev)
+		c.prevNS = 0
 		return nil, nil, nil
 	}
 	if !c.logged {
@@ -75,6 +83,9 @@ func (c *helperPowerCollector) Collect(ctx context.Context) (*float64, *float64,
 		c.logger().Info("helper: serving RAPL counters", "zones", len(body.Domains))
 	}
 
+	if body.ReadNS != 0 && body.ReadNS == c.prevNS {
+		return nil, nil, nil // the helper's cached reading: nothing new, keep the baselines
+	}
 	now := c.now()
 	cur := make(map[string]raplReading, len(body.Domains))
 	var pkgWatts float64
@@ -92,7 +103,7 @@ func (c *helperPowerCollector) Collect(ctx context.Context) (*float64, *float64,
 		if !seen {
 			continue
 		}
-		dt := now.Sub(prev.at).Seconds()
+		dt := c.deltaSeconds(prev.at, now, body.ReadNS)
 		if dt <= 0 {
 			continue
 		}
@@ -109,12 +120,26 @@ func (c *helperPowerCollector) Collect(ctx context.Context) (*float64, *float64,
 		}
 	}
 	c.prev = cur // zones absent from this response lose their baseline
+	c.prevNS = body.ReadNS
 
 	var cpu *float64
 	if havePkg {
 		cpu = &pkgWatts
 	}
 	return cpu, psysWatts, nil
+}
+
+// deltaSeconds is the time between the previous and the current reading: from
+// the helper's read timestamps when both responses carry one, otherwise from the
+// agent clock. A non-advancing timestamp yields 0 (no rate).
+func (c *helperPowerCollector) deltaSeconds(prevAt, now time.Time, curNS uint64) float64 {
+	if c.prevNS == 0 || curNS == 0 {
+		return now.Sub(prevAt).Seconds()
+	}
+	if curNS <= c.prevNS {
+		return 0
+	}
+	return float64(curNS-c.prevNS) / 1e9
 }
 
 func (c *helperPowerCollector) logger() *slog.Logger {

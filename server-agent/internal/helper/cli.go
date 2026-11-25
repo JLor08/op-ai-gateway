@@ -105,7 +105,7 @@ func run(parent context.Context, args []string, _, stderr io.Writer) int {
 		return 2
 	}
 	root := cfg.PowercapRoot
-	h := newHandler(func() []collector.HelperRAPLDomain { return collector.ReadTopLevelRAPLDomains(root) }, modules, time.Now, log)
+	h := newHandler(func() []collector.HelperRAPLDomain { return collector.ReadTopLevelRAPLDomains(root) }, modules, time.Now, monotonicNS, log)
 	srv := newServer(h)
 	log.Info("helper: serving", "socket", cfg.Socket, "agent_uid", id.UID, "agent_gid", id.GID)
 

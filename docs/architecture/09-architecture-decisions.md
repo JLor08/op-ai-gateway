@@ -13829,7 +13829,9 @@ reports.
   both `root:<agent group>`. A leftover socket is removed only if a dial shows nobody listens on it (`another helper is already listening`
   otherwise); any other file type at the path is an error. On shutdown Go's unlink-on-close removes the socket.
 - **Endpoints.** `GET /v1/rapl` returns every top-level `intel-rapl:N` zone (no sub-zones) with a name and a readable `energy_uj`, keyed by `zone`
-  so the agent tracks counters per zone, **from a cache refreshed at most every 250 ms**. `GET /v1/memory-modules` returns the DIMMs in the
+  so the agent tracks counters per zone, **from a cache refreshed at most every 250 ms**, as
+  `{"read_ns":…,"domains":[…]}`: `read_ns` is the system-wide `CLOCK_MONOTONIC` time in nanoseconds of the refresh, repeated by every cached
+  response. `GET /v1/memory-modules` returns the DIMMs in the
   inventory's `MemoryModule` shape, parsed **once at startup** (the table is static; an unreadable table logs a Warn and serves an empty list). JSON,
   `Cache-Control: no-store`, `404`/`405` for another path or method, and one token bucket for the whole socket, 20 requests/s with burst 40, then
   `429`: there is exactly one legitimate client, and the bucket only bounds the helper's work.
@@ -13845,7 +13847,8 @@ reports.
 - **Power order.** The Linux native collector is split into its RAPL and its hwmon part, and the composite becomes **native RAPL → helper →
   hwmon → hostpower HTTP → LibreHardwareMonitor**, first non-nil per metric. The `helper` source applies the RAPL collector's rules to the served
   counters (sum of `package*` zones for CPU, `psys` for system, per-zone delta with wraparound correction, nil on the first sample and after any
-  failure). A root agent's result is unchanged (it never composes the helper, and RAPL `psys` still wins over hwmon); an unprivileged agent gets
+  failure). Δt is the difference of the two responses' `read_ns`; an unchanged `read_ns` (a cached reading) yields nil and keeps the baselines,
+  so the next fresh reading spans the whole interval. When either response lacks `read_ns` (an older helper) the agent clock times the delta. A root agent's result is unchanged (it never composes the helper, and RAPL `psys` still wins over hwmon); an unprivileged agent gets
   the helper's `psys` before the world-readable hwmon sensor, exactly as a root agent would.
 - **Memory modules and the retry.** An unprivileged agent asks the helper once in the startup inventory (within the 2 s hardware-source budget).
   When that left no modules, the agent retries just this fetch **every 30 s** on its run loop (2 s timeout each) until the first successful reply,
@@ -13887,8 +13890,10 @@ reports.
   in-process costs one small bounded parser, shared with the root agent.
 - *Per-pid peer checks (`/proc/<pid>/exe` and the like):* same-uid processes can manipulate one another, and a pid can be reused, so it would be a
   false boundary that suggests protection it cannot give.
-- *Fresh RAPL reads per request:* every same-uid reader could sample as fast as the socket allows, which is what the side channel needs; the
-  250 ms cache costs the agent nothing at its 1 s default interval.
+- *Fresh RAPL reads per request:* every same-uid reader could sample as fast as the socket allows, which is what the side channel needs. The
+  250 ms cache costs the agent no accuracy: Δt comes from the helper's read timestamp, so a cached reading is never misread as 0 W. At the
+  250 ms interval floor about every other helper sample is empty (nil) because the cache has not refreshed; at the 1 s default every sample is
+  fresh.
 
 **Consequences.**
 

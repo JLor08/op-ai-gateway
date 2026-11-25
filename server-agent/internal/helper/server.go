@@ -34,27 +34,30 @@ func peerUIDFrom(ctx context.Context) (uint32, bool) {
 type handler struct {
 	rapl    func() []collector.HelperRAPLDomain
 	modules []sample.MemoryModule
-	now     func() time.Time
+	now     func() time.Time // drives the cache TTL and the rate limiter
+	mono    func() uint64    // stamps each RAPL refresh (read_ns)
 	log     *slog.Logger
 
 	mu       sync.Mutex
 	tokens   float64
 	refilled time.Time
 	cached   []collector.HelperRAPLDomain
+	cachedNS uint64
 	cachedAt time.Time
 	hasCache bool
 }
 
 // newHandler builds the helper's HTTP handler. modules is the startup DIMM
-// inventory, served unchanged; rapl is called at most once per 250 ms.
-func newHandler(rapl func() []collector.HelperRAPLDomain, modules []sample.MemoryModule, now func() time.Time, log *slog.Logger) http.Handler {
+// inventory, served unchanged; rapl is called at most once per 250 ms and each
+// call is stamped with mono (monotonicNS in production).
+func newHandler(rapl func() []collector.HelperRAPLDomain, modules []sample.MemoryModule, now func() time.Time, mono func() uint64, log *slog.Logger) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	if modules == nil {
 		modules = []sample.MemoryModule{}
 	}
-	return &handler{rapl: rapl, modules: modules, now: now, log: log, tokens: rateBurst}
+	return &handler{rapl: rapl, modules: modules, now: now, mono: mono, log: log, tokens: rateBurst}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +76,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var body any
 	if r.URL.Path == collector.HelperRAPLPath {
-		body = collector.HelperRAPL{Domains: h.raplDomains()}
+		body = h.raplReading()
 	} else {
 		body = collector.HelperMemoryModules{Modules: h.modules}
 	}
@@ -106,18 +109,20 @@ func (h *handler) allow() bool {
 	return true
 }
 
-// raplDomains returns the cached reading, refreshing it when older than the TTL.
-func (h *handler) raplDomains() []collector.HelperRAPLDomain {
+// raplReading returns the cached reading with its read timestamp, refreshing it
+// when older than the TTL. A cached response repeats the refresh's read_ns.
+func (h *handler) raplReading() collector.HelperRAPL {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if now := h.now(); !h.hasCache || now.Sub(h.cachedAt) > raplCacheTTL {
 		h.cached = h.rapl()
+		h.cachedNS = h.mono()
 		if h.cached == nil {
 			h.cached = []collector.HelperRAPLDomain{}
 		}
 		h.cachedAt, h.hasCache = now, true
 	}
-	return h.cached
+	return collector.HelperRAPL{ReadNS: h.cachedNS, Domains: h.cached}
 }
 
 // newServer builds the HTTP server with the same timeouts and header limit as
