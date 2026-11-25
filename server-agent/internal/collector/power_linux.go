@@ -7,20 +7,24 @@ package collector
 
 // Default sysfs roots for the RAPL/hwmon readers; raplCollector itself is
 // build-tag-free and testable on any OS via newRAPLCollector's explicit
-// powercapRoot/hwmonRoot params (tests point them at a synthetic tree) -- these
-// two defaults are only needed here, where the real native collector is wired
+// powercapRoot param (tests point it at a synthetic tree) -- these two
+// defaults are only needed here, where the real native collector is wired
 // up for the standard Linux sysfs layout.
 const (
 	defaultPowercapRoot = "/sys/class/powercap"
 	defaultHwmonRoot    = "/sys/class/hwmon"
 )
 
-// newNativePowerCollector returns the Linux RAPL/hwmon power collector reading the
-// standard sysfs roots, or powercapRoot instead of the default powercap root when
-// non-empty (e.g. a host-provided virtiofs tree); the hwmon root is unchanged.
+// newNativePowerCollector returns the Linux RAPL power collector reading the
+// standard powercap root, or powercapRoot instead when non-empty (e.g. a
+// host-provided virtiofs tree). hwmon is a separate collector
+// (newNativeHwmonCollector) so the privileged helper can slot in between.
 func newNativePowerCollector(powercapRoot string) PowerCollector {
 	if powercapRoot == "" {
 		powercapRoot = defaultPowercapRoot
 	}
-	return newRAPLCollector(powercapRoot, defaultHwmonRoot, raplDomainGlobLinux)
+	return newRAPLCollector(powercapRoot, raplDomainGlobLinux)
 }
+
+// newNativeHwmonCollector returns the world-readable hwmon power-sensor collector.
+func newNativeHwmonCollector() PowerCollector { return newHwmonPowerCollector(defaultHwmonRoot) }

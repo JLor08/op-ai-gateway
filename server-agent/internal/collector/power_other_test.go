@@ -18,7 +18,4 @@ func TestNativePowerCollectorWindowsWiring(t *testing.T) {
 	if c.domainGlob != "intel-rapl_*" {
 		t.Fatalf("domainGlob = %q, want intel-rapl_*", c.domainGlob)
 	}
-	if c.hwmonRoot != "" {
-		t.Fatalf("hwmonRoot = %q, want empty", c.hwmonRoot)
-	}
 }

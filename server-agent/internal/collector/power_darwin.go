@@ -55,3 +55,6 @@ func (c *powermetricsCollector) Collect(ctx context.Context) (*float64, *float64
 	}
 	return parsePowermetricsCPUWatts(out), nil, nil
 }
+
+// newNativeHwmonCollector returns nil: there is no hwmon on macOS.
+func newNativeHwmonCollector() PowerCollector { return nil }

@@ -29,7 +29,7 @@ func TestRAPLDeltaWatts(t *testing.T) {
 	writeSysfs(t, pkg, "max_energy_range_uj", "262143328850\n")
 	writeSysfs(t, pkg, "energy_uj", "1000000\n")
 
-	c := newRAPLCollector(root, filepath.Join(root, "nohwmon"), raplDomainGlobLinux)
+	c := newRAPLCollector(root, raplDomainGlobLinux)
 	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	c.now = func() time.Time { return base }
 
@@ -64,7 +64,7 @@ func TestRAPLWraparound(t *testing.T) {
 	writeSysfs(t, pkg, "max_energy_range_uj", "20000000\n")
 	writeSysfs(t, pkg, "energy_uj", "19000000\n")
 
-	c := newRAPLCollector(root, filepath.Join(root, "nohwmon"), raplDomainGlobLinux)
+	c := newRAPLCollector(root, raplDomainGlobLinux)
 	base := time.Now()
 	c.now = func() time.Time { return base }
 	if _, _, err := c.Collect(context.Background()); err != nil {
@@ -85,24 +85,23 @@ func TestRAPLUnreadableEnergyYieldsNil(t *testing.T) {
 	writeSysfs(t, pkg, "name", "package-0\n")
 	// No energy_uj file at all -> the same skip path as a real EACCES (0400,
 	// non-root) read failure -> no package domain readable -> CPU nil.
-	c := newRAPLCollector(root, filepath.Join(root, "nohwmon"), raplDomainGlobLinux)
+	c := newRAPLCollector(root, raplDomainGlobLinux)
 	cpu, sys, _ := c.Collect(context.Background())
 	if cpu != nil {
 		t.Fatalf("CPU = %v, want nil (energy unreadable)", *cpu)
 	}
 	if sys != nil {
-		t.Fatalf("system = %v, want nil (no psys/hwmon)", *sys)
+		t.Fatalf("system = %v, want nil (no psys)", *sys)
 	}
 }
 
-func TestRAPLSystemPsysThenHwmonFallback(t *testing.T) {
-	// psys present -> system from psys delta.
+func TestRAPLSystemFromPsys(t *testing.T) {
 	root := t.TempDir()
 	psys := filepath.Join(root, "intel-rapl:1")
 	writeSysfs(t, psys, "name", "psys\n")
 	writeSysfs(t, psys, "max_energy_range_uj", "1000000000\n")
 	writeSysfs(t, psys, "energy_uj", "0\n")
-	c := newRAPLCollector(root, filepath.Join(root, "nohwmon"), raplDomainGlobLinux)
+	c := newRAPLCollector(root, raplDomainGlobLinux)
 	base := time.Now()
 	c.now = func() time.Time { return base }
 	_, _, _ = c.Collect(context.Background())
@@ -113,21 +112,11 @@ func TestRAPLSystemPsysThenHwmonFallback(t *testing.T) {
 		t.Fatalf("psys system watts = %v, want 5", sys)
 	}
 
-	// No psys -> hwmon power1_input (microwatts, instantaneous) -> system watts.
-	root2 := t.TempDir()
-	hwmon := filepath.Join(root2, "hwmon", "hwmon0")
-	writeSysfs(t, hwmon, "power1_input", "7000000\n") // 7,000,000 uW = 7 W
-	c2 := newRAPLCollector(filepath.Join(root2, "powercap"), filepath.Join(root2, "hwmon"), raplDomainGlobLinux)
-	_, sys2, _ := c2.Collect(context.Background())
-	if sys2 == nil || *sys2 < 6.999 || *sys2 > 7.001 {
-		t.Fatalf("hwmon system watts = %v, want 7", sys2)
-	}
-
-	// Neither psys nor hwmon -> nil.
-	c3 := newRAPLCollector(t.TempDir(), t.TempDir(), raplDomainGlobLinux)
+	// No psys: system stays nil (hwmon is its own collector, see hwmon_power.go).
+	c3 := newRAPLCollector(t.TempDir(), raplDomainGlobLinux)
 	_, sys3, _ := c3.Collect(context.Background())
 	if sys3 != nil {
-		t.Fatalf("system = %v, want nil (no psys, no hwmon)", *sys3)
+		t.Fatalf("system = %v, want nil (no psys)", *sys3)
 	}
 }
 
@@ -137,7 +126,7 @@ func TestRAPLSystemPsysThenHwmonFallback(t *testing.T) {
 // appears.
 func TestRAPLCollectorCustomRootAppearsLater(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "notyet")
-	c := newRAPLCollector(root, filepath.Join(t.TempDir(), "nohwmon"), raplDomainGlobLinux)
+	c := newRAPLCollector(root, raplDomainGlobLinux)
 	base := time.Date(2026, 8, 3, 12, 0, 0, 0, time.UTC)
 	c.now = func() time.Time { return base }
 
@@ -182,7 +171,7 @@ func TestRAPLZeroRangeCounterDecreaseIsZeroWatts(t *testing.T) {
 	writeSysfs(t, pkg, "max_energy_range_uj", "0\n")
 	writeSysfs(t, pkg, "energy_uj", "5000000\n")
 
-	c := newRAPLCollector(root, filepath.Join(root, "nohwmon"), raplDomainGlobLinux)
+	c := newRAPLCollector(root, raplDomainGlobLinux)
 	base := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	c.now = func() time.Time { return base }
 	if _, _, err := c.Collect(context.Background()); err != nil {
@@ -225,7 +214,7 @@ func TestRAPLWindowsGlobReadsUnderscoreDomain(t *testing.T) {
 	root := t.TempDir()
 	pkg := filepath.Join(root, "intel-rapl_0")
 	writePackageDomain(t, pkg, "1000000\n")
-	c := newRAPLCollector(root, "", raplDomainGlobWindows)
+	c := newRAPLCollector(root, raplDomainGlobWindows)
 	if !c.Available() {
 		t.Fatal("Available() = false, want true for an intel-rapl_0 domain")
 	}
@@ -243,7 +232,7 @@ func TestRAPLEachPlatformCountsOnce(t *testing.T) {
 			under := filepath.Join(root, "intel-rapl_0")
 			writePackageDomain(t, colon, "1000000\n")
 			writePackageDomain(t, under, "1000000\n")
-			c := newRAPLCollector(root, "", glob)
+			c := newRAPLCollector(root, glob)
 			cpu := sampleTwice(t, c, func() {
 				writeSysfs(t, colon, "energy_uj", "11000000\n")
 				writeSysfs(t, under, "energy_uj", "11000000\n")
@@ -252,23 +241,5 @@ func TestRAPLEachPlatformCountsOnce(t *testing.T) {
 				t.Fatalf("CPU watts = %v, want 10 (never 20)", cpu)
 			}
 		})
-	}
-}
-
-func TestRAPLEmptyHwmonRootNeverGlobsCwd(t *testing.T) {
-	cwd := t.TempDir()
-	writeSysfs(t, filepath.Join(cwd, "x"), "power1_input", "5000000")
-	t.Chdir(cwd)
-
-	c := newRAPLCollector(t.TempDir(), "", raplDomainGlobWindows)
-	if c.Available() {
-		t.Fatal("Available() = true, want false (empty hwmon root must not glob the working directory)")
-	}
-	_, system, err := c.Collect(context.Background())
-	if err != nil {
-		t.Fatalf("Collect: %v", err)
-	}
-	if system != nil {
-		t.Fatalf("system watts = %v, want nil", *system)
 	}
 }
