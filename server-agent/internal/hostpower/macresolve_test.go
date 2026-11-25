@@ -700,16 +700,38 @@ func TestResolveForeignAfterSYNSurvivesNewSYN(t *testing.T) {
 	wantReason(t, vmid, err, "foreign ingress")
 }
 
-func TestResolveNewSYNDropsOlderTapEvidence(t *testing.T) {
-	// Replacement drops earlier positive evidence: an old tap observation
-	// neither identifies nor taints the new connection.
+func TestResolveLaterSYNFromAnotherTapIsForeign(t *testing.T) {
+	// VM 100's connection is in flight when VM 101 sends a SYN and an ACK
+	// for the same 4-tuple from its own tap more than synBurstWindow later.
+	// The replacement must not hand VM 101's identity to VM 100's request:
+	// the carried tap100i0 observation is foreign to the new SYN's tap.
 	clock := time.Unix(1_000_000, 0)
 	f := clockFixture(t, map[string]string{"100": conf(testMACA), "101": conf(testMACB)}, &clock)
 	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0")
-	clock = clock.Add(time.Second)
+	clock = clock.Add(250 * time.Millisecond)
 	f.handshake(t, testKey, testMACB, "tap101i0", "vmbr0")
 	vmid, err := f.resolve()
-	wantVMID(t, vmid, err, "101")
+	wantReason(t, vmid, err, "foreign ingress")
+
+	// And the other way round: the earlier tap never identifies.
+	clock = clock.Add(time.Second)
+	f.see(t, testKey, testMACA, "enp3s0", "vmbr0")
+	f.ack(t, testKey, testMACA, "enp3s0", "vmbr0")
+	vmid, err = f.resolve()
+	wantReason(t, vmid, err, "not a VM port")
+}
+
+func TestResolveLaterSYNFromSameTapResolves(t *testing.T) {
+	// VM 100 retransmits its SYN more than synBurstWindow after the first
+	// one: the carried observations entered on its own tap and the bridge,
+	// so the connection still resolves to VM 100.
+	clock := time.Unix(1_000_000, 0)
+	f := clockFixture(t, map[string]string{"100": conf(testMACA), "101": conf(testMACB)}, &clock)
+	f.see(t, testKey, testMACA, "tap100i0", "vmbr0")
+	clock = clock.Add(250 * time.Millisecond)
+	f.handshake(t, testKey, testMACA, "tap100i0", "vmbr0")
+	vmid, err := f.resolve()
+	wantVMID(t, vmid, err, "100")
 }
 
 func TestResolveCarriedSegmentsDoNotCompleteHandshake(t *testing.T) {

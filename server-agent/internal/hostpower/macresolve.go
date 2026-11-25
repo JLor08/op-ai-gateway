@@ -35,9 +35,11 @@ const (
 	// synBurstWindow groups the copies of one SYN frame. A frame from a VM
 	// is seen on its tap, the firewall devices and the bridge within
 	// microseconds; an observation for the same 4-tuple that starts later
-	// than this belongs to a different SYN and replaces the earlier set, so
-	// a later connection reusing a 4-tuple never inherits an older tap
-	// observation.
+	// than this belongs to a different SYN and replaces the earlier set. The
+	// replaced observations are carried only as Earlier evidence, so a
+	// later connection reusing a 4-tuple never inherits an older tap as its
+	// identity, and a later SYN from another tap cannot take over a
+	// connection whose earlier segments entered elsewhere.
 	synBurstWindow = 200 * time.Millisecond
 
 	// Table bounds. A VM's connection yields about six distinct observations
@@ -86,10 +88,11 @@ type ConnKey struct {
 
 // Observation is one received copy of a client segment: the interface the
 // kernel received it on, the frame's Ethernet source address and whether the
-// segment was a SYN (SYN set, ACK clear). Earlier marks a non-tap
-// observation kept from an earlier connection attempt on the same 4-tuple:
-// it still counts for the foreign-ingress rule but is neither a SYN nor a
-// segment of the current handshake.
+// segment was a SYN (SYN set, ACK clear). Earlier marks an observation kept
+// from an earlier connection attempt on the same 4-tuple: it still counts
+// for the foreign-ingress rule (a carried tap other than the one the current
+// SYN entered on is foreign) but is neither a SYN nor a segment of the
+// current handshake.
 type Observation struct {
 	Ifname  string
 	SrcMAC  net.HardwareAddr
@@ -319,10 +322,13 @@ func NewObservationTable(ttl time.Duration, now func() time.Time) *ObservationTa
 // A SYN starts a new connection for its 4-tuple: it replaces whatever the
 // table holds for the key unless that already contains a SYN observed less
 // than synBurstWindow earlier (another copy of the same SYN). Replacement
-// only drops positive evidence: the earlier entry's observations on
-// interfaces that are not taps (foreign or transit) are kept, marked
-// Earlier, while younger than ttl, and so is an overflow mark. Every mark
-// lasts ttl from its latest sighting.
+// only drops positive evidence: every observation of the earlier entry
+// younger than ttl is kept, marked Earlier (never as a SYN or a handshake
+// segment), and so is an overflow mark. A carried tap observation on the tap
+// the new SYN enters on is harmless; one on any other tap makes the
+// connection foreign ingress, so a VM that sends a later SYN for another
+// VM's 4-tuple cannot take over that VM's connection. Every mark lasts ttl
+// from its latest sighting.
 // Non-SYN segments are added to the key's entry, creating one if needed.
 func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	now := t.now()
@@ -393,16 +399,18 @@ func (t *ObservationTable) overflowed(e *observedConn, now time.Time) bool {
 }
 
 // carryLocked copies the negative evidence of a replaced entry into its
-// successor: observations on non-tap interfaces younger than ttl, as Earlier
-// non-SYN observations (copies that collapse keep the latest At), and an
-// overflow mark younger than ttl with its own time.
+// successor: every observation younger than ttl, taps included, as an
+// Earlier non-SYN observation (copies that collapse keep the latest At), and
+// an overflow mark younger than ttl with its own time. Earlier observations
+// never identify a VM or complete a handshake; they only feed the
+// foreign-ingress rule.
 func (t *ObservationTable) carryLocked(dst, src *observedConn, now time.Time) {
 	if t.overflowed(src, now) {
 		dst.overflow, dst.overflowAt = true, src.overflowAt
 		return
 	}
 	for _, o := range src.obs {
-		if tapPortPattern.MatchString(o.Ifname) || now.Sub(o.At) > t.ttl {
+		if now.Sub(o.At) > t.ttl {
 			continue
 		}
 		o.SYN, o.Earlier = false, true
