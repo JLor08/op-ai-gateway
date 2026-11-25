@@ -13784,6 +13784,10 @@ side by side; the attribution, cadence and counter semantics of ADR-115 are unch
   clear: anyone who can passively read any hop of the path (token mode is meant for routed or NAT paths) can copy and replay it, so use it only on a
   trusted network until TLS exists.
 - A guest with several transports configured reports one value (collector order), so nothing is double counted.
+- In MAC mode the identity is the tap a connection entered, so a VM that routes, NATs or proxies for others (an OPNsense or pfSense VM, a
+  reverse-proxy VM) lends its identity: a machine behind it receives the router VM's counter. Networks behind such a VM use token mode or block
+  the listen port (TCP 9873) behind the router VM. The guest agent logs the VM ID it is served at Info on the first success and on every change, so a
+  misattribution is visible; failed requests are logged at Debug with the URL and status or error, never the token.
 - The state directory is `0700` (the unit sets `StateDirectoryMode=0700`) so no unprivileged host process reads another VM's tree.
 - → [Telemetry](cross-cutting/telemetry-usage-observability.md),
   [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),

@@ -1004,6 +1004,7 @@ service.
 |---|---|
 | Linux or Windows guest on the host's Linux bridge (the common case) | HTTP, MAC mode: set only `hostpower_url` |
 | Guest not on the host's bridge (routed, NAT, Open vSwitch, SDN), or IPv6 only (then `-listen` must be an IPv6 address) | HTTP, token mode: `hostpower_url` and `hostpower_token` |
+| Guest behind a router, NAT or proxy VM (for example an OPNsense or pfSense VM, or a reverse-proxy VM) | HTTP, token mode; MAC mode would serve it the router VM's counter |
 | No network path between guest and host wanted, no migration needed | virtiofs |
 
 Use exactly one transport per guest. If several are configured the collector
@@ -1086,6 +1087,16 @@ the NIC (the `fwbr`/`fwln`/`fwpr` interfaces are transit) and with the host
 address on a VLAN device over the bridge (for example `vmbr0.10`). Open
 vSwitch is not supported and fails closed (every VM gets `401`).
 
+A VM that routes, NATs or proxies for others lends its identity: the identity
+is the tap the connection entered, so a connection from a machine behind a
+router VM (an OPNsense or pfSense VM, a reverse-proxy VM) enters on the router
+VM's tap and receives the router VM's counter, silently. For networks behind
+such a VM use token mode, or block TCP port 9873 (the listen port) on the
+router VM for traffic from behind it. The guest agent logs the VM ID it is
+served at Info (`hostpower: host serves this VM's counter`, with `vmid` and
+`url`) on the first success and whenever it changes, so a guest that is served
+another VM's counter shows it in its log.
+
 Threat model. In scope and safe: a VM forging another VM's IP or MAC, a LAN
 device forging a VM's IP or MAC, and replay. Out of scope in this version: a
 layer-2 man-in-the-middle, where a LAN device or a guest poisons the host's
@@ -1139,7 +1150,10 @@ at most once every 10 minutes per source address and reason (`rate limited
 (source)` and `rate limited (vm)` for the two limits); served requests are
 logged at Debug only; tokens and `Authorization` values are never logged. The guest client
 ignores `HTTP_PROXY`/`HTTPS_PROXY` (through a proxy VM, MAC mode would
-identify the proxy) and does not follow redirects.
+identify the proxy) and does not follow redirects. To diagnose a guest whose
+`cpu_power_w` stays `null`, run its agent with `-v`: every failed request is
+logged at Debug as `hostpower: request failed` with the URL and the status code
+(`401`, `429`, `503`, ...) or the connection error, never the token.
 
 **How the share is computed.** Per interval the service takes the host's
 RAPL package energy delta and splits it across VMs by active CPU time (from

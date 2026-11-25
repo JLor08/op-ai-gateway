@@ -6,6 +6,7 @@ package collector
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -300,4 +301,91 @@ func TestHostpowerHTTPDoesNotFollowRedirects(t *testing.T) {
 	wantNil(t, "first after redirect", cpu)
 	cpu, _ = s.collect("ok", 31_000_000, 3*time.Second)
 	wantWatts(t, "second after redirect", cpu, 15)
+}
+
+// recordLogs points the collector at a text handler on a buffer at Debug.
+func recordLogs(c *hostpowerHTTPCollector) *syncBuffer {
+	buf := &syncBuffer{}
+	c.log = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return buf
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestHostpowerHTTPLogsFailuresWithoutToken(t *testing.T) {
+	s := newStepper(t, "ophp_guestsecret")
+	logs := recordLogs(s.c)
+	s.collect("503", 0, 0)
+	s.collect("garbage", 0, time.Second)
+	out := logs.String()
+	for _, want := range []string{
+		"level=DEBUG", `msg="hostpower: request failed"`, "status 503",
+		"url=" + s.f.srv.URL + "/v1/energy", "not the energy JSON",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log lacks %q:\n%s", want, out)
+		}
+	}
+	for _, leak := range []string{"ophp_guestsecret", "Bearer", "Authorization"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("log leaks %q:\n%s", leak, out)
+		}
+	}
+}
+
+func TestHostpowerHTTPLogsTransportError(t *testing.T) {
+	c := newHostpowerHTTPCollector("http://user:pw-secret@127.0.0.1:1", "ophp_guestsecret", NewHostpowerHTTPClient())
+	logs := recordLogs(c)
+	if cpu, _, err := c.Collect(context.Background()); cpu != nil || err != nil {
+		t.Fatalf("Collect = %v, %v", cpu, err)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `msg="hostpower: request failed"`) || !strings.Contains(out, "127.0.0.1:1") {
+		t.Fatalf("log = %s", out)
+	}
+	for _, leak := range []string{"ophp_guestsecret", "pw-secret"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("log leaks %q:\n%s", leak, out)
+		}
+	}
+}
+
+func TestHostpowerHTTPLogsServedVMIDOnFirstSuccessAndChange(t *testing.T) {
+	s := newStepper(t, "")
+	logs := recordLogs(s.c)
+	infos := func() int {
+		return strings.Count(logs.String(), `level=INFO msg="hostpower: host serves this VM's counter"`)
+	}
+	s.collect("ok", 1_000_000, 0)
+	s.collect("ok", 2_000_000, time.Second)
+	s.collect("503", 0, 2*time.Second)
+	s.collect("ok", 3_000_000, 3*time.Second)
+	if n := infos(); n != 1 {
+		t.Fatalf("infos = %d, want 1 (first success only):\n%s", n, logs.String())
+	}
+	if !strings.Contains(logs.String(), "vmid=100") || !strings.Contains(logs.String(), "url="+s.f.srv.URL) {
+		t.Fatalf("info lacks vmid/url:\n%s", logs.String())
+	}
+	s.f.mu.Lock()
+	s.f.vmid = "101"
+	s.f.mu.Unlock()
+	s.collect("ok", 4_000_000, 4*time.Second)
+	if n := infos(); n != 2 || !strings.Contains(logs.String(), "vmid=101") {
+		t.Fatalf("infos = %d after a vmid change, want 2:\n%s", n, logs.String())
+	}
 }
