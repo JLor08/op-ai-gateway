@@ -5,6 +5,7 @@ package hostpower
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -467,6 +468,21 @@ func TestParseAuthModes(t *testing.T) {
 		if _, err := ParseAuthModes(in); err == nil {
 			t.Fatalf("%q: expected error", in)
 		}
+	}
+}
+
+func TestNewServerErrorLogIsSlogDebug(t *testing.T) {
+	orig := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	var logs bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	srv := NewServer("127.0.0.1:0", http.NotFoundHandler())
+	if srv.ErrorLog == nil {
+		t.Fatal("ErrorLog is nil")
+	}
+	srv.ErrorLog.Printf("http: TLS handshake error from 192.0.2.1:1234: EOF")
+	if out := logs.String(); !strings.Contains(out, "level=DEBUG") || !strings.Contains(out, "TLS handshake error") {
+		t.Fatalf("log = %q", out)
 	}
 }
 

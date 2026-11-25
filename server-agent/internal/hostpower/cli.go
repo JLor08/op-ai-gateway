@@ -5,6 +5,7 @@ package hostpower
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"op-ai-server-agent/internal/collector"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,6 +38,9 @@ type Config struct {
 	Listen     string // empty: no HTTP endpoint
 	Auth       AuthModes
 	TokensPath string
+	TLS        bool   // serve -listen over HTTPS
+	TLSCert    string // certificate (PEM), read only with TLS
+	TLSKey     string // private key (PEM), read only with TLS
 }
 
 func newFlagSet() (fs *flag.FlagSet, cfg *Config, auth *string) {
@@ -45,16 +50,19 @@ func newFlagSet() (fs *flag.FlagSet, cfg *Config, auth *string) {
 	fs.StringVar(&cfg.OutDir, "out", DefaultOutDir, "directory for the synthetic powercap tree")
 	fs.DurationVar(&cfg.Interval, "interval", DefaultInterval, "write interval (minimum 100ms)")
 	fs.BoolVar(&cfg.Verbose, "v", false, "verbose (debug) logging")
-	fs.StringVar(&cfg.Listen, "listen", "", "serve /v1/energy over HTTP on host:port (off when empty)")
+	fs.StringVar(&cfg.Listen, "listen", "", "serve /v1/energy over HTTP (HTTPS with -tls) on host:port (off when empty)")
 	auth = fs.String("auth", "mac,token", "HTTP identification modes: comma list of mac, token")
 	fs.StringVar(&cfg.TokensPath, "tokens", DefaultTokensPath, "token store file for -auth token")
+	fs.BoolVar(&cfg.TLS, "tls", false, "serve the -listen endpoint over HTTPS (TLS 1.3)")
+	fs.StringVar(&cfg.TLSCert, "tls-cert", DefaultTLSCertPath, "TLS certificate (PEM) for -tls; generated with -tls-key when both are absent")
+	fs.StringVar(&cfg.TLSKey, "tls-key", DefaultTLSKeyPath, "TLS private key (PEM) for -tls")
 	return fs, cfg, auth
 }
 
 // ParseArgs parses the arguments after "hostpower". Besides the flag.FlagSet
 // errors it rejects positional arguments and an interval below MinInterval,
 // which also guards the ticker in Run against a non-positive duration. -auth is
-// validated only when -listen enables HTTP.
+// validated only when -listen enables HTTP, and -tls needs -listen.
 func ParseArgs(args []string) (Config, error) {
 	fs, cfg, auth := newFlagSet()
 	if err := fs.Parse(args); err != nil {
@@ -65,6 +73,9 @@ func ParseArgs(args []string) (Config, error) {
 	}
 	if cfg.Interval < MinInterval {
 		return Config{}, fmt.Errorf("hostpower: -interval must be at least %s", MinInterval)
+	}
+	if cfg.TLS && cfg.Listen == "" {
+		return Config{}, errors.New("hostpower: -tls needs -listen")
 	}
 	cfg.Auth = AuthModes{MAC: true, Token: true} // the -auth default
 	if cfg.Listen != "" {
@@ -114,7 +125,7 @@ func packageEnergyReadable(domains []string) bool {
 	return false
 }
 
-const usageText = "usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-v]\n" +
+const usageText = "usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-tls] [-tls-cert path] [-tls-key path] [-v]\n" +
 	"       server-agent hostpower token [-tokens path] create|revoke|list [vmid]\n" +
 	"       server-agent hostpower tls [-tls-cert path] fingerprint\n"
 
@@ -176,9 +187,20 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return serve(ctx, cancel, cfg, svc, stderr)
 }
 
-// serve runs the HTTP listener next to the tick loop until either ends and
-// returns the exit code.
+// serve runs the HTTP listener (HTTPS with -tls) next to the tick loop until
+// either ends and returns the exit code.
 func serve(ctx context.Context, cancel context.CancelFunc, cfg Config, svc *Service, stderr io.Writer) int {
+	var tlsConfig *tls.Config
+	if cfg.TLS {
+		cert, generated, err := LoadOrCreateCert(cfg.TLSCert, cfg.TLSKey, time.Now, slog.Default())
+		if err != nil {
+			fmt.Fprintf(stderr, "server-agent: %v\n", err)
+			return 2
+		}
+		slog.Info("hostpower: tls certificate", "cert", cfg.TLSCert,
+			"sha256", collector.FormatHostpowerFingerprint(cert.Certificate[0]), "generated", generated)
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}
+	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		fmt.Fprintf(stderr, "server-agent: hostpower: listen: %v\n", err)
@@ -194,11 +216,16 @@ func serve(ctx context.Context, cancel context.CancelFunc, cfg Config, svc *Serv
 			return 2
 		}
 	}
+	// The capture filters on the TCP port above; RemoteAddr and the local
+	// address that MAC mode resolves still come from the TCP connection.
+	if tlsConfig != nil {
+		ln = tls.NewListener(ln, tlsConfig)
+	}
 	srv := NewServer(ln.Addr().String(), newHandler(cfg.Auth, svc, &IngressResolver{Table: table},
 		NewTokenStore(cfg.TokensPath), slog.Default(), time.Now))
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
-	slog.Info("hostpower: serving", "listen", ln.Addr().String(), "auth", authSummary(cfg.Auth))
+	slog.Info("hostpower: serving", "listen", ln.Addr().String(), "auth", authSummary(cfg.Auth), "tls", cfg.TLS)
 
 	code := 0
 	tickDone := make(chan int, 1)

@@ -338,6 +338,9 @@ func NewServer(listen string, h http.Handler) *http.Server {
 		WriteTimeout:      5 * time.Second,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    4096,
+		// Connection-level errors (TLS handshakes from scanners or mis-pinned
+		// guests, mostly) go to Debug so they cannot flood the log.
+		ErrorLog: slog.NewLogLogger(slog.Default().Handler(), slog.LevelDebug),
 	}
 	srv.SetKeepAlivesEnabled(false)
 	return srv

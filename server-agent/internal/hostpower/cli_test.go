@@ -163,16 +163,56 @@ func TestParseArgsBadAuth(t *testing.T) {
 	}
 }
 
+func TestParseArgsTLSNeedsListen(t *testing.T) {
+	_, err := ParseArgs([]string{"-tls"})
+	if err == nil || err.Error() != "hostpower: -tls needs -listen" {
+		t.Fatalf("err = %v", err)
+	}
+	var buf bytes.Buffer
+	if code := Main([]string{"-tls"}, io.Discard, &buf); code != 2 || !strings.Contains(buf.String(), "-tls needs -listen") {
+		t.Fatalf("code = %d stderr=%q", code, buf.String())
+	}
+	// The path flags alone are only read with -tls.
+	if _, err := ParseArgs([]string{"-tls-cert", "/x.crt", "-tls-key", "/x.key"}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestParseArgsTLSDefaults(t *testing.T) {
+	cfg, err := ParseArgs([]string{"-listen", "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS || cfg.TLSCert != DefaultTLSCertPath || cfg.TLSKey != DefaultTLSKeyPath {
+		t.Fatalf("without -tls: %+v", cfg)
+	}
+	cfg, err = ParseArgs([]string{"-listen", "127.0.0.1:0", "-tls"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TLS || cfg.TLSCert != DefaultTLSCertPath || cfg.TLSKey != DefaultTLSKeyPath {
+		t.Fatalf("-tls: %+v", cfg)
+	}
+	cfg, err = ParseArgs([]string{"-listen", "127.0.0.1:0", "-tls", "-tls-cert", "/x.crt", "-tls-key", "/x.key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TLS || cfg.TLSCert != "/x.crt" || cfg.TLSKey != "/x.key" {
+		t.Fatalf("custom paths: %+v", cfg)
+	}
+}
+
 func TestMainHelpListsAllFlags(t *testing.T) {
 	var buf bytes.Buffer
 	if code := Main([]string{"-h"}, io.Discard, &buf); code != 0 {
 		t.Fatalf("code = %d", code)
 	}
 	for _, want := range []string{
-		"usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-v]",
+		"usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-tls] [-tls-cert path] [-tls-key path] [-v]",
 		"       server-agent hostpower token [-tokens path] create|revoke|list [vmid]",
 		"       server-agent hostpower tls [-tls-cert path] fingerprint",
-		"-listen", "-auth", "-tokens",
+		"-listen", "-auth", "-tokens", "-tls-cert", "-tls-key",
+		"serve the -listen endpoint over HTTPS (TLS 1.3)",
 	} {
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("usage lacks %q:\n%s", want, buf.String())
@@ -415,6 +455,155 @@ func TestRunServesTokenModeEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "hostpower: serving") {
 		t.Fatalf("no serving log: %s", stderr.String())
+	}
+}
+
+// freeAddr reserves a free loopback port and releases it for run to bind (the
+// listen address is the only handle the test has).
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	probe.Close()
+	return addr
+}
+
+func TestServeTLSTokenMode(t *testing.T) {
+	dir := t.TempDir()
+	tokens := filepath.Join(dir, "tokens.json")
+	token, err := CreateToken(tokens, "100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath := certPaths(filepath.Join(dir, "tls"))
+	addr := freeAddr(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stderr lockedBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-out", filepath.Join(dir, "out"), "-interval", "100ms",
+			"-listen", addr, "-auth", "token", "-tokens", tokens,
+			"-tls", "-tls-cert", certPath, "-tls-key", keyPath,
+		}, io.Discard, &stderr)
+	}()
+
+	// The certificate is written before the listener opens.
+	var der []byte
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if der, err = readCertDER(certPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no certificate: %v; stderr=%s", err, stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	fp := collector.FormatHostpowerFingerprint(der)
+	pin, err := collector.ParseHostpowerFingerprint(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	do := func(client *http.Client, url string) int {
+		req, _ := http.NewRequest(http.MethodGet, url, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			resp, err := client.Do(req)
+			if err == nil {
+				resp.Body.Close()
+				return resp.StatusCode
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: %v; stderr=%s", url, err, stderr.String())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if code := do(collector.NewHostpowerHTTPClient(pin), "https://"+addr+"/v1/energy"); code != http.StatusServiceUnavailable && code != http.StatusOK {
+		t.Fatalf("pinned https: code = %d", code)
+	}
+	if code := do(http.DefaultClient, "http://"+addr+"/v1/energy"); code != http.StatusBadRequest {
+		t.Fatalf("plain http: code = %d, want 400", code)
+	}
+
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit = %d stderr=%s", code, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after cancel")
+	}
+	logs := stderr.String()
+	for _, want := range []string{
+		"hostpower: tls certificate", "cert=" + certPath, "sha256=" + fp, "generated=true",
+		"hostpower: serving", "tls=true",
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("log lacks %q:\n%s", want, logs)
+		}
+	}
+}
+
+func TestServePlainLogsTLSFalse(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	var stderr lockedBuffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"-out", filepath.Join(dir, "out"), "-interval", "100ms",
+			"-listen", "127.0.0.1:0", "-auth", "token", "-tokens", filepath.Join(dir, "tokens.json"),
+		}, io.Discard, &stderr)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stderr.String(), "hostpower: serving") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no serving log: %s", stderr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("exit = %d stderr=%s", code, stderr.String())
+	}
+	if logs := stderr.String(); !strings.Contains(logs, "tls=false") || strings.Contains(logs, "hostpower: tls certificate") {
+		t.Fatalf("log = %s", logs)
+	}
+}
+
+func TestServeTLSCertFailureExits2BeforeListening(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := certPaths(filepath.Join(dir, "tls"))
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte("half a pair"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	code := Main([]string{
+		"-out", filepath.Join(dir, "out"), "-listen", "127.0.0.1:0", "-auth", "token",
+		"-tokens", filepath.Join(dir, "tokens.json"), "-tls", "-tls-cert", certPath, "-tls-key", keyPath,
+	}, io.Discard, &buf)
+	if code != 2 {
+		t.Fatalf("code = %d stderr=%q", code, buf.String())
+	}
+	if !strings.Contains(buf.String(), "server-agent: hostpower: tls key ") || !strings.Contains(buf.String(), certPath) ||
+		strings.Contains(buf.String(), "hostpower: serving") {
+		t.Fatalf("stderr = %q", buf.String())
+	}
+	if _, err := os.Lstat(certPath); err == nil {
+		t.Fatal("certificate written next to a lone key")
 	}
 }
 
