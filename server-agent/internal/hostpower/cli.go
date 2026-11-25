@@ -115,7 +115,8 @@ func packageEnergyReadable(domains []string) bool {
 }
 
 const usageText = "usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-v]\n" +
-	"       server-agent hostpower token [-tokens path] create|revoke|list [vmid]\n"
+	"       server-agent hostpower token [-tokens path] create|revoke|list [vmid]\n" +
+	"       server-agent hostpower tls [-tls-cert path] fingerprint\n"
 
 // Main runs the hostpower mode and returns the process exit code.
 func Main(args []string, stdout, stderr io.Writer) int {
@@ -128,6 +129,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "token" {
 		return TokenMain(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "tls" {
+		return TLSMain(args[1:], stdout, stderr)
 	}
 	cfg, err := ParseArgs(args)
 	if errors.Is(err, flag.ErrHelp) {

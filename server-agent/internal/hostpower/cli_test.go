@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"op-ai-server-agent/internal/collector"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -170,6 +171,7 @@ func TestMainHelpListsAllFlags(t *testing.T) {
 	for _, want := range []string{
 		"usage: server-agent hostpower [-out dir] [-interval duration] [-listen host:port] [-auth mac,token] [-tokens path] [-v]",
 		"       server-agent hostpower token [-tokens path] create|revoke|list [vmid]",
+		"       server-agent hostpower tls [-tls-cert path] fingerprint",
 		"-listen", "-auth", "-tokens",
 	} {
 		if !strings.Contains(buf.String(), want) {
@@ -186,6 +188,59 @@ func TestMainTokenSubcommand(t *testing.T) {
 	}
 	if !strings.HasPrefix(strings.TrimSpace(out.String()), "ophp_") {
 		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestMainTLSFingerprint(t *testing.T) {
+	certPath, keyPath := certPaths(t.TempDir())
+	cert, _, err := LoadOrCreateCert(certPath, keyPath, time.Now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := Main([]string{"tls", "-tls-cert", certPath, "fingerprint"}, &out, &errb); code != 0 {
+		t.Fatalf("code = %d stderr=%q", code, errb.String())
+	}
+	if want := collector.FormatHostpowerFingerprint(cert.Certificate[0]) + "\n"; out.String() != want {
+		t.Fatalf("stdout = %q, want %q", out.String(), want)
+	}
+}
+
+func TestMainTLSFingerprintUnreadableExits1(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.crt")
+	garbage := filepath.Join(dir, "garbage.crt")
+	if err := os.WriteFile(garbage, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{missing, garbage} {
+		var out, errb bytes.Buffer
+		if code := Main([]string{"tls", "-tls-cert", path, "fingerprint"}, &out, &errb); code != 1 {
+			t.Errorf("%s: code = %d, want 1", path, code)
+		}
+		if out.Len() != 0 || !strings.Contains(errb.String(), path) {
+			t.Errorf("%s: stdout=%q stderr=%q", path, out.String(), errb.String())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "tls.key")); err == nil {
+		t.Fatal("fingerprint verb generated a key")
+	}
+}
+
+func TestMainTLSUsageErrorsExit2(t *testing.T) {
+	for _, args := range [][]string{
+		{"tls"},
+		{"tls", "frob"},
+		{"tls", "fingerprint", "extra"},
+		{"tls", "-nosuchflag", "fingerprint"},
+	} {
+		var out, errb bytes.Buffer
+		if code := Main(args, &out, &errb); code != 2 {
+			t.Errorf("%v: code = %d, want 2", args, code)
+		}
+		if out.Len() != 0 || !strings.Contains(errb.String(), "usage: server-agent hostpower tls") {
+			t.Errorf("%v: stdout=%q stderr=%q", args, out.String(), errb.String())
+		}
 	}
 }
 

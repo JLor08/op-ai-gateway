@@ -91,28 +91,43 @@ func loadForWrite(path string) (map[string]tokenRecord, error) {
 }
 
 func writeTokenFile(path string, recs map[string]tokenRecord) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(filepath.Dir(path)); err != nil {
 		return err
-	}
-	if di, err := os.Stat(dir); err != nil {
-		return err
-	} else if di.Mode().Perm()&^0o700 != 0 {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
-		}
 	}
 	data, err := json.MarshalIndent(recs, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".tokens-*.tmp")
+	return writePrivateFileAtomic(path, append(data, '\n'))
+}
+
+// ensurePrivateDir creates dir (and its parents) with mode 0700, or tightens
+// an existing dir that grants group or other permissions to 0700.
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	di, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if di.Mode().Perm()&^0o700 != 0 {
+		return os.Chmod(dir, 0o700)
+	}
+	return nil
+}
+
+// writePrivateFileAtomic replaces path with data through a temp file in the
+// same directory that is chmod'ed to 0600 before the rename, so readers see
+// either the old or the new content and never a group/other-readable file.
+func writePrivateFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return err
 	}
 	name := tmp.Name()
 	cleanup := func() { _ = os.Remove(name) }
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		cleanup()
 		return err
