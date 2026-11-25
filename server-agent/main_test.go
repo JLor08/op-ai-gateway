@@ -4,9 +4,12 @@
 package main
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"op-ai-server-agent/internal/config"
+	"strings"
 	"testing"
 )
 
@@ -131,5 +134,18 @@ func TestGatewayFeaturesWiringReachesTheAgent(t *testing.T) {
 	if len(wired) != 1 || wired[0] != built[0] {
 		t.Fatalf("agent.Deps.GatewayFeatures is set from %q in main.go, want exactly %q, the client the runtime driver polls -- "+
 			"without it the agent reads the gateway as declaring nothing and never probes a stable_diffusion_cpp child", wired, built[0])
+	}
+}
+
+func TestResolvedConfigAttrsNeverCarryToken(t *testing.T) {
+	cfg := config.Config{HostpowerURL: "http://192.0.2.1:9873", HostpowerToken: "ophp_secret"}
+	attrs := fmt.Sprint(resolvedConfigAttrs(cfg))
+	if strings.Contains(attrs, "ophp_secret") {
+		t.Fatalf("resolved config attrs leak the hostpower token: %s", attrs)
+	}
+	for _, want := range []string{"hostpower_token_set true", "hostpower_url http://192.0.2.1:9873"} {
+		if !strings.Contains(attrs, want) {
+			t.Fatalf("attrs %q lack %q", attrs, want)
+		}
 	}
 }

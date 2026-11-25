@@ -49,8 +49,10 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_MODEL_STATUS_URL` | `-model-status-url` | `model_status_url` | — | Optional endpoint polled each cycle for the models currently **loaded**, e.g. `/running` (llama-swap), `/props` (llama.cpp), `/v1/models` (vLLM). Empty disables it. |
 | `OP_AGENT_MODEL_STATUS_FORMAT` | `-model-status-format` | `model_status_format` | — (auto) | How to parse `model_status_url`: `openai`, `llama_swap`, `llama_cpp`, `litellm`, or empty / `auto` (a tolerant union of all shapes). |
 | `OP_AGENT_TLS_INSECURE` | `-tls-insecure`  | `tls_insecure` | `false` | Skip TLS certificate verification (self-signed dev gateways). `true`/`1`. |
-| `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap sysfs root the Linux RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower`). Empty uses the platform default; ignored on other OSes. See [Linux guest on a Proxmox VE host](#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share). |
-| `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. The only Windows CPU-watt path; a Linux fallback when RAPL is unreadable. |
+| `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap root the RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower` on Linux, a drive root such as `Z:\` on Windows). Empty uses the platform default (Linux) or disables it (Windows); ignored on macOS. See [Linux or Windows guest on a Proxmox VE host](#linux-or-windows-guest-on-a-proxmox-ve-host). |
+| `OP_AGENT_HOSTPOWER_URL` | `-hostpower-url` | `hostpower_url` | — | Optional hostpower HTTP endpoint on the Proxmox host (e.g. `http://<host>:9873`) the guest reads its share of host CPU power from. Empty disables it. Without a token the host identifies the VM by its network port (MAC mode). A value without an `http://` or `https://` scheme or without a host logs a startup warning. |
+| `OP_AGENT_HOSTPOWER_TOKEN` | `-hostpower-token` | `hostpower_token` | — | Optional per-VM token for the hostpower HTTP endpoint (token mode; secret; never logged). Create it on the host with `server-agent hostpower token create <vmid>`. Set without `hostpower_url`, it logs a startup warning. |
+| `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. A Windows CPU-watt path (alongside `powercap_root` and `hostpower_url`); a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
 | `OP_AGENT_CERT_DIR`     | `-cert-dir`      | `cert_dir`     | —       | Directory certificate files are written into. **Required** when `cert_mode` is not `off`. |
 | `OP_AGENT_CERT_RELOAD_COMMAND` | `-cert-reload-command` | `cert_reload_command` | — | Local shell command run after a changed certificate is fully installed. Comes **only** from this local setting — the gateway can never deliver a command to run. |
@@ -872,8 +874,9 @@ Per-platform prerequisites:
   `null`. Total system watts is never available on macOS CGO-free → always `null`.
 
 - **Windows.** There is no native CGO-free path (RAPL is ring-0/MSR). CPU watts are
-  available **only** via the optional LibreHardwareMonitor source below; system watts
-  are `null`.
+  available via the optional LibreHardwareMonitor source below, or, for a guest on a
+  Proxmox host, from the host's share (virtiofs or HTTP, see the last item); system
+  watts are `null`.
 
 - **LibreHardwareMonitor source (any OS, opt-in).** Set `OP_AGENT_LHM_URL` to the
   operator's LibreHardwareMonitor Remote Web Server `/data.json`
@@ -884,32 +887,39 @@ Per-platform prerequisites:
   operator installs it. Unset/unreachable → power `null` (no chart). Per metric, the
   native reading wins and LHM fills gaps (native first).
 
-- **Linux guest, host-attributed (opt-in).** Set `OP_AGENT_POWERCAP_ROOT` to a
-  mounted `server-agent hostpower` tree; see
-  [below](#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share).
+- **Linux or Windows guest, host-attributed (opt-in).** Set `OP_AGENT_POWERCAP_ROOT` to a
+  mounted `server-agent hostpower` tree, or `OP_AGENT_HOSTPOWER_URL` to its HTTP endpoint; see
+  [below](#linux-or-windows-guest-on-a-proxmox-ve-host).
 
-### Linux guest on a Proxmox VE host (virtiofs-attributed share)
+### Linux or Windows guest on a Proxmox VE host
 
 A KVM guest has no RAPL: the MSRs are not passed through and
-`/sys/class/powercap` is empty, so `cpu_power_w` stays `null` there. Instead, a
-small service on the Proxmox VE (PVE 9.2) host measures the host's RAPL package
-energy, attributes it to each VM by CPU time, and publishes the result as a
-per-VM synthetic powercap tree that the guest mounts over virtiofs. The
-guest's agent reads it with its normal RAPL collector.
+`/sys/class/powercap` is empty (Windows has no powercap at all), so
+`cpu_power_w` stays `null` there. Instead, a small service on the Proxmox VE
+(PVE 9.2) host measures the host's RAPL package energy, attributes it to each
+VM by CPU time, and hands every VM its own cumulative energy counter over one
+of three transports. The guest agent turns the counter into watts, exactly as
+it does for bare-metal RAPL. This works for one PVE host; there is no cluster
+support (see Limitations).
 
-**1. Host service (once per host).** Install virtiofsd (`apt install virtiofsd`),
-download the Linux agent binary to `/usr/local/bin/server-agent`, and run it
-in `hostpower` mode as root (RAPL `energy_uj` is root-only) under systemd,
-for example `/etc/systemd/system/op-hostpower.service`:
+**1. Host service (once per host).** Install virtiofsd if you use virtiofs
+(`apt install virtiofsd`), download the Linux agent binary to
+`/usr/local/bin/server-agent`, and run it in `hostpower` mode as root (RAPL
+`energy_uj` is root-only) under systemd, for example
+`/etc/systemd/system/op-hostpower.service`:
 
 ```
 [Unit]
 Description=OnPrem AI Gateway hostpower (VM CPU power share)
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower
 Restart=always
+RestartSec=5s
 StateDirectory=op-hostpower
+StateDirectoryMode=0700
 ProtectSystem=strict
 ReadWritePaths=/var/lib/op-hostpower
 NoNewPrivileges=yes
@@ -919,28 +929,58 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
+To also serve the HTTP transports, add a listen address (the host's address
+on the VM bridge, here a documentation address):
+
+```
+ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower -listen 192.0.2.10:9873
+```
+
 `ProtectSystem=strict` makes the whole file system read-only for the service
 except `/dev`, `/proc` and `/sys`, which it only reads; `ReadWritePaths`
 leaves the out directory as its only writable path, and `StateDirectory`
 creates `/var/lib/op-hostpower` before the unit starts (a missing
-`ReadWritePaths` directory fails the start). Options: `-out DIR` (default
-`/var/lib/op-hostpower`), `-interval D` (default `250ms`, minimum `100ms`;
-keep it at most a quarter of the guest's `OP_AGENT_INTERVAL`, so each guest
-reading spans several host updates; a host tick near the guest interval makes
-readings alternate between 0 W and twice the true value), `-v`. Keep the
-guest at its 1 s default `OP_AGENT_INTERVAL`: at the agent's 250 ms floor the
-quarter rule would need a 62.5 ms host tick, below the host's 100 ms minimum.
-The service needs no token, contacts no gateway and opens no listener. It
-warns at startup when the host has no RAPL domain, when RAPL `energy_uj` is
-not readable (not root; guests would report 0 W) or when there is no
-`qemu.slice`, and keeps running. At startup it also removes leftover temp
-files from an earlier crash.
+`ReadWritePaths` directory fails the start). `network-online.target` and
+`RestartSec=5s` matter with `-listen`: if the unit starts before the bridge
+address exists, the listen fails and the service exits with 2, and with the
+default 100 ms restart delay it would hit systemd's start limit and stay failed,
+which also stops every virtiofs counter. If the PVE datacenter or host
+firewall is on, allow TCP 9873 inbound on the host from the VMs. `StateDirectoryMode=0700` keeps
+the per-VM trees readable by root only; guests are unaffected because virtiofsd
+runs as root. The service creates the out directory `0700` when it creates it
+itself.
 
-**2. Read-only source for the shares (once per host, recommended).** Every
-share is writable from inside its VM unless its source is read-only, so a
-guest could fill the host's root file system or plant symlinks in it. Map the
-VMs to a read-only bind mount of the out directory instead of the directory
-the service writes, for example with the host fstab line
+Usage: `server-agent hostpower [-out dir] [-interval duration]
+[-listen host:port] [-auth mac,token] [-tokens path] [-v]`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-out DIR` | `/var/lib/op-hostpower` | Where the per-VM trees are written |
+| `-interval D` | `250ms` (minimum `100ms`) | Tick length; see the cadence rule below |
+| `-listen host:port` | empty (HTTP off) | Serve the HTTP endpoint on this address |
+| `-auth mac,token` | `mac,token` | Enabled HTTP identification modes |
+| `-tokens PATH` | `/etc/op-hostpower/tokens.json` | Token store for token mode |
+| `-v` | off | Debug logging |
+
+Cadence rule: keep `-interval` at most a quarter of the guest's
+`OP_AGENT_INTERVAL`, so each guest reading spans several host updates; a host
+tick near the guest interval makes readings alternate between 0 W and twice
+the true value. Keep the guest at its 1 s default `OP_AGENT_INTERVAL`: at the
+agent's 250 ms floor the quarter rule would need a 62.5 ms host tick, below
+the host's 100 ms minimum. The service needs no gateway token and contacts no
+gateway; it opens a listener only when `-listen` is set. It warns at startup
+when the host has no RAPL domain, when RAPL `energy_uj` is not readable (not
+root; guests would report 0 W) or when there is no `qemu.slice`, and keeps
+running. At startup it also removes leftover temp files from an earlier crash.
+With `-auth` containing `mac` on a non-Linux build, or without the privilege
+to open a raw socket (it needs `CAP_NET_RAW`, which the root service has), the
+service refuses to start (exit 2); use `-auth token` there.
+
+**2. Read-only source for the shares (once per host, recommended for
+virtiofs).** Every share is writable from inside its VM unless its source is
+read-only, so a guest could fill the host's root file system or plant symlinks
+in it. Map the VMs to a read-only bind mount of the out directory instead of
+the directory the service writes, for example with the host fstab line
 
 ```
 /var/lib/op-hostpower /run/op-hostpower-ro none bind,ro 0 0
@@ -949,62 +989,207 @@ the service writes, for example with the host fstab line
 (create both directories once with
 `mkdir -p /var/lib/op-hostpower /run/op-hostpower-ro`, then
 `systemctl daemon-reload && mount /run/op-hostpower-ro`; at boot systemd
-recreates the mount point under `/run` itself). An fstab mount (or an equivalent systemd `.mount` unit) is part
-of `local-fs.target`, so it is re-established on every boot before PVE
-autostarts VMs. The service keeps writing to `/var/lib/op-hostpower`, and new
-VM directories appear in the bind. The service confines every write to the
-VM's own directory regardless (a symlink that leaves it is refused) and
-never reads a FIFO, other special file or oversized file a guest placed
-there (it replaces it), as defense in depth.
+recreates the mount point under `/run` itself). An fstab mount (or an
+equivalent systemd `.mount` unit) is part of `local-fs.target`, so it is
+re-established on every boot before PVE autostarts VMs. The service keeps
+writing to `/var/lib/op-hostpower`, and new VM directories appear in the bind.
+The service confines every write to the VM's own directory regardless (a
+symlink that leaves it is refused) and never reads a FIFO, other special file
+or oversized file a guest placed there (it replaces it), as defense in depth.
 
-**3. Per VM (on the host).** The directory
-`/var/lib/op-hostpower/<vmid>` appears only after the service has ticked while
-that VM is running (it discovers VMs by their live `qemu.slice/<vmid>.scope`);
-for a stopped VM create it yourself with `mkdir -p /var/lib/op-hostpower/<vmid>`.
-Then map its read-only view and attach it with the virtiofs cache disabled:
+**3. Choose a transport per VM.** All three run side by side from the one
+service.
+
+| Situation | Transport |
+|---|---|
+| Linux or Windows guest on the host's Linux bridge (the common case) | HTTP, MAC mode: set only `hostpower_url` |
+| Guest not on the host's bridge (routed, NAT, Open vSwitch, SDN), or IPv6 only (then `-listen` must be an IPv6 address) | HTTP, token mode: `hostpower_url` and `hostpower_token` |
+| Guest behind a router, NAT or proxy VM (for example an OPNsense or pfSense VM, or a reverse-proxy VM) | HTTP, token mode; MAC mode would serve it the router VM's counter |
+| No network path between guest and host wanted, no migration needed | virtiofs |
+
+Use exactly one transport per guest. If several are configured the collector
+order decides (native/virtiofs first, then hostpower HTTP, then
+LibreHardwareMonitor) and only one value is reported, so nothing is double
+counted.
+
+#### virtiofs (Linux and Windows guests)
+
+The directory `/var/lib/op-hostpower/<vmid>` appears only after the service
+has ticked while that VM is running (it discovers VMs by their live
+`qemu.slice/<vmid>.scope`); for a stopped VM create it yourself with
+`mkdir -p /var/lib/op-hostpower/<vmid>` (Linux guest) or
+`mkdir -p /var/lib/op-hostpower/<vmid>/windows` (Windows guest, whose mapping
+points at that subdirectory; virtiofsd needs it to exist or the VM fails to start). Each VM gets two trees:
+
+- `<vmid>/intel-rapl:0/` for Linux guests,
+- `<vmid>/windows/intel-rapl_0/` for Windows guests (the same files; the name
+  has no `:`: a colon is not a legal Windows file-name character and how
+  virtio-win presents such a host name is unverified, so the Windows tree avoids it).
+
+Map the read-only view and attach it with the virtiofs cache disabled. For a
+**Linux guest** map `<vmid>`:
 
 ```
 pvesh create /cluster/mapping/dir --id hostpower-<vmid> --map node=<node>,path=/run/op-hostpower-ro/<vmid>
 qm set <vmid> --virtiofs0 dirid=hostpower-<vmid>,cache=never
 ```
 
+For a **Windows guest** map `<vmid>/windows` instead
+(`path=/run/op-hostpower-ro/<vmid>/windows`) with the same `qm set` line.
+
 `cache=never` matters: with PVE's default `cache=auto` the guest can read a
 value up to about 1 s old after the host replaced the file, which brings back
 the alternation between 0 W and twice the true value.
 
-**4. In the guest.** Mount the share read-only, for example with the fstab
-line `hostpower-<vmid> /run/op-hostpower virtiofs ro,nofail 0 0`, and point the
-agent at it with `OP_AGENT_POWERCAP_ROOT=/run/op-hostpower` (or `-powercap-root`
-or `powercap_root` in the config file). The resolved `powercap_root` is logged at debug level (`-v`); the startup
-`power_sources` always lists `rapl` on Linux, so it does not prove the mount
-works. To check: `cat /run/op-hostpower/intel-rapl:0/energy_uj` in the guest
-must rise between two reads, and `cpu_power_w` turns non-null from the second
-sample (the first is `null`, a RAPL delta, as on bare metal). Under steady
-load `cpu_power_w` must stay roughly level; if it alternates between about 0
-and about twice the expected value, check `cache=never` (step 3) and the
-quarter rule (step 1).
+*Linux guest.* Mount the share read-only, for example with the fstab line
+`hostpower-<vmid> /run/op-hostpower virtiofs ro,nofail 0 0`, and point the
+agent at it with `OP_AGENT_POWERCAP_ROOT=/run/op-hostpower` (or
+`-powercap-root` or `powercap_root` in the config file). The resolved
+`powercap_root` is logged at debug level (`-v`); the startup `power_sources`
+always lists `rapl` on Linux, so it does not prove the mount works. To check:
+`cat /run/op-hostpower/intel-rapl:0/energy_uj` in the guest must rise between
+two reads.
+
+*Windows guest.* Install the virtio-win guest tools (they provide the
+VirtIO-FS service) and WinFsp, configure the VirtIO-FS service with the mapping
+tag and a drive letter, and set `powercap_root` to that drive root, for example
+`"powercap_root": "Z:\\"` in the JSON config file (or `OP_AGENT_POWERCAP_ROOT=Z:\`).
+Do not expose ACLs through the share (virtio-win guidance). The agent service
+account (commonly LocalSystem) must be able to see the drive. To check: the
+file `Z:\intel-rapl_0\energy_uj` must rise between two reads.
+
+In both cases `cpu_power_w` turns non-null from the second sample (the first
+is `null`, a RAPL delta, as on bare metal). Under steady load it must stay
+roughly level; if it alternates between about 0 and about twice the expected
+value, check `cache=never` and the cadence rule.
+
+#### HTTP, MAC mode (no secret)
+
+Set only the host URL in the guest, with `OP_AGENT_HOSTPOWER_URL=http://192.0.2.10:9873`
+(or `-hostpower-url` or `hostpower_url` in the config file) and no token. The
+guest asks `GET /v1/energy`; the host identifies the VM from the network path
+itself and answers with that VM's counter.
+
+How the host knows who is asking: the service watches (with a Linux
+`AF_PACKET` raw socket) the TCP SYN of every connection to the listen port and
+records which interface it entered on and its Ethernet source MAC. Only an
+interface named `tap<vmid>i<n>` counts as a VM port, so the VM ID comes from
+the bridge port the connection physically entered, not from anything the
+sender claims, and every segment observed before the decision must enter on the
+same tap (or on a transit interface such as the bridge). The SYN's source MAC
+must also equal the MAC of that NIC (`net<n>`) in the VM's current config
+(`/etc/pve/qemu-server/<vmid>.conf`, not its snapshots). ARP and the bridge
+forwarding table are never consulted.
+
+Requirements: Linux host, `CAP_NET_RAW` (root service), IPv4 only, and the VM's
+NIC must be a QEMU tap on this host. It works with the PVE firewall enabled on
+the NIC (the `fwbr`/`fwln`/`fwpr` interfaces are transit) and with the host
+address on a VLAN device over the bridge (for example `vmbr0.10`). Open
+vSwitch is not supported and fails closed (every VM gets `401`).
+
+A VM that routes, NATs or proxies for others lends its identity: the identity
+is the tap the connection entered, so a connection from a machine behind a
+router VM (an OPNsense or pfSense VM, a reverse-proxy VM) enters on the router
+VM's tap and receives the router VM's counter, silently. For networks behind
+such a VM use token mode, or block TCP port 9873 (the listen port) on the
+router VM for traffic from behind it. The guest agent logs the VM ID it is
+served at Info (`hostpower: host serves this VM's counter`, with `vmid` and
+`url`) on the first success and whenever it changes, so a guest that is served
+another VM's counter shows it in its log.
+
+Threat model. In scope and safe: a VM forging another VM's IP or MAC, a LAN
+device forging a VM's IP or MAC, and replay. Out of scope in this version: a
+layer-2 man-in-the-middle, where a LAN device or a guest poisons the host's
+ARP cache or bridge forwarding table for a VM's address and then relays that
+VM's traffic. This holds for MAC mode and token mode alike (token mode would
+even expose the token). Mitigations: enable the PVE firewall with MAC filter
+and IP filter on each VM NIC (this stops the guest variant), and keep the
+host's bridge on a trusted LAN segment. TLS with a pinned certificate is the
+possible follow-up.
+
+#### HTTP, token mode (routed networks, NAT, Open vSwitch, IPv6)
+
+Manage per-VM tokens on the host, as root, outside the service (flags go
+before the verb):
+
+```
+server-agent hostpower token [-tokens path] create <vmid>
+server-agent hostpower token [-tokens path] revoke <vmid>
+server-agent hostpower token [-tokens path] list
+```
+
+`create` creates or replaces the VM's token and prints it once; the store
+(`/etc/op-hostpower/tokens.json` by default, file `0600`, directory `0700`)
+keeps only its SHA-256, and `list` shows VM IDs and creation times, never
+hashes. The running service picks up changes without a restart. Put the token
+in the guest with `OP_AGENT_HOSTPOWER_TOKEN` (or `-hostpower-token` or
+`hostpower_token`) next to `hostpower_url`; it is a secret and is never
+logged. Token mode does not check the request's network origin.
+
+Tokens follow clones and templates: a token baked into a template or a cloned
+disk gives every clone the original VM's identity. Create a VM's token after
+cloning, never put `hostpower_token` into a template, and revoke the token when
+the VM is destroyed or its vmid is reused.
+
+The HTTP transport is plain HTTP: anyone who can read the traffic on the path
+can read the token and the values, so use it only on a trusted segment (see
+the threat model above).
+
+#### The HTTP endpoint (both modes)
+
+**The endpoint.** `GET /v1/energy` answers `200` with
+`{"vmid":"<vmid>","energy_uj":<n>,"max_energy_range_uj":0}` and
+`Cache-Control: no-store`. A request that carries any `Authorization` header
+(any scheme, even an empty one) is handled in token mode only, with no fallback
+to MAC mode; a request without it is handled in MAC mode. Status codes: `401`
+not identified (malformed authorization, unknown or revoked token, the mode
+is disabled, capture unavailable, IPv6 source, observation overflow, no SYN
+observed, handshake not observed, not a VM port, ambiguous or foreign ingress,
+no VM config, MAC mismatch), `503`
+identified but the VM has no live counter yet (just started, or stopped), `404`/`405` for another path or method, `429` above
+100 requests per second from one source address (burst 200, checked before
+identification) or above 10 requests per second for one VM (burst 20, checked
+once the request is tied to a VM), so many token-mode guests behind one NAT
+address are never limited by each other. Keep-alive is disabled, so every
+request is its own connection. Rejections, `429`s included, are logged at Warn
+at most once every 10 minutes per source address and reason (`rate limited
+(source)` and `rate limited (vm)` for the two limits); served requests are
+logged at Debug only; tokens and `Authorization` values are never logged. The guest client
+ignores `HTTP_PROXY`/`HTTPS_PROXY` (through a proxy VM, MAC mode would
+identify the proxy) and does not follow redirects. To diagnose a guest whose
+`cpu_power_w` stays `null`, run its agent with `-v`: every failed request is
+logged at Debug as `hostpower: request failed` with the URL and the status code
+(`401`, `429`, `503`, ...) or the connection error, never the token.
 
 **How the share is computed.** Per interval the service takes the host's
 RAPL package energy delta and splits it across VMs by active CPU time (from
 each VM's `qemu.slice/<vmid>.scope/cpu.stat` against `/proc/stat`), with the
 idle floor included in the attribution, so the sum of all VM shares never
-exceeds the package energy. Each VM gets `<out>/<vmid>/intel-rapl:0/` with
-`name`, `energy_uj` and `max_energy_range_uj`, each replaced atomically
-(temp file and rename, no fsync); `energy_uj` persists across service
-restarts. `max_energy_range_uj` is `0`, so the guest reads a counter that
-ever goes backwards as 0 J rather than as a wraparound.
+exceeds the package energy. Each VM gets `<out>/<vmid>/intel-rapl:0/` and
+`<out>/<vmid>/windows/intel-rapl_0/` with `name`, `energy_uj` and
+`max_energy_range_uj`, each replaced atomically (temp file and rename, no
+fsync); the HTTP endpoint serves the same counter. `energy_uj` of the Linux
+tree persists across service restarts. `max_energy_range_uj` is `0`, so the
+guest reads a counter that ever goes backwards as 0 J rather than as a
+wraparound.
 
-**When it stops.** If the service stops, or RAPL becomes unreadable on the
-host, every VM's counter freezes and the guests report a measured 0 W, not
-`null`. That also pulls the gateway's rolling-minimum idle baseline for those
-servers down. To notice: `systemctl status op-hostpower` on the host, and
-`energy_uj` under `/var/lib/op-hostpower/<vmid>/intel-rapl:0/` (or in the
-guest) not changing between two reads while the VM runs.
+**When it stops.** If RAPL becomes unreadable on the host while the service
+runs, every VM's counter freezes and guests on any transport report a measured
+0 W, not `null`; that also pulls the gateway's rolling-minimum idle baseline for
+those servers down. If the service itself stops, virtiofs guests read the frozen
+file and report 0 W, while HTTP guests get a refused connection, so
+`cpu_power_w` goes `null` (or falls through to LibreHardwareMonitor if
+configured). To notice: `systemctl status op-hostpower` on the host; for virtiofs
+guests `energy_uj` under `/var/lib/op-hostpower/<vmid>/intel-rapl:0/` (or in the
+guest) not changing between two reads while the VM runs; for HTTP guests a
+`cpu_power_w` that turns `null` or a `curl` of `/v1/energy` that fails.
 
 **Limitations.** A PVE VM with a virtiofs device cannot be live-migrated,
 snapshotted with RAM state or hibernated, and does not support memory
-hotplug. `system_power_w` stays `null` in a guest. Windows guests and LXC
-containers are out of scope.
+hotplug. Single PVE host only: there is no cluster support, and after a
+migration the HTTP transports report `null` until the guest's URL points at
+the node that runs the VM (token mode also needs a new token on that node). `system_power_w` stays `null` in a guest. LXC
+containers and macOS guests are out of scope.
 
 ## Resilience
 

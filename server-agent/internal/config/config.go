@@ -142,14 +142,21 @@ type Config struct {
 	ModelStatusFormat string
 	// LHMURL is an optional LibreHardwareMonitor Remote Web Server /data.json URL the
 	// agent GETs each cycle for CPU (and best-effort system) power watts. Empty
-	// disables it (the default) — the only Windows CPU-watt path and a Linux RAPL
-	// fallback.
+	// disables it (the default) — a Windows CPU-watt path after the native
+	// (virtiofs) and hostpower sources, and a Linux RAPL fallback.
 	LHMURL string
 	// PowercapRoot optionally replaces /sys/class/powercap as the RAPL collector's
 	// root, e.g. a Proxmox hostpower virtiofs mount that carries this VM's share
-	// of the host CPU package power. Empty = the platform default. Linux only;
-	// ignored elsewhere.
+	// of the host CPU package power. Read on Linux and Windows (Windows: the
+	// virtiofs drive root, e.g. Z:\); ignored on macOS. Empty = the platform
+	// default on Linux, off on Windows.
 	PowercapRoot string
+	// HostpowerURL optionally points the guest at the hostpower HTTP endpoint on
+	// the Proxmox host (e.g. http://<host>:9873). Empty disables it.
+	HostpowerURL string
+	// HostpowerToken is the optional per-VM bearer token for that endpoint
+	// (token mode); empty selects MAC mode. A secret: never logged.
+	HostpowerToken string
 
 	// CertMode selects the certificate behavior: CertModeOff (default, never
 	// fetch), CertModeFiles (write files + run CertReloadCommand on change), or
@@ -451,6 +458,8 @@ type fileConfig struct {
 	ModelStatusFormat    string       `json:"model_status_format"`
 	LHMURL               string       `json:"lhm_url"`
 	PowercapRoot         string       `json:"powercap_root"`
+	HostpowerURL         string       `json:"hostpower_url"`
+	HostpowerToken       string       `json:"hostpower_token"`
 	CertMode             string       `json:"cert_mode"`
 	CertDir              string       `json:"cert_dir"`
 	CertReloadCommand    string       `json:"cert_reload_command"`
@@ -502,7 +511,9 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	metricsURL := fs.String("metrics-url", "", "optional inference /metrics URL to scrape (env OP_AGENT_METRICS_URL / config metrics_url)")
 	modelStatusURL := fs.String("model-status-url", "", "optional model-status URL to poll for loaded models (env OP_AGENT_MODEL_STATUS_URL / config model_status_url)")
 	modelStatusFormat := fs.String("model-status-format", "", "model-status response format: openai|llama_swap|llama_cpp|litellm|auto (env OP_AGENT_MODEL_STATUS_FORMAT / config model_status_format)")
-	powercapRoot := fs.String("powercap-root", "", "optional powercap sysfs root for CPU power, e.g. a Proxmox hostpower virtiofs mount (env OP_AGENT_POWERCAP_ROOT / config powercap_root); Linux only, ignored elsewhere")
+	powercapRoot := fs.String("powercap-root", "", "optional powercap root for CPU power, e.g. a Proxmox hostpower virtiofs mount (Windows: the virtiofs drive root) (env OP_AGENT_POWERCAP_ROOT / config powercap_root); read on Linux and Windows, ignored on macOS")
+	hostpowerURL := fs.String("hostpower-url", "", "optional hostpower HTTP endpoint on the Proxmox host, e.g. http://<host>:9873 (env OP_AGENT_HOSTPOWER_URL / config hostpower_url)")
+	hostpowerToken := fs.String("hostpower-token", "", "optional per-VM token for the hostpower HTTP endpoint (secret; env OP_AGENT_HOSTPOWER_TOKEN / config hostpower_token)")
 	lhmURL := fs.String("lhm-url", "", "optional LibreHardwareMonitor /data.json URL for CPU/system power (env OP_AGENT_LHM_URL / config lhm_url)")
 	certMode := fs.String("cert-mode", "", "certificate mode: off|files|proxy (proxy also runs the agent-side TLS proxy) (env OP_AGENT_CERT_MODE / config cert_mode)")
 	certDir := fs.String("cert-dir", "", "directory certificate files are written into; required unless cert-mode=off (env OP_AGENT_CERT_DIR / config cert_dir)")
@@ -580,6 +591,8 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		ModelStatusFormat:    strings.TrimSpace(resolveStr("model-status-format", *modelStatusFormat, "OP_AGENT_MODEL_STATUS_FORMAT", file.ModelStatusFormat)),
 		LHMURL:               strings.TrimSpace(resolveStr("lhm-url", *lhmURL, "OP_AGENT_LHM_URL", file.LHMURL)),
 		PowercapRoot:         strings.TrimSpace(resolveStr("powercap-root", *powercapRoot, "OP_AGENT_POWERCAP_ROOT", file.PowercapRoot)),
+		HostpowerURL:         strings.TrimSpace(resolveStr("hostpower-url", *hostpowerURL, "OP_AGENT_HOSTPOWER_URL", file.HostpowerURL)),
+		HostpowerToken:       strings.TrimSpace(resolveStr("hostpower-token", *hostpowerToken, "OP_AGENT_HOSTPOWER_TOKEN", file.HostpowerToken)),
 		CertMode:             strings.ToLower(strings.TrimSpace(resolveStr("cert-mode", *certMode, "OP_AGENT_CERT_MODE", file.CertMode))),
 		CertDir:              strings.TrimSpace(resolveStr("cert-dir", *certDir, "OP_AGENT_CERT_DIR", file.CertDir)),
 		CertReloadCommand:    strings.TrimSpace(resolveStr("cert-reload-command", *certReloadCommand, "OP_AGENT_CERT_RELOAD_COMMAND", file.CertReloadCommand)),
@@ -642,8 +655,27 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
-	cfg.Warnings = runtimeAllowlistWarnings(cfg, fileKeys, getenv)
+	cfg.Warnings = append(runtimeAllowlistWarnings(cfg, fileKeys, getenv), hostpowerWarnings(cfg)...)
 	return cfg, nil
+}
+
+// hostpowerWarnings returns the startup warnings for the hostpower HTTP
+// options: a token without a URL (the token is unused) and a URL the guest
+// collector cannot use (no http:// or https:// scheme, or no host). The agent
+// starts regardless; a warning never contains the token or the URL itself
+// (a URL may carry a password in its userinfo).
+func hostpowerWarnings(cfg Config) []string {
+	var w []string
+	if cfg.HostpowerToken != "" && cfg.HostpowerURL == "" {
+		w = append(w, "hostpower_token is set but hostpower_url is empty: the token is unused and the hostpower HTTP source stays off")
+	}
+	if cfg.HostpowerURL != "" {
+		u, err := url.Parse(cfg.HostpowerURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			w = append(w, "hostpower_url must be an http:// or https:// URL with a host (for example http://<host>:9873); every hostpower request will fail")
+		}
+	}
+	return w
 }
 
 // removedWSLSettings maps each removed WSL allowlist setting (config key and

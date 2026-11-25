@@ -20,6 +20,12 @@ import (
 const (
 	// DomainDir is the powercap domain directory a guest's RAPL collector reads.
 	DomainDir = "intel-rapl:0"
+	// WindowsDir is the per-VM subtree a Windows guest reads. Windows cannot
+	// create or open names containing ':', so it mirrors the Linux tree under a
+	// colon-free domain directory name.
+	WindowsDir = "windows"
+	// WindowsDomainDir is DomainDir without the colon.
+	WindowsDomainDir = "intel-rapl_0"
 	// MaxEnergyRangeUJ is the advertised counter range. It is 0 on purpose: the
 	// guest's RAPL collector treats a counter decrease as a wraparound only when
 	// the range exceeds the previous value, so with 0 any host-side regression
@@ -49,13 +55,18 @@ func openVMRoot(vmDir string, create bool) (*os.Root, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 	name := filepath.Base(vmDir)
 	if create {
 		if err := out.MkdirAll(name, 0o755); err != nil {
 			return nil, err
 		}
 	}
+	// The Lstat and the OpenRoot below are two steps, which is safe only
+	// because <out> is host-owned with mode 0700 (no unprivileged host
+	// process can swap <vmid> in between) and a guest's share starts at
+	// <vmid> (or below it, <vmid>/windows), so a guest cannot replace its
+	// own share root with a symlink.
 	fi, err := out.Lstat(name)
 	if err != nil {
 		return nil, err
@@ -65,6 +76,9 @@ func openVMRoot(vmDir string, create bool) (*os.Root, error) {
 	}
 	return out.OpenRoot(name)
 }
+
+// windowsDomainPath is the Windows domain directory relative to a VM root.
+var windowsDomainPath = path.Join(WindowsDir, WindowsDomainDir)
 
 // WriteTree publishes the synthetic powercap domain under vmDir. Static files
 // are rewritten only when absent or different; energy_uj is replaced every call
@@ -80,36 +94,51 @@ func WriteTree(vmDir string, energyUJ uint64) error {
 	if err != nil {
 		return fmt.Errorf("hostpower: write %s: %w", vmDir, err)
 	}
-	defer root.Close()
-	if err := root.MkdirAll(DomainDir, 0o755); err != nil {
-		return fmt.Errorf("hostpower: write %s: %w", filepath.Join(vmDir, DomainDir), err)
+	defer func() { _ = root.Close() }()
+	if err := writeDomain(root, vmDir, DomainDir, energyUJ); err != nil {
+		return err
+	}
+	// The Windows domain goes through nested paths in the same Root, never by
+	// opening windows/ as a Root of its own: Root.OpenRoot opens a leaf without
+	// O_DIRECTORY or O_NONBLOCK, so a FIFO a guest swapped in would block the
+	// tick forever. Its failure is returned only after the Linux tree is
+	// written, so a guest that breaks its Windows subtree never freezes its
+	// Linux counter.
+	return writeDomain(root, vmDir, windowsDomainPath, energyUJ)
+}
+
+// writeDomain publishes one synthetic domain directory inside root; base is
+// root's path, used only in error messages.
+func writeDomain(root *os.Root, base, domainDir string, energyUJ uint64) error {
+	if err := root.MkdirAll(domainDir, 0o755); err != nil {
+		return fmt.Errorf("hostpower: write %s: %w", filepath.Join(base, domainDir), err)
 	}
 	static := []struct{ name, content string }{
 		{"name", "package-0\n"},
 		{"max_energy_range_uj", strconv.FormatUint(MaxEnergyRangeUJ, 10) + "\n"},
 	}
 	for _, f := range static {
-		rel := path.Join(DomainDir, f.name)
+		rel := path.Join(domainDir, f.name)
 		// Anything but a small regular file with the expected content (absent,
 		// different, a FIFO, a symlink, oversized) is replaced by the rename.
 		if cur, ok := readSmall(root, rel); ok && string(cur) == f.content {
 			continue
 		}
-		if err := writeAtomic(root, f.name, f.content); err != nil {
-			return fmt.Errorf("hostpower: write %s: %w", filepath.Join(vmDir, rel), err)
+		if err := writeAtomic(root, domainDir, f.name, f.content); err != nil {
+			return fmt.Errorf("hostpower: write %s: %w", filepath.Join(base, rel), err)
 		}
 	}
-	if err := writeAtomic(root, "energy_uj", strconv.FormatUint(energyUJ, 10)+"\n"); err != nil {
-		return fmt.Errorf("hostpower: write %s: %w", filepath.Join(vmDir, DomainDir, "energy_uj"), err)
+	if err := writeAtomic(root, domainDir, "energy_uj", strconv.FormatUint(energyUJ, 10)+"\n"); err != nil {
+		return fmt.Errorf("hostpower: write %s: %w", filepath.Join(base, domainDir, "energy_uj"), err)
 	}
 	return nil
 }
 
-// writeAtomic writes content to DomainDir/name inside root via a freshly
+// writeAtomic writes content to domainDir/name inside root via a freshly
 // created (O_EXCL) temp file and a rename, removing the temp file on any error.
 // rename replaces a symlink at the destination rather than following it.
-func writeAtomic(root *os.Root, name, content string) (err error) {
-	tmp, f, err := createTemp(root, name)
+func writeAtomic(root *os.Root, domainDir, name, content string) (err error) {
+	tmp, f, err := createTemp(root, domainDir, name)
 	if err != nil {
 		return err
 	}
@@ -129,17 +158,17 @@ func writeAtomic(root *os.Root, name, content string) (err error) {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	return root.Rename(tmp, path.Join(DomainDir, name))
+	return root.Rename(tmp, path.Join(domainDir, name))
 }
 
-// createTemp creates DomainDir/."+name+".<random> exclusively inside root.
-func createTemp(root *os.Root, name string) (string, *os.File, error) {
+// createTemp creates domainDir/."+name+".<random> exclusively inside root.
+func createTemp(root *os.Root, domainDir, name string) (string, *os.File, error) {
 	for range 10 {
 		var b [8]byte
 		if _, err := rand.Read(b[:]); err != nil {
 			return "", nil, err
 		}
-		tmp := path.Join(DomainDir, "."+name+"."+hex.EncodeToString(b[:]))
+		tmp := path.Join(domainDir, "."+name+"."+hex.EncodeToString(b[:]))
 		f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if errors.Is(err, fs.ErrExist) {
 			continue
@@ -166,7 +195,7 @@ func readSmall(root *os.Root, rel string) ([]byte, bool) {
 	if err != nil {
 		return nil, false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
 		return nil, false
 	}
@@ -185,7 +214,7 @@ func ReadCounter(vmDir string) uint64 {
 	if err != nil {
 		return 0
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	b, ok := readSmall(root, path.Join(DomainDir, "energy_uj"))
 	if !ok {
 		return 0
@@ -198,10 +227,11 @@ func ReadCounter(vmDir string) uint64 {
 }
 
 // RemoveStaleTemps deletes leftover temp files (from a crash between create
-// and rename) in DomainDir of every VM directory directly under outDir. It runs
-// once at startup, confined to each VM directory like WriteTree; a VM directory
-// or DomainDir that is missing, not a real directory or escapes is skipped. It
-// returns the joined errors of the removals it attempted.
+// and rename) in both domain directories (DomainDir and the Windows one) of
+// every VM directory directly under outDir. It runs once at startup, confined
+// to each VM directory like WriteTree; a VM directory or a domain directory
+// that is missing, not a real directory or escapes is skipped. It returns the
+// joined errors of the removals it attempted.
 func RemoveStaleTemps(outDir string) error {
 	entries, err := os.ReadDir(outDir)
 	if err != nil {
@@ -222,14 +252,20 @@ func removeStaleTempsIn(vmDir string) error {
 	if err != nil {
 		return nil
 	}
-	defer root.Close()
-	fi, err := root.Lstat(DomainDir)
+	defer func() { _ = root.Close() }()
+	return errors.Join(sweepDomain(root, DomainDir), sweepDomain(root, windowsDomainPath))
+}
+
+// sweepDomain removes the temp files in domainDir inside root; a domainDir that
+// is missing, not a real directory or escapes root is skipped.
+func sweepDomain(root *os.Root, domainDir string) error {
+	fi, err := root.Lstat(domainDir)
 	if err != nil || !fi.IsDir() {
 		return nil
 	}
 	// Non-blocking open and a Stat re-check: a FIFO swapped in after the
 	// Lstat must not block startup.
-	d, err := root.OpenFile(DomainDir, os.O_RDONLY|oNonblock, 0)
+	d, err := root.OpenFile(domainDir, os.O_RDONLY|oNonblock, 0)
 	if err != nil {
 		return nil
 	}
@@ -247,7 +283,7 @@ func removeStaleTempsIn(vmDir string) error {
 		if !isTempName(n) {
 			continue
 		}
-		if err := root.Remove(path.Join(DomainDir, n)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := root.Remove(path.Join(domainDir, n)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}

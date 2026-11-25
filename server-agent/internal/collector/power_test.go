@@ -5,6 +5,9 @@ package collector
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"testing"
 )
 
@@ -72,7 +75,7 @@ func (errPower) Collect(context.Context) (*float64, *float64, error) {
 }
 
 func TestDetectPowerCollectorComposesLHMWhenConfigured(t *testing.T) {
-	m := DetectPowerCollector("http://127.0.0.1:8085/data.json", "")
+	m := DetectPowerCollector(PowerConfig{LHMURL: "http://127.0.0.1:8085/data.json"})
 	if m == nil {
 		t.Fatal("DetectPowerCollector returned nil")
 	}
@@ -83,11 +86,46 @@ func TestDetectPowerCollectorComposesLHMWhenConfigured(t *testing.T) {
 
 func TestDetectPowerCollectorNeverNil(t *testing.T) {
 	// Even with no LHM URL the result is a non-nil, Collect-safe composite.
-	m := DetectPowerCollector("", "")
+	m := DetectPowerCollector(PowerConfig{})
 	if m == nil {
 		t.Fatal("DetectPowerCollector(\"\") returned nil")
 	}
 	if _, _, err := m.Collect(context.Background()); err != nil {
 		t.Fatalf("empty composite Collect should not error, got %v", err)
+	}
+}
+
+func TestDetectPowerCollectorOrderWithHostpower(t *testing.T) {
+	hp := httptest.NewServer(http.NotFoundHandler())
+	defer hp.Close()
+	lhm := httptest.NewServer(http.NotFoundHandler())
+	defer lhm.Close()
+
+	got := PowerSources(DetectPowerCollector(PowerConfig{HostpowerURL: hp.URL, LHMURL: lhm.URL}))
+	hpIdx, lhmIdx := -1, -1
+	for i, n := range got {
+		switch n {
+		case "hostpower":
+			hpIdx = i
+		case "lhm":
+			lhmIdx = i
+		}
+	}
+	if hpIdx < 0 || lhmIdx < 0 || hpIdx > lhmIdx {
+		t.Fatalf("sources = %v, want hostpower before lhm", got)
+	}
+	if hpIdx > 0 {
+		native := newNativePowerCollector("")
+		if native == nil || got[0] != native.Name() {
+			t.Fatalf("sources = %v, want the native collector first", got)
+		}
+	}
+
+	power, _ := DetectPowerAndTempCollectors(PowerConfig{HostpowerURL: hp.URL, LHMURL: lhm.URL})
+	if got2 := PowerSources(power); !reflect.DeepEqual(got, got2) {
+		t.Fatalf("combined sources = %v, want %v", got2, got)
+	}
+	if without := PowerSources(DetectPowerCollector(PowerConfig{})); containsString(without, "hostpower") {
+		t.Fatalf("hostpower listed without a URL: %v", without)
 	}
 }

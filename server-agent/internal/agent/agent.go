@@ -458,7 +458,17 @@ import (
 // powercap_root option (OP_AGENT_POWERCAP_ROOT / -powercap-root) so the
 // existing RAPL collector can read that tree mounted into a Linux guest. This
 // is the ONE bump for the whole branch; later commits on it do not bump again.
-const Version = "0.22.0"
+//
+// 0.22.0 -> 0.23.0 is the single bump for the hostpower transports. MINOR: the
+// hostpower service gains a colon-free Windows virtiofs tree
+// (<vmid>/windows/intel-rapl_0), an optional HTTP endpoint (-listen, -auth,
+// -tokens) that identifies a VM by the bridge port its connection entered (MAC
+// mode) or by a per-VM token (token mode), and a `hostpower token` subcommand;
+// the agent gains the hostpower_url and hostpower_token options, a hostpower
+// HTTP power collector between the native and LHM collectors, and reads
+// powercap_root on Windows. This is the ONE bump for the whole branch; later
+// commits on it do not bump again.
+const Version = "0.23.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

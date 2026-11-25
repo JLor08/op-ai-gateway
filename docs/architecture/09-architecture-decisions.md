@@ -13689,6 +13689,8 @@ a token with a server override, a prefix override or generated Claude aliases of
 agent never reports `cpu_power_w` and the energy engine falls back to the operator-estimated tier. The host can measure the CPU package, but the
 guest must be told its own share without any change to the wire format, gateway or portal.
 
+**Amended by [ADR-116](#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token) (more guests and transports).** Windows guests and an optional HTTP endpoint (MAC and token mode) were added next to the virtiofs tree; the decision below stands for the Linux virtiofs path, and "no listener" holds only while `-listen` is unset.
+
 **Decision.** A host-side `server-agent hostpower` mode (root, systemd, no token, no gateway contact, no listener) reads the RAPL package
 domains, `/proc/stat` and each VM's `qemu.slice/<vmid>.scope/cpu.stat`, and attributes the package energy delta to VMs by **active CPU time with the
 idle floor included**, so the sum of shares stays at or below the package. For each VM it writes an atomic synthetic `intel-rapl:0` tree
@@ -13724,4 +13726,70 @@ any counter decrease as 0 J rather than as a near-full-range wraparound; a uint6
 - → [Telemetry](cross-cutting/telemetry-usage-observability.md),
   [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
   [Config env](reference/config-env.md),
-  [Agent README](../../server-agent/README.md#linux-guest-on-a-proxmox-ve-host-virtiofs-attributed-share).
+  [Agent README](../../server-agent/README.md#linux-or-windows-guest-on-a-proxmox-ve-host).
+
+## ADR-116 — Hostpower transports: a colon-free Windows virtiofs tree and an HTTP endpoint that identifies the VM by bridge port or per-VM token
+
+**Context.** ADR-115 delivers a VM's CPU power share to a Linux guest only, over virtiofs. The operator wants to choose the transport per VM,
+for Linux and Windows guests alike, without any gateway or portal change, and a guest must never be able to obtain another VM's values.
+
+**Decision.** The one `server-agent hostpower` service keeps a single in-memory counter per VM and publishes it over three transports that run
+side by side; the attribution, cadence and counter semantics of ADR-115 are unchanged.
+
+- **Windows virtiofs.** Every tick the service also writes `<out>/<vmid>/windows/intel-rapl_0/{name,energy_uj,max_energy_range_uj}` with the
+  content of the Linux tree. The Windows directory mapping points at `<vmid>/windows`, so the share contains no `:` name (a colon is not a legal Windows file-name character and
+  how virtio-win presents such a host name is unverified). The persisted counter is read only from the Linux tree. On Windows the
+  RAPL collector reads `powercap_root` with the pattern `intel-rapl_*`, on Linux `intel-rapl:*`; a guest never globs both, so it cannot double count.
+- **HTTP endpoint (off unless `-listen` is set).** `GET /v1/energy` returns `{"vmid","energy_uj","max_energy_range_uj":0}`. A request with an
+  `Authorization` header (any scheme, even empty) is identified in token mode only (no fallback on a bad token); a request without one in MAC mode. A guest option
+  pair `hostpower_url` / `hostpower_token` selects the transport; the guest collector runs after the native one and before LibreHardwareMonitor,
+  so exactly one value is reported.
+- **MAC mode identifies the VM by the interface the connection entered.** The service captures, with a Linux `AF_PACKET` raw socket
+  (`CAP_NET_RAW`, which the root service has), the TCP SYN and the later segments of each connection to the listen port and records, per 4-tuple, the
+  receiving interface and the Ethernet source MAC. Only an interface named `tap<vmid>i<n>` is a VM port; the SYN must enter on exactly one such tap,
+  every other segment observed before the decision on that tap or on a transit interface (bridge masters, `fwbr`/`fwln`/`fwpr`, a VLAN device over a bridge), and
+  the SYN's source MAC must equal the `net<n>` MAC of the VM's current config. The VM ID therefore comes from where the packets physically entered the
+  host, which a sender cannot choose, and ARP and the bridge forwarding table, which a sender can write to, are never read. A first design that read the
+  ARP cache was rejected because ARP payloads let any VM or LAN device claim another VM's MAC and so obtain its counter.
+- **Threat model.** In scope and safe by construction: a VM forging another VM's IP or MAC (it enters on its own tap, so it gets its own values or `401`),
+  a LAN device forging a VM's IP or MAC (it enters on a physical uplink, `401`), and, in MAC mode, replay (nothing secret travels). Out of scope in this version: a
+  layer-2 man-in-the-middle that poisons the host's ARP cache or bridge forwarding table for a VM's address and relays that VM's traffic; it applies to
+  MAC mode and token mode alike (token mode would even expose the token). Mitigation: the PVE firewall with MAC and IP filter on each VM NIC and a trusted
+  LAN segment for the bridge.
+- **Token mode.** Token `ophp_` + base64url of 32 random bytes; the store (`/etc/op-hostpower/tokens.json`, `0600`, directory `0700`) keeps only the
+  SHA-256, written atomically, matched in constant time, reloaded on a modification-time change; `server-agent hostpower token create|revoke|list`
+  manages it and prints a token once. Tokens and `Authorization` values are never logged.
+- **Limits keyed by what they protect.** A per-source-address limit (100 requests/s, burst 200) runs before identification and guards the
+  MAC-mode resolver's bounded wait; a per-VM limit (10 requests/s, burst 20) runs after it. Keying the tight limit by VM rather than by address keeps
+  token-mode guests behind one NAT address from starving each other. Rejections and `429`s are logged at Warn at most once every 10 minutes per
+  (source address, reason), so mixed outcomes behind one address cannot flood the log.
+- **No TLS in this version.** Token mode is designed so TLS with a pinned certificate can be added later without changing the guest's identity model;
+  it is the follow-up that also closes the layer-2 man-in-the-middle case.
+- **Proxy-free guest client.** The guest uses its own `http.Transport` with no proxy and no redirect following, because through a proxy VM on the bridge MAC
+  mode would identify the proxy and silently hand its counter to the guest.
+- **Single PVE host.** Token store, counters and the guest URL are per host; after a migration the HTTP transports report `null` until the URL points at
+  the node that runs the VM.
+
+**Alternatives rejected.**
+- *Identifying the VM by SMBIOS UUID or another guest-supplied identity:* the guest states it, so a guest could claim another VM's.
+- *An alias for the Windows tree next to the Linux tree (`intel-rapl_0` beside `intel-rapl:0`):* the share would still contain a `:` name, a character that is not
+  legal in Windows file names and whose presentation by virtio-win is unverified; a separate `windows/` subtree mapped on its own avoids it.
+- *The ARP cache or the bridge forwarding table as the identity source:* both are written from packet contents a peer controls.
+- *Token mode only:* a per-VM secret in every guest for the common same-bridge case, where the network path already identifies the VM.
+
+**Consequences.**
+- MAC mode needs Linux, `CAP_NET_RAW`, IPv4 and a QEMU tap on this host; Open vSwitch fails closed (every VM `401`), and with `-auth` containing `mac`
+  on a non-Linux build or without privilege the service refuses to start.
+- The HTTP listener is plain HTTP. The layer-2 man-in-the-middle case above is an accepted gap until TLS. In token mode the token itself travels in
+  clear: anyone who can passively read any hop of the path (token mode is meant for routed or NAT paths) can copy and replay it, so use it only on a
+  trusted network until TLS exists.
+- A guest with several transports configured reports one value (collector order), so nothing is double counted.
+- In MAC mode the identity is the tap a connection entered, so a VM that routes, NATs or proxies for others (an OPNsense or pfSense VM, a
+  reverse-proxy VM) lends its identity: a machine behind it receives the router VM's counter. Networks behind such a VM use token mode or block
+  the listen port (TCP 9873) behind the router VM. The guest agent logs the VM ID it is served at Info on the first success and on every change, so a
+  misattribution is visible; failed requests are logged at Debug with the URL and status or error, never the token.
+- The state directory is `0700` (the unit sets `StateDirectoryMode=0700`) so no unprivileged host process reads another VM's tree.
+- → [Telemetry](cross-cutting/telemetry-usage-observability.md),
+  [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
+  [Config env](reference/config-env.md),
+  [Agent README](../../server-agent/README.md#linux-or-windows-guest-on-a-proxmox-ve-host).
