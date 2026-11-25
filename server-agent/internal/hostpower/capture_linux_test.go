@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-func TestStartCaptureSeesLoopbackSYN(t *testing.T) {
+func TestStartCaptureSeesLoopbackHandshake(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root (CAP_NET_RAW) for an AF_PACKET socket")
 	}
@@ -50,11 +50,16 @@ func TestStartCaptureSeesLoopbackSYN(t *testing.T) {
 	src := conn.LocalAddr().(*net.TCPAddr).AddrPort()
 	key := ConnKey{Src: netip.AddrPortFrom(src.Addr().Unmap(), src.Port()), Dst: netip.AddrPortFrom(dst.Addr().Unmap(), dst.Port())}
 
+	// Wait returns once a non-SYN segment (the handshake's ACK) is in.
 	obs := table.Wait(ctx, key, time.Second)
+	var syn, ack bool
 	for _, o := range obs {
 		if o.Ifname == "lo" {
-			return
+			syn = syn || o.SYN
+			ack = ack || !o.SYN
 		}
 	}
-	t.Fatalf("no observation on lo for %+v; got %+v", key, obs)
+	if !syn || !ack {
+		t.Fatalf("want a SYN and a non-SYN observation on lo for %+v; got %+v", key, obs)
+	}
 }

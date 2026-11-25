@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -16,15 +17,18 @@ import (
 	"time"
 )
 
-// DefaultPVEConfDir is where Proxmox VE keeps the QEMU VM configs.
-const DefaultPVEConfDir = "/etc/pve/qemu-server"
+// Default host paths for MAC-mode identification.
+const (
+	DefaultPVEConfDir  = "/etc/pve/qemu-server"
+	DefaultSysClassNet = "/sys/class/net"
+)
 
 const (
 	maxTextFileBytes = 64 << 10
 
 	// defaultMaxWait bounds how long Resolve waits for the capture goroutine
-	// to deliver the connection's SYN. The SYN always precedes the request;
-	// this only covers scheduling delay.
+	// to deliver the connection's SYN and a later segment. Both precede the
+	// request; this only covers scheduling delay.
 	defaultMaxWait = 250 * time.Millisecond
 
 	// synBurstWindow groups the copies of one SYN frame. A frame from a VM
@@ -35,26 +39,34 @@ const (
 	// observation.
 	synBurstWindow = 200 * time.Millisecond
 
-	// Table bounds. A VM's SYN yields at most about six observations (tap,
-	// fwbr, fwln, fwpr, bridge, VLAN device).
+	// Table bounds. A VM's connection yields about six distinct observations
+	// per segment kind (tap, fwbr, fwln, fwpr, bridge, VLAN device), for SYN
+	// and non-SYN segments.
 	maxObservedKeys       = 16384
-	maxObservationsPerKey = 16
+	maxObservationsPerKey = 32
 )
 
 // Reasons carried by ResolveError.
 const (
 	reasonIPv6        = "ipv6 not supported"
 	reasonNoSYN       = "no SYN observed"
+	reasonNoHandshake = "handshake not observed"
 	reasonNotVMPort   = "not a VM port"
 	reasonAmbiguous   = "ambiguous ingress"
+	reasonForeign     = "foreign ingress"
 	reasonNoVMConfig  = "no VM config"
 	reasonMACMismatch = "MAC mismatch"
 )
 
-// tapPortPattern matches the QEMU tap device of VM <vmid>, NIC <n>. Only these
-// count as VM ingress ports; the PVE firewall's fwbr/fwln/fwpr devices and the
-// bridge see copies of the same frame and are ignored.
-var tapPortPattern = regexp.MustCompile(`^tap(\d+)i(\d+)$`)
+var (
+	// tapPortPattern matches the QEMU tap device of VM <vmid>, NIC <n>. Only
+	// these count as VM ingress ports.
+	tapPortPattern = regexp.MustCompile(`^tap(\d+)i(\d+)$`)
+	// The PVE firewall's devices only carry copies of frames that entered on
+	// a tap or the uplink.
+	fwBridgePattern = regexp.MustCompile(`^fw(br|ln)\d+i\d+$`)
+	fwPeerPattern   = regexp.MustCompile(`^fwpr\d+p\d+$`)
+)
 
 // ResolveError reports why a connection could not be tied to one VM.
 type ResolveError struct{ Reason string }
@@ -63,17 +75,19 @@ func (e *ResolveError) Error() string { return "hostpower: " + e.Reason }
 
 func resolveFail(reason string) (string, error) { return "", &ResolveError{Reason: reason} }
 
-// ConnKey is a TCP connection's 4-tuple as seen in its SYN: Src is the client,
-// Dst the listener. Both addresses are unmapped IPv4.
+// ConnKey is a TCP connection's 4-tuple as seen in its client's segments: Src
+// is the client, Dst the listener. Both addresses are unmapped IPv4.
 type ConnKey struct {
 	Src, Dst netip.AddrPort
 }
 
-// Observation is one copy of a SYN frame: the interface the kernel received
-// it on and the frame's Ethernet source address.
+// Observation is one received copy of a client segment: the interface the
+// kernel received it on, the frame's Ethernet source address and whether the
+// segment was a SYN (SYN set, ACK clear).
 type Observation struct {
 	Ifname string
 	SrcMAC net.HardwareAddr
+	SYN    bool
 	At     time.Time
 }
 
@@ -92,49 +106,49 @@ const (
 	tcpFlagACK    = 0x10
 )
 
-// ParseSYNFrame reports whether frame is an Ethernet II frame (optionally
-// with one 802.1Q tag) carrying an IPv4 TCP segment with SYN set, ACK clear
-// and destination port dstPort, and returns its 4-tuple and source MAC. The
-// frame may end right after the TCP header. It never panics; anything
-// malformed or short yields ok == false.
-func ParseSYNFrame(frame []byte, dstPort uint16) (key ConnKey, src net.HardwareAddr, ok bool) {
+// ParseTCPFrame reports whether frame is an Ethernet II frame (optionally
+// with one 802.1Q tag) carrying an IPv4 TCP segment with destination port
+// dstPort, and returns its 4-tuple, its source MAC and whether it is a SYN
+// (SYN set, ACK clear). The frame may end right after the TCP header. It
+// never panics; anything malformed or short yields ok == false.
+func ParseTCPFrame(frame []byte, dstPort uint16) (key ConnKey, src net.HardwareAddr, syn, ok bool) {
 	if len(frame) < ethHeaderLen {
-		return ConnKey{}, nil, false
+		return ConnKey{}, nil, false, false
 	}
 	l3 := ethHeaderLen
 	etherType := binary.BigEndian.Uint16(frame[12:14])
 	if etherType == etherTypeVLAN {
 		if len(frame) < ethHeaderLen+vlanTagLen {
-			return ConnKey{}, nil, false
+			return ConnKey{}, nil, false, false
 		}
 		l3 += vlanTagLen
 		etherType = binary.BigEndian.Uint16(frame[16:18])
 	}
 	if etherType != etherTypeIPv4 {
-		return ConnKey{}, nil, false
+		return ConnKey{}, nil, false, false
 	}
 
 	ip := frame[l3:]
 	if len(ip) < ipv4MinHeader || ip[0]>>4 != 4 {
-		return ConnKey{}, nil, false
+		return ConnKey{}, nil, false, false
 	}
 	ihl := int(ip[0]&0x0f) * 4
 	if ihl < ipv4MinHeader || ip[9] != ipProtoTCP || binary.BigEndian.Uint16(ip[6:8])&ipFragOffset != 0 {
-		return ConnKey{}, nil, false
+		return ConnKey{}, nil, false, false
 	}
 	if len(ip) < ihl+tcpMinHeader {
-		return ConnKey{}, nil, false
+		return ConnKey{}, nil, false, false
 	}
 	tcp := ip[ihl:]
-	if binary.BigEndian.Uint16(tcp[2:4]) != dstPort || tcp[13]&(tcpFlagSYN|tcpFlagACK) != tcpFlagSYN {
-		return ConnKey{}, nil, false
+	if binary.BigEndian.Uint16(tcp[2:4]) != dstPort {
+		return ConnKey{}, nil, false, false
 	}
 
 	key = ConnKey{
 		Src: netip.AddrPortFrom(netip.AddrFrom4([4]byte(ip[12:16])), binary.BigEndian.Uint16(tcp[0:2])),
 		Dst: netip.AddrPortFrom(netip.AddrFrom4([4]byte(ip[16:20])), dstPort),
 	}
-	return key, bytes.Clone(frame[6:12]), true
+	return key, bytes.Clone(frame[6:12]), tcp[13]&(tcpFlagSYN|tcpFlagACK) == tcpFlagSYN, true
 }
 
 // --- kernel packet filter ---
@@ -171,56 +185,51 @@ const (
 	bpfAND  = 0x50
 )
 
-// synFilter returns a classic BPF program that passes (the first
+// tcpPortFilter returns a classic BPF program that passes (the first
 // captureSnapLen bytes of) Ethernet frames carrying an IPv4 TCP segment to
-// port with SYN set and ACK clear, untagged or with one 802.1Q tag, and drops
-// everything else. The filter is only an optimisation: the capture re-checks
-// every frame with ParseSYNFrame, so a filter that passed too much would cost
-// CPU, never correctness.
+// port that is not a non-first fragment, untagged or with one 802.1Q tag,
+// and drops everything else. The filter is only an optimisation: the capture
+// re-checks every frame with ParseTCPFrame, so a filter that passed too much
+// would cost CPU, never correctness.
 //
 // Jump offsets count instructions skipped after the jump; "rej" is
-// instruction 25, "acc" 26. Linux usually strips the VLAN tag into skb
+// instruction 19, "acc" 20. Linux usually strips the VLAN tag into skb
 // metadata before packet sockets see the frame, in which case the untagged
 // branch matches; the tagged branch covers a tag left in the data.
-func synFilter(port uint16) []bpfInsn {
+func tcpPortFilter(port uint16) []bpfInsn {
 	p := uint32(port)
 	return []bpfInsn{
 		/* 0 */ {Code: bpfLD | bpfH | bpfABS, K: 12}, // A = ethertype
-		/* 1 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeVLAN, Jt: 11}, // tagged → 13
+		/* 1 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeVLAN, Jt: 8}, // tagged → 10
 		// Untagged: IPv4 header at 14.
-		/* 2 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeIPv4, Jf: 22}, // not IPv4 → rej
+		/* 2 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeIPv4, Jf: 16}, // not IPv4 → rej
 		/* 3 */ {Code: bpfLD | bpfB | bpfABS, K: 14 + 9}, // A = IP protocol
-		/* 4 */ {Code: bpfJMP | bpfJEQ | bpfK, K: ipProtoTCP, Jf: 20}, // not TCP → rej
+		/* 4 */ {Code: bpfJMP | bpfJEQ | bpfK, K: ipProtoTCP, Jf: 14}, // not TCP → rej
 		/* 5 */ {Code: bpfLD | bpfH | bpfABS, K: 14 + 6}, // A = IP flags/fragment offset
-		/* 6 */ {Code: bpfJMP | bpfJSET | bpfK, K: ipFragOffset, Jt: 18}, // non-first fragment → rej
+		/* 6 */ {Code: bpfJMP | bpfJSET | bpfK, K: ipFragOffset, Jt: 12}, // non-first fragment → rej
 		/* 7 */ {Code: bpfLDX | bpfB | bpfMSH, K: 14}, // X = 4 * IHL
 		/* 8 */ {Code: bpfLD | bpfH | bpfIND, K: 14 + 2}, // A = TCP dst port
-		/* 9 */ {Code: bpfJMP | bpfJEQ | bpfK, K: p, Jf: 15}, // other port → rej
-		/* 10 */ {Code: bpfLD | bpfB | bpfIND, K: 14 + 13}, // A = TCP flags
-		/* 11 */ {Code: bpfALU | bpfAND | bpfK, K: tcpFlagSYN | tcpFlagACK},
-		/* 12 */ {Code: bpfJMP | bpfJEQ | bpfK, K: tcpFlagSYN, Jt: 13, Jf: 12}, // SYN only → acc, else rej
+		/* 9 */ {Code: bpfJMP | bpfJEQ | bpfK, K: p, Jt: 10, Jf: 9}, // port → acc, else rej
 		// One 802.1Q tag: inner ethertype at 16, IPv4 header at 18.
-		/* 13 */ {Code: bpfLD | bpfH | bpfABS, K: 16}, // A = inner ethertype
-		/* 14 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeIPv4, Jf: 10}, // not IPv4 → rej
-		/* 15 */ {Code: bpfLD | bpfB | bpfABS, K: 18 + 9}, // A = IP protocol
-		/* 16 */ {Code: bpfJMP | bpfJEQ | bpfK, K: ipProtoTCP, Jf: 8}, // not TCP → rej
-		/* 17 */ {Code: bpfLD | bpfH | bpfABS, K: 18 + 6}, // A = IP flags/fragment offset
-		/* 18 */ {Code: bpfJMP | bpfJSET | bpfK, K: ipFragOffset, Jt: 6}, // non-first fragment → rej
-		/* 19 */ {Code: bpfLDX | bpfB | bpfMSH, K: 18}, // X = 4 * IHL
-		/* 20 */ {Code: bpfLD | bpfH | bpfIND, K: 18 + 2}, // A = TCP dst port
-		/* 21 */ {Code: bpfJMP | bpfJEQ | bpfK, K: p, Jf: 3}, // other port → rej
-		/* 22 */ {Code: bpfLD | bpfB | bpfIND, K: 18 + 13}, // A = TCP flags
-		/* 23 */ {Code: bpfALU | bpfAND | bpfK, K: tcpFlagSYN | tcpFlagACK},
-		/* 24 */ {Code: bpfJMP | bpfJEQ | bpfK, K: tcpFlagSYN, Jt: 1}, // SYN only → acc, else rej
-		/* 25 rej */ {Code: bpfRET | bpfK, K: 0},
-		/* 26 acc */ {Code: bpfRET | bpfK, K: captureSnapLen},
+		/* 10 */ {Code: bpfLD | bpfH | bpfABS, K: 16}, // A = inner ethertype
+		/* 11 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeIPv4, Jf: 7}, // not IPv4 → rej
+		/* 12 */ {Code: bpfLD | bpfB | bpfABS, K: 18 + 9}, // A = IP protocol
+		/* 13 */ {Code: bpfJMP | bpfJEQ | bpfK, K: ipProtoTCP, Jf: 5}, // not TCP → rej
+		/* 14 */ {Code: bpfLD | bpfH | bpfABS, K: 18 + 6}, // A = IP flags/fragment offset
+		/* 15 */ {Code: bpfJMP | bpfJSET | bpfK, K: ipFragOffset, Jt: 3}, // non-first fragment → rej
+		/* 16 */ {Code: bpfLDX | bpfB | bpfMSH, K: 18}, // X = 4 * IHL
+		/* 17 */ {Code: bpfLD | bpfH | bpfIND, K: 18 + 2}, // A = TCP dst port
+		/* 18 */ {Code: bpfJMP | bpfJEQ | bpfK, K: p, Jt: 1}, // port → acc, else rej
+		/* 19 rej */ {Code: bpfRET | bpfK, K: 0},
+		/* 20 acc */ {Code: bpfRET | bpfK, K: captureSnapLen},
 	}
 }
 
 // --- observation table ---
 
-type observedSYN struct {
-	start    time.Time // first observation of this SYN burst
+type observedConn struct {
+	start    time.Time // first observation; drives expiry and eviction
+	synStart time.Time // first SYN observation; zero while none was seen
 	obs      []Observation
 	overflow bool // more distinct copies than maxObservationsPerKey
 }
@@ -230,14 +239,14 @@ type queuedKey struct {
 	start time.Time
 }
 
-// ObservationTable holds recent SYN observations by 4-tuple. It is safe for
-// concurrent use.
+// ObservationTable holds recent observations of client segments by 4-tuple.
+// It is safe for concurrent use.
 type ObservationTable struct {
 	ttl time.Duration
 	now func() time.Time
 
 	mu      sync.Mutex
-	entries map[ConnKey]*observedSYN
+	entries map[ConnKey]*observedConn
 	order   []queuedKey   // insertion order, for expiry and eviction
 	changed chan struct{} // closed and replaced on every Add
 }
@@ -248,14 +257,19 @@ func NewObservationTable(ttl time.Duration, now func() time.Time) *ObservationTa
 	return &ObservationTable{
 		ttl:     ttl,
 		now:     now,
-		entries: make(map[ConnKey]*observedSYN),
+		entries: make(map[ConnKey]*observedConn),
 		changed: make(chan struct{}),
 	}
 }
 
-// Add records one copy of a SYN. A zero obs.At is set to the table's clock.
-// Expired entries are purged first; when the table is full the oldest entry
-// is evicted.
+// Add records one received copy of a segment. A zero obs.At is set to the
+// table's clock. Expired entries are purged first; when the table is full the
+// oldest entry is evicted.
+//
+// A SYN starts a new connection for its 4-tuple: it replaces whatever the
+// table holds for the key unless that already contains a SYN observed less
+// than synBurstWindow earlier (another copy of the same SYN). Non-SYN
+// segments are added to the key's entry, creating one if needed.
 func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	now := t.now()
 	if obs.At.IsZero() {
@@ -266,19 +280,22 @@ func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 	t.purgeLocked(now)
 
 	e := t.entries[key]
-	if e != nil && obs.At.Sub(e.start) > synBurstWindow {
-		e = nil // a later SYN for this 4-tuple: forget the earlier one
+	if e != nil && obs.SYN && (e.synStart.IsZero() || obs.At.Sub(e.synStart) > synBurstWindow) {
+		e = nil // a new SYN for this 4-tuple: forget the earlier segments
 	}
 	if e == nil {
 		for len(t.entries) >= maxObservedKeys && len(t.order) > 0 {
 			t.popOldestLocked()
 		}
-		e = &observedSYN{start: obs.At}
+		e = &observedConn{start: obs.At}
 		t.entries[key] = e
 		t.order = append(t.order, queuedKey{key: key, start: obs.At})
 		if len(t.order) > 2*maxObservedKeys {
 			t.compactOrderLocked()
 		}
+	}
+	if obs.SYN && e.synStart.IsZero() {
+		e.synStart = obs.At
 	}
 	if !e.overflow && !containsObservation(e.obs, obs) {
 		if len(e.obs) >= maxObservationsPerKey {
@@ -293,14 +310,14 @@ func (t *ObservationTable) Add(key ConnKey, obs Observation) {
 
 func containsObservation(list []Observation, o Observation) bool {
 	for _, x := range list {
-		if x.Ifname == o.Ifname && bytes.Equal(x.SrcMAC, o.SrcMAC) {
+		if x.Ifname == o.Ifname && x.SYN == o.SYN && bytes.Equal(x.SrcMAC, o.SrcMAC) {
 			return true
 		}
 	}
 	return false
 }
 
-func (t *ObservationTable) expired(e *observedSYN, now time.Time) bool {
+func (t *ObservationTable) expired(e *observedConn, now time.Time) bool {
 	return now.Sub(e.start) > t.ttl
 }
 
@@ -331,8 +348,8 @@ func (t *ObservationTable) popOldestLocked() {
 	}
 }
 
-// compactOrderLocked drops queue items left behind by replaced SYNs, so the
-// order stays proportional to the live entries.
+// compactOrderLocked drops queue items left behind by replaced entries, so
+// the order stays proportional to the live entries.
 func (t *ObservationTable) compactOrderLocked() {
 	live := make([]queuedKey, 0, len(t.entries))
 	for _, q := range t.order {
@@ -343,9 +360,13 @@ func (t *ObservationTable) compactOrderLocked() {
 	t.order = live
 }
 
-// Wait returns the live observations for key, waiting up to maxWait for the
-// first one to arrive. It returns nil on timeout, when ctx ends, or when the
-// key received more distinct copies than the table keeps.
+// Wait returns the live observations for key once at least one non-SYN
+// segment of it has been observed, waiting up to maxWait for that; on
+// timeout or when ctx ends it returns what is there. A copy of a frame on
+// its ingress interface is always delivered before its transit copies, and a
+// connection's SYN before its later segments, so the observations returned
+// include the ingress of every segment up to the first non-SYN one. A key
+// that received more distinct copies than the table keeps yields nil.
 func (t *ObservationTable) Wait(ctx context.Context, key ConnKey, maxWait time.Duration) []Observation {
 	var timeout <-chan time.Time
 	if maxWait > 0 {
@@ -354,34 +375,55 @@ func (t *ObservationTable) Wait(ctx context.Context, key ConnKey, maxWait time.D
 		timeout = timer.C
 	}
 	for {
-		t.mu.Lock()
-		var got []Observation
-		if e := t.entries[key]; e != nil && !t.expired(e, t.now()) {
-			got = append(got, e.obs...)
-		}
-		changed := t.changed
-		t.mu.Unlock()
-		if len(got) > 0 || timeout == nil {
+		got, changed := t.snapshot(key)
+		if timeout == nil || hasNonSYN(got) {
 			return got
 		}
 		select {
 		case <-changed:
 		case <-timeout:
-			return nil
+			got, _ = t.snapshot(key)
+			return got
 		case <-ctx.Done():
-			return nil
+			got, _ = t.snapshot(key)
+			return got
 		}
 	}
 }
 
+func (t *ObservationTable) snapshot(key ConnKey) ([]Observation, <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var got []Observation
+	if e := t.entries[key]; e != nil && !t.expired(e, t.now()) {
+		got = append(got, e.obs...)
+	}
+	return got, t.changed
+}
+
+func hasNonSYN(obs []Observation) bool {
+	for _, o := range obs {
+		if !o.SYN {
+			return true
+		}
+	}
+	return false
+}
+
 // --- resolver ---
 
-// IngressResolver identifies the VM a TCP connection came from by the tap
-// device its SYN entered and the SYN's source MAC. Empty fields use defaults.
+// IngressResolver identifies the VM a TCP connection came from: its SYN
+// entered on exactly one tap device with the VM's configured MAC, and every
+// observed segment of the connection entered on that tap or a transit
+// interface. Empty fields use defaults.
 type IngressResolver struct {
-	Table      *ObservationTable
-	PVEConfDir string
-	MaxWait    time.Duration
+	Table       *ObservationTable
+	PVEConfDir  string
+	SysClassNet string
+	MaxWait     time.Duration
+
+	mu      sync.Mutex
+	bridges map[string]bool // interface name -> is a bridge master
 }
 
 // Resolve returns the ID of the VM that opened the connection from remote to
@@ -400,13 +442,15 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 		maxWait = defaultMaxWait
 	}
 	obs := r.Table.Wait(ctx, ConnKey{Src: src, Dst: dst}, maxWait)
-	if len(obs) == 0 {
-		return resolveFail(reasonNoSYN)
-	}
 
 	var tap *Observation
 	var nic string
+	sawSYN := false
 	for i := range obs {
+		if !obs[i].SYN {
+			continue
+		}
+		sawSYN = true
 		m := tapPortPattern.FindStringSubmatch(obs[i].Ifname)
 		if m == nil {
 			continue
@@ -416,8 +460,18 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 		}
 		tap, vmid, nic = &obs[i], m[1], m[2]
 	}
-	if tap == nil {
+	switch {
+	case !sawSYN:
+		return resolveFail(reasonNoSYN)
+	case !hasNonSYN(obs):
+		return resolveFail(reasonNoHandshake)
+	case tap == nil:
 		return resolveFail(reasonNotVMPort)
+	}
+	for _, o := range obs {
+		if o.Ifname != tap.Ifname && !r.isTransit(o.Ifname) {
+			return resolveFail(reasonForeign)
+		}
 	}
 
 	dir := r.PVEConfDir
@@ -432,6 +486,40 @@ func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrP
 		return resolveFail(reasonMACMismatch)
 	}
 	return vmid, nil
+}
+
+// isTransit reports whether frames received on ifname are only copies of
+// frames that entered the host elsewhere: a bridge master or a PVE firewall
+// device. Physical NICs, VLAN sub-interfaces, lo, veth and taps are ingress.
+func (r *IngressResolver) isTransit(ifname string) bool {
+	if fwBridgePattern.MatchString(ifname) || fwPeerPattern.MatchString(ifname) {
+		return true
+	}
+	return r.isBridge(ifname)
+}
+
+// isBridge reports whether ifname is a Linux bridge master, caching the
+// answer per name (interface names are created and renamed only by root).
+func (r *IngressResolver) isBridge(ifname string) bool {
+	if ifname == "" || ifname == "." || ifname == ".." || strings.ContainsAny(ifname, `/\`) {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if is, ok := r.bridges[ifname]; ok {
+		return is
+	}
+	root := r.SysClassNet
+	if root == "" {
+		root = DefaultSysClassNet
+	}
+	fi, err := os.Stat(filepath.Join(root, ifname, "bridge"))
+	is := err == nil && fi.IsDir()
+	if r.bridges == nil {
+		r.bridges = make(map[string]bool)
+	}
+	r.bridges[ifname] = is
+	return is
 }
 
 // configNICMAC returns the MAC of the VM config's current net<nic> line: the

@@ -31,8 +31,8 @@ func htons(v uint16) uint16 {
 }
 
 // StartCapture opens an AF_PACKET socket on all interfaces, filters it to
-// IPv4 TCP SYNs for port and records every received copy in table until ctx
-// ends. It returns an error when the socket cannot be set up (no CAP_NET_RAW,
+// IPv4 TCP segments for port and records every received copy in table until
+// ctx ends. It returns an error when the socket cannot be set up (no CAP_NET_RAW,
 // filter rejected); the read loop runs in its own goroutine.
 func StartCapture(ctx context.Context, port uint16, table *ObservationTable, log *slog.Logger) error {
 	if log == nil {
@@ -43,8 +43,8 @@ func StartCapture(ctx context.Context, port uint16, table *ObservationTable, log
 		return fmt.Errorf("hostpower: open packet socket: %w", err)
 	}
 	// Frames queued between socket() and the filter attach are unfiltered;
-	// the userspace re-check in the read loop drops them.
-	prog := synFilter(port)
+	// the userspace re-check in the read loop drops what does not belong.
+	prog := tcpPortFilter(port)
 	filter := make([]syscall.SockFilter, len(prog))
 	for i, in := range prog {
 		filter[i] = syscall.SockFilter{Code: in.Code, Jt: in.Jt, Jf: in.Jf, K: in.K}
@@ -89,9 +89,9 @@ func captureLoop(ctx context.Context, fd int, port uint16, table *ObservationTab
 		if !ok || ll.Pkttype == syscall.PACKET_OUTGOING {
 			continue
 		}
-		key, mac, ok := ParseSYNFrame(buf[:n], port)
+		key, mac, syn, ok := ParseTCPFrame(buf[:n], port)
 		if !ok {
-			log.Debug("hostpower: skipped captured frame: not a SYN for the listen port", "ifindex", ll.Ifindex, "len", n)
+			log.Debug("hostpower: skipped captured frame: not a TCP segment for the listen port", "ifindex", ll.Ifindex, "len", n)
 			continue
 		}
 		name, ok := interfaceName(names, ll.Ifindex)
@@ -99,7 +99,7 @@ func captureLoop(ctx context.Context, fd int, port uint16, table *ObservationTab
 			log.Debug("hostpower: skipped captured frame: interface gone", "ifindex", ll.Ifindex)
 			continue
 		}
-		table.Add(key, Observation{Ifname: name, SrcMAC: mac})
+		table.Add(key, Observation{Ifname: name, SrcMAC: mac, SYN: syn})
 	}
 }
 
