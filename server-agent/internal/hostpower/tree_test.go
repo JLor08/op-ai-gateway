@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func readFile(t *testing.T, path string) string {
@@ -246,5 +247,141 @@ func TestRemoveStaleTemps(t *testing.T) {
 	}
 	if _, err := os.Stat(stray); err != nil {
 		t.Errorf("removed through an escaping symlink: %v", err)
+	}
+}
+
+// within fails the test when fn does not return within 2 s (a blocked read).
+func within(t *testing.T, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked for more than 2s")
+	}
+}
+
+func mkfifoOrSkip(t *testing.T, p string) {
+	t.Helper()
+	if err := os.RemoveAll(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := mkfifo(p); err != nil {
+		t.Skipf("mkfifo unsupported: %v", err)
+	}
+}
+
+func TestWriteTreeReplacesFIFOWithoutBlocking(t *testing.T) {
+	vm := filepath.Join(t.TempDir(), "100")
+	if err := WriteTree(vm, 1); err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Join(vm, DomainDir, "name")
+	mkfifoOrSkip(t, name)
+	var err error
+	within(t, func() { err = WriteTree(vm, 2) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Lstat(name)
+	if err != nil || !fi.Mode().IsRegular() {
+		t.Fatalf("name after WriteTree: %v %v, want a regular file", fi, err)
+	}
+	if got := readFile(t, name); got != "package-0\n" {
+		t.Errorf("name = %q", got)
+	}
+}
+
+func TestWriteTreeReplacesOversizedStaticFile(t *testing.T) {
+	vm := filepath.Join(t.TempDir(), "100")
+	if err := WriteTree(vm, 1); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(vm, DomainDir, "max_energy_range_uj")
+	if err := os.WriteFile(p, []byte(strings.Repeat("0", maxTreeFileBytes+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteTree(vm, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, p); got != "0\n" {
+		t.Errorf("max_energy_range_uj = %q", got)
+	}
+}
+
+func TestReadCounterRejectsOversizedFile(t *testing.T) {
+	vm := filepath.Join(t.TempDir(), "100")
+	if err := WriteTree(vm, 1); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(vm, DomainDir, "energy_uj")
+	if err := os.WriteFile(p, []byte(strings.Repeat("1", maxTreeFileBytes+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadCounter(vm); got != 0 {
+		t.Errorf("ReadCounter = %d, want 0 (oversized)", got)
+	}
+	// At the cap it is still read (and then rejected only if unparsable).
+	if err := os.WriteFile(p, []byte("123\n"+strings.Repeat(" ", maxTreeFileBytes-4)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := ReadCounter(vm); got != 123 {
+		t.Errorf("ReadCounter at the cap = %d, want 123", got)
+	}
+}
+
+func TestReadCounterFIFOReturnsZeroWithoutBlocking(t *testing.T) {
+	vm := filepath.Join(t.TempDir(), "100")
+	if err := WriteTree(vm, 1); err != nil {
+		t.Fatal(err)
+	}
+	mkfifoOrSkip(t, filepath.Join(vm, DomainDir, "energy_uj"))
+	var got uint64
+	within(t, func() { got = ReadCounter(vm) })
+	if got != 0 {
+		t.Errorf("ReadCounter = %d, want 0", got)
+	}
+}
+
+// TestNonblockOpenOfFIFODoesNotBlock covers the Lstat-to-open race in
+// readSmall, which cannot be staged deterministically: a FIFO swapped in after
+// the Lstat is opened with the same flags readSmall uses, so the open returns
+// at once and the post-open Stat sees a non-regular file.
+func TestNonblockOpenOfFIFODoesNotBlock(t *testing.T) {
+	dir := t.TempDir()
+	mkfifoOrSkip(t, filepath.Join(dir, "x"))
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	within(t, func() {
+		f, err := root.OpenFile("x", os.O_RDONLY|oNonblock, 0)
+		if err != nil {
+			t.Errorf("open: %v", err)
+			return
+		}
+		defer f.Close()
+		if fi, err := f.Stat(); err != nil || fi.Mode().IsRegular() {
+			t.Errorf("Stat after open = %v, %v; want a non-regular file", fi, err)
+		}
+	})
+}
+
+func TestRemoveStaleTempsSkipsFIFODomain(t *testing.T) {
+	out := t.TempDir()
+	vm := filepath.Join(out, "100")
+	if err := os.MkdirAll(vm, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mkfifoOrSkip(t, filepath.Join(vm, DomainDir))
+	var err error
+	within(t, func() { err = RemoveStaleTemps(out) })
+	if err != nil {
+		t.Fatal(err)
 	}
 }

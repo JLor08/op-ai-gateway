@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -27,6 +28,12 @@ const (
 	// counter cannot wrap in practice, so no real wraparound is lost.
 	MaxEnergyRangeUJ uint64 = 0
 )
+
+// maxTreeFileBytes caps what the service ever reads from a VM tree: a uint64
+// (20 digits) plus a newline fits with room to spare. A guest can place any
+// file in its share, so a larger file, or anything that is not a regular file
+// (a FIFO would block a read forever), is never read.
+const maxTreeFileBytes = 64
 
 // treeFiles are the files of the synthetic domain; their temp files are named
 // "."+name+".<random>" in DomainDir.
@@ -83,7 +90,9 @@ func WriteTree(vmDir string, energyUJ uint64) error {
 	}
 	for _, f := range static {
 		rel := path.Join(DomainDir, f.name)
-		if cur, err := root.ReadFile(rel); err == nil && string(cur) == f.content {
+		// Anything but a small regular file with the expected content (absent,
+		// different, a FIFO, a symlink, oversized) is replaced by the rename.
+		if cur, ok := readSmall(root, rel); ok && string(cur) == f.content {
 			continue
 		}
 		if err := writeAtomic(root, f.name, f.content); err != nil {
@@ -143,17 +152,42 @@ func createTemp(root *os.Root, name string) (string, *os.File, error) {
 	return "", nil, fmt.Errorf("create temp file for %s: too many collisions", name)
 }
 
+// readSmall returns the content of rel inside root only when it is a regular
+// file of at most maxTreeFileBytes. Lstat rejects special and oversized files
+// before the open; the open is non-blocking (where the OS has O_NONBLOCK) and
+// the opened file is checked again with Stat and read through a bounded reader,
+// so swapping the file between Lstat and open cannot block or flood the read.
+func readSmall(root *os.Root, rel string) ([]byte, bool) {
+	fi, err := root.Lstat(rel)
+	if err != nil || !fi.Mode().IsRegular() || fi.Size() > maxTreeFileBytes {
+		return nil, false
+	}
+	f, err := root.OpenFile(rel, os.O_RDONLY|oNonblock, 0)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return nil, false
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxTreeFileBytes+1))
+	if err != nil || len(b) > maxTreeFileBytes {
+		return nil, false
+	}
+	return b, true
+}
+
 // ReadCounter returns the persisted energy_uj under vmDir, or 0 when it is
-// absent, empty, unparsable or reachable only through a symlink that escapes
-// vmDir.
+// absent, empty, unparsable, not a small regular file, or reachable only
+// through a symlink that escapes vmDir.
 func ReadCounter(vmDir string) uint64 {
 	root, err := openVMRoot(vmDir, false)
 	if err != nil {
 		return 0
 	}
 	defer root.Close()
-	b, err := root.ReadFile(path.Join(DomainDir, "energy_uj"))
-	if err != nil {
+	b, ok := readSmall(root, path.Join(DomainDir, "energy_uj"))
+	if !ok {
 		return 0
 	}
 	v, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
@@ -193,8 +227,14 @@ func removeStaleTempsIn(vmDir string) error {
 	if err != nil || !fi.IsDir() {
 		return nil
 	}
-	d, err := root.Open(DomainDir)
+	// Non-blocking open and a Stat re-check: a FIFO swapped in after the
+	// Lstat must not block startup.
+	d, err := root.OpenFile(DomainDir, os.O_RDONLY|oNonblock, 0)
 	if err != nil {
+		return nil
+	}
+	if fi, err := d.Stat(); err != nil || !fi.IsDir() {
+		_ = d.Close()
 		return nil
 	}
 	names, err := d.Readdirnames(-1)

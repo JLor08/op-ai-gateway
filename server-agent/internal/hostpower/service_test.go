@@ -213,8 +213,8 @@ func TestTickNoEnergyDeltaStillAdvancesBaselines(t *testing.T) {
 	f.setBusyUsec(3_000_000)
 	f.setVMUsec("100", 1_250_000)
 	mustTick(t, s)
-	// Final interval only: 0.25 * 10 J. Unadvanced baselines would give
-	// share 1_250_000/3_000_000 and a 20 J gap-spanning delta.
+	// Final interval only: 0.25 * 10 J. Busy and VM baselines left at their
+	// pre-gap values would give share 1_250_000/3_000_000 (about 4.17 J).
 	if c := s.Counters()["100"]; c != 2_500_000 {
 		t.Errorf("counter = %d, want 2500000", c)
 	}

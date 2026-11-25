@@ -953,8 +953,9 @@ recreates the mount point under `/run` itself). An fstab mount (or an equivalent
 of `local-fs.target`, so it is re-established on every boot before PVE
 autostarts VMs. The service keeps writing to `/var/lib/op-hostpower`, and new
 VM directories appear in the bind. The service confines every write to the
-VM's own directory regardless (a symlink that leaves it is refused), as
-defense in depth.
+VM's own directory regardless (a symlink that leaves it is refused) and
+never reads a FIFO, other special file or oversized file a guest placed
+there (it replaces it), as defense in depth.
 
 **3. Per VM (on the host).** The directory
 `/var/lib/op-hostpower/<vmid>` appears only after the service has ticked while
