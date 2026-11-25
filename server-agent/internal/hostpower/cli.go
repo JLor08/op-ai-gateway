@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -148,8 +149,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})))
 
 	opts := cfg.Options.withDefaults()
-	if err := os.MkdirAll(opts.OutDir, 0o700); err != nil {
-		fmt.Fprintf(stderr, "server-agent: hostpower: create out dir: %v\n", err)
+	if err := ensureOutDir(opts.OutDir); err != nil {
+		fmt.Fprintf(stderr, "server-agent: hostpower: out dir: %v\n", err)
 		return 2
 	}
 	slog.Info("hostpower: starting", "out", opts.OutDir, "interval", cfg.Interval)
@@ -209,6 +210,27 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		slog.Warn("hostpower: http shutdown", "err", err)
 	}
 	return code
+}
+
+// ensureOutDir creates the out directory with mode 0700, or tightens an
+// existing one to 0700, so no unprivileged host process can read a VM's tree
+// or swap a <vmid> entry (openVMRoot relies on it). An existing path must be a
+// real directory: a symlink or anything else is an error.
+func ensureOutDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return os.MkdirAll(dir, 0o700)
+	case err != nil:
+		return err
+	case fi.Mode()&fs.ModeSymlink != 0:
+		return fmt.Errorf("%s is a symlink, not a directory", dir)
+	case !fi.IsDir():
+		return fmt.Errorf("%s is not a directory", dir)
+	case fi.Mode().Perm()&^0o700 != 0:
+		return os.Chmod(dir, 0o700)
+	}
+	return nil
 }
 
 func runTicks(ctx context.Context, svc *Service, interval time.Duration, stderr io.Writer) int {

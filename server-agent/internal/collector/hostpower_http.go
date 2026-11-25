@@ -178,5 +178,9 @@ func (c *hostpowerHTTPCollector) fetch(ctx context.Context) (HostpowerEnergy, er
 	if err := json.Unmarshal(body, &e); err != nil {
 		return e, errors.New("response body is not the energy JSON")
 	}
+	if e.VMID == "" {
+		// null, {} or a body without vmid: nothing ties the counter to a VM.
+		return e, errors.New("response lacks vmid")
+	}
 	return e, nil
 }

@@ -309,3 +309,62 @@ func TestRunServesTokenModeEndToEnd(t *testing.T) {
 		t.Fatalf("no serving log: %s", stderr.String())
 	}
 }
+
+func TestEnsureOutDirTightensExistingDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits")
+	}
+	dir := filepath.Join(t.TempDir(), "out")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { // independent of the umask
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var buf bytes.Buffer
+	if code := run(ctx, []string{"-out", dir}, io.Discard, &buf); code != 0 {
+		t.Fatalf("code = %d stderr=%q", code, buf.String())
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("out dir mode = %o, want 700", perm)
+	}
+
+	created := filepath.Join(t.TempDir(), "new", "out")
+	if err := ensureOutDir(created); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(created); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("created out dir: %v, %v", fi, err)
+	}
+}
+
+func TestMainOutDirNotADirectoryExits2(t *testing.T) {
+	base := t.TempDir()
+	file := filepath.Join(base, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if code := Main([]string{"-out", file}, io.Discard, &buf); code != 2 || !strings.Contains(buf.String(), "not a directory") {
+		t.Fatalf("file: code = %d stderr=%q", code, buf.String())
+	}
+
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	buf.Reset()
+	if code := Main([]string{"-out", link}, io.Discard, &buf); code != 2 || !strings.Contains(buf.String(), "symlink") {
+		t.Fatalf("symlink: code = %d stderr=%q", code, buf.String())
+	}
+}

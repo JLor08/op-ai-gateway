@@ -54,6 +54,12 @@ func (f *fakeHost) serve(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/elsewhere/v1/energy", http.StatusFound)
 	case "garbage":
 		_, _ = w.Write([]byte("not json"))
+	case "null":
+		_, _ = w.Write([]byte("null"))
+	case "empty":
+		_, _ = w.Write([]byte("{}"))
+	case "novmid":
+		_, _ = fmt.Fprintf(w, `{"energy_uj":%d}`, energy)
 	case "big":
 		_, _ = w.Write([]byte(strings.Repeat("x", 1<<20)))
 	default:
@@ -388,4 +394,26 @@ func TestHostpowerHTTPLogsServedVMIDOnFirstSuccessAndChange(t *testing.T) {
 	if n := infos(); n != 2 || !strings.Contains(logs.String(), "vmid=101") {
 		t.Fatalf("infos = %d after a vmid change, want 2:\n%s", n, logs.String())
 	}
+}
+
+func TestHostpowerHTTPResponseWithoutVMIDIsFailure(t *testing.T) {
+	s := newStepper(t, "")
+	logs := recordLogs(s.c)
+	for i, mode := range []string{"null", "empty", "novmid", "novmid", "null"} {
+		cpu, system := s.collect(mode, uint64(i+1)*1_000_000, time.Duration(i)*time.Second)
+		wantNil(t, mode+" cpu", cpu)
+		wantNil(t, mode+" system", system)
+	}
+	out := logs.String()
+	if n := strings.Count(out, "host serves this VM's counter"); n != 0 {
+		t.Fatalf("Info logged %d times for vmid-less bodies:\n%s", n, out)
+	}
+	if n := strings.Count(out, `msg="hostpower: request failed"`); n != 5 || !strings.Contains(out, "response lacks vmid") {
+		t.Fatalf("want 5 Debug failures naming the missing vmid:\n%s", out)
+	}
+	// A vmid-less body re-baselines: the next good reading is a first sample.
+	s.collect("ok", 10_000_000, 10*time.Second)
+	s.collect("novmid", 11_000_000, 11*time.Second)
+	cpu, _ := s.collect("ok", 12_000_000, 12*time.Second)
+	wantNil(t, "cpu after vmid-less body", cpu)
 }
