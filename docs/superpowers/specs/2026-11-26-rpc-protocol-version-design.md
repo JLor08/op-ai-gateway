@@ -41,8 +41,9 @@ the RPC protocol version.
    - `rpc_server`: version/build/commit from the agent-versioned
      `llama_server` in its directory (as today, else the path); protocol from
      its own probe.
-   - `llama_server`: version/build/commit from its own `--version`; protocol
-     from the first protocol-carrying `rpc_server` in its directory.
+   - `llama_server`: version/build/commit from its own `--version`; the protocol
+     that the protocol-carrying `rpc_server`s of its directory agree on; none
+     when they disagree (final-review fix).
    - No llama-server in the directory → the rpc-server has only a protocol
      (plus whatever its path says, as today). No rpc-server → the
      llama-server has no protocol.
@@ -77,9 +78,12 @@ the RPC protocol version.
     cluster candidate picker lists rejected automatic candidates, disabled,
     with the reason text instead of hiding them.
 11. **Ingest retention:** an `rpc_server` re-report without protocol keeps the
-    stored protocol (same trade-off as `keepKnownBinaryVersions`: the runtime
-    banner check is the safety net); a `llama_server` row does not keep it
-    (its protocol is derived from a sibling that may be gone).
+    stored protocol while its version, build and commit equal the stored
+    row's (same trade-off as `keepKnownBinaryVersions`: the runtime banner
+    check is the safety net); a `llama_server` row does not keep its own (its
+    protocol is derived from a sibling that may be gone), but ingest
+    re-derives it from the written `rpc_server` rows of its directory
+    (final-review fix).
 12. **No relaunch:** the protocol is not part of the head's generation hash.
 
 ## Out of scope

@@ -2103,16 +2103,20 @@ combined output until the banner line, kills the process at once and reports the
 protocol; output without a well-formed banner yields none. The run is in its own
 process group (a job object on Windows) that is killed as a whole, so a wrapper
 script that does not `exec` leaves no rpc-server bound to the port behind, on the
-banner, the timeout and a plain exit alike. An rpc-server too old to print the
-`vX.Y.Z` banner runs for the full probe timeout on each retry (backoff 30 s
-doubling to 1 h) and ends with no protocol. It uses the same 10 s
+banner, the timeout and a plain exit alike; a descendant that left the group
+(`setsid`) survives the kill, so on the timeout the probe closes its end of the
+output pipe and returns within the 5 s wait delay instead of waiting for that
+descendant. A build that prints no `vX.Y.Z` banner yields no protocol: it either
+exits at once (an older build rejecting `-d`, say) or is killed at the probe
+timeout, and is retried on the backoff below (30 s doubling to 1 h). It uses the same 10 s
 timeout, (path, size, mtime) cache and retry backoff as the `--version` run. A
 `wsl://` `rpc-server` is never run (a process inside a distro cannot be killed
 reliably through `wsl.exe`, and a WSL rpc-server is never a cluster member) and
 carries no protocol. Binaries in one directory are one build, so the protocol is
 paired per directory in both directions: the `rpc-server` keeps its own protocol
 (and inherits version, build and commit as above), and the `llama-server` takes the
-protocol of the first `rpc-server` of its directory that has one. Pairing never
+protocol the protocol-carrying `rpc-server`s of its directory agree on, none when
+they report different ones (which of them its build speaks is unknown). Pairing never
 crosses directories; a `llama-server` with no probed `rpc-server` beside it, and any
 other kind, has no `rpc_protocol` (the field is omitted when empty, and an agent
 older than 0.25.2 never sends it).
@@ -2291,8 +2295,10 @@ listed, not `compatible`, with `incompatible_reason` (`no_rpc_binary`,
 `protocol_mismatch` with the member's protocol, `build_mismatch`,
 `version_unknown`, `head_version_unknown`), and a match names its binary's
 protocol ([HTTP API Surface](../reference/api-surface.md)). The protocol is
-not part of the head's `generation`, so learning or losing one relaunches
-nothing; the agent's runtime check stays the net
+not part of the head's `generation`, so learning one relaunches nothing;
+losing the one a cluster matched on alone withholds that cluster (stage 4
+below), which ingest's retention keeps from happening on a transient probe
+failure. The agent's runtime check stays the net
 ([ADR-120](../09-architecture-decisions.md#adr-120--match-rpc-cluster-binaries-on-the-probed-protocol-version)).
 
 **Ports.** Each member gets an RPC (or relay) port from 26000–26999 on its
@@ -2383,7 +2389,14 @@ stage that finds a reason stops it:
    one failed probe neither withholds the host's clusters nor moves a head's
    generation; since the inventory carries no file identity, a binary replaced
    at the same path whose probe fails keeps the old identity until a probe
-   succeeds.
+   succeeds. The RPC protocol is kept the same way, for an `rpc_server` row
+   only and only while its re-reported version, build and commit (after that
+   retention) equal the stored row's: another identity is another binary,
+   whose protocol is unknown until its probe succeeds. A protocol-less
+   `llama_server` row takes the protocol its directory's `rpc_server` rows
+   agree on (kept ones included; none without such a row or when they
+   differ), so an agent restart whose rpc-server probe fails withholds no
+   cluster that matched on the protocol alone.
 5. **The head's own address** in the resolved network (the stored choice, else
    the default): `.cluster_mesh_unavailable` (in `mesh`, the head server has
    NetBird off or no tracking group) or `.cluster_address_unknown` (no mesh IP;
