@@ -2519,6 +2519,8 @@ const de = {
   serverLanInterfaceMissing: 'fehlt',
   serverLanFallbackWarning: (missing: string, address: string) =>
     `Die gewählte Schnittstelle ${missing} wurde vom Agent nicht gemeldet. Ersatzweise wird ${address || 'keine Adresse'} verwendet.`,
+  serverLanFallbackWarningUnnamed: (target: string) =>
+    `Die gewählte Schnittstelle wurde vom Agent nicht gemeldet. Ersatzweise wird ${target || 'keine Adresse'} verwendet.`,
   serverLanAgentKeyHint:
     'Die Schnittstellen sind nur über ihren Namen erkennbar. Mit einem agent_key in der Agent-Konfiguration bleibt die Auswahl auch nach einer Umbenennung stabil.',
   serverLanNotReportedHint:
@@ -6529,6 +6531,8 @@ const en: PortalMessages = {
   serverLanInterfaceMissing: 'missing',
   serverLanFallbackWarning: (missing: string, address: string) =>
     `The chosen interface ${missing} is not reported by the agent. ${address || 'No address'} is used instead.`,
+  serverLanFallbackWarningUnnamed: (target: string) =>
+    `The chosen interface is not reported by the agent. ${target || 'No address'} is used instead.`,
   serverLanAgentKeyHint:
     'Interfaces are identified by name only. With an agent_key in the agent configuration the choice survives a rename.',
   serverLanNotReportedHint:

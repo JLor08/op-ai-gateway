@@ -121,9 +121,21 @@ function LanSourceEditor({
     !interfaces.some((i) => `${LAN_IF_PREFIX}${i.id}` === storedChoice)
       ? storedChoice.slice(LAN_IF_PREFIX.length)
       : '';
+  // What "Automatic" would pick, which is not what the stored choice resolves
+  // to: the effective address only counts when the effective source is auto.
+  // A non-NetBird server with a domain dials its domain under auto.
   let autoLabel = t.serverLanSourceAutoNone;
-  if (lan?.source === 'domain') autoLabel = t.serverLanSourceAutoDomain(server.domain);
-  else if (lan?.address) autoLabel = t.serverLanSourceAuto(lan.address, lan.interface_name);
+  if (lan?.source === 'auto' && lan.address) {
+    autoLabel = t.serverLanSourceAuto(lan.address, lan.interface_name);
+  } else if (
+    lan?.source === 'domain' ||
+    (lan?.source !== 'auto' && !server.netbird_enabled && server.domain)
+  ) {
+    autoLabel = t.serverLanSourceAutoDomain(server.domain);
+  } else if (lan) {
+    const pick = interfaces.find((i) => i.preferred) ?? interfaces.find((i) => !i.virtual);
+    if (pick?.ipv4[0]) autoLabel = t.serverLanSourceAuto(pick.ipv4[0], pick.name);
+  }
   const changes = [...(server.lan_address_changes ?? [])]
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
     .slice(0, LAN_CHANGES_SHOWN);
@@ -158,7 +170,12 @@ function LanSourceEditor({
       )}
       {lan?.fallback && (
         <Alert severity="warning">
-          {t.serverLanFallbackWarning(missingId || lan.interface_id, lan.address)}
+          {(() => {
+            const target = lan.source === 'domain' ? server.domain : lan.address;
+            return missingId
+              ? t.serverLanFallbackWarning(missingId, target)
+              : t.serverLanFallbackWarningUnnamed(target);
+          })()}
         </Alert>
       )}
       {lan && !lan.reported && <Alert severity="info">{t.serverLanNotReportedHint}</Alert>}
