@@ -360,3 +360,58 @@ func TestIngestBinariesKeepProbedIdentityOverPathFallback(t *testing.T) {
 		t.Fatalf("row after a new probe = %+v, want the new identity", b)
 	}
 }
+
+// TestIngestBinariesRPCProtocol: a well-formed protocol is stored, every
+// malformed one is stored as "" (the portal matching trusts only a valid
+// value), and a protocol-only change counts as an inventory change so the
+// clusters of the server are re-derived.
+func TestIngestBinariesRPCProtocol(t *testing.T) {
+	srv := NewTestServer()
+	ingestBinaries(t, srv, `[
+		{"path":"/a/rpc-server","kind":"rpc_server","rpc_protocol":"10.0.2","allowed":true},
+		{"path":"/b/rpc-server","kind":"rpc_server","rpc_protocol":"10.0","allowed":true},
+		{"path":"/c/rpc-server","kind":"rpc_server","rpc_protocol":"v10.0.2","allowed":true},
+		{"path":"/d/rpc-server","kind":"rpc_server","rpc_protocol":"1000.0.0","allowed":true}]`)
+	got := storedBinaries(t, srv)
+	if p := got["/a/rpc-server"].RPCProtocol; p != "10.0.2" {
+		t.Fatalf("valid protocol stored as %q, want 10.0.2", p)
+	}
+	for _, path := range []string{"/b/rpc-server", "/c/rpc-server", "/d/rpc-server"} {
+		if p := got[path].RPCProtocol; p != "" {
+			t.Fatalf("%s: malformed protocol stored as %q, want empty", path, p)
+		}
+	}
+
+	stored := []routing.ServerBinary{{Path: "/a", Kind: "rpc_server", Source: routing.BinarySourceAgent, RPCProtocol: "10.0.2"}}
+	if !binaryInventoryChanged(stored, []routing.ServerBinary{{Path: "/a", Kind: "rpc_server", RPCProtocol: "10.0.3"}}) {
+		t.Fatal("a protocol-only change must count as an inventory change")
+	}
+	if binaryInventoryChanged(stored, []routing.ServerBinary{{Path: "/a", Kind: "rpc_server", RPCProtocol: "10.0.2"}}) {
+		t.Fatal("an unchanged protocol must not count as a change")
+	}
+}
+
+// TestIngestBinariesKeepKnownRPCProtocol: a re-report of an rpc_server row
+// without a protocol (the probe failed) keeps the stored one; a later report
+// that carries one replaces it; a row of any other kind never keeps one.
+func TestIngestBinariesKeepKnownRPCProtocol(t *testing.T) {
+	srv := NewTestServer()
+	ingestBinaries(t, srv, `[{"path":"/a/rpc-server","kind":"rpc_server","rpc_protocol":"10.0.2","allowed":true},
+		{"path":"/a/llama-server","kind":"llama_server","allowed":true}]`)
+	ingestBinaries(t, srv, `[{"path":"/a/rpc-server","kind":"rpc_server","allowed":true},
+		{"path":"/a/llama-server","kind":"llama_server","allowed":true}]`)
+	if p := storedBinaries(t, srv)["/a/rpc-server"].RPCProtocol; p != "10.0.2" {
+		t.Fatalf("re-report without protocol stored %q, want the known 10.0.2 kept", p)
+	}
+	ingestBinaries(t, srv, `[{"path":"/a/rpc-server","kind":"rpc_server","rpc_protocol":"10.0.3","allowed":true}]`)
+	if p := storedBinaries(t, srv)["/a/rpc-server"].RPCProtocol; p != "10.0.3" {
+		t.Fatalf("re-report with protocol stored %q, want 10.0.3", p)
+	}
+
+	// A llama_server row never keeps a protocol, even one it somehow holds.
+	rows := []routing.ServerBinary{{Path: "/a/llama-server", Kind: "llama_server"}}
+	keepKnownBinaryVersions(rows, []routing.ServerBinary{{Path: "/a/llama-server", Kind: "llama_server", Source: routing.BinarySourceAgent, RPCProtocol: "10.0.2"}})
+	if rows[0].RPCProtocol != "" {
+		t.Fatalf("a llama_server row kept protocol %q", rows[0].RPCProtocol)
+	}
+}

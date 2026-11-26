@@ -33,11 +33,15 @@ type agentBinarySample struct {
 	Commit        string `json:"commit"`
 	VersionSource string `json:"version_source"`
 	Allowed       bool   `json:"allowed"`
+	// RPCProtocol is the protocol version "X.Y.Z" the agent probed from an
+	// rpc_server binary; absent when it did not or could not.
+	RPCProtocol string `json:"rpc_protocol"`
 }
 
 // sanitizeBinarySamples turns the reported entries into inventory rows:
 // entries without a plausible path are dropped, an unknown kind becomes
 // "other", an unknown version source becomes "", text fields are clamped,
+// a malformed RPC protocol becomes "" (see routing.ValidRPCProtocol),
 // duplicate paths keep the first entry and the list is capped.
 func sanitizeBinarySamples(in []agentBinarySample, serverID string, now time.Time) []routing.ServerBinary {
 	out := make([]routing.ServerBinary, 0, min(len(in), maxBinariesPerSample))
@@ -63,10 +67,14 @@ func sanitizeBinarySamples(in []agentBinarySample, serverID string, now time.Tim
 		if src != binaryVersionSrcAgent && src != binaryVersionSrcPath {
 			src = ""
 		}
+		protocol := b.RPCProtocol
+		if !routing.ValidRPCProtocol(protocol) {
+			protocol = ""
+		}
 		out = append(out, routing.ServerBinary{
 			ServerID: serverID, Path: b.Path, Kind: kind,
 			Version: clampBinaryField(b.Version), Build: clampBinaryField(b.Build), Commit: clampBinaryField(b.Commit),
-			VersionSource: src, Allowed: b.Allowed, ReportedAt: now,
+			VersionSource: src, Allowed: b.Allowed, RPCProtocol: protocol, ReportedAt: now,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
@@ -134,7 +142,7 @@ func binaryInventoryChanged(stored, rows []routing.ServerBinary) bool {
 		written++
 		b, ok := agent[r.Path]
 		if !ok || b.Kind != r.Kind || b.Version != r.Version || b.Build != r.Build || b.Commit != r.Commit ||
-			b.VersionSource != r.VersionSource || b.Allowed != r.Allowed {
+			b.VersionSource != r.VersionSource || b.Allowed != r.Allowed || b.RPCProtocol != r.RPCProtocol {
 			return true
 		}
 	}
@@ -160,7 +168,14 @@ func binaryInventoryChanged(stored, rows []routing.ServerBinary) bool {
 // keeps the sibling's last identity for as long as the agent reports the
 // path. The cluster start's own version and banner checks still catch a
 // mismatch.
+//
+// The RPC protocol follows the same idea on its own: a re-report of an
+// rpc_server row that carries no protocol (the agent's protocol probe failed or
+// timed out) keeps the protocol the row had, so the portal's protocol matching
+// does not flap to "unknown" and back. A report that carries one replaces it,
+// and a row of any other kind never keeps one.
 func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
+	keepKnownRPCProtocols(rows, stored)
 	known := make(map[string]routing.ServerBinary, len(stored))
 	for _, b := range stored {
 		if b.Source == routing.BinarySourceAgent && (b.Version != "" || b.Build != "" || b.Commit != "") {
@@ -176,6 +191,22 @@ func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
 		bare := r.Version == "" && r.Build == "" && r.Commit == ""
 		if b.VersionSource == binaryVersionSrcAgent || bare {
 			r.Version, r.Build, r.Commit, r.VersionSource = b.Version, b.Build, b.Commit, b.VersionSource
+		}
+	}
+}
+
+// keepKnownRPCProtocols carries the stored RPC protocol of an agent
+// rpc_server row over to a re-report of the same path that has none.
+func keepKnownRPCProtocols(rows, stored []routing.ServerBinary) {
+	known := make(map[string]string, len(stored))
+	for _, b := range stored {
+		if b.Source == routing.BinarySourceAgent && b.Kind == portal.BinaryKindRPCServer && b.RPCProtocol != "" {
+			known[b.Path] = b.RPCProtocol
+		}
+	}
+	for i := range rows {
+		if rows[i].Kind == portal.BinaryKindRPCServer && rows[i].RPCProtocol == "" {
+			rows[i].RPCProtocol = known[rows[i].Path]
 		}
 	}
 }
