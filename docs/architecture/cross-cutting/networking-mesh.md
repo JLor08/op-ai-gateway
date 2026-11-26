@@ -412,11 +412,46 @@ server's NetBird flag is turned off). Only these targeted writes set it: the
 full-row server update leaves it, so a portal save from an older read cannot
 bring back an address the sync has since replaced. A server
 takes part in a mesh cluster only with NetBird on, a tracking group and a known
-mesh IP. A `lan` cluster uses no NetBird state at all: it reaches members at
-their `lan_address` (an IPv4 literal, with `lan_bind_only` to listen there
-alone), else their `Domain`, which is why a NetBird-enabled server needs
-`lan_address` in a `lan` cluster: the peer sync rewrites its `Domain` to the
-NetBird DNS name.
+mesh IP. A `lan` cluster uses no NetBird state: it reaches each server at its
+**effective LAN address** (`LANResolutionOf`, `service_lan_address.go`),
+derived from the server row alone, its LAN address source (`lan_source`) and
+the interface list its agent last reported (`lan_interfaces`), so a gateway
+that has just restarted derives clusters before any agent reconnects:
+
+- **The source** is `lan_source`; a row without one (written before migration
+  110) reads as `manual` when it has a `lan_address`, else as `auto`.
+- **`manual`**: the typed `lan_address` (an IPv4 literal). Without one the
+  server resolves as before: its `Domain` when it is not NetBird-enabled, else
+  no address.
+- **`interface`**: the first IPv4 of the reported interface whose id is
+  `lan_interface_id`, else of the one whose name is (a choice made while the
+  agent reported name ids still resolves once its ids become keyed). When the
+  chosen interface is missing from the report, the resolution marks a
+  **fallback** and uses the `auto` pick; with no candidate at all, a
+  non-NetBird server's `Domain`, else no address.
+- **`auto`**: a server that is not NetBird-enabled and has a `Domain` keeps
+  dialing its `Domain`, even once its agent reports interfaces, so upgrading
+  the agent neither moves its address nor relaunches its clusters. Otherwise
+  the agent's preferred interface, else the first non-virtual one, else no
+  address.
+
+An address in `100.64.0.0/10` or equal to the server's `netbird_ip` is never a
+candidate, whatever the stored list carries. An unreadable stored list reads as
+not reported. A NetBird-enabled server therefore needs either a reported LAN
+interface or a `manual` `lan_address` in a `lan` cluster: the peer sync
+rewrites its `Domain` to the NetBird DNS name.
+
+The effective address is what the head dials, what the save check
+(`runtime_spec.cluster_lan_address_required`) requires, and, with
+`lan_bind_only`, the only address the member listens on. A bind-only member
+whose chosen interface is missing is withheld
+(`runtime.cluster_lan_interface_missing`) instead of listening on the fallback,
+which may be a wider network; an unknown address is never widened to
+`0.0.0.0`. As a **head**, a server on an `interface` or `auto` source
+identifies itself to its members with every reported IPv4 (deduplicated, in
+numeric order, fallback included), since a multi-homed head may reach a member
+through another NIC; a `manual` head with exactly its `lan_address`, and a head
+on its `Domain` with the name the member agent resolves.
 
 **One managed policy per member server.** While `manage_policies` is on, Loop B
 also reconciles the `op-gw-rpc-<member server id>` family

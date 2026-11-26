@@ -2002,7 +2002,8 @@ this section is the mechanics (`internal/portal/service_cluster*.go`,
 the launch spec form's cluster part; on each member server's **RPC** tab (its
 `rpc_member_enabled` and consent groups, its manual member specs under
 `/api/portal/servers/{id}/rpc-members`, and the live member rows); on each
-server's `lan_address` / `lan_bind_only`; and on each server's **Binaries** tab
+server's LAN address source (`lan_source`, `lan_interface_id`, `lan_address`)
+and `lan_bind_only`; and on each server's **Binaries** tab
 (the inventory, §3.6). The RPC tab is hidden for a file-mode agent, which
 ignores the gateway's documents, member specs and RPC membership alike. The spec
 PUT is a full document: a write that omits `cluster_enabled` turns the cluster
@@ -2106,9 +2107,12 @@ type-specific probes it; and the `rpc` block (head spec id, transport, bind
 address and port, the head's addresses or the domain the member agent resolves,
 cache switch). The
 addresses follow the network: a mesh member is dialled and bound at its mesh
-IPv4; a LAN member is dialled at `lan_address`, else `Domain` (never the
-`Domain` of a NetBird-enabled server), and binds `0.0.0.0`, or `lan_address`
-alone with `lan_bind_only`. A head's own idle timeout is derived from its
+IPv4; a LAN member is dialled at its effective LAN address (its manual
+`lan_address`, its chosen or most likely agent-reported interface, else the
+`Domain` of a non-NetBird server; [Networking §12](networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)),
+and binds `0.0.0.0`, or that address alone with `lan_bind_only`. A LAN head is
+recognised by its manual `lan_address`, by every IPv4 it reports when its
+source is an interface, or by its `Domain`. A head's own idle timeout is derived from its
 measured start and benchmark cold start like a replicable spec's, since its cold
 start waits for every member.
 
@@ -2148,10 +2152,12 @@ stage that finds a reason stops it:
 5. **The head's own address** in the resolved network (the stored choice, else
    the default): `.cluster_mesh_unavailable` (in `mesh`, the head server has
    NetBird off or no tracking group) or `.cluster_address_unknown` (no mesh IP;
-   in `lan`, neither `lan_address` nor a usable `Domain`).
-6. **Each member's address, then its bind address**, in member order: the same
-   two reasons, plus `.cluster_address_unknown` for a member with
-   `lan_bind_only` and no `lan_address`.
+   in `lan`, no effective LAN address and no usable `Domain`).
+6. **Each member's bind address, then its address**, in member order:
+   `.cluster_lan_interface_missing` for a member with `lan_bind_only` whose
+   chosen interface its agent no longer reports (it is never moved to the
+   fallback), `.cluster_address_unknown` for one with `lan_bind_only` and no
+   effective LAN address, then the two reasons of stage 5.
 7. **Transport**: `.cluster_direct_unavailable` (direct `mesh` without the
    NetBird policy preconditions), then `.cluster_lan_ack_required` (direct `lan`
    without the head's acknowledgement).

@@ -261,7 +261,8 @@ type AIServer struct {
 	// LANSource says where the server's effective LAN address comes from
 	// (migration 110): LANSourceAuto (derive it), LANSourceInterface (the
 	// reported interface named by LANInterfaceID) or LANSourceManual
-	// (LANAddress as typed). "" is read as auto. Routing never reads it.
+	// (LANAddress as typed). "" (a row written before migration 110) is read
+	// as manual when LANAddress is set, else as auto. Routing never reads it.
 	LANSource string
 	// LANInterfaceID is the stable id of the chosen reported interface under
 	// LANSourceInterface ("" otherwise).

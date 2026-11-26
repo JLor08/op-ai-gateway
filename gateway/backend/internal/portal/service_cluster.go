@@ -924,10 +924,12 @@ func netbirdMeshReady(s routing.AIServer) bool {
 }
 
 // lanAddressKnown reports whether a server has a LAN address for a lan
-// cluster: its lan_address, else its Domain -- except on a NetBird-enabled
-// server, whose Domain the peer sync rewrites to the NetBird DNS name.
+// cluster: an effective LAN address (LANResolutionOf), else its Domain --
+// except on a NetBird-enabled server, whose Domain the peer sync rewrites to
+// the NetBird DNS name.
 func lanAddressKnown(s routing.AIServer) bool {
-	return s.LANAddress != "" || (!s.NetbirdEnabled && strings.TrimSpace(s.Domain) != "")
+	res := LANResolutionOf(s)
+	return res.Address != "" || res.Source == LANSourceDomain
 }
 
 // defaultClusterNetwork is mesh when every server is mesh-ready, else lan.
