@@ -47,6 +47,7 @@ import "testing"
 var allowedDeps = map[string][]string{
 	mainPkgKey: {
 		"internal/agent",
+		"internal/agentkey",
 		"internal/certinstall",
 		"internal/client",
 		"internal/collector",
