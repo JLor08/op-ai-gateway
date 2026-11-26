@@ -265,15 +265,16 @@ func main() {
 	// operator estimate.
 	mgr.SetWSLVMPIDs(collector.NewWSLVMWorkerPIDs())
 
+	agentKey, err := agentkey.Parse(cfg.AgentKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "server-agent: %v\n", err)
+		os.Exit(2) //nolint:gocritic // exitAfterDefer: startup failure; process is exiting
+	}
+	deps.Interfaces = collector.NewInterfaceCollector(agentKey.Subkey(agentkey.PurposeInterfaceID))
 	var src runtimectl.Source
 	if cfg.RuntimeSource == config.RuntimeSourceFile {
 		src = runtimectl.NewFileSource(cfg.RuntimeConfigPath)
 	} else {
-		agentKey, err := agentkey.Parse(cfg.AgentKey)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "server-agent: %v\n", err)
-			os.Exit(2) //nolint:gocritic // exitAfterDefer: startup failure; process is exiting
-		}
 		src = runtimectl.NewGatewaySourceWithCacheKey(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath, agentKey.Subkey(agentkey.PurposeRuntimeCache))
 	}
 	var reporter runtimectl.RuntimeReporter // nil when the poster cannot report (never asserted unchecked)
