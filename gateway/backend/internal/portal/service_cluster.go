@@ -1043,7 +1043,10 @@ type hostGPU struct {
 
 // serverHostGPUs reads serverID's hardware report by GPU index. A server
 // without a (readable) report answers an empty map: its vendors are unknown,
-// and no vendor-dependent rule applies to it.
+// and no vendor-dependent rule applies to it. The host's OS family is the
+// runtime.GOOS in its last telemetry sample: the report's own os field is the
+// platform string ("ubuntu 24.04"), which names no family. Without telemetry
+// the family is unknown, so no Linux-only exemption applies.
 func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]hostGPU, error) {
 	out := map[int]hostGPU{}
 	hw, ok, err := s.routes.ServerHardwareByServer(ctx, serverID)
@@ -1051,7 +1054,6 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 		return out, err
 	}
 	var report struct {
-		OS   string `json:"os"`
 		GPUs []struct {
 			Index            int    `json:"index"`
 			Name             string `json:"name"`
@@ -1062,12 +1064,20 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 	if json.Unmarshal([]byte(hw.ReportJSON), &report) != nil {
 		return out, nil
 	}
-	kfdHost := report.OS == "linux" && len(report.GPUs) > 0
+	goos := ""
+	telemetry, hasTelemetry, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	if hasTelemetry {
+		goos = telemetry.OS
+	}
+	kfdHost := goos == "linux" && len(report.GPUs) > 0
 	for _, g := range report.GPUs {
 		kfdHost = kfdHost && gpuLooksAMD(g.Name)
 	}
 	for _, g := range report.GPUs {
-		apple := report.OS == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")
+		apple := goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")
 		out[g.Index] = hostGPU{
 			nvidia:  !apple && gpuLooksNVIDIA(g.Name, g.PCIBusID),
 			apple:   apple,
