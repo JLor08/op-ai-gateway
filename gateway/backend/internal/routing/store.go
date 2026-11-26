@@ -3385,9 +3385,9 @@ type ServerGPUBudget struct {
 // agent report never erases it; use EffectiveVersion for the one to act on.
 // VersionSource is how Version was determined: "agent", "path" or "manual".
 // Allowed is the agent-reported allowlist status. RPCProtocol is the
-// RPC protocol version ("X.Y.Z") an rpc_server binary speaks, probed by the
-// agent (migration 117); "" = unknown, and always "" for manual rows and for
-// every other kind.
+// RPC protocol version ("X.Y.Z") the agent probed (migration 117): an
+// rpc_server's own, a llama_server's taken from the rpc_server in its
+// directory; "" = unknown, and always "" for manual rows.
 type ServerBinary struct {
 	ServerID        string
 	Path            string

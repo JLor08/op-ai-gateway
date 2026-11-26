@@ -190,8 +190,12 @@ func TestBinariesAPI(t *testing.T) {
 	}
 
 	// An agent row: override allowed, manual fields and delete refused.
-	if err := srv.Routes.ReplaceAgentServerBinaries(context.Background(), serverID, []routing.ServerBinary{{Path: "/opt/agent/llama-server", Kind: "llama_server", Version: "v", Allowed: true}}); err != nil {
+	if err := srv.Routes.ReplaceAgentServerBinaries(context.Background(), serverID, []routing.ServerBinary{{Path: "/opt/agent/llama-server", Kind: "llama_server", Version: "v", Allowed: true, RPCProtocol: "10.0.2"}}); err != nil {
 		t.Fatal(err)
+	}
+	rec = rpcMemberDo(t, srv, http.MethodGet, base, "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"rpc_protocol":"10.0.2"`) || !strings.Contains(rec.Body.String(), `"rpc_protocol":""`) {
+		t.Fatalf("list with protocols = %d %s", rec.Code, rec.Body.String())
 	}
 	rec = rpcMemberDo(t, srv, http.MethodPut, base, `{"path":"/opt/agent/llama-server","version_override":"b8"}`)
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"effective_version":"b8"`) {

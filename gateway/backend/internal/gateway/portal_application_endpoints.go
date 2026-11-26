@@ -292,7 +292,7 @@ func (s *Server) handlePortalApplicationRuntime(w http.ResponseWriter, r *http.R
 			writePortalRuntimeSpecError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"data": list.Candidates, "head_binary_known": list.HeadBinaryKnown})
+		writeJSON(w, http.StatusOK, clusterCandidatesBody(list))
 	default:
 		writeJSON(w, http.StatusNotFound, apierror.Response(portal.CodeApplicationNotFound, msgApplicationNotFound, ""))
 	}

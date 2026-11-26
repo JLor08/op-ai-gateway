@@ -3160,19 +3160,25 @@ paths:
       - { name: binary, in: query, required: false, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Servers the llama.cpp RPC cluster head on the mapping may add as members ({"data":[...],"head_binary_known":bool})
+      summary: Servers the llama.cpp RPC cluster head on the mapping may add as members ({"data":[...],"head_binary_known":bool,"head_rpc_protocol":string})
       description: >
         Servers other than the head's that the caller manages and whose member
         consent admits the head (system scope included). binary is the head
         binary the operator's form has (default: the stored spec's); its
         version is read from the head server's inventory as the save check
-        reads it, and head_binary_known says whether it is known. automatic
-        (default): servers offering RPC membership, compatible when they have
-        a ggml-rpc-server of the head binary's version; manual: servers with
-        enabled member specs serving no other head, with
-        incompatible_member_specs naming the specs whose binary's known
-        version differs from the head binary's. Refusals as the runtime-spec
-        PUT's.
+        reads it, and head_binary_known says whether it is known (a commit, a
+        build or a probed RPC protocol); head_rpc_protocol is the head
+        binary's RPC protocol, omitted when unknown. automatic (default):
+        servers offering RPC membership, compatible when they have a
+        ggml-rpc-server the head binary can drive (the same RPC protocol when
+        both report one, else the same commit, else build; rpc_binary,
+        rpc_binary_version, rpc_binary_protocol), else listed with compatible
+        false and incompatible_reason (no_rpc_binary, protocol_mismatch with
+        member_rpc_protocol, build_mismatch, version_unknown,
+        head_version_unknown); manual: servers with enabled member specs
+        serving no other head, with incompatible_member_specs naming the specs
+        whose binary has a known protocol or build mismatch with the head
+        binary. Refusals as the runtime-spec PUT's.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
@@ -3184,7 +3190,7 @@ paths:
       - { name: binary, in: query, required: false, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Member candidates for a cluster head not stored yet ({"data":[...],"head_binary_known":bool})
+      summary: Member candidates for a cluster head not stored yet ({"data":[...],"head_binary_known":bool,"head_rpc_protocol":string})
       description: >
         The mapping-scoped cluster-candidates listing for a new runtime spec on
         the application: the head server is the application's, the head binary
@@ -3297,6 +3303,10 @@ paths:
     get:
       tags: [portal]
       summary: The server's binary inventory ({"data":[...]})
+      description: >
+        Each row carries rpc_protocol, the agent-probed RPC protocol (X.Y.Z)
+        of an rpc_server, or of the rpc_server beside a llama_server; empty
+        when unknown and on manual rows.
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }

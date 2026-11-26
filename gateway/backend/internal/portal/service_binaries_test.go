@@ -228,3 +228,197 @@ func TestParseWSLBinaryPathTwinVectors(t *testing.T) {
 		}
 	}
 }
+
+// TestRPCCompatibility is spec decision 5: two protocols decide alone (full
+// X.Y.Z equality), the build identity only refines a protocol match into an
+// identical one; without a protocol on either side the build identity rules
+// as before (commit, else build), and an unknown/0 identity is absent.
+func TestRPCCompatibility(t *testing.T) {
+	const c1, c2 = "2bc46ba", "9999fff"
+	for _, tc := range []struct {
+		name         string
+		head, member routing.ServerBinary
+		want         rpcCompat
+	}{
+		{"equal protocols, different commits", routing.ServerBinary{Commit: c1, RPCProtocol: "10.0.2"}, routing.ServerBinary{Commit: c2, RPCProtocol: "10.0.2"}, rpcCompatProtocol},
+		{"equal protocols, equal commit", routing.ServerBinary{Commit: c1, RPCProtocol: "10.0.2"}, routing.ServerBinary{Commit: c1, RPCProtocol: "10.0.2"}, rpcCompatIdentical},
+		{"patch differs", routing.ServerBinary{Commit: c1, RPCProtocol: "10.0.2"}, routing.ServerBinary{Commit: c1, RPCProtocol: "10.0.1"}, rpcMismatchProtocol},
+		{"major differs, no identity", routing.ServerBinary{RPCProtocol: "9.0.0"}, routing.ServerBinary{RPCProtocol: "10.0.0"}, rpcMismatchProtocol},
+		{"tarball builds, equal protocol", routing.ServerBinary{Commit: "unknown", Build: "0", RPCProtocol: "10.0.2"}, routing.ServerBinary{Commit: "unknown", Build: "0", RPCProtocol: "10.0.2"}, rpcCompatProtocol},
+		{"head no protocol, same commit", routing.ServerBinary{Commit: c1}, routing.ServerBinary{Commit: c1, RPCProtocol: "10.0.2"}, rpcCompatIdentical},
+		{"head no protocol, different commit", routing.ServerBinary{Commit: c1}, routing.ServerBinary{Commit: c2, RPCProtocol: "10.0.2"}, rpcMismatchBuild},
+		{"head no protocol, member unknown/0", routing.ServerBinary{Commit: c1, Build: "5"}, routing.ServerBinary{Commit: "unknown", Build: "0", RPCProtocol: "10.0.2"}, rpcCompatUnknown},
+		{"member no protocol, same build", routing.ServerBinary{Build: "42", RPCProtocol: "10.0.2"}, routing.ServerBinary{Build: "b42"}, rpcCompatIdentical},
+		{"malformed protocol is absent", routing.ServerBinary{Commit: c1, RPCProtocol: "10.0"}, routing.ServerBinary{Commit: c1, RPCProtocol: "10.0.2"}, rpcCompatIdentical},
+		// Old rows: no protocol on either side behaves as the build match did,
+		// except that commit "unknown" and build 0 count as absent.
+		{"old rows, same commit", routing.ServerBinary{Commit: c1, Build: "1"}, routing.ServerBinary{Commit: "2BC46BAA9207", Build: "2"}, rpcCompatIdentical},
+		{"old rows, different commits", routing.ServerBinary{Commit: c1, Build: "1"}, routing.ServerBinary{Commit: c2, Build: "1"}, rpcMismatchBuild},
+		{"old rows, same build", routing.ServerBinary{Build: "7"}, routing.ServerBinary{Build: "b7"}, rpcCompatIdentical},
+		{"old rows, different builds", routing.ServerBinary{Build: "7"}, routing.ServerBinary{Build: "8"}, rpcMismatchBuild},
+		{"old rows, commit vs build", routing.ServerBinary{Commit: c1}, routing.ServerBinary{Build: "8"}, rpcCompatUnknown},
+		{"old rows, nothing known", routing.ServerBinary{}, routing.ServerBinary{}, rpcCompatUnknown},
+		{"old rows, both commit unknown", routing.ServerBinary{Commit: "unknown", Build: "0"}, routing.ServerBinary{Commit: "Unknown", Build: "0"}, rpcCompatUnknown},
+	} {
+		if got := rpcCompatibility(tc.head, tc.member); got != tc.want {
+			t.Errorf("%s: rpcCompatibility = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	for c, want := range map[rpcCompat][2]bool{
+		rpcCompatIdentical:  {true, false},
+		rpcCompatProtocol:   {true, false},
+		rpcMismatchProtocol: {false, true},
+		rpcMismatchBuild:    {false, true},
+		rpcCompatUnknown:    {false, false},
+	} {
+		if c.compatible() != want[0] || c.mismatch() != want[1] {
+			t.Errorf("%v: compatible/mismatch = %v/%v, want %v", c, c.compatible(), c.mismatch(), want)
+		}
+	}
+}
+
+func TestBinaryIdentityUnknownHygiene(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		b                   routing.ServerBinary
+		wantCommit, wantBld string
+	}{
+		{"fields", routing.ServerBinary{Commit: "Unknown", Build: "0"}, "", ""},
+		{"b0 build", routing.ServerBinary{Commit: "2bc46ba", Build: "b0"}, "2bc46ba", ""},
+		{"override build 0, commit unknown", routing.ServerBinary{VersionOverride: "1.1.0-dev (build 0, commit unknown)", Commit: "2bc46ba", Build: "5"}, "", ""},
+		{"override b0", routing.ServerBinary{VersionOverride: "b0", Build: "5"}, "", ""},
+		{"override build 0 with a commit", routing.ServerBinary{VersionOverride: "1.1.0 (build 0, commit 2bc46ba)"}, "2bc46ba", ""},
+	} {
+		c, b := binaryIdentity(tc.b)
+		if c != tc.wantCommit || b != tc.wantBld {
+			t.Errorf("%s: binaryIdentity = (%q,%q), want (%q,%q)", tc.name, c, b, tc.wantCommit, tc.wantBld)
+		}
+	}
+	tarball := routing.ServerBinary{Commit: "unknown", Build: "0"}
+	if binaryVersionKnown(tarball) {
+		t.Error("a build 0, commit unknown row must not count as known")
+	}
+	tarball.RPCProtocol = "10.0.2"
+	if !binaryVersionKnown(tarball) {
+		t.Error("a probed protocol makes the binary's version known")
+	}
+	tarball.RPCProtocol = "garbage"
+	if binaryVersionKnown(tarball) {
+		t.Error("a malformed protocol must not count as known")
+	}
+}
+
+// Review Focus 3: a member with one protocol-matching and one build-identical
+// rpc-server picks the build-identical one, whatever the path order.
+func TestMatchingRPCBinaryPrefersIdentical(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newServerTestService(t, rpcMemberTestNow)
+	server := createTestServer(t, svc, "M", "m.example.test")
+	head := routing.ServerBinary{Commit: "2bc46ba", Build: "5", RPCProtocol: "10.0.2"}
+	for name, rows := range map[string][]routing.ServerBinary{
+		"both with protocol": {
+			{Path: "/a/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "9999fff", RPCProtocol: "10.0.2"},
+			{Path: "/b/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2bc46ba", RPCProtocol: "10.0.2"},
+		},
+		"identical row without protocol": {
+			{Path: "/a/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "unknown", Build: "0", RPCProtocol: "10.0.2"},
+			{Path: "/b/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2bc46ba"},
+		},
+	} {
+		if err := store.ReplaceAgentServerBinaries(ctx, server.ID, rows); err != nil {
+			t.Fatal(err)
+		}
+		b, ok, err := svc.MatchingRPCBinary(ctx, server.ID, head)
+		if err != nil || !ok || b.Path != "/b/rpc-server" {
+			t.Errorf("%s: match = %q %v %v, want the build-identical /b/rpc-server", name, b.Path, ok, err)
+		}
+	}
+	// Two protocol matches: the first by path.
+	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, []routing.ServerBinary{
+		{Path: "/d/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "9999fff", RPCProtocol: "10.0.2"},
+		{Path: "/c/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "8888eee", RPCProtocol: "10.0.2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if b, ok, err := svc.MatchingRPCBinary(ctx, server.ID, head); err != nil || !ok || b.Path != "/c/rpc-server" {
+		t.Fatalf("protocol matches: match = %q %v %v, want /c/rpc-server", b.Path, ok, err)
+	}
+}
+
+// Review Focus 3: one mismatching and one matching row pick the matching
+// one; a protocol mismatch is no match even with the same commit.
+func TestMatchingRPCBinarySkipsProtocolMismatch(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newServerTestService(t, rpcMemberTestNow)
+	server := createTestServer(t, svc, "M", "m.example.test")
+	head := routing.ServerBinary{Commit: "2bc46ba", RPCProtocol: "10.0.2"}
+	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, []routing.ServerBinary{
+		{Path: "/a/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2bc46ba", RPCProtocol: "10.0.1"},
+		{Path: "/b/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "unknown", Build: "0", RPCProtocol: "10.0.2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if b, ok, err := svc.MatchingRPCBinary(ctx, server.ID, head); err != nil || !ok || b.Path != "/b/rpc-server" {
+		t.Fatalf("match = %q %v %v, want the protocol-matching /b/rpc-server", b.Path, ok, err)
+	}
+	if err := store.ReplaceAgentServerBinaries(ctx, server.ID, []routing.ServerBinary{
+		{Path: "/a/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2bc46ba", RPCProtocol: "10.0.1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if b, ok, err := svc.MatchingRPCBinary(ctx, server.ID, head); err != nil || ok {
+		t.Fatalf("protocol mismatch: match = %q %v %v, want none", b.Path, ok, err)
+	}
+}
+
+// rpcBinaryRejection explains a server without a match, in the order
+// no_rpc_binary, protocol_mismatch, build_mismatch, version_unknown.
+func TestRPCBinaryRejection(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newServerTestService(t, rpcMemberTestNow)
+	server := createTestServer(t, svc, "M", "m.example.test")
+	head := routing.ServerBinary{Commit: "2bc46ba", RPCProtocol: "10.0.2"}
+	for _, tc := range []struct {
+		name         string
+		rows         []routing.ServerBinary
+		head         routing.ServerBinary
+		reason, prot string
+	}{
+		{"none", nil, head, rpcRejectNoBinary, ""},
+		{"only ineligible rows", []routing.ServerBinary{
+			{Path: "/a/llama-server", Kind: "llama_server", Allowed: true, Commit: "2bc46ba"},
+			{Path: "/b/rpc-server", Kind: "rpc_server", Allowed: false, Commit: "2bc46ba"},
+			{Path: "wsl://Ubuntu-24.04/opt/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2bc46ba"},
+		}, head, rpcRejectNoBinary, ""},
+		{"protocol before build mismatch, first by path", []routing.ServerBinary{
+			{Path: "/c/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "9999fff"},
+			{Path: "/e/rpc-server", Kind: "rpc_server", Allowed: true, RPCProtocol: "9.0.0"},
+			{Path: "/d/rpc-server", Kind: "rpc_server", Allowed: true, RPCProtocol: "10.0.1"},
+		}, head, rpcRejectProtocolMismatch, "10.0.1"},
+		{"build mismatch", []routing.ServerBinary{
+			{Path: "/c/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "9999fff"},
+			{Path: "/d/rpc-server", Kind: "rpc_server", Allowed: true},
+		}, head, rpcRejectBuildMismatch, ""},
+		{"version unknown", []routing.ServerBinary{
+			{Path: "/c/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "unknown", Build: "0"},
+		}, head, rpcRejectVersionUnknown, ""},
+		{"head unknown", []routing.ServerBinary{
+			{Path: "/c/rpc-server", Kind: "rpc_server", Allowed: true, Commit: "2bc46ba"},
+		}, routing.ServerBinary{Commit: "unknown"}, rpcRejectHeadVersionUnknown, ""},
+	} {
+		if err := store.ReplaceAgentServerBinaries(ctx, server.ID, tc.rows); err != nil {
+			t.Fatal(err)
+		}
+		reason, prot, err := svc.rpcBinaryRejection(ctx, server.ID, tc.head)
+		if err != nil || reason != tc.reason || prot != tc.prot {
+			t.Errorf("%s: rejection = %q %q %v, want %q %q", tc.name, reason, prot, err, tc.reason, tc.prot)
+		}
+	}
+}
+
+func TestServerBinaryDTORPCProtocol(t *testing.T) {
+	dto := serverBinaryDTO(routing.ServerBinary{Path: "/opt/rpc-server", Kind: BinaryKindRPCServer, RPCProtocol: "10.0.2"})
+	if dto.RPCProtocol != "10.0.2" {
+		t.Fatalf("dto.RPCProtocol = %q", dto.RPCProtocol)
+	}
+}

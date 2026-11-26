@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"strings"
 	"testing"
 	"time"
 )
@@ -140,6 +141,21 @@ func TestHandlePortalClusterCandidates(t *testing.T) {
 	list.Data, list.HeadBinaryKnown = nil, nil
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); rec.Code != http.StatusOK || err != nil || list.Data == nil || list.HeadBinaryKnown == nil || !*list.HeadBinaryKnown {
 		t.Fatalf("application list = %d %s err=%v", rec.Code, rec.Body.String(), err)
+	}
+	if strings.Contains(rec.Body.String(), "head_rpc_protocol") {
+		t.Fatalf("a head binary without a protocol must omit head_rpc_protocol: %s", rec.Body.String())
+	}
+	// A head binary with a probed RPC protocol: both listings carry it.
+	must(srv.Routes.ReplaceAgentServerBinaries(ctx, serverID, []routing.ServerBinary{{Path: "/opt/llama-p/llama-server", Kind: "llama_server", Allowed: true, RPCProtocol: "10.0.2"}}))
+	for _, u := range []string{base, appBase} {
+		rec = rpcMemberDo(t, srv, http.MethodGet, u+"?mode=automatic&binary=%2Fopt%2Fllama-p%2Fllama-server", "")
+		var proto struct {
+			HeadBinaryKnown bool   `json:"head_binary_known"`
+			HeadRPCProtocol string `json:"head_rpc_protocol"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &proto); rec.Code != http.StatusOK || err != nil || !proto.HeadBinaryKnown || proto.HeadRPCProtocol != "10.0.2" {
+			t.Fatalf("%s with a protocol head = %d %s err=%v", u, rec.Code, rec.Body.String(), err)
+		}
 	}
 	rec = rpcMemberDo(t, srv, http.MethodGet, appBase+"?mode=sideways", "")
 	if rec.Code != http.StatusBadRequest || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_mode_invalid" {

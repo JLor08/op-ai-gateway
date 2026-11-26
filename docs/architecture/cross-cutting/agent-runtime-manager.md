@@ -2237,7 +2237,8 @@ used spec's `device_backend` from `rocm` to `vulkan` leaves a stored head
 without `--tensor-split` that a fresh save would refuse, as a later change of
 the GPU set or the hardware does); last of all,
 automatic members need the head binary's
-version known (`runtime_spec.cluster_head_binary_version_unknown`). Rights are
+version known: a commit, a build or a probed RPC protocol
+(`runtime_spec.cluster_head_binary_version_unknown`). Rights are
 needed on every member server the write keeps or adds; removing members, turning
 the cluster off included, needs the head's rights only, as deleting the head
 does: removal only frees the member host, consent protects additions. Off a
@@ -2262,6 +2263,37 @@ save: `cluster_rpc_devices_not_first`, `cluster_mmdev_missing`,
 `cluster_member_budget_below_device`, `cluster_member_gpu_overlap`,
 `cluster_relay_mesh_deny_by_default_off` and `cluster_member_version_unknown`; a
 member the reader may not see adds none.
+
+**Matching member binaries** (`rpcCompatibility`, `service_binaries.go`). The
+contract between a head and a member is llama.cpp's RPC protocol, so a head
+binary (`llama_server`) and a member binary (`rpc_server`) are compared on it
+first. When both inventory rows carry an `rpc_protocol` (§3.6), it decides
+alone: equal in all of `X.Y.Z` is compatible (*identical* when the build
+identity matches too, else a *protocol* match), different is a **protocol
+mismatch**. llama.cpp's handshake checks only that the majors are equal and
+the member's minor is not above the head's, but a patch bump has inserted an
+op mid-enum and shifted the op numbers, so the gateway requires full
+equality. When either row lacks a protocol, the build identity decides as
+before: the commit when both have one, else the build when both have one, so
+equal is *identical* and different a **build mismatch**; anything else is
+**unknown**. A commit `unknown` (any case) and build `0`, which a source
+tarball build prints, count as absent, in the detected fields and in a
+version override alike; the protocol is the binary's own and an override
+does not change it. An automatic member takes, among its server's eligible
+`rpc_server` rows (native, and allowed when agent-reported), a compatible one,
+an identical build before a protocol match, then the first by path. A manual
+member's binary is refused on a protocol mismatch (the message names both
+protocols) or a build mismatch (`runtime_spec.cluster_version_mismatch`, the
+message names both versions), and an unknown pair only warns
+(`cluster_member_version_unknown`). The candidate listing for the head form
+uses the same rule: an automatic server without a compatible binary is still
+listed, not `compatible`, with `incompatible_reason` (`no_rpc_binary`,
+`protocol_mismatch` with the member's protocol, `build_mismatch`,
+`version_unknown`, `head_version_unknown`), and a match names its binary's
+protocol ([HTTP API Surface](../reference/api-surface.md)). The protocol is
+not part of the head's `generation`, so learning or losing one relaunches
+nothing; the agent's runtime check stays the net
+([ADR-120](../09-architecture-decisions.md#adr-120--match-rpc-cluster-binaries-on-the-probed-protocol-version)).
 
 **Ports.** Each member gets an RPC (or relay) port from 26000–26999 on its
 server: the lowest one no application port, TLS proxy port, fixed `listen_port`
@@ -2295,12 +2327,13 @@ document carries the `cluster` block: one endpoint per member in member order
 or 1 for a CPU member, which exposes its CPU device), the transport, the
 network, and `generation`, a digest of every member launch input the
 endpoints do not show (binaries and versions, args, env, the cache switch,
-device backends, GPU selections, bind addresses and ports): whatever relaunches
+device backends, GPU selections, bind addresses and ports; not the RPC
+protocol, which a probe can learn or lose without the binary changing): whatever relaunches
 a member relaunches the head, which would otherwise lose the member mid-request.
 For a member server it carries one `rpc_server` spec per membership: the manual
 spec's id, or `rpca_<head spec id>_<server id>`; the binary (an automatic
-member's `ggml-rpc-server` matching the head binary's version, read on every
-derivation, so an inventory change moves it); `-t <threads>` for an automatic
+member's `ggml-rpc-server` the head binary can drive (Matching member binaries
+above), read on every derivation, so an inventory change moves it); `-t <threads>` for an automatic
 member, the manual spec's own args and env otherwise; the GPUs with their demand
 and the RAM demand, each `max(stored usage, estimate)`; a 60 s startup and a
 60 s idle timeout; the generic type and the role `other`, so nothing
@@ -2340,10 +2373,10 @@ stage that finds a reason stops it:
    `server_agent` application on the member server), `.cluster_port_unknown`;
    each member runs all five before the next member is looked at.
 4. **Binaries, over all members**: `.cluster_member_no_matching_binary` when an
-   automatic member's server has no **native** `ggml-rpc-server` of the head
-   binary's version, and also when the **head** binary's own version is unknown (no
-   inventory row, or one with neither commit nor build), since then nothing can
-   match. A manual member takes its spec's binary and never fails here. An agent
+   automatic member's server has no **native** `ggml-rpc-server` the head
+   binary can drive (Matching member binaries above), and also when the
+   **head** binary's own version is unknown (no inventory row, or one with
+   neither commit nor build nor RPC protocol), since then nothing can match. A manual member takes its spec's binary and never fails here. An agent
    re-report of a binary without a probed version (a `--version` probe that
    failed or timed out, reported with no version or only what the path says)
    keeps the probed version, build and commit its inventory row already had, so

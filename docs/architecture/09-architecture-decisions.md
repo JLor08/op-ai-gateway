@@ -11727,6 +11727,11 @@ server's effective LAN address: its manual `lan_address`, its chosen or most lik
 non-NetBird server. A NetBird-enabled server therefore needs a reported LAN interface or a manual `lan_address`, a bind-only member whose
 chosen interface is missing is withheld, and a head on an interface source identifies itself with every IPv4 it reports.
 
+**Amended by [ADR-120](#adr-120--match-rpc-cluster-binaries-on-the-probed-protocol-version) (matching on the RPC protocol).** Point (d)
+below matches head and member binaries on the build identity alone. They are now compared on the RPC protocol the agent probes from
+each native `ggml-rpc-server` first (full `X.Y.Z` equality), the build identity only where a side has no protocol; `build 0` and `commit
+unknown` count as no identity, and a server without a compatible binary is listed with the reason instead of only as incompatible.
+
 **Decision — thirteen choices, taken together. Migrations 103–106; agent 0.18.0, feature `rpc_cluster` on both sides.**
 
 - **(a) The gateway configures, orders, holds, accounts and secures; it is never on the RPC data path.** A head is an
@@ -14099,3 +14104,76 @@ upstream `api_token` in plaintext, while the code said the token was never persi
   [Telemetry §8.2.8](cross-cutting/telemetry-usage-observability.md#828-lan-interface-candidates),
   [Agent-Managed Model Runtime §8.1](cross-cutting/agent-runtime-manager.md#81-gateway-mode-push-poll-and-a-disk-cache),
   [Data model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md), [Config env](reference/config-env.md).
+
+## ADR-120 — Match RPC cluster binaries on the probed protocol version
+
+**Context.** [ADR-096](#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster) (d) gives an
+automatic member the member server's `ggml-rpc-server` whose commit, else build, equals the head binary's. That identity is the wrong key
+twice over. A build without git metadata (a source tarball) prints `version: 1.1.0-dev (build 0, commit unknown)`: it never matches a git
+build of the same source, and `commit unknown` matched every other tarball build whatever its source. And it is stricter than the real
+contract, so two builds of different commits that speak the same wire protocol were never offered, and the portal hid a rejected server
+without saying why. What llama.cpp actually checks is the **RPC protocol version** (`RPC_PROTO_MAJOR/MINOR/PATCH`, llama.cpp master,
+2026-11-26):
+
+- The llama.cpp semver (`LLAMA_VERSION_*`, e.g. `1.1.0-dev`) is not aligned with it: 0.3.0, 0.4.1, 0.6.0 and 0.9.0 each span a protocol
+  major change (0.9.0 alone went 8.0.1 → 9.0.0 → 10.0.0), so equal llama major.minor is no usable rule.
+- In the handshake only the server reports its version, and the client accepts it when the majors are equal and the server's minor is not
+  above its own. The patch is not checked, yet 8.0.0 → 8.0.1 inserted `GGML_OP_TOP_K_MASK` mid-enum and shifted the op numbers: a patch
+  difference can compute wrong results without any error.
+- `ggml-rpc-server` prints `Starting RPC server vX.Y.Z` on stderr at the start of `ggml_backend_rpc_start_server`, before it initialises
+  devices or binds. It has no `--version`, and `llama-server` does not print its own protocol.
+
+**Decision.**
+
+1. **The agent probes native rpc-servers.** For every allowed native `rpc_server` it runs `<bin> -d CPU -H 127.0.0.1 -p <free port>`,
+   reads the combined output until the banner, then kills the process tree. Timeout 10 s, a minimal environment, and the cache (path, size,
+   mtime) and retry backoff of the `--version` probe; no banner yields no protocol, and `-d CPU` leaves the GPUs untouched.
+2. **No probe in WSL.** A `wsl://` `rpc_server` is never run for its protocol: a WSL rpc-server is never a cluster member, and killing a
+   process inside a distro through `wsl.exe` is not reliable.
+3. **Sibling pairing per directory, both directions.** Binaries in one directory are one build: an `rpc_server` takes version, build and
+   commit from the agent-versioned `llama_server` beside it (else its path) and keeps its own probed protocol; a `llama_server` keeps its
+   own `--version` identity and takes the protocol of the first protocol-carrying `rpc_server` beside it. Without a `llama-server` the
+   rpc-server has only its protocol (and what its path says); without an rpc-server the `llama-server` has none. Pairing never crosses
+   directories, so several installations on one host stay independent.
+4. **Wire and storage.** `rpc_protocol` (`X.Y.Z`, else empty) on the agent sample's `binaries[]` entry, `routing.ServerBinary.RPCProtocol`,
+   `server_binaries.rpc_protocol` (migration 117) and the portal's binaries DTO; ingest stores a malformed value as empty, and manual rows
+   have none.
+5. **Compatibility of a head binary H (`llama_server`) and a member binary M (`rpc_server`).** When both have a protocol: equal in all of
+   `X.Y.Z` is compatible (*identical* when the build identity matches too, else a *protocol* match), different is a **protocol mismatch**.
+   Otherwise the build identity as before (commit, else build): equal is *identical*, both known, comparable and different is a **build
+   mismatch**, anything else **unknown**.
+6. **Identity hygiene.** A commit `unknown` (any case) and build `0` count as absent, also inside a version override.
+7. **A head is known** when it has a build identity or a protocol.
+8. **Automatic members** take, among the server's eligible `rpc_server` rows, a compatible one: identical before protocol, then by path.
+   A server with none is still listed, `compatible: false`, with `incompatible_reason` (`no_rpc_binary`, `protocol_mismatch`,
+   `build_mismatch`, `version_unknown`, `head_version_unknown`) and, for a protocol mismatch, `member_rpc_protocol`; the listing carries
+   `head_rpc_protocol`, and a match `rpc_binary_protocol`.
+9. **Manual members.** The save refuses a protocol or build mismatch (`runtime_spec.cluster_version_mismatch`, naming both protocols for a
+   protocol mismatch); an unknown pair keeps the advisory `cluster_member_version_unknown`.
+10. **Portal.** The binaries table and the binary picker show the protocol; the cluster candidate picker lists rejected automatic candidates,
+    disabled, with the reason instead of hiding them.
+11. **Ingest retention.** An `rpc_server` re-report without a protocol keeps the stored one (the trade-off of the version retention: the
+    runtime banner check is the net); a `llama_server` row does not keep it, since its protocol came from a sibling that may be gone.
+12. **No relaunch.** The protocol is not part of the head's `generation`.
+
+**Alternatives rejected.**
+- *llama.cpp's own tolerance (equal major, member minor not above the head's):* the patch is unchecked upstream although a patch bump
+  has shifted the op enum, so full equality is the only safe rule.
+- *Equal llama.cpp major.minor:* the semver crosses protocol majors within one minor.
+- *A build → protocol lookup table in the gateway:* it goes stale with every upstream bump and cannot place an identity-less build at all.
+- *An upstream `--version` for `ggml-rpc-server`:* not ours to ship, and old builds would still need the banner.
+- *Pairing across directories (any `rpc-server` of the host):* two installations would lend each other the wrong protocol.
+
+**Consequences.**
+- Same source built from git and from a tarball now pairs (both report the same protocol); different commits with one protocol are
+  offered and accepted; a different protocol is not offered and is shown with both protocols; a head without a protocol needs a build
+  identity, else every automatic candidate shows `head_version_unknown`.
+- With an old agent (no protocol anywhere) matching is as before except the hygiene: two `commit unknown` builds no longer count as
+  identical, so a cluster that only matched that way is withheld (`cluster_member_no_matching_binary`) until its agents report protocols,
+  and a member row whose generation carried `unknown` or `0` relaunches its head once.
+- WSL rpc-servers carry no protocol, which costs nothing: they are never members.
+- The generation is unchanged, so learning or losing a protocol relaunches no cluster; the agent's runtime check
+  (`runtime.cluster_version_mismatch`) stays the net for a stale inventory.
+- Agent version 0.25.2 (PATCH): the new field is read when present and an old agent sends none, so nothing is negotiated.
+- → [Agent-Managed Model Runtime §3.6, §3.7](cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster),
+  [HTTP API Surface](reference/api-surface.md), [Data model](reference/data-model.md).
