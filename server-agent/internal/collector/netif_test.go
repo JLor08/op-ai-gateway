@@ -5,6 +5,9 @@ package collector
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"net"
 	"reflect"
 	"strings"
@@ -186,5 +189,39 @@ func TestCollectSortedByName(t *testing.T) {
 	out, _ := c.Collect(context.Background())
 	if out[0].Name != "eth0" || out[1].Name != "eth1" {
 		t.Fatalf("%+v", out)
+	}
+}
+
+func TestCollectKeyedIDsDistinctForSharedMAC(t *testing.T) {
+	key := []byte("key-one")
+	const shared, lone = "02:00:00:00:00:01", "02:00:00:00:00:02"
+	c := newFake(t, key, "",
+		fakeIf{"eth0", shared, up, []string{"10.0.0.5/24"}},
+		fakeIf{"eth0.10", shared, up, []string{"10.0.10.5/24"}},
+		fakeIf{"eth1", lone, up, []string{"10.0.1.5/24"}})
+	out, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, x := range out {
+		ids[x.Name] = x.ID
+	}
+	if ids["eth0"] == ids["eth0.10"] {
+		t.Fatalf("shared-MAC interfaces share an id: %s", ids["eth0"])
+	}
+	mac := func(s string) []byte { hw, _ := net.ParseMAC(s); return hw }
+	h := func(parts ...[]byte) string {
+		m := hmac.New(sha256.New, key)
+		for _, p := range parts {
+			m.Write(p)
+		}
+		return hex.EncodeToString(m.Sum(nil)[:16])
+	}
+	if want := h(mac(lone)); ids["eth1"] != want {
+		t.Fatalf("lone id %s, want MAC-only %s", ids["eth1"], want)
+	}
+	if want := h(mac(shared), []byte{0}, []byte("eth0.10")); ids["eth0.10"] != want {
+		t.Fatalf("shared id %s, want MAC+name %s", ids["eth0.10"], want)
 	}
 }

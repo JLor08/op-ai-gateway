@@ -72,6 +72,7 @@ type ifCandidate struct {
 	out      sample.NetInterface
 	hasRoute bool
 	hasRFC   bool
+	hw       net.HardwareAddr
 }
 
 // Collect returns the LAN candidates sorted by name, with exactly one
@@ -124,6 +125,7 @@ func (c *InterfaceCollector) Collect(ctx context.Context) ([]sample.NetInterface
 	}
 
 	slices.SortFunc(cands, func(a, b ifCandidate) int { return strings.Compare(a.out.Name, b.out.Name) })
+	c.assignIDs(cands)
 	out := make([]sample.NetInterface, 0, len(cands))
 	for _, cd := range cands {
 		out = append(out, cd.out)
@@ -168,20 +170,43 @@ func (c *InterfaceCollector) build(ifc net.Interface, addrs []netip.Addr, route 
 		IPv4:    strs,
 		Virtual: isVirtualName(ifc.Name),
 	}
-	if len(c.idKey) > 0 {
-		src := []byte(ifc.HardwareAddr)
-		if len(src) == 0 {
-			src = []byte(ifc.Name)
+	cd.hw = ifc.HardwareAddr
+	return cd
+}
+
+// assignIDs sets each candidate's opaque ID. VLAN and macvlan sub-interfaces
+// share their parent's MAC, so when two or more candidates share a non-empty
+// MAC each of them also mixes its name into the keyed ID; a unique MAC keeps
+// the MAC-only ID.
+func (c *InterfaceCollector) assignIDs(cands []ifCandidate) {
+	if len(c.idKey) == 0 {
+		for i := range cands {
+			cands[i].out.ID, cands[i].out.IDKind = cands[i].out.Name, "name"
 		}
+		return
+	}
+	macCount := map[string]int{}
+	for _, cd := range cands {
+		if len(cd.hw) > 0 {
+			macCount[string(cd.hw)]++
+		}
+	}
+	for i := range cands {
+		cd := &cands[i]
 		m := hmac.New(sha256.New, c.idKey)
-		m.Write(src)
+		switch {
+		case len(cd.hw) == 0:
+			m.Write([]byte(cd.out.Name))
+		case macCount[string(cd.hw)] > 1:
+			m.Write(cd.hw)
+			m.Write([]byte{0})
+			m.Write([]byte(cd.out.Name))
+		default:
+			m.Write(cd.hw)
+		}
 		cd.out.ID = hex.EncodeToString(m.Sum(nil)[:16])
 		cd.out.IDKind = "keyed"
-	} else {
-		cd.out.ID = ifc.Name
-		cd.out.IDKind = "name"
 	}
-	return cd
 }
 
 func isVirtualName(name string) bool {
