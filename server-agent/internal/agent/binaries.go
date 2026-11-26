@@ -176,7 +176,7 @@ func probeFor(kind string) (versionProbe, bool) {
 	return versionProbe{}, false
 }
 
-var rpcProtocolFormat = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+var rpcProtocolFormat = regexp.MustCompile(`^\d{1,3}\.\d{1,3}\.\d{1,3}$`)
 
 // parseRPCProtocol extracts the RPC protocol version from the output of a
 // ggml-rpc-server: the first "Starting RPC server vX.Y.Z" line. Backend
@@ -704,10 +704,13 @@ func freeLoopbackPort() (int, error) {
 // execRPCProtocol starts `<path> -d CPU -H 127.0.0.1 -p <free port>` directly
 // (no shell), reads its combined output until the "Starting RPC server" banner
 // and kills it. ggml-rpc-server has no --version, but prints the banner before
-// it initialises devices and binds the port; -d CPU keeps the GPUs
-// untouched, and the kill keeps the run from ever serving. It returns the
-// output read so far: with a nil error once the banner was seen, else with
-// the context or exit error.
+// it initialises devices and binds the port; -d CPU keeps every GPU from being
+// exposed as an RPC device or allocated, and the kill keeps the run from ever
+// serving. The process runs in its own process group (a job object on
+// Windows) that is killed as a whole, so a wrapper that does not exec leaves
+// no rpc-server bound to the port behind, on the banner, the timeout and a
+// plain exit alike. It returns the output read so far: with a nil error once
+// the banner was seen, else with the context or exit error.
 func execRPCProtocol(ctx context.Context, path string) (string, error) {
 	port, err := freeLoopbackPort()
 	if err != nil {
@@ -722,7 +725,7 @@ func execRPCProtocol(ctx context.Context, path string) (string, error) {
 	}
 	defer func() { _ = r.Close() }()
 	cmd.Stdout, cmd.Stderr = w, w
-	err = cmd.Start()
+	killTree, err := runtimectl.StartKillableTree(cmd)
 	_ = w.Close() // the child holds the only write end now
 	if err != nil {
 		return "", err
@@ -752,10 +755,10 @@ func execRPCProtocol(ctx context.Context, path string) (string, error) {
 	select {
 	case res = <-done:
 	case <-ctx.Done():
-		_ = r.Close() // unblocks the reader even when a grandchild holds the pipe
+		killTree() // closes the pipe's write ends, so the reader ends
 		res = <-done
 	}
-	_ = cmd.Process.Kill()
+	killTree()
 	werr := cmd.Wait()
 	if res.found {
 		return res.text, nil

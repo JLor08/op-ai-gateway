@@ -2098,9 +2098,14 @@ a member speak the same RPC wire protocol, so the agent also reads the protocol
 version (`X.Y.Z`, the one `ggml-rpc-server` prints as `Starting RPC server vX.Y.Z`
 before it initialises devices or binds its port). For every allowed **native**
 `rpc-server` it runs `<path> -d CPU -H 127.0.0.1 -p <free loopback port>` (no
-shell, minimal environment, `-d CPU` so no GPU is initialised), reads the
+shell, minimal environment, `-d CPU` so no GPU is exposed as an RPC device or allocated), reads the
 combined output until the banner line, kills the process at once and reports the
-protocol; output without a well-formed banner yields none. It uses the same 10 s
+protocol; output without a well-formed banner yields none. The run is in its own
+process group (a job object on Windows) that is killed as a whole, so a wrapper
+script that does not `exec` leaves no rpc-server bound to the port behind, on the
+banner, the timeout and a plain exit alike. An rpc-server too old to print the
+`vX.Y.Z` banner runs for the full probe timeout on each retry (backoff 30 s
+doubling to 1 h) and ends with no protocol. It uses the same 10 s
 timeout, (path, size, mtime) cache and retry backoff as the `--version` run. A
 `wsl://` `rpc-server` is never run (a process inside a distro cannot be killed
 reliably through `wsl.exe`, and a WSL rpc-server is never a cluster member) and

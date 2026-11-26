@@ -119,12 +119,15 @@ func TestVersionRunCachedByStat(t *testing.T) {
 }
 
 func TestOnlyVersionedKindsAreExecuted(t *testing.T) {
-	var ran []string
+	var ran, protoRan []string
 	run := func(_ context.Context, p string) (string, error) { ran = append(ran, p); return "", errors.New("boom") }
 	got := scanBinaries([]string{"/a/rpc-server", "/a/ggml-rpc-server.exe", "/a/LLAMA-SERVER.EXE", "/a/other", "/a/vllm"},
-		statFake(fakeFileInfo{}), run, nil, map[string]cachedVersion{})
+		statFake(fakeFileInfo{}), run, protoRunner("10.0.2", &protoRan), map[string]cachedVersion{})
 	if len(ran) != 2 || ran[0] != "/a/LLAMA-SERVER.EXE" || ran[1] != "/a/vllm" {
 		t.Fatalf("executed %v", ran)
+	}
+	if len(protoRan) != 2 || protoRan[0] != "/a/rpc-server" || protoRan[1] != "/a/ggml-rpc-server.exe" {
+		t.Fatalf("protocol runs %v", protoRan)
 	}
 	if got[0].Kind != "rpc_server" || got[1].Kind != "rpc_server" || got[2].Kind != "llama_server" || got[4].Kind != "vllm" {
 		t.Fatalf("kinds: %+v", got)
@@ -872,6 +875,7 @@ func TestParseRPCProtocol(t *testing.T) {
 		{rpcBanner, "10.0.2", true},
 		{"Starting RPC server v10.0.2\r\nmore\r\n", "10.0.2", true},
 		{"Starting RPC server v10.0", "", false},
+		{"Starting RPC server v1000.0.0", "", false},
 		{"Starting RPC server vx.y.z\n", "", false},
 		{"usage: ggml-rpc-server", "", false},
 		{"", "", false},
@@ -1067,5 +1071,85 @@ func TestExecRPCProtocolTimeout(t *testing.T) {
 	}
 	if _, ok := parseRPCProtocol(out); ok {
 		t.Fatalf("banner from nothing: %q", out)
+	}
+}
+
+// aliveEventually-gone check: the pid is not a live process once it is reaped
+// or killed, polled briefly because a group kill is delivered asynchronously.
+func pidGone(pid int) bool {
+	for range 50 {
+		proc, err := os.FindProcess(pid)
+		if err != nil || proc.Signal(syscall.Signal(0)) != nil {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return false
+}
+
+// wrapperScript is an rpc-server stand-in that does not exec: the long-lived
+// grandchild (a background sleep) records its pid and outlives the script.
+func wrapperScript(t *testing.T, banner string) (script, pidFile string) {
+	t.Helper()
+	pidFile = filepath.Join(t.TempDir(), "grandchild.pid")
+	body := "sleep 30 &\necho $! > '" + pidFile + "'\n"
+	if banner != "" {
+		body += "echo '" + banner + "' >&2\n"
+	}
+	body += "sleep 30\n"
+	return writeScript(t, body), pidFile
+}
+
+func grandchildPID(t *testing.T, pidFile string) int {
+	t.Helper()
+	var pid int
+	for range 50 {
+		if raw, err := os.ReadFile(pidFile); err == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				pid = n
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("grandchild pid never recorded")
+	}
+	return pid
+}
+
+func TestExecRPCProtocolKillsGrandchildAfterBanner(t *testing.T) {
+	p, pidFile := wrapperScript(t, "Starting RPC server v10.0.2")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := execRPCProtocol(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	pid := grandchildPID(t, pidFile)
+	t.Cleanup(func() {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Kill()
+		}
+	})
+	if !pidGone(pid) {
+		t.Fatalf("grandchild %d survived the probe", pid)
+	}
+}
+
+func TestExecRPCProtocolKillsGrandchildOnTimeout(t *testing.T) {
+	p, pidFile := wrapperScript(t, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	if _, err := execRPCProtocol(ctx, p); err == nil {
+		t.Fatal("expected the deadline error")
+	}
+	pid := grandchildPID(t, pidFile)
+	t.Cleanup(func() {
+		if proc, err := os.FindProcess(pid); err == nil {
+			_ = proc.Kill()
+		}
+	})
+	if !pidGone(pid) {
+		t.Fatalf("grandchild %d survived the timeout", pid)
 	}
 }
