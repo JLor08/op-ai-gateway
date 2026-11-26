@@ -639,17 +639,27 @@ func siblingDirKey(entry string) string {
 // build: every rpc_server in out gets the version of the agent-versioned
 // llama_server in its directory (byDir: directory -> its index in out), else
 // whatever its path says, and keeps its own protocol; every llama_server gets
-// the protocol of the first rpc_server of its directory that has one.
+// the protocol the protocol-carrying rpc_servers of its directory agree on,
+// none when they report different ones (which of them the llama-server's
+// build speaks is then unknown) or when none carries one.
 func inheritSiblingVersions(out []BinaryInfo, byDir map[string]int) {
 	protoByDir := map[string]string{}
+	disagree := map[string]bool{}
 	for _, b := range out {
-		if dir := siblingDirKey(b.Path); b.Kind == binaryKindRPCServer && b.RPCProtocol != "" && protoByDir[dir] == "" {
-			protoByDir[dir] = b.RPCProtocol
+		if b.Kind != binaryKindRPCServer || b.RPCProtocol == "" {
+			continue
 		}
+		dir := siblingDirKey(b.Path)
+		if p, seen := protoByDir[dir]; seen && p != b.RPCProtocol {
+			disagree[dir] = true
+		}
+		protoByDir[dir] = b.RPCProtocol
 	}
 	for i := range out {
 		if out[i].Kind == binaryKindLlamaServer {
-			out[i].RPCProtocol = protoByDir[siblingDirKey(out[i].Path)]
+			if dir := siblingDirKey(out[i].Path); !disagree[dir] {
+				out[i].RPCProtocol = protoByDir[dir]
+			}
 		}
 		if out[i].Kind != binaryKindRPCServer {
 			continue
@@ -709,8 +719,11 @@ func freeLoopbackPort() (int, error) {
 // serving. The process runs in its own process group (a job object on
 // Windows) that is killed as a whole, so a wrapper that does not exec leaves
 // no rpc-server bound to the port behind, on the banner, the timeout and a
-// plain exit alike. It returns the output read so far: with a nil error once
-// the banner was seen, else with the context or exit error.
+// plain exit alike. A descendant that left the group (setsid) survives the
+// kill; on the timeout the probe closes its read end and returns within
+// binaryWaitDelay rather than wait for that descendant's EOF. It returns the
+// output read so far: with a nil error once the banner was seen, else with
+// the context or exit error.
 func execRPCProtocol(ctx context.Context, path string) (string, error) {
 	port, err := freeLoopbackPort()
 	if err != nil {
@@ -755,8 +768,17 @@ func execRPCProtocol(ctx context.Context, path string) (string, error) {
 	select {
 	case res = <-done:
 	case <-ctx.Done():
-		killTree() // closes the pipe's write ends, so the reader ends
-		res = <-done
+		// The group kill closes the write ends its processes hold, but a
+		// descendant that left the group (setsid) keeps its own open, so the
+		// reader would wait for that descendant's EOF while the scan holds
+		// scanMu. Closing the read end ends the read; the wait is bounded
+		// anyway, for a platform where a close does not interrupt a read.
+		killTree()
+		_ = r.Close()
+		select {
+		case res = <-done:
+		case <-time.After(binaryWaitDelay):
+		}
 	}
 	killTree()
 	werr := cmd.Wait()

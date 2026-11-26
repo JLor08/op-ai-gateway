@@ -11,6 +11,7 @@ import (
 	"op-ai-server-agent/internal/config"
 	"op-ai-server-agent/internal/sample"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -959,6 +960,30 @@ func TestSiblingsPairPerDirectory(t *testing.T) {
 	}
 }
 
+// The rpc-servers of one directory that report different protocols leave its
+// llama-server without one: which of them the llama-server's build speaks is
+// unknown, so neither is taken. Each rpc-server keeps its own.
+func TestLlamaServerWithDisagreeingRPCSiblings(t *testing.T) {
+	run := func(context.Context, string) (string, error) { return llamaVersionOutput, nil }
+	proto := func(_ context.Context, p string) (string, error) {
+		if strings.HasSuffix(p, "/ggml-rpc-server") {
+			return "Starting RPC server v10.0.2\n", nil
+		}
+		return "Starting RPC server v9.0.0\n", nil
+	}
+	got := scanBinaries([]string{"/opt/a/llama-server", "/opt/a/ggml-rpc-server", "/opt/a/rpc-server"},
+		statFake(fakeFileInfo{size: 1}), run, proto, map[string]cachedVersion{})
+	if p := find(t, got, "/opt/a/llama-server").RPCProtocol; p != "" {
+		t.Errorf("llama with disagreeing rpc siblings: protocol %q, want none", p)
+	}
+	if p := find(t, got, "/opt/a/ggml-rpc-server").RPCProtocol; p != "10.0.2" {
+		t.Errorf("ggml-rpc-server: %q", p)
+	}
+	if p := find(t, got, "/opt/a/rpc-server").RPCProtocol; p != "9.0.0" {
+		t.Errorf("rpc-server: %q", p)
+	}
+}
+
 func TestRPCProtocolProbeCachedAndBackoff(t *testing.T) {
 	runs := 0
 	banner := false
@@ -1151,5 +1176,50 @@ func TestExecRPCProtocolKillsGrandchildOnTimeout(t *testing.T) {
 	})
 	if !pidGone(pid) {
 		t.Fatalf("grandchild %d survived the timeout", pid)
+	}
+}
+
+// setsidCommand is a shell command prefix that runs its argument in a new
+// session (out of the probe's process group), or "" when the host has
+// neither setsid(1) nor perl's POSIX::setsid.
+func setsidCommand() string {
+	if p, err := exec.LookPath("setsid"); err == nil {
+		return "'" + p + "'"
+	}
+	if p, err := exec.LookPath("perl"); err == nil {
+		return "'" + p + "' -MPOSIX -e 'POSIX::setsid() or die; exec @ARGV or die'"
+	}
+	return ""
+}
+
+// A descendant that left the probe's process group (setsid) survives the group
+// kill and keeps the output pipe's write end open; the probe must still return
+// once the timeout has killed what it can, not wait for that descendant's EOF
+// while the scan holds scanMu.
+func TestExecRPCProtocolReturnsWhenSessionLeaderHoldsOutput(t *testing.T) {
+	setsid := setsidCommand()
+	if setsid == "" {
+		t.Skip("neither setsid nor perl available")
+	}
+	pidFile := filepath.Join(t.TempDir(), "daemon.pid")
+	p := writeScript(t, setsid+" sleep 60 &\necho $! > '"+pidFile+"'\nexec sleep 60\n")
+	t.Cleanup(func() {
+		if raw, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil {
+				if proc, err := os.FindProcess(pid); err == nil {
+					_ = proc.Kill()
+				}
+			}
+		}
+	})
+	const timeout = 700 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	start := time.Now()
+	if _, err := execRPCProtocol(ctx, p); err == nil {
+		t.Fatal("expected the deadline error")
+	}
+	if d, limit := time.Since(start), timeout+binaryWaitDelay+2*time.Second; d > limit {
+		t.Fatalf("probe returned after %v, want within %v", d, limit)
 	}
 }
