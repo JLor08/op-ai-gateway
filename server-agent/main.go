@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"op-ai-server-agent/internal/agent"
+	"op-ai-server-agent/internal/agentkey"
 	"op-ai-server-agent/internal/certinstall"
 	"op-ai-server-agent/internal/client"
 	"op-ai-server-agent/internal/collector"
@@ -268,7 +269,12 @@ func main() {
 	if cfg.RuntimeSource == config.RuntimeSourceFile {
 		src = runtimectl.NewFileSource(cfg.RuntimeConfigPath)
 	} else {
-		src = runtimectl.NewGatewaySource(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath)
+		agentKey, err := agentkey.Parse(cfg.AgentKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "server-agent: %v\n", err)
+			os.Exit(2) //nolint:gocritic // exitAfterDefer: startup failure; process is exiting
+		}
+		src = runtimectl.NewGatewaySourceWithCacheKey(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath, agentKey.Subkey(agentkey.PurposeRuntimeCache))
 	}
 	var reporter runtimectl.RuntimeReporter // nil when the poster cannot report (never asserted unchecked)
 	if r, ok := deps.Poster.(runtimectl.RuntimeReporter); ok {
