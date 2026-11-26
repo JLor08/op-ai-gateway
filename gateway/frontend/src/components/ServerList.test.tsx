@@ -3282,7 +3282,8 @@ describe('ServerList managed_runtime_only control', () => {
         .map((o) => o.textContent);
 
     it('offers auto, every reported interface and manual', () => {
-      renderForm(managedApi({}), [lanServer()]);
+      // NetBird-enabled: a non-NetBird server with a domain words auto by the domain.
+      renderForm(managedApi({}), [lanServer({ netbird_enabled: true })]);
       openEditForm();
       fireEvent.mouseDown(sourceSelect());
       expect(optionNames()).toEqual([
@@ -3425,6 +3426,63 @@ describe('ServerList managed_runtime_only control', () => {
       ).toBeInTheDocument();
     });
 
+    it('shows a choice stored by name as the keyed interface it resolved to', async () => {
+      // Stored while ids were names; the agent now reports keyed ids and the
+      // gateway resolved the stored name to the keyed interface.
+      const server = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'eth0',
+        netbird_enabled: true,
+        lan: lan({ source: 'interface', fallback: false, interface_id: 'if-eth0' }),
+      });
+      const updateServer = echoUpdate(server);
+      renderForm(managedApi({ updateServer }), [server]);
+      openEditForm();
+      expect(sourceSelect()).toHaveTextContent('eth0 — 192.0.2.10');
+      expect(sourceSelect()).not.toHaveTextContent(t.serverLanInterfaceMissing);
+      expect(
+        screen.queryByText(t.serverLanFallbackWarning('eth0', '192.0.2.10')),
+      ).not.toBeInTheDocument();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()).not.toContain(`eth0 (${t.serverLanInterfaceMissing})`);
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+      fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+      await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+      expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_source');
+      expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_interface_id');
+    });
+
+    it('matches a choice stored by name against the reported names', () => {
+      const server = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'br0',
+        netbird_enabled: true,
+        lan: lan({
+          source: 'interface',
+          fallback: false,
+          interface_id: '',
+          address: '198.51.100.4',
+        }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      expect(sourceSelect()).toHaveTextContent('br0 — 198.51.100.4, 198.51.100.5');
+      expect(sourceSelect()).not.toHaveTextContent(t.serverLanInterfaceMissing);
+    });
+
+    it('words auto by the domain for a non-NetBird server whose chosen interface is missing', () => {
+      const server = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'if-gone',
+        netbird_enabled: false,
+        lan: lan({ source: 'auto', fallback: true }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()[0]).toBe(t.serverLanSourceAutoDomain(server.domain));
+    });
+
     it('shows the agent_key hint when ids are name-based', () => {
       renderForm(managedApi({}), [lanServer({ lan: lan({ keyed_ids: false }) })]);
       openEditForm();
@@ -3440,6 +3498,7 @@ describe('ServerList managed_runtime_only control', () => {
 
     it('offers only auto and manual when the agent reports no interfaces', () => {
       const server = lanServer({
+        netbird_enabled: true,
         lan: lan({ reported: false, interfaces: [], address: '', interface_name: '' }),
       });
       renderForm(managedApi({}), [server]);

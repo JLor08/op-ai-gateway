@@ -2564,7 +2564,7 @@ const de = {
   serverLanAgentKeyHint:
     'Die Schnittstellen sind nur über ihren Namen erkennbar. Mit einem agent_key in der Agent-Konfiguration bleibt die Auswahl auch nach einer Umbenennung stabil.',
   serverLanNotReportedHint:
-    'Der Agent meldet keine Schnittstellen (zu alt). Es stehen nur „Automatisch“ und die manuelle Adresse zur Auswahl.',
+    'Der Agent hat keine Schnittstellen gemeldet (kein Agent, noch nicht verbunden oder zu alt). Es stehen nur „Automatisch“ und die manuelle Adresse zur Auswahl.',
   serverLanAddressChangesTitle: 'Letzte Adresswechsel',
   serverLanAddressChangeEntry: (
     from: string,
@@ -2669,7 +2669,7 @@ const de = {
   },
   clusterBreachHidden: (member: string) => `${member}: ein Verstoß wurde gemeldet`,
   clusterBreachOther: (member: string, kind: string) => `${member}: Verstoß (${kind})`,
-  clusterAddressChangesTitle: 'Adresswechsel der Mitglieder',
+  clusterAddressChangesTitle: 'Adresswechsel',
   clusterAddressChangeMember: (
     server: string,
     from: string,
@@ -6701,7 +6701,7 @@ const en: PortalMessages = {
   serverLanAgentKeyHint:
     'Interfaces are identified by name only. With an agent_key in the agent configuration the choice survives a rename.',
   serverLanNotReportedHint:
-    'The agent reports no interfaces (too old). Only "Automatic" and the manual address are available.',
+    'The agent has not reported interfaces (no agent, not yet connected, or too old). Only "Automatic" and the manual address are available.',
   serverLanAddressChangesTitle: 'Recent address changes',
   serverLanAddressChangeEntry: (
     from: string,
@@ -6806,7 +6806,7 @@ const en: PortalMessages = {
   },
   clusterBreachHidden: (member: string) => `${member}: a breach was reported`,
   clusterBreachOther: (member: string, kind: string) => `${member}: breach (${kind})`,
-  clusterAddressChangesTitle: 'Member address changes',
+  clusterAddressChangesTitle: 'Address changes',
   clusterAddressChangeMember: (
     server: string,
     from: string,
