@@ -2190,12 +2190,13 @@ member, not replicable, an explicit startup timeout); the member list (one entry
 per server, none on the head's server); then rights and consent, member specs,
 member binaries, network and transport, and the member GPUs (an Apple GPU needs
 a GPU budget; a known non-NVIDIA GPU needs an estimate on an automatic member,
-and `--tensor-split` on the head, because its share is not reliably measured per
-process: AMD is measured only on Linux and only for ROCm/HIP builds, never for a
-Vulkan `rpc-server`. A GPU on a Linux member host whose hardware report lists
-only AMD GPUs, with `device_backend` `rocm` or `auto`, is exempt from both: the
-agent launches the member with ROCm device names and measures it from the KFD.
-Windows, Vulkan, mixed and unnamed GPUs still need them); last of all, automatic members need the head binary's
+and `--tensor-split` on the head, unless the agent measures it per process. It
+does so only for a member whose host reports `linux` and only AMD GPUs and whose
+`device_backend` is `rocm` or `auto`: the agent launches that member with ROCm
+device names, so it runs only as a ROCm/HIP process, which the KFD measurer
+sees. A Windows host, a mixed host, a GPU the report does not name as AMD and a
+Vulkan `rpc-server` are not measured and still need both); last of all,
+automatic members need the head binary's
 version known (`runtime_spec.cluster_head_binary_version_unknown`). Rights are
 needed on every member server the write keeps or adds; removing members, turning
 the cluster off included, needs the head's rights only, as deleting the head
