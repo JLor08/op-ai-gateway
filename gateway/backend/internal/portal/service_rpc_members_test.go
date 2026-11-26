@@ -222,6 +222,51 @@ func TestPutRPCMemberSpecVRAMEstimateOnNonNVIDIA(t *testing.T) {
 	}
 }
 
+func TestPutRPCMemberSpecVRAMEstimateExemptForLinuxROCm(t *testing.T) {
+	ctx := context.Background()
+	linuxAMD := `{"os":"ubuntu 24.04","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0"}]}`
+	windowsAMD := `{"os":"windows 11","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0"}]}`
+	mixed := `{"os":"ubuntu 24.04","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT"},{"index":1,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:02:00.0"}]}`
+	intelAMD := `{"os":"ubuntu 24.04","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT"},{"index":1,"name":"Intel Arc A770"}]}`
+	for _, tc := range []struct {
+		name, report, goos, backend string
+		refused                     bool
+	}{
+		{"linux amd rocm", linuxAMD, "linux", "rocm", false},
+		{"linux amd auto", linuxAMD, "linux", "auto", false},
+		{"linux amd default", linuxAMD, "linux", "", false},
+		{"linux amd vulkan", linuxAMD, "linux", "vulkan", true},
+		{"linux amd cuda", linuxAMD, "linux", "cuda", true},
+		{"linux amd sycl", linuxAMD, "linux", "sycl", true},
+		{"linux amd metal", linuxAMD, "linux", "metal", true},
+		{"windows amd rocm", windowsAMD, "windows", "rocm", true},
+		{"linux-looking report, windows telemetry", linuxAMD, "windows", "rocm", true},
+		{"linux-looking report, no telemetry", linuxAMD, "", "rocm", true},
+		{"mixed host rocm", mixed, "linux", "rocm", true},
+		{"non-AMD gpu beside an AMD card rocm", intelAMD, "linux", "rocm", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore := newServerTestService(t, rpcMemberTestNow)
+			server := createTestServer(t, svc, "M", "m.example.test")
+			if err := routeStore.UpsertServerHardware(ctx, routing.ServerHardware{ServerID: server.ID, CollectedAt: rpcMemberTestNow, UpdatedAt: rpcMemberTestNow, ReportJSON: tc.report}); err != nil {
+				t.Fatalf("hardware: %v", err)
+			}
+			if tc.goos != "" {
+				if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: server.ID, ReportedAt: rpcMemberTestNow, OS: tc.goos, UpdatedAt: rpcMemberTestNow}); err != nil {
+					t.Fatalf("telemetry: %v", err)
+				}
+			}
+			req := validRPCMemberRequest()
+			req.DeviceBackend = tc.backend
+			req.GPUs = []RuntimeSpecGPUDTO{{Index: 0}}
+			_, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", req)
+			if tc.refused != errors.Is(err, ErrRPCMemberVRAMEstimateRequired) || (!tc.refused && err != nil) {
+				t.Fatalf("err = %v, refused want %v", err, tc.refused)
+			}
+		})
+	}
+}
+
 func TestRPCMemberSpecForeignPrincipalSeesNothing(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newServerTestService(t, rpcMemberTestNow)

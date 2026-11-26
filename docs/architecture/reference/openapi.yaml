@@ -3260,7 +3260,10 @@ paths:
       summary: Create a manual member spec (full document)
       description: >
         400 runtime_spec.member_flag_reserved (-H/-p/-d/-c belong to the agent),
-        runtime_spec.device_backend_invalid, runtime_spec.member_vram_estimate_required.
+        runtime_spec.device_backend_invalid, runtime_spec.member_vram_estimate_required
+        (a non-NVIDIA GPU without an estimate, except AMD on a host whose telemetry OS is
+        linux and whose hardware report lists only AMD GPUs, with the rocm or auto
+        backend, which the agent measures).
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:

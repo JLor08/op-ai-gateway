@@ -13627,7 +13627,15 @@ rank equalled the rocm-smi card order.
 - The ordinal is an assumption, not a contract: KFD node rank is taken to equal the rocm-smi card index. Verified on the test host, recorded as a
   risk in [§11.1](11-risks-and-technical-debt.md#111-operational-risks).
 - Visibility is ROCm/HIP only; a Vulkan engine on AMD still reads as absent and falls back to the estimate.
-- On a mixed NVIDIA and AMD Linux host NVIDIA has priority and the KFD measurer is not installed.
+- With `nvidia-smi` on the `PATH` NVIDIA has priority and the KFD measurer is not installed, which is what a mixed NVIDIA and AMD Linux host
+  looks like to the agent.
+- The portal's cluster save checks exempt such members (a host whose telemetry OS is `linux` and whose hardware report lists only AMD GPUs,
+  `device_backend` `rocm` or `auto`) from the VRAM estimate and the head's `--tensor-split`: the agent launches the member with ROCm device
+  names, so a non-HIP binary fails with `runtime.device_backend_mismatch`, and every live process, `rpc_server` members included, is a
+  measurement target.
+- Accepted risk: the agent picks its vendors and measurer from the tools on its `PATH`, the report lists only GPUs whose collector succeeded.
+  On a Linux AMD host with a leftover `nvidia-smi` that finds no GPU the portal exempts the member, but `auto` resolves to Vulkan and an
+  explicit `rocm` member is not measured by the KFD; the member stays unknown-demand until the operator gives an estimate.
 - With real device totals, ADR-083's auto-detected VRAM budgets now apply on AMD hosts running rocm-smi 4.x.
 - → [Agent Runtime Manager §5.3](cross-cutting/agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement),
   [Telemetry](cross-cutting/telemetry-usage-observability.md).

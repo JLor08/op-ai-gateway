@@ -1033,14 +1033,20 @@ func (s *Service) checkClusterTransport(ctx context.Context, network, transport 
 
 // hostGPU is what a server's hardware report says about one GPU.
 type hostGPU struct {
-	nvidia  bool
-	apple   bool
+	nvidia bool
+	apple  bool
+	// kfdHost: a Linux host on which every listed GPU is AMD, so the agent's
+	// KFD measurer is the one installed (ADR-113).
+	kfdHost bool
 	totalMB int
 }
 
 // serverHostGPUs reads serverID's hardware report by GPU index. A server
 // without a (readable) report answers an empty map: its vendors are unknown,
-// and no vendor-dependent rule applies to it.
+// and no vendor-dependent rule applies to it. The host's OS family is the
+// runtime.GOOS in its last telemetry sample: the report's own os field is the
+// platform string ("ubuntu 24.04"), which names no family. Without telemetry
+// the family is unknown, so no Linux-only exemption applies.
 func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]hostGPU, error) {
 	out := map[int]hostGPU{}
 	hw, ok, err := s.routes.ServerHardwareByServer(ctx, serverID)
@@ -1048,7 +1054,6 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 		return out, err
 	}
 	var report struct {
-		OS   string `json:"os"`
 		GPUs []struct {
 			Index            int    `json:"index"`
 			Name             string `json:"name"`
@@ -1059,11 +1064,24 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 	if json.Unmarshal([]byte(hw.ReportJSON), &report) != nil {
 		return out, nil
 	}
+	goos := ""
+	telemetry, hasTelemetry, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	if hasTelemetry {
+		goos = telemetry.OS
+	}
+	kfdHost := goos == "linux" && len(report.GPUs) > 0
 	for _, g := range report.GPUs {
-		apple := report.OS == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")
+		kfdHost = kfdHost && gpuLooksAMD(g.Name)
+	}
+	for _, g := range report.GPUs {
+		apple := goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")
 		out[g.Index] = hostGPU{
 			nvidia:  !apple && gpuLooksNVIDIA(g.Name, g.PCIBusID),
 			apple:   apple,
+			kfdHost: kfdHost,
 			totalMB: int(g.MemoryTotalBytes / (1024 * 1024)),
 		}
 	}
@@ -1072,11 +1090,12 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 
 // checkClusterMemberGPUs is step 9 of validateClusterHead. An Apple GPU gets
 // no auto-detected budget on its agent, so a member on one needs the
-// operator's. A known non-NVIDIA GPU is not reliably measured per process
-// (AMD only on Linux and for ROCm/HIP builds, never a Vulkan rpc-server): an
-// automatic member needs the operator's estimate for it, and the head needs
+// operator's. A known non-NVIDIA GPU is not measured per process, so an
+// automatic member needs the operator's estimate for it and the head needs
 // --tensor-split, since the member's real share may stay invisible to its
-// agent.
+// agent. The exception is a measurable GPU (memberGPUMeasurable: AMD on
+// Linux under the ROCm or auto backend, read from KFD, ADR-113), which needs
+// neither.
 func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterEntry, scan clusterArgScan) error {
 	hosts := make([]map[int]hostGPU, len(entries))
 	for i, e := range entries {
@@ -1091,16 +1110,48 @@ func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterE
 		}
 	}
 	for i, e := range entries {
-		if !e.manual && slices.ContainsFunc(e.gpus, func(idx int) bool { return knownNonNVIDIA(hosts[i], idx) && e.estimate[idx] == 0 }) {
+		if !e.manual && slices.ContainsFunc(e.gpus, func(idx int) bool { return unmeasuredNonNVIDIA(hosts[i], idx, e) && e.estimate[idx] == 0 }) {
 			return ErrRPCMemberVRAMEstimateRequired
 		}
 	}
 	for i, e := range entries {
-		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, func(idx int) bool { return knownNonNVIDIA(hosts[i], idx) }) {
-			return e.refusal(ErrClusterTensorSplitRequired, "server %q has non-NVIDIA GPUs", e.server.Name)
+		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, func(idx int) bool { return unmeasuredNonNVIDIA(hosts[i], idx, e) }) {
+			return e.refusal(ErrClusterTensorSplitRequired, "server %q has GPUs whose VRAM the agent cannot measure", e.server.Name)
 		}
 	}
 	return nil
+}
+
+// entryDeviceBackend is the device backend entry e's member runs with: the
+// request's for an automatic member, the stored spec's for a manual one.
+func entryDeviceBackend(e clusterEntry) string {
+	if e.manual {
+		return e.spec.DeviceBackend
+	}
+	return e.req.DeviceBackend
+}
+
+// unmeasuredNonNVIDIA reports whether the report lists GPU idx of entry e as
+// a non-NVIDIA card whose VRAM the agent cannot measure.
+func unmeasuredNonNVIDIA(host map[int]hostGPU, idx int, e clusterEntry) bool {
+	return knownNonNVIDIA(host, idx) && !memberGPUMeasurable(host[idx], entryDeviceBackend(e))
+}
+
+// memberGPUMeasurable reports whether the agent measures g's per-process VRAM
+// for a member with the given device backend: g sits on a Linux host with only
+// AMD GPUs (kfdHost) and the backend is rocm, or auto/"" (which the agent
+// resolves to ROCm on such a host). A member that runs with the ROCm device
+// prefix is a HIP process, which the KFD measurer sees; a non-HIP binary fails
+// with device_backend_mismatch instead.
+func memberGPUMeasurable(g hostGPU, backend string) bool {
+	if !g.kfdHost {
+		return false
+	}
+	switch normalizeDeviceBackend(backend) {
+	case "rocm", deviceBackendAuto:
+		return true
+	}
+	return false
 }
 
 // knownNonNVIDIA reports whether the hardware report lists GPU idx and it is
