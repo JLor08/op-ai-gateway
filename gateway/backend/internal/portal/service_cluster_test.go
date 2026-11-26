@@ -540,12 +540,14 @@ func TestPutClusterSaveChecks(t *testing.T) {
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0, VRAMEstimateMB: 60000}}
 			r.Args = append(r.Args, "--tensor-split", "1,1")
 		}), nil},
-		{"non-NVIDIA member without an estimate", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		{"non-NVIDIA member without an estimate (Vulkan)", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			r.ClusterMembers[0].DeviceBackend = "vulkan" // Vulkan is not measured, even on a Linux AMD host
 			f.hardware(r.ClusterMembers[0].ServerID, `{"os":"linux","gpus":[{"index":0,"name":"AMD Radeon PRO W7900"}]}`)
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0}}
 			r.Args = append(r.Args, "--tensor-split", "1,1")
 		}), ErrRPCMemberVRAMEstimateRequired},
-		{"non-NVIDIA member without --tensor-split", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		{"non-NVIDIA member without --tensor-split (Vulkan)", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			r.ClusterMembers[0].DeviceBackend = "vulkan" // Vulkan is not measured, even on a Linux AMD host
 			f.hardware(r.ClusterMembers[0].ServerID, `{"os":"linux","gpus":[{"index":0,"name":"AMD Radeon PRO W7900"}]}`)
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0, VRAMEstimateMB: 40000}}
 		}), ErrClusterTensorSplitRequired},
@@ -554,15 +556,27 @@ func TestPutClusterSaveChecks(t *testing.T) {
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0, VRAMEstimateMB: 40000}}
 			r.Env = map[string]string{"LLAMA_ARG_TENSOR_SPLIT": "1,1"}
 		}), nil},
-		{"AMD member reporting a pci bus id without an estimate", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		{"AMD member reporting a pci bus id without an estimate (Vulkan)", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			r.ClusterMembers[0].DeviceBackend = "vulkan" // Vulkan is not measured, even on a Linux AMD host
 			f.hardware(r.ClusterMembers[0].ServerID, amdLinuxHardwareReport)
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0}}
 			r.Args = append(r.Args, "--tensor-split", "1,1")
 		}), ErrRPCMemberVRAMEstimateRequired},
-		{"AMD member reporting a pci bus id without --tensor-split", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		{"AMD member reporting a pci bus id without --tensor-split (Vulkan)", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			r.ClusterMembers[0].DeviceBackend = "vulkan" // Vulkan is not measured, even on a Linux AMD host
 			f.hardware(r.ClusterMembers[0].ServerID, amdLinuxHardwareReport)
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0, VRAMEstimateMB: 12000}}
 		}), ErrClusterTensorSplitRequired},
+		{"ROCm member on a Linux AMD host needs neither", with(rocmMember(amdLinuxTwoGPUReport, "rocm", 0)), nil},
+		{"auto member on a Linux AMD host needs neither", with(rocmMember(amdLinuxTwoGPUReport, "auto", 0)), nil},
+		{"default-backend member on a Linux AMD host needs neither", with(rocmMember(amdLinuxTwoGPUReport, "", 0)), nil},
+		{"Vulkan member on a Linux AMD host needs the estimate", with(rocmMember(amdLinuxTwoGPUReport, "vulkan", 0)), ErrRPCMemberVRAMEstimateRequired},
+		{"Vulkan member with an estimate still needs --tensor-split", with(rocmMember(amdLinuxTwoGPUReport, "vulkan", 12000)), ErrClusterTensorSplitRequired},
+		{"ROCm member with an estimate needs no --tensor-split", with(rocmMember(amdLinuxTwoGPUReport, "rocm", 12000)), nil},
+		{"ROCm member on a Windows AMD host needs the estimate", with(rocmMember(strings.Replace(amdLinuxTwoGPUReport, `"linux"`, `"windows"`, 1), "rocm", 0)), ErrRPCMemberVRAMEstimateRequired},
+		{"ROCm member on a mixed NVIDIA/AMD host needs the estimate", with(rocmMember(mixedLinuxReport, "rocm", 0)), ErrRPCMemberVRAMEstimateRequired},
+		{"manual ROCm member on a Linux AMD host needs no --tensor-split", with(manualRocmMember("rocm")), nil},
+		{"manual Vulkan member on a Linux AMD host needs --tensor-split", with(manualRocmMember("vulkan")), ErrClusterTensorSplitRequired},
 		{"NVIDIA member needs neither", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			f.hardware(r.ClusterMembers[0].ServerID, `{"os":"linux","gpus":[{"index":0,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:01:00.0"}]}`)
 			r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0}}
@@ -1508,6 +1522,38 @@ func TestPutClusterBinaryChangeRunsMemberChecks(t *testing.T) {
 
 // amdLinuxHardwareReport is an AMD card as the agent reports it from
 // rocm-smi 4.x on Linux: with a PCI bus id and a uuid, like an NVIDIA card.
+const amdLinuxTwoGPUReport = `{"os":"linux","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0"},{"index":1,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:02:00.0"}]}`
+
+const mixedLinuxReport = `{"os":"linux","gpus":[{"index":0,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:01:00.0"},{"index":1,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:02:00.0"}]}`
+
+// rocmMember seeds report on the first member, selects its GPU 1 (an AMD card
+// on every report used with it) with estimate, and sets the member's device
+// backend.
+func rocmMember(report, backend string, estimate int) func(*clusterFixture, *PutRuntimeSpecRequest) {
+	return func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		f.hardware(r.ClusterMembers[0].ServerID, report)
+		r.ClusterMembers[0].DeviceBackend = backend
+		r.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 1, VRAMEstimateMB: estimate}}
+	}
+}
+
+// manualRocmMember attaches a manual member spec with backend on a Linux AMD
+// host; its GPU carries an estimate so only the tensor-split rule is at issue.
+func manualRocmMember(backend string) func(*clusterFixture, *PutRuntimeSpecRequest) {
+	return func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+		srv := r.ClusterMembers[0].ServerID
+		f.hardware(srv, amdLinuxTwoGPUReport)
+		spec, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), srv, "", PutRPCMemberSpecRequest{
+			Binary: clusterRPCBinary, DeviceBackend: backend, GPUs: []RuntimeSpecGPUDTO{{Index: 1, VRAMEstimateMB: 12000}},
+		})
+		if err != nil {
+			f.t.Fatalf("manual spec: %v", err)
+		}
+		r.MemberMode = "manual"
+		r.ClusterMembers[0].MemberSpecID = spec.ID
+	}
+}
+
 const amdLinuxHardwareReport = `{"os":"linux","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0","uuid":"0x12b1004de0189bb2","memory_total_bytes":17163091968}]}`
 
 // TestPutClusterHiddenMemberGPURefusalNamesNothing: in an unchanged
@@ -1517,7 +1563,9 @@ func TestPutClusterHiddenMemberGPURefusalNamesNothing(t *testing.T) {
 	f := newClusterFixture(t)
 	mine, foreign := f.member("Mine"), f.foreignServer("Foreign")
 	f.hardware(foreign.ID, `{"os":"linux","gpus":[{"index":3,"name":"AMD Radeon PRO W7900"}]}`)
-	req := clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID, 3))
+	hidden := autoMember(foreign.ID, 3)
+	hidden.DeviceBackend = "vulkan" // a ROCm member on this host would be measurable and need no --tensor-split
+	req := clusterHeadRequest(autoMember(mine.ID), hidden)
 	req.Args = append(req.Args, "--tensor-split", "1,1")
 	if _, err := f.put(systemToken(), req); err != nil {
 		t.Fatalf("system save: %v", err)

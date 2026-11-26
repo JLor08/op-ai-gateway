@@ -27,10 +27,10 @@ var (
 	// known set.
 	ErrRPCMemberDeviceBackendInvalid = errors.New("runtime_spec.device_backend_invalid")
 	// ErrRPCMemberVRAMEstimateRequired rejects a GPU row without a VRAM
-	// estimate on a server whose hardware report shows no NVIDIA GPU: only
-	// NVIDIA devices are measured reliably (AMD only for ROCm/HIP builds on
-	// Linux, never a Vulkan rpc-server), so admission needs the operator's
-	// number.
+	// estimate when its VRAM cannot be measured: the report lists the GPU as
+	// non-NVIDIA, except AMD on a Linux host with only AMD GPUs under the
+	// ROCm or auto device backend (measured from KFD, ADR-113). Admission
+	// needs the operator's number for every other non-NVIDIA GPU.
 	ErrRPCMemberVRAMEstimateRequired = errors.New("runtime_spec.member_vram_estimate_required")
 	// ErrRPCMemberInUse rejects disabling or deleting a member spec that a
 	// cluster head still references.
@@ -151,7 +151,7 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 	if err != nil {
 		return "", false, err
 	}
-	if err := s.requireRPCMemberVRAMEstimates(ctx, server.ID, req.GPUs); err != nil {
+	if err := s.requireRPCMemberVRAMEstimates(ctx, server.ID, req.GPUs, backend); err != nil {
 		return "", false, err
 	}
 	enabled := req.Enabled == nil || *req.Enabled
@@ -350,53 +350,44 @@ func (s *Service) rpcMemberHeadGroups(ctx context.Context, serverID string, requ
 }
 
 // requireRPCMemberVRAMEstimates enforces the estimate for every declared GPU
-// that has none and is known to be non-NVIDIA. A GPU whose vendor cannot be
-// determined (no hardware report, an unreadable one, or an index the report
-// does not list) keeps the estimate optional.
-func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID string, gpus []RuntimeSpecGPUDTO) error {
+// that has none, is known to be non-NVIDIA and whose VRAM the agent cannot
+// measure (memberGPUMeasurable with the spec's device backend). A GPU whose
+// vendor cannot be determined (no hardware report, an unreadable one, or an
+// index the report does not list) keeps the estimate optional.
+func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID string, gpus []RuntimeSpecGPUDTO, backend string) error {
 	if !slices.ContainsFunc(gpus, func(g RuntimeSpecGPUDTO) bool { return g.VRAMEstimateMB == 0 }) {
 		return nil
 	}
-	hw, ok, err := s.routes.ServerHardwareByServer(ctx, serverID)
+	host, err := s.serverHostGPUs(ctx, serverID)
 	if err != nil {
 		return err
 	}
-	if !ok {
-		return nil
-	}
-	var report struct {
-		GPUs []struct {
-			Index    int    `json:"index"`
-			Name     string `json:"name"`
-			PCIBusID string `json:"pci_bus_id"`
-		} `json:"gpus"`
-	}
-	if err := json.Unmarshal([]byte(hw.ReportJSON), &report); err != nil {
-		return nil
-	}
-	nonNVIDIA := map[int]bool{}
-	for _, rg := range report.GPUs {
-		if !gpuLooksNVIDIA(rg.Name, rg.PCIBusID) {
-			nonNVIDIA[rg.Index] = true
-		}
-	}
-	if slices.ContainsFunc(gpus, func(g RuntimeSpecGPUDTO) bool { return g.VRAMEstimateMB == 0 && nonNVIDIA[g.Index] }) {
+	if slices.ContainsFunc(gpus, func(g RuntimeSpecGPUDTO) bool {
+		return g.VRAMEstimateMB == 0 && knownNonNVIDIA(host, g.Index) && !memberGPUMeasurable(host[g.Index], backend)
+	}) {
 		return ErrRPCMemberVRAMEstimateRequired
 	}
 	return nil
 }
 
+// gpuLooksAMD recognises an AMD card by its name keywords ("amd", "radeon",
+// "instinct"), case-insensitively.
+func gpuLooksAMD(name string) bool {
+	n := strings.ToLower(name)
+	return strings.Contains(n, "amd") || strings.Contains(n, "radeon") || strings.Contains(n, "instinct")
+}
+
 // gpuLooksNVIDIA recognises an NVIDIA card in a hardware report, which has no
 // vendor field. Both the NVIDIA and the AMD collector fill pci_bus_id, so a
-// name that marks the card as AMD ("amd", "radeon", "instinct") is checked
-// first and always means not NVIDIA. Otherwise an NVIDIA name keyword or a
-// non-empty bus id means NVIDIA; the bus id stays the fallback for NVIDIA
-// names that carry no keyword (an "H100 PCIe", say).
+// name that marks the card as AMD (gpuLooksAMD) is checked first and always
+// means not NVIDIA. Otherwise an NVIDIA name keyword or a non-empty bus id
+// means NVIDIA; the bus id stays the fallback for NVIDIA names that carry no
+// keyword (an "H100 PCIe", say).
 func gpuLooksNVIDIA(name, pciBusID string) bool {
-	n := strings.ToLower(name)
-	if strings.Contains(n, "amd") || strings.Contains(n, "radeon") || strings.Contains(n, "instinct") {
+	if gpuLooksAMD(name) {
 		return false
 	}
+	n := strings.ToLower(name)
 	return pciBusID != "" || strings.Contains(n, "nvidia") || strings.Contains(n, "geforce") ||
 		strings.Contains(n, "quadro") || strings.Contains(n, "tesla")
 }

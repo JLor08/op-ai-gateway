@@ -222,6 +222,39 @@ func TestPutRPCMemberSpecVRAMEstimateOnNonNVIDIA(t *testing.T) {
 	}
 }
 
+func TestPutRPCMemberSpecVRAMEstimateExemptForLinuxROCm(t *testing.T) {
+	ctx := context.Background()
+	linuxAMD := `{"os":"linux","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0"}]}`
+	windowsAMD := `{"os":"windows","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0"}]}`
+	mixed := `{"os":"linux","gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT"},{"index":1,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:02:00.0"}]}`
+	for _, tc := range []struct {
+		name, report, backend string
+		refused               bool
+	}{
+		{"linux amd rocm", linuxAMD, "rocm", false},
+		{"linux amd auto", linuxAMD, "auto", false},
+		{"linux amd default", linuxAMD, "", false},
+		{"linux amd vulkan", linuxAMD, "vulkan", true},
+		{"windows amd rocm", windowsAMD, "rocm", true},
+		{"mixed host rocm", mixed, "rocm", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore := newServerTestService(t, rpcMemberTestNow)
+			server := createTestServer(t, svc, "M", "m.example.test")
+			if err := routeStore.UpsertServerHardware(ctx, routing.ServerHardware{ServerID: server.ID, CollectedAt: rpcMemberTestNow, UpdatedAt: rpcMemberTestNow, ReportJSON: tc.report}); err != nil {
+				t.Fatalf("hardware: %v", err)
+			}
+			req := validRPCMemberRequest()
+			req.DeviceBackend = tc.backend
+			req.GPUs = []RuntimeSpecGPUDTO{{Index: 0}}
+			_, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", req)
+			if tc.refused != errors.Is(err, ErrRPCMemberVRAMEstimateRequired) || (!tc.refused && err != nil) {
+				t.Fatalf("err = %v, refused want %v", err, tc.refused)
+			}
+		})
+	}
+}
+
 func TestRPCMemberSpecForeignPrincipalSeesNothing(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := newServerTestService(t, rpcMemberTestNow)
