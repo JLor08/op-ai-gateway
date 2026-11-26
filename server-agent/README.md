@@ -114,6 +114,16 @@ curl -fL -H "Authorization: Bearer <per-server-agent-token>" \
   https://gw.example/api/agent/v1/download/config -o server-agent.json
 ```
 
+Every generated file carries a **fresh** `agent_key`. When you replace an
+existing `server-agent.json` with a newly downloaded one, **copy the old
+`agent_key` into the new file** (or keep `OP_AGENT_AGENT_KEY` as it was). A
+different key changes every keyed interface id, so a LAN interface chosen in the
+portal reads as missing until you choose it again, and under `lan_bind_only` a
+cluster member on that server is withheld meanwhile. It also makes the sealed
+API tokens in the runtime-config cache unreadable; the agent drops them and
+fetches them again from the gateway on its next contact, so a managed model that
+needs `${API_TOKEN}` cannot start before the gateway is reachable.
+
 The example below is a hand-written **abbreviation** with a few values filled
 in, not that generated document: the generated one carries *every* key in the
 table above, each at its own default and with a comment on what its value — and

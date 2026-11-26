@@ -206,8 +206,10 @@ lists the host's **LAN address candidates** for a `lan` RPC cluster
 every interface that is up, not loopback and not a NetBird `wt<n>` interface,
 with its IPv4 addresses minus `100.64.0.0/10`, link-local and loopback; an
 interface left without an address is not listed. Each entry carries `id`,
-`id_kind`, `name`, `ipv4` (numeric order), `virtual` (a name prefix such as
-`docker`, `br-`, `veth`, `vEthernet`, `tun`, `utun` or `wg`) and `preferred`,
+`id_kind`, `name`, `ipv4` (the source address of the default IPv4 route
+first, then the RFC 1918 addresses in ascending order, then the rest in
+ascending order), `virtual` (a name prefix such as `docker`, `br-`, `bridge`,
+`veth`, `vEthernet`, `podman`, `cilium`, `tun`, `utun` or `wg`) and `preferred`,
 set on exactly one entry of a non-empty list: the interface that carries the
 source address of the default IPv4 route first, then an RFC 1918 address, then a
 physical interface, then the name. The `id` is what a stored choice matches:

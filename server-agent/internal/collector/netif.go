@@ -21,9 +21,14 @@ import (
 var netbirdName = regexp.MustCompile(`^wt[0-9]+$`)
 
 // virtualPrefixes are lower-case name prefixes of virtual/overlay interfaces.
+// "bridge" covers the macOS Internet-sharing and VM bridges (bridge100, ...);
+// the virtual flag only ranks a candidate below a physical one, after the
+// route source and RFC 1918 tests, so a host whose LAN sits on such a bridge
+// still prefers it when it carries the default route.
 var virtualPrefixes = []string{
-	"docker", "br-", "veth", "virbr", "vethernet", "vmnet", "vboxnet", "tun",
-	"tap", "utun", "zt", "tailscale", "wg", "lxc", "cni", "flannel",
+	"docker", "br-", "bridge", "veth", "virbr", "vethernet", "vmnet", "vboxnet",
+	"tun", "tap", "utun", "zt", "tailscale", "wg", "lxc", "cni", "flannel",
+	"podman", "cilium",
 }
 
 var (

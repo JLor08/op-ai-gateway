@@ -225,3 +225,54 @@ func TestCollectKeyedIDsDistinctForSharedMAC(t *testing.T) {
 		t.Fatalf("shared id %s, want MAC+name %s", ids["eth0.10"], want)
 	}
 }
+
+// TestCollectKeyedIDGolden pins the keyed interface-id formula with fixed
+// expected values: the gateway persists these ids as a server's interface
+// choice, so any change to the formula (the HMAC input, the separator, the
+// truncation) silently re-reads every stored choice as missing. The
+// expected ids were computed outside this code (HMAC-SHA256 under the
+// 32-byte key 00..1f, first 16 bytes as hex).
+func TestCollectKeyedIDGolden(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	c := newFake(t, key, "",
+		fakeIf{"eth0", "02:00:00:00:00:01", up, []string{"10.0.0.5/24"}},
+		fakeIf{"eth0.10", "02:00:00:00:00:01", up, []string{"10.0.10.5/24"}},
+		fakeIf{"eth1", "02:00:00:00:00:02", up, []string{"10.0.1.5/24"}},
+		fakeIf{"wlan0", "", up, []string{"10.0.2.5/24"}})
+	out, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, x := range out {
+		got[x.Name] = x.ID
+	}
+	want := map[string]string{
+		"eth0":    "4023bb39d9d755d1abadc930df1951d9", // shared MAC: MAC, 0x00, name
+		"eth0.10": "9769cabfbdb4167ad32aa395d7204186", // shared MAC: MAC, 0x00, name
+		"eth1":    "762211bc44a7190624ef8d19cbc0cce8", // unique MAC: MAC only
+		"wlan0":   "f23f82a2d2697fd70282522de361d3f7", // no MAC: name only
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keyed ids = %v, want %v", got, want)
+	}
+}
+
+// TestCollectMarksBridgeAndContainerInterfacesVirtual covers the macOS
+// bridge (bridge100, the Internet-sharing and VM bridge), podman and cilium
+// interfaces next to the existing prefixes.
+func TestCollectMarksBridgeAndContainerInterfacesVirtual(t *testing.T) {
+	for _, name := range []string{"bridge100", "bridge0", "podman0", "cilium_host", "Bridge1"} {
+		if !isVirtualName(name) {
+			t.Errorf("isVirtualName(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"en0", "eth0", "Ethernet", "Wi-Fi", "enp3s0"} {
+		if isVirtualName(name) {
+			t.Errorf("isVirtualName(%q) = true, want false", name)
+		}
+	}
+}
