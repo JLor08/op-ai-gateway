@@ -552,41 +552,79 @@ func (s *Service) scanRPCBinaries(ctx context.Context, serverID string, head rou
 		return rpcMemberScan{}, err
 	}
 	slices.SortFunc(rows, func(a, b routing.ServerBinary) int { return strings.Compare(a.Path, b.Path) })
-	var out rpcMemberScan
-	var best rpcCompat
-	eligible, protocolMismatch, buildMismatch := false, false, false
+	var t rpcScanTally
 	for _, b := range rows {
-		if b.Kind != BinaryKindRPCServer || isWSLBinaryPath(b.Path) || (b.Source == routing.BinarySourceAgent && !b.Allowed) {
-			continue
-		}
-		eligible = true
-		switch c := rpcCompatibility(head, b); {
-		case c.compatible():
-			if !out.matched || (c == rpcCompatIdentical && best != rpcCompatIdentical) {
-				out.match, out.matched, best = b, true, c
-			}
-		case c == rpcMismatchProtocol:
-			if !protocolMismatch {
-				out.memberProtocol = rpcProtocolOf(b)
-			}
-			protocolMismatch = true
-		case c == rpcMismatchBuild:
-			buildMismatch = true
-		}
+		t.add(head, b)
 	}
+	return t.result(), nil
+}
+
+// rpcScanTally accumulates the rows of one scanRPCBinaries pass: the best
+// compatible row so far and the evidence for the reason if none is found.
+// It is split out so the per-row decision and the final verdict are each
+// small enough to read on their own.
+type rpcScanTally struct {
+	out              rpcMemberScan
+	best             rpcCompat
+	eligible         bool
+	protocolMismatch bool
+	buildMismatch    bool
+}
+
+// rpcMemberEligible reports whether b may serve as an automatic cluster
+// member: an rpc_server row, not under wsl://, and -- for agent-reported
+// rows -- allowed by the agent. Manual rows carry no allowlist status.
+func rpcMemberEligible(b routing.ServerBinary) bool {
+	if b.Kind != BinaryKindRPCServer || isWSLBinaryPath(b.Path) {
+		return false
+	}
+	return b.Source != routing.BinarySourceAgent || b.Allowed
+}
+
+// add folds one row (in path order) into the tally against head.
+func (t *rpcScanTally) add(head, b routing.ServerBinary) {
+	if !rpcMemberEligible(b) {
+		return
+	}
+	t.eligible = true
+	switch c := rpcCompatibility(head, b); {
+	case c.compatible():
+		t.keepIfBetter(b, c)
+	case c == rpcMismatchProtocol:
+		if !t.protocolMismatch {
+			t.out.memberProtocol = rpcProtocolOf(b)
+		}
+		t.protocolMismatch = true
+	case c == rpcMismatchBuild:
+		t.buildMismatch = true
+	}
+}
+
+// keepIfBetter records b as the match when there is none yet, or when it is
+// an identical build and the current match is not (identical beats a mere
+// protocol match; among equals the first by path stays).
+func (t *rpcScanTally) keepIfBetter(b routing.ServerBinary, c rpcCompat) {
+	if !t.out.matched || (c == rpcCompatIdentical && t.best != rpcCompatIdentical) {
+		t.out.match, t.out.matched, t.best = b, true, c
+	}
+}
+
+// result is the scan: the match, else the reason in the documented order.
+func (t *rpcScanTally) result() rpcMemberScan {
+	out := t.out
 	switch {
 	case out.matched:
 		out.memberProtocol = ""
-	case !eligible:
+	case !t.eligible:
 		out.reason = rpcRejectNoBinary
-	case protocolMismatch:
+	case t.protocolMismatch:
 		out.reason = rpcRejectProtocolMismatch
-	case buildMismatch:
+	case t.buildMismatch:
 		out.reason = rpcRejectBuildMismatch
 	default:
 		out.reason = rpcRejectVersionUnknown
 	}
-	return out, nil
+	return out
 }
 
 // MatchingRPCBinary returns the rpc_server binary on serverID that head's

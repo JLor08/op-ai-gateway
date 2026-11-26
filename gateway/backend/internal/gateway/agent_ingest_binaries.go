@@ -237,8 +237,26 @@ func keepKnownRPCProtocols(rows, stored []routing.ServerBinary) {
 // The rpc_server rows of the directory must agree; rows of different
 // protocols, or none carrying one, leave the llama_server without one.
 func deriveLlamaServerProtocols(rows []routing.ServerBinary) {
-	protoByDir := map[string]string{}
-	disagree := map[string]bool{}
+	protoByDir, disagree := rpcProtocolsByDir(rows)
+	for i := range rows {
+		r := &rows[i]
+		if r.Kind != portal.BinaryKindLlamaServer || r.RPCProtocol != "" {
+			continue
+		}
+		if dir := binarySiblingDirKey(r.Path); dir != "" && !disagree[dir] {
+			r.RPCProtocol = protoByDir[dir]
+		}
+	}
+}
+
+// rpcProtocolsByDir collects the RPC protocol of the rpc_server rows per
+// directory (binarySiblingDirKey) and which directories hold rpc_server rows
+// of differing protocols. It is split out of deriveLlamaServerProtocols so
+// the survey of the rpc_server side and the assignment to llama_server rows
+// stay two readable steps.
+func rpcProtocolsByDir(rows []routing.ServerBinary) (protoByDir map[string]string, disagree map[string]bool) {
+	protoByDir = map[string]string{}
+	disagree = map[string]bool{}
 	for _, r := range rows {
 		if r.Kind != portal.BinaryKindRPCServer || r.RPCProtocol == "" {
 			continue
@@ -252,15 +270,7 @@ func deriveLlamaServerProtocols(rows []routing.ServerBinary) {
 		}
 		protoByDir[dir] = r.RPCProtocol
 	}
-	for i := range rows {
-		r := &rows[i]
-		if r.Kind != portal.BinaryKindLlamaServer || r.RPCProtocol != "" {
-			continue
-		}
-		if dir := binarySiblingDirKey(r.Path); dir != "" && !disagree[dir] {
-			r.RPCProtocol = protoByDir[dir]
-		}
-	}
+	return protoByDir, disagree
 }
 
 // binarySiblingDirKey is the directory a reported path sits in, the key the
