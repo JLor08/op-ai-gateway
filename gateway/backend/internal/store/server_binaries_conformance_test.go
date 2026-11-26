@@ -118,6 +118,35 @@ func TestConformanceServerBinaries(t *testing.T) {
 			t.Fatalf("a manual row must shadow an agent report of the same path: %+v", got[2])
 		}
 
+		// The RPC protocol rides the agent report: it round-trips, a later
+		// report updates it, and the operator's version override is untouched.
+		withProto := func(proto string) []routing.ServerBinary {
+			rpc := agent("/b/llama-server", "llama-server", "b2")
+			rpc.RPCProtocol = proto
+			return []routing.ServerBinary{rpc}
+		}
+		if err := s.ReplaceAgentServerBinaries(ctx, "srv_bin", withProto("10.0.2")); err != nil {
+			t.Fatalf("replace with protocol: %v", err)
+		}
+		got, _ = s.ServerBinaries(ctx, "srv_bin")
+		if len(got) < 1 || got[0].Path != "/b/llama-server" || got[0].RPCProtocol != "10.0.2" || got[0].VersionOverride != "b-custom" {
+			t.Fatalf("rpc_protocol must round-trip beside the override: %+v", got)
+		}
+		if err := s.ReplaceAgentServerBinaries(ctx, "srv_bin", withProto("10.0.1")); err != nil {
+			t.Fatalf("replace with new protocol: %v", err)
+		}
+		got, _ = s.ServerBinaries(ctx, "srv_bin")
+		if len(got) < 1 || got[0].RPCProtocol != "10.0.1" || got[0].VersionOverride != "b-custom" {
+			t.Fatalf("a later report must update rpc_protocol and keep the override: %+v", got)
+		}
+		if err := s.ReplaceAgentServerBinaries(ctx, "srv_bin", withProto("")); err != nil {
+			t.Fatalf("replace clearing protocol: %v", err)
+		}
+		got, _ = s.ServerBinaries(ctx, "srv_bin")
+		if len(got) < 1 || got[0].RPCProtocol != "" {
+			t.Fatalf("an empty reported protocol must be stored empty: %+v", got)
+		}
+
 		// An empty report clears the agent rows and keeps the manual one.
 		if err := s.ReplaceAgentServerBinaries(ctx, "srv_bin", nil); err != nil {
 			t.Fatalf("empty replace: %v", err)

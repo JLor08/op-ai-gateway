@@ -149,6 +149,7 @@ var migrations = []migration{
 	{version: 114, name: "vendor_account_groups", up: migration114Up},
 	{version: 115, name: "user_chat_vendor_access", up: migration115Up},
 	{version: 116, name: "server_lan_interfaces", up: migration116Up},
+	{version: 117, name: "server_binaries_rpc_protocol", up: migration117Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4955,4 +4956,14 @@ func migration116Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return execTx(ctx, tx, dl, `update ai_servers
 		set lan_source = case when lan_address <> '' then 'manual' else 'auto' end
 		where lan_source = ''`)
+}
+
+// migration117Up adds server_binaries.rpc_protocol: the RPC protocol version
+// ("X.Y.Z") the agent probed from an rpc_server binary. The empty default
+// means unknown and is a true statement about every pre-upgrade row (and about
+// manual rows, which never carry one), so there is no backfill; the next agent
+// report fills it in. addColumnIfMissing keeps the step replayable on both
+// dialects.
+func migration117Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "server_binaries", "rpc_protocol text not null default ''")
 }
