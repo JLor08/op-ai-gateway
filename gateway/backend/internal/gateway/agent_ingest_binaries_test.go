@@ -419,3 +419,98 @@ func TestIngestBinariesKeepKnownRPCProtocol(t *testing.T) {
 		t.Fatalf("a llama_server row kept protocol %q", rows[0].RPCProtocol)
 	}
 }
+
+// TestIngestBinariesRPCProtocolRetentionNeedsSameIdentity: the stored
+// rpc_server protocol is kept for a protocol-less re-report only while the
+// re-reported version, build and commit equal the stored row's. A binary
+// replaced at the same path (another identity) whose first protocol probe
+// fails loses the protocol rather than keep the replaced binary's.
+func TestIngestBinariesRPCProtocolRetentionNeedsSameIdentity(t *testing.T) {
+	srv := NewTestServer()
+	ingestBinaries(t, srv, `[
+		{"path":"/a/llama-server","kind":"llama_server","version":"0.9.0 (build 1, commit 2bc46ba)","build":"1","commit":"2bc46ba","version_source":"agent","rpc_protocol":"10.0.2","allowed":true},
+		{"path":"/a/rpc-server","kind":"rpc_server","version":"0.9.0 (build 1, commit 2bc46ba)","build":"1","commit":"2bc46ba","version_source":"agent","rpc_protocol":"10.0.2","allowed":true}]`)
+	// Same identity, failed protocol probe: kept.
+	ingestBinaries(t, srv, `[
+		{"path":"/a/llama-server","kind":"llama_server","version":"0.9.0 (build 1, commit 2bc46ba)","build":"1","commit":"2bc46ba","version_source":"agent","allowed":true},
+		{"path":"/a/rpc-server","kind":"rpc_server","version":"0.9.0 (build 1, commit 2bc46ba)","build":"1","commit":"2bc46ba","version_source":"agent","allowed":true}]`)
+	if p := storedBinaries(t, srv)["/a/rpc-server"].RPCProtocol; p != "10.0.2" {
+		t.Fatalf("same identity: protocol %q, want 10.0.2 kept", p)
+	}
+	// Replaced binary (new identity), failed protocol probe: dropped.
+	ingestBinaries(t, srv, `[
+		{"path":"/a/llama-server","kind":"llama_server","version":"0.9.1 (build 2, commit 3cd57cb)","build":"2","commit":"3cd57cb","version_source":"agent","allowed":true},
+		{"path":"/a/rpc-server","kind":"rpc_server","version":"0.9.1 (build 2, commit 3cd57cb)","build":"2","commit":"3cd57cb","version_source":"agent","allowed":true}]`)
+	got := storedBinaries(t, srv)
+	if p := got["/a/rpc-server"].RPCProtocol; p != "" {
+		t.Fatalf("replaced binary: rpc protocol %q, want none", p)
+	}
+	if p := got["/a/llama-server"].RPCProtocol; p != "" {
+		t.Fatalf("replaced binary: llama protocol %q, want none", p)
+	}
+}
+
+// TestIngestBinariesLlamaServerProtocolFromSibling: after an agent restart
+// whose rpc-server protocol probe fails, the rpc_server row keeps its
+// protocol (retention), and the llama_server row of the same directory takes
+// it from there, so a protocol-only cluster (a head and member of different
+// builds, e.g. git vs source tarball) stays matchable. A llama_server whose
+// directory has no rpc_server row, or rpc_server rows of different
+// protocols, gets none.
+func TestIngestBinariesLlamaServerProtocolFromSibling(t *testing.T) {
+	srv := NewTestServer()
+	const tarball = `"version":"version: 1.1.0-dev (build 0, commit unknown)","build":"0","commit":"unknown","version_source":"agent"`
+	ingestBinaries(t, srv, `[
+		{"path":"/a/llama-server","kind":"llama_server",`+tarball+`,"rpc_protocol":"10.0.2","allowed":true},
+		{"path":"/a/rpc-server","kind":"rpc_server",`+tarball+`,"rpc_protocol":"10.0.2","allowed":true},
+		{"path":"C:\\llama\\llama-server.exe","kind":"llama_server",`+tarball+`,"rpc_protocol":"10.0.2","allowed":true},
+		{"path":"C:\\llama\\rpc-server.exe","kind":"rpc_server",`+tarball+`,"rpc_protocol":"10.0.2","allowed":true}]`)
+	// The transient failure: the agent restarted and its protocol probes failed.
+	ingestBinaries(t, srv, `[
+		{"path":"/a/llama-server","kind":"llama_server",`+tarball+`,"allowed":true},
+		{"path":"/a/rpc-server","kind":"rpc_server",`+tarball+`,"allowed":true},
+		{"path":"C:\\llama\\llama-server.exe","kind":"llama_server",`+tarball+`,"allowed":true},
+		{"path":"C:\\llama\\rpc-server.exe","kind":"rpc_server",`+tarball+`,"allowed":true},
+		{"path":"/b/llama-server","kind":"llama_server",`+tarball+`,"allowed":true}]`)
+	got := storedBinaries(t, srv)
+	for _, path := range []string{"/a/llama-server", "/a/rpc-server", `C:\llama\llama-server.exe`, `C:\llama\rpc-server.exe`} {
+		if p := got[path].RPCProtocol; p != "10.0.2" {
+			t.Errorf("%s after a failed probe: protocol %q, want 10.0.2", path, p)
+		}
+	}
+	if p := got["/b/llama-server"].RPCProtocol; p != "" {
+		t.Errorf("llama without rpc sibling: protocol %q", p)
+	}
+
+	// The sibling left: the llama_server row has no protocol any more.
+	ingestBinaries(t, srv, `[{"path":"/a/llama-server","kind":"llama_server",`+tarball+`,"allowed":true}]`)
+	if p := storedBinaries(t, srv)["/a/llama-server"].RPCProtocol; p != "" {
+		t.Fatalf("sibling gone: protocol %q, want none", p)
+	}
+
+	// Siblings of different protocols: none, even when one is only kept.
+	ingestBinaries(t, srv, `[
+		{"path":"/c/ggml-rpc-server","kind":"rpc_server",`+tarball+`,"rpc_protocol":"10.0.2","allowed":true}]`)
+	ingestBinaries(t, srv, `[
+		{"path":"/c/llama-server","kind":"llama_server",`+tarball+`,"allowed":true},
+		{"path":"/c/ggml-rpc-server","kind":"rpc_server",`+tarball+`,"allowed":true},
+		{"path":"/c/rpc-server","kind":"rpc_server",`+tarball+`,"rpc_protocol":"9.0.0","allowed":true}]`)
+	if p := storedBinaries(t, srv)["/c/llama-server"].RPCProtocol; p != "" {
+		t.Fatalf("disagreeing siblings: protocol %q, want none", p)
+	}
+}
+
+func TestBinarySiblingDirKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"/opt/a/llama-server":           "/opt/a",
+		`C:\llama\rpc-server.exe`:       `C:\llama`,
+		"C:/llama/rpc-server.exe":       "C:/llama",
+		"wsl://Ubuntu/opt/l/rpc-server": "wsl://Ubuntu/opt/l",
+		"wsl://Debian/opt/l/rpc-server": "wsl://Debian/opt/l",
+		"rpc-server":                    "",
+	} {
+		if got := binarySiblingDirKey(in); got != want {
+			t.Errorf("binarySiblingDirKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
