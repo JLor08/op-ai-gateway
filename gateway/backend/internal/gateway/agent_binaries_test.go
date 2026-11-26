@@ -518,6 +518,23 @@ func TestServeAgentConfigEmitsFreshAgentKey(t *testing.T) {
 	}
 }
 
+// TestServeAgentConfigIsNotCached pins Cache-Control: no-store on the
+// generated config: it carries the agent's token and a fresh agent_key, so no
+// shared or browser cache may keep it (the CA endpoint does the same).
+func TestServeAgentConfigIsNotCached(t *testing.T) {
+	s := newAgentBinTestServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/v1/download/config", nil)
+	req.Header.Set("Authorization", "Bearer valid-agent-secret")
+	rec := httptest.NewRecorder()
+	s.agentMux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+}
+
 func TestHandleAgentDownloadServesConfig(t *testing.T) {
 	// No manifest written: the config download must not depend on built binaries.
 	s := newAgentBinTestServer(t, t.TempDir())

@@ -1994,7 +1994,7 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 | `/api/agent/v1/features` | GET | The **gateway's** declared feature list, ETag-conditional — the gateway→agent half of capability negotiation |
 | `/api/agent/v1/runtime-config` | GET | The desired agent-managed runtime state for the caller's own server, ETag-conditional |
 | `/api/agent/v1/runtime-report` | POST | Ingest a file-mode agent's *effective* runtime configuration (env values and config-file content already masked agent-side) |
-| `/api/agent/v1/download/{...}` | GET | Agent distribution: download a ServerAgent release binary/manifest/config (fetched by operators or scripts; the agent does not update itself) |
+| `/api/agent/v1/download/{...}` | GET | Agent distribution: download a ServerAgent release binary/manifest/config (fetched by operators or scripts; the agent does not update itself). The config response is `Cache-Control: no-store`, since it carries the agent token and a fresh `agent_key` |
 
 ### 5.1 The two managed-runtime GETs
 

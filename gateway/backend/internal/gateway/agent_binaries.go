@@ -282,6 +282,9 @@ func (s *Server) handleAgentDownload(w http.ResponseWriter, r *http.Request) {
 // the listener's runtime address and stored public certificate material take
 // precedence. The token is the caller's own bearer, so the file needs no manual edit.
 func (s *Server) serveAgentConfig(w http.ResponseWriter, r *http.Request, token string) {
+	// The document carries the agent's token and a fresh agent_key: no cache
+	// may keep it, whatever the outcome.
+	w.Header().Set("Cache-Control", "no-store")
 	agentKey, err := newAgentConfigKey()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, apierror.Response("agent.config_key_failed", "could not generate the agent key", ""))
