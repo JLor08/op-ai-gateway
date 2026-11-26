@@ -604,4 +604,8 @@ type BinaryInfo struct {
 	Commit        string `json:"commit"`
 	VersionSource string `json:"version_source"`
 	Allowed       bool   `json:"allowed"`
+	// RPCProtocol is the llama.cpp RPC protocol version (X.Y.Z) of the
+	// binary's directory: read from an rpc_server's startup banner, shared with
+	// the llama_server beside it. Empty when unknown.
+	RPCProtocol string `json:"rpc_protocol,omitempty"`
 }

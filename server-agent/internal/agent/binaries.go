@@ -4,13 +4,16 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	runtimectl "op-ai-server-agent/internal/runtime"
 	"op-ai-server-agent/internal/sample"
 	"op-ai-server-agent/internal/wslentry"
@@ -91,6 +94,7 @@ type cachedVersion struct {
 	size                   int64
 	mtime                  time.Time
 	version, build, commit string
+	protocol               string // rpc_server: the RPC protocol version its banner gave
 	ok                     bool
 	failures               int       // consecutive runs without a version
 	retryAt                time.Time // when a failed run may be retried
@@ -132,24 +136,65 @@ func parseVLLMVersion(out string) (version string, ok bool) {
 	return "", false
 }
 
-// versionProbe is how a version-probed kind is run and read.
+// probedIdentity is what one probe run reads out of a binary's output.
+type probedIdentity struct{ version, build, commit, protocol string }
+
+// versionProbe is how a probed kind is run and read: run picks the runner of
+// a prober (nil: this context cannot run it, so the binary is not probed) and
+// parse reads its output.
 type versionProbe struct {
 	timeout time.Duration
-	parse   func(out string) (version, build, commit string, ok bool)
+	run     func(*prober) func(ctx context.Context, path string) (string, error)
+	parse   func(out string) (probedIdentity, bool)
 }
 
-// probeFor is the version probe of kind, false for a kind that is never run.
+// probeFor is the probe of kind, false for a kind that is never run. An
+// rpc_server has no --version, so its probe starts it on a throwaway loopback
+// port and reads the protocol from its banner.
 func probeFor(kind string) (versionProbe, bool) {
+	runVersion := func(p *prober) func(context.Context, string) (string, error) { return p.runVersion }
 	switch kind {
 	case binaryKindLlamaServer:
-		return versionProbe{binaryVersionTimeout, parseLlamaVersion}, true
+		return versionProbe{binaryVersionTimeout, runVersion, func(out string) (probedIdentity, bool) {
+			v, b, c, ok := parseLlamaVersion(out)
+			return probedIdentity{version: v, build: b, commit: c}, ok
+		}}, true
+	case binaryKindRPCServer:
+		return versionProbe{
+			binaryVersionTimeout, func(p *prober) func(context.Context, string) (string, error) { return p.runProtocol },
+			func(out string) (probedIdentity, bool) {
+				proto, ok := parseRPCProtocol(out)
+				return probedIdentity{protocol: proto}, ok
+			},
+		}, true
 	case binaryKindVLLM:
-		return versionProbe{binaryVLLMVersionTimeout, func(out string) (string, string, string, bool) {
+		return versionProbe{binaryVLLMVersionTimeout, runVersion, func(out string) (probedIdentity, bool) {
 			v, ok := parseVLLMVersion(out)
-			return v, "", "", ok
+			return probedIdentity{version: v}, ok
 		}}, true
 	}
 	return versionProbe{}, false
+}
+
+var rpcProtocolFormat = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+
+// parseRPCProtocol extracts the RPC protocol version from the output of a
+// ggml-rpc-server: the first "Starting RPC server vX.Y.Z" line. Backend
+// initialisation lines may precede it; a banner whose version is not X.Y.Z
+// yields nothing rather than a value the gateway could not compare.
+func parseRPCProtocol(out string) (string, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, runtimectl.RPCServerBannerStart) {
+			continue
+		}
+		proto := strings.TrimPrefix(line, runtimectl.RPCServerBannerStart)
+		if !rpcProtocolFormat.MatchString(proto) {
+			return "", false
+		}
+		return proto, true
+	}
+	return "", false
 }
 
 var (
@@ -196,6 +241,10 @@ func binaryKind(path string) string {
 type prober struct {
 	stat       func(string) (fs.FileInfo, error)
 	runVersion func(ctx context.Context, path string) (string, error)
+	// runProtocol starts an rpc_server and returns its output up to the banner;
+	// nil where it must not be run (WSL: a process inside a distro cannot be
+	// killed reliably through wsl.exe, and a WSL rpc-server is never a member).
+	runProtocol func(ctx context.Context, path string) (string, error)
 }
 
 // wslProbeConfig is what the agent needs to reach a distro: the wsl.exe to run
@@ -352,17 +401,19 @@ func (w *wslProbes) prober(distro string) *prober {
 }
 
 // scanBinaries computes the inventory of the allowed native binaries. Only a
-// llama_server or vllm is ever executed (with --version); an rpc_server takes
-// the version of a llama_server in the same directory, else whatever its path
-// says, and any other binary is listed without a version.
-func scanBinaries(allowed []string, stat func(string) (fs.FileInfo, error), runVersion func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo {
-	return scanBinariesCtx(context.Background(), time.Now(), allowed, stat, runVersion, cache)
+// llama_server or vllm is executed with --version, and a native rpc_server is
+// started once on a loopback port to read its protocol from the banner (runProtocol;
+// nil: never). An rpc_server takes the version of a llama_server in the same
+// directory, else whatever its path says, and a llama_server the protocol of
+// an rpc_server in its directory; any other binary is listed without a version.
+func scanBinaries(allowed []string, stat func(string) (fs.FileInfo, error), runVersion, runProtocol func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo {
+	return scanBinariesCtx(context.Background(), time.Now(), allowed, stat, runVersion, runProtocol, cache)
 }
 
 // scanBinariesCtx is scanBinaries at the time now (which decides whether a
 // failed version run is due again), ending early when ctx does.
-func scanBinariesCtx(ctx context.Context, now time.Time, allowed []string, stat func(string) (fs.FileInfo, error), runVersion func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo {
-	return scanAll(ctx, now, allowed, &prober{stat: stat, runVersion: runVersion}, nil, cache)
+func scanBinariesCtx(ctx context.Context, now time.Time, allowed []string, stat func(string) (fs.FileInfo, error), runVersion, runProtocol func(ctx context.Context, path string) (string, error), cache map[string]cachedVersion) []BinaryInfo {
+	return scanAll(ctx, now, allowed, &prober{stat: stat, runVersion: runVersion, runProtocol: runProtocol}, nil, cache)
 }
 
 // scanAll computes the inventory of every allowed entry: native paths through
@@ -472,7 +523,7 @@ func (sc *binaryScan) addOffline(bi *BinaryInfo, target string, probed bool) {
 	cv, hit := sc.cache[bi.Path]
 	switch {
 	case hit && cv.ok:
-		bi.Version, bi.Build, bi.Commit, bi.VersionSource = cv.version, cv.build, cv.commit, versionSourceAgent
+		sc.applyProbed(bi, cv)
 	case hit:
 		cv.retryAt = later(cv.retryAt, sc.now.Add(binaryRescanInterval))
 		sc.cache[bi.Path] = cv
@@ -500,18 +551,29 @@ func (sc *binaryScan) pathVersion(bi *BinaryInfo, target string) {
 	}
 }
 
+// applyProbed puts the result of a successful probe on bi: the protocol of an
+// rpc_server (which has no version of its own to report), the version triple
+// of the others.
+func (sc *binaryScan) applyProbed(bi *BinaryInfo, cv cachedVersion) {
+	if bi.Kind == binaryKindRPCServer {
+		bi.RPCProtocol = cv.protocol
+		return
+	}
+	bi.Version, bi.Build, bi.Commit, bi.VersionSource = cv.version, cv.build, cv.commit, versionSourceAgent
+}
+
 // versionProbed fills bi, a version-probed binary whose stat gave fi and
 // statErr, with its version: the one its --version run gives (agentVersioned),
 // else what its path says. aborted reports a shutdown that overtook the run.
 func (sc *binaryScan) versionProbed(bi *BinaryInfo, fi fs.FileInfo, statErr error, pr *prober, probe versionProbe, target string) (agentVersioned, aborted bool) {
-	if statErr == nil && sc.ctx.Err() == nil {
+	if statErr == nil && sc.ctx.Err() == nil && probe.run(pr) != nil {
 		cv, aborted := sc.cachedOrProbedVersion(bi.Path, target, fi, pr, probe)
 		if aborted {
 			return false, true
 		}
 		if cv.ok {
-			bi.Version, bi.Build, bi.Commit, bi.VersionSource = cv.version, cv.build, cv.commit, versionSourceAgent
-			agentVersioned = true
+			sc.applyProbed(bi, cv)
+			agentVersioned = bi.Kind != binaryKindRPCServer
 		}
 	}
 	sc.pathVersion(bi, target)
@@ -536,13 +598,15 @@ func (sc *binaryScan) cachedOrProbedVersion(entry, target string, fi fs.FileInfo
 	}
 	cv = cachedVersion{size: fi.Size(), mtime: fi.ModTime()}
 	rctx, cancel := context.WithTimeout(sc.ctx, probe.timeout)
-	text, rerr := pr.runVersion(rctx, target)
+	text, rerr := probe.run(pr)(rctx, target)
 	cancel()
 	if sc.ctx.Err() != nil {
 		return cv, true
 	}
 	if rerr == nil || text != "" {
-		cv.version, cv.build, cv.commit, cv.ok = probe.parse(text)
+		var id probedIdentity
+		id, cv.ok = probe.parse(text)
+		cv.version, cv.build, cv.commit, cv.protocol = id.version, id.build, id.commit, id.protocol
 	}
 	if !cv.ok {
 		cv.failures = failures + 1
@@ -571,11 +635,22 @@ func siblingDirKey(entry string) string {
 	return filepath.Dir(entry)
 }
 
-// inheritSiblingVersions gives every rpc_server in out the version of the
-// agent-versioned llama_server in its directory (byDir: directory -> its index
-// in out), else whatever its path says.
+// inheritSiblingVersions pairs the binaries of one directory, which are one
+// build: every rpc_server in out gets the version of the agent-versioned
+// llama_server in its directory (byDir: directory -> its index in out), else
+// whatever its path says, and keeps its own protocol; every llama_server gets
+// the protocol of the first rpc_server of its directory that has one.
 func inheritSiblingVersions(out []BinaryInfo, byDir map[string]int) {
+	protoByDir := map[string]string{}
+	for _, b := range out {
+		if dir := siblingDirKey(b.Path); b.Kind == binaryKindRPCServer && b.RPCProtocol != "" && protoByDir[dir] == "" {
+			protoByDir[dir] = b.RPCProtocol
+		}
+	}
 	for i := range out {
+		if out[i].Kind == binaryKindLlamaServer {
+			out[i].RPCProtocol = protoByDir[siblingDirKey(out[i].Path)]
+		}
 		if out[i].Kind != binaryKindRPCServer {
 			continue
 		}
@@ -616,14 +691,91 @@ func execVersion(ctx context.Context, path string) (string, error) {
 	return buf.buf.String(), err
 }
 
+// freeLoopbackPort is a TCP port on 127.0.0.1 nothing listens on right now.
+func freeLoopbackPort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port, nil
+}
+
+// execRPCProtocol starts `<path> -d CPU -H 127.0.0.1 -p <free port>` directly
+// (no shell), reads its combined output until the "Starting RPC server" banner
+// and kills it. ggml-rpc-server has no --version, but prints the banner before
+// it initialises devices and binds the port; -d CPU keeps the GPUs
+// untouched, and the kill keeps the run from ever serving. It returns the
+// output read so far: with a nil error once the banner was seen, else with
+// the context or exit error.
+func execRPCProtocol(ctx context.Context, path string) (string, error) {
+	port, err := freeLoopbackPort()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, path, "-d", "CPU", "-H", "127.0.0.1", "-p", strconv.Itoa(port))
+	cmd.Env = minimalEnv()
+	cmd.WaitDelay = binaryWaitDelay
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = r.Close() }()
+	cmd.Stdout, cmd.Stderr = w, w
+	err = cmd.Start()
+	_ = w.Close() // the child holds the only write end now
+	if err != nil {
+		return "", err
+	}
+	type result struct {
+		text  string
+		found bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		var text strings.Builder
+		br := bufio.NewReader(io.LimitReader(r, binaryOutputLimit))
+		for {
+			line, rerr := br.ReadString('\n')
+			text.WriteString(line)
+			if strings.HasPrefix(strings.TrimSpace(line), runtimectl.RPCServerBannerStart) {
+				done <- result{text.String(), true}
+				return
+			}
+			if rerr != nil {
+				done <- result{text.String(), false}
+				return
+			}
+		}
+	}()
+	var res result
+	select {
+	case res = <-done:
+	case <-ctx.Done():
+		_ = r.Close() // unblocks the reader even when a grandchild holds the pipe
+		res = <-done
+	}
+	_ = cmd.Process.Kill()
+	werr := cmd.Wait()
+	if res.found {
+		return res.text, nil
+	}
+	if ctx.Err() != nil {
+		return res.text, ctx.Err()
+	}
+	return res.text, werr
+}
+
 // binaryInventory keeps the last computed inventory and decides whether a
 // sample has to carry it.
 type binaryInventory struct {
 	allowed    []string
 	stat       func(string) (fs.FileInfo, error)
 	runVersion func(ctx context.Context, path string) (string, error)
-	wsl        wslProbeConfig
-	wslRun     wslCall
+	// runProtocol is the rpc_server probe, injectable like runVersion.
+	runProtocol func(ctx context.Context, path string) (string, error)
+	wsl         wslProbeConfig
+	wslRun      wslCall
 
 	scanMu sync.Mutex // one scan at a time; guards cache
 	cache  map[string]cachedVersion
@@ -638,19 +790,20 @@ type binaryInventory struct {
 
 func newBinaryInventory(allowed []string, wsl wslProbeConfig) *binaryInventory {
 	return &binaryInventory{
-		allowed:    allowed,
-		stat:       os.Stat,
-		runVersion: execVersion,
-		wsl:        wsl,
-		wslRun:     execWSLCall,
-		cache:      map[string]cachedVersion{},
+		allowed:     allowed,
+		stat:        os.Stat,
+		runVersion:  execVersion,
+		runProtocol: execRPCProtocol,
+		wsl:         wsl,
+		wslRun:      execWSLCall,
+		cache:       map[string]cachedVersion{},
 	}
 }
 
 // rescan recomputes the inventory and stores it.
 func (b *binaryInventory) rescan(ctx context.Context) {
 	b.scanMu.Lock()
-	list := scanAll(ctx, time.Now(), b.allowed, &prober{stat: b.stat, runVersion: b.runVersion},
+	list := scanAll(ctx, time.Now(), b.allowed, &prober{stat: b.stat, runVersion: b.runVersion, runProtocol: b.runProtocol},
 		&wslProbes{ctx: ctx, cfg: b.wsl, call: b.wslRun}, b.cache)
 	b.scanMu.Unlock()
 	if ctx.Err() != nil {

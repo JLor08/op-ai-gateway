@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -79,7 +80,7 @@ func TestRPCServerInheritsSiblingVersion(t *testing.T) {
 		return llamaVersionOutput, nil
 	}
 	got := scanBinaries([]string{"/opt/l/llama-server", "/opt/l/ggml-rpc-server", "/opt/other/b99/rpc-server", "/opt/x/tool"},
-		statFake(fakeFileInfo{size: 1}), run, map[string]cachedVersion{})
+		statFake(fakeFileInfo{size: 1}), run, nil, map[string]cachedVersion{})
 	if len(got) != 4 {
 		t.Fatalf("got %+v", got)
 	}
@@ -103,15 +104,15 @@ func TestVersionRunCachedByStat(t *testing.T) {
 	cache := map[string]cachedVersion{}
 	fi := fakeFileInfo{size: 10, mtime: time.Unix(100, 0)}
 	paths := []string{"/opt/l/llama-server"}
-	scanBinaries(paths, statFake(fi), run, cache)
-	scanBinaries(paths, statFake(fi), run, cache)
+	scanBinaries(paths, statFake(fi), run, nil, cache)
+	scanBinaries(paths, statFake(fi), run, nil, cache)
 	if runs != 1 {
 		t.Fatalf("runs = %d, want 1", runs)
 	}
 	fi.mtime = time.Unix(200, 0)
-	scanBinaries(paths, statFake(fi), run, cache)
+	scanBinaries(paths, statFake(fi), run, nil, cache)
 	fi.size = 11
-	scanBinaries(paths, statFake(fi), run, cache)
+	scanBinaries(paths, statFake(fi), run, nil, cache)
 	if runs != 3 {
 		t.Fatalf("runs = %d, want 3 after mtime and size changes", runs)
 	}
@@ -121,7 +122,7 @@ func TestOnlyVersionedKindsAreExecuted(t *testing.T) {
 	var ran []string
 	run := func(_ context.Context, p string) (string, error) { ran = append(ran, p); return "", errors.New("boom") }
 	got := scanBinaries([]string{"/a/rpc-server", "/a/ggml-rpc-server.exe", "/a/LLAMA-SERVER.EXE", "/a/other", "/a/vllm"},
-		statFake(fakeFileInfo{}), run, map[string]cachedVersion{})
+		statFake(fakeFileInfo{}), run, nil, map[string]cachedVersion{})
 	if len(ran) != 2 || ran[0] != "/a/LLAMA-SERVER.EXE" || ran[1] != "/a/vllm" {
 		t.Fatalf("executed %v", ran)
 	}
@@ -172,7 +173,7 @@ func TestNativeVLLMIsProbedWithLongTimeout(t *testing.T) {
 		left = time.Until(dl)
 		return "0.11.0\n", nil
 	}
-	got := scanBinaries([]string{"/opt/venv/bin/vllm"}, statFake(fakeFileInfo{size: 1}), run, map[string]cachedVersion{})
+	got := scanBinaries([]string{"/opt/venv/bin/vllm"}, statFake(fakeFileInfo{size: 1}), run, nil, map[string]cachedVersion{})
 	if len(gotArgs) != 1 || left < 50*time.Second {
 		t.Fatalf("ran %v, deadline in %v", gotArgs, left)
 	}
@@ -488,7 +489,7 @@ func TestExecVersionChildEnvHasNoAgentSettings(t *testing.T) {
 
 func TestScanSkipsNonRegularEntries(t *testing.T) {
 	stat := statFake(fakeFileInfo{mode: fs.ModeDir})
-	got := scanBinaries([]string{"/opt/llama-dir"}, stat, func(context.Context, string) (string, error) { return "", nil }, nil)
+	got := scanBinaries([]string{"/opt/llama-dir"}, stat, func(context.Context, string) (string, error) { return "", nil }, nil, nil)
 	if len(got) != 0 {
 		t.Fatalf("directory listed: %+v", got)
 	}
@@ -549,7 +550,7 @@ func TestFailedVersionProbeRetriedWithBackoff(t *testing.T) {
 	paths := []string{"/opt/l/llama-server"}
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	scan := func(at time.Time) []BinaryInfo {
-		return scanBinariesCtx(context.Background(), at, paths, stat, run, cache)
+		return scanBinariesCtx(context.Background(), at, paths, stat, run, nil, cache)
 	}
 
 	if got := scan(t0); got[0].Version != "" || runs != 1 {
@@ -587,7 +588,7 @@ func TestFailedVersionProbeBackoffIsCapped(t *testing.T) {
 	stat := statFake(fakeFileInfo{size: 10, mtime: time.Unix(100, 0)})
 	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	for range 20 {
-		scanBinariesCtx(context.Background(), at, []string{"/opt/l/llama-server"}, stat, run, cache)
+		scanBinariesCtx(context.Background(), at, []string{"/opt/l/llama-server"}, stat, run, nil, cache)
 		at = at.Add(binaryRetryCap)
 	}
 	if runs != 20 {
@@ -848,5 +849,223 @@ func TestParseRunningDistros(t *testing.T) {
 				t.Errorf("%s: %q missing from %v", tc.name, n, got)
 			}
 		}
+	}
+}
+
+const rpcBanner = "ggml_cuda_init: found 1 CUDA devices\nStarting RPC server v10.0.2\n  endpoint       : 127.0.0.1:50052\n"
+
+func protoRunner(proto string, ran *[]string) func(context.Context, string) (string, error) {
+	return func(_ context.Context, p string) (string, error) {
+		if ran != nil {
+			*ran = append(*ran, p)
+		}
+		return "Starting RPC server v" + proto + "\n", nil
+	}
+}
+
+func TestParseRPCProtocol(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{rpcBanner, "10.0.2", true},
+		{"Starting RPC server v10.0.2\r\nmore\r\n", "10.0.2", true},
+		{"Starting RPC server v10.0", "", false},
+		{"Starting RPC server vx.y.z\n", "", false},
+		{"usage: ggml-rpc-server", "", false},
+		{"", "", false},
+	}
+	for _, c := range cases {
+		got, ok := parseRPCProtocol(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("%q: got %q %v, want %q %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func find(t *testing.T, got []BinaryInfo, p string) BinaryInfo {
+	t.Helper()
+	for _, b := range got {
+		if b.Path == p {
+			return b
+		}
+	}
+	t.Fatalf("%s not in %+v", p, got)
+	return BinaryInfo{}
+}
+
+func TestRPCServerProtocolProbed(t *testing.T) {
+	run := func(_ context.Context, p string) (string, error) {
+		if p != "/opt/llama/b1/llama-server" {
+			t.Fatalf("--version run on %s", p)
+		}
+		return llamaVersionOutput, nil
+	}
+	var ran []string
+	got := scanBinaries([]string{"/opt/llama/b1/llama-server", "/opt/llama/b1/ggml-rpc-server"},
+		statFake(fakeFileInfo{size: 1}), run, protoRunner("10.0.2", &ran), map[string]cachedVersion{})
+	if len(ran) != 1 || ran[0] != "/opt/llama/b1/ggml-rpc-server" {
+		t.Fatalf("protocol runs = %v", ran)
+	}
+	rpc := find(t, got, "/opt/llama/b1/ggml-rpc-server")
+	if rpc.RPCProtocol != "10.0.2" || rpc.Version != "0.9.0-dev" || rpc.Build != "1" || rpc.Commit != "2bc46ba" {
+		t.Errorf("rpc: %+v", rpc)
+	}
+	llama := find(t, got, "/opt/llama/b1/llama-server")
+	if llama.RPCProtocol != "10.0.2" || llama.Version != "0.9.0-dev" {
+		t.Errorf("llama: %+v", llama)
+	}
+}
+
+func TestRPCServerWithoutLlamaSibling(t *testing.T) {
+	got := scanBinaries([]string{"/opt/rpc/ggml-rpc-server"}, statFake(fakeFileInfo{size: 1}),
+		func(context.Context, string) (string, error) { t.Fatal("version run"); return "", nil },
+		protoRunner("10.0.2", nil), map[string]cachedVersion{})
+	r := got[0]
+	if r.RPCProtocol != "10.0.2" || r.Version != "" || r.Build != "" || r.Commit != "" || r.VersionSource != "" {
+		t.Errorf("rpc: %+v", r)
+	}
+}
+
+func TestLlamaServerWithoutRPCSibling(t *testing.T) {
+	got := scanBinaries([]string{"/opt/l/llama-server"}, statFake(fakeFileInfo{size: 1}),
+		func(context.Context, string) (string, error) { return llamaVersionOutput, nil },
+		protoRunner("10.0.2", nil), map[string]cachedVersion{})
+	if got[0].RPCProtocol != "" {
+		t.Errorf("llama: %+v", got[0])
+	}
+}
+
+func TestSiblingsPairPerDirectory(t *testing.T) {
+	run := func(context.Context, string) (string, error) { return llamaVersionOutput, nil }
+	proto := func(_ context.Context, p string) (string, error) {
+		if strings.HasPrefix(p, "/opt/a/") {
+			return "Starting RPC server v10.0.2\n", nil
+		}
+		return "Starting RPC server v9.0.0\n", nil
+	}
+	got := scanBinaries([]string{"/opt/a/llama-server", "/opt/a/rpc-server", "/opt/b/llama-server", "/opt/b/rpc-server"},
+		statFake(fakeFileInfo{size: 1}), run, proto, map[string]cachedVersion{})
+	if p := find(t, got, "/opt/a/llama-server").RPCProtocol; p != "10.0.2" {
+		t.Errorf("a llama: %q", p)
+	}
+	if p := find(t, got, "/opt/b/llama-server").RPCProtocol; p != "9.0.0" {
+		t.Errorf("b llama: %q", p)
+	}
+}
+
+func TestRPCProtocolProbeCachedAndBackoff(t *testing.T) {
+	runs := 0
+	banner := false
+	proto := func(context.Context, string) (string, error) {
+		runs++
+		if banner {
+			return "Starting RPC server v10.0.2\n", nil
+		}
+		return "no banner\n", errors.New("exit 1")
+	}
+	cache := map[string]cachedVersion{}
+	stat := statFake(fakeFileInfo{size: 10, mtime: time.Unix(100, 0)})
+	paths := []string{"/opt/r/ggml-rpc-server"}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	scan := func(at time.Time) []BinaryInfo {
+		return scanBinariesCtx(context.Background(), at, paths, stat, nil, proto, cache)
+	}
+	if got := scan(t0); got[0].RPCProtocol != "" || runs != 1 {
+		t.Fatalf("first: %+v runs %d", got, runs)
+	}
+	scan(t0.Add(retryBackoff(1) - time.Second))
+	if runs != 1 {
+		t.Fatalf("runs = %d inside the backoff", runs)
+	}
+	banner = true
+	if got := scan(t0.Add(retryBackoff(1))); got[0].RPCProtocol != "10.0.2" || runs != 2 {
+		t.Fatalf("retry: %+v runs %d", got, runs)
+	}
+	if got := scan(t0.Add(48 * time.Hour)); got[0].RPCProtocol != "10.0.2" || runs != 2 {
+		t.Fatalf("cached: %+v runs %d", got, runs)
+	}
+}
+
+func TestWSLRPCServerNotProbed(t *testing.T) {
+	var ran []string
+	native := &prober{stat: statFake(fakeFileInfo{size: 1}), runProtocol: protoRunner("10.0.2", &ran)}
+	wsl := &prober{
+		stat:       statFake(fakeFileInfo{size: 1}),
+		runVersion: func(context.Context, string) (string, error) { return llamaVersionOutput, nil },
+	}
+	sc := &binaryScan{ctx: context.Background(), now: time.Now(), cache: map[string]cachedVersion{}, byDir: map[string]int{}}
+	if !sc.add("wsl://Ubuntu/opt/l/ggml-rpc-server", "/opt/l/ggml-rpc-server", wsl) {
+		t.Fatal("aborted")
+	}
+	if !sc.add("/opt/n/ggml-rpc-server", "/opt/n/ggml-rpc-server", native) {
+		t.Fatal("aborted")
+	}
+	if len(ran) != 1 || ran[0] != "/opt/n/ggml-rpc-server" {
+		t.Fatalf("protocol runs = %v", ran)
+	}
+	if sc.out[0].RPCProtocol != "" || sc.out[1].RPCProtocol != "10.0.2" {
+		t.Errorf("out: %+v", sc.out)
+	}
+}
+
+// rpcScript writes a stand-in ggml-rpc-server that records its argv and pid.
+func rpcScript(t *testing.T, banner string) (script, argsFile, pidFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	argsFile, pidFile = filepath.Join(dir, "args"), filepath.Join(dir, "pid")
+	body := "echo \"$@\" > '" + argsFile + "'\necho $$ > '" + pidFile + "'\n"
+	if banner != "" {
+		body += "echo '" + banner + "' >&2\n"
+	}
+	body += "exec sleep 30\n"
+	return writeScript(t, body), argsFile, pidFile
+}
+
+func TestExecRPCProtocolKillsAfterBanner(t *testing.T) {
+	p, argsFile, pidFile := rpcScript(t, "Starting RPC server v10.0.2")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	out, err := execRPCProtocol(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Fatal("did not return promptly after the banner")
+	}
+	if got, ok := parseRPCProtocol(out); !ok || got != "10.0.2" {
+		t.Fatalf("out %q", out)
+	}
+	raw, _ := os.ReadFile(pidFile)
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if proc, err := os.FindProcess(pid); err != nil || proc.Signal(syscall.Signal(0)) == nil {
+		t.Fatalf("process %d still alive", pid)
+	}
+	args, _ := os.ReadFile(argsFile)
+	f := strings.Fields(string(args))
+	if len(f) != 6 || f[0] != "-d" || f[1] != "CPU" || f[2] != "-H" || f[3] != "127.0.0.1" || f[4] != "-p" {
+		t.Fatalf("argv %q", args)
+	}
+	if n, err := strconv.Atoi(f[5]); err != nil || n <= 0 || n >= 65536 {
+		t.Fatalf("port %q", f[5])
+	}
+}
+
+func TestExecRPCProtocolTimeout(t *testing.T) {
+	p, _, _ := rpcScript(t, "")
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	out, err := execRPCProtocol(ctx, p)
+	if err == nil {
+		t.Fatalf("no error, out %q", out)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("returned after %v", d)
+	}
+	if _, ok := parseRPCProtocol(out); ok {
+		t.Fatalf("banner from nothing: %q", out)
 	}
 }

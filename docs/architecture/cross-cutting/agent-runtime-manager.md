@@ -2080,18 +2080,39 @@ The telemetry sample carries a top-level `binaries` list: one entry per path in
 the agent's local `runtime_allowed_binaries` (the gateway can never widen it),
 native and `wsl://` entries alike, with `kind` (`llama_server`, `rpc_server`, `vllm` or `other`, from the file name alone,
 case-insensitive, without `.exe`), `version`, `build`, `commit`,
-`version_source` and `allowed`. Versions are derived without trusting the
-gateway: only a `llama-server` or a `vllm` is ever executed, as `<path> --version` with no
+`version_source`, `allowed` and `rpc_protocol`. Versions are derived without trusting the
+gateway: only a `llama-server` or a `vllm` is executed as `<path> --version` (a native `rpc-server` is run differently, see below), with no
 shell, a 10 s timeout (60 s for `vllm`, whose start-up imports a large Python stack) and a minimal environment (only what is needed to find
 shared libraries, so no secret reaches the child); its `version: X (build N,
 commit H)` line gives `version_source: agent`; when the run fails or prints no
 such line, the path-derived version below applies instead. A `vllm` takes the
 version from the **last** non-empty output line shaped like `0.11.2` or `v0.11.2` (it
-prints log and warning lines around it), with no build or commit. An `rpc-server` is
-never executed: it inherits the version of a `llama-server` in the same
+prints log and warning lines around it), with no build or commit. An `rpc-server` has
+no `--version`, so it never gets one of its own: it inherits the version of a `llama-server` in the same
 directory (`agent`), else whatever its path says (`path`: a `b<digits>` tag as
 the build, a 7 to 40 character hex segment containing at least one a-f letter as
-the commit), else it has no version. A run that yields a version is cached by
+the commit), else it has no version.
+
+**RPC protocol (`rpc_protocol`).** Build identity does not say whether a head and
+a member speak the same RPC wire protocol, so the agent also reads the protocol
+version (`X.Y.Z`, the one `ggml-rpc-server` prints as `Starting RPC server vX.Y.Z`
+before it initialises devices or binds its port). For every allowed **native**
+`rpc-server` it runs `<path> -d CPU -H 127.0.0.1 -p <free loopback port>` (no
+shell, minimal environment, `-d CPU` so no GPU is initialised), reads the
+combined output until the banner line, kills the process at once and reports the
+protocol; output without a well-formed banner yields none. It uses the same 10 s
+timeout, (path, size, mtime) cache and retry backoff as the `--version` run. A
+`wsl://` `rpc-server` is never run (a process inside a distro cannot be killed
+reliably through `wsl.exe`, and a WSL rpc-server is never a cluster member) and
+carries no protocol. Binaries in one directory are one build, so the protocol is
+paired per directory in both directions: the `rpc-server` keeps its own protocol
+(and inherits version, build and commit as above), and the `llama-server` takes the
+protocol of the first `rpc-server` of its directory that has one. Pairing never
+crosses directories; a `llama-server` with no probed `rpc-server` beside it, and any
+other kind, has no `rpc_protocol` (the field is omitted when empty, and an agent
+older than 0.25.2 never sends it).
+
+A run that yields a version is cached by
 (path, size, mtime) for good. One that does not (the timeout on a loaded host,
 a failed exec, output without the line) is retried for the same bytes after a
 backoff, 30 s after the first failure and doubling up to an hour: a missing
