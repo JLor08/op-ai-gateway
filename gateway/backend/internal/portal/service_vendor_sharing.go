@@ -47,6 +47,17 @@ type SetVendorAccountShareLevelRequest struct {
 	AdminGroupIDs []string `json:"admin_group_ids"`
 }
 
+// SetVendorAccountShareUsageRequest is the body of PUT
+// /api/portal/vendor-accounts/{id}/share-usage: the owner's opt-in to show the
+// account's usage figures (the plan windows and spend, #407) to everyone allowed to
+// use it.
+//
+// Enabled is a pointer so a body without it is told apart from an explicit false:
+// the handler rejects a missing value instead of silently switching the opt-in off.
+type SetVendorAccountShareUsageRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
 // vendorShareLevelRank orders the share levels: none < shared < full. A level the
 // service does not know (a corrupt row) ranks with `none`: private, fail closed.
 func vendorShareLevelRank(level string) int {
@@ -96,6 +107,40 @@ func (s *Service) SetVendorAccountShareLevel(ctx context.Context, principal auth
 		return s.RaiseVendorAccountShareLevel(ctx, principal, id, target, req.AdminGroupIDs)
 	}
 	return s.LowerVendorAccountShareLevel(ctx, principal, id, target)
+}
+
+// SetVendorAccountShareUsage turns the owner's usage-sharing opt-in on or off (#407).
+// With it on, a member's read of the account carries its usage snapshot
+// (memberVendorAccountDTO) and Claude Code's responses carry the plan's rate-limit
+// headers. It is the OWNER's decision alone: the owner check of the raise gate (a CM or
+// a member, who can already see the account, is ErrVendorAccountForbidden; a stranger,
+// an unknown id and system scope are ErrVendorAccountNotFound), without the admin-role
+// requirement, since the figures are the owner's own. It is not gated on the sharing
+// flags and is allowed at any share level (the opt-in grants nothing while the account
+// is private). The vendor_accounts_enabled module flag answers first, as for every
+// vendor-account write. Returns the management view.
+func (s *Service) SetVendorAccountShareUsage(ctx context.Context, principal auth.Token, id string, req SetVendorAccountShareUsageRequest) (VendorAccountDTO, error) {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	acc, err := s.loadVendorAccount(ctx, id)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if !isVendorAccountOwner(principal, acc) {
+		if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+			return VendorAccountDTO{}, err
+		}
+		return VendorAccountDTO{}, ErrVendorAccountForbidden
+	}
+	if req.Enabled == nil {
+		return VendorAccountDTO{}, ErrVendorAccountShareUsageEnabledRequired
+	}
+	if err := s.routes.UpdateVendorAccountShareUsage(ctx, acc.ID, *req.Enabled); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	acc.ShareUsageWithMembers = *req.Enabled
+	return s.vendorAccountDTO(ctx, principal, acc)
 }
 
 // RaiseVendorAccountShareLevel raises an account to `shared` or `full` (spec

@@ -164,7 +164,7 @@ func periodStart(period string, now time.Time) time.Time {
 }
 
 // Admit decides whether a request from principal p may proceed, checking (in
-// order — the cheapest first, and returning on the FIRST breach per design
+// order — the cheapest first, the FIRST breach deciding per design
 // spec §6.1): the in-memory rate limit, then the persistent request quota,
 // token quota, and cost budget, each only if configured (threshold > 0 AND a
 // period is set). reason is one of "" (allowed), "rate", "request_quota",
@@ -187,38 +187,89 @@ func periodStart(period string, now time.Time) time.Time {
 // unconfigured principal) takes up to CacheTTL to be observed by Admit —
 // accepted, symmetric with the pre-existing aggregate-cache propagation delay.
 func (l *PrincipalLimiter) Admit(ctx context.Context, p Principal) (allow bool, reason string, retryAfter time.Duration) {
+	a := l.Evaluate(ctx, p)
+	return a.Allow, a.Reason, a.RetryAfter
+}
+
+// Admission is Evaluate's verdict: Admit's three results plus what admission
+// read to reach them (design spec §5 and §6). Standing carries one reading per
+// configured quota or budget so the handlers can describe a denial's blocking
+// limit, or a success's fullest limit, without any store I/O of their own.
+// At is the instant the verdict was taken, the "now" every reading's period and
+// reset were computed from.
+type Admission struct {
+	Allow      bool
+	Reason     string
+	RetryAfter time.Duration
+	At         time.Time
+	Standing   LimitStanding
+}
+
+// Evaluate is Admit with its readings kept. Everything Admit documents holds
+// (check order, nil-safety, caching, fail-open). It differs in one read pattern:
+// after the rate check it reads EVERY configured limit's aggregate before it
+// judges any breach, so a denial still knows the other limits (§6 picks the one
+// with the latest reset). Standing is nil when the principal has no configured
+// quota or budget, when the config read failed, or on a rate denial (which
+// stops before any read). An aggregate read that fails yields a Failed reading:
+// admission still fails open on it, but the reading cannot be mistaken for 0 %.
+func (l *PrincipalLimiter) Evaluate(ctx context.Context, p Principal) Admission {
 	if l == nil || l.store == nil {
-		return true, "", 0
+		return Admission{Allow: true}
 	}
 
 	now := l.now()
+	allowed := Admission{Allow: true, At: now}
 	cfg, ok := l.configFor(ctx, p, now)
 	if !ok {
 		// A store error on this read: fail open for THIS call only (never cache
 		// the failure — a transient blip must not entrench a false "no limits"
 		// verdict for the rest of the TTL window, and it must not disturb an
 		// already-cached good config either).
-		return true, "", 0
+		return allowed
 	}
 
 	if cfg == (routing.LimitConfig{}) {
-		return true, "", 0 // no limits configured at all: skip every check, including the rate bucket
+		return allowed // no limits configured at all: skip every check, including the rate bucket
 	}
 
 	if deny, wait := l.checkRate(p, cfg, now); deny {
-		return false, "rate", wait
+		return Admission{Reason: "rate", RetryAfter: wait, At: now}
 	}
 
-	if cfg.RequestQuota > 0 && cfg.RequestQuotaPeriod != "" {
-		reqs, _, _ := l.aggregate(ctx, p, cfg.RequestQuotaPeriod, now)
-		if reqs >= int64(cfg.RequestQuota) {
-			return false, "request_quota", 0
+	standing := l.readStanding(ctx, p, cfg, now)
+	allowed.Standing = standing
+	for _, r := range standing {
+		if r.breached() {
+			allowed.Allow, allowed.Reason = false, string(r.Kind)
+			break
 		}
 	}
-	if reason := l.spendBreach(ctx, p, cfg, now); reason != "" {
-		return false, reason, 0
+	return allowed
+}
+
+// readStanding reads every configured limit of cfg, in the fixed order request
+// quota, token quota, cost budget. A limit is configured when its threshold is
+// > 0 and its period is set, the same rule every other check here uses.
+func (l *PrincipalLimiter) readStanding(ctx context.Context, p Principal, cfg routing.LimitConfig, now time.Time) LimitStanding {
+	var standing LimitStanding
+	read := func(kind LimitKind, threshold float64, period string, pick func(reqs, toks int64, cost float64) float64) {
+		if threshold <= 0 || period == "" {
+			return
+		}
+		reqs, toks, cost, ok := l.aggregate(ctx, p, period, now)
+		standing = append(standing, LimitReading{
+			Kind: kind, Used: pick(reqs, toks, cost), Cap: threshold,
+			Period: period, Reset: routing.PeriodEnd(period, now), Failed: !ok,
+		})
 	}
-	return true, "", 0
+	read(LimitKindRequestQuota, float64(cfg.RequestQuota), cfg.RequestQuotaPeriod,
+		func(reqs, _ int64, _ float64) float64 { return float64(reqs) })
+	read(LimitKindTokenQuota, float64(cfg.TokenQuota), cfg.TokenQuotaPeriod,
+		func(_, toks int64, _ float64) float64 { return float64(toks) })
+	read(LimitKindCostBudget, cfg.CostBudget, cfg.CostBudgetPeriod,
+		func(_, _ int64, cost float64) float64 { return cost })
+	return standing
 }
 
 // Check decides whether principal p may go on consuming what it was already
@@ -255,13 +306,13 @@ func (l *PrincipalLimiter) Check(ctx context.Context, p Principal) (allow bool, 
 // that fails counts as zero (aggregate), so a store error never breaches.
 func (l *PrincipalLimiter) spendBreach(ctx context.Context, p Principal, cfg routing.LimitConfig, now time.Time) string {
 	if cfg.TokenQuota > 0 && cfg.TokenQuotaPeriod != "" {
-		_, toks, _ := l.aggregate(ctx, p, cfg.TokenQuotaPeriod, now)
+		_, toks, _, _ := l.aggregate(ctx, p, cfg.TokenQuotaPeriod, now)
 		if toks >= cfg.TokenQuota {
 			return "token_quota"
 		}
 	}
 	if cfg.CostBudget > 0 && cfg.CostBudgetPeriod != "" {
-		_, _, cost := l.aggregate(ctx, p, cfg.CostBudgetPeriod, now)
+		_, _, cost, _ := l.aggregate(ctx, p, cfg.CostBudgetPeriod, now)
 		if cost >= cfg.CostBudget {
 			return "cost_budget"
 		}
@@ -309,26 +360,28 @@ func (l *PrincipalLimiter) checkRate(p Principal, cfg routing.LimitConfig, now t
 // within the TTL, per design spec §6.2) or freshly loaded from the store. A
 // store error is Debug-logged and treated as a zero aggregate (fail-open —
 // zero is always <= any positive threshold, so this can never wrongly deny).
-func (l *PrincipalLimiter) aggregate(ctx context.Context, p Principal, period string, now time.Time) (requests, tokens int64, cost float64) {
+// ok is false on that error, so a caller that must tell "zero" from "unread"
+// (Evaluate's readings) can; callers keeping the fail-open semantics ignore it.
+func (l *PrincipalLimiter) aggregate(ctx context.Context, p Principal, period string, now time.Time) (requests, tokens int64, cost float64, ok bool) {
 	ps := periodStart(period, now)
 	key := aggregateCacheKey{Principal: p, period: period}
 
 	l.mu.Lock()
-	entry, ok := l.aggCache[key]
-	fresh := ok && entry.periodStart.Equal(ps) && now.Sub(entry.loadedAt) < l.cacheTTL
+	entry, hit := l.aggCache[key]
+	fresh := hit && entry.periodStart.Equal(ps) && now.Sub(entry.loadedAt) < l.cacheTTL
 	if fresh {
 		requests, tokens, cost = entry.requests, entry.tokens, entry.cost
 	}
 	l.mu.Unlock()
 	if fresh {
-		return requests, tokens, cost
+		return requests, tokens, cost, true
 	}
 
 	requests, tokens, cost, err := l.store.UsageAggregateSince(ctx, p.Type, p.ID, ps)
 	if err != nil {
 		slog.Debug("principal limiter: aggregate read failed, failing open",
 			"principal_type", p.Type, "principal_id", p.ID, "period", period, "err", err)
-		return 0, 0, 0
+		return 0, 0, 0, false
 	}
 
 	l.mu.Lock()
@@ -337,7 +390,7 @@ func (l *PrincipalLimiter) aggregate(ctx context.Context, p Principal, period st
 		periodStart: ps, loadedAt: now,
 	}
 	l.mu.Unlock()
-	return requests, tokens, cost
+	return requests, tokens, cost, true
 }
 
 // configFor returns principal p's LimitConfig, preferring a cached value that

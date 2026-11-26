@@ -441,7 +441,50 @@ import (
 // WebSocket to a managed child's /v1/realtime and holds the spec admitted for
 // the session. This is the ONE bump for the whole branch; later commits on it
 // do not bump again.
-const Version = "0.20.1"
+//
+// 0.20.1 -> 0.21.0 is the single bump for Strata support (#424). MINOR:
+// agent.Features gains the runtime_gpu_main_last entry (the
+// ${HOST_GPU_IDS_MAIN_LAST} placeholder) and the runtime_process_tree_job
+// entry (process-tree job supervision). This is the ONE bump for the whole
+// branch; later commits on it do not bump again.
+//
+// 0.21.0 -> 0.21.1 is a PATCH: the AMD Linux VRAM telemetry fix (#432) reads
+// rocm-smi 4.x output and adds a KFD per-process VRAM measurer. Hardware
+// capability, not a negotiated feature, so no agent.Features entry.
+//
+// 0.21.1 -> 0.22.0 is the single bump for the VM CPU power share. MINOR: a new
+// `server-agent hostpower` mode runs on a Proxmox VE host and publishes a
+// per-VM synthetic RAPL tree attributed by CPU time, and the agent gains the
+// powercap_root option (OP_AGENT_POWERCAP_ROOT / -powercap-root) so the
+// existing RAPL collector can read that tree mounted into a Linux guest. This
+// is the ONE bump for the whole branch; later commits on it do not bump again.
+//
+// 0.22.0 -> 0.23.0 is the single bump for the hostpower transports. MINOR: the
+// hostpower service gains a colon-free Windows virtiofs tree
+// (<vmid>/windows/intel-rapl_0), an optional HTTP endpoint (-listen, -auth,
+// -tokens) that identifies a VM by the bridge port its connection entered (MAC
+// mode) or by a per-VM token (token mode), and a `hostpower token` subcommand;
+// the agent gains the hostpower_url and hostpower_token options, a hostpower
+// HTTP power collector between the native and LHM collectors, and reads
+// powercap_root on Windows. This is the ONE bump for the whole branch; later
+// commits on it do not bump again.
+//
+// 0.23.0 -> 0.24.0 is the single bump for the privileged helper. MINOR: a new
+// `server-agent helper` mode runs as root and serves the RAPL counters and
+// SMBIOS memory modules over a peer-checked Unix socket, and the agent gains
+// the helper_socket option so an unprivileged Linux agent reads CPU/system
+// watts and memory modules from it. No wire change: the samples and system
+// reports keep their shape, so no agent.Features entry. This is the ONE bump
+// for the whole branch; later commits on it do not bump again.
+//
+// 0.24.0 -> 0.25.0 is the single bump for hostpower TLS. MINOR: the hostpower
+// service gains -tls, -tls-cert and -tls-key (TLS 1.3 with a self-generated or
+// operator-provided certificate) and a `hostpower tls fingerprint` subcommand;
+// the agent gains the hostpower_tls_fingerprint option, which pins the
+// hostpower endpoint's certificate by SHA-256. No wire change, so no
+// agent.Features entry. This is the ONE bump for the whole branch; later
+// commits on it do not bump again.
+const Version = "0.25.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -783,6 +826,25 @@ func tempLog(v *float64) any {
 // sources are individually bounded inside collector.CollectHardware).
 const hardwareCollectBudget = 15 * time.Second
 
+// defaultMemoryRetryInterval is how often Run retries the helper's memory
+// modules after the startup inventory came without them (the helper may start
+// seconds after the agent). Far below the 30 min system-report cadence on
+// purpose: that one would leave the inventory incomplete for half an hour.
+const defaultMemoryRetryInterval = 30 * time.Second
+
+// memoryRetryTimeout bounds one retried helper fetch. It runs on Run's
+// goroutine, so a wedged helper delays telemetry by at most this much.
+const memoryRetryTimeout = 2 * time.Second
+
+// memoryRetryInterval is defaultMemoryRetryInterval; a variable so tests need
+// no real 30 s waits.
+var memoryRetryInterval = defaultMemoryRetryInterval
+
+// helperMemoryModulesNeeded decides whether Run retries the helper fetch; a
+// variable so tests can drive the retry on a host that is not unprivileged
+// Linux.
+var helperMemoryModulesNeeded = collector.HelperMemoryModulesNeeded
+
 // Agent composes the host + GPU collectors, an optional scraper, and a poster
 // into a periodic telemetry loop.
 type Agent struct {
@@ -796,6 +858,13 @@ type Agent struct {
 	poster  poster
 	report  reporter
 	hw      *sample.SystemReport
+	// hwOpts carries the settings the hardware inventory depends on.
+	hwOpts collector.HardwareOptions
+	// fetchMemoryModules asks the privileged helper for the memory modules;
+	// nil without a helper socket. Run uses it to fill a.hw when the helper
+	// was not ready at startup. a.hw is touched only on Run's goroutine, so
+	// the retry runs there too.
+	fetchMemoryModules func(context.Context) ([]sample.MemoryModule, error)
 
 	// certSync is the Phase 2 certificate installer/syncer; nil when the
 	// caller has none to offer (every pre-Phase-2 test construction in this
@@ -1072,6 +1141,13 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		netifCollector:  d.Interfaces,
 		ifaces:          newInterfaceInventory(),
 		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries, wslProbeConfig{Exe: cfg.RuntimeWSLExe, User: cfg.RuntimeWSLUser}),
+		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket},
+	}
+	if cfg.HelperSocket != "" {
+		helper := collector.NewHelperHTTPClient(cfg.HelperSocket)
+		a.fetchMemoryModules = func(ctx context.Context) ([]sample.MemoryModule, error) {
+			return collector.FetchHelperMemoryModules(ctx, helper)
+		}
 	}
 	if r, ok := d.Poster.(reporter); ok {
 		a.report = r
@@ -1168,7 +1244,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.binaries != nil {
 		go a.binaries.run(ctx)
 	}
-	hw := collectHardware(ctx, a.gpus)
+	hw := collectHardware(ctx, a.gpus, a.hwOpts)
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
 	// so the pinned/force_running specs it admits at boot already see their
@@ -1220,6 +1296,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	if logTicker != nil {
 		defer logTicker.Stop()
 	}
+	memRetry, memRetryC := a.newMemoryRetryTicker()
+	if memRetry != nil {
+		defer memRetry.Stop()
+	}
 
 	for {
 		select {
@@ -1258,6 +1338,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.runtimeLogPort.SetLogWatch(data)
 		case <-logTickerC:
 			a.flushRuntimeLogs(ctx)
+		case <-memRetryC:
+			if a.retryMemoryModules(ctx) {
+				memRetry.Stop()
+				memRetryC = nil
+			}
 		case <-a.runtimeTransitions:
 			// A member that started, stopped or began draining gains or
 			// loses its relay first: a drain must close the head's session
@@ -1586,10 +1671,47 @@ func (a *Agent) seedCertReport() {
 }
 
 // collectHardware gathers the static inventory once, bounded by hardwareCollectBudget.
-func collectHardware(ctx context.Context, gpus []collector.GPUCollector) sample.SystemReport {
+func collectHardware(ctx context.Context, gpus []collector.GPUCollector, opts collector.HardwareOptions) sample.SystemReport {
 	cctx, cancel := context.WithTimeout(ctx, hardwareCollectBudget)
 	defer cancel()
-	return collector.CollectHardware(cctx, gpus, Version)
+	return collector.CollectHardware(cctx, gpus, Version, opts)
+}
+
+// newMemoryRetryTicker starts the helper memory-module retry when the startup
+// inventory lacks modules the helper could supply; nil ticker and channel
+// otherwise (a nil channel never fires in Run's select).
+func (a *Agent) newMemoryRetryTicker() (*time.Ticker, <-chan time.Time) {
+	if a.fetchMemoryModules == nil || a.hw == nil || !helperMemoryModulesNeeded(*a.hw, a.hwOpts) {
+		return nil, nil
+	}
+	t := time.NewTicker(memoryRetryInterval)
+	return t, t.C
+}
+
+// retryMemoryModules fetches the memory modules from the helper once and
+// reports whether the retry is done. A failure is logged at Debug (the helper
+// may not be installed) and keeps the retry going. A success ends it; when it
+// carries modules they replace the cached inventory's, which is sent again.
+func (a *Agent) retryMemoryModules(ctx context.Context) bool {
+	fctx, cancel := context.WithTimeout(ctx, memoryRetryTimeout)
+	defer cancel()
+	mods, err := a.fetchMemoryModules(fctx)
+	if err != nil {
+		slog.Debug("helper memory modules not available yet", "err", err)
+		return false
+	}
+	if len(mods) == 0 {
+		slog.Info("helper reports no memory modules")
+		return true
+	}
+	// A fresh copy rather than an in-place edit: the reporter got the old
+	// pointer and must not see it change under it.
+	hw := *a.hw
+	hw.Memory.Modules = mods
+	a.hw = &hw
+	slog.Info("memory modules received from the helper", "modules", len(mods))
+	a.sendSystemReport(ctx)
+	return true
 }
 
 // sendSystemReport pushes the cached inventory (best-effort; a failure is logged).
@@ -1785,8 +1907,14 @@ type runtimeCapabilityEntry struct {
 //     literal copies of its type strings.)
 func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st runtimectl.Status, rs *sample.RuntimeSample) {
 	base := "http://127.0.0.1:" + strconv.Itoa(st.Port)
+	// A spec with a token authenticates every probe below (#424): a keyed
+	// child (Strata, an api-key'd llama-server) answers 401 on everything but
+	// its health path otherwise. The context and capability probes read the
+	// credential from ctx; the metrics scrape takes the same pair explicitly.
+	authHeader, authValue := childProbeAuth(st)
+	ctx = collector.WithProbeAuth(ctx, authHeader, authValue)
 
-	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, st, rs)
+	rs.MetricsProbe = probeRuntimeChildMetrics(ctx, client, base, authHeader, authValue, st, rs)
 	rs.ContextProbe = a.probeRuntimeChildContext(ctx, client, base, st, rs)
 	if st.Type == "vllm_sr" || st.Type == "sglang" || st.Type == "sglang_omni" {
 		// No capability probe: the vLLM Semantic Router worker and the SGLang
@@ -1795,6 +1923,22 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 		return
 	}
 	a.probeRuntimeChildProps(ctx, client, base, st, rs)
+}
+
+// childProbeAuth is the credential header the agent's own probes of st's
+// child send: none for a spec without a token (today's behaviour), else the
+// token in the spec's effective header -- "Authorization: Bearer <token>" when
+// the spec names no header, the raw token under a named one, exactly as the
+// gateway authenticates its own requests to the child (provider's
+// setUpstreamAuth).
+func childProbeAuth(st runtimectl.Status) (header, value string) {
+	if st.APIToken == "" {
+		return "", ""
+	}
+	if st.APITokenHeader != "" {
+		return st.APITokenHeader, st.APIToken
+	}
+	return "Authorization", "Bearer " + st.APIToken
 }
 
 // probeRuntimeChildMetrics runs probeRuntimeChild's metrics-scrape half and
@@ -1809,7 +1953,10 @@ func (a *Agent) probeRuntimeChild(ctx context.Context, client *http.Client, st r
 // could re-parse the URL's Host off-loopback. Skip the probe rather than dial
 // it, and report it as unreachable: a path IS configured, it just cannot be
 // used.
-func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base string, st runtimectl.Status, rs *sample.RuntimeSample) string {
+//
+// authHeader/authValue are the credential probeRuntimeChild computed once
+// (childProbeAuth); an empty header sends none.
+func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base, authHeader, authValue string, st runtimectl.Status, rs *sample.RuntimeSample) string {
 	if st.MetricsPath == "" {
 		return "na"
 	}
@@ -1818,7 +1965,7 @@ func probeRuntimeChildMetrics(ctx context.Context, client *http.Client, base str
 		return "unreachable"
 	}
 	cctx, cancel := context.WithTimeout(ctx, collectTimeout)
-	active, queue, err := collector.NewScraper(base+st.MetricsPath, client).Scrape(cctx)
+	active, queue, err := collector.NewPromScraper(base+st.MetricsPath, client, authHeader, authValue).Scrape(cctx)
 	cancel()
 	if err != nil {
 		slog.Debug("runtime metrics probe failed", "spec_id", st.SpecID, "err", err)

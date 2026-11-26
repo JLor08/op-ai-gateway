@@ -11,13 +11,13 @@ import (
 	"time"
 )
 
-// TestMigration110AddsLANInterfaceColumns runs migration 110 over a genuine
-// version-109 database and pins what an upgrade depends on: the three columns
+// TestMigration116AddsLANInterfaceColumns runs migration 116 over a genuine
+// version-115 database and pins what an upgrade depends on: the three columns
 // are absent before and present after with the declared defaults, a server that
 // already has a lan_address resolves "manual", one without resolves "auto", and
 // no server has reported interfaces yet (” = never reported).
-func TestMigration110AddsLANInterfaceColumns(t *testing.T) {
-	forEachDialectMigratedTo(t, 109, func(t *testing.T, s *SQLStore) {
+func TestMigration116AddsLANInterfaceColumns(t *testing.T) {
+	forEachDialectMigratedTo(t, 115, func(t *testing.T, s *SQLStore) {
 		ctx := context.Background()
 		now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
 		want := map[string]string{
@@ -28,19 +28,19 @@ func TestMigration110AddsLANInterfaceColumns(t *testing.T) {
 		before := tableColumnDecls(ctx, t, s, "ai_servers")
 		for c := range want {
 			if _, ok := before[c]; ok {
-				t.Fatalf("ai_servers already has %s at v109", c)
+				t.Fatalf("ai_servers already has %s at v115", c)
 			}
 		}
 		seedBaselineServer(ctx, t, s, routing.AIServer{
-			ID: "srv_m110_lan", Name: "m110-lan", Provider: routing.ProviderVLLM,
-			Endpoint: "http://srv_m110_lan:8000",
+			ID: "srv_m116_lan", Name: "m116-lan", Provider: routing.ProviderVLLM,
+			Endpoint: "http://srv_m116_lan:8000",
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
 		})
-		mustExec(ctx, t, s, `update ai_servers set lan_address = ? where id = ?`, "192.0.2.20", "srv_m110_lan")
+		mustExec(ctx, t, s, `update ai_servers set lan_address = ? where id = ?`, "192.0.2.20", "srv_m116_lan")
 		seedBaselineServer(ctx, t, s, routing.AIServer{
-			ID: "srv_m110_none", Name: "m110-none", Provider: routing.ProviderVLLM,
-			Endpoint: "http://srv_m110_none:8000",
+			ID: "srv_m116_none", Name: "m116-none", Provider: routing.ProviderVLLM,
+			Endpoint: "http://srv_m116_none:8000",
 			Status:   routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 			CreatedAt: now, UpdatedAt: now,
 		})
@@ -55,7 +55,7 @@ func TestMigration110AddsLANInterfaceColumns(t *testing.T) {
 			}
 		}
 		for id, wantSource := range map[string]string{
-			"srv_m110_lan": routing.LANSourceManual, "srv_m110_none": routing.LANSourceAuto,
+			"srv_m116_lan": routing.LANSourceManual, "srv_m116_none": routing.LANSourceAuto,
 		} {
 			got, err := s.AIServerByID(ctx, id)
 			if err != nil {
@@ -68,21 +68,21 @@ func TestMigration110AddsLANInterfaceColumns(t *testing.T) {
 		}
 
 		// A replay is a no-op and must not rewrite an operator's later choice.
-		if err := s.UpdateServerLANInterfaces(ctx, "srv_m110_none", `[]`); err != nil {
+		if err := s.UpdateServerLANInterfaces(ctx, "srv_m116_none", `[]`); err != nil {
 			t.Fatalf("report empty: %v", err)
 		}
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			t.Fatalf("begin tx: %v", err)
 		}
-		if err := migration110Up(ctx, tx, s.dl); err != nil {
+		if err := migration116Up(ctx, tx, s.dl); err != nil {
 			_ = tx.Rollback()
 			t.Fatalf("replay: %v", err)
 		}
 		if err := tx.Commit(); err != nil {
 			t.Fatalf("commit replay: %v", err)
 		}
-		got, err := s.AIServerByID(ctx, "srv_m110_none")
+		got, err := s.AIServerByID(ctx, "srv_m116_none")
 		if err != nil {
 			t.Fatal(err)
 		}

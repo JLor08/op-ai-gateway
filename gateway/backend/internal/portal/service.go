@@ -44,6 +44,8 @@ const (
 	// exported so internal/gateway/portal_vendor_account_endpoints.go shares the
 	// exact value instead of re-hardcoding it.
 	CodeVendorAccountNotFound = "vendor_account.not_found"
+	// CodeVendorGroupNotFound is ErrVendorGroupNotFound's API error code.
+	CodeVendorGroupNotFound = "vendor_account_group.not_found"
 )
 
 var (
@@ -63,7 +65,26 @@ var (
 	// ErrTokenVendorAccessConflict: with all=false, two of the selected accounts
 	// would advertise the same public model name under their effective prefixes.
 	ErrTokenVendorAccessConflict = errors.New("portal.token_vendor_access_conflict")
-	ErrTokenNotDeletable         = errors.New("token.not_deletable")
+	// ErrTokenClaudeCodeUsageDisplayRequiresRotation: an update asked to change
+	// claude_code_usage_display. The flag shapes the token's secret, so it
+	// changes only through rotation (a PATCH with the stored value is a no-op).
+	ErrTokenClaudeCodeUsageDisplayRequiresRotation = errors.New("portal.token_claude_code_usage_display_requires_rotation")
+	ErrTokenNotDeletable                           = errors.New("token.not_deletable")
+
+	// Vendor account groups (spec 2026-11-24). The not-found answer is the same for a
+	// stranger's group and an unknown id. The member, prefix and threshold failures
+	// are all validation errors (400).
+	ErrVendorGroupNotFound             = errors.New(CodeVendorGroupNotFound)
+	ErrVendorGroupForbidden            = errors.New("vendor_account_group.forbidden")
+	ErrVendorGroupNameRequired         = errors.New("vendor_account_group.name_required")
+	ErrVendorGroupVendorInvalid        = errors.New("vendor_account_group.vendor_invalid")
+	ErrVendorGroupModelPrefixInvalid   = errors.New("vendor_account_group.model_prefix_invalid")
+	ErrVendorGroupStatusInvalid        = errors.New("vendor_account_group.status_invalid")
+	ErrVendorGroupThresholdInvalid     = errors.New("vendor_account_group.threshold_invalid")
+	ErrVendorGroupMemberVendorMismatch = errors.New("vendor_account_group.member_vendor_mismatch")
+	ErrVendorGroupMemberUnreachable    = errors.New("vendor_account_group.member_unreachable")
+	ErrVendorGroupMemberDuplicate      = errors.New("vendor_account_group.member_duplicate")
+	ErrVendorGroupPrefixConflict       = errors.New("vendor_account_group.prefix_conflict")
 
 	ErrServerNotFound       = errors.New(CodeServerNotFound)
 	ErrServerForbidden      = errors.New("server.forbidden")
@@ -201,16 +222,19 @@ var (
 	// ErrVendorAccountNotShared: the request needs a shared account (management groups
 	// can only be assigned to one that is `shared` or `full`) and the account is not
 	// one. Asked of the owner only, after the 404/403 gate. A 400.
-	ErrVendorAccountSharingDisabled          = errors.New("vendor_accounts.sharing_disabled")
-	ErrVendorSubscriptionSharingDisabled     = errors.New("vendor_accounts.subscription_sharing_disabled")
-	ErrVendorAccountSubscriptionShareCapped  = errors.New("vendor_account.subscription_share_capped")
-	ErrVendorAccountShareLevelInvalid        = errors.New("vendor_account.share_level_invalid")
-	ErrVendorAccountShareLevelUnchanged      = errors.New("vendor_account.share_level_unchanged")
-	ErrVendorAccountAdminGroupRequired       = errors.New("vendor_account.admin_group_required")
-	ErrVendorAccountAdminGroupInvalid        = errors.New("vendor_account.admin_group_invalid")
-	ErrVendorAccountAdminGroupParentMismatch = errors.New("vendor_account.admin_group_parent_mismatch")
-	ErrVendorAccountRootMismatch             = errors.New("vendor_account.root_mismatch")
-	ErrVendorAccountNotShared                = errors.New("vendor_account.not_shared")
+	ErrVendorAccountSharingDisabled         = errors.New("vendor_accounts.sharing_disabled")
+	ErrVendorSubscriptionSharingDisabled    = errors.New("vendor_accounts.subscription_sharing_disabled")
+	ErrVendorAccountSubscriptionShareCapped = errors.New("vendor_account.subscription_share_capped")
+	ErrVendorAccountShareLevelInvalid       = errors.New("vendor_account.share_level_invalid")
+	ErrVendorAccountShareLevelUnchanged     = errors.New("vendor_account.share_level_unchanged")
+	// ErrVendorAccountShareUsageEnabledRequired: a PUT .../share-usage body without
+	// `enabled` (a 400, answered after the 404/403 gate; nothing is written).
+	ErrVendorAccountShareUsageEnabledRequired = errors.New("vendor_account.share_usage_enabled_required")
+	ErrVendorAccountAdminGroupRequired        = errors.New("vendor_account.admin_group_required")
+	ErrVendorAccountAdminGroupInvalid         = errors.New("vendor_account.admin_group_invalid")
+	ErrVendorAccountAdminGroupParentMismatch  = errors.New("vendor_account.admin_group_parent_mismatch")
+	ErrVendorAccountRootMismatch              = errors.New("vendor_account.root_mismatch")
+	ErrVendorAccountNotShared                 = errors.New("vendor_account.not_shared")
 
 	// Subscription connect (the OAuth code-paste flow and the token import).
 	// ErrVendorAccountNotSubscription: connect operates on an auth_type
@@ -292,6 +316,10 @@ type TokenRepository interface {
 	UpdateTokenMetadata(ctx context.Context, token store.TokenRecord) error
 	DeleteToken(ctx context.Context, id string) error
 	RotateTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, updatedAt time.Time) error
+	// RotateUserTokenSecret is RotateTokenSecret for a USER token: it also
+	// writes api_tokens.claude_code_usage_display in the same write, since the
+	// flag decides the shape of the secret being stored.
+	RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error
 	// SetTokenLastUsedModel records the gateway model or group name of a token's
 	// last SUCCESSFULLY routed request (the api_tokens.last_used_model column),
 	// or returns store.ErrNotFound when no token has that id — including the empty
@@ -848,6 +876,8 @@ type netbirdState struct {
 }
 
 type Service struct {
+	// vendorCooldowns is the routing limit-cooldown registry (nil: none shown).
+	vendorCooldowns   *routing.VendorLimitCooldowns
 	users             UserReader
 	tokens            TokenRepository
 	usage             usage.Store
@@ -944,6 +974,9 @@ type Service struct {
 	// vendor (in memory, zero value ready), so the on-view lazy usage refresh can
 	// skip a pull that is still fresh (see vendorUsagePullTracker).
 	vendorUsagePulls vendorUsagePullTracker
+	// vendorGroupPulls is the in-memory throttle of the group-triggered usage pull
+	// (RequestVendorUsagePull; zero value ready).
+	vendorGroupPulls vendorGroupPullState
 	// vendorDeviceConnect holds the OPTIONAL device-code connect flow's in-memory
 	// pending state (see vendorDeviceConnectState). It reuses vendorConnect's
 	// OpenAI endpoints and http client, so it needs no wiring of its own.
@@ -1130,6 +1163,15 @@ func (s *Service) SetVendorTokenRefresher(fn VendorTokenRefresher) {
 	s.vendorDiscovery.tokenRefresher = fn
 }
 
+// SetVendorLimitCooldowns hands the service the gateway's process-local registry of
+// vendor limit cooldowns, so a group's member status shows the cooldowns routing
+// applies. A setter for the same reason as SetVendorTokenRefresher: the registry
+// belongs to the gateway Server, built after the Service. nil (the default) shows no
+// cooldowns. Call it once at startup; it is not synchronised.
+func (s *Service) SetVendorLimitCooldowns(c *routing.VendorLimitCooldowns) {
+	s.vendorCooldowns = c
+}
+
 type CurrentUser struct {
 	ID                             string `json:"id"`
 	Email                          string `json:"email"`
@@ -1254,6 +1296,18 @@ type TokenDTO struct {
 	// default and ungated like ClaudeModelAliases; always emitted so a client
 	// reading a token and writing it back preserves it.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// ClaudeCodeUsageDisplay reports that the token's secret carries the Claude
+	// Code shape, so Claude Code shows the usage limits. Always emitted. It
+	// changes only through rotation (RotateTokenRequest).
+	ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
+	// SendUsageLimits opts the token into receiving the gateway's usage-limit
+	// headers in a coding client (#420). Plain opt-in flag, off by default and
+	// ungated; always emitted so a client reading a token and writing it back
+	// preserves it.
+	SendUsageLimits bool `json:"send_usage_limits"`
+	// CodexModelSwitchPrompt opts the token into the Codex CLI's model-switch
+	// popup (#420). Same shape as SendUsageLimits.
+	CodexModelSwitchPrompt bool `json:"codex_model_switch_prompt"`
 }
 
 // VendorAccessDTO is a token's vendor-account access policy on the wire. All
@@ -1263,9 +1317,23 @@ type TokenDTO struct {
 // covered by All: it is used only when Accounts names it, with an optional prefix
 // override (the per-account opt-in, ADR-050). Mirrors the stored
 // vendor_provider_access shape (see store.DecodeVendorAccess).
+//
+// IncludeGroups (honored only together with All) additionally covers every active
+// vendor account group the principal owns, under the group's own prefix; Groups opts
+// individual own groups in, with the same optional prefix override as an account
+// entry. A service owns no group, so a service token carrying either is invalid.
 type VendorAccessDTO struct {
-	All      bool                   `json:"all"`
-	Accounts []VendorAccessEntryDTO `json:"accounts"`
+	All           bool                   `json:"all"`
+	IncludeGroups bool                   `json:"include_groups,omitempty"`
+	Accounts      []VendorAccessEntryDTO `json:"accounts"`
+	Groups        []VendorAccessGroupDTO `json:"groups,omitempty"`
+}
+
+// VendorAccessGroupDTO opts one vendor account group in, by its id: one the
+// principal owns. PrefixOverride is the one the account entries use.
+type VendorAccessGroupDTO struct {
+	GroupID        string             `json:"group_id"`
+	PrefixOverride *PrefixOverrideDTO `json:"prefix_override,omitempty"`
 }
 
 // VendorAccessEntryDTO opts one vendor account in, by its stable account id: one
@@ -1328,6 +1396,23 @@ type CreateTokenRequest struct {
 	// DecisionsConfidenceNormalize opts the token into recomputed decision
 	// confidence (see TokenDTO). Off when omitted.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// ClaudeCodeUsageDisplay gives the new token's secret the Claude Code shape
+	// (see claudeCodeTokenSecret). Off when omitted.
+	ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
+	// SendUsageLimits opts the new token into the usage-limit headers (see
+	// TokenDTO). Off when omitted.
+	SendUsageLimits bool `json:"send_usage_limits"`
+	// CodexModelSwitchPrompt opts the new token into the Codex CLI's
+	// model-switch popup (see TokenDTO). Off when omitted.
+	CodexModelSwitchPrompt bool `json:"codex_model_switch_prompt"`
+}
+
+// RotateTokenRequest is the optional body of a token rotation.
+type RotateTokenRequest struct {
+	// ClaudeCodeUsageDisplay: nil = keep the stored shape, a non-nil value
+	// switches the token to it. Rotation is the only way to change the flag,
+	// because the secret has to change with it.
+	ClaudeCodeUsageDisplay *bool `json:"claude_code_usage_display,omitempty"`
 }
 
 type CreateTokenResponse struct {
@@ -1373,6 +1458,15 @@ type UpdateTokenRequest struct {
 	// DecisionsConfidenceNormalize: nil = keep the stored flag, a non-nil value
 	// replaces it.
 	DecisionsConfidenceNormalize *bool `json:"decisions_confidence_normalize,omitempty"`
+	// ClaudeCodeUsageDisplay: nil or equal to the stored value = no-op; a
+	// different value is ErrTokenClaudeCodeUsageDisplayRequiresRotation (the
+	// secret has to change with it, see RotateTokenRequest).
+	ClaudeCodeUsageDisplay *bool `json:"claude_code_usage_display,omitempty"`
+	// SendUsageLimits: nil = keep the stored flag, a non-nil value replaces it.
+	SendUsageLimits *bool `json:"send_usage_limits,omitempty"`
+	// CodexModelSwitchPrompt: nil = keep the stored flag, a non-nil value
+	// replaces it.
+	CodexModelSwitchPrompt *bool `json:"codex_model_switch_prompt,omitempty"`
 }
 
 type DashboardResponse struct {
@@ -1908,7 +2002,8 @@ func (s *Service) UserTokens(ctx context.Context, principal auth.Token, userID s
 
 // tokensForUser lists userID's real tokens with the synthetic, non-deletable
 // ChatSession row prepended, carrying that user's profile chat flags. A user
-// lookup failure falls back to false/false rather than failing the whole list;
+// lookup failure falls back to false/false (and omits the chat row's
+// vendor_access, so the editor stays disabled) rather than failing the whole list;
 // the frontend localizes the display name via is_chat_session.
 func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListResponse, error) {
 	records, err := s.tokens.TokensByUser(ctx, userID)
@@ -1916,10 +2011,12 @@ func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListRe
 		return TokenListResponse{}, err
 	}
 	var chatLog, chatSecret bool
+	var chatVendorAccess *VendorAccessDTO
 	if s.users != nil {
 		if user, err := s.users.UserByID(ctx, userID); err == nil {
 			chatLog = user.ChatLogCommunication
 			chatSecret = user.ChatSecret
+			chatVendorAccess = chatSessionVendorAccessDTO(user.ChatVendorAccess)
 		}
 	}
 	chat := TokenDTO{
@@ -1929,6 +2026,7 @@ func (s *Service) tokensForUser(ctx context.Context, userID string) (TokenListRe
 		Scopes:           []string{},
 		LogCommunication: chatLog,
 		Secret:           chatSecret,
+		VendorAccess:     chatVendorAccess,
 		IsChatSession:    true,
 		Deletable:        false,
 	}
@@ -2021,6 +2119,12 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		ClaudeModelAliases:           req.ClaudeModelAliases,
 		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
+		ClaudeCodeUsageDisplay:       req.ClaudeCodeUsageDisplay,
+		SendUsageLimits:              req.SendUsageLimits,
+		CodexModelSwitchPrompt:       req.CodexModelSwitchPrompt,
+	}
+	if req.ClaudeCodeUsageDisplay {
+		secret = claudeCodeTokenSecret(secret)
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateTokenResponse{}, err
@@ -2051,6 +2155,12 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	// the same request — can be half-written on a refusal.
 	if req.ClaudeEffortCompatibility != nil && !principalMayManageTokenSetting(owner) {
 		return TokenDTO{}, ErrPrincipalForbidden
+	}
+	// The flag shapes the secret, so only a rotation may change it; the same
+	// value is accepted (a client writing a token back unchanged). Checked
+	// before any field is applied, like the refusal above.
+	if req.ClaudeCodeUsageDisplay != nil && *req.ClaudeCodeUsageDisplay != record.ClaudeCodeUsageDisplay {
+		return TokenDTO{}, ErrTokenClaudeCodeUsageDisplayRequiresRotation
 	}
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
@@ -2129,6 +2239,12 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.DecisionsConfidenceNormalize != nil {
 		record.DecisionsConfidenceNormalize = *req.DecisionsConfidenceNormalize
+	}
+	if req.SendUsageLimits != nil {
+		record.SendUsageLimits = *req.SendUsageLimits
+	}
+	if req.CodexModelSwitchPrompt != nil {
+		record.CodexModelSwitchPrompt = *req.CodexModelSwitchPrompt
 	}
 	if req.ProjectID != nil {
 		projectID, err := s.assignTokenProject(ctx, owner.UserID, *req.ProjectID)
@@ -2215,8 +2331,10 @@ func (s *Service) DeleteToken(ctx context.Context, owner auth.Token, tokenID str
 // stops working immediately; the fresh secret is returned once, exactly like
 // CreateToken, so the frontend reuses the reveal flow. The chat-session pseudo
 // id has no stored secret and is rejected as not-found. Owner-scoped: a foreign
-// or missing token is ErrTokenNotFound with no existence leak.
-func (s *Service) RotateToken(ctx context.Context, owner auth.Token, id string) (CreateTokenResponse, error) {
+// or missing token is ErrTokenNotFound with no existence leak. The secret keeps
+// the token's Claude Code shape; req.ClaudeCodeUsageDisplay switches it, and
+// the flag is stored together with the new hash so the two never disagree.
+func (s *Service) RotateToken(ctx context.Context, owner auth.Token, id string, req RotateTokenRequest) (CreateTokenResponse, error) {
 	id = strings.TrimSpace(id)
 	if id == "" || id == ChatSessionTokenID {
 		return CreateTokenResponse{}, ErrTokenNotFound
@@ -2230,7 +2348,13 @@ func (s *Service) RotateToken(ctx context.Context, owner auth.Token, id string) 
 		return CreateTokenResponse{}, err
 	}
 	now := s.clock().UTC()
-	if err := s.tokens.RotateTokenSecret(ctx, record.ID, auth.HashSecret(secret), secretPrefix(secret), now); err != nil {
+	if req.ClaudeCodeUsageDisplay != nil {
+		record.ClaudeCodeUsageDisplay = *req.ClaudeCodeUsageDisplay
+	}
+	if record.ClaudeCodeUsageDisplay {
+		secret = claudeCodeTokenSecret(secret)
+	}
+	if err := s.tokens.RotateUserTokenSecret(ctx, record.ID, auth.HashSecret(secret), secretPrefix(secret), record.ClaudeCodeUsageDisplay, now); err != nil {
 		return CreateTokenResponse{}, err
 	}
 	record.SecretPrefix = secretPrefix(secret)
@@ -3775,6 +3899,8 @@ func viewRuntimeType(view mappingView, idx runtimeSpecIndex) routing.RuntimeSpec
 		return routing.RuntimeSpecTypeAudioCpp
 	case routing.ProviderVllmSR:
 		return routing.RuntimeSpecTypeVllmSR
+	case routing.ProviderStrata:
+		return routing.RuntimeSpecTypeStrata
 	}
 	return ""
 }
@@ -5942,6 +6068,8 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
+		SendUsageLimits:                record.SendUsageLimits,
+		CodexModelSwitchPrompt:         record.CodexModelSwitchPrompt,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden
@@ -5980,6 +6108,9 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
+		ClaudeCodeUsageDisplay:         record.ClaudeCodeUsageDisplay,
+		SendUsageLimits:                record.SendUsageLimits,
+		CodexModelSwitchPrompt:         record.CodexModelSwitchPrompt,
 	}
 }
 
@@ -5992,7 +6123,17 @@ func encodeVendorAccessDTO(d *VendorAccessDTO) string {
 	if d == nil {
 		return ""
 	}
-	v := auth.VendorAccess{All: d.All}
+	// include_groups only means something next to all (spec 5.1); anything else is
+	// dropped rather than stored as a flag that does nothing.
+	v := auth.VendorAccess{All: d.All, IncludeGroups: d.All && d.IncludeGroups}
+	for _, e := range d.Groups {
+		entry := auth.VendorAccessGroupEntry{GroupID: strings.TrimSpace(e.GroupID)}
+		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
+			entry.OverrideEnabled = true
+			entry.OverridePrefix = strings.TrimSpace(e.PrefixOverride.Value)
+		}
+		v.Groups = append(v.Groups, entry)
+	}
 	for _, e := range d.Accounts {
 		entry := auth.VendorAccessEntry{AccountID: strings.TrimSpace(e.AccountID)}
 		if e.PrefixOverride != nil && e.PrefixOverride.Enabled {
@@ -6009,11 +6150,23 @@ func encodeVendorAccessDTO(d *VendorAccessDTO) string {
 // strict default (blank, malformed, or empty) so the field is omitted.
 func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 	v := store.DecodeVendorAccess(s)
-	if !v.All && len(v.Accounts) == 0 {
+	if !v.All && len(v.Accounts) == 0 && len(v.Groups) == 0 {
 		return nil
 	}
-	// Accounts is always an array on the wire (never null), even for all=true.
-	d := &VendorAccessDTO{All: v.All, Accounts: []VendorAccessEntryDTO{}}
+	return vendorAccessToDTO(v)
+}
+
+// vendorAccessToDTO renders a policy as the wire shape; Accounts is always an
+// array on the wire (never null), even for all=true or an empty policy.
+func vendorAccessToDTO(v auth.VendorAccess) *VendorAccessDTO {
+	d := &VendorAccessDTO{All: v.All, IncludeGroups: v.All && v.IncludeGroups, Accounts: []VendorAccessEntryDTO{}}
+	for _, e := range v.Groups {
+		entry := VendorAccessGroupDTO{GroupID: e.GroupID}
+		if e.OverrideEnabled {
+			entry.PrefixOverride = &PrefixOverrideDTO{Enabled: true, Value: e.OverridePrefix}
+		}
+		d.Groups = append(d.Groups, entry)
+	}
 	for _, e := range v.Accounts {
 		entry := VendorAccessEntryDTO{AccountID: e.AccountID}
 		if e.OverrideEnabled {
@@ -6022,6 +6175,15 @@ func decodeVendorAccessDTO(s string) *VendorAccessDTO {
 		d.Accounts = append(d.Accounts, entry)
 	}
 	return d
+}
+
+// chatSessionVendorAccessDTO renders users.chat_vendor_provider_access for the
+// synthetic chat-session row. Unlike decodeVendorAccessDTO it is never nil: the
+// zero policy is an explicit "no providers" choice there and must stay distinct
+// from the unset default (all accounts and groups), which store.ChatSessionVendorAccess
+// owns.
+func chatSessionVendorAccessDTO(encoded string) *VendorAccessDTO {
+	return vendorAccessToDTO(store.ChatSessionVendorAccess(encoded))
 }
 
 // userTokenPrincipal is the principal a USER token acts as: the owning user, and
@@ -6067,11 +6229,15 @@ func serviceTokenPrincipal(serviceID string) auth.Token {
 // the grant fails CLOSED (VendorAccountsForRouting), so a store error there reads as
 // "not reachable" -- the same answer routing gives in that window.
 func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token, d *VendorAccessDTO) error {
-	if d == nil || len(d.Accounts) == 0 {
+	includesGroups := d != nil && (len(d.Groups) > 0 || d.IncludeGroups)
+	if includesGroups && principal.IsService() {
+		return fmt.Errorf("%w: a service owns no vendor account group", ErrTokenVendorAccessInvalid)
+	}
+	if d == nil || (len(d.Accounts) == 0 && len(d.Groups) == 0 && !(d.All && d.IncludeGroups)) {
 		return nil
 	}
 	if s.routes == nil {
-		if d.All {
+		if d.All && len(d.Groups) == 0 {
 			return nil
 		}
 		return fmt.Errorf("%w: vendor accounts unavailable", ErrTokenVendorAccessInvalid)
@@ -6081,9 +6247,16 @@ func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token
 		return err
 	}
 	check := vendorAccessCheck{
-		byID:  byID,
-		seen:  make(map[string]struct{}, len(d.Accounts)),
-		names: make(map[string]string),
+		byID:         byID,
+		seen:         make(map[string]struct{}, len(d.Accounts)),
+		names:        make(map[string]string),
+		groupMembers: make(map[string]map[string]struct{}),
+		groupNames:   make(map[string]string),
+	}
+	// Groups first: an account entry that names one of a group's members must know
+	// the group's members to tell "shadowed by the group" from a real clash.
+	if err := s.claimVendorAccessGroups(ctx, principal, byID, d, &check); err != nil {
+		return err
 	}
 	for _, e := range d.Accounts {
 		if d.All && coveredByAll(principal, byID, e) {
@@ -6092,6 +6265,9 @@ func (s *Service) validateVendorAccess(ctx context.Context, principal auth.Token
 		if err := s.checkVendorAccessEntry(ctx, &check, e); err != nil {
 			return err
 		}
+	}
+	if d.All {
+		return s.checkOwnAccountsAgainstGroups(ctx, principal, &check)
 	}
 	return nil
 }
@@ -6107,7 +6283,40 @@ func coveredByAll(principal auth.Token, byID map[string]routing.VendorAccount, e
 type vendorAccessCheck struct {
 	byID  map[string]routing.VendorAccount // the accounts the principal can reach, by id
 	seen  map[string]struct{}              // account ids already listed in the policy
-	names map[string]string                // effective public name -> id of the account that first produced it
+	names map[string]string                // effective public name -> id of the account or group that first produced it
+	// groupMembers lists, per opted-in group id, every member account of the group
+	// (usable or not): a clash between a group and one of these is the group
+	// shadowing its member, not a conflict (spec 5.1).
+	groupMembers map[string]map[string]struct{}
+	// groupNames is the public name -> group id of every name an opted-in group
+	// claims, and subscriptionsOn the vendor_subscriptions_enabled switch the group
+	// claims were computed under (checkOwnAccountsAgainstGroups reuses it).
+	groupNames      map[string]string
+	subscriptionsOn bool
+}
+
+// shadows reports whether group id groupID has accountID as a member.
+func (c *vendorAccessCheck) shadows(groupID, accountID string) bool {
+	_, ok := c.groupMembers[groupID][accountID]
+	return ok
+}
+
+// claim records source (an account id, or a group id) as the producer of the public
+// name and reports ErrTokenVendorAccessConflict when another source already produced
+// it, except for a group and one of its own members (the group wins the name).
+func (c *vendorAccessCheck) claim(name, source string) error {
+	prior, clash := c.names[name]
+	switch {
+	case !clash || prior == source:
+		c.names[name] = source
+	case c.shadows(prior, source):
+		// the earlier group shadows this member; the name stays the group's
+	case c.shadows(source, prior):
+		c.names[name] = source
+	default:
+		return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, prior, source)
+	}
+	return nil
 }
 
 // reachableVendorAccountsByID loads the accounts principal can reach keyed by id:
@@ -6154,7 +6363,7 @@ func (s *Service) checkVendorAccessEntry(ctx context.Context, check *vendorAcces
 			"account_id", acc.ID, "error", err)
 		return nil
 	}
-	return claimVendorAccessNames(check.names, id, prefix, models)
+	return check.claimNames(id, prefix, models)
 }
 
 // tokenVendorEntryPrefix resolves the prefix an entry serves its account's models
@@ -6171,16 +6380,14 @@ func tokenVendorEntryPrefix(acc routing.VendorAccount, e VendorAccessEntryDTO) (
 	return norm, nil
 }
 
-// claimVendorAccessNames records the effective public name (prefix + upstream
-// model id) of each of accountID's models in names, and reports
-// ErrTokenVendorAccessConflict when another account already produced one of them.
-func claimVendorAccessNames(names map[string]string, accountID, prefix string, models []routing.VendorAccountModel) error {
+// claimNames records the effective public name (prefix + upstream model id) of each
+// of sourceID's models, and reports ErrTokenVendorAccessConflict when another source
+// already produced one of them (see claim).
+func (c *vendorAccessCheck) claimNames(sourceID, prefix string, models []routing.VendorAccountModel) error {
 	for _, m := range models {
-		name := prefix + m.UpstreamModel
-		if prior, clash := names[name]; clash && prior != accountID {
-			return fmt.Errorf("%w: %q is served by both %q and %q", ErrTokenVendorAccessConflict, name, prior, accountID)
+		if err := c.claim(prefix+m.UpstreamModel, sourceID); err != nil {
+			return err
 		}
-		names[name] = accountID
 	}
 	return nil
 }
@@ -6254,6 +6461,21 @@ func percentile95(values []int64) int64 {
 		index = 1
 	}
 	return values[index-1]
+}
+
+// claudeCodeTokenSecretPrefix is `{"alg":"none","typ":"JWT"}` and
+// `{"aud":"claude-gateway"}`, each base64url-encoded, plus the separating dot.
+// Claude Code shows an Anthropic subscription's usage limits only when its
+// bearer token is a JWT whose payload `aud` is `claude-gateway`; it decodes the
+// payload without verifying anything. The gateway never parses or verifies this
+// shape either: the whole string is an opaque bearer that is only SHA-256
+// hashed, and the opaigw_ secret after the last dot is what carries the
+// entropy.
+const claudeCodeTokenSecretPrefix = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJhdWQiOiJjbGF1ZGUtZ2F0ZXdheSJ9."
+
+// claudeCodeTokenSecret gives a freshly generated secret the Claude Code shape.
+func claudeCodeTokenSecret(secret string) string {
+	return claudeCodeTokenSecretPrefix + secret
 }
 
 func generateSecret() (string, error) {

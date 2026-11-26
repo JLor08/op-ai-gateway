@@ -22,6 +22,8 @@ import (
 	"op-ai-server-agent/internal/client"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
+	"op-ai-server-agent/internal/helper"
+	"op-ai-server-agent/internal/hostpower"
 	"op-ai-server-agent/internal/proxy"
 	"slices"
 
@@ -43,6 +45,17 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "-license" {
 		fmt.Print(licenseNotice())
 		os.Exit(0)
+	}
+	// hostpower runs on a Proxmox host as its own systemd service: no gateway,
+	// token or config file, so it returns before config.Load.
+	if len(os.Args) > 1 && os.Args[1] == "hostpower" {
+		os.Exit(hostpower.Main(os.Args[2:], os.Stdout, os.Stderr))
+	}
+
+	// helper is the root-only RAPL/DMI reader serving the unprivileged agent
+	// over a Unix socket; like hostpower it needs no config file.
+	if len(os.Args) > 1 && os.Args[1] == "helper" {
+		os.Exit(helper.Main(os.Args[2:], os.Stdout, os.Stderr))
 	}
 
 	cfg, err := config.Load(os.Args[1:], os.Getenv)
@@ -86,7 +99,7 @@ func main() {
 	// separately) so that, when LHMURL is configured, the power and temp
 	// collectors share one lhmSource and issue a single LHM /data.json
 	// GET+parse per telemetry cycle instead of two (SA-6).
-	power, temp := collector.DetectPowerAndTempCollectors(cfg.LHMURL)
+	power, temp := collector.DetectPowerAndTempCollectors(powerConfig(cfg))
 
 	// certInstaller is always constructed, even with cert_mode=off: Sync and
 	// Report both no-op internally for that mode (no HTTP call, no disk
@@ -230,21 +243,26 @@ func main() {
 		// admitted against. Operator-owned (OP_AGENT_WSL_RAM_RESERVE_MB,
 		// default 1024), never gateway-supplied.
 		WSLRAMReserveMB: cfg.WSLRAMReserveMB,
+		// A process_tree "job" generation's tree (#424, Windows) is
+		// registered with the measurers' registry, so its RAM and per-GPU
+		// VRAM are charged to the root pid the manager asks about.
+		ProcessTrees: collector.RegisterProcessTree,
 	})
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
 	// Per-process VRAM measurement is a HARDWARE capability, not a negotiated
 	// feature (design spec §5): NewVRAMMeasurer returns nil on hosts that
-	// cannot measure (AMD, Apple unified memory, no GPU at all, no nvidia-smi),
-	// and SetMeasurer(nil) is exactly NewManager's own default -- operator VRAM
-	// estimates stand.
+	// cannot measure (Apple unified memory, no GPU at all, neither nvidia-smi
+	// nor AMD's KFD sysfs), and SetMeasurer(nil) is exactly NewManager's own
+	// default -- operator VRAM estimates stand.
 	//
 	// The measurer is chosen per PLATFORM, inside the collector package: every
-	// non-Windows host gets the nvidia-smi compute-apps measurer it always had,
-	// while Windows gets the PDH one or none, never compute-apps -- which under
-	// WDDM reports `[N/A]` per process, parses to 0, and would override every
-	// operator estimate with a measured zero. Do not call a specific measurer's
-	// constructor from here; that routes around the split.
+	// non-Windows host gets the nvidia-smi compute-apps measurer when nvidia-smi
+	// exists, AMD Linux hosts fall back to KFD sysfs, while Windows gets the
+	// PDH one or none, never compute-apps -- which under WDDM reports `[N/A]`
+	// per process, parses to 0, and would override every operator estimate
+	// with a measured zero. Do not call a specific measurer's constructor from
+	// here; that routes around the split.
 	mgr.SetMeasurer(collector.NewVRAMMeasurer())
 	// Per-process host-RAM measurement is the same kind of hardware capability
 	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
@@ -349,39 +367,13 @@ func main() {
 	// above) — Debug is opt-in via -v/--verbose for local troubleshooting, and
 	// an operator diagnosing a certificate reload needs to see what command
 	// actually ran; it is still never surfaced by default.
-	slog.Debug("resolved config",
-		"gateway_url", cfg.GatewayURL,
-		"metrics_url", cfg.MetricsURL,
-		"model_status_url", cfg.ModelStatusURL,
-		"model_status_format", cfg.ModelStatusFormat,
-		"lhm_url", cfg.LHMURL,
-		"cert_mode", cfg.CertMode,
-		"cert_dir", cfg.CertDir,
-		"cert_reload_command", cfg.CertReloadCommand,
-		"cert_poll_interval", cfg.CertPollInterval.String(),
-		"ca_file", cfg.CAFile,
-		"ca_cache_file", cfg.CACacheFile,
-		"ca_pem_set", cfg.CAPEM != "",
-		"tls_insecure", cfg.TLSInsecure,
-		"interval", cfg.Interval.String(),
-		"system_report_interval", cfg.SystemReportInterval.String(),
-		"runtime_config_path", cfg.RuntimeConfigPath,
-		"runtime_cache_path", cfg.RuntimeCachePath,
-		"config_files_dir", cfg.ConfigFilesDir,
-		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
-		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs),
-		"runtime_allow_binary_dirs", cfg.RuntimeAllowBinaryDirs,
+	slog.Debug("resolved config", append(resolvedConfigAttrs(cfg),
 		"runtime_router_bind_host", runtimeBindHost,
 		// The RESOLVED capacities, not the configured ones: NewLogStore
 		// clamps a too-small or absent value, and an operator who set one
 		// needs to see what it actually became rather than what they typed.
 		"runtime_log_buffer_bytes", logBufferPerSpec,
-		"runtime_log_buffer_total_bytes", logBufferTotal,
-		"vram_headroom_mb", cfg.VRAMHeadroomMB,
-		"host_ram_reserve_mb", cfg.HostRAMReserveMB,
-		"wsl_ram_reserve_mb", cfg.WSLRAMReserveMB,
-		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB,
-		"eviction_grace_seconds", cfg.EvictionGraceSeconds)
+		"runtime_log_buffer_total_bytes", logBufferTotal)...)
 	// A loopback runtime_router_bind under cert_mode=proxy is the workaround
 	// operators used to repair the proxied path before the in-process wiring
 	// above existed. It is no longer needed, and it is no longer free: it
@@ -500,4 +492,67 @@ func runtimeGPUVendor(gpus []collector.GPUCollector) runtimectl.GPUVendor {
 		}
 	}
 	return runtimectl.GPUVendorNone
+}
+
+// powerConfig maps the resolved config onto the power collectors' settings.
+func powerConfig(cfg config.Config) collector.PowerConfig {
+	return collector.PowerConfig{
+		LHMURL:                  cfg.LHMURL,
+		PowercapRoot:            cfg.PowercapRoot,
+		HostpowerURL:            cfg.HostpowerURL,
+		HostpowerToken:          cfg.HostpowerToken,
+		HostpowerTLSFingerprint: cfg.HostpowerTLSFingerprint,
+		HelperSocket:            cfg.HelperSocket,
+	}
+}
+
+// loggedHostpowerFingerprint is the hostpower_tls_fingerprint value of the
+// resolved-config line: a valid fingerprint as is (Load has normalised it),
+// empty as empty, and anything else as "(invalid)", since an invalid value may
+// be a token pasted into the wrong field.
+func loggedHostpowerFingerprint(fp string) string {
+	if fp == "" || config.ValidHostpowerFingerprint(fp) {
+		return fp
+	}
+	return "(invalid)"
+}
+
+// resolvedConfigAttrs returns the config-derived attributes of the Debug
+// "resolved config" line. The hostpower token is a secret and is reported only
+// as hostpower_token_set; the value never reaches a log attribute. An invalid
+// hostpower_tls_fingerprint is logged as "(invalid)".
+func resolvedConfigAttrs(cfg config.Config) []any {
+	return []any{
+		"gateway_url", cfg.GatewayURL,
+		"metrics_url", cfg.MetricsURL,
+		"model_status_url", cfg.ModelStatusURL,
+		"model_status_format", cfg.ModelStatusFormat,
+		"lhm_url", cfg.LHMURL,
+		"powercap_root", cfg.PowercapRoot,
+		"hostpower_url", cfg.HostpowerURL,
+		"hostpower_token_set", cfg.HostpowerToken != "",
+		"hostpower_tls_fingerprint", loggedHostpowerFingerprint(cfg.HostpowerTLSFingerprint),
+		"helper_socket", cfg.HelperSocket,
+		"cert_mode", cfg.CertMode,
+		"cert_dir", cfg.CertDir,
+		"cert_reload_command", cfg.CertReloadCommand,
+		"cert_poll_interval", cfg.CertPollInterval.String(),
+		"ca_file", cfg.CAFile,
+		"ca_cache_file", cfg.CACacheFile,
+		"ca_pem_set", cfg.CAPEM != "",
+		"tls_insecure", cfg.TLSInsecure,
+		"interval", cfg.Interval.String(),
+		"system_report_interval", cfg.SystemReportInterval.String(),
+		"runtime_config_path", cfg.RuntimeConfigPath,
+		"runtime_cache_path", cfg.RuntimeCachePath,
+		"config_files_dir", cfg.ConfigFilesDir,
+		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
+		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs),
+		"runtime_allow_binary_dirs", cfg.RuntimeAllowBinaryDirs,
+		"vram_headroom_mb", cfg.VRAMHeadroomMB,
+		"host_ram_reserve_mb", cfg.HostRAMReserveMB,
+		"wsl_ram_reserve_mb", cfg.WSLRAMReserveMB,
+		"ram_bootstrap_guess_mb", cfg.RAMBootstrapGuessMB,
+		"eviction_grace_seconds", cfg.EvictionGraceSeconds,
+	}
 }

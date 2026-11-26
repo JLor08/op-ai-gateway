@@ -1,0 +1,788 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 OnPrem AI Gateway contributors
+
+package hostpower
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"net"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Default host paths for MAC-mode identification.
+const (
+	DefaultPVEConfDir  = "/etc/pve/qemu-server"
+	DefaultSysClassNet = "/sys/class/net"
+)
+
+const (
+	maxTextFileBytes = 64 << 10
+
+	// defaultMaxWait bounds how long Resolve waits for the capture goroutine
+	// to deliver the connection's SYN and a later segment. Both precede the
+	// request; this only covers scheduling delay.
+	defaultMaxWait = 250 * time.Millisecond
+
+	// synBurstWindow groups the copies of one SYN frame. A frame from a VM
+	// is seen on its tap, the firewall devices and the bridge within
+	// microseconds; an observation for the same 4-tuple that starts later
+	// than this belongs to a different SYN and replaces the earlier set. The
+	// replaced observations are carried only as Earlier evidence, so a
+	// later connection reusing a 4-tuple never inherits an older tap as its
+	// identity, and a later SYN from another tap cannot take over a
+	// connection whose earlier segments entered elsewhere.
+	synBurstWindow = 200 * time.Millisecond
+
+	// Table bounds. A VM's connection yields about six distinct observations
+	// per segment kind (tap, fwbr, fwln, fwpr, bridge, VLAN device), for SYN
+	// and non-SYN segments.
+	maxObservedKeys       = 16384
+	maxObservationsPerKey = 32
+)
+
+// Reasons carried by ResolveError.
+const (
+	reasonIPv6        = "ipv6 not supported"
+	reasonCaptureDown = "capture unavailable"
+	reasonOverflow    = "observation overflow"
+	reasonNoSYN       = "no SYN observed"
+	reasonNoHandshake = "handshake not observed"
+	reasonNotVMPort   = "not a VM port"
+	reasonAmbiguous   = "ambiguous ingress"
+	reasonForeign     = "foreign ingress"
+	reasonNoVMConfig  = "no VM config"
+	reasonMACMismatch = "MAC mismatch"
+)
+
+var (
+	// tapPortPattern matches the QEMU tap device of VM <vmid>, NIC <n>. Only
+	// these count as VM ingress ports.
+	tapPortPattern = regexp.MustCompile(`^tap(\d+)i(\d+)$`)
+	// The PVE firewall's devices only carry copies of frames that entered on
+	// a tap or the uplink.
+	fwBridgePattern = regexp.MustCompile(`^fw(br|ln)\d+i\d+$`)
+	fwPeerPattern   = regexp.MustCompile(`^fwpr\d+p\d+$`)
+)
+
+// ResolveError reports why a connection could not be tied to one VM.
+type ResolveError struct{ Reason string }
+
+func (e *ResolveError) Error() string { return "hostpower: " + e.Reason }
+
+func resolveFail(reason string) (string, error) { return "", &ResolveError{Reason: reason} }
+
+// ConnKey is a TCP connection's 4-tuple as seen in its client's segments: Src
+// is the client, Dst the listener. Both addresses are unmapped IPv4.
+type ConnKey struct {
+	Src, Dst netip.AddrPort
+}
+
+// Observation is one received copy of a client segment: the interface the
+// kernel received it on, the frame's Ethernet source address and whether the
+// segment was a SYN (SYN set, ACK clear). Earlier marks an observation kept
+// from an earlier connection attempt on the same 4-tuple: it still counts
+// for the foreign-ingress rule (a carried tap other than the one the current
+// SYN entered on is foreign) but is neither a SYN nor a segment of the
+// current handshake.
+type Observation struct {
+	Ifname  string
+	SrcMAC  net.HardwareAddr
+	SYN     bool
+	Earlier bool
+	At      time.Time
+}
+
+// --- frame parsing ---
+
+const (
+	ethHeaderLen  = 14
+	vlanTagLen    = 4
+	etherTypeIPv4 = 0x0800
+	etherTypeVLAN = 0x8100
+	ipv4MinHeader = 20
+	ipProtoTCP    = 6
+	ipFragOffset  = 0x1fff // fragment offset bits of the flags/offset field
+	ipMoreFrags   = 0x2000 // MF flag of the flags/offset field
+	tcpMinHeader  = 20
+	tcpPortBytes  = 4 // source and destination port
+	tcpFlagSYN    = 0x02
+	tcpFlagACK    = 0x10
+)
+
+// ParseTCPFrame reports whether frame is an Ethernet II frame (optionally
+// with one 802.1Q tag) carrying an IPv4 TCP segment with destination port
+// dstPort, and returns its 4-tuple, its source MAC and whether it is a SYN
+// (SYN set, ACK clear). The IPv4 total length is honoured: bytes after it
+// (Ethernet padding) are ignored, and a packet longer than the frame is
+// rejected. A first fragment (MF set, offset 0) is accepted once it carries
+// the 4 port bytes; its flags are not trusted, so it never counts as a SYN.
+// Non-first fragments carry no ports and are rejected. It never panics;
+// anything malformed or short yields ok == false.
+func ParseTCPFrame(frame []byte, dstPort uint16) (key ConnKey, src net.HardwareAddr, syn, ok bool) {
+	return parseTCPFrame(frame, len(frame), dstPort)
+}
+
+// parseTCPFrame is ParseTCPFrame for a frame of wireLen bytes of which only
+// the prefix frame was read (the capture reads headers only and learns the
+// full length from the kernel).
+func parseTCPFrame(frame []byte, wireLen int, dstPort uint16) (key ConnKey, src net.HardwareAddr, syn, ok bool) {
+	if wireLen < len(frame) {
+		frame = frame[:max(wireLen, 0)]
+	}
+	l3, ok := ipv4Offset(frame)
+	if !ok {
+		return ConnKey{}, nil, false, false
+	}
+
+	ip, ihl, firstFragment, ok := boundIPv4Packet(frame[l3:], wireLen-l3)
+	if !ok {
+		return ConnKey{}, nil, false, false
+	}
+	tcp := ip[ihl:]
+	if binary.BigEndian.Uint16(tcp[2:4]) != dstPort {
+		return ConnKey{}, nil, false, false
+	}
+
+	key = ConnKey{
+		Src: netip.AddrPortFrom(netip.AddrFrom4([4]byte(ip[12:16])), binary.BigEndian.Uint16(tcp[0:2])),
+		Dst: netip.AddrPortFrom(netip.AddrFrom4([4]byte(ip[16:20])), dstPort),
+	}
+	syn = !firstFragment && tcp[13]&(tcpFlagSYN|tcpFlagACK) == tcpFlagSYN
+	return key, bytes.Clone(frame[6:12]), syn, true
+}
+
+// ipv4Offset returns the offset of the IPv4 header in an Ethernet II frame
+// (after an optional single 802.1Q tag), or ok == false when the frame is
+// too short or does not carry IPv4.
+func ipv4Offset(frame []byte) (l3 int, ok bool) {
+	if len(frame) < ethHeaderLen {
+		return 0, false
+	}
+	l3 = ethHeaderLen
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+	if etherType == etherTypeVLAN {
+		if len(frame) < ethHeaderLen+vlanTagLen {
+			return 0, false
+		}
+		l3 += vlanTagLen
+		etherType = binary.BigEndian.Uint16(frame[16:18])
+	}
+	return l3, etherType == etherTypeIPv4
+}
+
+// boundIPv4Packet validates the IPv4 header of ip (the bytes after the
+// Ethernet header; ipWireLen is the packet's length on the wire) and returns
+// the packet trimmed to its total length, its header length and whether it
+// is a first fragment. ok is false for anything that is not a TCP packet
+// with at least the needed TCP bytes inside the frame.
+func boundIPv4Packet(ip []byte, ipWireLen int) (pkt []byte, ihl int, firstFragment, ok bool) {
+	if len(ip) < ipv4MinHeader || ip[0]>>4 != 4 {
+		return nil, 0, false, false
+	}
+	ihl = int(ip[0]&0x0f) * 4
+	frag := binary.BigEndian.Uint16(ip[6:8])
+	if ihl < ipv4MinHeader || ip[9] != ipProtoTCP || frag&ipFragOffset != 0 {
+		return nil, 0, false, false
+	}
+	firstFragment = frag&ipMoreFrags != 0
+	need := tcpMinHeader
+	if firstFragment {
+		need = tcpPortBytes
+	}
+	total := int(binary.BigEndian.Uint16(ip[2:4]))
+	if total < ihl+need || total > ipWireLen {
+		return nil, 0, false, false
+	}
+	ip = ip[:min(len(ip), total)]
+	if len(ip) < ihl+need {
+		return nil, 0, false, false
+	}
+	return ip, ihl, firstFragment, true
+}
+
+// --- kernel packet filter ---
+
+// bpfAcceptLen is the filter's accept value. It exceeds any packet, so the
+// kernel does not trim accepted frames and recvfrom with MSG_TRUNC reports
+// their full length (the capture copies only the headers), which the parser
+// checks against the IPv4 total length.
+const bpfAcceptLen = 0x40000
+
+// bpfInsn is one classic BPF instruction (struct sock_filter). It is kept
+// platform-neutral so the program is unit-tested on every build target; the
+// Linux capture converts it to syscall.SockFilter.
+type bpfInsn struct {
+	Code   uint16
+	Jt, Jf uint8
+	K      uint32
+}
+
+// Classic BPF opcode parts (linux/filter.h).
+const (
+	bpfLD   = 0x00
+	bpfLDX  = 0x01
+	bpfALU  = 0x04
+	bpfJMP  = 0x05
+	bpfRET  = 0x06
+	bpfW    = 0x00
+	bpfH    = 0x08
+	bpfB    = 0x10
+	bpfABS  = 0x20
+	bpfIND  = 0x40
+	bpfMSH  = 0xa0
+	bpfK    = 0x00
+	bpfJEQ  = 0x10
+	bpfJSET = 0x40
+	bpfAND  = 0x50
+)
+
+// tcpPortFilter returns a classic BPF program that passes Ethernet frames
+// carrying an IPv4 TCP segment to port that is not a non-first fragment,
+// untagged or with one 802.1Q tag, and drops everything else. A first
+// fragment passes once it holds the 4 port bytes (the port load needs them).
+// The filter is only an optimisation: the capture re-checks every frame with
+// ParseTCPFrame, so a filter that passed too much would cost CPU, never
+// correctness.
+//
+// Jump offsets count instructions skipped after the jump; "rej" is
+// instruction 19, "acc" 20. Linux usually strips the VLAN tag into skb
+// metadata before packet sockets see the frame, in which case the untagged
+// branch matches; the tagged branch covers a tag left in the data.
+func tcpPortFilter(port uint16) []bpfInsn {
+	p := uint32(port)
+	return []bpfInsn{
+		/* 0 */ {Code: bpfLD | bpfH | bpfABS, K: 12}, // A = ethertype
+		/* 1 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeVLAN, Jt: 8}, // tagged → 10
+		// Untagged: IPv4 header at 14.
+		/* 2 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeIPv4, Jf: 16}, // not IPv4 → rej
+		/* 3 */ {Code: bpfLD | bpfB | bpfABS, K: 14 + 9}, // A = IP protocol
+		/* 4 */ {Code: bpfJMP | bpfJEQ | bpfK, K: ipProtoTCP, Jf: 14}, // not TCP → rej
+		/* 5 */ {Code: bpfLD | bpfH | bpfABS, K: 14 + 6}, // A = IP flags/fragment offset
+		/* 6 */ {Code: bpfJMP | bpfJSET | bpfK, K: ipFragOffset, Jt: 12}, // non-first fragment → rej
+		/* 7 */ {Code: bpfLDX | bpfB | bpfMSH, K: 14}, // X = 4 * IHL
+		/* 8 */ {Code: bpfLD | bpfH | bpfIND, K: 14 + 2}, // A = TCP dst port
+		/* 9 */ {Code: bpfJMP | bpfJEQ | bpfK, K: p, Jt: 10, Jf: 9}, // port → acc, else rej
+		// One 802.1Q tag: inner ethertype at 16, IPv4 header at 18.
+		/* 10 */ {Code: bpfLD | bpfH | bpfABS, K: 16}, // A = inner ethertype
+		/* 11 */ {Code: bpfJMP | bpfJEQ | bpfK, K: etherTypeIPv4, Jf: 7}, // not IPv4 → rej
+		/* 12 */ {Code: bpfLD | bpfB | bpfABS, K: 18 + 9}, // A = IP protocol
+		/* 13 */ {Code: bpfJMP | bpfJEQ | bpfK, K: ipProtoTCP, Jf: 5}, // not TCP → rej
+		/* 14 */ {Code: bpfLD | bpfH | bpfABS, K: 18 + 6}, // A = IP flags/fragment offset
+		/* 15 */ {Code: bpfJMP | bpfJSET | bpfK, K: ipFragOffset, Jt: 3}, // non-first fragment → rej
+		/* 16 */ {Code: bpfLDX | bpfB | bpfMSH, K: 18}, // X = 4 * IHL
+		/* 17 */ {Code: bpfLD | bpfH | bpfIND, K: 18 + 2}, // A = TCP dst port
+		/* 18 */ {Code: bpfJMP | bpfJEQ | bpfK, K: p, Jt: 1}, // port → acc, else rej
+		/* 19 rej */ {Code: bpfRET | bpfK, K: 0},
+		/* 20 acc */ {Code: bpfRET | bpfK, K: bpfAcceptLen},
+	}
+}
+
+// --- observation table ---
+
+type observedConn struct {
+	start    time.Time // first observation; drives expiry and eviction
+	synStart time.Time // first SYN observation; zero while none was seen
+	obs      []Observation
+	// overflow: more distinct copies than maxObservationsPerKey arrived, at
+	// overflowAt; the mark lasts ttl from then.
+	overflow   bool
+	overflowAt time.Time
+}
+
+type queuedKey struct {
+	key   ConnKey
+	start time.Time
+}
+
+// ObservationTable holds recent observations of client segments by 4-tuple.
+// It is safe for concurrent use.
+type ObservationTable struct {
+	ttl time.Duration
+	now func() time.Time
+
+	captureOK atomic.Bool // the capture goroutine is running and reading
+
+	mu      sync.Mutex
+	entries map[ConnKey]*observedConn
+	order   []queuedKey   // insertion order, for expiry and eviction
+	changed chan struct{} // closed and replaced on every Add
+}
+
+// setCaptureHealthy records whether the capture feeding the table works. A
+// new table starts unhealthy, so resolving without a running capture fails
+// closed.
+func (t *ObservationTable) setCaptureHealthy(ok bool) { t.captureOK.Store(ok) }
+
+func (t *ObservationTable) captureHealthy() bool { return t.captureOK.Load() }
+
+// NewObservationTable returns a table whose observations expire after ttl,
+// measured with now.
+func NewObservationTable(ttl time.Duration, now func() time.Time) *ObservationTable {
+	return &ObservationTable{
+		ttl:     ttl,
+		now:     now,
+		entries: make(map[ConnKey]*observedConn),
+		changed: make(chan struct{}),
+	}
+}
+
+// Add records one received copy of a segment. A zero obs.At is set to the
+// table's clock. Expired entries are purged first; when the table is full the
+// oldest entry is evicted.
+//
+// A SYN starts a new connection for its 4-tuple: it replaces whatever the
+// table holds for the key unless that already contains a SYN observed less
+// than synBurstWindow earlier (another copy of the same SYN). Replacement
+// only drops positive evidence: every observation of the earlier entry
+// younger than ttl is kept, marked Earlier (never as a SYN or a handshake
+// segment), and so is an overflow mark. A carried tap observation on the tap
+// the new SYN enters on is harmless; one on any other tap makes the
+// connection foreign ingress, so a VM that sends a later SYN for another
+// VM's 4-tuple cannot take over that VM's connection. Every mark lasts ttl
+// from its latest sighting.
+// Non-SYN segments are added to the key's entry, creating one if needed.
+func (t *ObservationTable) Add(key ConnKey, obs Observation) {
+	now := t.now()
+	if obs.At.IsZero() {
+		obs.At = now
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.purgeLocked(now)
+
+	e := t.entries[key]
+	var carried *observedConn
+	if e != nil && obs.SYN && (e.synStart.IsZero() || obs.At.Sub(e.synStart) > synBurstWindow) {
+		carried, e = e, nil // a new SYN for this 4-tuple
+	}
+	if e == nil {
+		for len(t.entries) >= maxObservedKeys && len(t.order) > 0 {
+			t.popOldestLocked()
+		}
+		e = &observedConn{start: obs.At}
+		if carried != nil {
+			t.carryLocked(e, carried, now)
+		}
+		t.entries[key] = e
+		t.order = append(t.order, queuedKey{key: key, start: obs.At})
+		if len(t.order) > 2*maxObservedKeys {
+			t.compactOrderLocked()
+		}
+	}
+	if obs.SYN && e.synStart.IsZero() {
+		e.synStart = obs.At
+	}
+	t.recordLocked(e, obs, now)
+	close(t.changed)
+	t.changed = make(chan struct{})
+}
+
+// recordLocked adds o to e. A duplicate (same interface, MAC, SYN and
+// Earlier flags) only moves the existing observation's At to the newer of
+// the two; one distinct copy more than maxObservationsPerKey turns e into an
+// overflow at now. An active overflow drops o; an expired one is cleared.
+func (t *ObservationTable) recordLocked(e *observedConn, o Observation, now time.Time) {
+	if e.overflow {
+		if t.overflowed(e, now) {
+			return
+		}
+		e.overflow = false
+	}
+	for i := range e.obs {
+		x := &e.obs[i]
+		if x.Ifname == o.Ifname && x.SYN == o.SYN && x.Earlier == o.Earlier && bytes.Equal(x.SrcMAC, o.SrcMAC) {
+			if o.At.After(x.At) {
+				x.At = o.At
+			}
+			return
+		}
+	}
+	if len(e.obs) >= maxObservationsPerKey {
+		e.overflow, e.overflowAt, e.obs = true, now, nil
+		return
+	}
+	e.obs = append(e.obs, o)
+}
+
+// overflowed reports an overflow mark younger than ttl.
+func (t *ObservationTable) overflowed(e *observedConn, now time.Time) bool {
+	return e.overflow && now.Sub(e.overflowAt) <= t.ttl
+}
+
+// carryLocked copies the negative evidence of a replaced entry into its
+// successor: every observation younger than ttl, taps included, as an
+// Earlier non-SYN observation (copies that collapse keep the latest At), and
+// an overflow mark younger than ttl with its own time. Earlier observations
+// never identify a VM or complete a handshake; they only feed the
+// foreign-ingress rule.
+func (t *ObservationTable) carryLocked(dst, src *observedConn, now time.Time) {
+	if t.overflowed(src, now) {
+		dst.overflow, dst.overflowAt = true, src.overflowAt
+		return
+	}
+	for _, o := range src.obs {
+		if now.Sub(o.At) > t.ttl {
+			continue
+		}
+		o.SYN, o.Earlier = false, true
+		t.recordLocked(dst, o, now)
+	}
+}
+
+func (t *ObservationTable) expired(e *observedConn, now time.Time) bool {
+	return now.Sub(e.start) > t.ttl
+}
+
+// purgeLocked drops entries older than ttl from the front of the insertion
+// order.
+func (t *ObservationTable) purgeLocked(now time.Time) {
+	for len(t.order) > 0 {
+		q := t.order[0]
+		if e := t.entries[q.key]; e != nil && e.start.Equal(q.start) && !t.expired(e, now) {
+			return
+		}
+		t.popOldestLocked()
+	}
+}
+
+// popOldestLocked removes the front of the insertion order and, unless the
+// key was replaced by a later SYN since, its entry. The order must not be
+// empty.
+func (t *ObservationTable) popOldestLocked() {
+	q := t.order[0]
+	t.order[0] = queuedKey{}
+	t.order = t.order[1:]
+	if e := t.entries[q.key]; e != nil && e.start.Equal(q.start) {
+		delete(t.entries, q.key)
+	}
+	if len(t.order) == 0 {
+		t.order = nil // let the backing array go
+	}
+}
+
+// compactOrderLocked drops queue items left behind by replaced entries, so
+// the order stays proportional to the live entries.
+func (t *ObservationTable) compactOrderLocked() {
+	live := make([]queuedKey, 0, len(t.entries))
+	for _, q := range t.order {
+		if e := t.entries[q.key]; e != nil && e.start.Equal(q.start) {
+			live = append(live, q)
+		}
+	}
+	t.order = live
+}
+
+// Wait returns the live observations for key once at least one non-SYN
+// segment of the current connection has been observed, waiting up to maxWait
+// for that; on timeout or when ctx ends it returns what is there. A copy of a
+// frame on its ingress interface is always delivered before its transit
+// copies, and a connection's SYN before its later segments, so the
+// observations returned include the ingress of every segment up to the
+// first non-SYN one. A key that received more distinct copies than the
+// table keeps yields nil.
+func (t *ObservationTable) Wait(ctx context.Context, key ConnKey, maxWait time.Duration) []Observation {
+	ctx, cancel := waitContext(ctx, maxWait)
+	defer cancel()
+	obs, _ := t.waitUntil(ctx, key, hasHandshakeSegment)
+	return obs
+}
+
+// waitContext bounds ctx by maxWait; maxWait <= 0 means do not wait.
+func waitContext(ctx context.Context, maxWait time.Duration) (context.Context, context.CancelFunc) {
+	if maxWait <= 0 {
+		ctx, cancel := context.WithCancel(ctx)
+		cancel()
+		return ctx, cancel
+	}
+	return context.WithTimeout(ctx, maxWait)
+}
+
+// waitUntil returns the live observations for key as soon as done reports
+// true for them, or what is there when ctx ends. overflow reports a key that
+// received more distinct copies than the table keeps (obs is then nil).
+func (t *ObservationTable) waitUntil(ctx context.Context, key ConnKey, done func([]Observation) bool) (obs []Observation, overflow bool) {
+	for {
+		obs, overflow, changed := t.snapshot(key)
+		if overflow || done(obs) {
+			return obs, overflow
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			obs, overflow, _ = t.snapshot(key)
+			return obs, overflow
+		}
+	}
+}
+
+func (t *ObservationTable) snapshot(key ConnKey) (obs []Observation, overflow bool, changed <-chan struct{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	if e := t.entries[key]; e != nil && !t.expired(e, now) {
+		if t.overflowed(e, now) {
+			return nil, true, t.changed
+		}
+		for _, o := range e.obs {
+			if o.Earlier && now.Sub(o.At) > t.ttl {
+				continue
+			}
+			obs = append(obs, o)
+		}
+	}
+	return obs, false, t.changed
+}
+
+func hasSYN(obs []Observation) bool {
+	for _, o := range obs {
+		if o.SYN {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHandshakeSegment reports a non-SYN segment of the current connection.
+func hasHandshakeSegment(obs []Observation) bool {
+	for _, o := range obs {
+		if !o.SYN && !o.Earlier {
+			return true
+		}
+	}
+	return false
+}
+
+// --- resolver ---
+
+// IngressResolver identifies the VM a TCP connection came from: its SYN
+// entered on exactly one tap device with the VM's configured MAC, and every
+// observed segment of the connection entered on that tap or a transit
+// interface. Empty fields use defaults.
+type IngressResolver struct {
+	Table       *ObservationTable
+	PVEConfDir  string
+	SysClassNet string
+	MaxWait     time.Duration
+
+	mu      sync.Mutex
+	transit map[string]bool // interface name -> only carries copies (isTransit)
+}
+
+// Resolve returns the ID of the VM that opened the connection from remote to
+// local, or a *ResolveError.
+func (r *IngressResolver) Resolve(ctx context.Context, remote, local netip.AddrPort) (vmid string, err error) {
+	src := netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
+	dst := netip.AddrPortFrom(local.Addr().Unmap(), local.Port())
+	if !src.Addr().Is4() || !dst.Addr().Is4() {
+		return resolveFail(reasonIPv6)
+	}
+	if r.Table == nil || !r.Table.captureHealthy() {
+		return resolveFail(reasonCaptureDown)
+	}
+	maxWait := r.MaxWait
+	if maxWait <= 0 {
+		maxWait = defaultMaxWait
+	}
+	ctx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+	key := ConnKey{Src: src, Dst: dst}
+
+	tap, vmid, nic, reason := r.awaitIngress(ctx, key)
+	if reason != "" {
+		return resolveFail(reason)
+	}
+	if reason := r.checkVMConfig(vmid, nic, tap); reason != "" {
+		return resolveFail(reason)
+	}
+	return vmid, nil
+}
+
+// awaitIngress waits for the connection's handshake and returns the tap it
+// entered on, or the failure reason.
+func (r *IngressResolver) awaitIngress(ctx context.Context, key ConnKey) (tap *Observation, vmid, nic, reason string) {
+	// The VM-port rule is decided as soon as the SYN is in, then the
+	// handshake is awaited within the same deadline and everything is
+	// evaluated again on the final observations.
+	obs, overflow := r.Table.waitUntil(ctx, key, hasSYN)
+	if overflow {
+		return nil, "", "", reasonOverflow
+	}
+	if _, _, _, reason := selectTap(obs); reason != "" {
+		return nil, "", "", reason
+	}
+	obs, overflow = r.Table.waitUntil(ctx, key, hasHandshakeSegment)
+	if overflow {
+		return nil, "", "", reasonOverflow
+	}
+	tap, vmid, nic, reason = selectTap(obs)
+	if reason != "" {
+		return nil, "", "", reason
+	}
+	if !hasHandshakeSegment(obs) {
+		return nil, "", "", reasonNoHandshake
+	}
+	for _, o := range obs {
+		if o.Ifname != tap.Ifname && !r.isTransit(o.Ifname) {
+			return nil, "", "", reasonForeign
+		}
+	}
+	return tap, vmid, nic, ""
+}
+
+// checkVMConfig verifies the tap's source MAC against the VM's configured
+// NIC and returns the failure reason, or "" when it matches.
+func (r *IngressResolver) checkVMConfig(vmid, nic string, tap *Observation) string {
+	dir := r.PVEConfDir
+	if dir == "" {
+		dir = DefaultPVEConfDir
+	}
+	conf, ok, err := readCapped(filepath.Join(dir, vmid+".conf"), maxTextFileBytes)
+	if err != nil || !ok {
+		return reasonNoVMConfig
+	}
+	if mac := configNICMAC(conf, nic); mac == nil || !bytes.Equal(mac, tap.SrcMAC) {
+		return reasonMACMismatch
+	}
+	return ""
+}
+
+// selectTap returns the single tap device the connection's SYN entered on,
+// or the reason there is none.
+func selectTap(obs []Observation) (tap *Observation, vmid, nic, reason string) {
+	sawSYN := false
+	for i := range obs {
+		if !obs[i].SYN {
+			continue
+		}
+		sawSYN = true
+		m := tapPortPattern.FindStringSubmatch(obs[i].Ifname)
+		if m == nil {
+			continue
+		}
+		if tap != nil {
+			return nil, "", "", reasonAmbiguous // deduplicated: a second tap or a second MAC
+		}
+		tap, vmid, nic = &obs[i], m[1], m[2]
+	}
+	switch {
+	case !sawSYN:
+		return nil, "", "", reasonNoSYN
+	case tap == nil:
+		return nil, "", "", reasonNotVMPort
+	}
+	return tap, vmid, nic, ""
+}
+
+// isTransit reports whether frames received on ifname are only copies of
+// frames that entered the host elsewhere: a PVE firewall device, a bridge
+// master, or a VLAN device over a bridge master (a frame on vmbr0.10 was
+// first received on the tap or uplink that fed vmbr0). Physical NICs, VLANs
+// over them, lo, veth, taps and anything that cannot be classified are
+// ingress.
+func (r *IngressResolver) isTransit(ifname string) bool {
+	if fwBridgePattern.MatchString(ifname) || fwPeerPattern.MatchString(ifname) {
+		return true
+	}
+	if !validIfname(ifname) {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if is, ok := r.transit[ifname]; ok {
+		return is
+	}
+	root := r.SysClassNet
+	if root == "" {
+		root = DefaultSysClassNet
+	}
+	is := isBridgeMaster(root, ifname) || isVLANOverBridge(root, ifname)
+	if r.transit == nil {
+		r.transit = make(map[string]bool)
+	}
+	// Cached per name: interfaces are created and renamed only by root, and
+	// a device's type and lower device do not change while it exists.
+	r.transit[ifname] = is
+	return is
+}
+
+func validIfname(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\`)
+}
+
+// isBridgeMaster reports whether <root>/<ifname>/bridge is a directory.
+func isBridgeMaster(root, ifname string) bool {
+	fi, err := os.Stat(filepath.Join(root, ifname, "bridge"))
+	return err == nil && fi.IsDir()
+}
+
+// isVLANOverBridge reports whether ifname is an 802.1Q device (DEVTYPE=vlan
+// in its uevent) whose single lower device, named by the lower_<name> link
+// the kernel creates for stacked devices, is a bridge master.
+func isVLANOverBridge(root, ifname string) bool {
+	dir := filepath.Join(root, ifname)
+	uevent, ok, err := readCapped(filepath.Join(dir, "uevent"), maxTextFileBytes)
+	if err != nil || !ok || !hasLine(uevent, "DEVTYPE=vlan") {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	lower := ""
+	for _, e := range entries {
+		name, found := strings.CutPrefix(e.Name(), "lower_")
+		if !found {
+			continue
+		}
+		if lower != "" {
+			return false // a VLAN has exactly one lower device
+		}
+		lower = name
+	}
+	return validIfname(lower) && isBridgeMaster(root, lower)
+}
+
+func hasLine(data []byte, want string) bool {
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// configNICMAC returns the MAC of the VM config's current net<nic> line: the
+// first key=value that parses as a 6-byte MAC. Lines from the first [section]
+// on (snapshots, pending changes) do not count.
+func configNICMAC(conf []byte, nic string) net.HardwareAddr {
+	prefix := "net" + nic + ":"
+	for line := range strings.SplitSeq(string(conf), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			return nil
+		}
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		for kv := range strings.SplitSeq(strings.TrimPrefix(line, prefix), ",") {
+			_, val, found := strings.Cut(strings.TrimSpace(kv), "=")
+			if !found {
+				continue
+			}
+			if hw, err := net.ParseMAC(val); err == nil && len(hw) == 6 {
+				return hw
+			}
+		}
+		return nil
+	}
+	return nil
+}

@@ -320,6 +320,14 @@ func (c *OpenAICompatibleClient) LoadedModels(ctx context.Context, target routin
 	return fetchLoadedModels(ctx, c.http, target, statusPath, format)
 }
 
+var _ LoadedModelInfoLister = (*OpenAICompatibleClient)(nil)
+
+// LoadedModelInfos is LoadedModels plus each model's context window from the
+// same status document (see parseLoadedModelInfos).
+func (c *OpenAICompatibleClient) LoadedModelInfos(ctx context.Context, target routing.Target, statusPath, format string) ([]ModelInfo, error) {
+	return fetchLoadedModelInfos(ctx, c.http, target, statusPath, format)
+}
+
 var _ ModelUnloader = (*OpenAICompatibleClient)(nil)
 
 // UnloadModel implements ModelUnloader via llama-swap's unload endpoint. On a non-llama-swap

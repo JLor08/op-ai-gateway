@@ -339,8 +339,10 @@ func TestVendorSubscriptionUnknownVendorDoesNotMatch(t *testing.T) {
 // Crucially ExtraHeaders/Masquerade/VendorAccountID are NOT listed either -- an
 // Anthropic subscription target that forgot any of them is a bug.
 var vendorSubscriptionTargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // a subscription target never serves the decision endpoints
 	"VendorDecisionModel":         true, // a subscription account serves no decision model (IsVendorDecisionModel)
+	"VendorShareUsageWithMembers": true, // the owner opt-in; this fixture leaves it off
 	"SystemOneMode":               true, // a subscription target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server
 	"APIToken":                    true, // bearer resolved at dispatch, not carried here
@@ -362,8 +364,10 @@ var vendorSubscriptionTargetMayBeZero = map[string]bool{
 // Masquerade IS zero-OK (the ChatGPT backend wants the real Codex body, no system
 // block). ExtraHeaders/VendorAccountID stay required.
 var vendorSubscriptionOpenAITargetMayBeZero = map[string]bool{
+	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // a subscription target never serves the decision endpoints
 	"VendorDecisionModel":         true, // a subscription account serves no decision model (IsVendorDecisionModel)
+	"VendorShareUsageWithMembers": true, // the owner opt-in; this fixture leaves it off
 	"SystemOneMode":               true, // a subscription target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server
 	"APIToken":                    true, // bearer resolved at dispatch, not carried here

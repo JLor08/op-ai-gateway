@@ -27,7 +27,7 @@ func TestMigration86AddsVendorAccountBaseURL(t *testing.T) {
 			t.Fatalf("vendor_accounts already has base_url at v85: %v", cols)
 		}
 
-		if err := s.CreateUser(ctx, newTestUser("u_m86", "m86@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m86", "m86@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		// Seed a pre-upgrade row that cannot name base_url.

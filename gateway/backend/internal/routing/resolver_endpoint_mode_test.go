@@ -205,3 +205,37 @@ func TestTargetLiveProgressSpecTypeUsesEffectiveTypeNotRawType(t *testing.T) {
 		t.Fatalf("target.LiveProgressSpecType = %q, want %q (EffectiveRuntimeSpecType detected from the llama-server binary; the raw Type is empty)", target.LiveProgressSpecType, RuntimeSpecTypeLlamaCpp)
 	}
 }
+
+// TestServerAgentStrataSpecResolvesToStrataKind pins that a server_agent
+// mapping backed by a runtime spec of type strata resolves to a Target whose
+// EffectiveKind is "strata", both for an explicit Type and for Type "" with a
+// strata.cmd binary (auto-detect). The gateway's Strata media guard keys on
+// EffectiveKind() == "strata", so without this a runtime-spec-served Strata
+// would escape the guard that a direct strata application gets.
+func TestServerAgentStrataSpecResolvesToStrataKind(t *testing.T) {
+	cases := []struct {
+		name, specType, binary string
+	}{
+		{"explicit type", string(RuntimeSpecTypeStrata), `C:\Users\<user>\AppData\Local\Strata\terminal\current\bin\launcher.exe`},
+		{"detected from strata.cmd", "", `C:\Users\<user>\AppData\Local\Strata\terminal\current\bin\strata.cmd`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+			store := NewMemoryStore()
+			must(t, store.CreateAIServer(ctx, AIServer{ID: "srv", Domain: "srv.test", Status: ServerStatusActive, HealthStatus: HealthHealthy, CreatedAt: now, UpdatedAt: now}))
+			must(t, store.CreateApplication(ctx, Application{ID: "app", ServerID: "srv", Type: ProviderServerAgent, Port: 8000, Scheme: "http", APIFlavors: []string{APIFlavorOpenAI}, Priority: 10, Weight: 50, TimeoutMS: 30000, Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+			must(t, store.CreateMapping(ctx, ModelMapping{ID: "map", ApplicationID: "app", GatewayModelName: "m", AppModelName: "m", Status: ServerStatusActive, CreatedAt: now, UpdatedAt: now}))
+			must(t, store.UpsertTelemetry(ctx, ServerTelemetry{ServerID: "srv", ReportedAt: now, ProviderHealth: "{}", Capabilities: "{}", RawSummary: "{}", UpdatedAt: now}))
+			must(t, store.UpsertRuntimeSpec(ctx, RuntimeSpec{ID: "spec", MappingID: "map", Type: tc.specType, Binary: tc.binary, CreatedAt: now, UpdatedAt: now}))
+
+			resolver := NewResolver(store, func() time.Time { return now }, nil)
+			target, err := resolver.Resolve(ctx, auth.Token{ID: "t", UserID: "u", Active: true}, inference.Request{Model: "m", APIFlavor: "openai_chat_completions"})
+			must(t, err)
+			if got := target.EffectiveKind(); got != string(RuntimeSpecTypeStrata) {
+				t.Fatalf("target.EffectiveKind() = %q, want strata (Provider %q, LiveProgressSpecType %q)", got, target.Provider, target.LiveProgressSpecType)
+			}
+		})
+	}
+}

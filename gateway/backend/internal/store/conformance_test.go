@@ -612,6 +612,100 @@ func testTokenClaudeEffortCompatibilityRoundTrip(t *testing.T, s *SQLStore) {
 	}
 }
 
+// TestConformanceTokenClaudeCodeUsageDisplayRoundTrip proves the opt-in
+// api_tokens.claude_code_usage_display flag (#407) on both dialects: written by
+// CreatePlainToken and read by TokenByID and TokensByUser; written by
+// RotateUserTokenSecret TOGETHER with the new hash and prefix (the old secret
+// stops resolving, the new one resolves the same token); and NEVER written by
+// UpdateTokenMetadata, so a metadata edit carrying a stale record cannot flip
+// the shape of a secret it did not rotate. RotateTokenSecret (the service-token
+// rotation) leaves the flag alone.
+func TestConformanceTokenClaudeCodeUsageDisplayRoundTrip(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateUser(ctx, newTestUser("usr_ccud", "ccud@example.test", now)); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		on := TokenRecord{ID: "tok_ccud_on", UserID: "usr_ccud", Name: "on", CreatedAt: now, UpdatedAt: now, ClaudeCodeUsageDisplay: true}
+		off := TokenRecord{ID: "tok_ccud_off", UserID: "usr_ccud", Name: "off", CreatedAt: now, UpdatedAt: now}
+		if err := s.CreatePlainToken(ctx, on, "ccud-on-secret"); err != nil {
+			t.Fatalf("CreatePlainToken(on): %v", err)
+		}
+		if err := s.CreatePlainToken(ctx, off, "ccud-off-secret"); err != nil {
+			t.Fatalf("CreatePlainToken(off): %v", err)
+		}
+		gotOn, err := s.TokenByID(ctx, "tok_ccud_on")
+		if err != nil || !gotOn.ClaudeCodeUsageDisplay {
+			t.Fatalf("TokenByID(on) err=%v flag=%v, want true", err, gotOn.ClaudeCodeUsageDisplay)
+		}
+		gotOff, err := s.TokenByID(ctx, "tok_ccud_off")
+		if err != nil || gotOff.ClaudeCodeUsageDisplay {
+			t.Fatalf("TokenByID(off) err=%v flag=%v, want false", err, gotOff.ClaudeCodeUsageDisplay)
+		}
+		byUser, err := s.TokensByUser(ctx, "usr_ccud")
+		if err != nil {
+			t.Fatalf("TokensByUser: %v", err)
+		}
+		listed := map[string]bool{}
+		for _, rec := range byUser {
+			listed[rec.ID] = rec.ClaudeCodeUsageDisplay
+		}
+		if len(listed) != 2 || !listed["tok_ccud_on"] || listed["tok_ccud_off"] {
+			t.Fatalf("TokensByUser flags = %v, want on=true off=false", listed)
+		}
+
+		// UpdateTokenMetadata never writes the flag, in either direction.
+		gotOn.ClaudeCodeUsageDisplay = false
+		gotOn.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, gotOn); err != nil {
+			t.Fatalf("UpdateTokenMetadata(on): %v", err)
+		}
+		gotOff.ClaudeCodeUsageDisplay = true
+		gotOff.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, gotOff); err != nil {
+			t.Fatalf("UpdateTokenMetadata(off): %v", err)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_on"); !rec.ClaudeCodeUsageDisplay {
+			t.Fatal("UpdateTokenMetadata cleared claude_code_usage_display")
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_off"); rec.ClaudeCodeUsageDisplay {
+			t.Fatal("UpdateTokenMetadata set claude_code_usage_display")
+		}
+
+		// RotateUserTokenSecret switches the flag with the secret.
+		rotatedAt := now.Add(time.Hour)
+		if err := s.RotateUserTokenSecret(ctx, "tok_ccud_off", auth.HashSecret("ccud-off-rotated"), "ccud-off", true, rotatedAt); err != nil {
+			t.Fatalf("RotateUserTokenSecret(off->on): %v", err)
+		}
+		if _, ok := s.LookupBearer("Bearer ccud-off-secret"); ok {
+			t.Fatal("old secret must stop working after rotate")
+		}
+		if resolved, ok := s.LookupBearer("Bearer ccud-off-rotated"); !ok || resolved.ID != "tok_ccud_off" {
+			t.Fatalf("rotated secret lookup: ok=%v resolved=%+v", ok, resolved)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_off"); !rec.ClaudeCodeUsageDisplay || rec.SecretPrefix != "ccud-off" {
+			t.Fatalf("after rotate(off->on): %+v", rec)
+		}
+		if err := s.RotateUserTokenSecret(ctx, "tok_ccud_on", auth.HashSecret("ccud-on-rotated"), "ccud-on-", false, rotatedAt); err != nil {
+			t.Fatalf("RotateUserTokenSecret(on->off): %v", err)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_on"); rec.ClaudeCodeUsageDisplay {
+			t.Fatal("rotate(on->off) did not clear claude_code_usage_display")
+		}
+		// The plain rotation leaves the flag alone.
+		if err := s.RotateTokenSecret(ctx, "tok_ccud_off", auth.HashSecret("ccud-off-plain"), "ccud-off", rotatedAt); err != nil {
+			t.Fatalf("RotateTokenSecret: %v", err)
+		}
+		if rec, _ := s.TokenByID(ctx, "tok_ccud_off"); !rec.ClaudeCodeUsageDisplay {
+			t.Fatal("RotateTokenSecret cleared claude_code_usage_display")
+		}
+		if err := s.RotateUserTokenSecret(ctx, "nope", auth.HashSecret("x"), "x", true, rotatedAt); err != ErrNotFound {
+			t.Fatalf("rotate missing id = %v, want ErrNotFound", err)
+		}
+	})
+}
+
 // TestConformanceTokenDecisionsConfidenceNormalizeRoundTrip proves the opt-in
 // api_tokens.decisions_confidence_normalize flag (#373) is carried by the whole
 // token path on both dialects, so the Postgres leg exercises the widened
@@ -6528,6 +6622,16 @@ func TestConformanceMigration40ServiceAccountsRebuild(t *testing.T) {
 		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column decisions_confidence_normalize integer not null default 0`); err != nil {
 			t.Fatalf("reapply api_tokens.decisions_confidence_normalize after migration40RawUp: %v", err)
 		}
+		// ...and v111's per-token Claude Code usage display opt-in.
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column claude_code_usage_display integer not null default 0`); err != nil {
+			t.Fatalf("reapply api_tokens.claude_code_usage_display after migration40RawUp: %v", err)
+		}
+		// ...and v112's per-token usage-limit switches.
+		for _, col := range []string{"send_usage_limits", "codex_model_switch_prompt"} {
+			if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column `+col+` integer not null default 0`); err != nil {
+				t.Fatalf("reapply api_tokens.%s after migration40RawUp: %v", col, err)
+			}
+		}
 
 		// The token's OWN data survived the rebuild losslessly, via the NEW
 		// Go code path (TokenByID/scanToken, which now reads the rebuilt shape).
@@ -9292,6 +9396,113 @@ func TestMigration81BillingPairDefaultsAreANoOp(t *testing.T) {
 		}
 		if got.TotalTokens != 30 {
 			t.Errorf("TotalTokens = %d, want 30 (the pre-existing measure must survive)", got.TotalTokens)
+		}
+	})
+}
+
+// TestConformanceTokenUsageLimitSwitchesRoundTrip proves the two opt-in switches
+// api_tokens.send_usage_limits and api_tokens.codex_model_switch_prompt (#420)
+// travel the whole token path on every dialect: written by CreatePlainToken,
+// read back by TokenByID and TokensByUser, and rewritten by UpdateTokenMetadata
+// (unlike claude_code_usage_display, which only rotation changes). They are
+// independent of each other, and independent of claude_code_usage_display.
+func TestConformanceTokenUsageLimitSwitchesRoundTrip(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateUser(ctx, newTestUser("usr_uls", "uls@example.test", now)); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		both := TokenRecord{ID: "tok_uls_both", UserID: "usr_uls", Name: "both", CreatedAt: now, UpdatedAt: now, SendUsageLimits: true, CodexModelSwitchPrompt: true}
+		onlySend := TokenRecord{ID: "tok_uls_send", UserID: "usr_uls", Name: "send", CreatedAt: now, UpdatedAt: now, SendUsageLimits: true}
+		none := TokenRecord{ID: "tok_uls_none", UserID: "usr_uls", Name: "none", CreatedAt: now, UpdatedAt: now}
+		for _, rec := range []TokenRecord{both, onlySend, none} {
+			if err := s.CreatePlainToken(ctx, rec, rec.ID+"-secret"); err != nil {
+				t.Fatalf("CreatePlainToken(%s): %v", rec.ID, err)
+			}
+		}
+		want := map[string][2]bool{"tok_uls_both": {true, true}, "tok_uls_send": {true, false}, "tok_uls_none": {false, false}}
+		for id, w := range want {
+			got, err := s.TokenByID(ctx, id)
+			if err != nil {
+				t.Fatalf("TokenByID(%s): %v", id, err)
+			}
+			if got.SendUsageLimits != w[0] || got.CodexModelSwitchPrompt != w[1] {
+				t.Fatalf("%s switches = %v/%v, want %v/%v", id, got.SendUsageLimits, got.CodexModelSwitchPrompt, w[0], w[1])
+			}
+			if got.ClaudeCodeUsageDisplay {
+				t.Fatalf("%s: usage switches leaked into claude_code_usage_display", id)
+			}
+		}
+		listed, err := s.TokensByUser(ctx, "usr_uls")
+		if err != nil {
+			t.Fatalf("TokensByUser: %v", err)
+		}
+		if len(listed) != 3 {
+			t.Fatalf("TokensByUser returned %d tokens, want 3", len(listed))
+		}
+		for _, rec := range listed {
+			w := want[rec.ID]
+			if rec.SendUsageLimits != w[0] || rec.CodexModelSwitchPrompt != w[1] {
+				t.Fatalf("listed %s switches = %v/%v, want %v/%v", rec.ID, rec.SendUsageLimits, rec.CodexModelSwitchPrompt, w[0], w[1])
+			}
+		}
+
+		// UpdateTokenMetadata turns both off, and the other direction too.
+		gotBoth, _ := s.TokenByID(ctx, "tok_uls_both")
+		gotBoth.SendUsageLimits, gotBoth.CodexModelSwitchPrompt = false, false
+		gotBoth.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, gotBoth); err != nil {
+			t.Fatalf("UpdateTokenMetadata(off): %v", err)
+		}
+		gotNone, _ := s.TokenByID(ctx, "tok_uls_none")
+		gotNone.SendUsageLimits, gotNone.CodexModelSwitchPrompt = true, true
+		gotNone.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, gotNone); err != nil {
+			t.Fatalf("UpdateTokenMetadata(on): %v", err)
+		}
+		afterBoth, err := s.TokenByID(ctx, "tok_uls_both")
+		if err != nil || afterBoth.SendUsageLimits || afterBoth.CodexModelSwitchPrompt {
+			t.Fatalf("after off: err=%v %v/%v, want false/false", err, afterBoth.SendUsageLimits, afterBoth.CodexModelSwitchPrompt)
+		}
+		afterNone, err := s.TokenByID(ctx, "tok_uls_none")
+		if err != nil || !afterNone.SendUsageLimits || !afterNone.CodexModelSwitchPrompt {
+			t.Fatalf("after on: err=%v %v/%v, want true/true", err, afterNone.SendUsageLimits, afterNone.CodexModelSwitchPrompt)
+		}
+	})
+}
+
+// TestTokenUsageSwitchesReachAuthTokenSQL pins that the request-time bearer
+// lookup copies both usage-limit switches into the auth.Token the gateway
+// handlers read (the copy claude_code_usage_display never had), and that a
+// metadata update shows up on the next lookup.
+func TestTokenUsageSwitchesReachAuthTokenSQL(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateUser(ctx, newTestUser("usr_ulr", "ulr@example.test", now)); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		rec := TokenRecord{ID: "tok_ulr", UserID: "usr_ulr", Name: "r", CreatedAt: now, UpdatedAt: now, SendUsageLimits: true, CodexModelSwitchPrompt: true}
+		if err := s.CreatePlainToken(ctx, rec, "ulr-secret"); err != nil {
+			t.Fatalf("CreatePlainToken: %v", err)
+		}
+		tok, ok := s.LookupBearer("Bearer ulr-secret")
+		if !ok || !tok.SendUsageLimits || !tok.CodexModelSwitchPrompt {
+			t.Fatalf("LookupBearer ok=%v send=%v prompt=%v, want true/true", ok, tok.SendUsageLimits, tok.CodexModelSwitchPrompt)
+		}
+		rec, err := s.TokenByID(ctx, "tok_ulr")
+		if err != nil {
+			t.Fatalf("TokenByID: %v", err)
+		}
+		rec.SendUsageLimits, rec.CodexModelSwitchPrompt = false, false
+		rec.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, rec); err != nil {
+			t.Fatalf("UpdateTokenMetadata: %v", err)
+		}
+		tok, ok = s.LookupBearer("Bearer ulr-secret")
+		if !ok || tok.SendUsageLimits || tok.CodexModelSwitchPrompt {
+			t.Fatalf("after update LookupBearer ok=%v send=%v prompt=%v, want false/false", ok, tok.SendUsageLimits, tok.CodexModelSwitchPrompt)
 		}
 	})
 }

@@ -622,13 +622,38 @@ func TestCreateApplicationAllowsLlamaSwapTypeAndAcceptsAllValidTypes(t *testing.
 	server := createTestServer(t, svc, "S", "s.example.test")
 
 	port := 9000
-	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp, routing.ProviderVllmSR} {
+	for _, typ := range []string{routing.ProviderOllama, routing.ProviderVLLM, routing.ProviderLlamaCPP, routing.ProviderLlamaSwap, routing.ProviderLiteLLM, routing.ProviderServerAgent, routing.ProviderStableDiffusionCpp, routing.ProviderAudioCpp, routing.ProviderVllmSR, routing.ProviderStrata} {
 		port++
 		if _, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
 			Type: typ, Port: port, Scheme: "http",
 		}); err != nil {
 			t.Fatalf("CreateApplication type=%s: %v", typ, err)
 		}
+	}
+}
+
+// TestCreateApplicationStrataKeepsStockDefaults pins the strata application
+// type: it is creatable, and like llama_cpp it keeps the stock 30 s timeout and
+// passthrough on both coding-agent endpoints.
+func TestCreateApplicationStrataKeepsStockDefaults(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	svc, _ := newServerTestService(t, now)
+	server := createTestServer(t, svc, "S", "s.example.test")
+
+	dto, err := svc.CreateApplication(context.Background(), ownerToken(), server.ID, CreateApplicationRequest{
+		Type: " strata ", Port: 8080, Scheme: "http",
+	})
+	if err != nil {
+		t.Fatalf("CreateApplication strata: %v", err)
+	}
+	if dto.Type != routing.ProviderStrata {
+		t.Fatalf("Type = %q, want %q", dto.Type, routing.ProviderStrata)
+	}
+	if dto.TimeoutMS != 30000 {
+		t.Fatalf("TimeoutMS = %d, want 30000", dto.TimeoutMS)
+	}
+	if dto.ResponsesMode != string(routing.EndpointModePassthrough) || dto.MessagesMode != string(routing.EndpointModePassthrough) {
+		t.Fatalf("modes = %q/%q, want passthrough/passthrough", dto.ResponsesMode, dto.MessagesMode)
 	}
 }
 
@@ -4578,5 +4603,20 @@ func TestCreateApplicationVllmSRTimeoutDefault(t *testing.T) {
 	}
 	if dto.TimeoutMS != 600000 {
 		t.Fatalf("TimeoutMS = %d, want 600000", dto.TimeoutMS)
+	}
+}
+
+// TestViewRuntimeTypeStrataApplication pins that a direct strata application's
+// mappings take the strata runtime kind, and with it the chat role.
+func TestViewRuntimeTypeStrataApplication(t *testing.T) {
+	view := mappingView{
+		app:     routing.Application{Type: routing.ProviderStrata},
+		mapping: routing.ModelMapping{ID: "m1"},
+	}
+	if got := viewRuntimeType(view, runtimeSpecIndex{}); got != routing.RuntimeSpecTypeStrata {
+		t.Fatalf("viewRuntimeType = %q, want strata", got)
+	}
+	if got := routing.DeriveRole(viewRuntimeType(view, runtimeSpecIndex{}), nil); got != routing.RoleChat {
+		t.Fatalf("role = %q, want chat", got)
 	}
 }

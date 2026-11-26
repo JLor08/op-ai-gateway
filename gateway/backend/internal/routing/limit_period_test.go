@@ -78,3 +78,29 @@ func TestValidLimitPeriod(t *testing.T) {
 		}
 	}
 }
+
+func TestPeriodEnd(t *testing.T) {
+	cases := []struct {
+		name   string
+		period string
+		now    time.Time
+		want   time.Time
+	}{
+		{"hour", "hour", periodUTC(2026, 3, 15, 13, 47, 22), periodUTC(2026, 3, 15, 14, 0, 0)},
+		{"day year boundary", "day", periodUTC(2025, 12, 31, 23, 59, 59), periodUTC(2026, 1, 1, 0, 0, 0)},
+		// 2026-12-27 is a Sunday (verified with date), the last day of its ISO week.
+		{"week sunday", "week", periodUTC(2026, 12, 27, 10, 0, 0), periodUTC(2026, 12, 28, 0, 0, 0)},
+		{"week thursday", "week", periodUTC(2026, 12, 31, 10, 0, 0), periodUTC(2027, 1, 4, 0, 0, 0)},
+		{"month year boundary", "month", periodUTC(2026, 12, 31, 23, 59, 59), periodUTC(2027, 1, 1, 0, 0, 0)},
+		{"month 31st", "month", periodUTC(2026, 1, 31, 12, 0, 0), periodUTC(2026, 2, 1, 0, 0, 0)},
+		{"off", "", periodUTC(2026, 3, 15, 0, 0, 0), time.Time{}},
+		{"unknown", "fortnight", periodUTC(2026, 3, 15, 0, 0, 0), time.Time{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PeriodEnd(tc.period, tc.now); !got.Equal(tc.want) {
+				t.Fatalf("PeriodEnd(%q, %v) = %v, want %v", tc.period, tc.now, got, tc.want)
+			}
+		})
+	}
+}

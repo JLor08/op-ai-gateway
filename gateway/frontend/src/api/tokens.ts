@@ -19,6 +19,11 @@ export type ModelOverrideEntry = {
 // (the account's models are offered under their bare original names), ON with a
 // value replaces the account's own model_prefix for this token. On write, OMIT
 // `prefix_override` entirely when the override is off (never send enabled:false).
+export type VendorAccessGroupDTO = {
+  group_id: string;
+  prefix_override?: { enabled: boolean; value: string };
+};
+
 export type VendorAccessAccountDTO = {
   account_id: string;
   prefix_override?: { enabled: boolean; value: string };
@@ -39,6 +44,11 @@ export type VendorAccessAccountDTO = {
 export type VendorAccessDTO = {
   all: boolean;
   accounts?: VendorAccessAccountDTO[];
+  // Vendor account groups: `include_groups` covers every group the token's own
+  // user owns (also future ones); `groups` names explicit groups with an optional
+  // per-group prefix override. A deleted group named here matches nothing.
+  include_groups?: boolean;
+  groups?: VendorAccessGroupDTO[];
 };
 
 export type PortalToken = {
@@ -92,6 +102,16 @@ export type PortalToken = {
   // and /v1/systemone report a confidence on a 0..1 scale whatever the
   // model's own scale is. Ungated: any token owner may set it.
   decisions_confidence_normalize?: boolean;
+  // Opt-in Claude Code usage display (#407): the token secret is JWT-shaped so
+  // Claude Code reads the gateway's rate-limit headers and shows the plan's
+  // usage limits. Always emitted by the server on every token read.
+  claude_code_usage_display: boolean;
+  // Usage-limit opt-ins (#420): the gateway sends its rate-limit headers to
+  // the coding client only for a token with send_usage_limits; the Codex
+  // switch-prompt flag is meaningful only together with it. Both are always
+  // emitted by the server on every token read, and neither rotates the token.
+  send_usage_limits: boolean;
+  codex_model_switch_prompt: boolean;
   log_communication: boolean;
   secret: boolean;
   is_chat_session: boolean;
@@ -129,6 +149,12 @@ export type CreateTokenRequest = {
   claude_effort_compatibility?: boolean;
   // Decision-confidence normalization (see PortalToken); omitted = off.
   decisions_confidence_normalize?: boolean;
+  // Claude Code usage display (see PortalToken); omitted = off. Fixes the
+  // secret's shape, so it changes only through rotation.
+  claude_code_usage_display?: boolean;
+  // Usage-limit switches (see PortalToken); omitted = off.
+  send_usage_limits?: boolean;
+  codex_model_switch_prompt?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // Optional project attribution (§6); "" = no project. Membership-checked
@@ -167,6 +193,9 @@ export type UpdateTokenRequest = {
   // Decision-confidence normalization (see PortalToken). Omitted = keep the
   // current value.
   decisions_confidence_normalize?: boolean;
+  // Usage-limit switches (see PortalToken). Omitted = keep the current value.
+  send_usage_limits?: boolean;
+  codex_model_switch_prompt?: boolean;
   log_communication?: boolean;
   secret?: boolean;
   // nil (omitted) = keep the current project attribution; "" = clear it;
@@ -181,9 +210,13 @@ export function tokensApi(fetcher: Fetcher) {
     tokens: () => request<{ data: PortalToken[] }>(fetcher, '/api/portal/tokens'),
     createToken: (body: CreateTokenRequest) =>
       request<CreateTokenResponse>(fetcher, '/api/portal/tokens', { method: 'POST', body }),
-    rotateToken: (id: string) =>
+    // The optional body switches the Claude Code secret shape together with the
+    // rotation (a secret's shape cannot change in place); without it the shape
+    // is kept.
+    rotateToken: (id: string, body?: { claude_code_usage_display: boolean }) =>
       request<CreateTokenResponse>(fetcher, `/api/portal/tokens/${encodeURIComponent(id)}/rotate`, {
         method: 'POST',
+        body,
       }),
     updateToken: (id: string, body: UpdateTokenRequest) =>
       request<PortalToken>(fetcher, `/api/portal/tokens/${encodeURIComponent(id)}`, {

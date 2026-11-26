@@ -4,10 +4,14 @@
 package gateway
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/usage"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -99,6 +103,9 @@ func TestWriteLimitDeniedRate(t *testing.T) {
 	if got := rec.Header().Get("Retry-After"); got != "7" {
 		t.Fatalf("Retry-After = %q, want 7", got)
 	}
+	if _, ok := rec.Header()["X-Should-Retry"]; ok {
+		t.Fatalf("X-Should-Retry must be absent for a rate denial")
+	}
 }
 
 // TestWriteLimitDeniedRateSubSecondFloor proves a sub-second retryAfter (e.g.
@@ -125,6 +132,9 @@ func TestWriteLimitDeniedRequestQuota(t *testing.T) {
 	if got := rec.Header().Get("Retry-After"); got != "" {
 		t.Fatalf("Retry-After = %q, want absent for a non-rate reason", got)
 	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("X-Should-Retry = %q, want false", got)
+	}
 }
 
 func TestWriteLimitDeniedTokenQuota(t *testing.T) {
@@ -135,6 +145,9 @@ func TestWriteLimitDeniedTokenQuota(t *testing.T) {
 	}
 	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.token_quota_exceeded" {
 		t.Fatalf("error code = %q, want limit.token_quota_exceeded", got)
+	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("X-Should-Retry = %q, want false", got)
 	}
 }
 
@@ -149,6 +162,9 @@ func TestWriteLimitDeniedCostBudget(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got != "" {
 		t.Fatalf("Retry-After = %q, want absent for a cost-budget denial", got)
+	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("X-Should-Retry = %q, want false", got)
 	}
 }
 
@@ -451,5 +467,283 @@ func TestPrincipalLimiterAppliesToUserToken(t *testing.T) {
 	}
 	if got := decodeErrorCode(t, rec2.Body.Bytes()); got != "limit.rate_limited" {
 		t.Fatalf("error code = %q, want limit.rate_limited", got)
+	}
+}
+
+// --- /v1/messages block (design spec §6) ------------------------------------
+
+const (
+	messagesBlockBody = `{"model":"qwen-coder","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	chatBlockBody     = `{"model":"qwen-coder","messages":[{"role":"user","content":"hi"}]}`
+
+	responsesBlockBody       = `{"model":"qwen-coder","input":"hi"}`
+	responsesNativeBlockBody = `{"model":"native-model","input":"hi"}`
+)
+
+// blockTestServer wires a svc_1 service principal with cfg and aggregates
+// (requests, tokens, cost) behind a limiter on a fixed clock, 2026-03-15 12:00 UTC.
+func blockTestServer(t *testing.T, cfg routing.LimitConfig, requests, tokens int64, cost float64) (*Server, *usage.Recorder) {
+	t.Helper()
+	srv, tokenStore, recorder := newServiceScopeTestServer(t)
+	addServiceToken(tokenStore, "svc-secret", auth.Token{ID: "tok_svc", ServiceID: "svc_1", ServiceName: "Svc", SendUsageLimits: true})
+	store := newFakePrincipalStore()
+	p := Principal{Type: routing.PrincipalTypeService, ID: "svc_1"}
+	store.setConfig(p, cfg)
+	store.setAggregate(p, requests, tokens, cost)
+	now := utc(2026, 3, 15, 12, 0, 0)
+	srv.Limiter = NewPrincipalLimiter(store, PrincipalLimiterOptions{Now: clockAt(&now)})
+	return srv, recorder
+}
+
+func decodeErrorType(t *testing.T, body []byte) (top, inner string) {
+	t.Helper()
+	var v struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	return v.Type, v.Error.Type
+}
+
+func TestMessagesQuotaDenialIsBillingError(t *testing.T) {
+	srv, recorder := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 0, 100, 0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/messages", messagesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if top, inner := decodeErrorType(t, rec.Body.Bytes()); top != "error" || inner != "billing_error" {
+		t.Fatalf("type = %q/%q, want error/billing_error", top, inner)
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.token_quota_exceeded" {
+		t.Fatalf("code = %q", got)
+	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("X-Should-Retry = %q", got)
+	}
+	if got := rec.Header().Get(unifiedRateLimitPrefix + "status"); got != "rejected" {
+		t.Fatalf("unified status = %q", got)
+	}
+	if n, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || n <= 0 {
+		t.Fatalf("Retry-After = %q, want > 0", rec.Header().Get("Retry-After"))
+	}
+	if n := len(recorder.All()); n != 0 {
+		t.Fatalf("recorded usage events = %d, want 0", n)
+	}
+}
+
+func TestMessagesCostBudgetDenialIs429(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{CostBudget: 1, CostBudgetPeriod: "month"}, 0, 0, 1.0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/messages", messagesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.cost_budget_exceeded" {
+		t.Fatalf("code = %q", got)
+	}
+	if got := rec.Header().Get(unifiedRateLimitPrefix + "overage-period"); got != "monthly" {
+		t.Fatalf("overage-period = %q, want monthly", got)
+	}
+}
+
+func TestMessagesBlockDescribesLatestReset(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day", CostBudget: 1, CostBudgetPeriod: "month"}, 0, 100, 1.0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/messages", messagesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.cost_budget_exceeded" {
+		t.Fatalf("code = %q, want the cost budget (later reset)", got)
+	}
+	if got := rec.Header().Get(unifiedRateLimitPrefix + "overage-period"); got != "monthly" {
+		t.Fatalf("overage-period = %q, want monthly", got)
+	}
+}
+
+func TestChatQuotaDenialKeepsShapeAddsNoRetry(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 0, 100, 0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/chat/completions", chatBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if top, _ := decodeErrorType(t, rec.Body.Bytes()); top != "" {
+		t.Fatalf("top-level type = %q, want none (apierror shape)", top)
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.token_quota_exceeded" {
+		t.Fatalf("code = %q", got)
+	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("X-Should-Retry = %q", got)
+	}
+	if got := rec.Header().Get(unifiedRateLimitPrefix + "status"); got != "" {
+		t.Fatalf("unified status = %q, want absent", got)
+	}
+
+	srv, _ = blockTestServer(t, routing.LimitConfig{CostBudget: 1, CostBudgetPeriod: "month"}, 0, 0, 1.0)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/chat/completions", chatBlockBody, "svc-secret"))
+	if rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("cost status = %d, want 402", rec.Code)
+	}
+}
+
+func TestMessagesRateDenialUnchanged(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{RateRequests: 1, RateWindowSeconds: 60}, 0, 0, 0)
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/messages", messagesBlockBody, "svc-secret"))
+		if i == 0 {
+			continue
+		}
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+		}
+		if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.rate_limited" {
+			t.Fatalf("code = %q", got)
+		}
+		if rec.Header().Get("Retry-After") == "" {
+			t.Fatalf("Retry-After missing")
+		}
+		if _, ok := rec.Header()["X-Should-Retry"]; ok {
+			t.Fatalf("X-Should-Retry must be absent")
+		}
+		if got := rec.Header().Get(unifiedRateLimitPrefix + "status"); got != "" {
+			t.Fatalf("unified status = %q, want absent", got)
+		}
+	}
+}
+
+// --- /v1/responses block (Codex usage_limit_reached) -------------------------
+
+func decodeResetsAt(t *testing.T, body []byte) int64 {
+	t.Helper()
+	var v struct {
+		Error struct {
+			ResetsAt int64 `json:"resets_at"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		t.Fatalf("decode %s: %v", body, err)
+	}
+	return v.Error.ResetsAt
+}
+
+func assertNoCodexBlockLeaks(t *testing.T, h http.Header) {
+	t.Helper()
+	for _, name := range []string{"X-Codex-Limit-Name", "X-Codex-Active-Limit", "X-Codex-Rate-Limit-Reached-Type", "X-Codex-Secondary-Used-Percent"} {
+		if got := h.Get(name); got != "" {
+			t.Fatalf("%s = %q, want absent", name, got)
+		}
+	}
+}
+
+func assertResponsesTokenQuotaBlock(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if _, inner := decodeErrorType(t, rec.Body.Bytes()); inner != "usage_limit_reached" {
+		t.Fatalf("error.type = %q, want usage_limit_reached", inner)
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.token_quota_exceeded" {
+		t.Fatalf("code = %q", got)
+	}
+	if decodeResetsAt(t, rec.Body.Bytes()) <= 0 {
+		t.Fatalf("error.resets_at not set, body = %s", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Should-Retry"); got != "false" {
+		t.Fatalf("X-Should-Retry = %q", got)
+	}
+	if n, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || n <= 0 {
+		t.Fatalf("Retry-After = %q, want > 0", rec.Header().Get("Retry-After"))
+	}
+	if got := rec.Header().Get("X-Codex-Primary-Used-Percent"); got != "100" {
+		t.Fatalf("primary used percent = %q, want 100", got)
+	}
+	if got := rec.Header().Get("X-Codex-Promo-Message"); got != codexPromoMessage(LimitKindTokenQuota) {
+		t.Fatalf("promo = %q", got)
+	}
+	assertNoCodexBlockLeaks(t, rec.Header())
+}
+
+func TestResponsesQuotaDenialIsUsageLimitReached(t *testing.T) {
+	srv, recorder := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 0, 100, 0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	assertResponsesTokenQuotaBlock(t, rec)
+	if n := len(recorder.All()); n != 0 {
+		t.Fatalf("recorded usage events = %d, want 0", n)
+	}
+}
+
+func TestResponsesCostBudgetDenialIs429(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{CostBudget: 1, CostBudgetPeriod: "month"}, 0, 0, 1.0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.cost_budget_exceeded" {
+		t.Fatalf("code = %q", got)
+	}
+	if got := rec.Header().Get("X-Codex-Primary-Window-Minutes"); got != "43200" {
+		t.Fatalf("window minutes = %q, want 43200", got)
+	}
+}
+
+func TestResponsesBlockDescribesLatestReset(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day", CostBudget: 1, CostBudgetPeriod: "month"}, 0, 100, 1.0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.cost_budget_exceeded" {
+		t.Fatalf("code = %q, want the cost budget (later reset)", got)
+	}
+}
+
+func TestResponsesBlockOnNativeModel(t *testing.T) {
+	srv, recorder := blockTestServer(t, routing.LimitConfig{TokenQuota: 100, TokenQuotaPeriod: "day"}, 0, 100, 0)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesNativeBlockBody, "svc-secret"))
+	assertResponsesTokenQuotaBlock(t, rec)
+	if n := len(recorder.All()); n != 0 {
+		t.Fatalf("recorded usage events = %d, want 0 (the denied native-passthrough request must not reach the upstream)", n)
+	}
+}
+
+func TestResponsesRateDenialUnchanged(t *testing.T) {
+	srv, _ := blockTestServer(t, routing.LimitConfig{RateRequests: 1, RateWindowSeconds: 60}, 0, 0, 0)
+	first := httptest.NewRecorder()
+	srv.ServeHTTP(first, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200, body = %s", first.Code, first.Body.String())
+	}
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, bearerRequest(http.MethodPost, "/v1/responses", responsesBlockBody, "svc-secret"))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := decodeErrorCode(t, rec.Body.Bytes()); got != "limit.rate_limited" {
+		t.Fatalf("code = %q", got)
+	}
+	if top, inner := decodeErrorType(t, rec.Body.Bytes()); top != "" || inner != "" {
+		t.Fatalf("type = %q/%q, want none (apierror shape)", top, inner)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("Retry-After missing")
+	}
+	for name := range rec.Header() {
+		if strings.HasPrefix(strings.ToLower(name), "x-codex-") {
+			t.Fatalf("unexpected %s on a rate denial", name)
+		}
 	}
 }

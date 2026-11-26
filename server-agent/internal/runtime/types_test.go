@@ -208,6 +208,19 @@ func TestSpecUnmarshalsTypeAndProbePaths(t *testing.T) {
 	}
 }
 
+// TestSpecUnmarshalsAPITokenHeader pins the wire tag of the effective token
+// header the gateway pushes beside api_token (AgentRuntimeSpecDTO's
+// api_token_header, #424): the agent's own child probes send the token in it.
+func TestSpecUnmarshalsAPITokenHeader(t *testing.T) {
+	var spec Spec
+	if err := json.Unmarshal([]byte(`{"id":"rspec_1","api_token":"t","api_token_header":"X-Api-Key"}`), &spec); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if spec.APITokenHeader != "X-Api-Key" {
+		t.Errorf("spec.APITokenHeader = %q, want %q", spec.APITokenHeader, "X-Api-Key")
+	}
+}
+
 // TestConfigDecodeReadsRAMMB pins the wire tag of the spec-level host-RAM
 // demand the gateway pushes (AgentRuntimeSpecDTO.RAMMB,
 // gateway/backend/internal/portal/service_runtime.go): ParseConfig must land

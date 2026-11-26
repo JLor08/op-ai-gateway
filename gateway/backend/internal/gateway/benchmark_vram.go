@@ -147,9 +147,10 @@ const (
 // How a per-GPU result identified the card it is attributed to. A stored VRAM
 // number attributed to index 1 after the cards were renumbered is worse than no
 // number, so the result records what it actually compared -- and says which,
-// because the strongest available field differs by vendor: GPUSample.UUID is
-// NVIDIA-only, so on exactly the two host classes the delta strategy exists to
-// serve (AMD, Apple) a UUID-only detector would be empty.
+// because the strongest available field differs by vendor: GPUSample.UUID
+// comes from NVIDIA and from AMD with rocm-smi 4.x only, so on the host classes
+// the delta strategy exists to serve (Apple, older AMD) a UUID-only detector
+// would be empty.
 const (
 	// vramFingerprintUUID: a GPU UUID, so any renumbering is detectable.
 	vramFingerprintUUID = "uuid"

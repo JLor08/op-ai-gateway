@@ -300,6 +300,34 @@ an opted-in token (a translated `/v1/decisions` answer is buffered for every tok
 onto the run (`AuthorizeRunAsToken` copies the field); the portal session principal itself
 never has it.
 
+#### Claude Code token secret shape
+
+A user token can opt into `claude_code_usage_display` (default off). Claude Code shows an
+Anthropic subscription's usage limits only when its bearer token (`ANTHROPIC_AUTH_TOKEN`)
+is a JWT whose payload `aud` is `claude-gateway`; it decodes the payload and verifies
+nothing. A token with the flag therefore gets a secret of the form
+`<header>.<payload>.<opaigw_ secret>`, where the header is `{"alg":"none","typ":"JWT"}` and
+the payload is `{"aud":"claude-gateway"}`, both base64url. The gateway never parses or
+verifies this shape: the whole string is an opaque bearer that is SHA-256 hashed like any
+other, and the **third segment, the `opaigw_` secret, is what carries the entropy**. `alg:
+none` is harmless because nothing verifies the signature, there is none to forge. The shape is
+fixed at issue time: the flag changes only through rotation, which issues a fresh secret in
+the requested shape and retires the old one; a PATCH cannot change it
+(`portal.token_claude_code_usage_display_requires_rotation`). Service tokens and agent tokens
+keep the plain `opaigw_` secret. The shape only makes Claude Code look at the rate-limit
+headers; what the gateway sends is described in [Claude Code usage-limit
+display](compatibility-and-inference.md#93-claude-code-usage-limit-display).
+
+The option is the "Claude Code token format" and is **not** what decides whether usage limits are
+sent. Two separate per-token switches do (issue #420, [ADR-110](../09-architecture-decisions.md#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it)): `send_usage_limits` and
+`codex_model_switch_prompt`, both default off. They are ordinary, ungated settings (any principal that may edit
+the token may change them) and need no rotation, since they do not shape the secret. A user token takes them on create and
+PATCH and always reads them back; a service token takes them on create and reads them back (editing is issue
+#421). Without `send_usage_limits` the token receives no `anthropic-ratelimit-unified-*` and no `x-codex-*`
+header on any path, only the status codes, `Retry-After`, `X-Should-Retry`, the block bodies and the Codex block's
+`x-codex-promo-message`. `codex_model_switch_prompt` counts only together with `send_usage_limits`. Claude Code needs the
+token format and `send_usage_limits`; Codex needs only the switch. Migration 112 switched `send_usage_limits` on for user tokens that already had the token format.
+
 ## 5. Run-as token (`X-OP-Run-As-Token`)
 
 Portal chat runs as the logged-in **session** principal, but the operator may
@@ -320,8 +348,21 @@ bare session. `handleOpenAISpeech` (`speech_handler.go`) and
 shared `runAsPrincipal` helper, so a speech or transcription call made over the
 loopback pair with a run-as header would bill and capture under the token rather than
 under the bare session. The flowchart in [§7](#7-request-authentication-decision-flow)
-shows both edges into `AuthorizeRunAsToken`; do not read this section as
+shows the edges into `AuthorizeRunAsToken`; do not read this section as
 naming chat completions exclusively.
+
+**The portal models listing is a further consumer, with a stricter rule.**
+`GET /api/portal/models` reads the same header from a **session** caller and
+computes the listing for the token's principal, so the chat picker shows what a
+run with that token can use ([ADR-114](../09-architecture-decisions.md#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token)).
+It runs the same `AuthorizeRunAsToken` gate, but where the inference handlers
+**silently ignore** the header for a bearer caller, this endpoint **refuses**: a
+bearer caller (`token.ID != ""`) sending it gets `403 portal.token_forbidden`,
+decided before any lookup. A token that is foreign, unknown or disabled gets the
+gate's own `403 portal.token_forbidden` with an identical body, so the answer
+does not reveal whether a token id exists. Combined with `?manage=1` the header
+is `400 portal.models_run_as_conflict`. The loading counts of the listing use the
+run-as principal too.
 
 The gate is the resolved principal's **token id being empty**, not the path and
 not the headers the request carries: `token.ID == ""` is true only for the
@@ -407,6 +448,8 @@ flowchart TD
     M --> N["requireWebAnyScope:<br/>gateway:use OR llm:invoke"]
     N -- "session + optional<br/>X-OP-Run-As-Token" --> O["AuthorizeRunAsToken<br/>(ownership + active + scope)"]
     N -- pass --> L
+
+    H -- "GET /api/portal/models<br/>+ X-OP-Run-As-Token<br/>(bearer: 403 before lookup)" --> O
 
     D -- "/v1/responses, /v1/messages,<br/>/v1/messages/count_tokens,<br/>model-listing endpoints" --> P["Bearer ONLY<br/>(authenticate / requireAnyScope)"]
     P -- no/invalid bearer --> X2
@@ -1007,7 +1050,7 @@ the owner's single-use refresh token. The properties that matter for the securit
   the shared arm (the owner's own accounts are always kept), and an unwired seam falls
   back to owner-only, never allow-all. It decides *reach* only: a token still *uses* a
   shared account only when its policy **names** it (`all: true` and a portal session
-  cover only the principal's own accounts), for a user token and, create-only, a service
+  whose stored chat policy is unset cover only the principal's own accounts), for a user token and, create-only, a service
   token, and a service reaches one only through a **direct** service provision
   ([External Vendor Accounts §4.6](external-vendor-accounts.md#46-routing-to-a-shared-account-the-pure-grant),
   [§11](external-vendor-accounts.md#11-per-token-vendor-access),
@@ -1026,7 +1069,8 @@ enforces nothing".**
   narrows a non-`system` caller to its `ManageableUserIDs` set — checked once,
   before the method switch, so GET and PUT 404 identically on a target outside
   it. There is deliberately no self-service path, not even for one's own
-  limits. Behind that gate the two service methods differ: the **read**,
+  limits. The limit configuration stays admin-only; a principal's own standing (utilization and reset of its fullest
+  quota or budget) is reported on its own `/v1/messages` and `/v1/responses` responses, see [Compatibility & Inference §9.4](compatibility-and-inference.md#94-claude-code-display-of-the-gateways-own-limits) and [§9.6](compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits). Behind that gate the two service methods differ: the **read**,
   `UserLimits(ctx, userID)`, takes no `auth.Token` and checks nothing, so its
   route's gate really is its only gate; the **write**,
   `SetUserLimits(ctx, principal, …)`, opens with `isAdmin(principal)` and
@@ -1245,7 +1289,13 @@ canonicalizes header casing:
 Each matched header's value is replaced with the literal marker
 `[redacted]`; the header *name* is kept so the capture viewer can still show
 that the header was present. Response headers are stored verbatim (a
-response never carries an inbound credential). On the **translate** path —
+response never carries an inbound credential), with one exception: on the translate path a
+vendor account's `anthropic-ratelimit-unified-*` headers, its Codex `x-codex-*` rate-limit family and
+`anthropic-organization-id` are dropped from the captured upstream response headers unless the principal
+is entitled to that account's figures (capture redaction is entitlement-based and does not depend on the token's
+`send_usage_limits`) ([Claude Code usage-limit
+display](compatibility-and-inference.md#93-claude-code-usage-limit-display), [Codex usage-limit
+display](compatibility-and-inference.md#95-codex-usage-limit-display)). On the **translate** path —
 where the gateway rewrites a client request into a different upstream
 protocol (e.g. Anthropic-shaped in, Chat-Completions-shaped out) — the
 translated *upstream* request headers are redacted with the exact same list,

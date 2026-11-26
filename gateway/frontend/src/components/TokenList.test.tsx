@@ -86,6 +86,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     system_group_name: '',
     is_owner: true,
     shared_by: '',
+    share_usage_with_members: false,
     ...overrides,
   };
 }
@@ -113,6 +114,9 @@ function makeToken(overrides: Partial<PortalToken> = {}): PortalToken {
     model_override: '',
     log_communication: false,
     secret: false,
+    claude_code_usage_display: false,
+    send_usage_limits: false,
+    codex_model_switch_prompt: false,
     is_chat_session: false,
     deletable: true,
     ...overrides,
@@ -150,6 +154,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // OWN account list api.vendorAccounts() resolves with.
     vendorAccountsEnabled?: boolean;
     vendorAccounts?: VendorAccount[];
+    createdSecret?: string;
   }) {
     const created = opts.created ?? [];
     const tokens = opts.tokens ?? [];
@@ -164,8 +169,11 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           scopes: body.scopes,
           model_override: body.model_override ?? '',
           log_communication: body.log_communication ?? false,
+          claude_code_usage_display: body.claude_code_usage_display ?? false,
+          send_usage_limits: body.send_usage_limits ?? false,
+          codex_model_switch_prompt: body.codex_model_switch_prompt ?? false,
         });
-        return { token, secret: 'opaigw_created_secret' };
+        return { token, secret: opts.createdSecret ?? 'opaigw_created_secret' };
       }),
       updateToken: vi.fn(async (id: string, body: Record<string, unknown>) =>
         makeToken({ id, name: (body.name as string) ?? '', ...body }),
@@ -196,6 +204,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // The vendor-access section's account list (the caller's own accounts).
       // Only fetched while vendorAccountsEnabled is on.
       vendorAccounts: vi.fn(async () => ({ data: opts.vendorAccounts ?? defaultVendorAccounts })),
+      vendorAccountGroups: vi.fn(async () => ({ groups: [] })),
     };
 
     render(
@@ -584,6 +593,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         updateChatSettings: vi.fn(),
         updateToken: vi.fn(),
         vendorAccounts: vi.fn(async () => ({ data: [] })),
+        vendorAccountGroups: vi.fn(async () => ({ groups: [] })),
       };
 
       render(
@@ -672,6 +682,156 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
   });
 
+  describe(`TokenList chat-session provider access [${locale}]`, () => {
+    function chatPanel() {
+      return within(screen.getByRole('region', { name: t.chatSessionName }));
+    }
+    function save() {
+      fireEvent.click(chatPanel().getByRole('button', { name: t.tokenActionSave }));
+    }
+
+    it('pre-fills "all + incl. groups" for an unset user and sends only the booleans when untouched', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalledTimes(1));
+      const chat = chatPanel();
+      expect(chat.getByLabelText(t.tokenVendorAccessAll)).toBeChecked();
+      expect(chat.getByLabelText(t.tokenVendorAccessIncludeGroups)).toBeChecked();
+
+      fireEvent.click(chat.getByLabelText(`${t.tokenSecretLabel} ${t.chatSessionName}`));
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: true,
+      });
+      expect(fakeApi.vendorAccountGroups).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends the explicit object once the editor was edited, even alongside a flag toggle', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      const chat = chatPanel();
+      fireEvent.click(chat.getByLabelText(t.tokenVendorAccessAll));
+      fireEvent.click(await chat.findByRole('checkbox', { name: 'Work OpenAI' }));
+      fireEvent.click(chat.getByLabelText(`${t.tokenSecretLabel} ${t.chatSessionName}`));
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: true,
+        vendor_access: { all: false, accounts: [{ account_id: 'acc_a' }] },
+      });
+    });
+
+    it('an explicit-zero edit still sends {all:false, accounts:[]}', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      const chat = chatPanel();
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalled());
+      fireEvent.click(chat.getByLabelText(t.tokenVendorAccessAll));
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+        vendor_access: { all: false, accounts: [] },
+      });
+    });
+
+    it('leaves an explicit "no providers" row untouched when only a flag is saved', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: false, accounts: [] } })],
+      });
+      const chat = chatPanel();
+      expect(await chat.findByRole('checkbox', { name: 'Work OpenAI' })).not.toBeChecked();
+      expect(chat.getByLabelText(t.tokenVendorAccessAll)).not.toBeChecked();
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+      });
+    });
+
+    it('unticking all and ticking one account sends that explicit list', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      const chat = chatPanel();
+      fireEvent.click(chat.getByLabelText(t.tokenVendorAccessAll));
+      fireEvent.click(await chat.findByRole('checkbox', { name: 'Work OpenAI' }));
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+        vendor_access: { all: false, accounts: [{ account_id: 'acc_a' }] },
+      });
+    });
+
+    it('hides the editor behind a hint and sends only the booleans when the row has no policy', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow()],
+      });
+      const chat = chatPanel();
+      expect(chat.getByText(t.chatSessionVendorAccessUnavailable)).toBeInTheDocument();
+      expect(chat.queryByLabelText(t.tokenVendorAccessAll)).not.toBeInTheDocument();
+
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+      });
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+    });
+
+    it('omits the editor and the field while the vendor-accounts flag is off', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      expect(chatPanel().queryByText(t.tokenVendorAccessLabel)).not.toBeInTheDocument();
+      save();
+      await waitFor(() => expect(fakeApi.updateChatSettings).toHaveBeenCalled());
+      expect(fakeApi.updateChatSettings).toHaveBeenCalledWith({
+        log_communication: false,
+        secret: false,
+      });
+      expect(fakeApi.vendorAccounts).not.toHaveBeenCalled();
+    });
+
+    it('renders a policy conflict translated', async () => {
+      const { fakeApi } = renderTokenList({
+        vendorAccountsEnabled: true,
+        tokens: [makeChatSessionRow({ vendor_access: { all: true, include_groups: true } })],
+      });
+      fakeApi.updateChatSettings.mockRejectedValueOnce(
+        new PortalApiError(400, 'portal.token_vendor_access_conflict', 'raw'),
+      );
+      await waitFor(() => expect(fakeApi.vendorAccounts).toHaveBeenCalled());
+      save();
+      expect(
+        await screen.findByText(
+          `portal.token_vendor_access_conflict: ${t.errorTokenVendorAccessConflict}`,
+        ),
+      ).toBeInTheDocument();
+    });
+  });
+
   describe(`TokenList one-time-secret reveal modal [${locale}]`, () => {
     it('shows the created secret in a widened (md) dialog', async () => {
       renderTokenList({});
@@ -682,6 +842,286 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const dialog = await screen.findByRole('dialog');
       expect(dialog).toHaveClass('MuiDialog-paperWidthMd');
       expect(within(dialog).getByText('opaigw_created_secret')).toBeInTheDocument();
+    });
+  });
+
+  describe(`TokenList Claude Code usage display option (#407) [${locale}]`, () => {
+    const box = () => screen.getByRole('checkbox', { name: t.tokenClaudeCodeUsageDisplay });
+
+    it('defaults to off, shows the hint and sends false on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      expect(box()).not.toBeChecked();
+      expect(screen.getByText(t.tokenClaudeCodeUsageDisplayHint)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'neu' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ claude_code_usage_display: false });
+    });
+
+    it('sends true on create when checked and shows the long secret unchanged', async () => {
+      const longSecret = `eyJhbGciOi.${'a'.repeat(130)}.signature`;
+      const { fakeApi, created } = renderTokenList({ createdSecret: longSecret });
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'cc' } });
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({ claude_code_usage_display: true });
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByText(longSecret)).toBeInTheDocument();
+    });
+
+    it('resets to off when the create form is opened again', async () => {
+      const { fakeApi } = renderTokenList({});
+      openCreate();
+      fireEvent.click(box());
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'cc' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      fireEvent.click(await screen.findByRole('button', { name: t.captureClose }));
+      fireEvent.click(await screen.findByRole('button', { name: t.tokenCreate }));
+      expect(box()).not.toBeChecked();
+    });
+
+    it('shows a Claude Code chip only on tokens with the flag', () => {
+      renderTokenList({
+        tokens: [
+          makeToken({ id: 'tok_a', name: 'With Flag', claude_code_usage_display: true }),
+          makeToken({ id: 'tok_b', name: 'Without Flag' }),
+        ],
+      });
+      const withRow = screen.getByText('With Flag').closest('tr') as HTMLElement;
+      const withoutRow = screen.getByText('Without Flag').closest('tr') as HTMLElement;
+      expect(within(withRow).getByText(t.tokenClaudeCodeBadge)).toBeInTheDocument();
+      expect(within(withoutRow).queryByText(t.tokenClaudeCodeBadge)).not.toBeInTheDocument();
+    });
+  });
+
+  describe(`TokenList Claude Code option on an existing token (#407) [${locale}]`, () => {
+    const box = () => screen.getByRole('checkbox', { name: t.tokenClaudeCodeUsageDisplay });
+    const rotateMock = (fakeApi: { rotateToken: unknown }) =>
+      fakeApi.rotateToken as unknown as { mock: { calls: unknown[][] } };
+
+    it('shows the stored value and no warning until it is changed', () => {
+      renderTokenList({
+        tokens: [makeToken({ id: 'tok_e', claude_code_usage_display: true })],
+      });
+      openEdit();
+      expect(box()).toBeChecked();
+      expect(screen.queryByText(t.tokenClaudeCodeUsageRotateWarning)).not.toBeInTheDocument();
+      fireEvent.click(box());
+      expect(screen.getByText(t.tokenClaudeCodeUsageRotateWarning)).toBeInTheDocument();
+      fireEvent.click(box());
+      expect(screen.queryByText(t.tokenClaudeCodeUsageRotateWarning)).not.toBeInTheDocument();
+    });
+
+    it('saves, rotates with the new value and reveals the new secret', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ id: 'tok_e', claude_code_usage_display: false })],
+      });
+      openEdit();
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() =>
+        expect(fakeApi.rotateToken).toHaveBeenCalledWith('tok_e', {
+          claude_code_usage_display: true,
+        }),
+      );
+      const [, body] = (fakeApi.updateToken as unknown as { mock: { calls: unknown[][] } }).mock
+        .calls[0];
+      expect(body).not.toHaveProperty('claude_code_usage_display');
+      expect(await screen.findByText('opaigw_rotated_secret')).toBeInTheDocument();
+    });
+
+    it('does not rotate when the checkbox is left unchanged', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [makeToken({ id: 'tok_e', claude_code_usage_display: true })],
+      });
+      openEdit();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(rotateMock(fakeApi).mock.calls).toHaveLength(0);
+    });
+
+    it('shows the error and keeps the old setting when the rotation fails after the save', async () => {
+      const fakeApi = {
+        createToken: vi.fn(),
+        updateToken: vi.fn(async (id: string, body: Record<string, unknown>) =>
+          makeToken({ id, name: (body.name as string) ?? '', claude_code_usage_display: false }),
+        ),
+        deleteToken: vi.fn(),
+        rotateToken: vi.fn(async () => {
+          throw new PortalApiError(500, 'internal', 'boom');
+        }),
+        updateChatSettings: vi.fn(),
+        myProjects: vi.fn(async () => defaultProjects),
+        serverModels: vi.fn(async () => []),
+        vendorAccounts: vi.fn(async () => ({ data: [] })),
+        vendorAccountGroups: vi.fn(async () => ({ groups: [] })),
+      };
+      const setTokens = vi.fn();
+      render(
+        <ToastProvider>
+          <TokenList
+            t={t}
+            api={fakeApi}
+            tokens={[makeToken({ id: 'tok_e', claude_code_usage_display: false })]}
+            setTokens={setTokens}
+            role="admin"
+            models={models}
+            servers={[]}
+          />
+        </ToastProvider>,
+      );
+      openEdit();
+      fireEvent.click(box());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.rotateToken).toHaveBeenCalled());
+      // The rotate warning plus the error toast.
+      await waitFor(() => expect(screen.getAllByRole('alert')).toHaveLength(2));
+      expect(screen.queryByText('opaigw_rotated_secret')).not.toBeInTheDocument();
+      // The list state only ever received the PATCH result (old setting).
+      for (const [updater] of setTokens.mock.calls) {
+        const next = (updater as (rows: PortalToken[]) => PortalToken[])([
+          makeToken({ id: 'tok_e' }),
+        ]);
+        expect(next.every((row) => row.claude_code_usage_display === false)).toBe(true);
+      }
+    });
+  });
+
+  describe(`TokenList usage-limit switches (#420) [${locale}]`, () => {
+    const send = () => screen.getByRole('checkbox', { name: t.tokenSendUsageLimits });
+    const codex = () => screen.getByRole('checkbox', { name: t.tokenCodexModelSwitchPrompt });
+    const format = () => screen.getByRole('checkbox', { name: t.tokenClaudeCodeUsageDisplay });
+    const bodyOf = (fn: unknown) =>
+      (fn as { mock: { calls: unknown[][] } }).mock.calls[0][1] as Record<string, unknown>;
+
+    it('shows both help texts', () => {
+      renderTokenList({});
+      openCreate();
+      expect(screen.getByText(t.tokenSendUsageLimitsHint)).toBeInTheDocument();
+      expect(screen.getByText(t.tokenCodexModelSwitchPromptHint)).toBeInTheDocument();
+      expect(t.tokenSendUsageLimitsHint).toMatch(/Codex/);
+      expect(t.tokenCodexModelSwitchPromptHint).toMatch(/gpt-5\.4-mini/);
+      expect(t.tokenCodexModelSwitchPromptHint).toMatch(/90/);
+    });
+
+    it('sends both switches false by default on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      expect(send()).not.toBeChecked();
+      expect(codex()).not.toBeChecked();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'n' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({
+        send_usage_limits: false,
+        codex_model_switch_prompt: false,
+      });
+    });
+
+    it('sends both switches on create', async () => {
+      const { fakeApi, created } = renderTokenList({});
+      openCreate();
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'n' } });
+      fireEvent.click(send());
+      fireEvent.click(codex());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      expect(created[0]).toMatchObject({
+        send_usage_limits: true,
+        codex_model_switch_prompt: true,
+      });
+    });
+
+    it('keeps the Codex switch disabled until usage limits are sent, and clears it with them', () => {
+      renderTokenList({});
+      openCreate();
+      expect(codex()).toBeDisabled();
+      fireEvent.click(send());
+      expect(codex()).toBeEnabled();
+      fireEvent.click(codex());
+      expect(codex()).toBeChecked();
+      fireEvent.click(send());
+      expect(codex()).not.toBeChecked();
+      expect(codex()).toBeDisabled();
+    });
+
+    it('ticks usage limits with the Claude Code token format, and lets the user untick them', () => {
+      renderTokenList({});
+      openCreate();
+      fireEvent.click(format());
+      expect(send()).toBeChecked();
+      fireEvent.click(send());
+      expect(send()).not.toBeChecked();
+      expect(format()).toBeChecked();
+    });
+
+    it('resets both switches when the create form is opened again', async () => {
+      const { fakeApi } = renderTokenList({});
+      openCreate();
+      fireEvent.click(send());
+      fireEvent.click(codex());
+      fireEvent.change(screen.getByLabelText(t.tokenNameLabel), { target: { value: 'n' } });
+      fireEvent.click(screen.getByRole('button', { name: t.tokenCreate }));
+      await waitFor(() => expect(fakeApi.createToken).toHaveBeenCalled());
+      fireEvent.click(await screen.findByRole('button', { name: t.captureClose }));
+      fireEvent.click(await screen.findByRole('button', { name: t.tokenCreate }));
+      expect(send()).not.toBeChecked();
+      expect(codex()).not.toBeChecked();
+    });
+
+    it('PATCHes both changed values on edit without rotating', async () => {
+      const { fakeApi } = renderTokenList({ tokens: [makeToken({ id: 'tok_e' })] });
+      openEdit();
+      expect(send()).not.toBeChecked();
+      fireEvent.click(send());
+      fireEvent.click(codex());
+      expect(screen.queryByText(t.tokenClaudeCodeUsageRotateWarning)).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(bodyOf(fakeApi.updateToken)).toMatchObject({
+        send_usage_limits: true,
+        codex_model_switch_prompt: true,
+      });
+      expect(
+        (fakeApi.rotateToken as unknown as { mock: { calls: unknown[][] } }).mock.calls,
+      ).toHaveLength(0);
+    });
+
+    it('shows the stored values on edit and PATCHes an unchecked pair', async () => {
+      const { fakeApi } = renderTokenList({
+        tokens: [
+          makeToken({ id: 'tok_e', send_usage_limits: true, codex_model_switch_prompt: true }),
+        ],
+      });
+      openEdit();
+      expect(send()).toBeChecked();
+      expect(codex()).toBeChecked();
+      fireEvent.click(send());
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionSave }));
+      await waitFor(() => expect(fakeApi.updateToken).toHaveBeenCalled());
+      expect(bodyOf(fakeApi.updateToken)).toMatchObject({
+        send_usage_limits: false,
+        codex_model_switch_prompt: false,
+      });
+    });
+
+    it('shows a badge only on tokens that send usage limits', () => {
+      renderTokenList({
+        tokens: [
+          makeToken({ id: 'tok_a', name: 'Sends', send_usage_limits: true }),
+          makeToken({ id: 'tok_b', name: 'Silent' }),
+        ],
+      });
+      const on = screen.getByText('Sends').closest('tr') as HTMLElement;
+      const off = screen.getByText('Silent').closest('tr') as HTMLElement;
+      expect(within(on).getByText(t.tokenUsageLimitsBadge)).toBeInTheDocument();
+      expect(within(off).queryByText(t.tokenUsageLimitsBadge)).not.toBeInTheDocument();
     });
   });
 

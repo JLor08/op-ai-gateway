@@ -1341,9 +1341,10 @@ func TestRefreshVendorAccountModelsKeepsTheStoredUsageWhenTheFetchIsUnverifiable
 	})
 }
 
-// Only an OpenAI SUBSCRIPTION is asked for usage: an api-key account (of either
-// vendor) and an Anthropic subscription never reach the fetcher, and the models
-// refresh answers exactly as it did before the usage fetch existed.
+// Only an OpenAI SUBSCRIPTION is asked for usage through the OpenAI fetcher: an
+// api-key account (of either vendor) never reaches a usage fetcher, an Anthropic
+// subscription has its own (unconfigured here, so it stores nothing), and the
+// models refresh answers exactly as it did before the usage fetch existed.
 func TestRefreshVendorAccountModelsSkipsTheUsageFetchForEveryOtherAccountKind(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -27,7 +27,7 @@ func TestMigration88AddsTokenClaudeModelAliases(t *testing.T) {
 			t.Fatalf("api_tokens already has claude_model_aliases at v87: %v", cols)
 		}
 
-		if err := s.CreateUser(ctx, newTestUser("u_m88", "m88@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m88", "m88@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		// Seed a pre-upgrade token that cannot name claude_model_aliases (the

@@ -297,6 +297,29 @@ type orchFixture struct {
 
 	clockMu sync.Mutex
 	now     time.Time
+
+	// pushes records every server whose document the orchestrator pushed;
+	// with applyPushes set, the server's agent then applies its current
+	// document, as a connected agent does.
+	pushMu      sync.Mutex
+	pushes      []string
+	applyPushes bool
+}
+
+func (f *orchFixture) push(serverID string) {
+	f.pushMu.Lock()
+	f.pushes = append(f.pushes, serverID)
+	apply := f.applyPushes
+	f.pushMu.Unlock()
+	if apply {
+		go f.ack(serverID)
+	}
+}
+
+func (f *orchFixture) pushed() []string {
+	f.pushMu.Lock()
+	defer f.pushMu.Unlock()
+	return slices.Clone(f.pushes)
 }
 
 func newOrchFixture(t *testing.T, members int, transport, network string) *orchFixture {
@@ -328,6 +351,7 @@ func newOrchFixture(t *testing.T, members int, transport, network string) *orchF
 		authCtx:  func(ctx context.Context, _ routing.Target) context.Context { return ctx },
 		base:     context.Background,
 		now:      f.clock,
+		push:     f.push,
 	}, orchTimings())
 	t.Cleanup(f.o.wait)
 	return f
@@ -686,6 +710,70 @@ func TestEnsureClusterWaitsForConfigAck(t *testing.T) {
 	}
 	if calls := g.agent.recorded(); len(calls) != 0 {
 		t.Fatalf("calls = %q, want none", calls)
+	}
+}
+
+// TestEnsureClusterPushesADocumentTheAgentLacks pins step one against a
+// document that moved without a push. Some writes change a document and
+// deliberately push nothing -- a member's usage rise during a formed run
+// (cluster_usage.go), the agent's VRAM write-back, the capability writers --
+// so an agent can apply an older document than the one derived now, until its
+// 60 s poll. A start that reaches step one meanwhile (a manual start of a
+// formed cluster whose telemetry has not yet shown the head running) pushes
+// the current document to that agent and accepts its acknowledgement, rather
+// than waiting out its bound for one nothing would send -- once per document
+// the agent reports applied, so a document that moves again is pushed again.
+// An agent that never applies it fails the start as before, after one push.
+func TestEnsureClusterPushesADocumentTheAgentLacks(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	f.holdOnHeadEnsure(0)
+	f.ackAll()
+	f.statuses.SetAppliedConfigETag(orchMemberServer(0), "etag-before-the-usage-rise")
+	f.applyPushes = true
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got, want := f.pushed(), []string{orchMemberServer(0)}; !slices.Equal(got, want) {
+		t.Fatalf("pushed = %q, want %q: only the agent that lacks its current document", got, want)
+	}
+	if f.o.State(orchHead) != clusterFormed {
+		t.Fatalf("state = %v, want formed", f.o.State(orchHead))
+	}
+
+	g := newOrchFixture(t, 1, "relay", "lan")
+	g.ackAll()
+	g.statuses.SetAppliedConfigETag(orchMemberServer(0), "etag-before-the-usage-rise")
+	ce := clusterErrOf(t, g.o.Ensure(context.Background(), orchHead))
+	if ce.Code != codeClusterStartFailed || ce.Cause != codeClusterConfigUnacknowledged || ce.Position != 0 || ce.Head {
+		t.Fatalf("error = %+v, want cluster_start_failed with config_unacknowledged on member 0", ce)
+	}
+	if got, want := g.pushed(), []string{orchMemberServer(0)}; !slices.Equal(got, want) {
+		t.Fatalf("pushed = %q, want %q: one push per document the agent reports", got, want)
+	}
+	if calls := g.agent.recorded(); len(calls) != 0 {
+		t.Fatalf("calls = %q, want none", calls)
+	}
+
+	// A document that moves again while the start waits (the usage rises once
+	// more before the agent applied the push) is pushed again: once per
+	// document the agent reports applied, not once per start.
+	h := newOrchFixture(t, 1, "relay", "lan")
+	h.holdOnHeadEnsure(0)
+	h.ackAll()
+	h.statuses.SetAppliedConfigETag(orchMemberServer(0), "etag-before-the-usage-rise")
+	h.o.deps.push = func(serverID string) {
+		h.push(serverID)
+		if len(h.pushed()) == 1 {
+			go h.statuses.SetAppliedConfigETag(serverID, "etag-between-two-rises")
+			return
+		}
+		go h.ack(serverID)
+	}
+	if err := h.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure after a second rise: %v", err)
+	}
+	if got, want := h.pushed(), []string{orchMemberServer(0), orchMemberServer(0)}; !slices.Equal(got, want) {
+		t.Fatalf("pushed = %q, want %q: one push per document the agent reports", got, want)
 	}
 }
 

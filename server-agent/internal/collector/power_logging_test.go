@@ -62,11 +62,11 @@ func TestLHMCollectLogsNon2xx(t *testing.T) {
 // TestPowerSourcesReflectsLHM: PowerSources lists "lhm" iff an LHM URL is configured —
 // the startup line that tells the operator whether LHM is even a source.
 func TestPowerSourcesReflectsLHM(t *testing.T) {
-	with := PowerSources(DetectPowerCollector("http://127.0.0.1:8085/data.json"))
+	with := PowerSources(DetectPowerCollector(PowerConfig{LHMURL: "http://127.0.0.1:8085/data.json"}))
 	if !containsString(with, "lhm") {
 		t.Fatalf("expected 'lhm' among power sources when a URL is set, got %v", with)
 	}
-	without := PowerSources(DetectPowerCollector(""))
+	without := PowerSources(DetectPowerCollector(PowerConfig{}))
 	if containsString(without, "lhm") {
 		t.Fatalf("did not expect 'lhm' among power sources with no URL, got %v", without)
 	}

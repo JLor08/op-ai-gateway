@@ -100,7 +100,7 @@ func vendorListingPrincipal(token auth.Token) bool {
 // when an account's models could not be read; the accounts that could be are still
 // returned.
 func (s *Service) advertisedVendorAccountModels(ctx context.Context, token auth.Token, accounts []routing.VendorAccount, subscriptionsOn bool) (out []vendorAccountModels, loaded bool) {
-	loaded = true
+	out, loaded = s.advertisedVendorGroupModels(ctx, token, accounts, subscriptionsOn)
 	for _, acc := range accounts {
 		if acc.Status != routing.VendorAccountStatusActive {
 			continue
@@ -132,9 +132,91 @@ func (s *Service) advertisedVendorAccountModels(ctx context.Context, token auth.
 }
 
 // vendorAccountModels is one active vendor account with the models it serves.
+// GroupID and GroupName are set when the entry is a member's models relabeled to a
+// vendor account group's prefix (advertisedVendorGroupModels), empty for a plain
+// account entry.
 type vendorAccountModels struct {
-	Account routing.VendorAccount
-	Models  []routing.VendorAccountModel
+	Account   routing.VendorAccount
+	Models    []routing.VendorAccountModel
+	GroupID   string
+	GroupName string
+}
+
+// advertisedVendorGroupModels is the group half of the listing and mirrors the
+// resolver's group step (routing.Resolver.resolveVendorGroup): for each of the
+// token's own ACTIVE groups the token uses (routing.TokenVendorGroupPrefix), one
+// entry per usable member -- reachable (accounts is the enumerator's answer), of
+// the group's vendor, active, subscriptions switch on -- with that member's models
+// relabeled to the group prefix. Thresholds and cooldowns do not affect the
+// listing: they decide which member serves, not whether the name exists. Groups
+// come first because the resolver tries them before any single account (a group
+// shadows its members' names). loaded is false when a store read failed; what was
+// read is still returned. Nothing is read for a token that can use no group
+// (routing.TokenUsesVendorGroups: no user -- groups are personal -- or neither
+// all + include_groups nor a listed group), so its listing never depends on the
+// group tables.
+func (s *Service) advertisedVendorGroupModels(ctx context.Context, token auth.Token, accounts []routing.VendorAccount, subscriptionsOn bool) (out []vendorAccountModels, loaded bool) {
+	if !routing.TokenUsesVendorGroups(token) {
+		return nil, true
+	}
+	groups, err := s.routes.VendorAccountGroupsByOwner(ctx, token.UserID)
+	if err != nil {
+		return nil, false
+	}
+	loaded = true
+	reachable := make(map[string]routing.VendorAccount, len(accounts))
+	for _, acc := range accounts {
+		reachable[acc.ID] = acc
+	}
+	for _, g := range groups {
+		if g.Status != routing.VendorAccountGroupStatusActive {
+			continue
+		}
+		prefix, allowed := routing.TokenVendorGroupPrefix(token, g)
+		if !allowed {
+			continue
+		}
+		members, complete := s.advertisedVendorGroupMembers(ctx, g, prefix, reachable, subscriptionsOn)
+		out = append(out, members...)
+		loaded = loaded && complete
+	}
+	return out, loaded
+}
+
+// advertisedVendorGroupMembers is group g's entries of the listing: one per usable
+// member (vendorGroupMemberListable) with that member's models relabeled to prefix,
+// in member order. complete is false when the member list or a member's models could
+// not be read; what could be read is still returned.
+func (s *Service) advertisedVendorGroupMembers(ctx context.Context, g routing.VendorAccountGroup, prefix string, reachable map[string]routing.VendorAccount, subscriptionsOn bool) (out []vendorAccountModels, complete bool) {
+	members, err := s.routes.VendorAccountGroupMembers(ctx, g.ID)
+	if err != nil {
+		return nil, false
+	}
+	complete = true
+	for _, m := range members {
+		acc, ok := reachable[m.AccountID]
+		if !ok || !vendorGroupMemberListable(g, acc, subscriptionsOn) {
+			continue
+		}
+		models, err := s.routes.VendorAccountModels(ctx, acc.ID)
+		if err != nil {
+			complete = false
+			continue
+		}
+		models, _ = relabelVendorModels(models, prefix)
+		out = append(out, vendorAccountModels{Account: acc, Models: models, GroupID: g.ID, GroupName: g.Name})
+	}
+	return out, complete
+}
+
+// vendorGroupMemberListable reports whether reachable account acc counts as a usable
+// member of g for the listing: of the group's vendor, active, and not a subscription
+// while vendor_subscriptions_enabled is off (the resolver's structural rules).
+func vendorGroupMemberListable(g routing.VendorAccountGroup, acc routing.VendorAccount, subscriptionsOn bool) bool {
+	if acc.Vendor != g.Vendor || acc.Status != routing.VendorAccountStatusActive {
+		return false
+	}
+	return acc.AuthType != routing.VendorAuthSubscription || subscriptionsOn
 }
 
 // vendorModelFlavorSets returns, for the PRINCIPAL, each gateway model one of
@@ -222,11 +304,17 @@ func (s *Service) vendorDashboardRoutes(ctx context.Context, token auth.Token) [
 	owned, _ := s.ownVendorAccountModels(ctx, token) // best-effort listing: a partial set is shown as is
 	for _, am := range owned {
 		for _, m := range am.Models {
+			id, host := am.Account.ID+":"+m.GatewayModel, am.Account.Name
+			if am.GroupID != "" {
+				// A group row is one member's view of the group name; the group id
+				// keeps it distinct from the account's own row for the same name.
+				id, host = am.GroupID+":"+id, am.GroupName+" · "+am.Account.Name
+			}
 			out = append(out, RouteDTO{
-				ID:       am.Account.ID + ":" + m.GatewayModel,
+				ID:       id,
 				Model:    m.GatewayModel,
 				Provider: am.Account.Vendor,
-				Host:     am.Account.Name,
+				Host:     host,
 				Status:   routing.ServerStatusActive,
 			})
 		}

@@ -173,10 +173,11 @@ var nvidiaMeasureTimeout = 2 * time.Second
 // backed by `nvidia-smi --query-compute-apps`, for wiring into
 // runtime.Manager.SetMeasurer. It returns nil when nvidia-smi is not on
 // PATH: measurement is a HARDWARE capability, not a negotiated protocol
-// feature (design doc §5) -- a host without nvidia-smi (no NVIDIA GPUs, AMD,
-// or Apple unified memory, which has no per-process split to report at
-// all) simply has no measurer installed, and the manager falls back to each
-// spec's operator-entered VRAM estimate exactly as it already does today.
+// feature (design doc §5) -- a host without nvidia-smi (no NVIDIA GPUs, or
+// Apple unified memory, which has no per-process split to report at all) has
+// no NVIDIA measurer; on Linux NewVRAMMeasurer then tries the AMD KFD sysfs
+// measurer. Otherwise no measurer is installed, and the manager falls back to
+// each spec's operator-entered VRAM estimate exactly as it already does today.
 func NewNvidiaComputeApps() func(pids []int) map[int]map[int]int {
 	if _, err := exec.LookPath(nvidiaSMI); err != nil {
 		return nil

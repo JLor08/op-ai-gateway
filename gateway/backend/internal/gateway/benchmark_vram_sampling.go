@@ -161,10 +161,10 @@ func vramUsedMB(usedBytes int64) int {
 // to, and NAMES which field did it. A stored VRAM number attributed to index 1
 // after the cards were renumbered is worse than no number, so the result
 // carries the strongest available identifier -- and says how strong it is,
-// because GPUSample.UUID is populated only by the NVIDIA parse. On the two
-// host classes the delta strategy exists to serve (AMD via ROCm, Apple via
-// ioreg) it is always empty, so a UUID-only detector would silently verify
-// nothing there.
+// because GPUSample.UUID is populated only by the NVIDIA parse and by the AMD
+// parse of rocm-smi 4.x. On the host classes the delta strategy exists to
+// serve (Apple via ioreg, AMD with pre-4.0 rocm-smi) it is always empty, so a
+// UUID-only detector would silently verify nothing there.
 //
 // name+total catches a swap between UNLIKE cards only: two identical cards
 // trading indices are indistinguishable, which is why the kind travels with

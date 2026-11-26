@@ -111,16 +111,57 @@ func PowerSources(pc PowerCollector) []string {
 	return []string{pc.Name()}
 }
 
-// DetectPowerCollector composes the OS-native power collector (if any) with the
-// optional LHM-HTTP source (when lhmURL != ""), native first. The result is always
-// non-nil (an empty composite when nothing applies) and safe to Collect.
-func DetectPowerCollector(lhmURL string) PowerCollector {
+// PowerConfig carries the power-source options the collectors are composed from.
+type PowerConfig struct {
+	// LHMURL is the optional LibreHardwareMonitor /data.json URL.
+	LHMURL string
+	// PowercapRoot optionally replaces the native powercap root; read on Linux
+	// and Windows (Windows: the virtiofs drive root), ignored on macOS.
+	PowercapRoot string
+	// HostpowerURL is the optional hostpower HTTP endpoint on the Proxmox host.
+	HostpowerURL string
+	// HostpowerToken is that endpoint's optional per-VM token (a secret).
+	HostpowerToken string
+	// HostpowerTLSFingerprint optionally pins the hostpower server certificate
+	// (SHA-256, as ParseHostpowerFingerprint accepts it) for an https://
+	// HostpowerURL. Empty: standard TLS verification. Not a secret.
+	HostpowerTLSFingerprint string
+	// HelperSocket is the privileged helper's Unix socket; empty disables the
+	// helper power source.
+	HelperSocket string
+}
+
+// nativeAndHostpowerSubs returns the leading power sub-collectors shared by both
+// Detect* entry points: native RAPL, the privileged helper (Linux, non-root,
+// socket configured), hwmon (Linux), then the hostpower HTTP source (when
+// HostpowerURL != ""). The LHM source follows in the callers.
+func nativeAndHostpowerSubs(cfg PowerConfig) []PowerCollector {
 	var subs []PowerCollector
-	if native := newNativePowerCollector(); native != nil { //nolint:staticcheck // newNativePowerCollector returns nil only on the !linux && !darwin build (power_other.go); always-true on this build is an intentional cross-platform guard
+	if native := newNativePowerCollector(cfg.PowercapRoot); native != nil { //nolint:staticcheck // newNativePowerCollector returns nil only on the !linux && !darwin build (power_other.go); always-true on this build is an intentional cross-platform guard
 		subs = append(subs, native)
 	}
-	if strings.TrimSpace(lhmURL) != "" {
-		subs = append(subs, newLHMPowerCollector(lhmURL, &http.Client{Timeout: 5 * time.Second}))
+	if helperEnabled(cfg.HelperSocket) {
+		subs = append(subs, newHelperPowerCollector(NewHelperHTTPClient(cfg.HelperSocket)))
+	}
+	if hw := newNativeHwmonCollector(); hw != nil { //nolint:staticcheck // nil only off Linux; always-true on this build is an intentional cross-platform guard
+		subs = append(subs, hw)
+	}
+	if hp := strings.TrimSpace(cfg.HostpowerURL); hp != "" {
+		subs = append(subs, newHostpowerHTTPCollector(hp, cfg.HostpowerToken, cfg.HostpowerTLSFingerprint, nil))
+	}
+	return subs
+}
+
+// DetectPowerCollector composes, in this order: the OS-native collector (RAPL
+// on Linux, powermetrics on macOS, a host-provided powercap tree elsewhere when
+// PowercapRoot is set), the privileged helper (Linux, non-root agent,
+// HelperSocket set), hwmon (Linux), the hostpower HTTP source (HostpowerURL
+// set) and the LHM-HTTP source (LHMURL set). The result is always non-nil (an
+// empty composite when nothing applies) and safe to Collect.
+func DetectPowerCollector(cfg PowerConfig) PowerCollector {
+	subs := nativeAndHostpowerSubs(cfg)
+	if strings.TrimSpace(cfg.LHMURL) != "" {
+		subs = append(subs, newLHMPowerCollector(cfg.LHMURL, &http.Client{Timeout: 5 * time.Second}))
 	}
 	return &multiPowerCollector{subs: subs}
 }
@@ -212,17 +253,14 @@ func DetectTempCollector(lhmURL string) TempCollector {
 // (findLHMPower / findLHMTemp) over the shared result. Use this instead of
 // calling DetectPowerCollector/DetectTempCollector separately whenever both
 // are needed.
-func DetectPowerAndTempCollectors(lhmURL string) (PowerCollector, TempCollector) {
-	var powerSubs []PowerCollector
-	if native := newNativePowerCollector(); native != nil { //nolint:staticcheck // see DetectPowerCollector's identical guard
-		powerSubs = append(powerSubs, native)
-	}
+func DetectPowerAndTempCollectors(cfg PowerConfig) (PowerCollector, TempCollector) {
+	powerSubs := nativeAndHostpowerSubs(cfg)
 	var tempSubs []TempCollector
 	if native := newNativeTempCollector(); native != nil {
 		tempSubs = append(tempSubs, native)
 	}
-	if strings.TrimSpace(lhmURL) != "" {
-		source := newLHMSource(lhmURL, &http.Client{Timeout: 5 * time.Second})
+	if strings.TrimSpace(cfg.LHMURL) != "" {
+		source := newLHMSource(cfg.LHMURL, &http.Client{Timeout: 5 * time.Second})
 		powerSubs = append(powerSubs, newLHMPowerCollectorFromSource(source))
 		tempSubs = append(tempSubs, newLHMTempCollectorFromSource(source))
 	}

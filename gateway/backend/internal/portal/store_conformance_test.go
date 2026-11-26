@@ -5,6 +5,7 @@ package portal
 
 import (
 	"context"
+	"fmt"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
@@ -916,6 +917,21 @@ func TestTokenRepositoryConformance(t *testing.T) {
 		}
 		if err := tr.RotateTokenSecret(ctx, "tok_tc_missing", auth.HashSecret("x"), "x-", now); err != store.ErrNotFound {
 			t.Fatalf("RotateTokenSecret(missing) = %v, want ErrNotFound", err)
+		}
+
+		// RotateUserTokenSecret sets hash, prefix and the Claude Code flag together.
+		for _, want := range []bool{true, false} {
+			secret := fmt.Sprintf("tc-secret-user-rot-%v", want)
+			if err := tr.RotateUserTokenSecret(ctx, tok2.ID, auth.HashSecret(secret), "tcuse-", want, now.Add(3*time.Minute)); err != nil {
+				t.Fatalf("RotateUserTokenSecret(%v): %v", want, err)
+			}
+			got, err := tr.TokenByID(ctx, tok2.ID)
+			if err != nil || got.SecretHash != auth.HashSecret(secret) || got.SecretPrefix != "tcuse-" || got.ClaudeCodeUsageDisplay != want {
+				t.Fatalf("after RotateUserTokenSecret(%v): %+v err=%v", want, got, err)
+			}
+		}
+		if err := tr.RotateUserTokenSecret(ctx, "tok_tc_missing", auth.HashSecret("x"), "x-", true, now); err != store.ErrNotFound {
+			t.Fatalf("RotateUserTokenSecret(missing) = %v, want ErrNotFound", err)
 		}
 
 		// DeleteToken.

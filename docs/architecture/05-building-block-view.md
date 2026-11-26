@@ -327,7 +327,7 @@ Additions worth knowing when looking for code on this side:
 | Package | Responsibility |
 |---|---|
 | `agent` | The agent run loop, version, and orchestration of collection + reporting. |
-| `collector` | Host (gopsutil, including available memory), GPU (nvidia-smi/rocm-smi/ioreg), the per-process VRAM and host-RAM measurers (build-tag split per platform), power, CPU-temperature, and hardware-inventory collectors; optional inference `/metrics` scraper and loaded-model lister. |
+| `collector` | Host (gopsutil, including available memory), GPU (nvidia-smi/rocm-smi/ioreg), the per-process VRAM measurers (NVIDIA compute-apps, Windows PDH, AMD-on-Linux KFD sysfs) and the host-RAM measurer (build-tag split per platform), power, CPU-temperature, and hardware-inventory collectors; optional inference `/metrics` scraper and loaded-model lister. |
 | `client` | HTTP and WebSocket senders that push telemetry to the gateway. |
 | `sample` | Telemetry sample shaping. |
 | `trust` | Gateway trust store (CA handling) for outbound TLS. |
@@ -336,6 +336,8 @@ Additions worth knowing when looking for code on this side:
 | `runtime` | The [agent-managed model runtime](cross-cutting/agent-runtime-manager.md): launch-spec wire types, the admission policy, the agent-local security policy, the process manager, the log ring buffer, the router, both config sources, the features client, the redacted report builder, and the driver. |
 | `rpcrelay` | A leaf package: the byte relay in front of a llama.cpp RPC cluster member in relay transport — the allowlist checked on accept before any read, the dial on the first byte, one forwarding session per member, keepalive and the stall signal ([Agent-Managed Model Runtime §3.6](cross-cutting/agent-runtime-manager.md#the-relay)). |
 | `config` | Agent configuration (env `OP_AGENT_*`, config file, flags). |
+| `hostpower` | The `server-agent hostpower` mode for a Proxmox VE host: attributes the host's RAPL package energy to VMs and serves each VM its counter over virtiofs trees and an optional HTTP endpoint, optionally over TLS 1.3 with a self-signed certificate the guest pins by SHA-256 ([ADR-115](09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs), [ADR-116](09-architecture-decisions.md#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token), [ADR-118](09-architecture-decisions.md#adr-118--hostpower-http-over-tls-13-with-a-self-signed-server-certificate-the-guest-pins-by-sha-256)). |
+| `helper` | The root-only `server-agent helper` mode on Linux: serves the top-level RAPL counters and the SMBIOS memory modules over a Unix socket that only the configured agent uid may use (`SO_PEERCRED`), so the agent itself runs unprivileged ([ADR-117](09-architecture-decisions.md#adr-117--a-root-only-agent-helper-serves-rapl-counters-and-dimms-over-a-peer-checked-unix-socket-so-the-linux-agent-runs-unprivileged)). |
 
 The RPC cluster member side spans three packages: in `runtime`, the member
 kind's command line, cache and readiness (`rpc_member.go`), holds, reservations

@@ -108,14 +108,18 @@ type User struct {
 	// log_communication / secret flags and feed the session principal.
 	ChatLogCommunication bool
 	ChatSecret           bool
-	TOTPSecret           string
-	TOTPPendingSecret    string
-	TOTPEnabled          bool
-	TOTPConfirmedAt      *time.Time
-	PasswordHash         string
-	PasswordSetAt        *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// ChatVendorAccess is the token-less chat session's vendor-access policy in
+	// the api_tokens.vendor_provider_access JSON encoding. '' means unset (all
+	// own accounts, groups included); see ChatSessionVendorAccess.
+	ChatVendorAccess  string
+	TOTPSecret        string
+	TOTPPendingSecret string
+	TOTPEnabled       bool
+	TOTPConfirmedAt   *time.Time
+	PasswordHash      string
+	PasswordSetAt     *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type TokenRecord struct {
@@ -193,6 +197,22 @@ type TokenRecord struct {
 	// (ADR-098). Stored as api_tokens.decisions_confidence_normalize; off means
 	// no behaviour change. Ungated, like ClaudeModelAliases.
 	DecisionsConfidenceNormalize bool
+	// ClaudeCodeUsageDisplay is the opt-in (default false) that gives the
+	// token's secret the Claude Code shape (a JWT-looking prefix around the
+	// opaigw_ secret) so Claude Code shows the usage limits. Stored as
+	// api_tokens.claude_code_usage_display. It changes only through secret
+	// rotation (RotateUserTokenSecret): UpdateTokenMetadata never writes it,
+	// because the secret has to change with it.
+	ClaudeCodeUsageDisplay bool
+	// SendUsageLimits is the opt-in (default false) that lets the gateway send
+	// its usage-limit headers to a coding client on this token (#420). Stored
+	// as api_tokens.send_usage_limits; ungated and editable through
+	// UpdateTokenMetadata.
+	SendUsageLimits bool
+	// CodexModelSwitchPrompt is the opt-in (default false) that lets the Codex
+	// CLI show its model-switch popup for this token (#420). Stored as
+	// api_tokens.codex_model_switch_prompt; ungated, like SendUsageLimits.
+	CodexModelSwitchPrompt bool
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored

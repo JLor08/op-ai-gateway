@@ -7,10 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/routing"
+	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -55,6 +58,66 @@ func unavailableStatus(status int) error {
 		base = ErrAuthRejected
 	}
 	return fmt.Errorf("%w: upstream status %d", base, status)
+}
+
+// LimitError is a vendor's limit answer: HTTP 429 (a rate or usage limit) or 402
+// (out of credit), decided by status alone -- OpenAI's insufficient_quota and
+// Codex's usage_limit_reached arrive as 429, so no body is read. It carries what a
+// vendor-group failover needs: the status, the delay the vendor asked for in
+// Retry-After (0 when it sent none), and a copy of the response headers, whose
+// rate-limit windows the gateway scrapes. It unwraps to ErrUnavailable and reads
+// exactly like unavailableStatus's error, so every errors.Is(err, ErrUnavailable)
+// check, every log line and the client mapping (502 provider.unavailable) are
+// unchanged. Build it with vendorStatusError.
+type LimitError struct {
+	Status     int
+	RetryAfter time.Duration
+	Header     http.Header
+}
+
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("%v: upstream status %d", ErrUnavailable, e.Status)
+}
+
+func (e *LimitError) Unwrap() error { return ErrUnavailable }
+
+// IsLimitStatus reports whether an upstream status is a vendor limit answer (429
+// or 402). 5xx and 529 (overloaded) are not.
+func IsLimitStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusPaymentRequired
+}
+
+// maxRetryAfterSeconds keeps a Retry-After delay inside time.Duration.
+const maxRetryAfterSeconds = math.MaxInt64 / int64(time.Second)
+
+// ParseRetryAfter reads h's Retry-After -- delay-seconds or an HTTP-date -- as the
+// delay from now. It is 0 when the header is absent, unparsable, or not in the
+// future.
+func ParseRetryAfter(h http.Header, now time.Time) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(min(secs, maxRetryAfterSeconds)) * time.Second
+	}
+	if at, err := http.ParseTime(v); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
+}
+
+// vendorStatusError maps a vendor client's non-2xx answer: a limit status is a
+// *LimitError (with Retry-After parsed and the headers cloned), every other status
+// unavailableStatus's error.
+func vendorStatusError(resp *http.Response) error {
+	if IsLimitStatus(resp.StatusCode) {
+		return &LimitError{Status: resp.StatusCode, RetryAfter: ParseRetryAfter(resp.Header, time.Now()), Header: resp.Header.Clone()}
+	}
+	return unavailableStatus(resp.StatusCode)
 }
 
 // contentTypeHeader and jsonContentType are the request header name/value the

@@ -192,6 +192,32 @@ and inline images only. Not guarded: a spec whose type is misdeclared (an explic
 an sglang-omni server, and a raw Responses or Messages passthrough to an `sglang` target (switching those modes to translate
 closes it). Every other target is unchanged.
 
+**No host paths for Strata, on the translate path and in the raw passthrough body
+([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).** Strata
+(`Niko1221/Strata@c6f6427`) resolves an image reference in `Vision.load`: `data:` is decoded,
+`http://`/`https://` is fetched, and anything else is read as a path on the model host
+(`file://` stripped first), all with case-sensitive `startswith` checks; its only guard
+concerns a browser `Origin`, which a gateway request never carries. So for a target whose
+effective kind is `strata` — a `strata` application or a `server_agent` spec of type `strata`
+(`Target.EffectiveKind`) — every image reference must start with lowercase `data:`, `http://`
+or `https://` (`strataImageRefAllowed`; `HTTP://x` would land in Strata's path branch, so it is
+refused). On the translate path `mediaURLsRefused` checks it, as for `sglang`. Because a Strata
+application and template keep `responses_mode` and `messages_mode` at `passthrough`, the raw
+body is checked as well, before it is relayed (`strataPassthroughMediaRefused`, called from
+`relayPassthroughTarget`): a recursive walk over every object at any depth (so blocks inside
+`tool_result` content and Responses function-call outputs are covered) refuses an Anthropic
+`image` or `document` block whose `source` names a reference that fails the rule
+(`source.url`, `source.path` or a string source; a `url`/`path` source without either key is
+refused too). The `url` and `path` keys are checked whenever present, a `base64` source
+included: Strata's `_image_source` reads only the data of a `base64` source today, but a stray
+reference beside it is refused so a later Strata that reads it first cannot reach a host file.
+It also refuses an `input_image` or `image_url` part whose `image_url` (a string or
+`{"url": …}`) fails it. Malformed JSON is left to the relay's own handling. Either refusal is
+**400 `chat.media_url_unsupported`**, logged at Warn and recorded as a usage row with no upstream
+call. `/v1/messages/count_tokens` is counted locally and never relayed, so it needs no scan.
+**http(s) stays allowed**: Strata fetches the URL from the model host, the same accepted
+posture as SGLang and vLLM, because blocking it breaks ordinary vision use.
+
 ### 3.2 OpenAI Responses — Codex continuity
 
 `compat.ParseOpenAIResponses` accepts both the simple string `input` and the
@@ -1940,7 +1966,7 @@ for `EffectiveDecisionsRoute`; a blank mode behaves as `auto`):
 | `translate` | translate: the OpenAI Decisions body goes to the upstream's `/v1/decisions` | `decision_openai: yes` on a passthrough-capable kind | `404 routing.model_not_capable` |
 | `auto` (or blank) | **passthrough** when `decision: yes`, else **translate** when `decision_openai: yes` on a capable kind | either | `404 routing.model_not_capable` |
 
-`routing.DecisionsPassthroughCapableKind` (false for `llama_cpp` and `vllm_sr`, §3.10 item 11) is the
+`routing.DecisionsPassthroughCapableKind` (false for `llama_cpp`, `vllm_sr` and `strata`, §3.10 item 11) is the
 "has an OpenAI `/v1/decisions`" test, so for those two kinds a `decision_openai` verdict is ignored (a stale or manual `yes`
 never sends a translated body to an upstream that cannot parse it). `translate` is therefore **refused at save** for them:
 `400 application.systemone_translate_unsupported` (the request set `systemone_mode`, on create or on an update
@@ -2100,7 +2126,7 @@ places, because the mode and the verdicts are only known together after the reso
 - **After the resolve.** `resolveDecisionsTarget` applies the flavor half
   (`targetServesFlavor`, else `404 routing.no_model_route`), and `decisionsRoute` hands the
   target's effective `decisions_mode` and the mapping's two verdicts to
-  `routing.EffectiveDecisionsRoute` (with the effective kind: for `llama_cpp` and `vllm_sr`, which have no native `/v1/decisions` route, a `decision_openai` verdict is ignored, so `auto` translates and a stale forced `passthrough` is `404 routing.model_not_capable`):
+  `routing.EffectiveDecisionsRoute` (with the effective kind: for `llama_cpp`, `vllm_sr` and `strata`, which have no native `/v1/decisions` route, a `decision_openai` verdict is ignored, so `auto` translates and a stale forced `passthrough` is `404 routing.model_not_capable`):
 
 | Effective mode | Route taken | Needs | Without it |
 |---|---|---|---|
@@ -2484,6 +2510,48 @@ service, on an application's create and on every runtime-spec write
 upstream now serves both native endpoints (see [Agent-Managed Model
 Runtime](agent-runtime-manager.md) for the researched matrix and rationale).
 
+**Response headers on the Messages passthrough.** Of the upstream's other response
+headers, only an allowlist is relayed, and only for the `anthropic_messages` flavor
+(`forwardRateLimitHeaders`, `ratelimit_headers.go`): `retry-after` and `x-should-retry`
+always, and the unified rate-limit family (`anthropic-ratelimit-unified-*`, every value)
+only when the caller's token has `send_usage_limits` (default off, [§9.3](#93-claude-code-usage-limit-display);
+[ADR-110](../09-architecture-decisions.md#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it)) **and** the caller is entitled to the routed account's figures
+(`rateLimitFiguresEntitled`). The switch is checked first, so a token without it never triggers the
+entitlement lookup. On inference the figures reach the account owner, a
+community manager of a `shared`/`full` account, or anyone when the owner opted in
+(`share_usage_with_members`); an inference token never carries system scope, which
+matches what the same principal sees in the portal without elevation. A self-hosted
+target is always entitled. The portal answer (`VendorAccountUsageManager`) is cached
+60 s per principal and account, bounded to 2 s per lookup, and a portal error or
+timeout is not entitled (cached 5 s); a response with no unified header skips the
+lookup entirely. The headers are copied from the final upstream response only, at the
+point the status line is written, so a discarded re-selection attempt contributes none.
+Request ids, organization ids and the `anthropic-ratelimit-requests-*` /
+`anthropic-ratelimit-tokens-*` headers are never forwarded, and neither is anything
+of the unified family on the Responses flavor (it has its own allowlist, below). A success from a target that reports no unified figures of its own
+carries the caller's last subscription windows instead; see [§9.3](#93-claude-code-usage-limit-display).
+A token without `send_usage_limits` gets nothing of the unified family, relayed or cached, on any path;
+`retry-after` and `x-should-retry` still reach it.
+
+**Response headers on the Responses passthrough.** The `openai_responses` flavor relays the same kind of allowlist
+(`forwardRateLimitHeaders`): `retry-after` and `x-should-retry` always, and the Codex rate-limit family
+(`isCodexRateLimitHeader`: `x-codex-` names ending with one of `used-percent`, `window-minutes`, `reset-at` or `limit-name` (after a dash), plus
+`x-codex-credits-has-credits`, `x-codex-credits-unlimited`, `x-codex-credits-balance`, `x-codex-active-limit`,
+`x-codex-rate-limit-reached-type` and `x-codex-promo-message`; every value) only when the caller's token has `send_usage_limits`
+and the caller is entitled to the routed account's figures, by the rule of the Messages paragraph
+above (`rateLimitFiguresEntitled`, looked up only when the upstream sent a family header). It applies on any status, from the final
+upstream response only. `x-codex-turn-state` and every other `x-codex-` header outside the family, request ids, organization ids,
+`x-ratelimit-*` and the unified Anthropic family are never forwarded. A success from a target that reports no Codex windows carries the
+caller's last observed ones instead, unless the principal's own fullest limit is at 75 % or more: the cached windows are then not
+attached and the gateway's own window replaces them ([§9.6](#96-codex-display-of-the-gateways-own-limits)); see
+[§9.5](#95-codex-usage-limit-display). A caller who is not entitled gets neither the relayed
+family nor cached windows on a response whose upstream carries the family, so Codex shows no subscription limits for that response. A
+2xx that ends up with no family header at all (a local model with nothing cached, such a withheld response, or a reply on which the gateway's limit took over from the cache) carries the principal's
+own fullest quota or budget instead, when it has one ([§9.6](#96-codex-display-of-the-gateways-own-limits)).
+A token without `send_usage_limits` gets no `x-codex-*` header from the relay, the cache or the gateway's own standing,
+the vendor's credits headers included; `retry-after` and `x-should-retry` still reach it. The one `x-codex-*` header the
+gateway writes for such a token is `x-codex-promo-message` on its own limit block (§9.6).
+
 **One exception at dispatch: `sglang_omni`.** For a target whose effective kind
 (`Target.EffectiveKind`) is `sglang_omni`, `endpointModeFor` answers a
 `passthrough` mode as `translate`, so the relay decision and the usage row's
@@ -2492,6 +2560,16 @@ route, and a raw body would bypass the media guard (§3.1). The portal's
 `sglang_omni` defaults disable both modes, but an Auto-typed spec, a spec written
 through the API and a row stored before the type existed keep the stock
 passthrough ([ADR-103](../09-architecture-decisions.md#adr-103--sglang-and-sglang-omni-runtime-spec-types-duration-fallbacks-for-non-audiocpp-audio-and-inline-only-media-for-sglang-omni)).
+
+**`strata` keeps its passthrough, and the raw body is scanned instead.** A target of
+effective kind `strata` serves both native routes, so `endpointModeFor` does not coerce it;
+`relayPassthroughTarget` scans the raw body for image references Strata would read from the
+model host and refuses such a body before `proxyNative` (§3.1,
+[ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)). Strata's
+Anthropic usage (`input_tokens: 1`, the prompt in the cache fields) is recorded by the
+unchanged passthrough scan as the disjoint split (input 1, the cache reads as cached, the cache
+writes as cache write); `/v1/messages` carries no `timings`, so such a request records no
+tokens per second, while chat completions and `/v1/responses` do.
 
 **Where the effective mode lives.** An ordinary application carries
 `ResponsesMode`/`MessagesMode` directly on `routing.Application`
@@ -2883,7 +2961,7 @@ row routes as it did in Phase 1; a `server_agent` candidate is judged after the 
 | Mode | `decisions_mode` (`/v1/decisions`) | `systemone_mode` (`/v1/systemone`) |
 |---|---|---|
 | `auto` | passthrough when the mapping has `decision_openai: yes`, else translate to System One | passthrough when the mapping has `decision: yes`, else translate to OpenAI Decisions when it has `decision_openai: yes` on a passthrough-capable kind |
-| `translate` | always translate to System One; needs `decision: yes` | always translate to the upstream's `/v1/decisions`; needs `decision_openai: yes` on a passthrough-capable kind; **refused at save** for `llama_cpp` and `vllm_sr` |
+| `translate` | always translate to System One; needs `decision: yes` | always translate to the upstream's `/v1/decisions`; needs `decision_openai: yes` on a passthrough-capable kind; **refused at save** for `llama_cpp`, `vllm_sr` and `strata` |
 | `passthrough` | always pass through to the upstream's `/v1/decisions`; needs `decision_openai: yes` | always pass through to the upstream's `/v1/systemone`, the Phase 1 relay; needs `decision: yes` |
 | `disabled` | not served | not served |
 
@@ -2908,9 +2986,9 @@ the listing has none; `GET /v1/systemone/models` and the portal's `systemone_rou
 cannot call it" case `UnknownModelRedirectBlocked` redirects. A forced mode whose verdict the mapping lacks is `404
 routing.model_not_capable` after the resolve (no re-selection), and `routing.EffectiveDecisionsRoute`
 is the one function that maps the effective kind, mode and verdicts to a route (for a kind without a native
-`/v1/decisions` route, `llama_cpp` and `vllm_sr`, a `decision_openai` verdict is ignored, so `auto`
+`/v1/decisions` route, `llama_cpp`, `vllm_sr` and `strata`, a `decision_openai` verdict is ignored, so `auto`
 translates and a stale forced `passthrough` is `404 routing.model_not_capable`, §3.10 item 11).
-`passthrough` is **refused at save for `llama_cpp`** (no `/v1/decisions` route) **and for `vllm_sr`** (its `/v1/decisions` is the System One alias, §3.10 item 11):
+`passthrough` is **refused at save for `llama_cpp`** (no `/v1/decisions` route) **and for `vllm_sr`** (its `/v1/decisions` is the System One alias, §3.10 item 11) **and for `strata`** (no `/v1/decisions` route either, [ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)):
 `application.decisions_passthrough_unsupported` (400, the request supplied the type),
 `application.decisions_passthrough_conflict` (409, an update that sends no `type` and
 collides with the stored one) and `runtime_spec.decisions_passthrough_unsupported` (400,
@@ -2919,7 +2997,7 @@ the spec's effective type). **`systemone_mode: translate` is refused for the sam
 `application.systemone_translate_unsupported` (400), `application.systemone_translate_conflict` (409)
 and `runtime_spec.systemone_translate_unsupported` (400), by the same rules. A save that sends **both** an incapable `decisions_mode`
 (`passthrough`) and an incapable `systemone_mode` (`translate`) for such a kind is refused once, with one message that names both modes; the HTTP status and
-code are the decisions refusal's (the error matches both sentinels, and the mapping reads the decisions row first). An application **retyped** to `llama_cpp` or `vllm_sr` with a stored
+code are the decisions refusal's (the error matches both sentinels, and the mapping reads the decisions row first). An application **retyped** to `llama_cpp`, `vllm_sr` or `strata` with a stored
 `passthrough` (decisions) or `translate` (System One) is reset to `auto` rather than refused (the "clear when the type cannot carry
 it" rule `responses_live_timings_enabled` follows). An unrecognized mode is
 `application.endpoint_mode_invalid` / `runtime_spec.endpoint_mode_invalid`, for either field. API shapes are in [HTTP API
@@ -3212,6 +3290,68 @@ is not the loop's own
 ([Agent-Managed Model Runtime
 §11.9](agent-runtime-manager.md#119-manual-runs-on-an-images-only-mapping)).
 
+### 7.3 An agent's in-stream failure on the native passthrough
+
+A streamed request to an agent-managed (`server_agent`) target can fail after the
+agent's router has already committed `200` and SSE headers, for example a start
+that dies while the router sends `: keepalive` heartbeats. The router then ends the
+stream with one terminal frame,
+`data: {"error":{"code":"runtime.<…>","message":"…"}}`, with no `event:` line and
+no `type` ([Agent-Managed Model Runtime
+§4.4](agent-runtime-manager.md#44-streaming-heartbeats-and-the-lazy-200)). Relayed
+verbatim, that frame is no event an Anthropic or Responses client knows: Claude Code
+saw a stream without `message_start`, and Codex saw a stream closed before
+`response.completed` and dropped the agent's message.
+
+The native passthrough relay therefore translates it, for a streamed
+`anthropic_messages` or `openai_responses` request to a `server_agent` target only
+(`agentStreamErrorFilter`, `internal/gateway/agent_stream_error.go`):
+
+| Flavor | What the client gets in place of the agent's frame |
+|---|---|
+| Anthropic Messages | `event: error` with `{"type":"error","error":{"type":<t>,"message":"<code>: <agent message>"}}`; `<t>` is `overloaded_error` for `runtime.admission_blocked`, `runtime.instance_busy`, `runtime.instance_no_capacity`, `runtime.cluster_not_ready`, `runtime.cluster_member_unreachable` and `runtime.start_timeout`, `api_error` for every other code |
+| Responses | `event: error` with `{"type":"error","code":<code>,"message":<agent message>,"param":null,"sequence_number":…}`, then `event: response.failed` shaped like the translate path's own (`status: "failed"`, `error: {code, message}` with the agent's code). Its `response.id` is the one from a relayed `response.created`, else `resp_<gateway request id>`. The `response.failed` is sent without a prior `response.created` too, because Codex ignores a bare `error` event and reads only `response.failed` |
+
+Chat Completions never takes the native passthrough, and OpenAI's own chat stream
+error already has the agent's `data: {"error":…}` shape.
+
+Only the agent's exact shape is recognized: one `data:` line whose JSON is an object
+with the single key `error`, holding exactly a string `code` that begins `runtime.`
+and a string `message`. A model server's own error frame, which carries no
+`runtime.` code, passes unchanged, and so does every frame from a target that is not
+agent-managed. Every other byte, the `: keepalive` comments included, is relayed
+unchanged and as soon as it arrives. The one exception is an event that opens like
+`data: {"error":`: it is held until it ends (at most 64 KiB) and is then written
+whole.
+
+`runtime.upstream_gone` also carries a non-2xx the child itself answered after the
+router had committed `200`, such as a model server's `400` for an over-long context.
+It becomes `api_error`, so an Anthropic client may retry without streaming where it
+would otherwise have seen an invalid-request error. That is no worse than before:
+the verbatim frame was not readable as an error either.
+
+A captured response (`respBuf`) holds the bytes the client received, so it shows the
+translated error event, not the agent's raw frame.
+
+The usage row records the request as failed: status `error`, the agent's code as the
+error code, `http_status` the `200` that was on the wire, and no tokens. An idle
+timeout, a client disconnect or a copy error that ends the same stream keeps its own
+code.
+
+What the clients do with the translated event (verified against Claude Code 2.1.311
+and Codex 0.137.0 through a gateway relaying a loopback agent stub):
+
+- **Claude Code**, with `api_error`, logs
+  `Error streaming, falling back to non-streaming mode: <the error event>` and retries
+  the turn without streaming at once. With `overloaded_error` it first retries the
+  stream twice ("Mid-stream 529 before content — retrying streaming") and then falls
+  back. Without the translation it fell back the same way, logging only
+  `Stream completed without receiving message_start event`, so the agent's code
+  and message never reached its log.
+- **Codex** reports `stream disconnected before completion: <agent message>` and
+  reconnects up to five times, as for any retryable failure. Without the translation
+  it reported `stream closed before response.completed`.
+
 ## 8. Provider clients
 
 | Client | `internal/provider/*.go` | `Complete` | `CompleteStream` | `NativeProxyClient` | `ModelLister` |
@@ -3252,7 +3392,7 @@ The mock, Ollama and OpenAI-compatible clients also implement `Prober` (reachabi
 routing/capacity subsystems — out of this chapter's scope; see [Routing & Model
 Selection](routing-and-model-selection.md). One `OpenAICompatibleClient`
 instance is shared across vLLM, llama.cpp, llama-swap, LiteLLM, `server_agent`,
-`stable_diffusion_cpp`, `audio_cpp` and `vllm_sr` (`cmd/gateway/main.go`) since they all speak the
+`stable_diffusion_cpp`, `audio_cpp`, `vllm_sr` and `strata` (`cmd/gateway/main.go`) since they all speak the
 same OpenAI HTTP dialect; only Ollama gets its own client for its distinct
 `/api/chat` NDJSON shape. `stable_diffusion_cpp` cannot borrow the Ollama client
 instead: that client does not implement `NativeProxyClient`, and the images
@@ -3893,6 +4033,482 @@ llama.cpp that maps `output_config.effort` itself would be an alternative to the
 native edit; the deployed build and template are what decide, and a manual smoke
 test that the template actually consumes the injected value, not merely that the
 gateway sent it, is the check to run. The reasoning is recorded in [ADR-059](../09-architecture-decisions.md#adr-059--claude-code-effort-is-delivered-as-a-chat-template-kwarg-on-both-paths-for-llamacpp-and-vllm-and-is-a-management-only-token-setting).
+
+### 9.3 Claude Code usage-limit display
+
+Claude Code can show an Anthropic subscription's usage limits (the 5 hour and 7 day
+windows) from the `anthropic-ratelimit-unified-*` response headers of `/v1/messages`.
+Through the gateway this works for a user who routes to a vendor subscription account and
+to local models in one session, under four conditions.
+
+**Token condition (opt-in).** Nothing of this section reaches a client unless the token has the
+per-token switch `send_usage_limits` (default off; user tokens create, PATCH and read, no rotation;
+service tokens create and read only, editing is issue #421). With it off, no
+`anthropic-ratelimit-unified-*` header leaves the gateway on any path (relay, cached windows,
+[§9.4](#94-claude-code-display-of-the-gateways-own-limits)'s overage window, its block) and the window
+cache neither observes nor attaches for that token. What stays: the status codes, `Retry-After`,
+`X-Should-Retry` and the block bodies, which is what keeps clients from retrying into a limit (Claude
+Code stops on `X-Should-Retry: false`). Migration 112 switched it on for every user token that already
+had the Claude Code token format. Decisions: [ADR-110](../09-architecture-decisions.md#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it).
+
+**Client condition.** Claude Code only reads those headers when its bearer token
+(`ANTHROPIC_AUTH_TOKEN`) is a JWT whose payload `aud` is `claude-gateway`. A token gets such
+a secret through the opt-in `claude_code_usage_display` token option (the "Claude Code token format"),
+set at creation or through rotation; see [Claude Code token secret
+shape](security-auth-rbac.md#claude-code-token-secret-shape). The gateway does not look at
+the shape, so it is a separate setting from `send_usage_limits`: Claude Code needs both. The token
+format without the switch is a token whose display stays blank; the switch without the format sends
+headers Claude Code ignores.
+
+**Relay.** A vendor subscription response's unified figures reach the client through the
+allowlist, switch and entitlement rule of §6 (*Response headers on the Messages passthrough*).
+
+**Window cache.** Claude Code clears its per-window display when a `/v1/messages` response
+arrives without unified headers, as every answer of a local model does. So the gateway
+remembers the caller's last subscription windows (`rateLimitWindowCache`,
+`ratelimit_window_cache.go`) and attaches them to `/v1/messages` responses of other targets:
+
+- Observed in `recordUsage`, from the upstream headers of any `vendor_anthropic` response
+  that carries `anthropic-ratelimit-unified-status` (a 2xx or a 429; native passthrough and
+  translate), and only when the caller is entitled to the account's figures
+  (`rateLimitFiguresEntitled`). The key is the principal (`user:<id>` or `service:<id>`). A token
+  without `send_usage_limits` observes nothing.
+- Attached only for the Anthropic Messages flavor, on a success (2xx) that carries no
+  unified status of its own: the native passthrough before the status line, and the
+  translate path on both the buffered JSON answer and the SSE header block. An error,
+  a response with fresh upstream figures, and every other flavor (Chat Completions,
+  Responses) get nothing. On the SSE translate path the windows are written with the 200
+  header block before the upstream has answered, so a stream whose upstream then fails
+  carries them together with its SSE error event. Never attached for a token without
+  `send_usage_limits`.
+- Only windows whose reset time is still in the future are written. The top-level status is
+  `allowed`, or `allowed_warning` when an attached window warns or is rejected; it is never
+  `rejected`, because the response of another provider was not refused. Overage, fallback
+  and retry headers are never replayed.
+- Per process and best effort: in memory, capped at 10 000 principals (oldest observation
+  evicted), pruned as windows expire, lost on restart and not shared between replicas.
+  After a restart or on another replica the display simply stays blank until the next
+  subscription response.
+
+**Revocation.** Entitlement is checked when a window is observed, not when it is
+attached. The cache therefore also records which vendor account each entry came from: when
+a later `vendor_anthropic` response carrying the unified status reaches a principal who is
+no longer entitled to that account (for example the owner turned off
+`share_usage_with_members`), that principal's entry from the same account is dropped
+(`Forget`), and an entry observed from another account is left alone. A token without
+`send_usage_limits` observes nothing, but its vendor response on that account still runs this
+check when its principal has an entry from there, so an opted-out token purges a revoked entry
+too. **Known limitation:** the drop needs such a response, so a principal who has lost entitlement and
+then uses only other providers keeps receiving its last stored figures, frozen, on
+local-model replies until those windows reset (up to 7 days) or the process restarts.
+Nothing new is disclosed (the principal already saw these figures), and sharing is off by
+default.
+
+**Payload captures.** The translate path stores the upstream response headers in a payload
+capture, which its owner (and admins, for a non-secret capture) can read. For a
+vendor-account target, the `anthropic-ratelimit-unified-*` headers and
+`anthropic-organization-id` are removed from the captured upstream response headers unless
+the principal is entitled to the account's figures, so a capture never hands them to
+someone the relay would have withheld them from. Native passthrough captures hold the
+client response headers, which the relay already gates.
+
+**What Claude Code shows.** The per-window utilization and reset in its own status and
+warning display. It does not show the Claude Desktop usage card or the `/usage` plan
+panel, which read Anthropic's own endpoints and need a first-party login; the gateway does
+not emulate them. The gateway's own request quota, token quota and cost budget are reported in
+the same header family; that is [§9.4](#94-claude-code-display-of-the-gateways-own-limits).
+
+**Dependency.** All of this relies on undocumented Claude Code behavior (the `aud`
+check, the header names and the clear-on-missing rule). A client update can change it
+without notice; nothing in the gateway breaks, the display just stops working.
+
+### 9.4 Claude Code display of the gateway's own limits
+
+§9.3 shows an Anthropic subscription's windows. This section covers the other limits Claude Code can report: the
+principal's own request quota, token quota and cost budget (`routing.LimitConfig`, enforced by `PrincipalLimiter`;
+see [Telemetry, Usage & Observability](telemetry-usage-observability.md)). A developer hears about them before they
+bite, and when one bites Claude Code shows one sentence (which limit, when it resets, whom to ask) instead of retrying.
+Decisions: [ADR-107](../09-architecture-decisions.md#adr-107--the-gateways-own-principal-limits-reach-claude-code-as-the-overage-window-and-a-429-billing_error-from-readings-taken-at-admission).
+
+**Contract and verified client behavior.** The shape is the "Usage-limit headers — optional" section of the Claude apps
+gateway `/protocol` text embedded in the Claude Code binary; its public counterpart is [Usage warnings in Claude
+Code](https://code.claude.com/docs/en/claude-apps-gateway-spend-limits.md). Verified in Claude Code 2.1.328:
+
+- With a JWT-shaped token (`aud: claude-gateway`, the Claude Code token format `claude_code_usage_display` of §9.3) the client reads the
+  overage window (a `rate_limit_event` with `rateLimitType: overage`, utilization and threshold) and prints the contract
+  429's `error.message` verbatim, after one request. With an opaque token it prints `API Error: Request rejected (429) ·
+  <message>`, also after one request.
+- The status line's `rate_limits.spend_limit` and the `/usage` "Spend limit" bar appear only in a gateway sign-in session
+  (`CLAUDE_CODE_USE_GATEWAY=1` or `/login` to a gateway), which Claude Desktop cannot use. The same headers feed them
+  there with no further work.
+- The client picks its warning from the first window with a surpassed threshold, in the order `5h`, `7d`, `7d_oi`,
+  `overage`.
+- Before this behavior, a quota denial (a 429 without `Retry-After` or `x-should-retry`) made Claude Code retry with
+  backoff (8 retries in 90 s, still retrying), and the cost-budget 402 printed `API Error: 402 cost budget exceeded`.
+
+**Readings at admission.** `PrincipalLimiter.Evaluate` is `Admit` with its readings kept (`Admit` calls it). After the
+rate check it reads every configured limit (threshold above 0 and a period set, the rule every check uses) through the
+existing cached aggregate path and returns an `Admission`: the verdict, the instant `At`, and a `LimitStanding`, one
+`LimitReading` per configured limit in the fixed order request quota, token quota, cost budget. A reading holds the kind,
+the period `used`, the `cap`, the period and the `Reset`, the end of the current UTC calendar period
+(`routing.PeriodEnd`). `utilization = used / cap`. A read that failed yields a reading with `Failed` set, which is not
+zero used. `inferencePreflight` returns the standing in `preflight.Standing`, and `handleAnthropicMessages` puts it on the
+request context (`withLimitStanding`) for the attach points. No store I/O happens on the response path: the figures are
+the ones admission judged, and `Record` bumps from concurrent requests during the upstream call are not reflected.
+Because the readings are fixed at admission, a response that arrives after a calendar-period boundary (an hourly quota
+with a slow first byte, a long buffered completion) carries the old period's utilization and a reset already in the
+past; the next response corrects it.
+
+**Success (2xx, `/v1/messages`).** `LimitStanding.Fullest` picks the reading to describe: highest utilization, ties to
+the later reset, then to the fixed order. It reports no reading when the standing is empty or any reading failed, because
+a partial picture could name the wrong limit; no gateway header is then written and §9.3's headers stay as they were. A
+principal with no quota or budget is unaffected byte for byte. `attachPrincipalLimitStanding`
+(`principal_limit_headers.go`) runs as the last header step at the three attach points of §9.3: the native passthrough on
+any 2xx before the status line, and on the translate path (through `attachTranslatedUsageLimits`) the buffered JSON
+answer and the SSE header block. It changes only the client header set, never the upstream set that `recordUsage`, the
+window cache and the vendor usage scrape read. The overage window is written by `writeOverageStanding`:
+
+| Header | Value |
+|---|---|
+| `anthropic-ratelimit-unified-overage-utilization` | `floor(utilization × 100) / 100` with two decimals, at most `0.99` (concurrent bumps can push the cached figure to 1 or above on an admitted request; the contract wants it below 1 while requests are allowed) |
+| `anthropic-ratelimit-unified-overage-surpassed-threshold` | `0.95` from a written 0.95, `0.75` from a written 0.75, otherwise absent |
+| `anthropic-ratelimit-unified-overage-status` | `allowed_warning` when a threshold is written, otherwise `allowed` |
+| `anthropic-ratelimit-unified-overage-reset` and `anthropic-ratelimit-unified-reset` | the reading's reset, unix seconds |
+| `anthropic-ratelimit-unified-representative-claim` | `overage` |
+| `anthropic-ratelimit-unified-status` | `allowed_warning` when the overage window warns or a kept subscription window is `allowed_warning` or `rejected`, otherwise `allowed` |
+
+There is no `anthropic-ratelimit-unified-overage-period` on a success, which the contract does not list there.
+
+**Coexistence with §9.3.** For a principal with a describable standing, the §9.3 steps run first (relay, or cached
+windows on another provider's success). Then every unified header is removed except the per-window fields of `5h`, `7d`
+and `7d_oi` (utilization, reset, status and surpassed-threshold). What goes is the subscription's own top-level
+fields, its `overage-*` fields (they describe Anthropic's extra usage, not this gateway's cap) and the fallback and
+upgrade-paths fields. Then the overage window above is written. The gateway's cap owns the top-level fields, as the contract
+wants, and the subscription windows stay visible beside it.
+
+**Gate.** Both the overage window of a success and the unified headers of the block below are written only
+for a token with `send_usage_limits` (§9.3). Without it a success carries no gateway header, and the block keeps
+everything except the unified family: the 429, `Retry-After`, `X-Should-Retry: false` and the same
+`billing_error` body with its sentence, which is the error itself. Claude Code then prints the
+sentence after one request and does not retry, but shows no overage window.
+
+**Block (`/v1/messages` only).** A quota or budget denial on the Anthropic Messages flavor (`/v1/messages` and its
+aliases; `count_tokens` never admits) is answered by `writeLimitBlocked`, called from `admitPrincipal`, which now takes
+the flavor. The cost budget is a 429 here and on `/v1/responses` ([§9.6](#96-codex-display-of-the-gateways-own-limits)), not the 402 of *Other endpoints*. `LimitStanding.Blocking` picks the limit to name: among
+the breached readings the one with the latest reset (when the user can work again), ties to the fixed order; a defensive
+fallback, not an expected race (the denial and `Blocking` read the same standing, so a breached reading always exists on
+a quota or budget denial), takes the reading of the limit `Admit` named when none is breached. A failed read counts as
+not breached. Response:
+
+- **Body:** `{"type":"error","error":{"type":"billing_error","code":"<code>","message":"<sentence>"}}`, with the limit's
+  stable code (`limit.request_quota_exceeded`, `limit.token_quota_exceeded` or `limit.cost_budget_exceeded`). The
+  top-level `"type":"error"` exists for this one body; every other gateway error keeps the `apierror` shape, except [§9.6](#96-codex-display-of-the-gateways-own-limits)'s Codex `usage_limit_reached` body.
+- **Sentence:** `<request quota|token quota|cost budget> reached · resets <Mon D, HH:MM> UTC · ask your gateway
+  administrator to raise it`, for example `token quota reached · resets Nov 22, 00:00 UTC · ask your gateway
+  administrator to raise it`.
+- **Headers:** `Retry-After` (seconds to the reset, rounded up, at least 1), `X-Should-Retry: false`, and, only for a token with
+  `send_usage_limits`, `anthropic-ratelimit-unified-status: rejected`, `anthropic-ratelimit-unified-reset` and `anthropic-ratelimit-unified-overage-reset` (unix seconds), `anthropic-ratelimit-unified-overage-utilization: 1`,
+  `anthropic-ratelimit-unified-overage-surpassed-threshold: 1`, `anthropic-ratelimit-unified-overage-period` (`daily`, `weekly` or `monthly`; absent for `hour`, which the
+  client accepts), `anthropic-ratelimit-unified-overage-disabled-reason: org_spend_cap_reached`. `representative-claim` and `overage-status` stay
+  absent on purpose: with them Claude Code composes its own line and drops ours. No subscription windows are attached.
+- A denied request is still not recorded as a usage event and never reaches `Resolve`. The short rate limit is unchanged
+  everywhere (429 with `Retry-After`, `apierror` body).
+
+**Other endpoints.** Every other caller of the shared admission (chat completions, images, speech, transcription, live
+transcription, the `/v1/realtime` handshake, the portal loopback paths) keeps each quota or budget denial's status (quota
+429, budget 402) and `apierror` body and gains `X-Should-Retry: false` (`writeLimitDenied`), so the Anthropic and OpenAI SDKs
+stop retrying into a block that holds until the period resets. `/v1/responses` is the second exception: there a quota or
+budget denial is Codex's 429 `usage_limit_reached`, see [§9.6](#96-codex-display-of-the-gateways-own-limits). The rate
+denial keeps its `Retry-After` and no `X-Should-Retry`.
+
+**Memory driver.** It holds no `usage_events`, so every aggregate is zero and a configured principal reads 0 %, which
+matches what enforcement sees (quotas and budgets are a persistent-store feature).
+
+**End to end.** Run against Claude Code 2.1.328 with a sqlite-mode gateway and a stub upstream. The gateway's own
+response at 88 % of a daily token quota carried `allowed_warning` with threshold `0.75`. Claude Code's overage
+`rate_limit_event` came from a later request, at 99 %: `rateLimitType: overage`, utilization `0.99`, threshold `0.95`.
+Past the cap the 429 sentence was printed verbatim, with zero upstream requests and no retries.
+
+**Dependency.** The display relies on undocumented client behavior (the `aud` gate, the header names and the window
+order); a client update can stop it without breaking the gateway. The 429 shape and `x-should-retry` are documented in the
+contract and help every client. The server agent, the store schema and the portal are untouched. See [Risks & Technical
+Debt](../11-risks-and-technical-debt.md#111-operational-risks).
+
+### 9.5 Codex usage-limit display
+
+The Codex CLI can show an OpenAI subscription's usage limits from the `x-codex-*` response headers of `/v1/responses`. Through
+the gateway this works for a user who routes to a vendor subscription account and to local models in one session, for a token
+with the `send_usage_limits` switch (§9.3; no token format is needed). Without the switch no `x-codex-*` header reaches the client on
+a success; the one exception is the promo message of the gateway's own block ([§9.6](#96-codex-display-of-the-gateways-own-limits)). Decisions: [ADR-108](../09-architecture-decisions.md#adr-108--codex-shows-an-openai-subscriptions-usage-limits-through-an-allowlisted-x-codex-relay-and-a-per-principal-window-cache).
+
+**Client behavior** (Codex CLI 0.137.0, issue #416). Codex parses the family on every HTTP `/responses` stream, whatever the auth
+mode or provider (a custom provider uses HTTP, not WebSocket), so no token shape is needed. Each response's snapshot replaces the
+primary and secondary windows; only credits and plan type carry over. A response without the headers clears them, and `/status`
+then says `Limits: not available for this account`. Codex does not read `retry-after` (other OpenAI SDK clients do). On a 429 with
+`error.type = usage_limit_reached` it makes one request, no retry, and prints "You've hit your usage limit ... try again at ...",
+using the windows of the family that `x-codex-active-limit` names.
+
+**Relay.** A vendor subscription response's family reaches the client through the allowlist and entitlement rule of §6 (*Response
+headers on the Responses passthrough*), for a token with `send_usage_limits` only. The family is the six single names and the four window suffixes listed there, for the default
+`x-codex` family and any further `x-codex-<id>` family (for example `x-codex-other-*`); an id outside the `x-codex` prefix is not
+relayed. One predicate drives the relay, the entitlement trigger and the capture redaction.
+
+**Window cache.** Because a headerless response clears Codex's display, the gateway remembers the caller's last observed windows
+(`rateLimitWindowCache` as the server field `codexRateLimitWindows`, `codex_window_cache.go`) and attaches them to `/v1/responses`
+successes that carry none of their own. It is a second instance of the store §9.3 describes, so one principal's Claude Code and Codex
+entries never evict or overwrite each other.
+
+- Observed in `recordUsage`, from the upstream headers of any response of an OpenAI vendor provider
+  (`routing.IsOpenAIVendorProvider`) that carries a `primary-used-percent` or `secondary-used-percent` header of the `x-codex` family or an `x-codex-<id>` family (any
+  status; native passthrough and translate), and only when the caller is entitled to the account's figures. A caller who is not
+  entitled loses that account's entry (`Forget`). A token with no principal (neither user nor service id) caches nothing. A token without `send_usage_limits` observes nothing
+  either, but its vendor response still purges a revoked entry of its principal from that account (`Forget`, after an entitlement check that only runs when such an entry exists).
+- Stored per family: the primary and secondary window (`used-percent`, `window-minutes`, `reset-at`) and the family's `limit-name`, from
+  the first value of each header. A window without a positive integer `reset-at` is not stored, because it could never expire; the other
+  windows still are. Credits, `x-codex-active-limit`, `x-codex-rate-limit-reached-type`, `x-codex-promo-message` and the retry headers
+  are not stored (Codex carries credits over itself).
+- Attached only for the Responses flavor, on a success (2xx) that carries no family header of its own: the native passthrough before
+  the status line, and the translate path on both the buffered JSON answer and the SSE header block (written with the 200 before the
+  upstream answers). Not attached while the gateway's own limit takes over from 75 % (§9.6, *Precedence with §9.5*). An error, a response with fresh upstream windows (a vendor 429 included: its own headers are never overlaid),
+  every other flavor and a token without `send_usage_limits` get nothing.
+- Only windows whose reset time is still in the future are written, and a family's `limit-name` only with at least one of its windows.
+- Per process and best effort, with the bounds of §9.3: in memory, capped at 10 000 principals (oldest observation evicted), at most 8 families per
+  observation (the default `x-codex` family first, the others in sorted order) and no header value longer than 256 bytes (such a value counts as absent), pruned as
+  windows expire, lost on restart, not shared between replicas. The entitlement revocation behavior, the purge by an opted-out token and the known limitation are those
+  of §9.3.
+
+**Payload captures.** The translate path stores the upstream response headers in a capture. For a vendor-account target the Codex
+family is removed from them, with the unified family and `anthropic-organization-id`, unless the principal is entitled to the
+account's figures (`redactCapturedAccountHeaders`). Native passthrough captures hold the client headers, which the relay already gates.
+
+**What Codex shows.** The windows in its status-line items (`five-hour-limit`, `weekly-limit`), the `/status` bars with reset times, and
+warnings at 75, 90 and 95 % ("Heads up, you have less than ...% of your 5h limit left"). At 90 % and above Codex also nudges the user
+to switch to `gpt-5.4-mini`, which the gateway may not map. The gateway writes its credits flag (§9.6) only in its own standing and its own block, never
+next to subscription figures, relayed or cached, so on those the vendor's relayed credits headers decide (a reply on which the
+gateway's limit took over from the cache carries no subscription figure). The gateway influences the popup
+only through Codex's credits carry-over after one of its own standing or block responses, and only for a token without
+`codex_model_switch_prompt`; `notices.hide_rate_limit_model_nudge = true` in Codex's
+configuration hides it client-side. Before the first subscription response of a session, and after a gateway restart, the display is empty unless the gateway writes the principal's own limit (§9.6): Codex's startup prefetch
+exists only for a ChatGPT login. The gateway's own request quota, token quota and cost budget are written in the same default family
+(for a token with `send_usage_limits`), but only on a success that carries no fresh subscription figures, and on one that carries only cached ones from 75 % of the
+limit; fresh figures always win, below 75 % the cached ones do too. That is
+[§9.6](#96-codex-display-of-the-gateways-own-limits).
+
+**End to end.** Run against Codex CLI 0.137.0 with a memory-mode gateway and a self-hosted stub (always entitled) answering
+`/v1/responses` with the family: the status line showed `5h 57% left · weekly 83% left` and `/status` showed both bars. The
+vendor-only parts (entitlement and cache observe) are covered by handler tests, because the ChatGPT backend URL is fixed in the
+resolver and cannot be pointed at a stub.
+
+**Dependency.** The display relies on undocumented Codex behavior (the header names and the clear-on-missing rule). A client update can
+change it without notice; nothing in the gateway breaks, the display just stops working. See [Risks & Technical
+Debt](../11-risks-and-technical-debt.md#111-operational-risks).
+
+### 9.6 Codex display of the gateway's own limits
+
+§9.5 shows an OpenAI subscription's windows in Codex. This section brings the limits of §9.4 there: the principal's own
+request quota, token quota and cost budget (`routing.LimitConfig`, enforced by `PrincipalLimiter`). The fullest of them
+appears in Codex's status line, `/status` and warnings on a `/v1/responses` success, and a quota or budget block prints one
+sentence with the reset time after exactly one request. Both depend on the token: the fullest limit is written only for a token with
+`send_usage_limits` (§9.3), and the block sends only what stops a retry plus the promo message without it (*Block*, below).
+Decisions: [ADR-110](../09-architecture-decisions.md#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it) for the switches,
+[ADR-109](../09-architecture-decisions.md#adr-109--the-gateways-own-principal-limits-reach-codex-in-the-default-x-codex-family-and-as-a-429-usage_limit_reached-and-a-subscriptions-figures-win).
+
+**Verified client behavior** (Codex CLI 0.137.0, [issue #418](https://github.com/JLor08/op-ai-gateway/issues/418): stub runs
+with an isolated `CODEX_HOME` and a code read at tag `rust-v0.137.0`):
+
+- **One family per response.** Codex parses every header family (`x-codex-*` first, then each `x-<id>-*` family in sorted id
+  order) but keeps one snapshot slot and emits it once per response, so only the response's last family reaches the display.
+  An extra family on a response that also carries the subscription's `x-codex-*` windows hides the subscription.
+- **Only the default family `x-codex` drives the status line and the warnings.** An extra family is a `/status` row only,
+  without a status-line item, warning or popup. With `x-codex-limit-name: <name>` and one window, the default family gives the
+  status line `daily 38% left`, the `/status` row `<name> Daily limit: […] 38% left (resets …)` and warnings at 75, 90 and
+  95 % such as `Heads up, you have less than 10% of your daily limit left. Run /status for a breakdown.`
+- **Window labels** come from the family's `window-minutes` header, within ±5 %: 1440 `daily`, 10080 `weekly`, 43200
+  `monthly`. Anything else, 60 included, falls back to `usage`.
+- **The model-switch popup and the credits flag.** At 90 % or more of the default family Codex opens the popup
+  `Switch to gpt-5.4-mini for lower credit usage?` with the switch preselected; one Enter switched a test session's model,
+  which a gateway may not route. `x-codex-credits-has-credits: true` with `x-codex-credits-unlimited: false` and no balance
+  suppresses the popup and adds no `/status` row; in Codex's code the flag affects only the popup and the credits row.
+  Credits carry over between responses (§9.5). A token with `codex_model_switch_prompt` (and `send_usage_limits`) wants the popup, so
+  the gateway writes no credits flag of its own (*Popup switch*, below).
+- **The block path.** A 429 whose body `error.type` is `usage_limit_reached` is never retried. With `x-codex-promo-message`
+  and no `limit-name` header on the active family, Codex prints
+  `You've hit your usage limit. <promo>, or try again at <reset in local time>.`, the time taken from `error.resets_at`. A
+  `limit-name` header on the active family wins over the promo and yields
+  `You've hit your usage limit for <name>. Switch to another model now, or try again at …`. The 429's family windows (the
+  default family when `x-codex-active-limit` is absent) replace the display; a 429 without windows clears it.
+- **Retries.** Codex reads neither `retry-after` nor `x-should-retry`. No 429 is retried (`retry_429` is false for every
+  provider); a 402 is retried at turn level. Before this behavior a quota 429 printed
+  `exceeded retry limit, last status: 429 Too Many Requests` after one request, and the cost-budget 402 was retried five
+  times in about 7 s and then printed `unexpected status 402 Payment Required: cost budget exceeded, url: …`.
+
+**Readings at admission.** The same as §9.4: `PrincipalLimiter.Evaluate` returns the `LimitStanding` that admission judged, and
+`inferencePreflight` returns it in `preflight.Standing`. `handleOpenAIResponses` puts it on the request context
+(`withLimitStanding`) after either of its two `inferencePreflight` calls (on the probed model before the native passthrough is
+tried, and on the parsed model when the probe found none), as `handleAnthropicMessages` does. The response path does no
+store I/O.
+
+**Success (2xx, `/v1/responses`).** `attachCodexPrincipalLimitStanding` (`codex_principal_limit_headers.go`) runs as the last
+header step at the three attach points of §9.5, for the `openai_responses` flavor only: the native passthrough on any 2xx,
+after the relay and the cache attach and before the status line; and on the translate path, through
+`attachTranslatedCodexUsageLimits` (which runs `attachCodexRateLimitWindows` first, unless the gateway's limit takes over, below), the buffered JSON answer and the SSE
+header block written with the 200. A token without `send_usage_limits` gets nothing. It changes only the client header set, never the upstream set that `recordUsage`, the window
+caches and the vendor usage scrape read. `LimitStanding.Fullest` picks the reading as in §9.4 (highest utilization, ties to
+the later reset, then the fixed order; none when the standing is empty or any reading failed). Nothing is written when it
+reports none, or when the reading's reset is not after the moment of writing: a response that outlives the period boundary
+stays headerless, and the next one corrects it (§9.4 writes the stale reset there; Codex would show a reset in the past).
+Otherwise `writeCodexLimitStanding` writes the primary window of the default family:
+
+| Header | Value |
+|---|---|
+| `x-codex-primary-used-percent` | `floor(utilization × 100)` as an integer, at least 0 and at most 99 (§9.4's rule: an admitted request stays below 100) |
+| `x-codex-primary-window-minutes` | the nominal period length: hour `60`, day `1440`, week `10080`, month `43200` (nominal, so a 28-day February still reads `monthly`) |
+| `x-codex-primary-reset-at` | the reading's reset, unix seconds |
+| `x-codex-limit-name` | `OP AI Gateway request quota`, `OP AI Gateway token quota` or `OP AI Gateway cost budget` (one window cannot say which limit it is) |
+| `x-codex-credits-has-credits` | `true`, which suppresses the model-switch popup; not written for a token with `codex_model_switch_prompt` |
+| `x-codex-credits-unlimited` | `false`; not written for a token with `codex_model_switch_prompt` |
+
+There is no secondary window, no `x-codex-credits-balance` and no `x-codex-active-limit`. Codex then shows the status line
+`daily 62% left` (an hourly limit takes the fallback label `usage`), the `/status` row
+`OP AI Gateway token quota Daily limit: […] 62% left (resets …)`, its warnings at 75, 90 and 95 %, and no popup.
+
+**Precedence with §9.5.** Fresh figures win whole; cached ones yield from 75 %. The gateway writes nothing when, after §9.5's
+relay or cache attach, the client header set already carries any Codex rate-limit header (`hasCodexRateLimitHeader`, over the family
+of §6): one family per response leaves room for only one of the two, and fresh vendor figures stay exactly as ADR-108 writes them.
+`retry-after` and `x-should-retry` are not in the family and do not count.
+
+The cache attach is conditional. On a `/v1/responses` 2xx for a token with `send_usage_limits`, at the point where §9.5 would attach
+the cached windows (the upstream sent no Codex rate-limit header: a native vendor reply without one, a local-model passthrough, or the
+translate path, JSON or the SSE header block), `codexGatewayLimitTakesOver` decides. It takes the reading the writer above would use
+(`codexPrincipalLimitReading`: `Fullest()`, with a reset after now) and holds when its written percent (`overageUtilizationCents`,
+floored, at most 99) is at least `codexGatewayTakeoverPercent` (75, Codex's first warning step). On a takeover the cached windows are
+not attached, the default family, any further family and the limit names included, and the unchanged standing writer then writes the
+gateway's window alone. One `now` serves the decision and the writer, so they cannot disagree about the reset. Below 75 %, without a
+quota or budget, with a failed reading or a reset not after now there is no takeover and the cached windows attach as in §9.5. The
+decision is on the integer percent that is written: 74.99 % writes 74 and keeps the cache. It does not look at how full the cached
+subscription windows are: a local request does not consume the subscription, and the next vendor reply shows the subscription's fresh
+figures again. Observation is unchanged; vendor responses keep feeding the cache.
+
+| Reply | Gateway below 75 % (or no limit, failed reading) | Gateway at 75 % or more |
+|---|---|---|
+| Vendor reply with fresh figures, entitled caller | vendor figures | vendor figures |
+| Vendor reply, figures withheld (caller not entitled) | gateway window (none without a limit or with a failed reading) | gateway window |
+| Local reply (native passthrough without Codex headers, translate JSON, translate SSE) | cached windows | gateway window, no cached family |
+| Any non-2xx, and a block | as before | as before |
+
+A native vendor 2xx without Codex headers (normal for an API-key account) counts like a local reply. Nothing from the vendor is
+replaced there. No translate reply carries fresh Codex figures, because an OpenAI subscription or API-key target on `openai_responses` always
+uses native passthrough (`vendorAccountTarget`, `vendorSubscriptionOpenAITarget` in `internal/routing/resolver.go`); a
+`/v1/responses` request that translates goes to an Anthropic or OpenAI-compatible vendor account or a local model. This has four consequences:
+
+- A principal who also uses an OpenAI subscription sees the gateway's limit on responses that carry no fresh subscription figure from
+  75 % of its fullest limit; below that the cached windows are shown and Codex gives no gateway warning. A block still names the
+  gateway's limit.
+- A vendor family that the relay withheld from a caller who is not entitled (§6) is not in the client header set, so that
+  caller gets the gateway's limit instead, at any utilization.
+- From 75 % the display alternates between the subscription (vendor replies) and the gateway (local replies). The takeover reply has no
+  secondary window, so the subscription's weekly bar leaves the status line and `/status` on local replies and returns with the next
+  vendor reply. Codex keeps one warning step counter per slot (primary, secondary) for the whole chat session, never reset (read in Codex's
+  `RateLimitWarningState`, `codex-rs/tui/src/chatwidget/rate_limits.rs` at tag rust-v0.137.0), shared by
+  whatever figure fills the default family's primary slot. A 75 % warning already taken by the subscription's 5h window therefore
+  means the gateway's first warning comes at 90 %, and the other way round: a gateway warning taken first (at 80 %, say) swallows the
+  subscription's 5h warning at that step. The alternation repeats no warning. In the same file `take_warnings` returns no
+  warning for a snapshot whose primary or secondary window is at 100 %.
+- Codex carries credits over between responses: once a gateway response, a takeover reply included, has set
+  `x-codex-credits-has-credits: true`, a later local-model reply that carries only cached subscription windows also suppresses the
+  subscription's popup, until the next vendor response sends its own credits headers.
+
+**Popup switch (`codex_model_switch_prompt`).** A per-token boolean, default off, effective only together with `send_usage_limits` (without
+it no `x-codex-*` header is written at all). When on, the gateway never writes its own `x-codex-credits-has-credits` or
+`x-codex-credits-unlimited`, neither on the success standing above nor on the block below, so Codex shows its
+`Switch to gpt-5.4-mini` popup at 90 % of its default window. Because Codex carries credits over between responses, the popup also appears
+while the default window shows the gateway's own limit, because with the switch the gateway sets no credits flag, so none carries over
+from its responses. A session that already received one from the gateway before the switch was turned on keeps it until it restarts. The vendor's own relayed credits headers are untouched. Verified on the Codex CLI 0.137.0 TUI: the popup with the switch, only the
+warning without it. Meant for a user who works with a Codex subscription and wants the offer.
+
+**Block (`/v1/responses` only).** A quota or budget denial on the OpenAI Responses flavor (`/v1/responses` and
+`/openai/v1/responses`) is answered by `writeCodexLimitBlocked`, called from `admitPrincipal`'s flavor switch beside §9.4's
+`writeLimitBlocked`. `LimitStanding.Blocking` picks the limit to name exactly as in §9.4 (the breached reading with the latest
+reset, ties to the fixed order, the defensive fallback to the reading `Admit` named); when it reports none, the request falls
+back to `writeLimitDenied`. The status is 429 for all three kinds: the cost budget is a 429 here too, not its 402.
+
+**Body** (`Content-Type: application/json`), for example:
+
+```json
+{"error":{"type":"usage_limit_reached","code":"limit.token_quota_exceeded","message":"token quota reached · resets Nov 22, 00:00 UTC · ask your gateway administrator to raise it","resets_at":1795305600}}
+```
+
+`code` is the limit's stable code (`limit.request_quota_exceeded`, `limit.token_quota_exceeded` or
+`limit.cost_budget_exceeded`), `message` is §9.4's sentence (`limitBlockedMessage`) for SDK clients that print
+`error.message`, and `resets_at` is the reading's reset in unix seconds, which Codex formats in local time. Like §9.4's body,
+it is not the `apierror` shape.
+
+**Headers.** The first three rows go out for every token; the rest only for a token with `send_usage_limits`:
+
+| Header | Value |
+|---|---|
+| `Retry-After` | seconds to the reset, rounded up, at least 1 |
+| `X-Should-Retry` | `false` |
+| `x-codex-promo-message` | `OP AI Gateway <request quota\|token quota\|cost budget> reached; ask your gateway administrator to raise it` (ASCII only) |
+| `x-codex-primary-used-percent` | `100` |
+| `x-codex-primary-window-minutes` | the nominal period length, as on a success |
+| `x-codex-primary-reset-at` | the reading's reset, unix seconds |
+| `x-codex-credits-has-credits` | `true`; not written for a token with `codex_model_switch_prompt` |
+| `x-codex-credits-unlimited` | `false`; not written for a token with `codex_model_switch_prompt` |
+
+**Without `send_usage_limits`.** The block is the 429, `Retry-After`, `X-Should-Retry: false`, the same `usage_limit_reached` body (sentence and
+`resets_at`) and `x-codex-promo-message`, the one named exception to "no `x-codex-*` header": Codex 0.137.0 prints only its own
+`You've hit your usage limit` line plus that header, never the body's `message`, so without it a gateway block would look like a ChatGPT
+plan limit. The header carries no figure, only that it is the gateway's quota and whom to ask. Nothing else reaches the client, and the
+retry stops all the same: Codex never retries a 429 `usage_limit_reached`, ignores the retry headers, but retries a 402 five times
+(which is why the block is a 429).
+
+Deliberately absent: `x-codex-limit-name` (with it Codex prints "Switch to another model now" instead of the sentence),
+`x-codex-active-limit` (the default family is the one Codex reads), `x-codex-rate-limit-reached-type` and any secondary
+window. During a block `/status` therefore labels the row `Daily limit` without the `OP AI Gateway` prefix, and the status
+line shows `daily 0% left`. The 100 % window replaces whatever the display held, so a subscription user sees the gateway's
+0 % until a later success carries other figures: the subscription's, relayed or cached, or the gateway's own window.
+
+What Codex prints, after one request and without a retry (a daily quota, a client in UTC+1):
+`You've hit your usage limit. OP AI Gateway token quota reached; ask your gateway administrator to raise it, or try again at 1:00 AM.`
+
+A denied request is still not recorded as a usage event and never reaches `Resolve`. The short rate limit is unchanged (429
+`limit.rate_limited` with `Retry-After`, `apierror` body); Codex prints
+`exceeded retry limit, last status: 429 Too Many Requests` for it, after one request.
+
+**Unchanged.** Capture redaction (still by entitlement), `writeLimitDenied` and the verbatim relay of vendor error bodies are not affected by
+the switches. Every other flavor keeps its denial: `/v1/messages` answers as §9.4 describes, and chat completions, images,
+speech, transcription, live transcription, the `/v1/realtime` handshake and the portal loopback paths keep
+`writeLimitDenied` (§9.4, *Other endpoints*). The rate denial is unchanged on every flavor, and so are §9.5's relay, cache,
+entitlement and capture redaction. An upstream error response (non-2xx) gets no gateway header. A principal with no quota or budget
+gets no gateway header, byte for byte as before, and neither does a success whose standing holds a failed reading.
+
+**Memory driver.** As in §9.4: it holds no `usage_events`, so a configured principal reads 0 % in Codex too, which matches
+enforcement.
+
+**End to end.** Run against Codex CLI 0.137.0 with a sqlite-mode gateway and a self-hosted stub answering `/v1/responses`
+with 12 tokens per request, for a principal with a token quota of 100 per day. At 60 % used the status line read
+`daily 40% left` and `/status` showed `OP AI Gateway token quota Daily limit: […] 40% left (resets 01:00)`. At 96 % Codex
+printed its warning `Heads up, you have less than 5% of your daily limit left. Run /status for a breakdown.`, the status line
+read `daily 4% left`, no `gpt-5.4-mini` popup opened and the model stayed unchanged. Past the cap the gateway answered the
+429 `usage_limit_reached` above; Codex sent the request once, the stub received none, and Codex printed
+`You've hit your usage limit. OP AI Gateway token quota reached; ask your gateway administrator to raise it, or try again at 1:00 AM.`,
+with the status line at `daily 0% left` and the `/status` row `Daily limit: … 0% left`. This is a documented manual run, as in
+§9.5; the gateway's paths are covered by handler tests.
+
+The takeover from cached windows was run against Codex CLI 0.137.0 and a loopback stub that sent the header sets the gateway
+writes, without a gateway. In one session a subscription 5h window at 80 % with a weekly window at 17 % warned `less than 25% of your
+5h limit left` and showed `5h 20% left · weekly 83% left`. The gateway window at 80 % then showed `daily 20% left` without the weekly
+bar, with the `/status` row `OP AI Gateway token quota Daily limit: … 20% left` and no new 75 % warning. The subscription again
+restored `5h 20% left · weekly 83% left` without a warning, and the gateway at 91 % warned `less than 10% of your daily limit left`
+with `daily 9% left` and no `gpt-5.4-mini` popup. As in §9.5, the cached path itself is not end to end testable (the cache is filled
+only from an OpenAI vendor provider, whose ChatGPT backend URL is fixed); handler tests cover it.
+
+**Dependency.** The display and the block sentence rely on undocumented Codex behavior: one family per response with the last
+one winning, the default family as the only one with a status line and warnings, the window-minute labels, the credits flag's
+effect on the popup (and the popup's return when `codex_model_switch_prompt` withholds it), and the promo message's precedence below a `limit-name` header. A client update can change any of them
+without notice; nothing in the gateway breaks, and the 429, `Retry-After`, `X-Should-Retry: false` and enforcement keep
+working. See [Risks & Technical Debt](../11-risks-and-technical-debt.md#111-operational-risks).
 
 ## 10. Request bodies and size limits
 
@@ -5107,7 +5723,7 @@ serving endpoint with the session cookie and names the file from the response's
 ## 13. Errors
 
 Every inference error response uses the gateway-wide envelope
-(`apierror.Response`, `internal/apierror/`):
+(`apierror.Response`, `internal/apierror/`), with two exceptions: the §9.4 `billing_error` body on `/v1/messages` and the §9.6 `usage_limit_reached` body on `/v1/responses`; both still carry the stable `error.code`:
 
 ```json
 {"error": {"code": "provider.unavailable", "message": "...", "request_id": "req_..."}}
@@ -5117,8 +5733,8 @@ Every inference error response uses the gateway-wide envelope
 |---|---|---|
 | `request.*` (e.g. `request.model_required`, `openai.content_required`, `anthropic.content_unsupported`) | 400 | body failed `compat.Parse*`/`inference.Request.Validate` |
 | `model.not_allowed` | 403 | service-token allowlist (§6 step 2) |
-| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate; `.token_quota_exceeded` is also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
-| `limit.cost_budget_exceeded` | 402 | `PrincipalLimiter` admission gate; also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
+| `limit.rate_limited` / `.request_quota_exceeded` / `.token_quota_exceeded` | 429 | `PrincipalLimiter` admission gate; the two quota codes also carry `X-Should-Retry: false`, and on `/v1/messages` they come as a `billing_error` body (§9.4), on `/v1/responses` as a Codex `usage_limit_reached` body (§9.6); the usage-limit headers of those two blocks go out only for a token with `send_usage_limits`, the status, `Retry-After`, `X-Should-Retry`, the body and (Codex) `x-codex-promo-message` always; `.token_quota_exceeded` is also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
+| `limit.cost_budget_exceeded` | 402 (429 `billing_error` on `/v1/messages`, §9.4; 429 `usage_limit_reached` on `/v1/responses`, §9.6; their usage-limit headers only for a token with `send_usage_limits`) | `PrincipalLimiter` admission gate, with `X-Should-Retry: false`; also the usage-row code of a `/v1/realtime` session a re-check ended (close 1008, §3.11) |
 | `server_override.forbidden` | 403 | re-authorization failure (§6) |
 | `responses.endpoint_disabled` | 404 | the resolved application/spec's effective `ResponsesMode` is `disabled` (§6) |
 | `messages.endpoint_disabled` | 404 | the resolved application/spec's effective `MessagesMode` is `disabled` (§6) |

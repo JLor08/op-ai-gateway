@@ -138,7 +138,7 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecVisibleDevicesNoGPUs, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_no_gpus", msg: "set_visible_devices requires at least one gpu row: an empty visible-devices value hides every gpu from the model"},
 	{err: portal.ErrRuntimeSpecVisibleDevicesConflict, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_conflict", msg: "set_visible_devices conflicts with a gpu visibility variable set by hand in env"},
 	{err: portal.ErrRuntimeSpecVisibleDevicesModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_mode_invalid", msg: "visible_devices_mode must be \"env\" or \"args\""},
-	{err: portal.ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_args_no_placeholder", msg: "args mode requires one of ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES} in args"},
+	{err: portal.ErrRuntimeSpecVisibleDevicesArgsNoPlaceholder, status: http.StatusBadRequest, code: "runtime_spec.visible_devices_args_no_placeholder", msg: "args mode requires one of ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES}/${DEVICES}/${HOST_GPU_IDS}/${HOST_GPU_IDS_MAIN_LAST} in args or a config file"},
 	{err: portal.ErrRuntimeSpecNotServerAgent, status: http.StatusBadRequest, code: "runtime_spec.application_not_server_agent", msg: "runtime spec requires a server_agent application"},
 	{err: portal.ErrRuntimeSpecEndpointModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.endpoint_mode_invalid", msg: "runtime spec endpoint mode is invalid"},
 	{err: portal.ErrRuntimeSpecFlavorInvalid, status: http.StatusBadRequest, code: "runtime_spec.flavor_invalid", msg: "runtime spec api flavor is invalid"},
@@ -146,7 +146,9 @@ var portalRuntimeSpecErrRows = []errRow{
 	{err: portal.ErrRuntimeSpecWSLDistroInvalid, status: http.StatusBadRequest, code: "runtime_spec.wsl_distro_invalid", msg: "a wsl runtime spec needs a wsl_distro of letters, digits, '.', '_' and '-' (at most 64)"},
 	{err: portal.ErrRuntimeSpecWSLPathNotLinux, status: http.StatusBadRequest, code: "runtime_spec.wsl_path_not_linux", msg: "a wsl runtime spec runs inside the distro: binary and work_dir must be Linux absolute paths"},
 	{err: portal.ErrRuntimeSpecWSLClusterUnsupported, status: http.StatusBadRequest, code: "runtime_spec.wsl_cluster_unsupported", msg: "a wsl runtime spec cannot be an rpc cluster head"},
-	{err: portal.ErrRuntimeSpecTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.type_invalid", msg: "runtime spec type must be one of vllm, llama_cpp, tgi, ollama, stable_diffusion_cpp, audio_cpp, vllm_sr, sglang, sglang_omni, custom (or empty for auto)"},
+	{err: portal.ErrRuntimeSpecProcessTreeInvalid, status: http.StatusBadRequest, code: "runtime_spec.process_tree_invalid", msg: "process_tree must be \"direct\" or \"job\""},
+	{err: portal.ErrRuntimeSpecProcessTreeUnsupported, status: http.StatusBadRequest, code: "runtime_spec.process_tree_unsupported", msg: "process_tree \"job\" needs a Windows agent that declares runtime_process_tree_job"},
+	{err: portal.ErrRuntimeSpecTypeInvalid, status: http.StatusBadRequest, code: "runtime_spec.type_invalid", msg: "runtime spec type must be one of vllm, llama_cpp, tgi, ollama, stable_diffusion_cpp, audio_cpp, vllm_sr, sglang, sglang_omni, strata, custom (or empty for auto)"},
 	// The one row in this table with a dynamic message. The service wraps the
 	// sentinel with the offending EFFECTIVE kind (fmt.Errorf("%w: ...")), and
 	// naming it is the entire point of refusing the write instead of storing

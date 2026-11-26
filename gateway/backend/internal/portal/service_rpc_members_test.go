@@ -210,6 +210,12 @@ func TestPutRPCMemberSpecVRAMEstimateOnNonNVIDIA(t *testing.T) {
 	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", noEstimate); err != nil {
 		t.Fatalf("nvidia without estimate: %v", err)
 	}
+	// An AMD card on Linux reports its PCI bus id and uuid too (rocm-smi
+	// 4.x); it still needs the estimate, since the bus id is no NVIDIA signal.
+	set(`{"gpus":[{"index":0,"name":"AMD Radeon RX 6900 XT","pci_bus_id":"0000:01:00.0","uuid":"0x12b1004de0189bb2"}]}`)
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", noEstimate); !errors.Is(err, ErrRPCMemberVRAMEstimateRequired) {
+		t.Fatalf("amd with pci bus id, without estimate: %v", err)
+	}
 	set(`not json`)
 	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", noEstimate); err != nil {
 		t.Fatalf("unreadable report: %v", err)
@@ -336,5 +342,29 @@ func TestRPCMemberSpecWritesNotifyMemberAndHead(t *testing.T) {
 	}
 	if got := calls()[before:]; !reflect.DeepEqual(got, []string{member.ID}) {
 		t.Fatalf("delete notified %v", got)
+	}
+}
+
+// TestGPULooksNVIDIA pins the vendor rule behind the NVIDIA-only member
+// exemptions: an AMD name wins over a PCI bus id, which both vendors report.
+func TestGPULooksNVIDIA(t *testing.T) {
+	cases := []struct {
+		name, gpu, busID string
+		want             bool
+	}{
+		{"nvidia name with bus id", "NVIDIA GeForce RTX 4090", "00000000:01:00.0", true},
+		{"nvidia keyword without bus id", "Tesla T4", "", true},
+		{"keyword-less name with bus id", "H100 PCIe", "00000000:41:00.0", true},
+		{"amd radeon with bus id", "AMD Radeon RX 6900 XT", "0000:01:00.0", false},
+		{"amd instinct with bus id", "Instinct MI210", "0000:c1:00.0", false},
+		{"radeon without vendor word", "Radeon PRO W7900", "0000:03:00.0", false},
+		{"empty name and bus id", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := gpuLooksNVIDIA(tc.gpu, tc.busID); got != tc.want {
+				t.Fatalf("gpuLooksNVIDIA(%q, %q) = %v, want %v", tc.gpu, tc.busID, got, tc.want)
+			}
+		})
 	}
 }

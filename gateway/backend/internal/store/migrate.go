@@ -142,7 +142,13 @@ var migrations = []migration{
 	{version: 107, name: "application_decision_modes", up: migration107Up},
 	{version: 108, name: "token_decisions_confidence_normalize", up: migration108Up},
 	{version: 109, name: "runtime_spec_execution_mode", up: migration109Up},
-	{version: 110, name: "server_lan_interfaces", up: migration110Up},
+	{version: 110, name: "vendor_account_share_usage", up: migration110Up},
+	{version: 111, name: "token_claude_code_usage_display", up: migration111Up},
+	{version: 112, name: "token_usage_limit_switches", up: migration112Up},
+	{version: 113, name: "runtime_spec_process_tree", up: migration113Up},
+	{version: 114, name: "vendor_account_groups", up: migration114Up},
+	{version: 115, name: "user_chat_vendor_access", up: migration115Up},
+	{version: 116, name: "server_lan_interfaces", up: migration116Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4815,13 +4821,128 @@ func migration109Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return nil
 }
 
-// migration110Up adds the agent-reported LAN interface list and the LAN
+// migration110Up adds the owner's opt-in vendor_accounts.share_usage_with_members
+// flag (#407): when set, a member who reaches the account through sharing also sees
+// its usage figures (rate-limit windows and spend) in the portal's account page and
+// dashboard and receives its subscription's usage-limit headers in Claude Code; the
+// owner always does. A boolean is `integer not null default 0` on both dialects, and existing
+// accounts land on 0 = off, so the upgrade exposes no usage data to anyone new.
+// addColumnIfMissing keeps it re-runnable.
+func migration110Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "vendor_accounts", "share_usage_with_members integer not null default 0")
+}
+
+// migration111Up adds the opt-in api_tokens.claude_code_usage_display flag
+// (#407): when set, the token's secret carries the JWT-shaped prefix Claude
+// Code needs before it shows the usage limits. The flag is recorded so the
+// shape survives a rotation. `integer not null default 0` on both dialects,
+// existing tokens land on 0 = opaque secret, so the upgrade changes nothing.
+// addColumnIfMissing keeps it re-runnable.
+func migration111Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "api_tokens", "claude_code_usage_display integer not null default 0")
+}
+
+// migration112Up adds the two opt-in api_tokens switches that decide whether a
+// coding client sees the gateway's usage-limit signals (#420):
+// send_usage_limits (the rate-limit headers) and codex_model_switch_prompt
+// (the Codex CLI's model-switch popup). Both are `integer not null default 0`
+// on both dialects. send_usage_limits is backfilled from
+// claude_code_usage_display, so a token that already shows the limits in
+// Claude Code keeps showing them after the upgrade; every other token, and
+// every codex_model_switch_prompt, lands on 0 = off. The backfill is
+// idempotent: it only raises a 0 to 1 where the display flag is set.
+// addColumnIfMissing keeps the step re-runnable.
+func migration112Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"send_usage_limits integer not null default 0",
+		"codex_model_switch_prompt integer not null default 0",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "api_tokens", col); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, "update api_tokens set send_usage_limits = 1 where claude_code_usage_display = 1"); err != nil {
+		return fmt.Errorf("backfill api_tokens.send_usage_limits: %w", err)
+	}
+	return nil
+}
+
+// migration113Up adds process_tree to agent_runtime_specs: how the agent
+// supervises a native spec's process tree on a Windows host ("direct" or
+// "job", a Windows Job Object). Operator-owned. The default makes every
+// existing row a direct spec, so the upgrade changes no behaviour and a direct
+// spec's pushed document stays byte-identical. addColumnIfMissing keeps the
+// step replayable on both dialects.
+func migration113Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "process_tree text not null default 'direct'")
+}
+
+// migration115Up adds users.chat_vendor_provider_access: the encoded
+// vendor-access policy (the api_tokens.vendor_provider_access JSON codec) the
+// token-less portal chat session carries. The empty default means "unset" and
+// keeps today's behaviour (all own accounts, groups included) for every
+// existing user; an explicit "no providers" policy is stored as {"all":false},
+// never as the empty string. addColumnIfMissing keeps the step replayable on
+// both dialects.
+func migration115Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "users", "chat_vendor_provider_access text not null default ''")
+}
+
+// migration114Up creates the vendor account group tables and stamps usage rows
+// with the group that routed them. vendor_account_groups is a user's personal,
+// named, ordered set of their own vendor accounts of one vendor;
+// vendor_account_group_members is its link table, the twin of migration92Up's:
+// both sides are real foreign keys ON DELETE CASCADE (deleting the group, or a
+// member account, drops the link row; deleting the owner drops the group), the
+// unique pairs keep a member listed once and positions distinct, and the
+// vendor_account_id index serves the reverse lookup the unique pair's implicit
+// index (led by group_id) does not. The three threshold columns default to 99
+// (routing.DefaultVendorGroupThresholdPct).
+//
+// usage_events.vendor_group_id is the group's id on a request it served; the
+// empty-string default is every pre-upgrade row and every request outside a group.
+// Create-if-not-exists and addColumnIfMissing make a second run change nothing.
+func migration114Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	ts := dl.timestampType()
+	stmts := []string{
+		`create table if not exists vendor_account_groups (
+			id text primary key,
+			owner_user_id text not null references users(id) on delete cascade,
+			vendor text not null,
+			name text not null,
+			model_prefix text not null default '',
+			status text not null default 'active',
+			threshold_five_hour_pct integer not null default 99,
+			threshold_weekly_pct integer not null default 99,
+			threshold_credits_pct integer not null default 99,
+			created_at ` + ts + ` not null,
+			updated_at ` + ts + ` not null
+		)`,
+		`create index if not exists idx_vendor_account_groups_owner on vendor_account_groups(owner_user_id)`,
+		`create table if not exists vendor_account_group_members (
+			group_id text not null references vendor_account_groups(id) on delete cascade,
+			vendor_account_id text not null references vendor_accounts(id) on delete cascade,
+			position integer not null,
+			unique(group_id, vendor_account_id),
+			unique(group_id, position)
+		)`,
+		`create index if not exists idx_vendor_account_group_members_vendor_account on vendor_account_group_members(vendor_account_id)`,
+	}
+	for _, stmt := range stmts {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return addColumnIfMissing(ctx, tx, dl, "usage_events", "vendor_group_id text not null default ''")
+}
+
+// migration116Up adds the agent-reported LAN interface list and the LAN
 // address source to ai_servers: lan_interfaces (” = never reported, '[]' =
 // reported empty), lan_source and lan_interface_id. It then backfills the
 // source so an existing setup resolves exactly as before: a server that already
 // carries a lan_address is 'manual', every other one 'auto'. The backfill only
 // touches rows still at the ” default, so a replay never rewrites a choice.
-func migration110Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+func migration116Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	for _, col := range []string{
 		"lan_interfaces text not null default ''",
 		"lan_source text not null default ''",

@@ -19,6 +19,9 @@ import { type Fetcher, request, subscribeSSE } from './transport';
 // 'vllm_sr': an operator-run vLLM Semantic Router (Engine mode); it serves
 // POST /v1/systemone only, so the form defaults to the 'decisions' flavor, and
 // its models and health are read from GET /v1/systemone/models.
+// 'strata': an operator-run Strata (`strata serve`, or the desktop app's LAN
+// share, which serves only /v1/models among its GET routes), so health, the
+// loaded models and the context window are all read from GET /v1/models.
 export type ApplicationType =
   | 'ollama'
   | 'vllm'
@@ -28,7 +31,8 @@ export type ApplicationType =
   | 'server_agent'
   | 'stable_diffusion_cpp'
   | 'audio_cpp'
-  | 'vllm_sr';
+  | 'vllm_sr'
+  | 'strata';
 export type ApplicationScheme = 'http' | 'https';
 export type ApplicationStatus = 'active' | 'disabled';
 
@@ -534,6 +538,9 @@ export type ModelOption = {
   // Count of servers offering this model whose managed spec currently reports the
   // "starting" lifecycle state (i.e. the model is mid-load on that server).
   loading_on_count: number;
+  // On a token-scoped listing: the real model behind a generated alias row (the row's `id` is the
+  // name the token offers). Absent on every other row.
+  original_model_id?: string;
   // The model's global visibility (default "shown"). Only meaningful for a real
   // model; a group row (is_group) has no visibility control.
   visibility?: ModelVisibility;
@@ -839,7 +846,14 @@ export const LIVE_TRANSCRIPTION_SAMPLE_RATE = 16000;
 
 export function modelsApi(fetcher: Fetcher) {
   return {
-    models: () => request<{ data: ModelOption[] }>(fetcher, '/api/portal/models'),
+    // With a run-as token id the listing is that token's own (its names, aliases and
+    // visibility), asked for through the X-OP-Run-As-Token header -- never a query param.
+    models: (runAsTokenId?: string) =>
+      request<{ data: ModelOption[] }>(
+        fetcher,
+        '/api/portal/models',
+        runAsTokenId ? { headers: { 'X-OP-Run-As-Token': runAsTokenId } } : undefined,
+      ),
     // manageModels returns the UNSUPPRESSED model listing (admin only): hidden/
     // locked models are INCLUDED so the management UI can revert them or add them
     // to a group. Feeds ModelList + ModelGroupSection, never the chat picker.

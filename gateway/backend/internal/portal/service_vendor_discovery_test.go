@@ -100,6 +100,19 @@ type fakeVendorDiscoverers struct {
 	// seam's configured answer and its recorded calls.
 	compatUsage      fakeUsageResult
 	compatUsageCalls []fakeCompatUsageCall
+
+	// anthropicUsage is the Anthropic subscription usage seam's configured answer
+	// (usage and err; the zero value is "nothing known, unusable") and its
+	// recorded calls. anthropicUsageGate, when set, blocks every call until it is
+	// closed.
+	anthropicUsage      fakeAnthropicUsageResult
+	anthropicUsageCalls []fakeUsageCall
+	anthropicUsageGate  chan struct{}
+}
+
+type fakeAnthropicUsageResult struct {
+	usage vendorauth.OpenAISubscriptionUsage
+	err   error
 }
 
 func newFakeVendorDiscoverers() *fakeVendorDiscoverers {
@@ -108,6 +121,8 @@ func newFakeVendorDiscoverers() *fakeVendorDiscoverers {
 		usage:   fakeUsageResult{usage: unknownUsage(), status: vendorauth.DiscoveryUnverifiable},
 
 		compatUsage: fakeUsageResult{usage: unknownUsage(), status: vendorauth.DiscoveryUnverifiable},
+
+		anthropicUsage: fakeAnthropicUsageResult{usage: unknownUsage(), err: errors.New("anthropic usage not configured")},
 	}
 	for _, kind := range []string{kindOpenAISubscription, kindAnthropicSubscription, kindOpenAIAPIKey, kindAnthropicAPIKey, kindOpenAICompatibleAPIKey, kindGeminiAPIKey} {
 		f.results[kind] = fakeDiscoveryResult{status: vendorauth.DiscoveryUnverifiable}
@@ -180,6 +195,41 @@ func (f *fakeVendorDiscoverers) recordUsage(accessToken, accountID string, clien
 	}
 	f.usageCalls = append(f.usageCalls, call)
 	return f.usage.usage, f.usage.status
+}
+
+// okAnthropicUsage makes the Anthropic subscription usage fetch answer usage.
+func (f *fakeVendorDiscoverers) okAnthropicUsage(usage vendorauth.OpenAISubscriptionUsage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.anthropicUsage = fakeAnthropicUsageResult{usage: usage}
+}
+
+// failAnthropicUsage makes the Anthropic subscription usage fetch fail with err.
+func (f *fakeVendorDiscoverers) failAnthropicUsage(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.anthropicUsage = fakeAnthropicUsageResult{usage: unknownUsage(), err: err}
+}
+
+func (f *fakeVendorDiscoverers) recordAnthropicUsage(accessToken string, client *http.Client) (vendorauth.OpenAISubscriptionUsage, error) {
+	f.mu.Lock()
+	call := fakeUsageCall{accessToken: accessToken, hasClient: client != nil}
+	if client != nil {
+		call.timeout = client.Timeout
+	}
+	f.anthropicUsageCalls = append(f.anthropicUsageCalls, call)
+	gate, res := f.anthropicUsageGate, f.anthropicUsage
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	return res.usage, res.err
+}
+
+func (f *fakeVendorDiscoverers) anthropicUsageRecorded() []fakeUsageCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeUsageCall(nil), f.anthropicUsageCalls...)
 }
 
 func (f *fakeVendorDiscoverers) usageRecorded() []fakeUsageCall {
@@ -289,6 +339,9 @@ func (f *fakeVendorDiscoverers) discoverers() VendorModelDiscoverers {
 		GeminiAPIKey:           f.gemini(),
 		OpenAIUsage: func(_ context.Context, client *http.Client, accessToken, accountID string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
 			return f.recordUsage(accessToken, accountID, client)
+		},
+		AnthropicUsage: func(_ context.Context, client *http.Client, accessToken string) (vendorauth.OpenAISubscriptionUsage, error) {
+			return f.recordAnthropicUsage(accessToken, client)
 		},
 		OpenAICompatibleUsage: func(_ context.Context, client *http.Client, usageVia, usageURL, apiKey string) (vendorauth.OpenAISubscriptionUsage, vendorauth.DiscoveryStatus) {
 			return f.recordCompatUsage(usageVia, usageURL, apiKey, client)

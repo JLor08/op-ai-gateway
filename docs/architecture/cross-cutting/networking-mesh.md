@@ -419,7 +419,7 @@ the interface list its agent last reported (`lan_interfaces`), so a gateway
 that has just restarted derives clusters before any agent reconnects:
 
 - **The source** is `lan_source`; a row without one (written before migration
-  110) reads as `manual` when it has a `lan_address`, else as `auto`.
+  116) reads as `manual` when it has a `lan_address`, else as `auto`.
 - **`manual`**: the typed `lan_address` (an IPv4 literal). Without one the
   server resolves as before: its `Domain` when it is not NetBird-enabled, else
   no address.

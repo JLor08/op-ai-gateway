@@ -113,7 +113,7 @@ func DeriveRole(specType RuntimeSpecType, caps map[string]bool) ModelRole {
 	switch specType {
 	case RuntimeSpecTypeStableDiffusionCpp:
 		return RoleImage
-	case RuntimeSpecTypeVLLM, RuntimeSpecTypeLlamaCpp, RuntimeSpecTypeTGI, RuntimeSpecTypeOllama, RuntimeSpecTypeSGLang:
+	case RuntimeSpecTypeVLLM, RuntimeSpecTypeLlamaCpp, RuntimeSpecTypeTGI, RuntimeSpecTypeOllama, RuntimeSpecTypeSGLang, RuntimeSpecTypeStrata:
 		return RoleChat
 	}
 

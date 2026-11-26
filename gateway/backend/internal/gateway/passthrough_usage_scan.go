@@ -11,9 +11,9 @@ import (
 )
 
 // usageScanner incrementally extracts token usage — and, for the gateway-derived
-// fallback rate (Anthropic; Responses for a vendor target), the
-// generation-window start — from a native-passthrough
-// response AS ITS BYTES PASS THROUGH THE COPIER, independently of the capture
+// fallback rates (Anthropic and Responses), the first-content timestamp that
+// opens the generation window and closes the time to first content — from a
+// native-passthrough response AS ITS BYTES PASS THROUGH THE COPIER, independently of the capture
 // tee's cap.
 //
 // The capture buffer (nativeCopier.respBuf, bounded by capBytes) exists for a
@@ -30,13 +30,11 @@ import (
 // amount of state instead.
 type usageScanner struct {
 	apiFlavor string
-	// vendorTarget records that the relay's resolved target is a VENDOR-account
-	// target (routing.Target.VendorAccountID != ""), as opposed to a self-hosted
-	// server. It is read in exactly one place, usage()'s derived rate, where it
-	// is what admits the Responses flavor: a vendor OpenAI target reports no
-	// `timings` of any kind, whereas an absent `timings` on a self-hosted
-	// Responses upstream means "the server did not say" and must stay 0.
-	vendorTarget bool
+	// upstreamSentAt is the moment proxyNative sent the request upstream
+	// (setUpstreamSentAt), or the zero time when nobody said. It opens the
+	// time-to-first-content window usage()'s gateway-measured prompt rate is
+	// computed over; a zero value derives no prompt rate.
+	upstreamSentAt time.Time
 	// capBytes bounds the carry (see feed) — deliberately the SAME budget the
 	// capture tee uses, since both exist to cap gateway memory against a
 	// pathological or enormous upstream response, not because the two features
@@ -159,6 +157,12 @@ type usageScanner struct {
 	progress *requestProgress
 }
 
+// minGatewayPromptRateTokens is the fewest processed prompt tokens usage()
+// derives a gateway-measured prompt rate from (#426). Below it the time to first
+// content is mostly fixed latency (network, scheduling, the first decode step),
+// not prefill, and the quotient says little about prompt throughput.
+const minGatewayPromptRateTokens = 256
+
 // newUsageScanner returns a scanner for one native-passthrough response, or NIL
 // for a flavor this scanner can extract nothing from.
 // capBytes should be the same budget the capture tee uses (see usageScanner's
@@ -166,8 +170,6 @@ type usageScanner struct {
 // progress is the live counter to publish per-frame facts into, or nil for a
 // response whose progress is not displayed (a buffered one, and every test that
 // only cares about the recorded totals).
-// vendorTarget is whether the relay's target is a vendor-account target
-// (VendorAccountID != ""); see the usageScanner field for what it gates.
 //
 // apiFlavorImages gets NO scanner. Every field the scan can produce comes out of
 // mergePassthroughUsage (native_passthrough.go), whose switch has cases for
@@ -188,11 +190,21 @@ type usageScanner struct {
 // for it, so a scan of the response can produce nothing, and the body is a
 // binary audio/wav file that feed would split on '\n' and retain (the buffered
 // branch keeps up to 2×capBytes of it) only to find that out.
-func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress, vendorTarget bool) *usageScanner {
+func newUsageScanner(apiFlavor string, capBytes int, progress *requestProgress) *usageScanner {
 	if apiFlavor == apiFlavorImages || apiFlavor == apiFlavorSpeech {
 		return nil
 	}
-	return &usageScanner{apiFlavor: apiFlavor, vendorTarget: vendorTarget, capBytes: capBytes, progress: progress}
+	return &usageScanner{apiFlavor: apiFlavor, capBytes: capBytes, progress: progress}
+}
+
+// setUpstreamSentAt records when the request was sent upstream: proxyNative takes
+// the timestamp immediately before the upstream round trip, for vendor and
+// self-hosted targets alike. Nil-safe, like every other scanner method.
+func (s *usageScanner) setUpstreamSentAt(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.upstreamSentAt = at
 }
 
 // feed appends chunk (one read from the upstream body) to the carry buffer,
@@ -743,12 +755,12 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 // mid-stream peak. The figure is the authoritative terminal frame's own where
 // one arrived, and the last rate the stream reported where none did.
 //
-// For the Anthropic flavor, and for the Responses flavor on a vendor target
-// (derivesGatewayRate), when the upstream reported an output-token count but no
-// rate of its own (Anthropic carries no `timings` object on any frame at all —
-// unlike a self-hosted Responses upstream; see parsePassthroughUsage — and no
-// vendor reports one either), a rate is derived from that EXACT count over the
-// generation window: first content
+// For the Anthropic and the Responses flavor (derivesGatewayRate), when the
+// upstream reported an output-token count but no rate of its own (Anthropic
+// carries no `timings` object on any frame at all, no vendor reports one, and a
+// self-hosted Responses upstream may not either — Strata's `strata serve`
+// sends none), a rate is derived from that EXACT count over the generation
+// window: first content
 // frame -> last observed activity (lastAt, stamped by every feed/finish call,
 // so it tracks the true end of the stream). Never over the whole request — that
 // would fold in queueing and prompt processing and stop being the same
@@ -779,19 +791,44 @@ func (s *usageScanner) publishProgress(frame inference.Usage, authoritativeUsage
 // gate read -- so an implausible sample would not self-correct, it would be
 // permanently blended into a number that steers request routing.
 //
-// The Responses shape gets the same derivation, but ONLY for a vendor target
-// (vendorTarget; derivesGatewayRate). OpenAI's platform and the Codex backend
-// report no `timings` at all, so without it every vendor Responses row on the
-// Activity page carried no rate (#182). For a SELF-HOSTED Responses upstream an
-// absent `timings` object still means "the server did not say" and is left at 0:
-// a gateway-side figure there is a different quantity from llama.cpp's own
-// predicted_per_second, and would pollute the speed histogram and the throughput
-// EWMA. (That EWMA is additionally unreachable from a vendor row: it needs an
-// application's opportunistic-metrics opt-in, which a vendor target does not
-// carry.) The window for Responses opens at the first token of ANY kind,
-// reasoning included — see isContentFrame for why that matters for the accuracy
-// of the figure. A buffered (non-streaming) body has no content frames, hence no
-// window, hence no derived rate, for either flavor.
+// The Responses shape gets the same derivation for EVERY target, vendor and
+// self-hosted alike — the rule the Anthropic shape always had. OpenAI's platform
+// and the Codex backend report no `timings` at all, so without it every vendor
+// Responses row carried no rate (#182). Until #426 a self-hosted Responses
+// upstream was left at 0 when it sent no `timings` ("the server did not say"),
+// which left every Codex request to Strata's `strata serve` unrated; the derived
+// window is the same measurement the Anthropic path already records for the same
+// server. An upstream that DOES report a rate (llama.cpp's predicted_per_second)
+// still wins: the derivation only runs when the frames reported none. The window
+// for Responses opens at the first token of ANY kind, reasoning included — see
+// isContentFrame for why that matters for the accuracy of the figure. A buffered
+// (non-streaming) body has no content frames, hence no window, hence no derived
+// rate, for either flavor.
+//
+// The same two flavors get a GATEWAY-MEASURED PROMPT rate when no frame
+// reported one (#426): the prompt tokens the upstream actually processed —
+// InputTokens minus the cache-read CachedTokens, i.e. fresh input plus cache
+// creation for Anthropic (whose canonical InputTokens folds both cache buckets
+// in) and input_tokens minus input_tokens_details.cached_tokens for Responses —
+// divided by the time to first content: upstreamSentAt (proxyNative's send
+// timestamp) to the first content frame. It needs a send timestamp, a content
+// frame, the authoritative terminal frame, at least minGatewayPromptRateTokens
+// processed tokens and a window of at least minGatewayRateWindow. A buffered
+// body has no first-content timestamp distinct from its end and derives none.
+//
+// The window includes network and any upstream queueing, so the figure errs
+// low WHEN the upstream reports its cache reads. An upstream that reuses a
+// prefix cache without reporting it (vLLM without
+// --enable-prompt-tokens-details, llama.cpp slot reuse) makes it read HIGH: the
+// count includes tokens that were never processed. That is why it is marked
+// (PromptPerSecondGatewayMeasured) and kept analytics-only: recordUsage writes
+// it to the usage row but never into the mapping's PromptTokensPerSecond EWMA.
+//
+// The derived GENERATION rate, by contrast, feeds the same places an upstream
+// rate does — the usage row, and through recordUsage the mapping's
+// opportunistic GenTokensPerSecond EWMA the scorer and a model group's
+// MinTokensPerSecond gate read — exactly as the derived Anthropic generation
+// rate always has.
 func (s *usageScanner) usage() inference.Usage {
 	if s == nil {
 		return inference.Usage{}
@@ -825,21 +862,25 @@ func (s *usageScanner) usage() inference.Usage {
 			u.TokensPerSecond = float64(u.OutputTokens) / window.Seconds()
 		}
 	}
+	if s.derivesGatewayRate() && u.PromptPerSecond == 0 && s.haveFirstContent && s.haveTerminalUsage &&
+		!s.upstreamSentAt.IsZero() {
+		processed := u.InputTokens - u.CachedTokens
+		if ttft := s.firstContentAt.Sub(s.upstreamSentAt); processed >= minGatewayPromptRateTokens && ttft >= minGatewayRateWindow {
+			u.PromptPerSecond = float64(processed) / ttft.Seconds()
+			u.PromptPerSecondGatewayMeasured = true
+		}
+	}
 	return u
 }
 
-// derivesGatewayRate reports whether usage() may derive a tokens/s from the
-// generation window for this response. Anthropic always may (the shape carries no
-// rate of any kind). Responses may only for a VENDOR target: OpenAI's platform and
-// Codex backend report no `timings`, so without a derived figure every vendor
-// Responses row would show no rate, whereas for a self-hosted Responses upstream
-// an absent `timings` means "the server did not say" and stays 0.
+// derivesGatewayRate reports whether usage() may derive the generation and
+// prompt tokens/s for this response when the upstream reported none. Anthropic
+// and Responses may, for every target (see usage). Chat Completions may not: its
+// self-hosted upstreams report llama.cpp `timings` themselves.
 func (s *usageScanner) derivesGatewayRate() bool {
 	switch s.apiFlavor {
-	case "anthropic_messages":
+	case inference.APIFlavorAnthropicMessages, inference.APIFlavorOpenAIResponses:
 		return true
-	case inference.APIFlavorOpenAIResponses:
-		return s.vendorTarget
 	}
 	return false
 }
@@ -930,9 +971,9 @@ func isContentFrame(apiFlavor string, payload []byte) bool {
 // value: the frame this branch identifies FREEZES takeFinalRates's capture, so
 // `response.completed`'s own rate — not the accumulator's mid-stream peak, and
 // not a rate from anything after it — is what the recording path gets. usage()'s
-// DERIVED rate (Anthropic, and Responses for a vendor target) additionally
-// requires this frame to have been seen, so a vendor Responses stream cut off
-// before its `response.completed` records no derived rate (see usage()).
+// DERIVED rates (Anthropic and Responses) additionally
+// require this frame to have been seen, so a Responses stream cut off before its
+// `response.completed` records no derived rate (see usage()).
 //
 // What this branch does NOT decide is whether a rate is recorded at all. A
 // response it never matches keeps the last rate its own frames reported, which

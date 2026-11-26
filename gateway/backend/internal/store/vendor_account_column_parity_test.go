@@ -74,8 +74,11 @@ func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 				ModelPrefix: "prefix-" + idx + "/",
 				BaseURL:     "https://base-" + idx + ".example.test",
 				ShareLevel:  shareLevels[i], SystemGroupID: "ugrp_cols_sys_" + idx,
-				CreatedAt: now.Add(time.Duration(-10-i) * time.Minute),
-				UpdatedAt: now.Add(time.Duration(-3-i) * time.Minute),
+				// Rows 0 and 2 opted in, row 1 did not: a reader that drops the
+				// column reads false for the opted-in rows and fails the compare.
+				ShareUsageWithMembers: i != 1,
+				CreatedAt:             now.Add(time.Duration(-10-i) * time.Minute),
+				UpdatedAt:             now.Add(time.Duration(-3-i) * time.Minute),
 			})
 		}
 		for _, acc := range want {
@@ -89,6 +92,9 @@ func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 			}
 			if err := s.UpdateVendorAccountSystemGroup(ctx, acc.ID, acc.SystemGroupID); err != nil {
 				t.Fatalf("set system group %s: %v", acc.ID, err)
+			}
+			if err := s.UpdateVendorAccountShareUsage(ctx, acc.ID, acc.ShareUsageWithMembers); err != nil {
+				t.Fatalf("set share usage %s: %v", acc.ID, err)
 			}
 		}
 
@@ -172,7 +178,7 @@ func TestVendorAccountsSchemaColumnsAllCovered(t *testing.T) {
 			bools: nil,
 			seeded: []string{
 				"api_key", "auth_type", "base_url", "created_at", "id", "model_prefix", "name", "oauth_tokens",
-				"owner_user_id", "share_level", "status", "system_group_id", "updated_at", "vendor",
+				"owner_user_id", "share_level", "share_usage_with_members", "status", "system_group_id", "updated_at", "vendor",
 			},
 			ignored: nil,
 		})

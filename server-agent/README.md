@@ -49,7 +49,12 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_MODEL_STATUS_URL` | `-model-status-url` | `model_status_url` | — | Optional endpoint polled each cycle for the models currently **loaded**, e.g. `/running` (llama-swap), `/props` (llama.cpp), `/v1/models` (vLLM). Empty disables it. |
 | `OP_AGENT_MODEL_STATUS_FORMAT` | `-model-status-format` | `model_status_format` | — (auto) | How to parse `model_status_url`: `openai`, `llama_swap`, `llama_cpp`, `litellm`, or empty / `auto` (a tolerant union of all shapes). |
 | `OP_AGENT_TLS_INSECURE` | `-tls-insecure`  | `tls_insecure` | `false` | Skip TLS certificate verification (self-signed dev gateways). `true`/`1`. |
-| `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. The only Windows CPU-watt path; a Linux fallback when RAPL is unreadable. |
+| `OP_AGENT_POWERCAP_ROOT` | `-powercap-root` | `powercap_root` | `/sys/class/powercap` | Optional powercap root the RAPL collector reads instead of the default, e.g. a Proxmox `hostpower` virtiofs mount (`/run/op-hostpower` on Linux, a drive root such as `Z:\` on Windows). Empty uses the platform default (Linux) or disables it (Windows); ignored on macOS. See [Linux or Windows guest on a Proxmox VE host](#linux-or-windows-guest-on-a-proxmox-ve-host). |
+| `OP_AGENT_HOSTPOWER_URL` | `-hostpower-url` | `hostpower_url` | — | Optional hostpower HTTP endpoint on the Proxmox host (e.g. `http://<host>:9873`) the guest reads its share of host CPU power from. Empty disables it. Without a token the host identifies the VM by its network port (MAC mode). A value without an `http://` or `https://` scheme or without a host logs a startup warning. |
+| `OP_AGENT_HOSTPOWER_TOKEN` | `-hostpower-token` | `hostpower_token` | — | Optional per-VM token for the hostpower HTTP endpoint (token mode; secret; never logged). Create it on the host with `server-agent hostpower token create <vmid>`. Set without `hostpower_url`, it logs a startup warning. |
+| `OP_AGENT_HOSTPOWER_TLS_FINGERPRINT` | `-hostpower-tls-fingerprint` | `hostpower_tls_fingerprint` | — | Optional SHA-256 fingerprint of the hostpower TLS certificate (64 hex digits, `:` separators allowed). With an `https://` `hostpower_url` the guest accepts only that certificate. Print it on the host with `server-agent hostpower tls fingerprint`. An invalid value, or one set with an `http://` URL, logs a startup warning and every hostpower request fails; set without `hostpower_url`, it logs a startup warning. |
+| `OP_AGENT_HELPER_SOCKET` | `-helper-socket` | `helper_socket` | `/run/op-agent-helper/agent.sock` (Linux) | Unix socket of the privileged `server-agent helper`, from which an agent that does not run as root reads RAPL counters (CPU and system watts) and memory modules. Linux only: on macOS and Windows it is empty, and a configured path logs a startup warning and is ignored. `off` disables it (an empty env var means unset). A relative path logs a startup warning and turns the helper off. A root agent reads both natively and never uses it. Without a helper installed, set `off` to stop the per-sample attempts and the 30 s memory-module retry (both logged at Debug). See [Privileged helper (Linux)](#privileged-helper-linux). |
+| `OP_AGENT_LHM_URL`      | `-lhm-url`       | `lhm_url`      | —       | Optional LibreHardwareMonitor Remote Web Server `/data.json` URL for CPU (and best-effort system) power watts, e.g. `http://127.0.0.1:8085/data.json`. Empty disables it. A Windows CPU-watt path (alongside `powercap_root` and `hostpower_url`); a Linux fallback when RAPL is unreadable. |
 | `OP_AGENT_CERT_MODE`    | `-cert-mode`     | `cert_mode`    | `off`   | Certificate install mode: `off` (never fetch), `files` (write cert files + run the reload command), or `proxy` (install like `files` **and** run a TLS-terminating reverse proxy in front of the application). See [Certificate installation](#certificate-installation). |
 | `OP_AGENT_CERT_DIR`     | `-cert-dir`      | `cert_dir`     | —       | Directory certificate files are written into. **Required** when `cert_mode` is not `off`. |
 | `OP_AGENT_CERT_RELOAD_COMMAND` | `-cert-reload-command` | `cert_reload_command` | — | Local shell command run after a changed certificate is fully installed. Comes **only** from this local setting — the gateway can never deliver a command to run. |
@@ -300,7 +305,8 @@ templating still works.
 |---|---|---|
 | `${PORT}` | the port the agent assigned this process | — |
 | `${MODEL}` | the spec's `upstream_model` — the **application-side** model name (the mapping's *app model name*), i.e. what the model server itself calls the model | hard error if `upstream_model` is empty |
-| `${HOST_GPU_IDS}` | the spec's own GPU indices **as this host numbers them**, ascending and comma-separated (`2,5`) | hard error if the spec declares no GPUs |
+| `${HOST_GPU_IDS}` | the spec's own GPU indices **as this host numbers them**, in the order the spec declares them, deduplicated and comma-separated (`2,5`) | hard error if the spec declares no GPUs |
+| `${HOST_GPU_IDS_MAIN_LAST}` | the same list with the **first** declared GPU (the main card) moved to the end (`2,0,1` → `0,1,2`), for an engine that wants its main card last — Strata's config `gpu` (agent 0.21.0 and later) | hard error if the spec declares no GPUs |
 | `${CONFIG_DIR}` | the absolute per-spec directory the agent writes the spec's config files into, `<config_files_dir>/<spec-id>` — see [Config files](#config-files-for-a-managed-process) | — (a plain path; always resolves) |
 | `${AGENT_ENV:NAME}` | `NAME` from the **agent's own** process environment | hard error naming the variable; never a silent empty value |
 
@@ -326,8 +332,8 @@ the exact forms (`${PORTX}`, `${port}`, `${AGENT_ENV:}`). `${MODEL}` and
 `${MODELS_DIR}`, `${MODEL_ID}` and `${GPU_IDS_FILE}` are plausible things to
 pass through, so only the exact spellings are substituted — the cost being that
 `${MDOEL}`, `${model}` or the shorter `${GPU_IDS}` reaches the child as literal
-text instead of erroring. `${CONFIG_DIR}` follows the same exact-match rule, so
-`${CONFIG_DIR_X}` is passed through.
+text instead of erroring. `${CONFIG_DIR}` and `${HOST_GPU_IDS_MAIN_LAST}` follow the
+same exact-match rule, so `${CONFIG_DIR_X}` is passed through.
 
 #### Config files for a managed process
 
@@ -341,7 +347,8 @@ which may not be writable — and the spec's `args` point the server at them:
 `["--config", "${CONFIG_DIR}/server.json"]`. Each file is rewritten on every
 launch, atomically, with mode `0600`.
 
-A file's content may use `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`, the three
+A file's content may use `${PORT}`, `${MODEL}`, `${HOST_GPU_IDS}`,
+`${HOST_GPU_IDS_MAIN_LAST}`, the three
 `*_DEVICES` lists and `${CONFIG_DIR}`, so a model id written as `${MODEL}` always
 matches the spec. **It may never use `${API_TOKEN}` or `${AGENT_ENV:…}`**: a secret
 is not written to disk, and the spec is refused (gateway) or reported
@@ -639,6 +646,49 @@ as the agent's account. Use a **dedicated distro** for the models and set
 files (`${CONFIG_DIR}` resolves to the agent's directory under `/mnt/<drive>`),
 you can also turn the drive mounts off with `[automount]` `enabled=false`.
 
+#### Strata on Windows
+
+The portal's **Strata** spec type launches `strata serve` from the Strata Terminal
+install. On the agent's side it needs:
+
+- **The agent runs under the Windows account that installed Strata.** The install
+  lives under that user's `%LOCALAPPDATA%`, and the run config's `component:`
+  references resolve per user. An agent under LocalSystem or another account is not
+  supported for Strata (a service runs as LocalSystem unless you set its log-on
+  account; with NSSM, set it on the *Log on* tab).
+- **The absolute path of `strata.cmd` in `runtime_allowed_binaries`**, exactly as the
+  spec's binary field names it:
+
+  ```json
+  "runtime_allowed_binaries": [
+    "C:\\Users\\<user>\\AppData\\Local\\Strata\\terminal\\current\\bin\\strata.cmd"
+  ]
+  ```
+
+- **Agent 0.21.0 or later**, for `${HOST_GPU_IDS_MAIN_LAST}` (the run config's `gpu`
+  value: the first GPU row is the main card, and Strata wants it last; `strata serve` has no `--gpu` flag) and for the
+  process tree below.
+
+The template sets **`process_tree: job`**: the agent starts `strata.cmd` suspended
+inside a Windows job object and resumes it once assigned, so Strata's `python.exe`
+and engine processes are all in the job. A stop sends Ctrl-Break to the tree (Strata
+drains and quits its engine), and after the 5 s kill grace the whole job is
+terminated; RAM and per-GPU VRAM are measured over every process in the job. If the
+launcher exits, anything it left behind is killed at once, and if the agent itself
+dies, Windows ends the whole job with it. A spec left at `direct` (the default) is
+stopped by killing the launcher alone, which leaves the engine running, so keep `job`
+for Strata. **Verified on hardware (2026-11-23):** the job-mode start with `strata.cmd`, per-GPU VRAM over the whole tree and the agent's probes, and the stop: Ctrl-Break reached Strata, which drained and exited 0 about 2.7 s after the stop; cmd.exe's "Terminate batch job" prompt only adds a log line and a root exit code of -1, and VRAM was freed within about 2 s, so `strata.cmd` stays the binary. The measured RAM (private working set over the job) under-counts: it read 7.7 GB while host RAM in use fell by about 11.5 GB at stop. **Still pending:** the RAM figure against Task Manager beyond that, Claude Code and Codex round trips and the console-less (service) agent path.
+
+The key goes in the spec's environment as `STRATA_API_KEY=${API_TOKEN}`, never in
+the run config file; the agent's own probes of the child (metrics, context,
+capabilities) send it too. The template turns **visible devices on in args mode**
+("Via args or config file"): the agent then sets no `CUDA_VISIBLE_DEVICES` (which
+would renumber the cards from 0), and the run config's `gpu` list, in the host's card
+numbers, is what restricts Strata to the spec's cards. Never switch the mode to
+`env` for Strata. Strata's own engine wait defaults to 900 s, so the template's startup
+timeout is 960 s; raise the parent `server_agent` application's timeout to at least
+960000 ms, or the portal warns that a cold start can be cut short.
+
 ## Build & run
 
 ```sh
@@ -795,8 +845,18 @@ total and — best-effort — per-DIMM (size/type/speed), mainboard + BIOS (vend
 product, version), GPUs (model, VRAM, driver version), and OS/kernel/arch/hostname.
 Everything is best-effort — a field the platform doesn't expose is simply blank.
 
-- **Per-DIMM detail** is free on Windows and Intel macOS; on **Linux it needs root**
-  (else RAM total only); Apple Silicon uses unified memory (total only).
+- **Per-DIMM detail** is free on Windows and Intel macOS; Apple Silicon uses unified
+  memory (total only). On **Linux** the DIMMs come from the SMBIOS table
+  `/sys/firmware/dmi/tables/DMI`, which only root can read: an agent running as root
+  parses it in-process, an agent running as an ordinary user gets the same list from
+  the [privileged helper](#privileged-helper-linux), which parses it with the same
+  code. Without either, RAM total only. `dmidecode` is not used and need not be
+  installed. When an unprivileged agent's startup inventory has no modules (the
+  helper did not answer, or answered with none), the agent retries just this
+  fetch every 30 s until the first successful reply. A reply with modules
+  updates the inventory, which is re-sent (Info `memory modules received from the
+  helper`), so a helper that starts late still fills the **Hardware** view; an
+  empty reply also ends the retry (Info `helper reports no memory modules`).
 - **Privacy:** the agent never collects serial numbers, board/product/chassis UUIDs,
   or MAC addresses (and the gateway stores only a canonical blob with no such fields).
 
@@ -811,15 +871,24 @@ the native path; the optional LibreHardwareMonitor source is enabled with
 
 Per-platform prerequisites:
 
-- **Linux (native RAPL).** CPU watts come from the powercap RAPL sysfs energy
-  counters (`/sys/class/powercap/intel-rapl:*/energy_uj`); system watts from a RAPL
-  `psys` domain if present, else a hwmon power sensor
-  (`/sys/class/hwmon/*/power*_input`). `energy_uj` is root-only (mode 0400) since the
-  PLATYPUS/CVE-2020-8694 mitigation, so **run the agent as root** or apply a
-  udev/`setcap` rule granting the agent's user read access to `energy_uj`. If unmet →
-  CPU watts `null` (no chart). `psys`/hwmon power sensors are often absent on rack
-  servers → system watts `null`. RAPL is an energy counter, so the **first sample
-  after start is `null`** (no delta yet).
+- **Linux (native RAPL, privileged helper, hwmon).** CPU watts come from the powercap
+  RAPL sysfs energy counters (`/sys/class/powercap/intel-rapl:*/energy_uj`, the
+  `package*` domains summed); system watts from a RAPL `psys` domain if present, else
+  a hwmon power sensor (`/sys/class/hwmon/*/power*_input`, world-readable).
+  `energy_uj` is root-only (mode 0400) since the PLATYPUS/CVE-2020-8694 mitigation.
+  An agent running as root reads it directly. An agent running as an ordinary user
+  reads the same counters from the **[privileged helper](#privileged-helper-linux)**
+  (`server-agent helper`, a small root service) over a Unix socket; `helper_socket`
+  defaults to the helper's socket on Linux, so installing the helper unit is all it
+  takes. The sources run in the order native RAPL → helper → hwmon → hostpower HTTP →
+  LibreHardwareMonitor, and the first non-null value per metric wins: a root agent (or
+  one a udev rule grants read access to `energy_uj`) is unaffected by the helper, and
+  an unprivileged agent gets the helper's `psys` before the hwmon sensor, exactly as a
+  root agent would. The helper is never consulted when the agent runs as root. If
+  neither root nor the helper is available → CPU watts `null` (no chart).
+  `psys`/hwmon power sensors are often absent on rack servers → system watts `null`.
+  RAPL is an energy counter, so the **first sample after start is `null`** (no delta
+  yet).
 
 - **macOS (native powermetrics).** CPU watts come from
   `powermetrics --samplers cpu_power`, which **requires root/sudo**. Run the agent as
@@ -827,8 +896,9 @@ Per-platform prerequisites:
   `null`. Total system watts is never available on macOS CGO-free → always `null`.
 
 - **Windows.** There is no native CGO-free path (RAPL is ring-0/MSR). CPU watts are
-  available **only** via the optional LibreHardwareMonitor source below; system watts
-  are `null`.
+  available via the optional LibreHardwareMonitor source below, or, for a guest on a
+  Proxmox host, from the host's share (virtiofs or HTTP, see the last item); system
+  watts are `null`.
 
 - **LibreHardwareMonitor source (any OS, opt-in).** Set `OP_AGENT_LHM_URL` to the
   operator's LibreHardwareMonitor Remote Web Server `/data.json`
@@ -838,6 +908,698 @@ Per-platform prerequisites:
   enabled, embed credentials in the URL. The agent ships/links nothing from LHM — the
   operator installs it. Unset/unreachable → power `null` (no chart). Per metric, the
   native reading wins and LHM fills gaps (native first).
+
+- **Linux or Windows guest, host-attributed (opt-in).** Set `OP_AGENT_POWERCAP_ROOT` to a
+  mounted `server-agent hostpower` tree, or `OP_AGENT_HOSTPOWER_URL` to its HTTP endpoint; see
+  [below](#linux-or-windows-guest-on-a-proxmox-ve-host).
+
+### Linux or Windows guest on a Proxmox VE host
+
+A KVM guest has no RAPL: the MSRs are not passed through and
+`/sys/class/powercap` is empty (Windows has no powercap at all), so
+`cpu_power_w` stays `null` there. Instead, a small service on the Proxmox VE
+(PVE 9.2) host measures the host's RAPL package energy, attributes it to each
+VM by CPU time, and hands every VM its own cumulative energy counter over one
+of three transports. The guest agent turns the counter into watts, exactly as
+it does for bare-metal RAPL. This works for one PVE host; there is no cluster
+support (see Limitations).
+
+**1. Host service (once per host).** Install virtiofsd if you use virtiofs
+(`apt install virtiofsd`), download the Linux agent binary to
+`/usr/local/bin/server-agent`, and run it in `hostpower` mode as root (RAPL
+`energy_uj` is root-only) under systemd, for example
+`/etc/systemd/system/op-hostpower.service`:
+
+```
+[Unit]
+Description=OnPrem AI Gateway hostpower (VM CPU power share)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower
+Restart=always
+RestartSec=5s
+StateDirectory=op-hostpower op-hostpower-tls
+StateDirectoryMode=0700
+ProtectSystem=strict
+ReadWritePaths=/var/lib/op-hostpower /var/lib/op-hostpower-tls
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+To also serve the HTTP transports, add a listen address (the host's address
+on the VM bridge, here a documentation address):
+
+```
+ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower -listen 192.0.2.10:9873
+```
+
+`ProtectSystem=strict` makes the whole file system read-only for the service
+except `/dev`, `/proc` and `/sys`, which it only reads; `ReadWritePaths`
+leaves the out directory and the TLS directory `/var/lib/op-hostpower-tls`
+as its only writable paths, and `StateDirectory` creates both under
+`/var/lib` before the unit starts (a missing `ReadWritePaths` directory fails
+the start). The TLS directory is used only with `-tls` (see
+[HTTPS with a pinned certificate](#https-with-a-pinned-certificate-both-modes));
+it is a directory of its own because the out directory is the source of the
+guests' shares and must never hold the private key. `network-online.target` and
+`RestartSec=5s` matter with `-listen`: if the unit starts before the bridge
+address exists, the listen fails and the service exits with 2, and with the
+default 100 ms restart delay it would hit systemd's start limit and stay failed,
+which also stops every virtiofs counter. If the PVE datacenter or host
+firewall is on, allow TCP 9873 inbound on the host from the VMs. `StateDirectoryMode=0700` applies to
+both directories: it keeps the per-VM trees and the TLS key readable by root
+only; guests are unaffected because virtiofsd runs as root. The service creates the out directory `0700` when it creates it itself.
+
+Usage: `server-agent hostpower [-out dir] [-interval duration]
+[-listen host:port] [-auth mac,token] [-tokens path] [-tls]
+[-tls-cert path] [-tls-key path] [-v]`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-out DIR` | `/var/lib/op-hostpower` | Where the per-VM trees are written |
+| `-interval D` | `250ms` (minimum `100ms`) | Tick length; see the cadence rule below |
+| `-listen host:port` | empty (HTTP off) | Serve the HTTP endpoint on this address |
+| `-auth mac,token` | `mac,token` | Enabled HTTP identification modes |
+| `-tokens PATH` | `/etc/op-hostpower/tokens.json` | Token store for token mode |
+| `-tls` | off | Serve the `-listen` endpoint over HTTPS (TLS 1.3 only); needs `-listen` |
+| `-tls-cert PATH` | `/var/lib/op-hostpower-tls/tls.crt` | TLS certificate (PEM); generated together with the key when both are absent |
+| `-tls-key PATH` | `/var/lib/op-hostpower-tls/tls.key` | TLS private key (PEM) |
+| `-v` | off | Debug logging |
+
+Cadence rule: keep `-interval` at most a quarter of the guest's
+`OP_AGENT_INTERVAL`, so each guest reading spans several host updates; a host
+tick near the guest interval makes readings alternate between 0 W and twice
+the true value. Keep the guest at its 1 s default `OP_AGENT_INTERVAL`: at the
+agent's 250 ms floor the quarter rule would need a 62.5 ms host tick, below
+the host's 100 ms minimum. The service needs no gateway token and contacts no
+gateway; it opens a listener only when `-listen` is set. It warns at startup
+when the host has no RAPL domain, when RAPL `energy_uj` is not readable (not
+root; guests would report 0 W) or when there is no `qemu.slice`, and keeps
+running. At startup it also removes leftover temp files from an earlier crash.
+With `-auth` containing `mac` on a non-Linux build, or without the privilege
+to open a raw socket (it needs `CAP_NET_RAW`, which the root service has), the
+service refuses to start (exit 2); use `-auth token` there.
+
+**2. Read-only source for the shares (once per host, recommended for
+virtiofs).** Every share is writable from inside its VM unless its source is
+read-only, so a guest could fill the host's root file system or plant symlinks
+in it. Map the VMs to a read-only bind mount of the out directory instead of
+the directory the service writes, for example with the host fstab line
+
+```
+/var/lib/op-hostpower /run/op-hostpower-ro none bind,ro 0 0
+```
+
+(create both directories once with
+`mkdir -p /var/lib/op-hostpower /run/op-hostpower-ro`, then
+`systemctl daemon-reload && mount /run/op-hostpower-ro`; at boot systemd
+recreates the mount point under `/run` itself). An fstab mount (or an
+equivalent systemd `.mount` unit) is part of `local-fs.target`, so it is
+re-established on every boot before PVE autostarts VMs. The service keeps
+writing to `/var/lib/op-hostpower`, and new VM directories appear in the bind.
+The service confines every write to the VM's own directory regardless (a
+symlink that leaves it is refused) and never reads a FIFO, other special file
+or oversized file a guest placed there (it replaces it), as defense in depth.
+
+**3. Choose a transport per VM.** All three run side by side from the one
+service.
+
+| Situation | Transport |
+|---|---|
+| Linux or Windows guest on the host's Linux bridge (the common case) | HTTP, MAC mode: set only `hostpower_url` |
+| Guest not on the host's bridge (routed, NAT, Open vSwitch, SDN), or IPv6 only (then `-listen` must be an IPv6 address) | HTTP, token mode: `hostpower_url` and `hostpower_token` |
+| Guest behind a router, NAT or proxy VM (for example an OPNsense or pfSense VM, or a reverse-proxy VM) | HTTP, token mode; MAC mode would serve it the router VM's counter |
+| No network path between guest and host wanted, no migration needed | virtiofs |
+
+Use exactly one transport per guest. If several are configured the collector
+order decides (native/virtiofs first, then on Linux the privileged helper and
+hwmon, then hostpower HTTP, then LibreHardwareMonitor) and only one value is
+reported, so nothing is double counted. A guest has no helper: set
+`helper_socket` to `off` in an unprivileged Linux guest (see
+[Privileged helper (Linux)](#privileged-helper-linux)).
+
+#### virtiofs (Linux and Windows guests)
+
+The directory `/var/lib/op-hostpower/<vmid>` appears only after the service
+has ticked while that VM is running (it discovers VMs by their live
+`qemu.slice/<vmid>.scope`); for a stopped VM create it yourself with
+`mkdir -p /var/lib/op-hostpower/<vmid>` (Linux guest) or
+`mkdir -p /var/lib/op-hostpower/<vmid>/windows` (Windows guest, whose mapping
+points at that subdirectory; virtiofsd needs it to exist or the VM fails to start). Each VM gets two trees:
+
+- `<vmid>/intel-rapl:0/` for Linux guests,
+- `<vmid>/windows/intel-rapl_0/` for Windows guests (the same files; the name
+  has no `:`: a colon is not a legal Windows file-name character and how
+  virtio-win presents such a host name is unverified, so the Windows tree avoids it).
+
+Map the read-only view and attach it with the virtiofs cache disabled. For a
+**Linux guest** map `<vmid>`:
+
+```
+pvesh create /cluster/mapping/dir --id hostpower-<vmid> --map node=<node>,path=/run/op-hostpower-ro/<vmid>
+qm set <vmid> --virtiofs0 dirid=hostpower-<vmid>,cache=never
+```
+
+For a **Windows guest** map `<vmid>/windows` instead
+(`path=/run/op-hostpower-ro/<vmid>/windows`) with the same `qm set` line.
+
+`cache=never` matters: with PVE's default `cache=auto` the guest can read a
+value up to about 1 s old after the host replaced the file, which brings back
+the alternation between 0 W and twice the true value.
+
+*Linux guest.* Mount the share read-only, for example with the fstab line
+`hostpower-<vmid> /run/op-hostpower virtiofs ro,nofail 0 0`, and point the
+agent at it with `OP_AGENT_POWERCAP_ROOT=/run/op-hostpower` (or
+`-powercap-root` or `powercap_root` in the config file). The resolved
+`powercap_root` is logged at debug level (`-v`); the startup `power_sources`
+always lists `rapl` on Linux, so it does not prove the mount works. To check:
+`cat /run/op-hostpower/intel-rapl:0/energy_uj` in the guest must rise between
+two reads.
+
+*Windows guest.* Install the virtio-win guest tools (they provide the
+VirtIO-FS service) and WinFsp, configure the VirtIO-FS service with the mapping
+tag and a drive letter, and set `powercap_root` to that drive root, for example
+`"powercap_root": "Z:\\"` in the JSON config file (or `OP_AGENT_POWERCAP_ROOT=Z:\`).
+Do not expose ACLs through the share (virtio-win guidance). The agent service
+account (commonly LocalSystem) must be able to see the drive. To check: the
+file `Z:\intel-rapl_0\energy_uj` must rise between two reads.
+
+In both cases `cpu_power_w` turns non-null from the second sample (the first
+is `null`, a RAPL delta, as on bare metal). Under steady load it must stay
+roughly level; if it alternates between about 0 and about twice the expected
+value, check `cache=never` and the cadence rule.
+
+#### HTTP, MAC mode (no secret)
+
+Set only the host URL in the guest, with `OP_AGENT_HOSTPOWER_URL=http://192.0.2.10:9873`
+(or `-hostpower-url` or `hostpower_url` in the config file) and no token. The
+guest asks `GET /v1/energy`; the host identifies the VM from the network path
+itself and answers with that VM's counter.
+
+How the host knows who is asking: the service watches (with a Linux
+`AF_PACKET` raw socket) the TCP SYN of every connection to the listen port and
+records which interface it entered on and its Ethernet source MAC. Only an
+interface named `tap<vmid>i<n>` counts as a VM port, so the VM ID comes from
+the bridge port the connection physically entered, not from anything the
+sender claims, and every segment observed before the decision must enter on the
+same tap (or on a transit interface such as the bridge). The SYN's source MAC
+must also equal the MAC of that NIC (`net<n>`) in the VM's current config
+(`/etc/pve/qemu-server/<vmid>.conf`, not its snapshots). ARP and the bridge
+forwarding table are never consulted.
+
+Requirements: Linux host, `CAP_NET_RAW` (root service), IPv4 only, and the VM's
+NIC must be a QEMU tap on this host. It works with the PVE firewall enabled on
+the NIC (the `fwbr`/`fwln`/`fwpr` interfaces are transit) and with the host
+address on a VLAN device over the bridge (for example `vmbr0.10`). Open
+vSwitch is not supported and fails closed (every VM gets `401`).
+
+A VM that routes, NATs or proxies for others lends its identity: the identity
+is the tap the connection entered, so a connection from a machine behind a
+router VM (an OPNsense or pfSense VM, a reverse-proxy VM) enters on the router
+VM's tap and receives the router VM's counter, silently. For networks behind
+such a VM use token mode, or block TCP port 9873 (the listen port) on the
+router VM for traffic from behind it. The guest agent logs the VM ID it is
+served at Info (`hostpower: host serves this VM's counter`, with `vmid` and
+`url`) on the first success and whenever it changes, so a guest that is served
+another VM's counter shows it in its log.
+
+Threat model. In scope and safe: a VM forging another VM's IP or MAC, a LAN
+device forging a VM's IP or MAC, and replay. A layer-2 man-in-the-middle, where
+a LAN device or a guest poisons the host's ARP cache or bridge forwarding
+table for a VM's address and then relays that VM's traffic, can read the VM's
+counter over plain HTTP (in token mode it can also copy the token); this holds
+for MAC mode and token mode alike. With
+[HTTPS and a pinned certificate](#https-with-a-pinned-certificate-both-modes)
+that case is in scope: the relay sees only TLS 1.3 records, so it can neither
+read nor alter the counter nor read a token, and without the host's private
+key it cannot pose as the host. It can still drop or delay the traffic (the
+guest then reports `null`). TLS does not change who is identified: a relay that
+re-originates the connection enters the host on its own port, so it gets its
+own counter or `401`, as without TLS. Out of scope remain a compromised host
+(including theft of the key file, which needs root on the host) and a guest
+without a pin. Mitigations without TLS, still useful with it: enable the PVE
+firewall with MAC filter and IP filter on each VM NIC (this stops the guest
+variant), and keep the host's bridge on a trusted LAN segment.
+
+#### HTTP, token mode (routed networks, NAT, Open vSwitch, IPv6)
+
+Manage per-VM tokens on the host, as root, outside the service (flags go
+before the verb):
+
+```
+server-agent hostpower token [-tokens path] create <vmid>
+server-agent hostpower token [-tokens path] revoke <vmid>
+server-agent hostpower token [-tokens path] list
+```
+
+`create` creates or replaces the VM's token and prints it once; the store
+(`/etc/op-hostpower/tokens.json` by default, file `0600`, directory `0700`)
+keeps only its SHA-256, and `list` shows VM IDs and creation times, never
+hashes. The running service picks up changes without a restart. Put the token
+in the guest with `OP_AGENT_HOSTPOWER_TOKEN` (or `-hostpower-token` or
+`hostpower_token`) next to `hostpower_url`; it is a secret and is never
+logged. Token mode does not check the request's network origin.
+
+Tokens follow clones and templates: a token baked into a template or a cloned
+disk gives every clone the original VM's identity. Create a VM's token after
+cloning, never put `hostpower_token` into a template, and revoke the token when
+the VM is destroyed or its vmid is reused.
+
+Over plain HTTP anyone who can read the traffic on the path can read the
+token and the values, and copy and replay the token, so use plain HTTP only on
+a trusted segment (see the threat model above). With
+[HTTPS and a pinned certificate](#https-with-a-pinned-certificate-both-modes)
+the token and the values travel encrypted, and a guest that is presented any
+other certificate fails the handshake before the token is sent.
+
+#### HTTPS with a pinned certificate (both modes)
+
+Either HTTP mode can run over HTTPS. The service then presents a TLS
+certificate, and the guest accepts exactly that certificate, identified by its
+SHA-256 fingerprint (the pin). Identity does not change: MAC mode still
+identifies the VM by the tap the TCP connection entered, token mode by the
+token. TLS adds confidentiality and integrity, which closes the layer-2
+man-in-the-middle case of the threat model above.
+
+*On the host.* Add `-tls` to the listen line:
+
+```
+ExecStart=/usr/local/bin/server-agent hostpower -out /var/lib/op-hostpower -listen 192.0.2.10:9873 -tls
+```
+
+The unit needs the TLS state directory, as in the example unit above
+(`StateDirectory=op-hostpower op-hostpower-tls` and
+`/var/lib/op-hostpower-tls` in `ReadWritePaths`). With a unit that lacks it,
+`ProtectSystem=strict` keeps the directory read-only, and the first start
+fails (exit 2) with a read-only file system error and a hint to add both
+lines. The service reads `-tls-cert` and `-tls-key` once at start:
+
+- Both absent: it generates a self-signed ECDSA P-256 certificate (subject
+  `CN=op-hostpower`, valid for 100 years, no host names) and writes the key,
+  then the certificate, each `0600`. A missing directory is created `0700`;
+  an existing one keeps its mode. If the certificate cannot be written, the key is removed again, so the next start
+  generates afresh.
+- Both present: it loads them as a pair (a key that does not belong to the
+  certificate fails the start). They may be your own files, for example a pair
+  signed by your CA, and may be symlinks to regular files. A key file readable
+  by group or others is used, with a Warn.
+- Exactly one present, a dangling symlink, or a path that is not a regular
+  file: the service refuses to start (exit 2) and writes nothing; it never
+  completes half a pair.
+
+Neither path may lie inside the `-out` directory, which guests read over
+virtiofs; the service refuses to start (exit 2) if one does. The check compares
+the cleaned absolute paths and does not resolve symlinks.
+
+The endpoint offers TLS 1.3 only, and a handshake must finish within 2 s.
+Handshake errors (scanners, a guest with a wrong pin) are logged at Debug
+only; other HTTP server errors, such as a failed accept, at Warn. A plain-HTTP request to the TLS port gets `400`. At
+startup the service logs `hostpower: tls certificate` at Info with `cert` (the
+path), `sha256` (the fingerprint) and `generated` (whether it was just
+created), and its `hostpower: serving` line carries `tls=true`.
+
+Print the fingerprint as root (flags go before the verb):
+
+```
+server-agent hostpower tls [-tls-cert path] fingerprint
+```
+
+It prints the SHA-256 of the certificate as uppercase hex with `:` between
+bytes, the same value as
+`openssl x509 -noout -fingerprint -sha256 -in /var/lib/op-hostpower-tls/tls.crt`
+prints after its `Fingerprint=` prefix, so you can cross-check it. The verb
+only reads (exit 1 when the certificate cannot be read or parsed, for example
+before the first start with `-tls`; exit 2 on a usage error), never generates
+a certificate, and is safe next to the running service.
+
+*In the guest.* Point the agent at the HTTPS URL and paste the fingerprint as
+printed:
+
+```
+OP_AGENT_HOSTPOWER_URL=https://192.0.2.10:9873
+OP_AGENT_HOSTPOWER_TLS_FINGERPRINT=<the printed fingerprint>
+```
+
+(or `-hostpower-tls-fingerprint` or `hostpower_tls_fingerprint` in the config
+file), next to `hostpower_token` in token mode. The value is 64 hex digits,
+with or without `:` separators, in any case; surrounding whitespace is
+ignored. It is not a secret: the resolved value, normalised to 64 lowercase
+hex digits, is logged at Debug with the other settings; an invalid value is
+logged as `(invalid)`, since it may be a token pasted into the wrong field.
+
+| `hostpower_url` | `hostpower_tls_fingerprint` | Behaviour |
+|---|---|---|
+| `http://` | empty | Plain HTTP, as before |
+| `https://` | valid | TLS 1.3; only a server certificate with this SHA-256 is accepted; its chain, host names and validity dates are not checked. Any other certificate fails the handshake before a byte of HTTP is sent, so a token never leaves the guest |
+| `https://` | empty | Standard verification against the guest's system roots (not the agent's `ca_file` or `ca_pem`) and the URL's host name, for a certificate signed by a CA the guest trusts. A self-signed hostpower certificate fails every request. Startup warning |
+| `http://` | set | Fail closed: every request fails without a connection, because the pin shows TLS was intended and a clear-text request would expose the token. Startup warning |
+| any | invalid | Fail closed: every request fails. Startup warning |
+
+A fingerprint set without `hostpower_url` is unused and logs a startup
+warning.
+
+*Rotation.* The guest pins the exact certificate, so every certificate change
+needs the new fingerprint in every guest; until then that guest's requests fail
+and `cpu_power_w` is `null`. To replace the generated certificate, delete both
+files and restart the service, then copy the new fingerprint (from the startup
+log or the `tls fingerprint` verb) into every guest. To use your own pair, put
+both files in place (or point `-tls-cert` and `-tls-key` at them) and restart.
+
+*Troubleshooting.* With a wrong or outdated pin the guest logs at Warn
+`hostpower: server certificate does not match hostpower_tls_fingerprint`, with
+`want`, `got` (the fingerprint the server presented) and `url`, once when the
+mismatch begins and again only after a success in between; every failed
+request is also logged at Debug as `hostpower: request failed` (see below). If
+`got` is the host's current fingerprint, update the guest; if it is not,
+something between guest and host presents another certificate. On the host,
+failed handshakes are visible only with `-v`.
+
+#### The HTTP endpoint (both modes)
+
+**The endpoint.** `GET /v1/energy` answers `200` with
+`{"vmid":"<vmid>","energy_uj":<n>,"max_energy_range_uj":0}` and
+`Cache-Control: no-store`. A request that carries any `Authorization` header
+(any scheme, even an empty one) is handled in token mode only, with no fallback
+to MAC mode; a request without it is handled in MAC mode. Status codes: `401`
+not identified (malformed authorization, unknown or revoked token, the mode
+is disabled, capture unavailable, IPv6 source, observation overflow, no SYN
+observed, handshake not observed, not a VM port, ambiguous or foreign ingress,
+no VM config, MAC mismatch), `503`
+identified but the VM has no live counter yet (just started, or stopped), `404`/`405` for another path or method, `429` above
+100 requests per second from one source address (burst 200, checked before
+identification) or above 10 requests per second for one VM (burst 20, checked
+once the request is tied to a VM), so many token-mode guests behind one NAT
+address are never limited by each other. Keep-alive is disabled, so every
+request is its own connection. Rejections, `429`s included, are logged at Warn
+at most once every 10 minutes per source address and reason (`rate limited
+(source)` and `rate limited (vm)` for the two limits); served requests are
+logged at Debug only; tokens and `Authorization` values are never logged. The guest client
+ignores `HTTP_PROXY`/`HTTPS_PROXY` (through a proxy VM, MAC mode would
+identify the proxy) and does not follow redirects. To diagnose a guest whose
+`cpu_power_w` stays `null`, run its agent with `-v`: every failed request is
+logged at Debug as `hostpower: request failed` with the URL and the status code
+(`401`, `429`, `503`, ...) or the connection error, never the token.
+
+**How the share is computed.** Per interval the service takes the host's
+RAPL package energy delta and splits it across VMs by active CPU time (from
+each VM's `qemu.slice/<vmid>.scope/cpu.stat` against `/proc/stat`), with the
+idle floor included in the attribution, so the sum of all VM shares never
+exceeds the package energy. Each VM gets `<out>/<vmid>/intel-rapl:0/` and
+`<out>/<vmid>/windows/intel-rapl_0/` with `name`, `energy_uj` and
+`max_energy_range_uj`, each replaced atomically (temp file and rename, no
+fsync); the HTTP endpoint serves the same counter. `energy_uj` of the Linux
+tree persists across service restarts. `max_energy_range_uj` is `0`, so the
+guest reads a counter that ever goes backwards as 0 J rather than as a
+wraparound.
+
+**When it stops.** If RAPL becomes unreadable on the host while the service
+runs, every VM's counter freezes and guests on any transport report a measured
+0 W, not `null`; that also pulls the gateway's rolling-minimum idle baseline for
+those servers down. If the service itself stops, virtiofs guests read the frozen
+file and report 0 W, while HTTP guests get a refused connection, so
+`cpu_power_w` goes `null` (or falls through to LibreHardwareMonitor if
+configured). To notice: `systemctl status op-hostpower` on the host; for virtiofs
+guests `energy_uj` under `/var/lib/op-hostpower/<vmid>/intel-rapl:0/` (or in the
+guest) not changing between two reads while the VM runs; for HTTP guests a
+`cpu_power_w` that turns `null` or a `curl` of `/v1/energy` that fails.
+
+**Limitations.** A PVE VM with a virtiofs device cannot be live-migrated,
+snapshotted with RAM state or hibernated, and does not support memory
+hotplug. Single PVE host only: there is no cluster support, and after a
+migration the HTTP transports report `null` until the guest's URL points at
+the node that runs the VM (token mode also needs a new token on that node). `system_power_w` stays `null` in a guest. LXC
+containers and macOS guests are out of scope.
+
+## Privileged helper (Linux)
+
+On bare-metal Linux two measurements need root: the RAPL energy counters (CPU
+and `psys` system watts, `energy_uj` is mode 0400) and the SMBIOS table with
+the DIMM details (`/sys/firmware/dmi/tables/DMI`, root-only). The agent also
+starts the gateway-supplied model runtimes, so running it as root for two
+numbers is the wrong trade. Instead a second, tiny process runs as root,
+`server-agent helper`, and the agent runs as an ordinary user and reads both
+values from the helper's Unix socket. The helper only collects: it starts no
+process, opens no network socket, contacts no gateway and accepts no command;
+it answers two read-only requests, and only from the configured agent user.
+The same pair works on a Proxmox VE host, next to (not inside)
+`op-hostpower.service`; the two root services are independent.
+
+> **Hardware acceptance pending.** No Linux machine was available when the
+> helper was built. It is covered by the Linux CI tests (a real socket with
+> `SO_PEERCRED` accept and deny, directory and socket permissions) and by a run
+> in a local Linux container (helper as root, clients as uid 1000, uid 2000 and
+> root). The real-RAPL, real-DMI-table and systemd checks in the
+> [checklist](#hardware-acceptance-checklist) below are still open, and the
+> example helper unit's `CapabilityBoundingSet` and `SystemCallFilter` lines are
+> **unverified** until then.
+
+**What the agent needs.** Nothing: `helper_socket` defaults to
+`/run/op-agent-helper/agent.sock` on Linux. The agent uses the helper only when
+it does not run as root (a root agent reads RAPL and the DMI table itself and
+never asks the helper) and only for values its own reads left empty. The
+startup line's `power_sources` then lists `helper` (between `rapl` and
+`hwmon`); that only shows the source is configured. The first successful reply
+is logged at Info (`helper: serving RAPL counters`, with the number of zones);
+failures are logged at Debug only (`helper: rapl request failed`,
+`helper memory modules not available yet`; run with `-v` to see them). On an
+unprivileged Linux agent **without** a helper, for example in a VM guest, set
+`helper_socket` to `off` (`OP_AGENT_HELPER_SOCKET=off` or
+`"helper_socket": "off"`): otherwise the agent tries the missing socket on
+every sample and retries the memory modules every 30 s, at Debug level.
+
+**1. Create the agent user** (once). The examples use `op-agent`:
+
+```
+useradd --system --user-group --no-create-home --home-dir /var/lib/op-agent --shell /usr/sbin/nologin op-agent
+```
+
+**2. Helper unit** `/etc/systemd/system/op-agent-helper.service`, with the
+Linux agent binary at `/usr/local/bin/server-agent`:
+
+```
+[Unit]
+Description=OnPrem AI Gateway agent helper (privileged RAPL and DIMM reads)
+Before=op-server-agent.service
+
+[Service]
+ExecStart=/usr/local/bin/server-agent helper -agent-user op-agent
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=op-agent-helper
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @mount @module @reboot @swap @raw-io @debug execve execveat
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`RuntimeDirectory=` creates the dedicated, empty directory
+`/run/op-agent-helper` (its parent `/run` exists) and makes it writable under
+`ProtectSystem=strict`; systemd removes it when the service stops. The point of
+the hardening lines is: no exec, no network, read sysfs, manage one socket.
+`@privileged` is not denied as a whole because it contains the `chown` the
+helper needs, and `SystemCallErrorNumber=EPERM` makes a denied call fail
+instead of killing the helper. The capability and system-call sets are
+**unverified** on hardware (see above); adjust them with the checklist.
+
+**3. Agent unit** `/etc/systemd/system/op-server-agent.service`, running the
+agent as `op-agent`. Its config file holds the agent token, so keep it `0600`
+and owned by `op-agent`. Relative paths in it (`ca_file`, `ca_cache_file`,
+`runtime_config`, `runtime_cache`, `config_files_dir`) resolve beside it, in the
+state directory the unit creates. An **empty** `runtime_cache` or
+`config_files_dir`, as in the portal-generated config, does not: it defaults to
+the binary's directory (`/usr/local/bin`), which `op-agent` cannot write, so
+the runtime cache, the specs' config files and the RPC tensor cache would fail.
+Set both to relative names in `server-agent.json`:
+
+```
+  "runtime_cache": "server-agent-runtime.cache.json",
+  "config_files_dir": "server-agent-config-files",
+```
+
+The unit:
+
+```
+[Unit]
+Description=OnPrem AI Gateway server agent
+Wants=network-online.target op-agent-helper.service
+After=network-online.target op-agent-helper.service
+
+[Service]
+User=op-agent
+Group=op-agent
+ExecStart=/usr/local/bin/server-agent -config /var/lib/op-agent/server-agent.json
+Restart=on-failure
+RestartSec=5s
+StateDirectory=op-agent
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create the directory and the config file before the first start
+(`install -d -m 0700 -o op-agent -g op-agent /var/lib/op-agent`, then copy
+`server-agent.json` there with mode `0600`), then
+`systemctl daemon-reload && systemctl enable --now op-agent-helper op-server-agent`.
+`After=`/`Wants=` start the helper first, but the order is not what makes it
+work: the agent asks the helper on every sample, so after a late start or a
+restart of the helper the watts return one sample after it first answers (the
+first reading is the baseline), and the memory modules arrive with the next
+30 s retry.
+
+Agent features that need more than an ordinary user, each with its usual
+remedy and no code change:
+
+- **GPU devices.** AMD's `/dev/kfd` and `/dev/dri/renderD*` (and on some
+  distributions NVIDIA's device nodes) belong to the `render`/`video` groups:
+  add `SupplementaryGroups=video render`.
+- **Proxy mode on a port below 1024** (`cert_mode: proxy`): add
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE`. Ambient capabilities are passed
+  on to the managed model processes too, so a listen port of 1024 or above is
+  the cleaner choice.
+- **`cert_dir`** must be writable by `op-agent` (and readable by whatever
+  consumes the files).
+- **`cert_reload_command`** such as `systemctl reload nginx` needs a sudoers or
+  polkit rule that lets `op-agent` run exactly that command.
+- **Model files, runtime binaries and caches**: the managed model processes run
+  as `op-agent` too, so it must be able to read the allowlisted binaries and the
+  model directories and write the caches the runtimes use (its home is
+  `/var/lib/op-agent` with the user above). The agent's own `runtime_cache` and
+  `config_files_dir` must be writable as well: set them as in step 3, since
+  their empty defaults point into the binary's directory.
+
+**Helper options.** Usage: `server-agent helper -agent-user user
+[-agent-group group] [-socket path] [-powercap-root dir] [-dmi-table file] [-v]`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-agent-user USER` | — (required) | The only uid allowed to use the socket: a user name or a decimal uid (canonical: `1000`, not `01000`). Root (uid 0) and `nobody` (uid 65534) are refused. A numeric uid without a passwd entry is accepted, but then `-agent-group` is required. |
+| `-agent-group GROUP` | the agent user's primary group | Group (name or decimal gid) that owns the socket directory and the socket. It grants file access only; it is never used to authorize a connection. |
+| `-socket PATH` | `/run/op-agent-helper/agent.sock` | The Unix socket; see the path rules below. |
+| `-powercap-root DIR` | `/sys/class/powercap` | Where the RAPL zones are read. |
+| `-dmi-table FILE` | `/sys/firmware/dmi/tables/DMI` | The raw SMBIOS table the DIMMs are parsed from. |
+| `-v` | off | Debug logging (one line per served request). |
+
+User and group names are looked up in `/etc/passwd` and `/etc/group` only (the
+binary is built without CGO); for accounts from a directory service give
+numeric ids. Run the helper as root. A startup error (missing or refused
+`-agent-user`, an unsafe socket path, not Linux) prints a message and exits
+with 2.
+
+**Socket path rules.** The path must be absolute and clean and must not sit
+directly in `/`. The parent of the socket directory must already exist (the
+helper creates only the socket directory itself, mode `0750`); it is resolved
+through symlinks once, and every directory from there up to `/` must be owned
+by root and not writable by group or others, unless it carries the sticky bit
+(a sticky world-writable directory such as `/tmp` is accepted, because others
+cannot rename or remove root's entries in it). The socket directory must be a
+real directory, not a symlink, owned by root and **dedicated**: it may contain
+nothing but the socket (so the helper never re-owns a shared directory such as
+`/run`; `RuntimeDirectory=` starts it empty). The helper then sets it to `0750`
+`root:<agent group>` and the socket to `0660` `root:<agent group>`. A leftover
+socket from a crash is removed; a socket another process still listens on is
+never removed (`another helper is already listening on ...`), and any other
+kind of file at the path is an error. On shutdown (SIGINT/SIGTERM) the socket
+is removed.
+
+**Who can connect.** Every connection is checked with `SO_PEERCRED` before a
+byte is read: only the configured agent uid is served. Everyone else, root
+included, is closed without a response, and the helper logs
+`helper: connection rejected` (with `peer_uid`, `peer_pid` and the reason) at
+Warn at most once every 10 minutes per peer uid. The model runtimes the agent
+starts run under the same uid, so they can read the helper too; that is
+accepted, because they are inside the agent's trust boundary anyway (they could
+signal or trace the agent). What they can learn is limited by the 250 ms cache
+below: at most four distinct RAPL values per second, a coarse average package
+power, far coarser than the counter's update rate (about 50 µs) that the
+PLATYPUS power side channel (CVE-2020-8694) relies on. Do not add other users
+to the agent's group: it would let them reach the socket, though `SO_PEERCRED`
+still turns them away.
+
+**Endpoints** (HTTP over the socket, `GET` only, JSON, `Cache-Control:
+no-store`; another path is `404`, another method `405`, more than 20 requests
+per second (burst 40) across the whole socket is `429`; timeouts and header
+limit as for the hostpower endpoint):
+
+- `GET /v1/rapl` →
+  `{"read_ns":…,"domains":[{"zone":"intel-rapl:0","name":"package-0","energy_uj":…,"max_energy_range_uj":…}, …]}`:
+  every top-level zone `intel-rapl:N` (sub-zones such as `intel-rapl:0:0` are
+  left out) with a name and a readable `energy_uj`, sorted by zone. The reading
+  is cached and refreshed at most every 250 ms, however fast clients ask.
+  `read_ns` is the system-wide `CLOCK_MONOTONIC` time in nanoseconds at which
+  the counters were read; a cached response repeats it. The agent divides the
+  energy delta by the difference of two `read_ns` values, so a cached reading
+  is never misread as 0 W: it yields no value and the next fresh one covers the
+  whole span. At the 250 ms interval floor about every other helper sample
+  therefore carries no value, and that metric falls through to the next source
+  (hwmon, hostpower, LHM) or stays empty for that sample; at the 1 s default
+  every sample is fresh. Against a helper
+  without `read_ns` the agent times the delta with its own clock. An empty
+  list is valid (no RAPL); the helper warns at startup
+  (`helper: no readable RAPL zone`) and keeps running.
+- `GET /v1/memory-modules` → `{"modules":[{"locator":…,"size_bytes":…,"type":…,"speed_mhz":…}, …]}`,
+  the inventory's DIMM shape. The table is parsed once at startup; an unreadable
+  table logs `helper: DMI table not readable; serving no memory modules` at Warn
+  and serves an empty list. Serial numbers, asset tags, part numbers and UUIDs
+  are never decoded.
+
+To query it by hand (as `op-agent`):
+`curl --unix-socket /run/op-agent-helper/agent.sock http://op-agent-helper/v1/rapl`.
+
+### Hardware acceptance checklist
+
+Status: **pending** (no Linux machine was available). On a bare-metal Linux
+server with Intel or AMD RAPL:
+
+1. Install both units as above and start them. `journalctl -u op-agent-helper`
+   shows `helper: serving` with the socket, `agent_uid` and `agent_gid`, and
+   neither `helper: no readable RAPL zone` nor
+   `helper: DMI table not readable; serving no memory modules`.
+2. `ls -ld /run/op-agent-helper /run/op-agent-helper/agent.sock` shows
+   `drwxr-x--- root op-agent` and `srw-rw---- root op-agent`.
+3. `sudo -u op-agent curl --unix-socket /run/op-agent-helper/agent.sock http://op-agent-helper/v1/rapl`
+   lists the same zones as `grep . /sys/class/powercap/intel-rapl:*/name`
+   (top level only), and `energy_uj` rises between two calls more than 250 ms
+   apart.
+4. The same `curl` as root gets no HTTP response (curl reports an empty reply
+   or a send/receive failure), and the helper logs
+   `helper: connection rejected` with `peer_uid` 0; as another ordinary user
+   it cannot connect at all (permission denied on the socket directory).
+5. The agent's startup line lists `helper` in `power_sources`, the agent logs
+   `helper: serving RAPL counters`, and from the second sample the portal shows
+   CPU watts (and system watts where a `psys` zone exists). Under steady load
+   they match what the same agent reports when run as root.
+6. The portal's **Hardware** view lists the DIMMs. Compare them with
+   `dmidecode -t memory` on the same machine: locator, size, type and speed
+   (the rated speed, else the configured speed) must agree for every populated
+   slot. Run the agent once as root and confirm the same list (its in-process
+   parse of the table).
+7. Late start: stop the helper, restart the agent, start the helper. Within
+   30 s the agent logs `memory modules received from the helper` and the
+   **Hardware** view fills in; the watts return from the second sample after
+   the helper is up.
+8. `systemd-analyze security op-agent-helper.service`, and the journal for
+   denied system calls or capability errors over a day of operation; then
+   tighten or correct `CapabilityBoundingSet` and `SystemCallFilter` (for
+   example whether `CAP_DAC_READ_SEARCH` and `CAP_FOWNER` are needed at all)
+   and record the verified sets here.
 
 ## Resilience
 

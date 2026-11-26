@@ -362,6 +362,32 @@ func TestRuntimeExecWSLFeatureName(t *testing.T) {
 	}
 }
 
+// TestStrataFeatureNames pins the literals the agent declares for the
+// main-last GPU placeholder and process-tree job supervision, and that both are
+// agent-only and read fail-closed.
+func TestStrataFeatureNames(t *testing.T) {
+	cases := map[string]string{
+		RuntimeGPUMainLastFeature:    "runtime_gpu_main_last",
+		RuntimeProcessTreeJobFeature: "runtime_process_tree_job",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Fatalf("feature constant = %q, want the agent's literal %q", got, want)
+		}
+		if slices.Contains(gatewayAgentFeatures, got) {
+			t.Fatalf("gatewayAgentFeatures = %v, want it without the agent-declared %q", gatewayAgentFeatures, got)
+		}
+		srv := NewTestServer()
+		if srv.AgentFeatures.Has("strata-host", got) {
+			t.Fatalf("a server that declared nothing must not read as having %q (fail-closed)", got)
+		}
+		srv.AgentFeatures.Set("strata-host", []string{got})
+		if !srv.AgentFeatures.Has("strata-host", got) {
+			t.Fatalf("a server that declared %q must read as having it", got)
+		}
+	}
+}
+
 // TestRealtimeProxyFeatureName pins the literal an agent that serves the
 // realtime WebSocket route declares in its own registry (server-agent/internal/
 // agent/features.go; the agent module cannot import this one), and that the name

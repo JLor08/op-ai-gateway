@@ -70,6 +70,8 @@ import { Field } from './shared/Field';
 import { SelectField } from './shared/SelectField';
 import { ApiVariantControls } from './shared/ApiVariantControls';
 import { runtimeSpecTemplate } from './shared/runtimeSpecTemplate';
+import { strataSpecTemplate } from './shared/strataTemplate';
+import { importStrataRunConfig } from './shared/strataRunConfig';
 import {
   formSpecIsLlamaCpp,
   formSpecIsStableDiffusion,
@@ -90,7 +92,12 @@ import {
   systemOneModeOrDefault,
 } from './shared/decisionsModes';
 import { runtimeSpecLiveTimingsKind, runtimeSpecSendsLiveTimings } from './shared/liveTimings';
-import { CONFIG_FILES_MAX, configFileIssues, type ConfigFileIssue } from './shared/configFiles';
+import {
+  CONFIG_FILES_MAX,
+  CONFIG_FILE_MAX_BYTES,
+  configFileIssues,
+  type ConfigFileIssue,
+} from './shared/configFiles';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { formatArgsText, formatEnvText, parseArgsText, parseEnvText } from './shared/specText';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
@@ -263,6 +270,8 @@ const configFileIssueLabel: Record<ConfigFileIssue, MessageKey> = {
 const runtimeWarningLabelByCode: Record<string, MessageKey> = {
   timeout_ms_below_startup_timeout: 'runtimeTimeoutWarning',
   binary_path_os_mismatch: 'runtimeBinaryPathOsMismatchWarning',
+  process_tree_agent_unknown: 'runtimeProcessTreeAgentUnknownWarning',
+  process_tree_agent_unsupported: 'runtimeProcessTreeAgentUnsupportedWarning',
   api_flavors_not_on_application: 'runtimeFlavorNotOnApplicationWarning',
   api_flavors_text_on_stable_diffusion: 'runtimeTextOnStableDiffusionWarning',
   api_flavors_text_on_vllm_sr: 'runtimeTextOnVllmSrWarning',
@@ -306,6 +315,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     set_visible_devices: false,
     visible_devices_mode: 'env',
     execution_mode: 'native',
+    process_tree: 'direct',
     wsl_distro: '',
     gpus: [],
     ram_estimate_mb: 0,
@@ -755,14 +765,15 @@ function runtimeSpecHealthPathDefault(type: RuntimeSpec['type']): string {
 }
 
 // The Type select's helper text: the note of a kind with something the operator
-// must know to launch or route it (sd-server, audio.cpp, vllm-srun, SGLang and
-// sglang-omni), nothing for every other kind, Auto included.
+// must know to launch or route it (sd-server, audio.cpp, vllm-srun, SGLang,
+// sglang-omni and Strata), nothing for every other kind, Auto included.
 function runtimeSpecTypeNote(type: RuntimeSpec['type'], t: Translation): string | undefined {
   if (type === 'stable_diffusion_cpp') return t.runtimeSpecTypeStableDiffusionCppNote;
   if (type === 'audio_cpp') return t.runtimeSpecTypeAudioCppNote;
   if (type === 'vllm_sr') return t.runtimeSpecTypeVllmSrNote;
   if (type === 'sglang') return t.runtimeSpecTypeSglangNote;
   if (type === 'sglang_omni') return t.runtimeSpecTypeSglangOmniNote;
+  if (type === 'strata') return t.runtimeSpecTypeStrataNote;
   return undefined;
 }
 
@@ -994,6 +1005,8 @@ function blankDetailLine(arg: string, lineNumber: number): string {
   return `${lineNumber}: ${visualiseWhitespaceRun(arg)}`;
 }
 
+const GPU_MAIN_LAST_PLACEHOLDER = '${HOST_GPU_IDS_MAIN_LAST}';
+
 type ArgsWarning = { key: string; message: string; detail?: string };
 
 /**
@@ -1146,8 +1159,23 @@ const visibleDevicesOwnedVars = [
   'HIP_VISIBLE_DEVICES',
 ];
 
+// The placeholders that name every card of the spec (mirrors the backend's
+// runtimeSpecDevicePlaceholders): the llama.cpp --device lists, the generic
+// ${DEVICES}, and the host-numbered ${HOST_GPU_IDS}/${HOST_GPU_IDS_MAIN_LAST}
+// for a server that takes its card list itself (Strata's run config). In args
+// mode one must appear in args or in a config file. The single-device tokens
+// (${FIRST_LOCAL_DEVICE}, ${CUDA_FIRST_DEVICE}, ...) do not count.
+const visibleDevicesListPlaceholders = [
+  '${CUDA_DEVICES}',
+  '${VULKAN_DEVICES}',
+  '${METAL_DEVICES}',
+  '${DEVICES}',
+  '${HOST_GPU_IDS}',
+  '${HOST_GPU_IDS_MAIN_LAST}',
+];
+
 /**
- * The two combinations `set_visible_devices` may not be saved in, checked
+ * The three combinations `set_visible_devices` may not be saved in, checked
  * before the round trip so the operator reads a message in the form instead of
  * a backend error code.
  *
@@ -1162,9 +1190,14 @@ const visibleDevicesOwnedVars = [
  *  - An empty GPU list would make the agent emit `CUDA_VISIBLE_DEVICES=`, and an
  *    EMPTY visibility value does not mean "no restriction" -- it means NOTHING
  *    is visible.
+ *  - In args mode the agent injects nothing, so the spec itself must carry a
+ *    card-list placeholder, in args or in a config file's content; without one
+ *    the selection is silently lost.
  */
 function validateVisibleDevices(
   on: boolean,
+  mode: 'env' | 'args',
+  specTexts: string[],
   env: Record<string, string>,
   gpuCount: number,
   t: Translation,
@@ -1176,6 +1209,12 @@ function validateVisibleDevices(
     }
   }
   if (gpuCount === 0) return t.errorRuntimeSpecVisibleDevicesNoGpus;
+  if (
+    mode === 'args' &&
+    !specTexts.some((text) => visibleDevicesListPlaceholders.some((ph) => text.includes(ph)))
+  ) {
+    return t.errorRuntimeSpecVisibleDevicesArgsNoPlaceholder;
+  }
   return undefined;
 }
 
@@ -1244,11 +1283,12 @@ function gpuOptionLabel(gpu: HardwareGPU): string {
  *  1. `pci_bus_id` — maps to a physical slot and survives the index
  *     renumbering across reboots that the GPU budget rows'
  *     expected_uuid/expected_name drift detection exists to catch. NVIDIA
- *     only.
+ *     and AMD (rocm-smi `PCI Bus`).
  *  2. a shortened `uuid` — unique and stable but opaque; enough to tell two
  *     otherwise identical rows apart, which is all this needs to do.
- *  3. nothing — AMD and Apple report neither. The label falls back to index +
- *     name, which still distinguishes every row.
+ *  3. nothing — Apple reports neither (and an AMD host whose rocm-smi omits
+ *     both). The label falls back to index + name, which still
+ *     distinguishes every row.
  */
 function stableGpuHandle(gpu: HardwareGPU): string {
   const busID = gpu.pci_bus_id?.trim() ?? '';
@@ -1293,6 +1333,13 @@ const apiTokenBackendRows: {
     envKey: 'runtimeSpecApiTokenRowTgiEnv',
     argsKey: 'runtimeSpecApiTokenRowTgiArgs',
     clientKey: 'runtimeSpecApiTokenRowTgiClient',
+  },
+  {
+    key: 'strata',
+    backendKey: 'runtimeSpecApiTokenRowStrataBackend',
+    envKey: 'runtimeSpecApiTokenRowStrataEnv',
+    argsKey: 'runtimeSpecApiTokenRowStrataArgs',
+    clientKey: 'runtimeSpecApiTokenRowStrataClient',
   },
 ];
 
@@ -1993,9 +2040,10 @@ export function RuntimeAdminSection({
   // created, and never overwrites them again. A live mismatch means the card
   // at this index changed (driver update renumbering GPUs, or a hardware
   // swap) -- worth a warning, never a block: a renumbered card must not take
-  // the server out of service. UUID is NVIDIA-only (AMD reports none, Apple
-  // is a single unified-memory device), so an absent UUID on either side
-  // means "no drift detection available here", not "drift detected".
+  // the server out of service. UUID comes from NVIDIA and from AMD with
+  // rocm-smi 4.x only (pre-4.0 rocm-smi reports none, Apple is a single
+  // unified-memory device), so an absent UUID on either side means "no drift
+  // detection available here", not "drift detected".
   function driftFor(row: BudgetRow): HardwareGPU | undefined {
     if (!row.expectedUuid) return undefined;
     const live = telemetryGpus.find((g) => g.index === row.index);
@@ -2769,6 +2817,7 @@ export function RuntimeAdminSection({
   const [visibleDevicesMode, setVisibleDevicesMode] = useState<'env' | 'args'>('env');
   const [executionMode, setExecutionMode] = useState<'native' | 'wsl'>('native');
   const [wslDistro, setWslDistro] = useState('');
+  const [processTree, setProcessTree] = useState<'direct' | 'job'>('direct');
   // Runtime-Spec API Token: mode + its per-mode write-only state.
   // `apiTokenHeaderSource`/`apiTokenHeader` are declared here alongside mode,
   // even though their own select + inherited-header display render later in
@@ -2834,6 +2883,11 @@ export function RuntimeAdminSection({
   // `config_files` clears the stored set, so this state is what keeps a save of
   // an unrelated field from deleting files that were set through the API.
   const [configFiles, setConfigFiles] = useState<ConfigFileRow[]>([]);
+  // The Strata "Import run config" panel (importStrataRunConfig).
+  const [strataImportOpen, setStrataImportOpen] = useState(false);
+  const [strataImportText, setStrataImportText] = useState('');
+  const [strataImportError, setStrataImportError] = useState('');
+  const [strataImportNotes, setStrataImportNotes] = useState<string[]>([]);
   // The cluster head configuration and the spec's device backend, bound from
   // the loaded spec and sent back by buildSpecBody for the same full-document
   // reason: a save without them turns a cluster head into a plain spec.
@@ -2947,6 +3001,10 @@ export function RuntimeAdminSection({
     setSpecDecisionsMode(defaultDecisionsMode);
     setSpecSystemOneMode(defaultSystemOneMode);
     setSpecType('');
+    setStrataImportOpen(false);
+    setStrataImportText('');
+    setStrataImportError('');
+    setStrataImportNotes([]);
     setSpecLiveTimings(undefined);
     setMetricsPath('');
     setContextProbePath('');
@@ -2982,6 +3040,7 @@ export function RuntimeAdminSection({
     setVisibleDevicesMode(spec.visible_devices_mode);
     setExecutionMode(spec.execution_mode === 'wsl' ? 'wsl' : 'native');
     setWslDistro(spec.wsl_distro ?? '');
+    setProcessTree(spec.process_tree === 'job' ? 'job' : 'direct');
     setApiTokenMode(spec.api_token_mode);
     setApiTokenHeaderSource(spec.api_token_header_source);
     setApiTokenHeader(spec.api_token_header);
@@ -3004,6 +3063,10 @@ export function RuntimeAdminSection({
     setSpecDecisionsMode(decisionsModeOrDefault(spec.decisions_mode));
     setSpecSystemOneMode(systemOneModeOrDefault(spec.systemone_mode));
     setSpecType(spec.type);
+    setStrataImportOpen(false);
+    setStrataImportText('');
+    setStrataImportError('');
+    setStrataImportNotes([]);
     // `configured: false` means the mapping has no spec row, so what the
     // document carries are zero values, defaults and app-derived echoes
     // rather than stored choices -- that `false` is not an operator decision
@@ -3147,6 +3210,63 @@ export function RuntimeAdminSection({
         ? rows
         : [...rows, { rowKey: makeRowKey(), name: '', content: '' }],
     );
+  }
+  // Writes (or replaces) strata.json, the GPU rows in declared order (position
+  // 1 = main), the startup timeout, and the upstream model name when it is
+  // still empty. Nothing is touched when the text is refused.
+  function applyStrataImport() {
+    const result = importStrataRunConfig(strataImportText);
+    if (!result.ok) {
+      let message = t.strataImportErrorMissingArgs;
+      if (result.error === 'invalid_json') message = t.strataImportErrorInvalidJson;
+      else if (result.error === 'missing_exe') message = t.strataImportErrorMissingExe;
+      setStrataImportError(message);
+      setStrataImportNotes([]);
+      return;
+    }
+    if (new TextEncoder().encode(result.fileContent).length > CONFIG_FILE_MAX_BYTES) {
+      setStrataImportError(t.strataImportTooLarge);
+      setStrataImportNotes([]);
+      return;
+    }
+    const existing = configFiles.findIndex((r) => r.name === 'strata.json');
+    if (existing < 0 && configFiles.length >= CONFIG_FILES_MAX) {
+      setStrataImportError(t.strataImportNoFreeSlot);
+      setStrataImportNotes([]);
+      return;
+    }
+    setConfigFiles((rows) => {
+      const i = rows.findIndex((r) => r.name === 'strata.json');
+      return i >= 0
+        ? rows.map((r, j) => (j === i ? { ...r, content: result.fileContent } : r))
+        : [...rows, { rowKey: makeRowKey(), name: 'strata.json', content: result.fileContent }];
+    });
+    if (result.gpuOrder.length > 0) {
+      // Keep each surviving index's budgets; new indexes start at zero.
+      const byIndex = new Map(gpuRows.map((r) => [r.index, r]));
+      setGpuRows(
+        result.gpuOrder.map(
+          (index) =>
+            byIndex.get(index) ?? {
+              rowKey: makeRowKey(),
+              index,
+              vramEstimateMb: 0,
+              vramMeasuredMb: 0,
+            },
+        ),
+      );
+    }
+    setStartupTimeoutSeconds(result.startupTimeoutSeconds);
+    if (result.upstreamModel !== undefined && appName === '') setAppName(result.upstreamModel);
+    setStrataImportError('');
+    setStrataImportNotes([
+      t.strataImportDone,
+      ...result.warnings.map((w) =>
+        w === 'layer_split_positional' ? t.strataImportWarnLayerSplit : t.strataImportWarnApiKey,
+      ),
+    ]);
+    setStrataImportText('');
+    setStrataImportOpen(false);
   }
   function removeConfigFile(idx: number) {
     setConfigFiles((rows) => rows.filter((_, i) => i !== idx));
@@ -3397,6 +3517,8 @@ export function RuntimeAdminSection({
       visible_devices_mode: visibleDevicesMode,
       execution_mode: executionMode,
       wsl_distro: executionMode === 'wsl' ? wslDistro.trim() : '',
+      // Always sent (the PUT replaces the whole spec); a wsl spec has no job.
+      process_tree: executionMode === 'wsl' ? 'direct' : processTree,
       api_token_mode: apiTokenMode,
       api_token_header_source: apiTokenHeaderSource,
       api_token_header: apiTokenHeader,
@@ -3526,6 +3648,27 @@ export function RuntimeAdminSection({
     setSpecFlavorsBeforeKindDefault(change.remembered);
   }
 
+  // The Strata launch template (strataSpecTemplate), filled in when the Type
+  // select switches to strata on a spec's FIRST write only: an edit of a
+  // stored spec keeps what it stores. Args and env the operator already typed
+  // are kept, as is a startup timeout moved off the stock 180 s; the
+  // visible-devices option is turned off (Strata takes host card numbers), and
+  // the API variants are the template's. The health path follows the Type
+  // select's own default rule, which already gives /health.
+  function applyStrataTemplate() {
+    if (!specFirstWrite) return;
+    const template = strataSpecTemplate();
+    if (argsText === '') setArgsText(formatArgsText(template.args));
+    if (envText === '') setEnvText(formatEnvText(template.env));
+    if (startupTimeoutSeconds === 180) setStartupTimeoutSeconds(template.startupTimeoutSeconds);
+    setSetVisibleDevices(template.setVisibleDevices);
+    setVisibleDevicesMode(template.visibleDevicesMode);
+    setSpecApiFlavors(template.flavors);
+    setSpecResponsesMode(template.responsesMode);
+    setSpecMessagesMode(template.messagesMode);
+    setProcessTree(template.processTree);
+  }
+
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
     if (specFlavorsMissing()) return;
@@ -3552,6 +3695,8 @@ export function RuntimeAdminSection({
     }
     const visibleDevicesError = validateVisibleDevices(
       setVisibleDevices,
+      visibleDevicesMode,
+      [...args, ...configFiles.map((r) => r.content)],
       parsedEnv.env,
       gpuRows.length,
       t,
@@ -3663,6 +3808,8 @@ export function RuntimeAdminSection({
     }
     const visibleDevicesError = validateVisibleDevices(
       setVisibleDevices,
+      visibleDevicesMode,
+      [...args, ...configFiles.map((r) => r.content)],
       parsedEnv.env,
       gpuRows.length,
       t,
@@ -4896,6 +5043,15 @@ export function RuntimeAdminSection({
     const configFileRowIssues = configFileIssues(configFiles);
     const showAgentNoConfigFiles =
       configFiles.length > 0 && reportReady && !agentFeatures.includes('runtime_config_files');
+    // ${HOST_GPU_IDS_MAIN_LAST} (#424) is expanded by the agent only when it
+    // declares runtime_gpu_main_last; an older one leaves it literal. Same
+    // advisory shape as above: only once the placeholder is actually used.
+    const usesGpuMainLast =
+      argsText.includes(GPU_MAIN_LAST_PLACEHOLDER) ||
+      envText.includes(GPU_MAIN_LAST_PLACEHOLDER) ||
+      configFiles.some((r) => r.content.includes(GPU_MAIN_LAST_PLACEHOLDER));
+    const showAgentNoGpuMainLast =
+      usesGpuMainLast && reportReady && !agentFeatures.includes('runtime_gpu_main_last');
     const gpuOrderIsCustom = gpuRows.some((r, i, all) => i > 0 && r.index < all[i - 1].index);
     const argsHaveMetalDevices = parseArgsText(argsText).some((a) =>
       a.includes('${METAL_DEVICES}'),
@@ -5067,7 +5223,11 @@ export function RuntimeAdminSection({
               }}
               binaries={serverBinaries}
               required
-              placeholder="/usr/local/bin/llama-server"
+              placeholder={
+                specType === 'strata'
+                  ? strataSpecTemplate().binaryHint
+                  : '/usr/local/bin/llama-server'
+              }
             />
             {/* RuntimeSpec Type: explicit backend kind ('' = auto-detect from
                 `binary` above), plus the per-type metrics/context-probe path
@@ -5110,6 +5270,28 @@ export function RuntimeAdminSection({
                 )}
               </>
             )}
+            {executionMode !== 'wsl' && (
+              <>
+                <SelectField
+                  id="runtime-spec-process-tree"
+                  label={t.runtimeSpecProcessTree}
+                  value={processTree}
+                  onChange={(e) => setProcessTree(e.target.value as 'direct' | 'job')}
+                  sx={{ maxWidth: 340 }}
+                >
+                  <option value="direct">{t.runtimeSpecProcessTreeDirect}</option>
+                  <option value="job">{t.runtimeSpecProcessTreeJob}</option>
+                </SelectField>
+                <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                  {t.runtimeSpecProcessTreeHint}
+                </Typography>
+              </>
+            )}
+            {showAgentNoGpuMainLast && (
+              <Alert severity="warning">
+                {`${t.runtimeSpecAgentNoGpuMainLast} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+              </Alert>
+            )}
             <SelectField
               id="runtime-spec-type"
               label={t.runtimeSpecType}
@@ -5127,6 +5309,7 @@ export function RuntimeAdminSection({
                   setHealthPath(runtimeSpecHealthPathDefault(next));
                 }
                 applySpecTypeFlavorDefaults(next);
+                if (next === 'strata' && next !== specType) applyStrataTemplate();
                 setSpecDecisionsMode(decisionsModeForKind(specDecisionsMode, next));
                 setSpecSystemOneMode(systemOneModeForKind(specSystemOneMode, next));
                 setSpecType(next);
@@ -5144,6 +5327,7 @@ export function RuntimeAdminSection({
               <option value="vllm_sr">{t.runtimeSpecTypeVllmSr}</option>
               <option value="sglang">{t.runtimeSpecTypeSglang}</option>
               <option value="sglang_omni">{t.runtimeSpecTypeSglangOmni}</option>
+              <option value="strata">{t.runtimeSpecTypeStrata}</option>
               <option value="custom">{t.runtimeSpecTypeCustom}</option>
             </SelectField>
             <Field
@@ -5321,7 +5505,63 @@ export function RuntimeAdminSection({
                 >
                   {t.runtimeSpecConfigFileAdd}
                 </Button>
+                {specType === 'strata' && (
+                  <Button
+                    type="button"
+                    variant="outlined"
+                    size="small"
+                    sx={{ ml: 1 }}
+                    onClick={() => setStrataImportOpen((o) => !o)}
+                  >
+                    {t.strataImportOpen}
+                  </Button>
+                )}
               </Box>
+              {specType === 'strata' && strataImportOpen && (
+                <Box sx={{ display: 'grid', gap: 1 }}>
+                  <Typography variant="caption" color="text.secondary">
+                    {t.strataImportHint}
+                  </Typography>
+                  <Field
+                    id="runtime-spec-strata-import"
+                    label={t.strataImportLabel}
+                    value={strataImportText}
+                    onChange={(e) => setStrataImportText(e.target.value)}
+                    multiline
+                    minRows={6}
+                    inputProps={{ spellCheck: false }}
+                    sx={{ '& textarea': { fontFamily: 'monospace' } }}
+                  />
+                  {strataImportError !== '' && <Alert severity="error">{strataImportError}</Alert>}
+                  <Box sx={{ display: 'flex', gap: 1 }}>
+                    <Button
+                      type="button"
+                      variant="contained"
+                      size="small"
+                      onClick={applyStrataImport}
+                    >
+                      {t.strataImportApply}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="small"
+                      color="secondary"
+                      onClick={() => {
+                        setStrataImportOpen(false);
+                        setStrataImportError('');
+                      }}
+                    >
+                      {t.strataImportCancel}
+                    </Button>
+                  </Box>
+                </Box>
+              )}
+              {specType === 'strata' &&
+                strataImportNotes.map((note, i) => (
+                  <Alert key={note} severity={i === 0 ? 'success' : 'warning'}>
+                    {note}
+                  </Alert>
+                ))}
             </Box>
             <Field
               id="runtime-spec-work-dir"

@@ -50,6 +50,14 @@ const (
 	// that one names the kind of an agent-launched vllm-srun worker on a
 	// server_agent application.
 	ProviderVllmSR = "vllm_sr"
+	// ProviderStrata is an operator-run Strata server (a llama.cpp-style local
+	// LLM server that speaks the OpenAI and Anthropic dialects). It shares the
+	// OpenAI-compatible provider client. The string equals
+	// RuntimeSpecTypeStrata, but it is a different namespace: that one names
+	// the kind of an agent-launched Strata runtime spec on a server_agent
+	// application. Upstream pin: Niko1221/Strata@c6f6427 (release 0.2.17,
+	// engine 0.1.63).
+	ProviderStrata = "strata"
 	// ProviderVendorOpenAI and ProviderVendorAnthropic are the provider kinds of
 	// a vendor-account target: inference served by a hosted vendor API
 	// (api.openai.com / api.anthropic.com) instead of an on-prem application.
@@ -259,15 +267,15 @@ type AIServer struct {
 	// interface (migration 103).
 	LANBindOnly bool
 	// LANSource says where the server's effective LAN address comes from
-	// (migration 110): LANSourceAuto (derive it), LANSourceInterface (the
+	// (migration 116): LANSourceAuto (derive it), LANSourceInterface (the
 	// reported interface named by LANInterfaceID) or LANSourceManual
-	// (LANAddress as typed). "" (a row written before migration 110) is read
+	// (LANAddress as typed). "" (a row written before migration 116) is read
 	// as manual when LANAddress is set, else as auto. Routing never reads it.
 	LANSource string
 	// LANInterfaceID is the stable id of the chosen reported interface under
 	// LANSourceInterface ("" otherwise).
 	LANInterfaceID string
-	// LANInterfaces is the agent-reported LAN interface list (migration 110): a
+	// LANInterfaces is the agent-reported LAN interface list (migration 116): a
 	// sanitized JSON array, "" = never reported, "[]" = reported empty. Written
 	// only by UpdateServerLANInterfaces, never by UpdateAIServer.
 	LANInterfaces string
@@ -360,8 +368,16 @@ type VendorAccount struct {
 	// private. Same write rules as ShareLevel -- UpdateVendorAccountSystemGroup and
 	// ClearVendorAccountSharing only.
 	SystemGroupID string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// ShareUsageWithMembers is the owner's opt-in (migration 110) to let members who
+	// reach this account through sharing also see its usage figures: the rate-limit
+	// windows and spend in the portal (account page, member view and dashboard) and the
+	// subscription's usage limits in Claude Code; the owner always sees them. Written only by
+	// UpdateVendorAccountShareUsage and, for the initial value, by CreateVendorAccount
+	// (the portal service defaults it to true for new accounts; the column default and
+	// existing rows stay false). UpdateVendorAccount never writes it.
+	ShareUsageWithMembers bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 // VendorAccountOperatePatch is a change to the OPERATE columns of a vendor account
@@ -2112,6 +2128,16 @@ const (
 // of any other task carries none, not even a no. It writes the speech,
 // transcription, transcription_streaming, speech_clone and speech_streaming
 // rows, and no other.
+//
+// CapabilitySourceStrataModels names the probe-rank source read from a Strata
+// application's own model listing, GET /v1/models: an entry whose
+// architecture.input_modalities lists "image" is a CapabilityVision yes. It
+// writes that one row, and only ever a yes: a listing without "image" (or
+// without the field) is no verdict, because nothing pins the modality list as
+// exhaustive. Its one producer is the gateway's health loop, for a strata
+// application without its own context probe path (recordListedModelInfos in
+// cmd/gateway). It ranks 1 through capabilitySourceRank's DEFAULT branch like
+// the sources above.
 const (
 	CapabilitySourceManual            = "manual"
 	CapabilitySourceVisionBenchmark   = "vision_benchmark"
@@ -2120,6 +2146,7 @@ const (
 	CapabilitySourceLlamaCppTimings   = "llama_cpp_timings"
 	CapabilitySourceSdcppCapabilities = "sdcpp_capabilities"
 	CapabilitySourceAudioCppModels    = "audiocpp_models"
+	CapabilitySourceStrataModels      = "strata_models"
 	CapabilitySourceSystemOneProbe    = "systemone_probe"
 	CapabilitySourceDecisionsProbe    = "decisions_probe"
 	CapabilitySourceLegacy            = "legacy"
@@ -3140,6 +3167,11 @@ type RuntimeSpec struct {
 	// WSLDistro is the WSL distro a "wsl" spec runs in; always "" for native
 	// (migration 109).
 	WSLDistro string
+	// ProcessTree is how the agent supervises a native spec's process tree on
+	// Windows: "direct" (the default and every pre-feature row) or "job" (a
+	// Windows Job Object; migration 113). "" reads as direct to in-memory
+	// callers that never set it.
+	ProcessTree ProcessTree
 	// SetVisibleDevices asks the agent to CONSTRAIN the child to the cards in
 	// this spec's GPU rows, by setting the vendor-appropriate visibility
 	// variable (CUDA_VISIBLE_DEVICES on NVIDIA, ROCR_VISIBLE_DEVICES on AMD;
@@ -3593,6 +3625,10 @@ type VendorAccountStore interface {
 	// deciding who may change it is the service's job. An unknown id is
 	// ErrNotFound.
 	UpdateVendorAccountShareLevel(ctx context.Context, id, level string) error
+	// UpdateVendorAccountShareUsage writes only share_usage_with_members (migration
+	// 110) with a targeted UPDATE of that one column; updated_at is left alone.
+	// Who may change it is the service's job. An unknown id is ErrNotFound.
+	UpdateVendorAccountShareUsage(ctx context.Context, id string, enabled bool) error
 	// UpdateVendorAccountSystemGroup writes only system_group_id -- the
 	// containment root (migration 91) -- with a targeted UPDATE of that one
 	// column, mirroring UpdateServerSystemGroup. An unknown id is ErrNotFound.
@@ -3675,6 +3711,7 @@ type Store interface {
 	RuntimeStore
 	RPCClusterStore
 	VendorAccountStore
+	VendorAccountGroupStore
 }
 
 // applicationHasAPIFlavor reports whether the application serves the flavor.

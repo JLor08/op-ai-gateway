@@ -615,8 +615,8 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.20.1" {
-		t.Fatalf("Version = %q, want 0.20.1 (the Linux VRAM PATCH fix; runtime_stop keeps Since 0.17.0)", Version)
+	if Version != "0.25.0" {
+		t.Fatalf("Version = %q, want 0.25.0; runtime_stop keeps Since 0.17.0", Version)
 	}
 }
 
@@ -639,8 +639,8 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.20.1" {
-		t.Fatalf("Version = %q, want 0.20.1 (the Linux VRAM PATCH fix; rpc_cluster keeps Since 0.18.0)", Version)
+	if Version != "0.25.0" {
+		t.Fatalf("Version = %q, want 0.25.0; rpc_cluster keeps Since 0.18.0", Version)
 	}
 }
 
@@ -696,7 +696,36 @@ func TestFeaturesDeclareRealtimeProxy(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "realtime_proxy") {
 		t.Fatal("FeatureNames() does not carry realtime_proxy, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.20.1" {
-		t.Fatalf("Version = %q, want 0.20.1 (the Linux VRAM PATCH fix; realtime_proxy keeps Since 0.20.0)", Version)
+	if Version != "0.25.0" {
+		t.Fatalf("Version = %q, want 0.25.0; realtime_proxy keeps Since 0.20.0", Version)
+	}
+}
+
+func TestFeaturesDeclareStrataFlags(t *testing.T) {
+	if FeatureRuntimeGPUMainLast != "runtime_gpu_main_last" {
+		t.Fatalf("FeatureRuntimeGPUMainLast = %q", FeatureRuntimeGPUMainLast)
+	}
+	if FeatureRuntimeProcessTreeJob != "runtime_process_tree_job" {
+		t.Fatalf("FeatureRuntimeProcessTreeJob = %q", FeatureRuntimeProcessTreeJob)
+	}
+	for _, name := range []string{"runtime_gpu_main_last", "runtime_process_tree_job"} {
+		found := false
+		for _, f := range Features {
+			if f.Name == name {
+				found = true
+				if f.Since != "0.21.0" {
+					t.Fatalf("%s Since = %q, want 0.21.0", name, f.Since)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("Features does not declare %s", name)
+		}
+		if !slices.Contains(FeatureNames(), name) {
+			t.Fatalf("FeatureNames() does not carry %s", name)
+		}
+	}
+	if Version != "0.25.0" {
+		t.Fatalf("Version = %q, want 0.25.0", Version)
 	}
 }

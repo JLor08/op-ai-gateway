@@ -739,3 +739,120 @@ func TestPrincipalLimiterCheckFailsOpen(t *testing.T) {
 		t.Fatal("a nil store's Check() denied")
 	}
 }
+
+func TestPrincipalLimiterEvaluateStandingOnAllow(t *testing.T) {
+	store := newFakePrincipalStore()
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	store.setConfig(p, routing.LimitConfig{
+		RequestQuota: 100, RequestQuotaPeriod: "day",
+		TokenQuota: 1000, TokenQuotaPeriod: "week",
+		CostBudget: 5, CostBudgetPeriod: "month",
+	})
+	store.setAggregate(p, 10, 300, 1.25)
+	now := utc(2026, 3, 18, 9, 0, 0)
+	limiter := NewPrincipalLimiter(store, PrincipalLimiterOptions{Now: clockAt(&now)})
+
+	a := limiter.Evaluate(context.Background(), p)
+	if !a.Allow || a.Reason != "" || !a.At.Equal(now) {
+		t.Fatalf("Evaluate() = allow %v reason %q at %v, want allow at %v", a.Allow, a.Reason, a.At, now)
+	}
+	want := LimitStanding{
+		{Kind: LimitKindRequestQuota, Used: 10, Cap: 100, Period: "day", Reset: utc(2026, 3, 19, 0, 0, 0)},
+		{Kind: LimitKindTokenQuota, Used: 300, Cap: 1000, Period: "week", Reset: utc(2026, 3, 23, 0, 0, 0)},
+		{Kind: LimitKindCostBudget, Used: 1.25, Cap: 5, Period: "month", Reset: utc(2026, 4, 1, 0, 0, 0)},
+	}
+	if len(a.Standing) != len(want) {
+		t.Fatalf("Standing = %+v, want %+v", a.Standing, want)
+	}
+	for i := range want {
+		if a.Standing[i] != want[i] {
+			t.Errorf("Standing[%d] = %+v, want %+v", i, a.Standing[i], want[i])
+		}
+	}
+}
+
+func TestPrincipalLimiterEvaluateStandingOnQuotaDeny(t *testing.T) {
+	store := newFakePrincipalStore()
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	store.setConfig(p, routing.LimitConfig{
+		RequestQuota: 10, RequestQuotaPeriod: "day",
+		CostBudget: 1, CostBudgetPeriod: "month",
+	})
+	store.setAggregate(p, 10, 0, 2)
+	limiter := NewPrincipalLimiter(store, PrincipalLimiterOptions{})
+
+	a := limiter.Evaluate(context.Background(), p)
+	if a.Allow || a.Reason != "request_quota" {
+		t.Fatalf("Evaluate() = allow %v reason %q, want request_quota deny", a.Allow, a.Reason)
+	}
+	if len(a.Standing) != 2 || a.Standing[0].Kind != LimitKindRequestQuota || a.Standing[1].Kind != LimitKindCostBudget {
+		t.Fatalf("Standing = %+v, want request and cost readings", a.Standing)
+	}
+}
+
+func TestPrincipalLimiterEvaluateNoStandingWithoutConfig(t *testing.T) {
+	store := newFakePrincipalStore()
+	none := Principal{Type: routing.PrincipalTypeUser, ID: "none"}
+	rate := Principal{Type: routing.PrincipalTypeUser, ID: "rate"}
+	store.setConfig(rate, routing.LimitConfig{RateRequests: 5, RateWindowSeconds: 60})
+	limiter := NewPrincipalLimiter(store, PrincipalLimiterOptions{})
+
+	for _, p := range []Principal{none, rate} {
+		a := limiter.Evaluate(context.Background(), p)
+		if !a.Allow || a.Standing != nil {
+			t.Fatalf("Evaluate(%s) = allow %v standing %+v, want allow and nil standing", p.ID, a.Allow, a.Standing)
+		}
+	}
+}
+
+func TestPrincipalLimiterEvaluateRateDenyHasNoStanding(t *testing.T) {
+	store := newFakePrincipalStore()
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	store.setConfig(p, routing.LimitConfig{
+		RateRequests: 1, RateWindowSeconds: 60,
+		RequestQuota: 100, RequestQuotaPeriod: "day",
+	})
+	limiter := NewPrincipalLimiter(store, PrincipalLimiterOptions{})
+
+	if a := limiter.Evaluate(context.Background(), p); !a.Allow {
+		t.Fatal("first Evaluate() denied, want allow")
+	}
+	a := limiter.Evaluate(context.Background(), p)
+	if a.Allow || a.Reason != "rate" || a.RetryAfter <= 0 || a.Standing != nil {
+		t.Fatalf("Evaluate() = %+v, want rate deny with RetryAfter > 0 and nil standing", a)
+	}
+}
+
+func TestPrincipalLimiterEvaluateAggregateErrorMarksFailed(t *testing.T) {
+	store := newFakePrincipalStore()
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	store.setConfig(p, routing.LimitConfig{
+		RequestQuota: 100, RequestQuotaPeriod: "day",
+		TokenQuota: 1000, TokenQuotaPeriod: "week",
+		CostBudget: 5, CostBudgetPeriod: "month",
+	})
+	store.aggErr = errors.New("db down")
+	limiter := NewPrincipalLimiter(store, PrincipalLimiterOptions{})
+
+	a := limiter.Evaluate(context.Background(), p)
+	if !a.Allow || len(a.Standing) != 3 {
+		t.Fatalf("Evaluate() = allow %v standing %+v, want allow with 3 readings", a.Allow, a.Standing)
+	}
+	for _, r := range a.Standing {
+		if !r.Failed {
+			t.Errorf("reading %s not marked Failed", r.Kind)
+		}
+	}
+}
+
+func TestPrincipalLimiterEvaluateConfigErrorNoStanding(t *testing.T) {
+	store := newFakePrincipalStore()
+	p := Principal{Type: routing.PrincipalTypeUser, ID: "u1"}
+	store.cfgErr = errors.New("db down")
+	limiter := NewPrincipalLimiter(store, PrincipalLimiterOptions{})
+
+	a := limiter.Evaluate(context.Background(), p)
+	if !a.Allow || a.Standing != nil {
+		t.Fatalf("Evaluate() = allow %v standing %+v, want allow and nil standing", a.Allow, a.Standing)
+	}
+}

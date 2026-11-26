@@ -2008,12 +2008,13 @@ type agentGPUInfo struct {
 	UUID             string `json:"uuid,omitempty"`
 	DriverVersion    string `json:"driver_version,omitempty"`
 	MemoryTotalBytes int64  `json:"memory_total_bytes"`
-	// PCIBusID is the card's PCI address (e.g. "00000000:65:00.0"), NVIDIA
-	// only. Additive and optional: an older agent omits it and the field
-	// decodes empty. Display and disambiguation only -- the portal shows it
-	// to tell 4x/8x identical cards apart, and nothing in this codebase
-	// matches or keys on it (GPU identity is the index; see the agent's
-	// sample.GPU.PCIBusID).
+	// PCIBusID is the card's PCI address (e.g. "00000000:65:00.0" on NVIDIA,
+	// "0000:01:00.0" on AMD with rocm-smi 4.x). Additive and optional: an
+	// older agent, Apple and pre-4.0 rocm-smi omit it and the field decodes
+	// empty. Display and disambiguation, not identity -- the portal shows it
+	// to tell 4x/8x identical cards apart, and GPU identity is the index (see
+	// the agent's sample.GPU.PCIBusID). The only logic reading it is the
+	// portal's gpuLooksNVIDIA, as an NVIDIA fallback behind an AMD name check.
 	PCIBusID string `json:"pci_bus_id,omitempty"`
 }
 

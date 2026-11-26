@@ -21,27 +21,35 @@ type raplReading struct {
 }
 
 // raplCollector derives CPU package watts and total-system watts from the Linux
-// powercap RAPL sysfs energy counters (Δenergy/Δt), with a hwmon power-sensor
-// fallback for system watts. It is pure filesystem + time (no linux-only syscalls),
-// so it lives in a build-tag-free file and is fully testable on any OS by pointing
-// powercapRoot/hwmonRoot at a synthetic tree. Stateful: it holds the previous
+// powercap RAPL sysfs energy counters (Δenergy/Δt). It is pure filesystem + time
+// (no linux-only syscalls), so it lives in a build-tag-free file and is fully
+// testable on any OS by pointing powercapRoot at a synthetic tree. Stateful: it holds the previous
 // per-domain reading, so the FIRST Collect returns nil (no delta yet). energy_uj is
 // root-only (0400) since CVE-2020-8694, so a non-root agent gets a read error on
 // every counter -> nil (best-effort, no graph).
 type raplCollector struct {
 	powercapRoot string
-	hwmonRoot    string
+	domainGlob   string // powercap domain directory pattern, per platform
 	now          func() time.Time
 
 	mu   sync.Mutex
 	prev map[string]raplReading // keyed by domain dir path
 }
 
-// newRAPLCollector builds a RAPL collector reading the given sysfs roots.
-func newRAPLCollector(powercapRoot, hwmonRoot string) *raplCollector {
+// Powercap domain directory patterns. Linux names carry a colon; the
+// host-provided Windows tree is colon-free because ':' is illegal in NTFS names.
+const (
+	raplDomainGlobLinux   = "intel-rapl:*"
+	raplDomainGlobWindows = "intel-rapl_*"
+)
+
+// newRAPLCollector builds a RAPL collector reading the given roots. domainGlob
+// selects the powercap domain directories (raplDomainGlobLinux or
+// raplDomainGlobWindows).
+func newRAPLCollector(powercapRoot, domainGlob string) *raplCollector {
 	return &raplCollector{
 		powercapRoot: powercapRoot,
-		hwmonRoot:    hwmonRoot,
+		domainGlob:   domainGlob,
 		now:          time.Now,
 		prev:         map[string]raplReading{},
 	}
@@ -50,22 +58,15 @@ func newRAPLCollector(powercapRoot, hwmonRoot string) *raplCollector {
 // Name identifies this collector.
 func (c *raplCollector) Name() string { return "rapl" }
 
-// Available reports whether any intel-rapl powercap domain OR a hwmon power sensor
-// is present. It does NOT prove the energy files are readable; an unreadable counter
+// Available reports whether any intel-rapl powercap domain is present. It does NOT prove the energy files are readable; an unreadable counter
 // simply yields a nil value from Collect.
 func (c *raplCollector) Available() bool {
-	if domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, "intel-rapl:*")); len(domains) > 0 {
-		return true
-	}
-	if inputs, _ := filepath.Glob(filepath.Join(c.hwmonRoot, "*", "power*_input")); len(inputs) > 0 {
-		return true
-	}
-	return false
+	domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, c.domainGlob))
+	return len(domains) > 0
 }
 
 // Collect reads every intel-rapl domain, sums the package-* domains for CPU watts
-// (multi-socket) and uses the psys domain (else a hwmon power sensor) for system
-// watts. Watts are Δenergy_uj / Δt across consecutive Collects, wraparound-corrected
+// (multi-socket) and uses the psys domain for system watts. Watts are Δenergy_uj / Δt across consecutive Collects, wraparound-corrected
 // via max_energy_range_uj. A metric with no readable counter or no prior sample
 // yields nil (best-effort). Never returns an error.
 func (c *raplCollector) Collect(_ context.Context) (*float64, *float64, error) {
@@ -73,7 +74,7 @@ func (c *raplCollector) Collect(_ context.Context) (*float64, *float64, error) {
 	defer c.mu.Unlock()
 
 	now := c.now()
-	domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, "intel-rapl:*"))
+	domains, _ := filepath.Glob(filepath.Join(c.powercapRoot, c.domainGlob))
 
 	var pkgWatts float64
 	havePkg := false
@@ -123,24 +124,7 @@ func (c *raplCollector) Collect(_ context.Context) (*float64, *float64, error) {
 		cpu = &w
 	}
 
-	system := psysWatts
-	if system == nil {
-		system = c.hwmonSystemWatts()
-	}
-	return cpu, system, nil
-}
-
-// hwmonSystemWatts returns the first readable hwmon power*_input (microwatts,
-// instantaneous) as watts, or nil when none is present/readable.
-func (c *raplCollector) hwmonSystemWatts() *float64 {
-	inputs, _ := filepath.Glob(filepath.Join(c.hwmonRoot, "*", "power*_input"))
-	for _, p := range inputs {
-		if uw, ok := readSysfsUint(p); ok {
-			w := float64(uw) / 1e6 // microwatts -> watts
-			return &w
-		}
-	}
-	return nil
+	return cpu, psysWatts, nil
 }
 
 // raplDeltaJoules returns the energy delta in JOULES between two µJ counter reads,

@@ -111,10 +111,10 @@ func TestVRAMDeltaMB(t *testing.T) {
 }
 
 // TestVRAMFingerprintOf is test-plan item 10: the fingerprint records the
-// STRONGEST AVAILABLE field and names which, because GPUSample.UUID is
-// NVIDIA-only -- so a UUID-only drift detector would be empty on exactly the
-// two host classes (AMD, Apple) the delta strategy exists to serve. A sample
-// with neither claims nothing at all.
+// STRONGEST AVAILABLE field and names which, because GPUSample.UUID comes
+// from NVIDIA and from AMD with rocm-smi 4.x only -- so a UUID-only drift
+// detector would be empty on the host classes (Apple, older AMD) the delta
+// strategy exists to serve. A sample with neither claims nothing at all.
 func TestVRAMFingerprintOf(t *testing.T) {
 	cases := []struct {
 		name     string

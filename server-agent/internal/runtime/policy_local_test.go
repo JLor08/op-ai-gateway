@@ -1981,3 +1981,61 @@ func TestExpandPlaceholdersVisibleDevicesConflictHoldsInBothModes(t *testing.T) 
 		})
 	}
 }
+
+// --- ${HOST_GPU_IDS_MAIN_LAST} (#424) ----------------------------------------
+
+func TestHostGPUIDsMainLast(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []int
+		want string
+	}{
+		{"first moves last", []int{2, 0, 1}, "0,1,2"},
+		{"single", []int{1}, "1"},
+		{"dedup first wins", []int{2, 2, 0}, "0,2"},
+		{"empty", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hostGPUIDsMainLast(tc.in); got != tc.want {
+				t.Fatalf("hostGPUIDsMainLast(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExpandPlaceholdersHostGPUIDsMainLast(t *testing.T) {
+	getenv := func(string) string { return "" }
+	gpus := []SpecGPU{{Index: 2}, {Index: 0}, {Index: 1}}
+	t.Run("args and env", func(t *testing.T) {
+		spec := Spec{
+			Args: []string{"--gpus", "${HOST_GPU_IDS_MAIN_LAST}"},
+			Env:  map[string]string{"X_DEVICES": "d:${HOST_GPU_IDS_MAIN_LAST}"},
+			GPUs: gpus,
+		}
+		args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+		if err != nil {
+			t.Fatalf("ExpandPlaceholders: %v", err)
+		}
+		if args[1] != "0,1,2" {
+			t.Errorf("args[1] = %q, want 0,1,2", args[1])
+		}
+		if !slices.Contains(env, "X_DEVICES=d:0,1,2") {
+			t.Errorf("env = %v, want X_DEVICES=d:0,1,2", env)
+		}
+	})
+	t.Run("no gpus is a hard error naming the token", func(t *testing.T) {
+		spec := Spec{Args: []string{"${HOST_GPU_IDS_MAIN_LAST}"}}
+		_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+		if err == nil || !strings.Contains(err.Error(), "HOST_GPU_IDS_MAIN_LAST") {
+			t.Fatalf("err = %v, want an error naming ${HOST_GPU_IDS_MAIN_LAST}", err)
+		}
+	})
+	t.Run("near miss passes through literally", func(t *testing.T) {
+		spec := Spec{Args: []string{"${HOST_GPU_IDS_MAIN_LAS}"}, GPUs: gpus}
+		args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+		if err != nil || args[0] != "${HOST_GPU_IDS_MAIN_LAS}" {
+			t.Fatalf("args = %v, err = %v, want literal pass-through", args, err)
+		}
+	})
+}

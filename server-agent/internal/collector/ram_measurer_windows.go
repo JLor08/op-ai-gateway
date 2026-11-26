@@ -141,27 +141,16 @@ func NewRAMMeasurer() func(pids []int) map[int]int {
 // measureProcessPrivateWorkingSet is the func(pids []int) map[int]int
 // NewRAMMeasurer hands out. See NewRAMMeasurer for the metric and contract.
 //
+// A pid the manager runs as a process_tree "job" root (#424) is charged the
+// private working set of its whole job -- the root and every descendant still
+// in it (measureTreeRAM, process_tree.go); every other pid is charged its own.
+//
 // A pid it cannot open or read (exited since the manager listed it, or access
 // denied) is skipped, and so is one whose private working set comes back 0 or
 // rounds to under 1 MB: the manager reads a present key as a measurement, and a
 // measured 0 means "unknown", not "needs no RAM" -- see runtime.realRAM.
 func measureProcessPrivateWorkingSet(pids []int) map[int]int {
-	var out map[int]int
-	for _, pid := range pids {
-		bytes, ok := privateWorkingSetBytes(pid)
-		if !ok {
-			continue
-		}
-		mb := int(int64(bytes) / bytesPerMB)
-		if mb <= 0 {
-			continue
-		}
-		if out == nil {
-			out = make(map[int]int, len(pids))
-		}
-		out[pid] = mb
-	}
-	return out
+	return measureTreeRAM(pids, snapshotProcessTrees(), privateWorkingSetBytes)
 }
 
 // privateWorkingSetBytes reads one process's private working set in bytes.

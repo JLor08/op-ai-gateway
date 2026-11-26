@@ -26,6 +26,32 @@ func (s *Server) handlePortalModels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// X-OP-Run-As-Token lists the models as one of the caller's own tokens would see
+	// them (its vendor-account policy, prefix overrides, manual and generated
+	// aliases) -- the portal chat picks its model from this. Unlike the inference
+	// endpoints, which silently ignore the header for a bearer caller, this
+	// endpoint refuses: a bearer is not the portal session the header is for.
+	// The refusals are the gate's own, identical for another user's, an unknown and
+	// a disabled token, so the header cannot probe which ids exist.
+	if runAsID := strings.TrimSpace(r.Header.Get(runAsHeaderName)); runAsID != "" {
+		if manageModelsRequested(r) {
+			writeJSON(w, http.StatusBadRequest, apierror.Response("portal.models_run_as_conflict", "run-as token cannot be combined with manage", ""))
+			return
+		}
+		if token.ID != "" || s.Portal == nil {
+			writePortalTokenError(w, portal.ErrTokenForbidden)
+			return
+		}
+		runAs, err := s.Portal.AuthorizeRunAsToken(r.Context(), token, runAsID)
+		if err != nil {
+			writePortalTokenError(w, err)
+			return
+		}
+		resp := s.Portal.Models(r.Context(), runAs)
+		s.injectLoadingOnCounts(r.Context(), runAs, resp.Data, true)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 	// The admin management surface (?manage=1) wants the UNSUPPRESSED listing so a
 	// hidden/locked model stays visible + editable. Only admins get it; a non-admin
 	// passing the flag just gets the normal suppressed list (the flag is ignored, no

@@ -5,9 +5,11 @@ package config
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"op-ai-server-agent/internal/collector"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -403,6 +405,38 @@ func TestLHMURLResolution(t *testing.T) {
 	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","lhm_url":"http://file:8085/data.json"}`)
 	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.LHMURL != "http://file:8085/data.json" {
 		t.Fatalf("config lhm_url LHMURL = %q (err %v)", cfg.LHMURL, err)
+	}
+}
+
+func TestPowercapRootResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	env := func(k string) string {
+		if k == "OP_AGENT_POWERCAP_ROOT" {
+			return " /mnt/hp "
+		}
+		return ""
+	}
+
+	if cfg, err := Load(base, noenv); err != nil || cfg.PowercapRoot != "" {
+		t.Fatalf("default PowercapRoot = %q (err %v), want \"\"", cfg.PowercapRoot, err)
+	}
+	if cfg, err := Load(append([]string{"-powercap-root=/run/op-hostpower"}, base...), noenv); err != nil || cfg.PowercapRoot != "/run/op-hostpower" {
+		t.Fatalf("-powercap-root PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
+	}
+	if cfg, err := Load(base, env); err != nil || cfg.PowercapRoot != "/mnt/hp" {
+		t.Fatalf("env OP_AGENT_POWERCAP_ROOT PowercapRoot = %q (err %v), want trimmed /mnt/hp", cfg.PowercapRoot, err)
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","powercap_root":"/cfg"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.PowercapRoot != "/cfg" {
+		t.Fatalf("config powercap_root PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
+	}
+	// precedence: flag > env > file
+	if cfg, err := Load([]string{"-config", path, "-powercap-root=/flag"}, env); err != nil || cfg.PowercapRoot != "/flag" {
+		t.Fatalf("flag over env/file PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.PowercapRoot != "/mnt/hp" {
+		t.Fatalf("env over file PowercapRoot = %q (err %v)", cfg.PowercapRoot, err)
 	}
 }
 
@@ -1955,5 +1989,348 @@ func TestAgentKeyValidation(t *testing.T) {
 	}
 	if _, err := Load(base, func(string) string { return "" }); err != nil {
 		t.Errorf("an absent key must load: %v", err)
+	}
+}
+
+func TestHostpowerOptionsResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	env := func(k string) string {
+		switch k {
+		case "OP_AGENT_HOSTPOWER_URL":
+			return " http://192.0.2.1:9873 "
+		case "OP_AGENT_HOSTPOWER_TOKEN":
+			return " ophp_env "
+		}
+		return ""
+	}
+
+	if cfg, err := Load(base, noenv); err != nil || cfg.HostpowerURL != "" || cfg.HostpowerToken != "" {
+		t.Fatalf("defaults = %q/%q (err %v), want empty", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	if cfg, err := Load(append([]string{"-hostpower-url=http://flag:1", "-hostpower-token=ophp_flag"}, base...), noenv); err != nil || cfg.HostpowerURL != "http://flag:1" || cfg.HostpowerToken != "ophp_flag" {
+		t.Fatalf("flags = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	if cfg, err := Load(base, env); err != nil || cfg.HostpowerURL != "http://192.0.2.1:9873" || cfg.HostpowerToken != "ophp_env" {
+		t.Fatalf("env = %q/%q (err %v), want trimmed values", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","hostpower_url":" http://file:2 ","hostpower_token":"ophp_file"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.HostpowerURL != "http://file:2" || cfg.HostpowerToken != "ophp_file" {
+		t.Fatalf("file = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	flags := []string{"-config", path, "-hostpower-url=http://flag:1", "-hostpower-token=ophp_flag"}
+	if cfg, err := Load(flags, env); err != nil || cfg.HostpowerURL != "http://flag:1" || cfg.HostpowerToken != "ophp_flag" {
+		t.Fatalf("flag over env/file = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.HostpowerURL != "http://192.0.2.1:9873" || cfg.HostpowerToken != "ophp_env" {
+		t.Fatalf("env over file = %q/%q (err %v)", cfg.HostpowerURL, cfg.HostpowerToken, err)
+	}
+}
+
+func TestLoadWarnsOnHostpowerOptions(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	for _, tc := range []struct {
+		name, url, token string
+		want             string // substring of the one warning; "" = no warning
+	}{
+		{"url only", "http://192.0.2.10:9873", "", ""},
+		{"https with token", "https://192.0.2.10:9873/", "ophp_tok", "without hostpower_tls_fingerprint"},
+		{"nothing", "", "", ""},
+		{"token without url", "", "ophp_tok", "hostpower_url is empty"},
+		{"no scheme", "192.0.2.10:9873", "", "http:// or https://"},
+		{"host only", "192.0.2.10", "", "http:// or https://"},
+		{"other scheme", "ftp://192.0.2.10:9873", "", "http:// or https://"},
+		{"no host", "http:///v1", "", "with a host"},
+		{"unparsable", "http://[::1", "ophp_tok", "with a host"},
+	} {
+		env := map[string]string{"OP_AGENT_HOSTPOWER_URL": tc.url, "OP_AGENT_HOSTPOWER_TOKEN": tc.token}
+		cfg, err := Load(base, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("%s: Load must still succeed: %v", tc.name, err)
+		}
+		if tc.want == "" {
+			if len(cfg.Warnings) != 0 {
+				t.Errorf("%s: Warnings = %v, want none", tc.name, cfg.Warnings)
+			}
+			continue
+		}
+		if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], tc.want) {
+			t.Errorf("%s: Warnings = %v, want one containing %q", tc.name, cfg.Warnings, tc.want)
+		}
+		for _, w := range cfg.Warnings {
+			if tc.token != "" && strings.Contains(w, tc.token) {
+				t.Errorf("%s: warning leaks the token: %q", tc.name, w)
+			}
+		}
+	}
+}
+
+// setConfigGOOS points the helper_socket resolution at goos for one test.
+func setConfigGOOS(t *testing.T, goos string) {
+	t.Helper()
+	orig := configGOOS
+	configGOOS = goos
+	t.Cleanup(func() { configGOOS = orig })
+}
+
+func TestHelperSocketDefaultLinux(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+
+	// Without injection the default follows the real OS.
+	cfg, err := Load(base, noenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ""
+	if runtime.GOOS == "linux" {
+		want = collector.HelperDefaultSocket
+	}
+	if cfg.HelperSocket != want {
+		t.Fatalf("default on %s = %q, want %q", runtime.GOOS, cfg.HelperSocket, want)
+	}
+
+	setConfigGOOS(t, "linux")
+	if cfg, err := Load(base, noenv); err != nil || cfg.HelperSocket != collector.HelperDefaultSocket || len(cfg.Warnings) != 0 {
+		t.Fatalf("linux default = %q, warnings %v (err %v), want %q", cfg.HelperSocket, cfg.Warnings, err, collector.HelperDefaultSocket)
+	}
+	env := func(k string) string {
+		if k == "OP_AGENT_HELPER_SOCKET" {
+			return " /run/env.sock "
+		}
+		return ""
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","helper_socket":"/run/file.sock"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.HelperSocket != "/run/file.sock" {
+		t.Fatalf("file = %q (err %v)", cfg.HelperSocket, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.HelperSocket != "/run/env.sock" {
+		t.Fatalf("env over file = %q (err %v), want trimmed env value", cfg.HelperSocket, err)
+	}
+	if cfg, err := Load([]string{"-config", path, "-helper-socket=/run/flag.sock"}, env); err != nil || cfg.HelperSocket != "/run/flag.sock" {
+		t.Fatalf("flag over env/file = %q (err %v)", cfg.HelperSocket, err)
+	}
+}
+
+func TestHelperSocketOff(t *testing.T) {
+	setConfigGOOS(t, "linux")
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	offEnv := func(k string) string {
+		if k == "OP_AGENT_HELPER_SOCKET" {
+			return "off"
+		}
+		return ""
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","helper_socket":"off"}`)
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  func(string) string
+	}{
+		{"env", base, offEnv},
+		{"flag", append([]string{"-helper-socket=off"}, base...), noenv},
+		{"file", []string{"-config", path}, noenv},
+	} {
+		cfg, err := Load(tc.args, tc.env)
+		if err != nil || cfg.HelperSocket != "" || len(cfg.Warnings) != 0 {
+			t.Errorf("%s: HelperSocket = %q, warnings %v (err %v), want empty, none", tc.name, cfg.HelperSocket, cfg.Warnings, err)
+		}
+	}
+}
+
+func TestHelperSocketRelativeWarns(t *testing.T) {
+	setConfigGOOS(t, "linux")
+	cfg, err := Load([]string{"-gateway-url=https://gw.example", "-token=x", "-helper-socket=run/agent.sock"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load must still succeed: %v", err)
+	}
+	if cfg.HelperSocket != "" {
+		t.Fatalf("HelperSocket = %q, want empty (a relative path turns the helper off)", cfg.HelperSocket)
+	}
+	want := []string{"helper_socket must be an absolute path; the helper source stays off"}
+	if !reflect.DeepEqual(cfg.Warnings, want) {
+		t.Fatalf("Warnings = %v, want %v", cfg.Warnings, want)
+	}
+}
+
+func TestHelperSocketNonLinuxWarns(t *testing.T) {
+	setConfigGOOS(t, "darwin")
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	cfg, err := Load(append([]string{"-helper-socket=/run/op-agent-helper/agent.sock"}, base...), noenv)
+	if err != nil {
+		t.Fatalf("Load must still succeed: %v", err)
+	}
+	want := []string{"helper_socket is set but the helper is only used on Linux; ignored"}
+	if cfg.HelperSocket != "" || !reflect.DeepEqual(cfg.Warnings, want) {
+		t.Fatalf("HelperSocket = %q, Warnings = %v, want empty and %v", cfg.HelperSocket, cfg.Warnings, want)
+	}
+	for _, args := range [][]string{base, append([]string{"-helper-socket=off"}, base...)} {
+		if cfg, err := Load(args, noenv); err != nil || cfg.HelperSocket != "" || len(cfg.Warnings) != 0 {
+			t.Errorf("%v: HelperSocket = %q, warnings %v (err %v), want empty, none", args, cfg.HelperSocket, cfg.Warnings, err)
+		}
+	}
+}
+
+const testFP = "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12"
+
+func TestHostpowerTLSFingerprintResolution(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	noenv := func(string) string { return "" }
+	other := "11" + testFP[2:]
+	third := "22" + testFP[2:]
+	env := func(k string) string {
+		if k == "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT" {
+			return " " + strings.ToUpper(testFP) + " "
+		}
+		return ""
+	}
+	if cfg, err := Load(base, noenv); err != nil || cfg.HostpowerTLSFingerprint != "" {
+		t.Fatalf("default = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+	if cfg, err := Load(base, env); err != nil || cfg.HostpowerTLSFingerprint != testFP {
+		t.Fatalf("env = %q (err %v), want normalised", cfg.HostpowerTLSFingerprint, err)
+	}
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","hostpower_tls_fingerprint":"`+other+`"}`)
+	if cfg, err := Load([]string{"-config", path}, noenv); err != nil || cfg.HostpowerTLSFingerprint != other {
+		t.Fatalf("file = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+	if cfg, err := Load([]string{"-config", path}, env); err != nil || cfg.HostpowerTLSFingerprint != testFP {
+		t.Fatalf("env over file = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+	if cfg, err := Load([]string{"-config", path, "-hostpower-tls-fingerprint=" + third}, env); err != nil || cfg.HostpowerTLSFingerprint != third {
+		t.Fatalf("flag over env/file = %q (err %v)", cfg.HostpowerTLSFingerprint, err)
+	}
+}
+
+// The accept/reject table mirrors collector.ParseHostpowerFingerprint (config
+// may not import collector).
+func TestNormalizeHostpowerFingerprint(t *testing.T) {
+	colon := ""
+	for i := 0; i < len(testFP); i += 2 {
+		if i > 0 {
+			colon += ":"
+		}
+		colon += testFP[i : i+2]
+	}
+	for _, tc := range []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{testFP, testFP, true},
+		{"  " + strings.ToUpper(testFP) + "\n", testFP, true},
+		{colon, testFP, true},
+		{strings.ToUpper(colon), testFP, true},
+		{"", "", false},
+		{testFP[:62], "", false},
+		{testFP + "00", "", false},
+		{"zz" + testFP[2:], "", false},
+		{"ab 12" + testFP[5:], "", false},
+	} {
+		got, ok := normalizeHostpowerFingerprint(tc.in)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("normalize(%q) = %q,%v want %q,%v", tc.in, got, ok, tc.want, tc.ok)
+		}
+		if v := ValidHostpowerFingerprint(tc.in); v != tc.ok {
+			t.Errorf("ValidHostpowerFingerprint(%q) = %v, want %v", tc.in, v, tc.ok)
+		}
+	}
+}
+
+func TestNormalizeHostpowerFingerprintMatchesCollector(t *testing.T) {
+	colon := func(h string) string {
+		var parts []string
+		for i := 0; i < len(h); i += 2 {
+			parts = append(parts, h[i:i+2])
+		}
+		return strings.Join(parts, ":")
+	}
+	mixed := strings.ToUpper(testFP[:32]) + testFP[32:]
+	for _, in := range []string{
+		testFP,
+		"  " + strings.ToUpper(testFP) + "\t\n",
+		strings.ToUpper(colon(testFP)),
+		colon(testFP),
+		mixed,
+		colon(mixed),
+		"",
+		"   ",
+		testFP[:63],
+		testFP + "0",
+		"zz" + testFP[2:],
+		testFP[:10] + " " + testFP[10:],
+		"sha256:" + testFP,
+		"sha256:" + colon(testFP),
+		"a:" + testFP[1:],
+		":" + testFP,
+		testFP + ":",
+		strings.Repeat(":", 5) + testFP,
+		colon(testFP[:62]),
+	} {
+		got, ok := normalizeHostpowerFingerprint(in)
+		parsed, err := collector.ParseHostpowerFingerprint(in)
+		if ok != (err == nil) {
+			t.Errorf("%q: config ok=%v, collector err=%v", in, ok, err)
+			continue
+		}
+		if ok && got != hex.EncodeToString(parsed) {
+			t.Errorf("%q: config %q, collector %q", in, got, hex.EncodeToString(parsed))
+		}
+	}
+}
+
+func TestLoadWarnsOnHostpowerTLSFingerprint(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	for _, tc := range []struct {
+		name, url, fp string
+		want          string
+	}{
+		{"https with pin", "https://192.0.2.10:9873", testFP, ""},
+		{"invalid format", "https://192.0.2.10:9873", "nothex", "is not a SHA-256 fingerprint"},
+		{"pin with http", "http://192.0.2.10:9873", testFP, "requires an https:// hostpower_url; every hostpower request will fail"},
+		{"pin without url", "", testFP, "hostpower_tls_fingerprint is set but hostpower_url is empty: the fingerprint is unused and the hostpower HTTP source stays off"},
+		{"https without pin", "https://192.0.2.10:9873", "", "hostpower_url is https:// without hostpower_tls_fingerprint: the certificate must chain to a system CA and match the host name; a self-signed hostpower certificate fails every request"},
+	} {
+		env := map[string]string{"OP_AGENT_HOSTPOWER_URL": tc.url, "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT": tc.fp}
+		cfg, err := Load(base, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if tc.want == "" {
+			if len(cfg.Warnings) != 0 {
+				t.Errorf("%s: Warnings = %v, want none", tc.name, cfg.Warnings)
+			}
+			continue
+		}
+		if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], tc.want) {
+			t.Errorf("%s: Warnings = %v, want one containing %q", tc.name, cfg.Warnings, tc.want)
+		}
+		for _, w := range cfg.Warnings {
+			if strings.Contains(w, "192.0.2.10") {
+				t.Errorf("%s: warning leaks the URL: %q", tc.name, w)
+			}
+		}
+	}
+}
+
+func TestHostpowerTLSFingerprintWarningCombinations(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	load := func(url, fp string) []string {
+		env := map[string]string{"OP_AGENT_HOSTPOWER_URL": url, "OP_AGENT_HOSTPOWER_TLS_FINGERPRINT": fp}
+		cfg, err := Load(base, func(k string) string { return env[k] })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Warnings
+	}
+	w := load("", "nothex")
+	if len(w) != 2 || !strings.Contains(w[0], "is not a SHA-256 fingerprint") || !strings.Contains(w[1], "fingerprint is unused") {
+		t.Errorf("malformed pin + empty URL = %v, want the invalid-format and the unused warning", w)
+	}
+	w = load("https://192.0.2.10:9873", "nothex")
+	if len(w) != 1 || strings.Contains(w[0], "without hostpower_tls_fingerprint") {
+		t.Errorf("invalid pin + https URL = %v, want only the invalid-format warning", w)
 	}
 }

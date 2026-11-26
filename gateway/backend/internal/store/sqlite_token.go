@@ -52,8 +52,9 @@ func (s *SQLiteStore) CreatePlainToken(ctx context.Context, token TokenRecord, s
 			server_override, server_override_force_unreachable,
 			last_used_model, unknown_model_redirect, unknown_model_redirect_blocked, unknown_model_fallback,
 			vendor_provider_access, claude_model_aliases, claude_effort_compatibility,
-			decisions_confidence_normalize
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			decisions_confidence_normalize, claude_code_usage_display,
+			send_usage_limits, codex_model_switch_prompt
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		token.ID,
 		nullableTokenRef(token.UserID),
 		token.Name,
@@ -82,6 +83,9 @@ func (s *SQLiteStore) CreatePlainToken(ctx context.Context, token TokenRecord, s
 		token.ClaudeModelAliases,
 		token.ClaudeEffortCompatibility,
 		token.DecisionsConfidenceNormalize,
+		token.ClaudeCodeUsageDisplay,
+		token.SendUsageLimits,
+		token.CodexModelSwitchPrompt,
 	)
 	if err != nil {
 		if s.dl.isForeignKeyViolation(err) {
@@ -117,7 +121,8 @@ const tokenColumns = `id, coalesce(user_id,''), name, secret_hash, secret_prefix
 		expires_at, last_used_at, created_at, updated_at, model_override, model_override_map, log_communication, secret,
 		coalesce(service_id,''), kind, coalesce(project_id,''), server_override, server_override_force_unreachable,
 		last_used_model, unknown_model_redirect, unknown_model_redirect_blocked, unknown_model_fallback,
-		vendor_provider_access, claude_model_aliases, claude_effort_compatibility, decisions_confidence_normalize`
+		vendor_provider_access, claude_model_aliases, claude_effort_compatibility, decisions_confidence_normalize,
+		claude_code_usage_display, send_usage_limits, codex_model_switch_prompt`
 
 func (s *SQLiteStore) TokenByID(ctx context.Context, id string) (TokenRecord, error) {
 	row := s.queryRow(ctx, `
@@ -228,12 +233,14 @@ func (s *SQLiteStore) UpdateTokenMetadata(ctx context.Context, token TokenRecord
 		set name = ?, scopes = ?, status = ?, updated_at = ?, model_override = ?, model_override_map = ?, log_communication = ?, secret = ?, project_id = ?,
 			server_override = ?, server_override_force_unreachable = ?,
 			unknown_model_redirect = ?, unknown_model_redirect_blocked = ?, unknown_model_fallback = ?,
-			vendor_provider_access = ?, claude_model_aliases = ?, claude_effort_compatibility = ?, decisions_confidence_normalize = ?
+			vendor_provider_access = ?, claude_model_aliases = ?, claude_effort_compatibility = ?, decisions_confidence_normalize = ?,
+			send_usage_limits = ?, codex_model_switch_prompt = ?
 		where id = ?`,
 		token.Name, token.Scopes, token.Status, token.UpdatedAt, token.ModelOverride, token.ModelOverrideMap, token.LogCommunication, token.Secret, nullableTokenRef(token.ProjectID),
 		token.ServerOverride, token.ServerOverrideForceUnreachable,
 		token.UnknownModelRedirect, token.UnknownModelRedirectBlocked, token.UnknownModelFallback,
 		token.VendorProviderAccess, token.ClaudeModelAliases, token.ClaudeEffortCompatibility, token.DecisionsConfidenceNormalize,
+		token.SendUsageLimits, token.CodexModelSwitchPrompt,
 		token.ID)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
@@ -269,6 +276,27 @@ func (s *SQLiteStore) RotateTokenSecret(ctx context.Context, id, secretHash, sec
 		set secret_hash = ?, secret_prefix = ?, updated_at = ?
 		where id = ?`,
 		secretHash, secretPrefix, updatedAt, id)
+	if err != nil {
+		if s.dl.isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("rotate token secret: %w", err)
+	}
+	return requireAffected(res)
+}
+
+// RotateUserTokenSecret is RotateTokenSecret that also writes the token's
+// claude_code_usage_display flag in the same statement: the flag decides the
+// shape of the secret, so the two must change together or not at all.
+func (s *SQLiteStore) RotateUserTokenSecret(ctx context.Context, id, secretHash, secretPrefix string, claudeCodeUsageDisplay bool, updatedAt time.Time) error {
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	res, err := s.exec(ctx, `
+		update api_tokens
+		set secret_hash = ?, secret_prefix = ?, claude_code_usage_display = ?, updated_at = ?
+		where id = ?`,
+		secretHash, secretPrefix, claudeCodeUsageDisplay, updatedAt, id)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
 			return ErrConflict
@@ -373,6 +401,8 @@ func (s *SQLiteStore) resolveBearer(ctx context.Context, header string) (auth.To
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
+		SendUsageLimits:                record.SendUsageLimits,
+		CodexModelSwitchPrompt:         record.CodexModelSwitchPrompt,
 	}, nil
 }
 
@@ -458,6 +488,9 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 	var claudeModelAliases int64
 	var claudeEffortCompatibility int64
 	var decisionsConfidenceNormalize int64
+	var claudeCodeUsageDisplay int64
+	var sendUsageLimits int64
+	var codexModelSwitchPrompt int64
 	err := row.Scan(
 		&token.ID,
 		&token.UserID,
@@ -487,6 +520,9 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 		&claudeModelAliases,
 		&claudeEffortCompatibility,
 		&decisionsConfidenceNormalize,
+		&claudeCodeUsageDisplay,
+		&sendUsageLimits,
+		&codexModelSwitchPrompt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return TokenRecord{}, ErrNotFound
@@ -508,6 +544,9 @@ func scanToken(row rowScanner) (TokenRecord, error) {
 	token.ClaudeModelAliases = claudeModelAliases != 0
 	token.ClaudeEffortCompatibility = claudeEffortCompatibility != 0
 	token.DecisionsConfidenceNormalize = decisionsConfidenceNormalize != 0
+	token.ClaudeCodeUsageDisplay = claudeCodeUsageDisplay != 0
+	token.SendUsageLimits = sendUsageLimits != 0
+	token.CodexModelSwitchPrompt = codexModelSwitchPrompt != 0
 	return token, nil
 }
 

@@ -163,6 +163,10 @@ type ServiceTokenDTO struct {
 	// DecisionsConfidenceNormalize opts the token into recomputed /v1/decisions
 	// confidence (ADR-098), ungated like ClaudeModelAliases; create only.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// SendUsageLimits and CodexModelSwitchPrompt are the usage-limit opt-ins
+	// (#420), identical in meaning to TokenDTO's; create only (#421).
+	SendUsageLimits        bool `json:"send_usage_limits"`
+	CodexModelSwitchPrompt bool `json:"codex_model_switch_prompt"`
 	// VendorAccess is the token's vendor-account access policy, the same shape and
 	// meaning as TokenDTO's: nil is the strict default (no vendor-account models).
 	// A service owns no vendor account, so the only accounts it can use are the ones
@@ -199,6 +203,10 @@ type CreateServiceTokenRequest struct {
 	// DecisionsConfidenceNormalize opts the new token into recomputed
 	// /v1/decisions confidence (ADR-098). Off when omitted.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// SendUsageLimits and CodexModelSwitchPrompt opt the new token into the
+	// usage-limit signals (see TokenDTO). Off when omitted.
+	SendUsageLimits        bool `json:"send_usage_limits"`
+	CodexModelSwitchPrompt bool `json:"codex_model_switch_prompt"`
 	// VendorAccess optionally opts the new token into shared vendor accounts (see
 	// ServiceTokenDTO); nil (omitted) is the strict default, no vendor access. Each
 	// named account must be reachable for THIS SERVICE (its service provisioned into
@@ -815,6 +823,8 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		ClaudeModelAliases:           req.ClaudeModelAliases,
 		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
+		SendUsageLimits:              req.SendUsageLimits,
+		CodexModelSwitchPrompt:       req.CodexModelSwitchPrompt,
 	}
 	if err := s.tokens.CreatePlainToken(ctx, record, secret); err != nil {
 		return CreateServiceTokenResponse{}, err
@@ -1130,6 +1140,8 @@ func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 		ClaudeModelAliases:           record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:    record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: record.DecisionsConfidenceNormalize,
+		SendUsageLimits:              record.SendUsageLimits,
+		CodexModelSwitchPrompt:       record.CodexModelSwitchPrompt,
 	}
 }
 

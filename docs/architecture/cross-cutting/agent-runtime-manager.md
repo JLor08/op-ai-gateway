@@ -255,7 +255,7 @@ placeholder-derived value by recorded provenance instead
 ([§14.7](#147-the-resolved-command-what-actually-ran)).
 See [ADR-027](../09-architecture-decisions.md#adr-027--model-secrets-never-enter-the-gateway).
 
-Exactly sixteen placeholders are resolved, in both `args` and `env` values — all but
+Exactly seventeen placeholders are resolved, in both `args` and `env` values — all but
 the two secret-bearing ones, `${AGENT_ENV:NAME}` and `${API_TOKEN}`, also in a
 spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)):
 
@@ -293,6 +293,19 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   Deduplicated (first occurrence wins) because CUDA stops parsing the list at
   the first repeated entry, so `1,1,2` would silently yield one visible device
   rather than three.
+- `${HOST_GPU_IDS_MAIN_LAST}` — an exact-match sibling of `${HOST_GPU_IDS}`: the
+  same declared, deduplicated host index list with the **first** entry (the main
+  card) moved to the **end** (`2,0,1` declared → `"0,1,2"`; one GPU renders
+  itself). It exists for an engine that takes host card numbers with its main card
+  last — Strata's config `gpu` (`"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` in `strata.json`), whose stage order is `[helper…, main]`
+  ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)) — while the
+  operator keeps the portal convention that the first GPU row is the main one. The
+  same empty-set refusal as `${HOST_GPU_IDS}`, on the same reasoning. It is
+  generic, not Strata's: the name says what it renders. It resolves in config-file
+  content too, and ships behind the `runtime_gpu_main_last` flag
+  ([§7](#7-feature-negotiation), agent 0.21.0): an older agent passes it through
+  literally, so the portal warns when a spec uses it against an agent that has not
+  declared the flag.
 - `${CUDA_DEVICES}` / `${VULKAN_DEVICES}` / `${METAL_DEVICES}` — exact-match
   siblings of `${HOST_GPU_IDS}` that render the same ordered/deduplicated index
   list as llama.cpp `--device` names instead of bare host indices:
@@ -427,7 +440,8 @@ over-eager refusal breaks specs that work while a literal pass-through breaks
 only a spec that was already wrong. `HOST_GPU_IDS` inherits that rule for the
 same reason (`${GPU_IDS_FILE}`, `${HOST_GPU_IDS_JSON}`), with the same accepted
 cost: `${GPU_IDS}` — the shorter name this token deliberately does *not* use —
-reaches the child as literal text. `CUDA_DEVICES`, `VULKAN_DEVICES` and
+reaches the child as literal text. `HOST_GPU_IDS_MAIN_LAST` is matched exactly as well (the
+near-miss `${HOST_GPU_IDS_MAIN_LAS}` passes through literally). `CUDA_DEVICES`, `VULKAN_DEVICES` and
 `METAL_DEVICES` are exact-match only for the identical reason and carry the
 identical accepted cost, and so is `CONFIG_DIR` (`${CONFIG_DIR_X}` is a plausible
 pass-through token): a typo such as `${CONFIG_DIRECTORY}` reaches the child as
@@ -601,6 +615,32 @@ forwarding now carries a second purpose (issue #58): the gateway's
 rides it too, which is why an api-key'd child's live-progress verdict is
 recoverable without the agent attaching anything of its own.
 
+**The agent's own child probes carry the same credential (agent 0.21.0,
+[ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).** Forwarding covers
+requests the gateway makes; the agent's **own** probes of a child — the
+Prometheus metrics scrape, the context probe and the `/props`-shaped capability
+probes of §10 — used to send nothing, so a keyed child (Strata, or a
+llama-server started with `--api-key`) answered them 401: its metrics and context
+read as unreachable, and a 401 from the capability probe was cached as a
+conclusive "no verdict". The pushed spec now carries **`api_token_header`**
+beside a non-empty `api_token`: the effective header name from the same
+`routing.SpecUpstreamAuth` (the spec's custom header, else the application's;
+empty means `Authorization: Bearer`). It is additive and `omitempty` — a
+token-less spec's document is byte-identical, and an older agent ignores the key —
+and the file-mode report mirrors it (a header name is not a secret). The agent's
+`probeRuntimeChild` derives the credential once with the gateway's own rule (the
+raw token under a named header, else `Authorization: Bearer <token>`) and hands it
+to the scrape (`collector.NewPromScraper`) and, through the context
+(`collector.WithProbeAuth`, whose value redacts itself when printed), to the
+`/props`-shaped probes. An authenticated probe follows **no redirect**, so the
+credential never travels to a location the child names (Go strips only
+`Authorization` across hosts, not a custom header). The token and header live in
+the in-memory runtime status only (`json:"-"`), never in a log line, an error
+string or a reported URL. `api_token_header` is probe-only and stripped from
+`sameLaunchShape`, so a header edit never relaunches a child. A spec without a
+token sends exactly what it sent before. No feature flag: it is a behaviour fix
+covered by the `0.21.0` bump, and the gateway gates nothing on it.
+
 **Sealed at rest, decrypted only at the moment of use, fail-closed on
 decrypt.** `set` and `random` values are sealed with the same capture cipher
 used everywhere else secrets are stored (`capture.SealSecret` /
@@ -707,16 +747,27 @@ the option is on:
 | Mode | Behavior |
 |---|---|
 | `env` (default) | The agent injects the vendor variable from the table above, exactly as before this field existed. |
-| `args` | The agent injects **no** visibility variable at all. The operator instead places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, or the generic `${DEVICES}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)), in the spec's own `args` — `["--device", "${CUDA_DEVICES}"]` for llama.cpp. |
+| `args` | The agent injects **no** visibility variable at all. The spec itself carries the restriction: the operator places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, the generic `${DEVICES}`, or one of the host-numbered card lists `${HOST_GPU_IDS}`/`${HOST_GPU_IDS_MAIN_LAST}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) in the spec's own `args` **or in a config file's content** — `["--device", "${CUDA_DEVICES}"]` for llama.cpp, `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` in Strata's `strata.json`. The portal labels this mode "Via args or config file"; the stored value stays `args`. |
 
 `args` mode exists because a visibility variable hides every other card from
 the whole child process, while llama.cpp's own `--device` flag is
 finer-grained; it is a second lever beside the variable, not a replacement for
 it, which is why `env` stays the default and every pre-existing spec keeps its
-old behaviour untouched. An **`args`-mode spec must carry one of the three
-placeholders, or `${DEVICES}`, somewhere in `args`** (the `${…_FIRST_DEVICE}` and
+old behaviour untouched. An **`args`-mode spec must carry one of the six
+card-list placeholders — the three `${…_DEVICES}` lists, `${DEVICES}`,
+`${HOST_GPU_IDS}` or `${HOST_GPU_IDS_MAIN_LAST}` — somewhere in `args` or in a
+config file's content** (the `${…_FIRST_DEVICE}` and
 `${FIRST_LOCAL_DEVICE}` tokens alone do not count: they name one device and
-restrict nothing). Turning the option on, selecting `args`,
+restrict nothing). The two host-numbered lists count because they name the
+spec's full card set for a model server that takes its card list itself and
+numbers cards like the host: such a server must not get a visibility variable
+(it would renumber the cards from 0 and break the host-numbered list), so
+`args` mode is the only enforcement that fits it, and the config file is
+where that list lives (the Strata launch shape in
+[§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+Existing specs are unchanged: no default moved, and the rule only widened. The check is a
+substring match over `args` and every config file's content; it does not
+parse the file. Turning the option on, selecting `args`,
 and never mentioning a placeholder would have the agent inject nothing *and*
 the args say nothing, silently leaving every card visible to the child — the
 exact failure trap 1 below exists to prevent, reached through the other door.
@@ -839,7 +890,7 @@ have emitted).
 ### 3.4 Runtime-server kind and per-kind probe-path derivation
 
 A spec's `Type` (`""` | `vllm` | `llama_cpp` | `tgi` | `ollama` |
-`stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `sglang` | `sglang_omni` | `custom`; migration 75, `text not null default ''`)
+`stable_diffusion_cpp` | `audio_cpp` | `vllm_sr` | `sglang` | `sglang_omni` | `strata` | `custom`; migration 75, `text not null default ''`)
 is what tells the gateway — and, through it, the agent — which conventions govern
 *this* child's metrics and context-window endpoints (design 2026-09-07), and,
 for `stable_diffusion_cpp`, its health path. `""` (every pre-feature row) is
@@ -850,8 +901,8 @@ launched binary's basename, first match wins — `vllm-srun`/`vllm_srun`
 (`sglang_omni`, before `sglang`, whose substring they contain), then `sglang`, then `vllm`, then
 `llama-server`/`llama_cpp`/`llama.cpp`, then
 `text-generation-launcher`/`tgi`, then `sd-server`/`stable-diffusion`, then
-`audiocpp_server`/`audio.cpp`, then `ollama` — and falls back to `custom` when nothing
-matches.
+`audiocpp_server`/`audio.cpp`, then `ollama`, then `strata` (last, so it shadows no
+earlier row) — and falls back to `custom` when nothing matches.
 `EffectiveRuntimeSpecType(spec)` resolves the type that actually governs a
 spec: the explicit `Type` when set, else the detected one.
 
@@ -870,6 +921,7 @@ winning **per field** over the type's own default:
 | `vllm_sr` | `/metrics` (Prometheus; `vllm_srun_queue_depth`=queue, **no** running gauge, so active stays 0) | `/v1/models` | `data[].limits.max_input_tokens` (the first entry that carries it; the best-effort scan is the fallback) |
 | `sglang` | `/metrics` (Prometheus, needs `--enable-metrics`; `sglang:num_queue_reqs`=queue, `sglang:num_running_reqs`=active) | `/v1/models` | `data[].max_model_len` |
 | `sglang_omni` | *(none)* — sglang-omni has no `/metrics` | *(none)* — its `/v1/models` carries no context length | — |
+| `strata` | `/metrics?format=prometheus` (the bare `/metrics` answers JSON; the Prometheus body uses llama.cpp's names, so `llamacpp:requests_processing`=active, `llamacpp:requests_deferred`=queue) | `/props` | `default_generation_settings.n_ctx` (the llama.cpp extractor, then the best-effort scan) |
 | `custom` | *(none — operator paths only)* | *(none — operator paths only)* | best-effort: scans the response for the first `n_ctx`/`max_model_len`/`context_length`(-suffixed) key at any depth |
 
 These upstream shapes were verified against each project's own documentation
@@ -1047,6 +1099,83 @@ wav, mp3, flac and pcm, with voice cloning through `ref_audio`. Their facts, eac
   harmless: it ignores the type string, so the gateway sees a best-effort context and no `sglang:` queue gauge, and the agent
   still sends the `/props` probe.
 
+**`strata` is Strata's `strata serve`, launched as an agent child
+([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).** Read off
+`Niko1221/Strata@c6f6427` (release 0.2.17, engine 0.1.63); the same string is also an
+application type ([Routing & Model Selection §1](routing-and-model-selection.md#1-data-model)).
+Its facts, each from the code:
+
+- **Detection** matches the binary's basename exactly, case-insensitively: `strata`,
+  `strata.cmd`, `strata.exe`, or an engine helper `strata-<name>` / `strata-<name>.exe`
+  (`strata-vision.exe`), checked after every other row. A name that merely contains the
+  word (`mystrata-tool`, `stratagem`) stays `custom`. A spec whose binary is
+  the bundled `python.exe` needs an explicit `type`.
+- **Probe paths.** Metrics `/metrics?format=prometheus`, used verbatim, query included;
+  context `/props`, read by the llama.cpp extractor (`default_generation_settings.n_ctx`
+  first, so another `n_ctx` elsewhere in the body cannot win). The health path is the stock
+  `/health`, which Strata answers without a key. Every other route needs the key, which the
+  agent's own probes now send ([§3.2](#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)).
+- **`/props` is probed** for capabilities as for llama.cpp (`strata serve` serves it), and
+  `EffectiveMappingContextProbePath` keeps the router's `/upstream/{model}/props` default for
+  the type.
+- **Role** falls back to chat. Live timings and live progress stay off.
+- **Launch shape** (the portal template, filled into a new spec when the type is chosen; an
+  edited stored spec is never prefilled): binary hint
+  `%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd` (the field takes the absolute
+  path, `C:\Users\<user>\AppData\Local\…`, which must be in `runtime_allowed_binaries`), args
+  `serve --config ${CONFIG_DIR}/strata.json --host 127.0.0.1 --port ${PORT} --output jsonl --shutdown-timeout 3` (`strata serve` has no `--gpu` flag; the card list is in the config file),
+  env `STRATA_API_KEY=${API_TOKEN}`, `set_visible_devices` **on in `args` mode** (§3.3:
+  the agent injects no `CUDA_VISIBLE_DEVICES`, which would renumber the cards from 0; the
+  config's host-numbered `gpu` list is the enforcement, and its
+  `${HOST_GPU_IDS_MAIN_LAST}` satisfies the args-mode placeholder rule — so a Strata spec
+  saves only once it has a GPU row and the imported `strata.json`), startup timeout 960 s, health path `/health`,
+  flavors `openai` and `anthropic`, `responses_mode` and `messages_mode` `passthrough`,
+  `process_tree` `job` ([§3.9](#39-the-windows-process-tree-process_tree)). The run config
+  itself is the config file `strata.json` ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)),
+  imported from `strata launch` ([§11.5](#115-what-each-remaining-tab-shows)). `--shutdown-timeout 3`
+  because the agent drains in-flight requests itself before it signals (§6), so Strata's own
+  second drain is redundant. **Which binary the template documents:** `strata.cmd` starts correctly in job mode and stops cleanly through Ctrl-Break (both verified on hardware, 2026-11-23, see §3.9); cmd.exe's "Terminate batch job" prompt only adds a cosmetic log line and a root exit code of -1, so the bundled `python.exe` fallback is not needed.
+- **GPU roles are the row order.** The first GPU row is main, the rest helpers;
+  the imported config's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` moves the main card last for Strata's stage order (a comma-separated string, valid JSON before expansion; Strata reads `"0,1,2"` like `[0,1,2]`), and `"gpu_order": "as_given"` stops Strata reordering them. A `gpu` set by hand wins over `gpu_roles` upstream, so the file carries no `gpu_roles`.
+- **The startup timeout is 960 s**, `max(engine_ready_s, 900) + 60` for Strata's default
+  engine wait of 900 s, so the agent never gives up before Strata does. `engine_ready_s`
+  is that ceiling, not a load time (a real load took one to two minutes). Against the
+  default `server_agent` `timeout_ms` of 600000 this raises `timeout_ms_below_startup_timeout`
+  (§11.5) — truthfully; the type note says to raise the parent application's timeout to at
+  least 960000 ms.
+- **Windows account.** The supported setup is the agent running under the account that
+  installed Strata: the install is `%LOCALAPPDATA%`-relative and the run config's
+  `component:` references resolve per user. An agent under LocalSystem or another account is
+  unsupported for Strata.
+- **Host paths are refused** for a Strata target, on the translate path and in the raw
+  passthrough body ([Compatibility & Inference §3.1](compatibility-and-inference.md#31-openai-chat-completions)).
+
+**Strata's telemetry endpoints, prepared but not yet read.** `strata serve` offers more than
+the gateway reads today. With the spec token now on the agent's probes, all of these are
+reachable; which of them the portal shows is a follow-up.
+
+| Endpoint | Auth | What it is | Read today |
+|---|---|---|---|
+| `/health` | none | `{"status":"ok","service":"strata","loaded":…}` | the agent's health probe |
+| `/v1/models` | key | one model, id = the config's `model_name`; newer releases add `status.value`, `context_length`, `meta.n_ctx`, `architecture.input_modalities` | by the gateway for a `strata` **application** (context and vision, [Routing & Model Selection §1](routing-and-model-selection.md#1-data-model)) |
+| `/props` | key | llama.cpp-shaped server properties, with the context size | context and capability probes |
+| `/metrics` | key | JSON by default; Prometheus with `?format=prometheus` or an `Accept` of `text/plain`/openmetrics, with llama.cpp's names (`llamacpp:requests_processing`, `llamacpp:requests_deferred`, `llamacpp:prompt_tokens_seconds`, `llamacpp:predicted_tokens_seconds`) plus `strata:*` counters (`strata:drafts_offered_total`, `strata:drafts_accepted_total`, …) | running and queued counts only |
+| `/v1/telemetry` | key | Strata's versioned telemetry contract (upstream `docs/TERMINAL_TELEMETRY_FIELDS.md`) | no |
+| `/slots` | key | llama.cpp-style slot state | no |
+| `/v1/status` | key | server status, with the engine version | no |
+
+The desktop app's LAN share (the app port + 1) serves only `/v1/models`,
+`/v1/chat/completions`, `/v1/messages` and `/v1/responses` and none of the endpoints above.
+Per-request rates come from the `timings` object of chat completions. `strata serve`'s
+`/v1/messages` and `/v1/responses` carry none, so for a streamed Claude Code or Codex request
+the gateway measures both rates itself (#426): generation over the first-content-to-end window,
+prompt over the time to first content. The prompt figure needs 256 processed tokens, is
+analytics-only and never feeds routing: it errs low when the upstream reports its cache reads
+and reads high when an upstream reuses a prefix cache without reporting it ([Telemetry §8.4.3](telemetry-usage-observability.md#843-running-connections-active-requests)).
+A buffered `/v1/messages` or `/v1/responses` records none. Candidate follow-ups: host tokens/s
+gauges, speculative-draft acceptance, conversation-cache hits, the engine version in the agent
+panel.
+
 **`ollama` is the one row whose verb is not `GET`, and having it wrong made
 that probe unsatisfiable for as long as it existed (issue #54, fixed).**
 Ollama's `/api/show` is POST-only and takes the model in the body; since
@@ -1136,7 +1265,8 @@ in `internal/routing/application_probes.go` supply what the fields would say:
   becomes "no probe" for a type whose server serves no `/props` — `vllm`,
   `tgi`, `ollama`, `vllm_sr` and `sglang`, which state their context size on
   another path (the table below), and `stable_diffusion_cpp`, `audio_cpp` and
-  `sglang_omni`, which have none. `llama_cpp` and `custom` (the detection
+  `sglang_omni`, which have none. `llama_cpp`, `strata` (whose `strata serve` serves
+  a llama.cpp-shaped `/props`) and `custom` (the detection
   fallback, which may be a llama-server under another name) keep the default,
   and a stored `context_probe_path` still wins for every type. The router
   forwards the passthrough to whatever child runs, so before this narrowing a
@@ -1499,7 +1629,7 @@ the child reads its files at startup, so a content edit relaunches it.
 **What a file's content may contain.** Placeholders are expanded in content by
 a small expander over the **same resolver** the `args`/`env` pass uses
 (`resolveNonSecretToken`), restricted to the **non-secret** tokens: `${PORT}`,
-`${MODEL}`, `${HOST_GPU_IDS}`, `${CUDA_DEVICES}`, `${VULKAN_DEVICES}`,
+`${MODEL}`, `${HOST_GPU_IDS}`, `${HOST_GPU_IDS_MAIN_LAST}`, `${CUDA_DEVICES}`, `${VULKAN_DEVICES}`,
 `${METAL_DEVICES}` and `${CONFIG_DIR}`, each meaning exactly what it means on the
 command line. `${API_TOKEN}` and any `${AGENT_ENV…}` spelling are **hard
 errors** in content, as is a `PORT`-prefixed near-miss; every other `${…}`
@@ -1512,6 +1642,32 @@ and backups can read it, so a decrypted secret is never put there; secrets keep
 travelling through `env`/`args`, where the reported command masks them. Errors
 name the offending token, never a value. The gateway refuses the two secret
 placeholders at submit time as well.
+
+**A worked example: Strata's run config.** A `strata` spec (§3.4) carries one file,
+`strata.json`, which the portal's "Import run config" action makes from the JSON
+`strata launch` wrote (§11.5) and the args name as `--config ${CONFIG_DIR}/strata.json`.
+Shortened, with the paths redacted, the stored content looks like this:
+
+```json
+{
+  "exe": "component:strata-engine",
+  "args": ["--pack", "C:\\Users\\<user>\\…", "--max-context", "262144", "--vision", "--kv", "fp16"],
+  "vision": {"exe": "…", "mmproj": "…", "model": "…", "gpu": true, "max_tokens": 1024},
+  "layer_split": "auto",
+  "vram_reserve_mib": 700,
+  "engine_ready_s": 1845,
+  "model_name": "${MODEL}",
+  "gpu_order": "as_given"
+}
+```
+
+`model_name` is `${MODEL}`, so the id Strata lists can never drift from the mapping's
+upstream model, and the card order is the file's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` (`strata serve` has no `--gpu` flag): the import drops the source's `gpu`,
+`gpu_roles`, `gpu_cards` and `gpu_order`, writes that `gpu` (none when the source named no cards) and sets `"gpu_order": "as_given"`. The key is
+never in the file; it travels as `STRATA_API_KEY=${API_TOKEN}` in `env`, and every key named
+`api_key` (any case, at any depth, e.g. inside `vision`, whatever its value) in the pasted
+JSON is dropped with a notice. For this file the import proposes a
+startup timeout of `max(1845, 900) + 60` = 1905 s.
 
 **Names, counts and sizes.** The gateway's runtime-spec PUT refuses a list
 that breaks any rule with 400 `runtime_spec.config_files_invalid` (the message
@@ -2034,15 +2190,16 @@ member, not replicable, an explicit startup timeout); the member list (one entry
 per server, none on the head's server); then rights and consent, member specs,
 member binaries, network and transport, and the member GPUs (an Apple GPU needs
 a GPU budget; a known non-NVIDIA GPU needs an estimate on an automatic member,
-and `--tensor-split` on the head, because its share is never measured per
-process); last of all, automatic members need the head binary's version known
-(`runtime_spec.cluster_head_binary_version_unknown`). Rights are needed on every
-member server the write keeps or adds; removing members, turning the cluster
-off included, needs the head's rights only, as deleting the head does: removal
-only frees the member host, consent protects additions. Off a head,
-`${RPC_SERVERS}` and `${RPC_DEVICES}` are refused in args, env and config file
-content alike. The scan of the head's args steps over option values with a table
-of llama-server's value-taking options at the pinned build
+and `--tensor-split` on the head, because its share is not reliably measured per
+process: AMD is measured only on Linux and only for ROCm/HIP builds, never for a
+Vulkan `rpc-server`); last of all, automatic members need the head binary's
+version known (`runtime_spec.cluster_head_binary_version_unknown`). Rights are
+needed on every member server the write keeps or adds; removing members, turning
+the cluster off included, needs the head's rights only, as deleting the head
+does: removal only frees the member host, consent protects additions. Off a
+head, `${RPC_SERVERS}` and `${RPC_DEVICES}` are refused in args, env and config
+file content alike. The scan of the head's args steps over option values with a
+table of llama-server's value-taking options at the pinned build
 (`internal/portal/llama_flags.go`), so `--alias -dev` is one option and its
 value. When the membership, member mode, network, transport and head binary are
 all as stored, the rights-to-network steps are skipped, so a member the caller
@@ -2236,7 +2393,10 @@ every usage write names the run it read):
   and only while the member reports that head's hold.
 - During a run the stored value only rises, and the run's own peak is kept
   beside it (`run_peak_*`), so a gateway restart in the middle keeps both. A
-  rise pushes nothing: the agent already charges `max(live, demand)`.
+  rise pushes nothing: the agent already charges `max(live, demand)`. A cluster
+  start that reaches its configuration step during the run sends the member
+  the document it lacks ([Runtime View
+  §6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start)).
 - When a run that formed ends, its peak replaces the stored value, a lower one
   included, and the member server's document is pushed: after the head
   disconnects the member falls back to its idle footprint, and its agent no
@@ -2525,8 +2685,8 @@ What differs is how each step reaches the process:
 | Step | Native | `wsl` |
 |---|---|---|
 | Start | exec the binary | exec `wsl.exe` with the chain above |
-| Terminate (graceful) | the process group on unix; a kill on Windows (§13) | `systemctl --user kill --signal=SIGTERM <unit>.scope` in the distro |
-| Kill grace expired | `killGroup` | `systemctl --user kill --signal=SIGKILL <unit>.scope`, then kill `wsl.exe` as the backstop, skipped once the generation has exited |
+| Terminate (graceful) | the process group on unix; on Windows a kill, or Ctrl-Break to the child's group for a `process_tree: job` spec (§3.9) | `systemctl --user kill --signal=SIGTERM <unit>.scope` in the distro |
+| Kill grace expired | `killGroup`; `TerminateJobObject` for a Windows `job` spec (§3.9) | `systemctl --user kill --signal=SIGKILL <unit>.scope`, then kill `wsl.exe` as the backstop, skipped once the generation has exited |
 | Exit code | the process's | `wsl.exe`'s: the workload's `WEXITSTATUS`, or the raw signal number for a death by signal; `-1` (Windows reports `4294967295`) is `wsl.exe`'s own failure |
 | Memory-pressure signature (ADR-086) | SIGKILL (unix) or the last measured RAM at 90 % of the host pool | the last measured RAM at 90 % of the **VM** pool only |
 | Orphan sweep | none | at the distro's first UID answer, kill every scope of another agent run (below) |
@@ -2555,8 +2715,8 @@ own error text is in the runtime log. A signal death returns the raw signal numb
 `exit(9)` and a SIGKILL both read as `9`, and nothing tells them apart today (§13).
 
 **The orphan sweep.** A unit outlives its agent when the agent dies without
-stopping it (a crash, a kill, a host-side update; the agent puts its children in
-no Job Object): its workload still holds the GPU, the RAM and the
+stopping it (a crash, a kill, a host-side update; a `wsl` child is in no Job
+Object, §3.9): its workload still holds the GPU, the RAM and the
 port inside the VM, invisible to the new run. So once per agent lifetime per
 distro, when the distro's first UID lookup answers (the lookup the first document
 whose `wsl` specs name that distro starts), the agent lists
@@ -2845,6 +3005,104 @@ because that account is now an unprivileged user and not LocalSystem. A dedicate
 distro with `[interop] enabled=false` narrows it, and where no `wsl` spec needs its
 config files through `/mnt/<drive>`, so does turning the drive mounts off
 (`[automount] enabled=false`).
+
+### 3.9 The Windows process tree (`process_tree`)
+
+A native Windows child used to be **kill-only**, and the kill reached the process the
+agent exec'd and nothing beneath it. That is wrong for a launcher-shaped server:
+Strata's `strata.cmd` runs `python.exe`, whose engine grandchild holds nearly all of
+the model's VRAM and RAM, so a stop left the engine running and the measurement
+charged the managed root almost nothing. A spec can therefore opt into a **job
+object** ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).
+**Verified on hardware (2026-11-23):** the job-mode start (suspended start, job, resume) works with `strata.cmd` as the binary; `${HOST_GPU_IDS_MAIN_LAST}` resolved to `0,1,2` for GPUs declared `2,0,1` and Strata logged a layer split across GPUs `[0, 1, 2]` (main card last); ready in 38 s; the live log shows the server's output including its JSONL `starting`/`ready` events; the agent's authenticated metrics and context probes both succeeded (context 262144); per-GPU VRAM is attributed over the whole tree (the engine is a grandchild, so per-root attribution would read about 0); a chat completion through the gateway answered. **Stop verified on hardware (2026-11-23, agent 0.21.0, 3 GPUs):** the portal's stop delivered Ctrl-Break and Strata logged `stopping` (`reason: "sigbreak"`), `draining` (0 pending, 3 s deadline) and `stopped` (`drained: true`, `cancelled_requests: 0`, `exit_code: 0`) about 2.7 s after the stop, inside the 5 s kill grace; cmd.exe then printed its localized "Terminate batch job (Y/N)?" prompt to the live log and the root exited about 0.1 s later with exit code -1, and the spec state became `stopped` (intentional stop, restarts 0). The prompt does not block the stop; its only side effects are a cosmetic log line and a root exit code of -1 instead of 0. VRAM was freed on all three GPUs within about 2 s (host totals 24.5/32.9/33.3 GB to 0.3/0.0/0.0 GB) and host RAM in use fell from 22.1 to 10.6 GB, so the engine and vision processes ended; leftover non-GPU processes (cmd.exe, python.exe) were not inspected in Task Manager. `strata.cmd` stays the documented binary and the `python.exe` fallback is not needed. **Known RAM under-count:** the spec's measured RAM (private working set summed over the job) read 7.7 GB while host RAM in use fell by about 11.5 GB at stop; pages that are not private working set (locked or mapped model pages, the file cache, driver allocations) are not counted. **Still pending:** the RAM figure against Task Manager beyond the above, Claude Code and Codex round trips, the Windows-tagged unit tests and the console-less (service) agent path. Everything else below is compiled and vetted for Windows (`GOOS=windows go vet`, `golangci-lint`); the Windows-tagged tests (`proc_job_windows_test.go`) are ones CI cannot run (§13).
+
+**The field.** `process_tree` is `direct` (the default, today's behaviour) or `job`
+(migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-115-migrations)).
+The gateway refuses any other value (400 `runtime_spec.process_tree_invalid`) and
+pushes `"process_tree": "job"` only for a job spec, omitting it for `direct`, so every
+existing document and its ETag are byte-identical. The agent reads an absent or empty
+value as `direct` and drops a spec with any other value at parse time (a Warn, like an
+unknown execution mode). It is **launch-affecting** (§5.6): `sameLaunchShape`
+normalises `direct` to the absent spelling, so `direct` ↔ `job` relaunches and a
+gateway that starts sending the explicit default does not. Job mode applies to a
+**native** spec on **Windows** only. On Linux and macOS the child already runs in its
+own process group (§3.1), and a `wsl` spec keeps its systemd scope (§3.8): a stored
+`job` is inert there, and the portal hides the control for `wsl`.
+
+**Negotiation.** The agent declares `runtime_process_tree_job` (§7, `Since:
+"0.21.0"`) on every OS, because the features registry has no per-OS mechanism, so the
+flag alone proves nothing. An operator's spec PUT that **moves** a spec into `job` (a
+new spec, or a stored one whose value is not `job`) is refused with 400
+`runtime_spec.process_tree_unsupported` when the gateway knows the agent cannot honour
+it: the server's reported OS (stored telemetry) is not `windows`, or the agent has
+declared its features since the gateway started and the flag is not among them. When
+either fact is still unknown and neither known fact refuses, the save succeeds and the
+runtime warnings carry `process_tree_agent_unknown` (§11.5). A re-save of a spec
+already stored as `job` is not refused, whatever the agent: the portal's
+Stop/Start/Pin/Clear overrides re-send the whole spec, and refusing them would lock the
+operator out of the spec. Such a spec on an agent known to lack support draws
+`process_tree_agent_unsupported` (§11.5) instead. The check runs last among the
+operator path's refusals, so an otherwise invalid body keeps its older answer; a
+benchmark writer re-saves the stored value unchecked. There is no push-time withhold:
+after an agent downgrade a stored job spec runs `direct`, and the warning says so until
+the operator switches it to `direct` or updates the agent.
+
+**Start.** `startInJob` creates a job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+first (so a creation failure leaves no process behind), starts the child with
+`CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP`, assigns it to the job and only then
+resumes it, so no grandchild can be spawned outside the job. `os.StartProcess` closes
+the primary thread handle, so the thread is found again through a ToolHelp snapshot
+and resumed with `ResumeThread`. Nested jobs (Windows 8 and later) let Strata's own
+job sit inside the agent's. When the agent has no console (a service), the child gets
+`CREATE_NEW_CONSOLE` with a hidden window, so it has a console to receive Ctrl-Break
+on. Stdio stays redirected to the generation's log writer (§14). A failure after the
+start kills and reaps the child and closes the job; the manager treats it as a failed
+exec (`start_failed`, then backoff).
+
+**Stop.** The drain grace (10 s) and the kill grace (5 s) are unchanged (§6).
+Terminate sends `CTRL_BREAK_EVENT` to the child's process group: on a shared console
+directly (the agent is not in that group), otherwise by attaching to the child's
+console (`AttachConsole`), disabling its own Ctrl handling, generating the event and
+detaching, serialised by a mutex. The owner waits at most **1 s** for the delivery; a
+failed or hung delivery is logged and falls straight through to the kill. The kill is
+`TerminateJobObject`: the whole tree. The Strata template passes
+`--shutdown-timeout 3`, because the agent has already drained in-flight requests
+before it signals; the engine's own unmap may be cut short by the job kill, which
+frees the VRAM immediately.
+
+**Lifetime.** A watcher closes the job handle **as soon as the root exits**, and the
+reap closes it again (`procCloser`, idempotent). Two consequences are intended:
+descendants left behind when the root exits on its own die at once, with no grace;
+and a grandchild that inherited the stdout pipe cannot keep the reap waiting for
+ever. A mutex makes kill, close and the member listing no-ops after the close, so no
+call reaches a recycled handle value. Because the agent holds the only handle, **the
+tree also dies with the agent**: a crashed or killed agent closes the handle and
+Windows ends every process in the job. A `direct` child, by contrast, outlives an
+agent crash.
+
+**Measurement.** A generation whose control can list its tree (`procTreeLister`,
+`jobControl.pids` over `JobObjectBasicProcessIdList`) is registered with the
+collector's process-tree registry at start (`collector.RegisterProcessTree`, wired
+through `ManagerOptions.ProcessTrees` in `main.go`, because `internal/runtime` may not
+import `internal/collector` under the frozen architecture-test allowlist) and
+unregistered after the job handle closes. A measurement takes one snapshot of all
+registered trees, calling each members function once outside the registry lock:
+
+- **RAM**: a registered root is charged the summed private working set of every
+  process in its tree, summed in bytes and rounded once; an unreadable member
+  contributes nothing, so a root that has exited while its tree runs on is still
+  charged the tree. The measurer contract is unchanged (absent, never 0; nil when
+  nothing is measurable).
+- **VRAM**: the per-process PDH GPU-memory rows of tree members are rewritten to the
+  root before the per-GPU sum, so the engine grandchild's memory on each card lands on
+  the managed spec, per GPU. nvidia-smi compute-apps rows get the same mapping on
+  Windows (`nvidia_groups_windows.go`), for consistency.
+
+A PID in no registered tree keeps its own per-PID attribution, and Linux keeps its
+process-group grouping (§5.3).
+
+**Error text.** A failed job step reads `runtime: exec <bin>: runtime: process_tree
+job: <step>: <err>` in `last_error`.
 
 ## 4. One router port per AI server
 
@@ -3218,7 +3476,12 @@ The accepted trade-off is therefore **scoped, not blanket**:
 - **After commit:** a later failure can only be a terminal SSE frame
   `data: {"error":{"code":…,"message":…}}` carrying the same stable code — the
   shape the gateway's own translate path already uses for mid-stream failures.
-  What is genuinely lost is the child's real response headers.
+  What is genuinely lost is the child's real response headers. On the
+  gateway's native passthrough an Anthropic Messages or Responses client cannot
+  read that frame, so the gateway translates it into the client flavor's own
+  error event (`event: error`, and for Responses also `response.failed`) and
+  records the request as failed under the agent's code ([API Compatibility &
+  Inference §7.3](compatibility-and-inference.md#73-an-agents-in-stream-failure-on-the-native-passthrough)).
 
 Four properties of the proxy paths are each one edit from a leaked request slot
 or a pinned model process:
@@ -3569,7 +3832,7 @@ is in [Data Model](../reference/data-model.md); the semantics that matter here:
 | `agent_runtime_spec_gpus.vram_estimate_mb` | Operator (portal) | Declared demand for this spec on this GPU index. A **floor** (see below). |
 | `agent_runtime_spec_gpus.vram_measured_mb` | Agent | Measured actual usage, written back through telemetry. **Always ignored on a portal write** — `PutRuntimeSpec` copies each index's stored measured value forward. |
 | `agent_runtime_specs.ram_estimate_mb` | Operator (portal) | Declared host-RAM demand of the whole spec: one number, not per GPU. A **floor**; `0` = unknown. |
-| `agent_runtime_specs.ram_measured_mb` | Agent | The managed child's measured resident RAM (RSS; the private working set on Windows), written back through telemetry. **Never clobbered by an operator upsert** — the store's update list does not touch it, and the portal's own response keeps the stored value. |
+| `agent_runtime_specs.ram_measured_mb` | Agent | The managed child's measured resident RAM (RSS; the private working set on Windows, summed over the job's processes for a `process_tree: job` spec, §3.9), written back through telemetry. **Never clobbered by an operator upsert** — the store's update list does not touch it, and the portal's own response keeps the stored value. |
 | `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU index on that server. **`0` means "no budget set" and is unconstrained**, identical to an absent row — see §5.2 — **except that the agent fills in a budget the operator did not set from the GPU's detected total memory** (below). |
 | `ai_servers.runtime_max_processes` | Operator | Concurrent managed processes; `0` = unlimited. |
 
@@ -3962,8 +4225,9 @@ keep the exception from reintroducing the thrash the order closed:
   evicted (busy, still loading) spends nothing: the decision is a plain `Wait`
   and the shot is still there for when the neighbour is idle.
 - **It needs a measurer.** The exception exists only to capture a measurement,
-  and measurement is NVIDIA-only (below). On an AMD, Apple-silicon or GPU-less
-  host no number could ever arrive, and this section is explicit that an
+  and measurement exists only for NVIDIA and for AMD on Linux (below). On an
+  Apple-silicon, GPU-less, AMD-on-Windows or non-ROCm AMD host no number could
+  ever arrive, and this section is explicit that an
   unknown-demand spec there simply waits behind a busy or pinned holder;
   evicting a working model for a spec that can never be measured is exactly the
   regression the order exists to prevent. So a host with no VRAM measurer never
@@ -4000,16 +4264,26 @@ moment a child first passes a health probe — the point where a model server
 has finished mapping its weights, so the first number is already the
 meaningful one.
 
-**VRAM measurement is NVIDIA-only (host RAM is measured on every platform, §5.1),
-and which NVIDIA measurer runs is decided per platform.** `main.go` installs exactly one measurer,
-`collector.NewVRAMMeasurer()` — a build-tag split (`measurer_other.go` /
-`measurer_windows.go`), not a `runtime.GOOS` branch — which yields the
-compute-apps measurer on every non-Windows host, the PDH measurer on Windows,
-and **nil** whenever the chosen one cannot work on this host. Both of them need
-`nvidia-smi` on PATH, so the NVIDIA-only scope is unchanged: an AMD host (the
-host-level `rocm-smi` collector reports no per-PID split), an Apple
-unified-memory host, and a host with no GPU at all install **no** measurer and
-never write a measurement back. On those hosts the operator's
+**VRAM measurement exists for NVIDIA and for AMD on Linux (host RAM is measured on
+every platform, §5.1), and which measurer runs is decided per platform.** `main.go`
+installs exactly one measurer, `collector.NewVRAMMeasurer()` — a build-tag split
+(`measurer_other.go` / `measurer_fallback_linux.go` / `measurer_fallback_other.go` /
+`measurer_windows.go`), not a `runtime.GOOS` branch — which yields, on **Linux**, the
+NVIDIA compute-apps measurer when `nvidia-smi` is on PATH, else the **KFD** measurer
+when `/sys/class/kfd/kfd/proc` exists, else nil; on other non-Windows hosts the
+compute-apps measurer or nil; and on Windows the PDH measurer or nil. The **KFD
+measurer** (`kfd_measurer.go`) reads the amdgpu compute driver's per-process counter
+`/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes) — a world-readable sysfs file,
+no subprocess — maps each `gpu_id` to its rank among the KFD topology's GPU nodes in
+numeric node order (the CPU node, `gpu_id 0`, is skipped; that rank is taken as the
+rocm-smi card index the manager's GPU indices use), attributes through the
+process-group leader exactly as the NVIDIA path does, sums the figures and floors to
+MiB, and returns nil on any failure so the manager falls back to the estimate. NVIDIA
+wins on a mixed host. The KFD sees only ROCm/HIP compute allocations: a Vulkan build
+of an engine allocates through the graphics stack and reads as absent. An Apple
+unified-memory host, a host with no GPU, AMD on Windows and an AMD runtime that is
+not ROCm/HIP install **no** measurer (or measure nothing) and never write a
+measurement back. On those hosts the operator's
 `vram_estimate_mb` is the only number there will ever be. The rule above still applies — a spec left at the default `0` waits
 while a pinned or busy spec holds one of its GPUs — but nothing resolves it
 except the other spec becoming evictable or the operator filling the estimate
@@ -4042,9 +4316,12 @@ cache, then sums all group members per GPU under that root PID. This includes
 vLLM's EngineCore workers even when the API process holds no GPU memory, and
 keeps separately managed runtimes isolated. Exited or inaccessible PIDs are
 omitted rather than assigned a guessed owner. Processes that detach into a
-different group remain outside this boundary, matching native group termination;
-other platforms retain their existing PID attribution. No gateway setting or
-additional feature flag is involved.
+different group remain outside this boundary, matching native group termination.
+On **Windows**, a spec with `process_tree: job` gets the counterpart: PDH rows of
+every process in its job are attributed to the job's root PID before the per-GPU sum,
+and its RAM is the summed private working set of the job's processes
+([§3.9](#39-the-windows-process-tree-process_tree)). Every other process, on every
+platform, keeps its existing per-PID attribution. No gateway setting is involved.
 
 The **compute-apps** measurer (every non-Windows host) resolves GPU UUID →
 index from a cached `--query-gpu=index,uuid` mapping, re-fetched only on the
@@ -4330,9 +4607,10 @@ and two things follow from that.
 > `notPermittedRetryInterval` elapses, and unlike a candidate that cannot start,
 > a pinned occupant *is* running — so **where a measurer is installed** the
 > housekeeping beat measures it and the block clears with nothing evicted. That
-> is the NVIDIA case and only the NVIDIA case: on AMD, Apple-silicon and
-> GPU-less hosts the agent installs no measurer at all, so nothing but an
-> operator filling the estimate in will ever clear it, and the re-evaluation
+> is the NVIDIA case and the AMD Linux case for ROCm/HIP builds only: for a
+> Vulkan build on AMD (which the KFD measurer cannot see), on AMD Windows,
+> Apple-silicon and GPU-less hosts nothing measures the occupant, so nothing but
+> an operator filling the estimate in will ever clear it, and the re-evaluation
 > loop simply re-confirms the same block every five seconds. Do not read
 > "terminal is not permanent" as a property of the state — it is a property of
 > the host, which is why the message has to name the spec whose estimate is
@@ -4667,8 +4945,8 @@ up. So:
 |---|---|
 | Spec removed from the document | **Applied immediately** — the spec drains. |
 | `admin_state` set to `force_stopped` | **Applied immediately** — a running child drains. |
-| A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `config_files` — the files the agent writes before the exec and the child reads at startup, so a content edit relaunches — `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
-| A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, startup/health timeouts, the reported runtime `type`, the client-facing model name, **the spec's `role`, or a GPU row's `vram_mb` or the spec's `ram_mb`** — admission inputs (the role orders eviction), not launch inputs; the gateway pushes each demand as `max(measured, estimate)`, so a fresh measurement alone changes the document without relaunching a healthy child, and a verdict change that moves the derived role does the same) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` or `ram_mb` binds at the next start, per the not-retroactive rule below). |
+| A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `config_files` — the files the agent writes before the exec and the child reads at startup, so a content edit relaunches — `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, `process_tree` (`direct` and an absent value are the same launch, [§3.9](#39-the-windows-process-tree-process_tree)), the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
+| A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, `api_token_header` (read only by the agent's own child probes, §3.2), startup/health timeouts, the reported runtime `type`, the client-facing model name, **the spec's `role`, or a GPU row's `vram_mb` or the spec's `ram_mb`** — admission inputs (the role orders eviction), not launch inputs; the gateway pushes each demand as `max(measured, estimate)`, so a fresh measurement alone changes the document without relaunching a healthy child, and a verdict change that moves the derived role does the same) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` or `ram_mb` binds at the next start, per the not-retroactive rule below). |
 | Lowered per-GPU VRAM budget | **Not retroactive.** Binds at the next start. |
 | Removed or newly forbidden co-residency pair (an explicit `forbid`, or a mode switch that closes pairs) | **Not retroactive.** Binds at the next start. |
 | Lowered `runtime_max_processes` | **Not retroactive.** Binds at the next start. |
@@ -5187,13 +5465,14 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Fifteen
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Eighteen
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
 `runtime_config_files`, `runtime_voices`, `fullduplex_proxy`,
 `runtime_model_params`, `runtime_ram_measurement`, `runtime_ram_accounting`,
-`runtime_role_eviction`, `runtime_stop`, `runtime_exec_wsl`); two,
+`runtime_role_eviction`, `runtime_stop`, `runtime_exec_wsl`, `realtime_proxy`,
+`runtime_gpu_main_last`, `runtime_process_tree_job`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
 only and read by the agent (below); and two, `runtime_instances` and `rpc_cluster`, are on **both** lists
 with a different fact behind each declaration, each side reading the other's (below).
@@ -5237,7 +5516,9 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_stop` ([§4.1](#41-control-routes)), `Since: "0.17.0"`, and
 `rpc_cluster` ([§3.6](#36-rpc-cluster-members-and-heads)), `Since: "0.18.0"`, and
 `runtime_exec_wsl` ([§3.8](#38-execution-modes-wsl2)), `Since: "0.19.0"`, and
-`realtime_proxy` ([§4.5](#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)), `Since: "0.20.0"`
+`realtime_proxy` ([§4.5](#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)), `Since: "0.20.0"`, and
+`runtime_gpu_main_last` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) and
+`runtime_process_tree_job` ([§3.9](#39-the-windows-process-tree-process_tree)), both `Since: "0.21.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
@@ -5437,6 +5718,18 @@ never reach a child. A document change in either direction bypasses the
 ETag short-circuit, like `runtime_instances`. `server-agent`'s `Version` moved
 `0.17.0` → `0.18.0` for this entry, MINOR per the same rule
 (`FeatureRPCCluster`, pinned with the version by `TestFeaturesDeclareRPCCluster`).
+
+`runtime_gpu_main_last` and `runtime_process_tree_job` (#424,
+[ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree))
+are on the agent's list alone. `runtime_gpu_main_last` says the agent resolves
+`${HOST_GPU_IDS_MAIN_LAST}`; the gateway gates nothing on it, and the portal reads it to
+warn, without blocking, when a spec uses the placeholder in args, env or a config file and
+the agent's reported features lack it (an older agent passes the token through literally
+and the child fails visibly). `runtime_process_tree_job` says the agent honours
+`process_tree: job`; it is declared on **every** OS, like `runtime_exec_wsl` below, so the
+gateway reads it together with the reported OS and refuses a `job` save, fail-closed, only
+on evidence (§3.9). `TestFeaturesDeclareStrataFlags` pins both names and their `Since`, and
+`TestStrataFeatureNames` pins the gateway's copies of the strings.
 
 `runtime_exec_wsl` (#381, [§3.8](#38-execution-modes-wsl2),
 [ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged))
@@ -6048,6 +6341,22 @@ request as if the model had no route (`404 routing.no_model_route`), never with 
 connection to an agent that cannot serve it, and an older gateway has no `/v1/realtime`
 at all. Upgrade the agent before relying on a realtime model ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)).
 
+**`0.20.0` → `0.20.1` (Linux runtime workers in VRAM measurements, #404) is PATCH.** No
+feature flag changes: on native Linux, compute-app rows are attributed to the managed
+runtime's process group (§5.3), which only changes the figures an operator sees.
+
+**`0.20.1` → `0.21.0` (Strata support, #424) is MINOR, and one bump for the whole
+branch.** `agent.Features` gained `runtime_gpu_main_last` and `runtime_process_tree_job`
+(§7), the spec gained `process_tree` and `api_token_header`, and the agent gained the
+`${HOST_GPU_IDS_MAIN_LAST}` placeholder (§3.2), the Windows job-object process tree with
+tree-wide RAM and VRAM attribution (§3.9), the Strata context extractor (§3.4) and
+authenticated child probes (§3.2). `TestFeaturesDeclareStrataFlags` pins the names, their
+`Since` and the version. The upgrade order matters for two things only: a `job` spec can be
+saved only once the agent has declared `runtime_process_tree_job`, and an older agent passes
+`${HOST_GPU_IDS_MAIN_LAST}` through literally (the portal warns). An older gateway never
+sends either field, and the new probe credential is additive
+([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
@@ -6634,6 +6943,14 @@ An auditor applying the rule without this list finds six apparent violations
 and either "fixes" them — the VRAM one would create a push storm at telemetry
 cadence — or concludes the rule is not real.
 
+Because of these exclusions, and the member usage rise of a running cluster
+(§3.7), an agent's applied document can lag the derived one by up to the 60 s
+poll without anything being wrong. A gate that waits for an agent to
+acknowledge the *current* document must therefore send it rather than only
+wait: the cluster start's configuration step pushes the document to an agent
+that applied another one ([Runtime View
+§6.9](../06-runtime-view.md#69-llamacpp-rpc-cluster-members-first-start)).
+
 **The diagnostic signature of a missing notification** is that a runtime change
 takes effect *after about a minute*, because the agent's 60 s poll is the
 backstop behind every push. Three concrete symptoms were found this way and
@@ -6825,6 +7142,9 @@ mirror). Three different cadences share the one collect cycle:
     child never reaches `probeRuntimeChildProps` at all.
   - `sglang`, `sglang_omni` — **no probe at all** (agent 0.19.2, ADR-103): neither server serves `/props`, so the skip
     sits in the same caller, `probeRuntimeChild`, beside `vllm_sr`'s.
+  - `strata` — no branch of its own: it falls into the last one, because `strata serve`
+    serves a llama.cpp-shaped `/props`. That document needs the key, which the probe
+    sends since agent 0.21.0 (§3.2); before, a keyed Strata child answered 401.
   - **every other type, `custom` INCLUDED** — `collector.ProbePropsVerdicts`
     GETs the fixed path `/props` (`collector.LiveProgressProbePath`),
     regardless of whether `st.ContextProbePath` is even set.
@@ -7157,6 +7477,7 @@ Nothing found is recorded as 0, which the history shows as "—". Per spec type:
 | `vllm_sr` | not applicable | not applicable | none from a benchmark | always: a `vllm_sr` mapping is decisions-only, so it gets no speed row and the standalone context probe is refused (`benchmark.decisions_only`). The context the agent reads (`data[].limits.max_input_tokens` of `/v1/models`, best effort) reaches the mapping through the ingest write-back, not through a benchmark |
 | `sglang` | none (the `/props` probe is skipped), so telemetry decides | `/v1/models` | `data[].max_model_len` | a child started with `--api-key`, which protects `/v1/models` (`/health` and `/metrics` stay open) |
 | `sglang_omni` | not applicable | not applicable | none | always: its `/v1/models` carries no context length, and the standalone context probe has no path to read |
+| `strata` | yes, through the router, which forwards the gateway's credential | `/props`, with the spec token since agent 0.21.0 | `default_generation_settings.n_ctx` | none in practice: the synchronous probe answers, and the template needs agent 0.21.0 anyway (`${HOST_GPU_IDS_MAIN_LAST}`) |
 | `custom` | yes, if the child serves a llama.cpp-shaped `/props` | only when the spec sets `context_probe_path`, and only for a child without a key | a best-effort scan for `n_ctx`, `max_model_len` or `context_length` | otherwise |
 | Auto (`""`) | follows the type `EffectiveRuntimeSpecType` resolves | | | |
 
@@ -7205,7 +7526,7 @@ live status frame forwards it.** RAM has no GPU axis and one process
 backs one instance, so the figure sits **beside** `gpus[]` on the instance's
 runtime entry, not inside it (a replicable spec reports one entry per instance,
 and the gateway writes back the largest, `foldInstanceRows`): the managed child's resident RAM in MB (RSS, the private working set on
-Windows), declared by the agent feature `runtime_ram_measurement` (§7), `omitempty`,
+Windows, summed over the whole job tree for a `process_tree: job` spec, §3.9), declared by the agent feature `runtime_ram_measurement` (§7), `omitempty`,
 and `0` is *unknown* — never measured, no measurer on this host, or the process has
 exited — so an unmeasured spec and every agent that predates the field send no key at
 all. The agent copies it from `Status.MeasuredRAMMB`, which is cleared when the
@@ -8027,6 +8348,46 @@ empty list stays both text flavors whatever the type
 ([ADR-045](../09-architecture-decisions.md#adr-045--a-model-listing-advertises-what-dispatch-serves-one-flavor-rule-read-from-the-spec)
 (g)).
 
+**Strata: a launch template, a run-config import and the process-tree control
+([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).** Choosing the
+Strata type on a spec's **first** write (a create, or a mapping without a spec row yet)
+applies `strataSpecTemplate()` (§3.4): args and env only when they are empty, the startup
+timeout only while it is still the stock 180 s, `set_visible_devices` off, flavors and
+both endpoint modes from the template, `process_tree` `job`; the health path follows the
+untouched-default rule. An edit of a stored spec is never prefilled. The binary field shows
+the template's `%LOCALAPPDATA%` path as a placeholder, never as a value, because the agent
+needs the absolute path. The API-token reference table gains a Strata row
+(`STRATA_API_KEY=${API_TOKEN}`, `--api-key ${API_TOKEN}`, `Authorization: Bearer` or
+`x-api-key`).
+
+- **"Import run config"** (Strata type only, in the config-files section) takes the pasted
+  JSON `strata launch` wrote and runs `importStrataRunConfig`, a pure frontend transform:
+  it writes or replaces `strata.json` (§3.5; it keeps every key but the launcher's
+  bookkeeping and `api_key`, keeps `engine_ready_s`, sets `model_name` to `${MODEL}` and
+  `gpu_order` to `as_given`), sets the GPU rows main first (from `gpu_roles`, else the
+  legacy `gpu` list rotated so its last entry comes first; a surviving index keeps its
+  budget; a file without GPU information leaves the rows alone), proposes the startup
+  timeout `max(engine_ready_s, 900) + 60` (the gateway only refuses a negative timeout, so
+  the clamp is a floor of 1) and fills an empty upstream model name from the old
+  `model_name`. Invalid JSON, a missing `exe` or a missing `args` list is an inline error
+  and writes nothing; a dropped non-empty `api_key` and a `layer_split` other than `auto`
+  (positional upstream, so reordering GPUs changes its meaning) are inline warnings. The
+  16-file and 64 KiB limits apply.
+- **Process tree** is a select (`direct`, or the Windows job tree) shown for every native
+  spec and hidden for `wsl`, labelled Windows-only (§3.9). The form loads the stored value
+  and sends `process_tree` on **every** create and update, because the PUT replaces the
+  whole spec and an omitted field would reset a job spec to `direct`; a `wsl` spec always
+  sends `direct`. The override-action body spreads the stored spec, so it carries the
+  field. Both refusals, `runtime_spec.process_tree_invalid` and
+  `runtime_spec.process_tree_unsupported`, map to localized messages; the latter names the
+  three causes (the agent is not on Windows, is older than 0.21.0, or lacks the capability)
+  and says that a spec already stored as job can still be saved — only the switch into
+  job is refused.
+- **`${HOST_GPU_IDS_MAIN_LAST}` against an older agent** draws a non-blocking warning, with
+  the agent's reported version, once the agent's features have loaded and args, env or a
+  config file use the token while `runtime_gpu_main_last` is missing — the same shape as the
+  `runtime_config_files` advisory.
+
 **A GPU row can show a THIRD number, and it is an offer rather than a field.**
 When the mapping's benchmark history carries an applicable VRAM measurement
 ([§11.6](#116-the-vram-benchmark-load-one-model-alone-and-measure-what-it-costs)),
@@ -8166,7 +8527,7 @@ been read, an agent that has not declared `runtime_config_files` draws a
 non-blocking warning with its reported version ([§7](#7-feature-negotiation)).
 
 A per-application warnings endpoint returns opaque string codes and today emits
-four. All are pure derivations with no store write, reloaded after every spec
+eight. All are pure derivations with no store write, reloaded after every spec
 save or delete. An unmapped future code renders its raw wire string rather than
 a wrong label — the forward-compatibility convention applied to **every** opaque
 wire enum on this screen, runtime states included.
@@ -8223,6 +8584,11 @@ audio.cpp twin** of this warning or of the form's matching inline hint: a spec o
 `audio_cpp` that keeps a text flavor is not flagged, because the agent-managed audio
 path is deferred ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
 
+**`api_flavors_text_on_vllm_sr`** — a spec of a `server_agent` application whose effective
+type is `vllm_sr` lists the `openai` or `anthropic` flavor. The gateway routes only the
+decision endpoints to `vllm-srun` (ADR-099), so text requests of those flavors dispatched to
+it fail. Advisory (`runtimeTextOnVllmSRWarning`).
+
 **`api_flavors_no_audio_on_sglang_omni`** — a spec of a `server_agent` application whose
 effective type is `sglang_omni` lists no `openai_audio` flavor. sglang-omni's speech and
 transcription endpoints are routed only under that flavor, so the model would never be
@@ -8238,6 +8604,23 @@ or not (`targetFrom` ignores `Enabled`). Each check is a pure helper beside
 `anyStableDiffusionSpecNotImagesOnly`), over the application and the specs
 `RuntimeWarnings` already loads, so neither adds a store read. The launch-spec
 form mirrors both as inline hints while it is open (above).
+
+**`process_tree_agent_unknown`** — a spec of the application has `process_tree: job`, and
+the server's agent has not yet reported enough to tell whether it honours job mode: its OS
+(no telemetry row, or an empty OS) or its declared features since this gateway started. The
+save was allowed, because the refusal (`runtime_spec.process_tree_unsupported`, §3.9) needs
+evidence; an agent that turns out not to honour it would run the spec `direct`. It counts
+disabled specs, like the OS-mismatch advisory, and reads nothing when no spec uses `job`
+(`jobSpecAgentSupport`).
+
+**`process_tree_agent_unsupported`** — a spec of the application is stored with
+`process_tree: job`, and the server's agent is known not to honour it: its reported OS is
+not Windows, or it declared its features without `runtime_process_tree_job`. The spec
+reached the store before the agent reported, or before the agent was downgraded or
+replaced; a re-save that keeps it `job` is not refused (§3.9), so the override buttons keep
+working, and this warning says that the agent runs the spec `direct`, leaving the engine's
+descendants alive on stop. It counts disabled specs and shares `jobSpecAgentSupport` with
+`process_tree_agent_unknown`; the two never appear together.
 
 **Co-residency editor.** The tab shows the application's co-residency document,
 `{mode, pairs:[{a, b, verdict}]}` ([§5.7](#57-co-residency-mode-verdicts-and-the-derived-role)),
@@ -8889,20 +9272,20 @@ figures and this feature claims nothing about spillover.
 **The card fingerprint degrades, and says how far.** A stored VRAM number
 attributed to index 1 after the cards were renumbered is worse than no number,
 so each per-GPU item carries what identified the card *and* which field did it:
-`uuid` on NVIDIA (any renumbering is detectable) or `name_total` elsewhere,
-read from the **post-load window's own sample** rather than the trigger-time
-one, because that is the sample the numbers came from: recording the
-trigger-time identity beside a window-time figure pairs the OLD card's uuid
-with the NEW card's number if the cards were renumbered in between, which is
-the exact event a fingerprint exists to detect and is worse than recording no
-identity at all —
-which catches a swap between *unlike* cards only, since two identical cards
-trading indices are indistinguishable. `GPUSample.UUID` is populated only by
-the NVIDIA parse, so a UUID-only detector would silently verify nothing on
-exactly the host classes the delta strategy exists to serve. On Apple silicon
-the figures are unified **system** memory read from ioreg rather than dedicated
-VRAM, so the item carries `unified_memory` and must be labelled wherever it is
-shown.
+`uuid` where the sample has one (NVIDIA, and AMD with rocm-smi 4.x; any
+renumbering is detectable) or `name_total` elsewhere, read from the **post-load
+window's own sample** rather than the trigger-time one, because that is the
+sample the numbers came from: recording the trigger-time identity beside a
+window-time figure pairs the OLD card's uuid with the NEW card's number if the
+cards were renumbered in between, which is the exact event a fingerprint exists
+to detect and is worse than recording no identity at all — which catches a swap
+between *unlike* cards only, since two identical cards trading indices are
+indistinguishable. `GPUSample.UUID` is populated only by the NVIDIA parse and
+the AMD parse of rocm-smi 4.x, so a UUID-only detector would silently verify
+nothing on Apple and pre-4.0 rocm-smi hosts, which the delta strategy exists to
+serve. On Apple silicon the figures are unified **system** memory read from
+ioreg rather than dedicated VRAM, so the item carries `unified_memory` and must
+be labelled wherever it is shown.
 
 **And the fingerprint is COMPARED, not merely displayed** — the launch-spec
 form checks it against the live hardware report's card at that index before it
@@ -10307,8 +10690,9 @@ operator meets first:
   whose address is only a name is allowed by the IPv4 addresses that name
   resolves to, so DNS is in the trust path and an IPv6-only head is never
   allowed.
-- **VRAM measurement is NVIDIA-only** (§5.3). On AMD, Apple unified memory and
-  GPU-less hosts the agent installs no measurer, so `vram_estimate_mb` is
+- **VRAM measurement covers NVIDIA and AMD on Linux only** (§5.3; ROCm/HIP
+  allocations, not Vulkan). On Apple unified memory, GPU-less hosts, AMD on Windows
+  and non-ROCm AMD runtimes the agent installs no measurer, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for
   the agent to resolve. Host RAM does not share the limit: it is measured on every
   platform whose OS exposes per-process memory to the agent (a container without
@@ -10402,18 +10786,21 @@ operator meets first:
   ([§4.1](#41-control-routes)) was widened either: that allowlist is a
   security boundary, and the loopback probe already reaches an Ollama child
   without it.
-- **Windows stop is kill-only.** Managed processes are started with
-  `exec.Command` (never `CommandContext`) and, on unix, in their own process
-  group so a stop signal reaches the whole tree; the platform-specific calls live
-  in a build-tag split because the release pipeline really cross-compiles the
-  agent for Windows. The Windows implementation has no graceful-drain
-  equivalent — a stop terminates the child rather than letting it finish
-  in-flight work. A real fix needs `CREATE_NEW_PROCESS_GROUP` plus
-  `GenerateConsoleCtrlEvent`. A `wsl` spec is the exception: it is stopped
-  gracefully from inside its distro, through its systemd scope
-  ([§3.8](#38-execution-modes-wsl2)). **CI does not check it at all** — every job in
+- **A Windows `direct` spec's stop is kill-only; graceful stop is opt-in.** Managed
+  processes are started with `exec.Command` (never `CommandContext`) and, on unix, in
+  their own process group so a stop signal reaches the whole tree; the
+  platform-specific calls live in a build-tag split because the release pipeline
+  really cross-compiles the agent for Windows. A native Windows spec with the default
+  `process_tree: direct` has no graceful-drain equivalent — a stop terminates the
+  child the agent exec'd, and nothing beneath it. A spec with `process_tree: job`
+  ([§3.9](#39-the-windows-process-tree-process_tree)) gets `CREATE_NEW_PROCESS_GROUP`,
+  Ctrl-Break (`GenerateConsoleCtrlEvent`) and a job-object kill of the whole tree; it
+  is **not yet verified on Windows hardware**, and there is no graceful stop for a
+  `direct` spec. A `wsl` spec is stopped gracefully from inside its distro, through
+  its systemd scope ([§3.8](#38-execution-modes-wsl2)). **CI does not check it at all** — every job in
   `.github/workflows/ci.yml` runs on `ubuntu-latest` with no `GOOS` set, so
-  `proc_windows.go` is never built there
+  `proc_windows.go` and `proc_job_windows.go` are never built there, and the
+  Windows-tagged job tests (`proc_job_windows_test.go`) run only on a Windows host
   ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks) and
   [§11.3](../11-risks-and-technical-debt.md#113-testing-blind-spots-to-remember);
   the same fact is stated in
@@ -10421,6 +10808,14 @@ operator meets first:
   environment base is a union rather than a `GOOS` switch for exactly this
   reason). Cross-compile locally with
   `GOOS=windows GOARCH={amd64,arm64} go vet ./...` before changing it.
+- **Strata leaves three gaps** ([§3.4](#34-runtime-server-kind-and-per-kind-probe-path-derivation)).
+  `/v1/messages` and `/v1/responses` carry no `timings`, so a Claude Code or Codex request
+  to Strata records only gateway-measured tokens per second (none when buffered; the
+  prompt rate is time-to-first-token based, analytics-only and absent below 256 processed
+  tokens); Strata's richer telemetry (`/v1/telemetry`, `/slots`,
+  `/v1/status`, the `strata:*` counters) is reachable but not read; and a Strata target
+  still fetches any http(s) image URL it is given, from the model host, as SGLang and
+  vLLM targets do.
 - **The WSL2 execution mode measures what Windows lets it see**
   ([§3.8](#38-execution-modes-wsl2)). A `wsl` workload's VRAM is a **start delta**,
   not a live per-process reading: growth after its start settled shows only in

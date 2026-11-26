@@ -7,7 +7,7 @@ Premise / On Prem), a Linux-first, cross-platform AI gateway portal, licensed
 AGPL-3.0-only.
 
 The system routes AI client requests to AI servers running Ollama, llama.cpp,
-vLLM or the vLLM Semantic Router. It supports OpenAI-compatible clients, Anthropic-compatible clients,
+vLLM, SGLang, Strata or the vLLM Semantic Router. It supports OpenAI-compatible clients, Anthropic-compatible clients,
 coding agents such as Codex and Claude Code, and a built-in portal chat
 experience. It ships with local users, invite-based provisioning, API tokens,
 model-based routing with load-aware scoring from agent telemetry, usage
@@ -57,6 +57,14 @@ These rules are absolute:
   code, docs, and one-line fixes alike.
 - Work on a feature branch, preferably in a worktree under
   `.worktrees/<feature-name>`.
+- **Branch names start with a type prefix**, in the style of Conventional
+  Commits, followed by a short kebab-case slug (an issue number is welcome):
+  `feat/`, `fix/`, `docs/`, `chore/`, `refactor/`, `test/`, `perf/`, `ci/`,
+  `build/`, `style/` or `revert/`. Examples: `feat/407-claude-code-usage-limits`,
+  `fix/rotate-trailing-json`, `docs/branch-naming-convention`. Choose the type
+  of the change's main commit. A branch a tool created under another prefix
+  (for example a session worktree named `agentic/<slug>-<suffix>`) is renamed
+  with `git branch -m <type>/<slug>` before its first push.
 - **`docs/superpowers/**` and `docs/implementation-status.md` must not land
   in `main`.** They may — and should — be created and used on the branch
   while working. As the **last step** before the branch is ready for its

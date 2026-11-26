@@ -2,7 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { useEffect, useRef, useState, type SubmitEvent } from 'react';
-import { Alert, Box, Button, Typography } from '@mui/material';
+import { Alert, Box, Button, Checkbox, FormControlLabel, Typography } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
 import ListAltIcon from '@mui/icons-material/ListAlt';
@@ -31,6 +31,7 @@ import {
 import { vendorAccountAccess } from './shared/vendorAccountAccess';
 import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountReadOnlyDetail } from './VendorAccountReadOnlyDetail';
+import { VendorAccountGroupsSection } from './VendorAccountGroupsSection';
 import { VendorAccountResourceGroupsSection } from './VendorAccountResourceGroupsSection';
 import { VendorAccountSharePanel, VendorAccountSharingOffPanel } from './VendorAccountSharePanel';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
@@ -109,8 +110,8 @@ function hasCredential(account: VendorAccount): boolean {
  * snapshot: an api key or a connected subscription. The panel is always there for
  * such an account (its limits, or an empty-state line) and shows only the limits
  * the vendor actually reports; it reads the snapshot from the single-account GET so
- * it can re-read it on its own. A connected OpenAI subscription and an OpenRouter
- * or Kilo api key -- the accounts the gateway can actively ask -- also get a
+ * it can re-read it on its own. A connected OpenAI or Anthropic subscription and an
+ * OpenRouter or Kilo api key -- the accounts the gateway can actively ask -- also get a
  * "Refresh" button (a forced usage refresh, independent of the models refresh) and
  * one on-view refresh when the detail opens.
  */
@@ -162,11 +163,17 @@ export function VendorAccountsView({
     | 'refreshModels'
     | 'refreshUsage'
     | 'setVendorAccountShareLevel'
+    | 'setVendorAccountShareUsage'
     | 'setVendorAccountAdminGroups'
     | 'vendorAccountAdminGroupCandidates'
     | 'vendorAccountResourceGroups'
     | 'joinVendorAccountResourceGroup'
     | 'leaveVendorAccountResourceGroup'
+    | 'vendorAccountGroups'
+    | 'createVendorAccountGroup'
+    | 'updateVendorAccountGroup'
+    | 'deleteVendorAccountGroup'
+    | 'setVendorAccountGroupMembers'
   >;
 }>) {
   const { showError, showSuccess } = useToast();
@@ -226,6 +233,8 @@ export function VendorAccountsView({
   // on send; immutable once created, so the detail view never edits it).
   const [baseUrl, setBaseUrl] = useState('');
   const baseUrlValid = isValidBaseUrl(baseUrl);
+  // Create only: share the usage figures with members (on by default for a new account).
+  const [shareUsage, setShareUsage] = useState(true);
   const rootVendor = isConfigurableRootVendor(vendor);
   // Custom has no default root, so a blank base URL cannot be created.
   const baseUrlMissing = vendor === 'openai_compatible' && baseUrl.trim() === '';
@@ -247,6 +256,7 @@ export function VendorAccountsView({
     setAuthType('api_key');
     setModelPrefix('');
     setBaseUrl('');
+    setShareUsage(true);
     resetKeyInput();
     setMode('create');
   }
@@ -282,12 +292,19 @@ export function VendorAccountsView({
       // A subscription account carries no key: it is created disconnected.
       const created = await api.createVendorAccount(
         createAuthType === 'subscription'
-          ? { vendor, auth_type: 'subscription', name, ...prefixField }
+          ? {
+              vendor,
+              auth_type: 'subscription',
+              name,
+              share_usage_with_members: shareUsage,
+              ...prefixField,
+            }
           : {
               vendor,
               auth_type: 'api_key',
               name,
               api_key: apiKey,
+              share_usage_with_members: shareUsage,
               ...prefixField,
               ...baseUrlField,
             },
@@ -661,6 +678,20 @@ export function VendorAccountsView({
                 required
               />
             )}
+            <Box>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={shareUsage}
+                    onChange={(e) => setShareUsage(e.target.checked)}
+                  />
+                }
+                label={t.vendorAccountShareUsageLabel}
+              />
+              <Typography variant="body2" color="text.secondary">
+                {t.vendorAccountShareUsageHelp}
+              </Typography>
+            </Box>
             <Box sx={{ display: 'flex', gap: 1.5 }}>
               <Button
                 type="submit"
@@ -719,6 +750,18 @@ export function VendorAccountsView({
             </Alert>
           )}
           <VendorAccountReadOnlyDetail t={t} account={account} status={effectiveStatus(account)} />
+          {/* The usage figures only when the owner shared them (the backend omits
+              `usage` from a member's view otherwise). Read-only: no refresh. */}
+          {account.usage && (
+            <VendorAccountUsageSection
+              t={t}
+              api={api}
+              account={account}
+              refreshKey={usageRefreshes}
+              onRefresh={refreshAccountUsage}
+              canRefresh={false}
+            />
+          )}
         </>
       );
     }
@@ -1008,6 +1051,9 @@ export function VendorAccountsView({
           loading={loading || accountsData === null}
         />
       </Panel>
+      <Box sx={{ mt: 3 }}>
+        <VendorAccountGroupsSection t={t} api={api} />
+      </Box>
     </>
   );
 }

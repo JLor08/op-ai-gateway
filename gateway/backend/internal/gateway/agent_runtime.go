@@ -418,6 +418,9 @@ type agentRuntimeReportSpec struct {
 	// well-behaved agent already masks it, but omitting it from this schema
 	// makes the sanitizer's re-parse drop it unconditionally -- plaintext or
 	// masked -- so the store never carries even a placeholder token.
+	// api_token_header, by contrast, is only the header NAME the token travels
+	// in (#424), not a secret, so it is mirrored like every other field.
+	APITokenHeader   string `json:"api_token_header,omitempty"`
 	Type             string `json:"type"`
 	MetricsPath      string `json:"metrics_path"`
 	ContextProbePath string `json:"context_probe_path"`
@@ -443,6 +446,9 @@ type agentRuntimeReportSpec struct {
 	// a native spec like the DTO's. It carries a mode and a distro name, no
 	// secret, so a file-mode agent's report keeps it.
 	Execution *portal.AgentExecutionDTO `json:"execution,omitempty"`
+	// ProcessTree is "job" for a Windows Job Object spec
+	// (AgentRuntimeSpecDTO's), omitted for direct like the DTO's. Not a secret.
+	ProcessTree string `json:"process_tree,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

@@ -376,6 +376,10 @@ func (m *nvidiaPDHMeasurer) measure(pids []int) map[int]map[int]int {
 		slog.Debug("pdh gpu process memory read failed", "err", err)
 		return nil
 	}
+	// A process_tree "job" root's descendants hold their VRAM under their own
+	// PIDs; charge it to the root the manager asks about (#424). Before the
+	// wanted filter, so their adapters are resolved too.
+	instances = snapshotProcessTrees().pdhRowsToRoots(instances)
 
 	// Resolve only the adapters the WANTED pids actually hold memory on. Every
 	// GPU process on the host produces counter instances -- the desktop

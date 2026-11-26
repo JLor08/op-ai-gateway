@@ -11,6 +11,7 @@ import { PageTitle } from './shared/PageTitle';
 import { Panel } from './shared/Panel';
 import { StatTile } from './shared/StatTile';
 import { TokenAggregateValue } from './TokenAggregateValue';
+import { DashboardVendorGroups } from './DashboardVendorGroups';
 import { DashboardVendorUsage } from './DashboardVendorUsage';
 
 type Metric = {
@@ -42,7 +43,7 @@ export function Dashboard({
   // accounts from. Optional: without BOTH the section is not mounted, so it makes
   // no request and the dashboard is exactly what it was before the feature.
   vendorAccountsEnabled?: boolean;
-  api?: Pick<PortalApi, 'vendorAccounts'>;
+  api?: Pick<PortalApi, 'vendorAccounts' | 'vendorAccountGroups'>;
 }>) {
   const metricRows: Metric[] = dashboard
     ? [
@@ -115,6 +116,7 @@ export function Dashboard({
       </Box>
 
       {vendorAccountsEnabled && api && <DashboardVendorUsage t={t} api={api} />}
+      {vendorAccountsEnabled && api && <DashboardVendorGroups t={t} api={api} />}
 
       <Panel titleId="route-heading" title={t.liveModelRoutes} subtitle={t.liveModelRoutesSubtitle}>
         <DataTable

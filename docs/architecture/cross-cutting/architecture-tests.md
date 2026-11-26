@@ -19,7 +19,7 @@ Two test families per module:
 1. **Frozen import graph** (`TestAllowlistFrozen`): every internal package's
    set of module-internal imports (production code only, tests excluded) is
    compared against a checked-in allowlist — 68 edges across 29 packages in
-   `op-ai-gateway`, 28 edges across 14 packages in `op-ai-server-agent`. Any
+   `op-ai-gateway`, 30 edges across 15 packages in `op-ai-server-agent`. Any
    NEW edge fails with a message naming it; adding it to the list is the
    deliberate act. The allowlist is frozen **in both directions**: a listed
    edge that no longer exists fails too, so an over-generous entry cannot sit
@@ -48,6 +48,8 @@ Server-agent (`op-ai-server-agent`):
 |---|---|
 | `gwapi`, `certfiles`, `wslentry` are stdlib-only | leaf contracts (gateway transport, cert-dir file layout, `wsl://` allowlist-entry grammar) shared by the feature packages |
 | `collector` ↛ `proxy`, `trust`, `client`, `agent` | telemetry collection is independent of transport and TLS machinery |
+| `hostpower` ↛ `agent`, `client`, `config`, `proxy`, `runtime`, `trust` | the Proxmox host service is not an enrolled agent: no gateway contact and no gateway token (it has an optional HTTP listener and a per-VM token store of its own), so it may use only the `collector` RAPL reader and endpoint type ([ADR-115](../09-architecture-decisions.md#adr-115--vm-cpu-power-via-a-host-attributed-synthetic-rapl-tree-over-virtiofs), [ADR-116](../09-architecture-decisions.md#adr-116--hostpower-transports-a-colon-free-windows-virtiofs-tree-and-an-http-endpoint-that-identifies-the-vm-by-bridge-port-or-per-vm-token)) |
+| `helper` imports only `collector` and `sample`; ↛ `agent`, `client`, `config`, `proxy`, `runtime`, `trust`, `hostpower` | the root agent helper must stay minimal: it shares the RAPL reader, the SMBIOS parser and the wire types with the agent, and carries its own HTTP server rather than reusing `hostpower`'s, so nothing of the agent's orchestration, transport, config or runtime layers runs as root ([ADR-117](../09-architecture-decisions.md#adr-117--a-root-only-agent-helper-serves-rapl-counters-and-dimms-over-a-peer-checked-unix-socket-so-the-linux-agent-runs-unprivileged)) |
 | `sample` imports no internal package | the wire-format vocabulary is a leaf |
 | `trust`, `proxy`, `certinstall` do not import each other | their only integration is the shared `certfiles`/`gwapi` leaves and the filesystem contract |
 

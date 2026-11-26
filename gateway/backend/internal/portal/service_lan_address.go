@@ -73,7 +73,7 @@ type LANResolution struct {
 // a gateway that has just restarted derives clusters before any agent
 // reconnects.
 //
-//   - The source is LANSource; "" (a row written before migration 110) reads
+//   - The source is LANSource; "" (a row written before migration 116) reads
 //     as manual when LANAddress is set, else auto.
 //   - manual: LANAddress. Without one, like an empty lan_address before:
 //     the Domain of a non-NetBird server, else nothing.

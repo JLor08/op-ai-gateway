@@ -552,10 +552,13 @@ every configured trust source (an operator-supplied CA file, `cert_dir`'s own
 behind a generation counter — so a CA rotation (§4) takes effect for every
 in-flight client without a restart.
 
-`InsecureSkipVerify` is wired to exactly one place: the explicit
-`OP_AGENT_TLS_INSECURE` escape hatch, off by default. Nothing in the normal
-CA-trust or certificate-fetch path ever sets it — the trust store is the only
-sanctioned way to make an agent accept the gateway's certificate.
+For calls to the gateway, `InsecureSkipVerify` is wired to exactly one place:
+the explicit `OP_AGENT_TLS_INSECURE` escape hatch, off by default. Nothing in
+the normal CA-trust or certificate-fetch path ever sets it — the trust store is
+the only sanctioned way to make an agent accept the gateway's certificate. The
+one other use in the agent is not a gateway call: the hostpower client sets it
+only together with a certificate pin that replaces the chain and name check
+(§12).
 
 ## 9. Certificate encryption at rest
 
@@ -622,6 +625,22 @@ sequenceDiagram
 | `OP_AGENT_CA_FILE` / `_CA_CACHE_FILE` / `_CA_PEM` / `_TLS_INSECURE` | — | Additive trust sources + the explicit insecure escape hatch (§8). |
 
 See [Configuration](configuration.md) for the full variable list.
+
+## 12. The hostpower endpoint's own certificate
+
+The Proxmox host service `server-agent hostpower` (not an enrolled agent, no
+gateway contact) can serve its `GET /v1/energy` endpoint over TLS 1.3 with
+`-tls`. Its certificate has nothing to do with the gateway-managed
+certificates above: by default the service generates a self-signed ECDSA
+P-256 certificate on first start under `/var/lib/op-hostpower-tls/` (or loads
+an operator-supplied pair), and the guest agent accepts exactly that
+certificate by its SHA-256 fingerprint (`hostpower_tls_fingerprint`), without
+chain, host-name or validity checks and without the trust store of §8. An
+`https://` hostpower URL without a pin uses plain system-root verification.
+Rotation is manual (new pair, restart, new fingerprint in every guest). The
+decision, threat model and alternatives are in
+[ADR-118](../09-architecture-decisions.md#adr-118--hostpower-http-over-tls-13-with-a-self-signed-server-certificate-the-guest-pins-by-sha-256); setup is in the
+[agent README](../../../server-agent/README.md#https-with-a-pinned-certificate-both-modes).
 
 ## Related chapters
 

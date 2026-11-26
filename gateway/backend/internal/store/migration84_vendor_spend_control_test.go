@@ -37,7 +37,7 @@ func TestMigration84AddsSpendControlColumns(t *testing.T) {
 			}
 		}
 
-		if err := s.CreateUser(ctx, newTestUser("u_m84", "m84@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m84", "m84@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		exec := func(query string, args ...any) {

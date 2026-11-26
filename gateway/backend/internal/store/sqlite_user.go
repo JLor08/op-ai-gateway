@@ -16,10 +16,10 @@ func (s *SQLiteStore) CreateUser(ctx context.Context, user User) error {
 	_, err := s.exec(ctx, `
 		insert into users (
 			id, email, display_name, role, status, preferred_language,
-			chat_log_communication, chat_secret,
+			chat_log_communication, chat_secret, chat_vendor_provider_access,
 			totp_secret, totp_pending_secret, totp_enabled, totp_confirmed_at,
 			password_hash, password_set_at, created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		user.ID,
 		user.Email,
 		user.DisplayName,
@@ -28,6 +28,7 @@ func (s *SQLiteStore) CreateUser(ctx context.Context, user User) error {
 		user.PreferredLanguage,
 		user.ChatLogCommunication,
 		user.ChatSecret,
+		user.ChatVendorAccess,
 		user.TOTPSecret,
 		user.TOTPPendingSecret,
 		user.TOTPEnabled,
@@ -49,7 +50,7 @@ func (s *SQLiteStore) CreateUser(ctx context.Context, user User) error {
 func (s *SQLiteStore) UserByID(ctx context.Context, id string) (User, error) {
 	row := s.queryRow(ctx, `
 		select id, email, display_name, role, status, preferred_language,
-			chat_log_communication, chat_secret,
+			chat_log_communication, chat_secret, chat_vendor_provider_access,
 			totp_secret, totp_pending_secret, totp_enabled, totp_confirmed_at,
 			password_hash, password_set_at, created_at, updated_at
 		from users
@@ -60,7 +61,7 @@ func (s *SQLiteStore) UserByID(ctx context.Context, id string) (User, error) {
 func (s *SQLiteStore) UserByEmail(ctx context.Context, email string) (User, error) {
 	row := s.queryRow(ctx, `
 		select id, email, display_name, role, status, preferred_language,
-			chat_log_communication, chat_secret,
+			chat_log_communication, chat_secret, chat_vendor_provider_access,
 			totp_secret, totp_pending_secret, totp_enabled, totp_confirmed_at,
 			password_hash, password_set_at, created_at, updated_at
 		from users
@@ -73,7 +74,7 @@ func (s *SQLiteStore) UpdateUser(ctx context.Context, user User) error {
 	result, err := s.exec(ctx, `
 		update users set
 			email = ?, display_name = ?, role = ?, status = ?,
-			preferred_language = ?, chat_log_communication = ?, chat_secret = ?,
+			preferred_language = ?, chat_log_communication = ?, chat_secret = ?, chat_vendor_provider_access = ?,
 			totp_secret = ?, totp_pending_secret = ?, totp_enabled = ?, totp_confirmed_at = ?,
 			password_hash = ?, password_set_at = ?, updated_at = ?
 		where id = ?`,
@@ -84,6 +85,7 @@ func (s *SQLiteStore) UpdateUser(ctx context.Context, user User) error {
 		user.PreferredLanguage,
 		user.ChatLogCommunication,
 		user.ChatSecret,
+		user.ChatVendorAccess,
 		user.TOTPSecret,
 		user.TOTPPendingSecret,
 		user.TOTPEnabled,
@@ -112,7 +114,7 @@ func (s *SQLiteStore) UpdateUser(ctx context.Context, user User) error {
 func (s *SQLiteStore) ListUsers(ctx context.Context) ([]User, error) {
 	rows, err := s.query(ctx, `
 		select id, email, display_name, role, status, preferred_language,
-			chat_log_communication, chat_secret,
+			chat_log_communication, chat_secret, chat_vendor_provider_access,
 			totp_secret, totp_pending_secret, totp_enabled, totp_confirmed_at,
 			password_hash, password_set_at, created_at, updated_at
 		from users
@@ -154,6 +156,7 @@ func scanUser(row rowScanner) (User, error) {
 		&user.PreferredLanguage,
 		&chatLog,
 		&chatSecret,
+		&user.ChatVendorAccess,
 		&user.TOTPSecret,
 		&user.TOTPPendingSecret,
 		&totpEnabled,

@@ -46,6 +46,23 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 		s.recordUsage(start, token, req, routing.Target{}, provider.Response{}, completionErrorCode(err), "error", usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor), nil)
 		return
 	}
+	s.completeOn(w, r, token, req, raw, render, completeAttempt{target: target, start: start, id: id})
+}
+
+// completeAttempt is one attempt of a buffered completion: the resolved target it
+// calls, and its own start time and request id -- complete's, or a fresh pair for a
+// vendor group's failover attempt (vendor_group_failover.go).
+type completeAttempt struct {
+	target routing.Target
+	start  time.Time
+	id     string
+}
+
+// completeOn is complete past its resolve: it calls the attempt's target, already
+// resolved, and writes and records the answer.
+func (s *Server) completeOn(w http.ResponseWriter, r *http.Request, token auth.Token, req inference.Request, raw []byte, render func(provider.Response) any, at completeAttempt) {
+	target, start, id := at.target, at.start, at.id
+	capturing := s.capturingEnabled(token)
 	// Register the in-flight request now that routing has resolved the target
 	// server, so the running-connections view can label it with the server name
 	// (mirrors completeStream, which registers after Resolve). A resolve failure
@@ -53,37 +70,8 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 	s.Active.Add(ActiveRequest{ID: id, UserID: token.UserID, TokenID: token.ID, TokenName: token.Name, ServiceID: token.ServiceID, ServiceName: token.ServiceName, ServerName: s.serverName(target.ServerID), ServerID: target.ServerID, InstanceKey: target.InstanceKey, Model: req.Model, RequestedModel: req.RequestedModel, APIFlavor: req.APIFlavor, BillingUnit: billingUnitFor(req.APIFlavor), ReqPath: r.URL.Path, ProviderPath: upstreamPath(target, req.APIFlavor, endpointChat), ProviderModel: effectiveProviderModel(target, req.Model), SessionID: req.ClientSessionID, SessionSource: req.SessionSource, AgentID: req.AgentID, Stream: false, StartedAt: start})
 	defer s.Active.Remove(id)
 	providerReq := s.upstreamRequest(r.Context(), target, req)
-	// Thread a capture sink so the provider records the upstream response headers.
-	// When capturing, it keeps the full translated request/response (bounded by
-	// captureMaxBytes). For a vendor-account target that is NOT capturing, a
-	// header-only sink (respCap 0, no body buffered) is still attached so the
-	// best-effort vendor rate-limit scrape can read the upstream headers off a
-	// normal (uncaptured) request. nil (no sink) for a non-vendor, non-capturing
-	// request, exactly as before.
-	provCtx := r.Context()
-	var sink *provider.CaptureSink
-	switch {
-	case capturing:
-		sink = provider.NewCaptureSink(s.captureMaxBytes)
-	case target.VendorAccountID != "":
-		sink = provider.NewCaptureSink(0)
-	}
-	if sink != nil {
-		provCtx = provider.WithCaptureSink(provCtx, sink)
-	}
-	// Attach the resolved application's per-app upstream credential (fail-open).
-	provCtx = s.upstreamAuthCtx(provCtx, target)
-	resp, err := s.Provider.Complete(provCtx, target, providerReq)
-	if err != nil {
-		// A head refused as not ready -- it stopped between the selection and the
-		// dispatch -- whose cluster formed again is asked once more; a second refusal
-		// is the answer, and so is the cluster's failure when it did not form
-		// (cluster_gate.go).
-		var retry bool
-		if retry, err = s.readyClusterHead(r.Context(), target, err); retry {
-			resp, err = s.Provider.Complete(provCtx, target, providerReq)
-		}
-	}
+	provCtx, sink := s.completeCaptureContext(r.Context(), capturing, target)
+	resp, err := s.completeProvider(r.Context(), provCtx, target, providerReq)
 	if err != nil && reselectsLostInstance(target, req, err) {
 		// The instance is gone (see instance_reselect.go): nothing has been written
 		// to the client and nothing recorded. The attempt leaves the instance first --
@@ -98,6 +86,17 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 		s.complete(w, r, token, withLostInstance(req, target), raw, render)
 		return
 	}
+	if limit, ok := groupLimitError(target, err); ok {
+		// A group member answered a limit (vendor_group_failover.go): nothing has been
+		// written to the client and nothing recorded. The request moves to the next
+		// member as a fresh attempt, which answers and records in this one's place;
+		// with no member left, this attempt's error is the answer below.
+		if next, nextTarget, ok := s.vendorGroupFailover(&token, req, target, limit.Header, limit.RetryAfter, s.translateTargetResolver(r)); ok {
+			s.Active.Remove(id)
+			s.completeOn(w, r, token, next, raw, render, completeAttempt{target: nextTarget, start: time.Now(), id: nextRequestID()})
+			return
+		}
+	}
 	status := "success"
 	errorCode := ""
 	var body []byte
@@ -108,11 +107,74 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, token auth.Tok
 		body = writeCompletionErrorCaptured(w, err)
 	} else {
 		slog.Debug("inference ok", "path", r.URL.Path, "api_flavor", req.APIFlavor, "model", req.Model, "server", s.serverName(target.ServerID), "output_tokens", resp.Usage.OutputTokens, "duration_ms", time.Since(start).Milliseconds())
+		s.attachTranslatedLimitHeaders(r, token, target, req.APIFlavor, w.Header())
 		body = writeJSONCaptured(w, http.StatusOK, render(resp))
 	}
 	ci := buildCaptureInput(capturing, token.UserID, token.Secret, r, raw, w.Header(), body, completionHTTPStatus(err), req.APIFlavor)
 	attachTranslatedCapture(ci, sink)
 	s.recordUsage(start, token, req, target, resp, errorCode, status, usageMeta{ReqPath: r.URL.Path, HTTPStatus: completionHTTPStatus(err), ContentType: "application/json"}, id, ci, sink.ResponseHeaders())
+}
+
+// completeCaptureContext is ctx with the capture sink a buffered completion threads
+// to the provider, so it records the upstream response headers, and the resolved
+// application's per-app upstream credential (fail-open). When capturing, the sink
+// keeps the full translated request/response (bounded by captureMaxBytes). For a
+// vendor-account target that is NOT capturing, a header-only sink (respCap 0, no
+// body buffered) is still attached so the best-effort vendor rate-limit scrape can
+// read the upstream headers off a normal (uncaptured) request. The sink is nil (none
+// attached) for a non-vendor, non-capturing request.
+func (s *Server) completeCaptureContext(ctx context.Context, capturing bool, target routing.Target) (context.Context, *provider.CaptureSink) {
+	var sink *provider.CaptureSink
+	switch {
+	case capturing:
+		sink = provider.NewCaptureSink(s.captureMaxBytes)
+	case target.VendorAccountID != "":
+		sink = provider.NewCaptureSink(0)
+	}
+	if sink != nil {
+		ctx = provider.WithCaptureSink(ctx, sink)
+	}
+	return s.upstreamAuthCtx(ctx, target), sink
+}
+
+// completeProvider calls the provider for providerReq on target with provCtx. A head
+// refused as not ready -- it stopped between the selection and the dispatch -- whose
+// cluster formed again (judged on reqCtx) is asked once more; a second refusal is
+// the answer, and so is the cluster's failure when it did not form (cluster_gate.go).
+func (s *Server) completeProvider(reqCtx, provCtx context.Context, target routing.Target, providerReq inference.Request) (provider.Response, error) {
+	resp, err := s.Provider.Complete(provCtx, target, providerReq)
+	if err == nil {
+		return resp, nil
+	}
+	retry, err := s.readyClusterHead(reqCtx, target, err)
+	if retry {
+		return s.Provider.Complete(provCtx, target, providerReq)
+	}
+	return resp, err
+}
+
+// groupLimitError is err as the vendor limit answer of a target that came from a
+// vendor account group, the one case that fails over (vendor_group_failover.go).
+func groupLimitError(target routing.Target, err error) (*provider.LimitError, bool) {
+	var limit *provider.LimitError
+	if target.VendorGroupID == "" || !errors.As(err, &limit) {
+		return nil, false
+	}
+	return limit, true
+}
+
+// attachTranslatedLimitHeaders adds the client-facing limit headers to a translated
+// answer of apiFlavor: on an Anthropic Messages answer #407's cached subscription
+// windows, on a Responses answer the Codex windows last observed for the caller
+// (unless the gateway's own limit takes over from 75 %), each followed by the
+// principal's own limit standing. Other flavors get none.
+func (s *Server) attachTranslatedLimitHeaders(r *http.Request, token auth.Token, target routing.Target, apiFlavor string, h http.Header) {
+	switch apiFlavor {
+	case inference.APIFlavorAnthropicMessages:
+		s.attachTranslatedUsageLimits(r, token, target, h)
+	case inference.APIFlavorOpenAIResponses:
+		s.attachTranslatedCodexUsageLimits(r, token, target, h)
+	}
 }
 
 // upstreamRequest is req as it is sent to target: the target's provider model in
@@ -768,6 +830,7 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		Provider:         target.Provider,
 		Host:             target.ServerID,
 		AccountID:        target.VendorAccountID, // "" for the self-hosted path; the vendor account id otherwise
+		VendorGroupID:    target.VendorGroupID,   // "" unless a vendor account group routed the request
 		InputTokens:      freshInputTokens,
 		OutputTokens:     resp.Usage.OutputTokens,
 		TotalTokens:      resp.Usage.TotalTokens,
@@ -838,22 +901,39 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 	// no-op for a non-vendor target, a nil header set, or a response carrying no
 	// recognized headers; any failure is swallowed (never faults this request).
 	s.scrapeVendorAccountUsage(target, upstreamHeaders)
+	// Remember a subscription response's rate-limit windows for the caller so a later
+	// /v1/messages answer from another provider can carry them (Claude Code clears
+	// its usage display otherwise). Entitlement-gated; a no-op for other providers.
+	s.observeRateLimitWindows(token, target, upstreamHeaders)
+	// The Codex counterpart: an OpenAI vendor response's family windows, kept so a
+	// later /v1/responses answer from another provider carries them (the Codex CLI
+	// clears its usage display otherwise). Entitlement-gated; a no-op otherwise.
+	s.observeCodexRateLimitWindows(token, target, upstreamHeaders)
 	// Opt-in payload capture: capture is already nil unless the caller decided to
 	// capture; capturingEnabled re-checks the FULL gate (global switch + opt-in +
 	// store/cipher wiring) defensively — capturingEnabled (capture.go) is the single
 	// place that logic lives, so this never drifts out of sync with it again.
 	// Fire-and-forget (persistCapture logs+discards errors).
 	if capture != nil && s.capturingEnabled(token) {
+		capture.TranslatedRespHeaders = s.redactCapturedAccountHeaders(context.Background(), token, target, capture.TranslatedRespHeaders)
 		s.persistCapture(id, capture)
 	}
 	// Opportunistic metric feedback: on a SUCCESSFUL real inference whose serving
 	// application opted in, EWMA-update the mapping's throughput from this sample.
 	// Best-effort (the store guards metrics_locked + skips non-positive samples);
 	// a failure is Debug-logged, never propagated, never faults the served response.
+	//
+	// A gateway-measured prompt rate (PromptPerSecondGatewayMeasured, #426) is
+	// analytics-only: it stays on the usage row above but is not a routing sample,
+	// so the EWMA gets 0 for it, which the store treats as "no sample".
+	promptSample := resp.Usage.PromptPerSecond
+	if resp.Usage.PromptPerSecondGatewayMeasured {
+		promptSample = 0
+	}
 	if status == "success" && target.OpportunisticMetrics && target.RouteID != "" &&
-		(resp.Usage.TokensPerSecond > 0 || resp.Usage.PromptPerSecond > 0) {
+		(resp.Usage.TokensPerSecond > 0 || promptSample > 0) {
 		if err := s.Routes.UpdateMappingOpportunisticMetrics(context.Background(), target.RouteID,
-			resp.Usage.TokensPerSecond, resp.Usage.PromptPerSecond, opportunisticEWMAAlpha, time.Now().UTC()); err != nil {
+			resp.Usage.TokensPerSecond, promptSample, opportunisticEWMAAlpha, time.Now().UTC()); err != nil {
 			slog.Debug("opportunistic metrics update failed", "mapping", target.RouteID, "err", err)
 		}
 	}

@@ -45,6 +45,32 @@
   // best-effort system) power watts. Empty disables it.
   "lhm_url": "",
 
+  // Optional powercap root for CPU power, e.g. a Proxmox hostpower virtiofs
+  // mount carrying this VM's share of the host CPU package power. Read on
+  // Linux and Windows (Windows: the virtiofs drive root, e.g. drive Z);
+  // ignored on macOS. Empty = /sys/class/powercap on Linux, off on Windows.
+  "powercap_root": "",
+
+  // Optional hostpower HTTP endpoint on the Proxmox host (e.g.
+  // http://<host>:9873). Empty disables it. Without a token the host
+  // identifies this VM by its network port (MAC mode).
+  "hostpower_url": "",
+
+  // Optional per-VM token for the hostpower HTTP endpoint (token mode).
+  // Create it on the host with: server-agent hostpower token create <vmid>
+  "hostpower_token": "",
+
+  // Optional SHA-256 fingerprint of the hostpower TLS certificate, used
+  // with an https:// hostpower_url. Print it on the host with:
+  // server-agent hostpower tls fingerprint
+  "hostpower_tls_fingerprint": "",
+
+  // Unix socket of the privileged "server-agent helper" (Linux only), which
+  // lets an agent that does not run as root report CPU/system watts and
+  // memory modules like a root agent. Empty = /run/op-agent-helper/agent.sock
+  // on Linux; "off" disables it. Ignored on macOS and Windows.
+  "helper_socket": "",
+
   // Certificate installation mode: "off" (default, never fetch a certificate),
   // "files" (write fullchain/cert/chain/ca/privkey into cert_dir and run
   // cert_reload_command on change), or "proxy" (everything "files" does, and

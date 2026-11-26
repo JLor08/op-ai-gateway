@@ -8,35 +8,39 @@ package collector
 import (
 	"context"
 	"op-ai-server-agent/internal/sample"
-	"os"
-	"os/exec"
 )
 
 // defaultDMIRoot is the Linux SMBIOS/DMI sysfs directory (all 0444 world-readable).
 const defaultDMIRoot = "/sys/class/dmi/id"
 
 // platformHardware reads mainboard/BIOS from sysfs DMI and per-DIMM detail from
-// dmidecode when running as root (else RAM total only). Best-effort.
-func platformHardware(ctx context.Context) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
+// the raw SMBIOS table (root) or the privileged helper (else RAM total only).
+// Best-effort.
+func platformHardware(ctx context.Context, opts HardwareOptions) (sample.Mainboard, sample.BIOS, []sample.MemoryModule) {
 	board, bios := newDMIReader(defaultDMIRoot).read()
-	return board, bios, linuxMemoryModules(ctx)
+	return board, bios, linuxMemoryModules(ctx, opts)
 }
 
-// linuxMemoryModules returns per-DIMM detail via `dmidecode -t memory`, but only
-// when euid==0 (dmidecode reads /dev/mem, which needs root) AND dmidecode is on
-// PATH. Otherwise nil (total-only, documented best-effort). Never errors.
-func linuxMemoryModules(ctx context.Context) []sample.MemoryModule {
-	if os.Geteuid() != 0 {
-		return nil
+// linuxMemoryModules returns per-DIMM detail. Root parses the raw SMBIOS table
+// itself; an unprivileged agent asks the privileged helper at opts.HelperSocket
+// within hwCollectTimeout. Otherwise, or on any failure, nil (total-only,
+// documented best-effort). Never errors.
+func linuxMemoryModules(ctx context.Context, opts HardwareOptions) []sample.MemoryModule {
+	if helperGeteuid() == 0 {
+		mods, err := ReadSMBIOSMemoryModules(DefaultDMITablePath)
+		if err != nil {
+			return nil
+		}
+		return mods
 	}
-	if _, err := exec.LookPath("dmidecode"); err != nil {
+	if !helperEnabled(opts.HelperSocket) {
 		return nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, hwCollectTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "dmidecode", "-t", "memory").Output()
-	if err != nil {
+	mods, err := FetchHelperMemoryModules(cctx, NewHelperHTTPClient(opts.HelperSocket))
+	if err != nil || len(mods) == 0 {
 		return nil
 	}
-	return parseDmidecodeMemory(out)
+	return mods
 }

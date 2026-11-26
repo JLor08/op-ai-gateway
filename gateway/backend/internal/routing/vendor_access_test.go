@@ -93,3 +93,36 @@ func TestTokenOwnsVendorAccount(t *testing.T) {
 		})
 	}
 }
+
+func TestTokenVendorGroupPrefix(t *testing.T) {
+	g := VendorAccountGroup{ID: "vag_1", OwnerUserID: "usr_me", ModelPrefix: "grp/"}
+	other := VendorAccountGroup{ID: "vag_1", OwnerUserID: "usr_other", ModelPrefix: "grp/"}
+	user := func(a auth.VendorAccess) auth.Token { return auth.Token{UserID: "usr_me", VendorAccess: a} }
+	listed := []auth.VendorAccessGroupEntry{{GroupID: "vag_1"}}
+	emptyOverride := []auth.VendorAccessGroupEntry{{GroupID: "vag_1", OverrideEnabled: true}}
+	cases := []struct {
+		name        string
+		token       auth.Token
+		g           VendorAccountGroup
+		wantPrefix  string
+		wantAllowed bool
+	}{
+		{"all and include_groups", user(auth.VendorAccess{All: true, IncludeGroups: true}), g, "grp/", true},
+		{"all and include_groups ignores override", user(auth.VendorAccess{All: true, IncludeGroups: true, Groups: emptyOverride}), g, "grp/", true},
+		{"all only", user(auth.VendorAccess{All: true}), g, "", false},
+		{"listed empty override", user(auth.VendorAccess{Groups: emptyOverride}), g, "", true},
+		{"listed no override", user(auth.VendorAccess{Groups: listed}), g, "grp/", true},
+		{"listed override value", user(auth.VendorAccess{Groups: []auth.VendorAccessGroupEntry{{GroupID: "vag_1", OverrideEnabled: true, OverridePrefix: "x/"}}}), g, "x/", true},
+		{"not listed", user(auth.VendorAccess{Groups: []auth.VendorAccessGroupEntry{{GroupID: "vag_9"}}}), g, "", false},
+		{"other users group even when listed", user(auth.VendorAccess{All: true, IncludeGroups: true, Groups: listed}), other, "", false},
+		{"service token", auth.Token{Kind: "service", ServiceID: "svc_1", VendorAccess: auth.VendorAccess{All: true, IncludeGroups: true, Groups: listed}}, g, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ok := TokenVendorGroupPrefix(tc.token, tc.g)
+			if p != tc.wantPrefix || ok != tc.wantAllowed {
+				t.Fatalf("= (%q,%v), want (%q,%v)", p, ok, tc.wantPrefix, tc.wantAllowed)
+			}
+		})
+	}
+}

@@ -29,7 +29,7 @@ func TestMigration83AddsPrefixAndDisplayNameColumns(t *testing.T) {
 			t.Fatalf("vendor_account_models already has display_name at v82: %v", cols)
 		}
 
-		if err := s.CreateUser(ctx, newTestUser("u_m83", "m83@example.test", now)); err != nil {
+		if err := createUserAtBaseline(ctx, s, newTestUser("u_m83", "m83@example.test", now)); err != nil {
 			t.Fatalf("seed user: %v", err)
 		}
 		exec := func(query string, args ...any) {

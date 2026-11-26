@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -59,7 +60,28 @@ func main() {
 	flag.Int("t", 0, "accepted and ignored: the operator's thread count")
 	printText := flag.String("print", "", "if set, write this text to stdout at startup, with \\n read as a newline -- stands in for the banner or error output of a real llama.cpp process")
 	argvLog := flag.String("argv-log", "", "if set, write this process's argv (space-joined, without the program name) -- the only way to observe from the parent's test the exact command line the manager launched")
+	spawnGrandchild := flag.Bool("spawn-grandchild", false, "start one more copy of this binary in -idle mode, sharing this process's stdout, and print \"stubchild: grandchild pid=<pid>\" -- a descendant the Windows process_tree job tests (#424) must see in the job and see die with it")
+	ignoreCtrlBreak := flag.Bool("ignore-ctrlbreak", false, "survive CTRL_BREAK_EVENT (and Ctrl-C) on Windows -- and SIGINT elsewhere -- so the job's kill, not the graceful stop, is what ends this process; passed on to a -spawn-grandchild")
+	idle := flag.Bool("idle", false, "do nothing but stay alive: the -spawn-grandchild descendant's mode")
 	flag.Parse()
+
+	// On Windows a Go program dies of CTRL_BREAK_EVENT unless os/signal is
+	// NOTIFIED of os.Interrupt (with signal.Ignore the runtime lets the default
+	// handler end the process), so the signal is caught and never read: once
+	// the buffer is full os/signal drops further ones, and the process lives.
+	if *ignoreCtrlBreak {
+		signal.Notify(make(chan os.Signal, 1), os.Interrupt)
+	}
+
+	if *idle {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+
+	if *spawnGrandchild {
+		spawnIdleGrandchild(*ignoreCtrlBreak)
+	}
 
 	if *printText != "" {
 		fmt.Print(strings.ReplaceAll(*printText, `\n`, "\n"))
@@ -144,7 +166,7 @@ func main() {
 				// cmd.Wait() in the parent report a signalled exit, which
 				// os.Exit cannot reproduce.
 				fmt.Fprintln(os.Stderr, "stubchild: scripted SIGKILL (simulated OOM)")
-				syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				killSelf()
 				// Unreachable once the signal lands; keep the goroutine honest.
 				select {}
 			}
@@ -238,6 +260,26 @@ func main() {
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("stubchild: listen %s: %v", addr, err)
 	}
+}
+
+// spawnIdleGrandchild starts this binary again in -idle mode with this
+// process's stdout and stderr, and prints its PID. It is never waited for: it
+// is the descendant a process-tree test expects the tree's stop to take down.
+func spawnIdleGrandchild(ignoreCtrlBreak bool) {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("stubchild: executable: %v", err)
+	}
+	args := []string{"-idle"}
+	if ignoreCtrlBreak {
+		args = append(args, "-ignore-ctrlbreak")
+	}
+	gc := exec.Command(exe, args...)
+	gc.Stdout, gc.Stderr = os.Stdout, os.Stderr
+	if err := gc.Start(); err != nil {
+		log.Fatalf("stubchild: start grandchild: %v", err)
+	}
+	fmt.Printf("stubchild: grandchild pid=%d\n", gc.Process.Pid)
 }
 
 // serveTCPOnly accepts connections on addr and closes each at once; it never

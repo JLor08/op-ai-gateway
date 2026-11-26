@@ -31,6 +31,7 @@ function makeStore(overrides: Partial<ChatStore> = {}): ChatStore {
     maxTokens: 0,
     selectedTokenId: '',
     chatModels: [],
+    modelsLoading: false,
     modelOptions: [],
     usableTokens: [],
     manageableServers: [],

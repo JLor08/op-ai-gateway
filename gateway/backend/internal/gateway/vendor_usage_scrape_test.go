@@ -51,9 +51,10 @@ func TestParseVendorAccountUsage(t *testing.T) {
 			name:     "anthropic full",
 			provider: routing.ProviderVendorAnthropic,
 			headers: hdr(map[string]string{
-				"anthropic-ratelimit-unified-5h-utilization": "0.42",
-				"anthropic-ratelimit-unified-7d-utilization": "0.1",
-				"anthropic-ratelimit-unified-reset":          "1760000000",
+				"anthropic-ratelimit-unified-5h-utilization":       "0.42",
+				"anthropic-ratelimit-unified-7d-utilization":       "0.1",
+				"anthropic-ratelimit-unified-reset":                "1760000000",
+				"anthropic-ratelimit-unified-representative-claim": "five_hour",
 			}),
 			wantOK: true,
 			want:   routing.VendorAccountUsage{AccountID: "acc", FiveHourPct: 42, WeeklyPct: 10, FiveHourResetAt: ptr(at), UpdatedAt: now},
@@ -157,6 +158,58 @@ func TestParseVendorAccountUsage(t *testing.T) {
 			}
 			if !timePtrEqual(got.WeeklyResetAt, tc.want.WeeklyResetAt) {
 				t.Fatalf("WeeklyResetAt = %v, want %v", got.WeeklyResetAt, tc.want.WeeklyResetAt)
+			}
+		})
+	}
+}
+
+// TestScrapeAnthropicPerWindowResets: the per-window reset headers fill their own
+// slots, even when the top-level reset (the representative claim's) names another time.
+func TestScrapeAnthropicPerWindowResets(t *testing.T) {
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-unified-5h-reset", "1795190222")
+	h.Set("anthropic-ratelimit-unified-7d-reset", "1795445822")
+	h.Set("anthropic-ratelimit-unified-reset", "1760000000")
+	h.Set("anthropic-ratelimit-unified-representative-claim", "five_hour")
+	got, ok := parseVendorAccountUsage(routing.ProviderVendorAnthropic, "acc", h, time.Now())
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if want := time.Unix(1795190222, 0); got.FiveHourResetAt == nil || !got.FiveHourResetAt.Equal(want) {
+		t.Fatalf("FiveHourResetAt = %v, want %v", got.FiveHourResetAt, want)
+	}
+	if want := time.Unix(1795445822, 0); got.WeeklyResetAt == nil || !got.WeeklyResetAt.Equal(want) {
+		t.Fatalf("WeeklyResetAt = %v, want %v", got.WeeklyResetAt, want)
+	}
+}
+
+// TestScrapeAnthropicTopLevelResetFallback: without a per-window reset, the
+// top-level reset is attributed to the window the representative claim names.
+func TestScrapeAnthropicTopLevelResetFallback(t *testing.T) {
+	reset := time.Unix(1795190222, 0)
+	cases := []struct {
+		name         string
+		claim        string
+		wantFiveHour bool
+		wantWeekly   bool
+	}{
+		{name: "five_hour claim", claim: "five_hour", wantFiveHour: true},
+		{name: "seven_day claim", claim: "seven_day", wantWeekly: true},
+		{name: "no claim", claim: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.Header{}
+			h.Set("anthropic-ratelimit-unified-reset", "1795190222")
+			if tc.claim != "" {
+				h.Set("anthropic-ratelimit-unified-representative-claim", tc.claim)
+			}
+			got, _ := parseVendorAccountUsage(routing.ProviderVendorAnthropic, "acc", h, time.Now())
+			if tc.wantFiveHour != (got.FiveHourResetAt != nil) || (tc.wantFiveHour && !got.FiveHourResetAt.Equal(reset)) {
+				t.Fatalf("FiveHourResetAt = %v, want set=%v", got.FiveHourResetAt, tc.wantFiveHour)
+			}
+			if tc.wantWeekly != (got.WeeklyResetAt != nil) || (tc.wantWeekly && !got.WeeklyResetAt.Equal(reset)) {
+				t.Fatalf("WeeklyResetAt = %v, want set=%v", got.WeeklyResetAt, tc.wantWeekly)
 			}
 		})
 	}
@@ -347,7 +400,7 @@ func TestRecordUsageScrapesVendorUsage(t *testing.T) {
 
 	headers := http.Header{}
 	headers.Set("anthropic-ratelimit-unified-5h-utilization", "0.8")
-	headers.Set("anthropic-ratelimit-unified-reset", "1760000000")
+	headers.Set("anthropic-ratelimit-unified-5h-reset", "1760000000")
 
 	target := routing.Target{RouteID: "vendor:acc_anthropic:claude", Provider: routing.ProviderVendorAnthropic, VendorAccountID: "acc_anthropic"}
 	s.recordUsage(time.Now(), auth.Token{ID: "tok", UserID: "usr_v"}, inference.Request{Model: "claude"}, target, provider.Response{}, "", "success", usageMeta{}, "req_scrape", nil, headers)
@@ -372,7 +425,7 @@ func TestHeaderOnlySinkCapturesVendorHeadersWithoutCapture(t *testing.T) {
 	// A stub Anthropic Messages endpoint that returns the rate-limit headers.
 	withRateLimitHeaders := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("anthropic-ratelimit-unified-5h-utilization", "0.25")
-		w.Header().Set("anthropic-ratelimit-unified-reset", "1760000000")
+		w.Header().Set("anthropic-ratelimit-unified-5h-reset", "1760000000")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
 	}))

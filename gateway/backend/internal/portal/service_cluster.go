@@ -1072,9 +1072,10 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 
 // checkClusterMemberGPUs is step 9 of validateClusterHead. An Apple GPU gets
 // no auto-detected budget on its agent, so a member on one needs the
-// operator's. A known non-NVIDIA GPU is never measured per process: an
+// operator's. A known non-NVIDIA GPU is not reliably measured per process
+// (AMD only on Linux and for ROCm/HIP builds, never a Vulkan rpc-server): an
 // automatic member needs the operator's estimate for it, and the head needs
-// --tensor-split, since the member's real share would stay invisible to its
+// --tensor-split, since the member's real share may stay invisible to its
 // agent.
 func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterEntry, scan clusterArgScan) error {
 	hosts := make([]map[int]hostGPU, len(entries))
