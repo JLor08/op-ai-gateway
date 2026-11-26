@@ -20,7 +20,7 @@ var portalRPCMemberErrRows = []errRow{
 	{err: portal.ErrRPCMemberSpecNotFound, status: http.StatusNotFound, code: "rpc_member_spec.not_found", msg: "rpc member spec not found"},
 	{err: portal.ErrRPCMemberFlagReserved, status: http.StatusBadRequest, code: "runtime_spec.member_flag_reserved", msg: "-H/--host, -p/--port, -d/--device and -c/--cache are set by the agent and cannot be used in member args"},
 	{err: portal.ErrRPCMemberDeviceBackendInvalid, status: http.StatusBadRequest, code: "runtime_spec.device_backend_invalid", msg: "device_backend must be one of auto, cuda, rocm, vulkan, metal, sycl"},
-	{err: portal.ErrRPCMemberVRAMEstimateRequired, status: http.StatusBadRequest, code: "runtime_spec.member_vram_estimate_required", msg: "a vram estimate is required for every gpu on a server without NVIDIA GPUs"},
+	{err: portal.ErrRPCMemberVRAMEstimateRequired, status: http.StatusBadRequest, code: "runtime_spec.member_vram_estimate_required", msg: "a vram estimate is required for every gpu whose vram the agent cannot measure (non-NVIDIA, except AMD on Linux with the rocm or auto backend)"},
 	{err: portal.ErrRPCMemberInUse, status: http.StatusConflict, code: "runtime.cluster_member_in_use", msg: "member is used by a cluster head", msgFn: rpcMemberInUseMessage},
 }
 

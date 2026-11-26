@@ -2424,7 +2424,7 @@ const de = {
   errorClusterMemberBudgetRequired:
     'Ein Mitglied auf einer Apple-GPU braucht ein GPU-Budget auf seinem Server.',
   errorClusterTensorSplitRequired:
-    'Ein Head mit einem Nicht-NVIDIA-Mitglied braucht --tensor-split.',
+    'Ein Head mit einem Mitglied auf einer GPU, deren VRAM der Agent nicht messen kann, braucht --tensor-split.',
   errorClusterHeadBinaryVersionUnknown:
     'Die Version des Head-Binaries ist unbekannt. Im Tab „Binaries“ seine Version eintragen.',
   errorClusterPortExhausted:
@@ -2470,7 +2470,7 @@ const de = {
   errorRuntimeSpecMemberFlagReserved:
     '-H/--host, -p/--port, -d/--device und -c/--cache setzt der Agent und sind in Mitglieds-Argumenten nicht erlaubt.',
   errorRuntimeSpecMemberVramEstimateRequired:
-    'Auf einem Server ohne NVIDIA-GPUs ist für jede GPU eine VRAM-Schätzung nötig.',
+    'Für jede GPU, deren VRAM der Agent nicht messen kann (nicht NVIDIA, außer AMD unter Linux mit dem Backend ROCm oder auto), ist eine VRAM-Schätzung nötig.',
   errorRpcMemberSpecNotFound: 'RPC-Mitglieds-Spezifikation nicht gefunden.',
   errorRpcMemberSpecRequestFailed:
     'Die Anfrage zur RPC-Mitglieds-Spezifikation ist fehlgeschlagen.',
@@ -6564,7 +6564,8 @@ const en: PortalMessages = {
   errorClusterDirectUnavailable:
     'Direct transport in a mesh cluster needs NetBird policy management with deny-by-default on and enforced, and the Default policy seen disabled; use relay instead.',
   errorClusterMemberBudgetRequired: 'A member on an Apple GPU needs a GPU budget on its server.',
-  errorClusterTensorSplitRequired: 'A head with a non-NVIDIA member needs --tensor-split.',
+  errorClusterTensorSplitRequired:
+    'A head with a member on a GPU whose VRAM the agent cannot measure needs --tensor-split.',
   errorClusterHeadBinaryVersionUnknown:
     "The head binary's version is unknown. Set this binary's version in the Binaries tab.",
   errorClusterPortExhausted:
@@ -6609,7 +6610,7 @@ const en: PortalMessages = {
   errorRuntimeSpecMemberFlagReserved:
     '-H/--host, -p/--port, -d/--device and -c/--cache are set by the agent and cannot be used in member args.',
   errorRuntimeSpecMemberVramEstimateRequired:
-    'A VRAM estimate is required for every GPU on a server without NVIDIA GPUs.',
+    'A VRAM estimate is required for every GPU whose VRAM the agent cannot measure (non-NVIDIA, except AMD on Linux with the ROCm or auto backend).',
   errorRpcMemberSpecNotFound: 'RPC member spec not found.',
   errorRpcMemberSpecRequestFailed: 'The RPC member spec request failed.',
   errorBinaryPathInvalid: 'The path must be an absolute path of at most 4096 characters.',
