@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"op-ai-server-agent/internal/agentkey"
 	"op-ai-server-agent/internal/wslentry"
 	"os"
 	"path/filepath"
@@ -127,6 +128,7 @@ type Config struct {
 
 	GatewayURL string        // gateway base URL, e.g. https://gw.example
 	Token      string        // per-server agent bearer token
+	AgentKey   string        // 64-hex local secret for per-purpose subkeys; never sent to the gateway
 	Interval   time.Duration // collection cadence (default 1s)
 	// SystemReportInterval is the POST-mode re-send cadence for the static hardware
 	// inventory (default 30m, floor 1m).
@@ -439,6 +441,7 @@ const MaxEvictionGraceSeconds = 86400
 type fileConfig struct {
 	GatewayURL           string       `json:"gateway_url"`
 	Token                string       `json:"token"`
+	AgentKey             string       `json:"agent_key"`
 	Interval             string       `json:"interval"`
 	SystemReportInterval string       `json:"system_report_interval"`
 	MetricsURL           string       `json:"metrics_url"`
@@ -593,6 +596,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
 		RuntimeAllowBinaryDirs: resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
 		RuntimeWSLExe:          resolveWSLExe(getenv("OP_AGENT_RUNTIME_WSL_EXE"), file.RuntimeWSLExe),
+		AgentKey:               resolveTrimmed(getenv("OP_AGENT_AGENT_KEY"), file.AgentKey),
 		RuntimeWSLUser:         resolveTrimmed(getenv("OP_AGENT_RUNTIME_WSL_USER"), file.RuntimeWSLUser),
 		RuntimeCachePath:       strings.TrimSpace(resolveStr("runtime-cache", *runtimeCachePath, "OP_AGENT_RUNTIME_CACHE", file.RuntimeCachePath)),
 		ConfigFilesDir:         strings.TrimSpace(resolveStr("config-files-dir", *configFilesDir, "OP_AGENT_CONFIG_FILES_DIR", file.ConfigFilesDir)),
@@ -1068,6 +1072,9 @@ func (c Config) Validate() error {
 	}
 	if c.Token == "" {
 		return fmt.Errorf("agent token is required")
+	}
+	if _, err := agentkey.Parse(c.AgentKey); err != nil {
+		return err
 	}
 	if c.Interval <= 0 {
 		return fmt.Errorf("interval must be greater than zero")

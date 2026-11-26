@@ -5,6 +5,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net"
@@ -280,11 +282,27 @@ func (s *Server) handleAgentDownload(w http.ResponseWriter, r *http.Request) {
 // the listener's runtime address and stored public certificate material take
 // precedence. The token is the caller's own bearer, so the file needs no manual edit.
 func (s *Server) serveAgentConfig(w http.ResponseWriter, r *http.Request, token string) {
-	body := buildAgentConfigJSON(s.agentConfigMaterial(r.Context(), requestOrigin(r)), token)
+	agentKey, err := newAgentConfigKey()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apierror.Response("agent.config_key_failed", "could not generate the agent key", ""))
+		return
+	}
+	body := buildAgentConfigJSON(s.agentConfigMaterial(r.Context(), requestOrigin(r)), token, agentKey)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="server-agent.json"`)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(body))
+}
+
+// newAgentConfigKey returns a fresh agent_key: 32 random bytes as 64 lowercase
+// hex characters. Each generated config gets its own; the gateway neither logs
+// nor stores it.
+func newAgentConfigKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // agentConfigMaterial derives the generated agent's transport and trust from
@@ -359,12 +377,13 @@ func requestOrigin(r *http.Request) string {
 // byte, and that golden's key set is checked against every json tag on the agent's
 // own fileConfig by reflection. See the golden's doc in agent_binaries_test.go for
 // the full chain and how to regenerate it.
-func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
+func buildAgentConfigJSON(material agentConfigMaterial, token, agentKey string) string {
 	gw, _ := json.Marshal(material.GatewayURL)
 	caFile, _ := json.Marshal(material.CAFile)
 	caCacheFile, _ := json.Marshal(material.CACacheFile)
 	caPEM, _ := json.Marshal(material.CAPEM)
 	tok, _ := json.Marshal(token)
+	key, _ := json.Marshal(agentKey)
 	return `{
   // The gateway base URL the agent sends telemetry to (origin only, no path).
   // Required. Example: https://gateway.example.com. Under a NetBird-only
@@ -375,6 +394,12 @@ func buildAgentConfigJSON(material agentConfigMaterial, token string) string {
   // It identifies this server to the gateway. Required. Keep this file private
   // (e.g. chmod 600) because it holds the token.
   "token": ` + string(tok) + `,
+
+  // A random local secret (64 hex characters = 32 bytes) generated with this
+  // file. The agent derives per-purpose subkeys from it; it never leaves this
+  // host and is never sent to the gateway. Keep this file private. Empty
+  // disables the features that need it.
+  "agent_key": ` + string(key) + `,
 
   // Telemetry transport: "websocket" (default; one persistent connection, cheap
   // for high-frequency sending) or "post" (one HTTP POST per sample).

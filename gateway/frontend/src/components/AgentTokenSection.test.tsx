@@ -324,6 +324,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const raw = buildServerAgentConfig(
         { ...configMaterial, gateway_url: 'https://gw.example' },
         'sk-abc',
+        'ab'.repeat(32),
       );
       // It carries English // comments (JSONC) — the agent strips whole-line comments.
       expect(raw).toContain('// Telemetry transport:');
@@ -430,6 +431,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       const raw = buildServerAgentConfig(
         { gateway_url: 'https://gw.example.test', ca_file: '', ca_cache_file: '', ca_pem: '' },
         'fixture-token',
+        '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f',
       );
       const goldenPath = path.resolve(
         path.dirname(fileURLToPath(import.meta.url)),
@@ -450,6 +452,48 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // And the whole document, so a difference the loop cannot express (a
       // trailing newline) still fails.
       expect(raw).toBe(golden);
+    });
+
+    it('downloadConfig emits a fresh 64-hex agent_key per download', async () => {
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+      const createObjectURL = vi.fn((_blob: Blob) => 'blob:agent-config');
+      Object.defineProperty(window.URL, 'createObjectURL', {
+        configurable: true,
+        value: createObjectURL,
+      });
+      Object.defineProperty(window.URL, 'revokeObjectURL', { configurable: true, value: vi.fn() });
+      const api = makeApi({
+        agentTokenStatus: vi.fn(async () => ({
+          exists: true,
+          secret_prefix: 'op_agt',
+          config: configMaterial,
+          agent_download_base: configDownloadBase,
+        })),
+      });
+      renderSection(api);
+
+      const button = await screen.findByRole('button', { name: t.agentDownloadConfig });
+      fireEvent.click(button);
+      fireEvent.click(button);
+      expect(createObjectURL).toHaveBeenCalledTimes(2);
+      const keys: string[] = [];
+      for (const call of createObjectURL.mock.calls) {
+        const raw = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(reader.error);
+          reader.onload = () => resolve(String(reader.result));
+          reader.readAsText(call[0]);
+        });
+        const cfg = JSON.parse(
+          raw
+            .split('\n')
+            .filter((line) => !line.trim().startsWith('//'))
+            .join('\n'),
+        );
+        expect(cfg.agent_key).toMatch(/^[0-9a-f]{64}$/);
+        keys.push(cfg.agent_key);
+      }
+      expect(keys[0]).not.toBe(keys[1]);
     });
 
     it('uses token.config even when the binary manifest is unavailable', async () => {
@@ -501,7 +545,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     });
 
     it('emits ca_file, ca_cache_file and ca_pem from one config object', () => {
-      const raw = buildServerAgentConfig(configMaterial, 'sk-abc');
+      const raw = buildServerAgentConfig(configMaterial, 'sk-abc', 'ab'.repeat(32));
       const cfg = JSON.parse(
         raw
           .split('\n')

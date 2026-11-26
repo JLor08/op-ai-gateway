@@ -330,7 +330,8 @@ func main() {
 		"verbose", cfg.Verbose,
 		"transport", cfg.Transport,
 		"cert_mode", cfg.CertMode,
-		"runtime_source", cfg.RuntimeSource)
+		"runtime_source", cfg.RuntimeSource,
+		"agent_key_configured", cfg.AgentKey != "")
 	// runtime_manager activation is no longer known synchronously at this
 	// point (fix round 1, I3: no more one-shot startup probe) -- the
 	// Driver's own Sync logs the transition itself the first time it

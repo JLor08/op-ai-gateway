@@ -17,6 +17,7 @@ import (
 	"op-ai-gateway/internal/usage"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -490,6 +491,33 @@ func TestHandleAgentDownloadServesManifestAndBinary(t *testing.T) {
 	}
 }
 
+func TestServeAgentConfigEmitsFreshAgentKey(t *testing.T) {
+	s := newAgentBinTestServer(t, t.TempDir())
+	keyPattern := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	var keys []string
+	for range 2 {
+		req := httptest.NewRequest(http.MethodGet, "/api/agent/v1/download/config", nil)
+		req.Header.Set("Authorization", "Bearer valid-agent-secret")
+		rec := httptest.NewRecorder()
+		s.agentMux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var cfg map[string]any
+		if err := json.Unmarshal([]byte(stripJSONCComments(rec.Body.String())), &cfg); err != nil {
+			t.Fatalf("config not valid JSON after comment-strip: %v", err)
+		}
+		key, _ := cfg["agent_key"].(string)
+		if !keyPattern.MatchString(key) {
+			t.Fatalf("agent_key = %q, want 64 lowercase hex characters", key)
+		}
+		keys = append(keys, key)
+	}
+	if keys[0] == keys[1] {
+		t.Errorf("two downloads share agent_key %q; each must get a fresh one", keys[0])
+	}
+}
+
 func TestHandleAgentDownloadServesConfig(t *testing.T) {
 	// No manifest written: the config download must not depend on built binaries.
 	s := newAgentBinTestServer(t, t.TempDir())
@@ -560,6 +588,7 @@ const (
 	agentConfigGoldenPath       = "../../../../server-agent/testdata/server-agent.config.jsonc"
 	agentConfigGoldenGatewayURL = "https://gw.example.test"
 	agentConfigGoldenToken      = "fixture-token"
+	agentConfigGoldenAgentKey   = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 )
 
 // updateAgentConfigGolden rewrites the golden from this template. Deliberately
@@ -596,7 +625,7 @@ func stripJSONCComments(raw string) string {
 // then run the frontend and server-agent suites, which will tell you whether
 // the other copies still agree with what you just generated.
 func TestBuildAgentConfigJSONMatchesSharedGolden(t *testing.T) {
-	got := buildAgentConfigJSON(agentConfigMaterial{GatewayURL: agentConfigGoldenGatewayURL}, agentConfigGoldenToken)
+	got := buildAgentConfigJSON(agentConfigMaterial{GatewayURL: agentConfigGoldenGatewayURL}, agentConfigGoldenToken, agentConfigGoldenAgentKey)
 
 	var cfg map[string]any
 	if err := json.Unmarshal([]byte(stripJSONCComments(got)), &cfg); err != nil {

@@ -65,6 +65,7 @@ var allowedDeps = map[string][]string{
 		"internal/sample",
 		"internal/wslentry",
 	},
+	"internal/agentkey":  {},
 	"internal/certfiles": {},
 	"internal/certinstall": {
 		"internal/certfiles",
@@ -78,6 +79,7 @@ var allowedDeps = map[string][]string{
 		"internal/sample",
 	},
 	"internal/config": {
+		"internal/agentkey",
 		"internal/wslentry",
 	},
 	"internal/gwapi": {},

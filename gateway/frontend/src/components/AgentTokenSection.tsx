@@ -41,6 +41,14 @@ function curlCommand(base: string, token: string, b: { os: string; arch: string 
 // comment names it: kept raw here so the template carries no escaped backslash.
 const DEFAULT_WINDOWS_WSL_EXE = String.raw`C:\Program Files\WSL\wsl.exe`;
 
+// newAgentKey returns 32 random bytes as 64 lowercase hex characters: the
+// agent_key written into every downloaded config. It is generated in the
+// browser and never sent to the gateway.
+function newAgentKey(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 // buildServerAgentConfig produces a ready-to-use, ANNOTATED server-agent.json:
 // gateway_url + token filled in and every other key pre-set to the agent's own
 // default, each preceded by an English comment explaining it. Output is JSONC — the
@@ -68,7 +76,11 @@ const DEFAULT_WINDOWS_WSL_EXE = String.raw`C:\Program Files\WSL\wsl.exe`;
 // template — which is how this copy came to carry a comment about five runtime
 // settings while emitting none of them. Change this function and the golden
 // test fails until the Go copy and the golden are updated to match.
-export function buildServerAgentConfig(config: AgentConfigMaterial, token: string): string {
+export function buildServerAgentConfig(
+  config: AgentConfigMaterial,
+  token: string,
+  agentKey: string,
+): string {
   return `{
   // The gateway base URL the agent sends telemetry to (origin only, no path).
   // Required. Example: https://gateway.example.com. Under a NetBird-only
@@ -79,6 +91,12 @@ export function buildServerAgentConfig(config: AgentConfigMaterial, token: strin
   // It identifies this server to the gateway. Required. Keep this file private
   // (e.g. chmod 600) because it holds the token.
   "token": ${JSON.stringify(token)},
+
+  // A random local secret (64 hex characters = 32 bytes) generated with this
+  // file. The agent derives per-purpose subkeys from it; it never leaves this
+  // host and is never sent to the gateway. Keep this file private. Empty
+  // disables the features that need it.
+  "agent_key": ${JSON.stringify(agentKey)},
 
   // Telemetry transport: "websocket" (default; one persistent connection, cheap
   // for high-frequency sending) or "post" (one HTTP POST per sample).
@@ -407,7 +425,7 @@ export function AgentTokenSection({
   // <AGENT_TOKEN> placeholder.
   function downloadConfig(token: string) {
     if (!status?.config) return;
-    const blob = new Blob([buildServerAgentConfig(status.config, token)], {
+    const blob = new Blob([buildServerAgentConfig(status.config, token, newAgentKey())], {
       type: 'application/json',
     });
     const url = URL.createObjectURL(blob);
