@@ -79,9 +79,10 @@ func TestConformanceServerBinaries(t *testing.T) {
 		}
 
 		// Operator work: a manual entry, and a version override on an agent row.
+		// A manual row never carries an RPC protocol, whatever the caller set.
 		if err := s.UpsertManualServerBinary(ctx, routing.ServerBinary{
 			ServerID: "srv_bin", Path: "/m/rpc-server", Kind: "rpc-server", Version: "b5", Build: "5",
-			Commit: "abcdef0", ReportedAt: now,
+			Commit: "abcdef0", RPCProtocol: "10.0.2", ReportedAt: now,
 		}); err != nil {
 			t.Fatalf("manual upsert: %v", err)
 		}
@@ -114,7 +115,7 @@ func TestConformanceServerBinaries(t *testing.T) {
 		if got[1].VersionOverride != "" {
 			t.Fatalf("a new row starts without an override: %+v", got[1])
 		}
-		if got[2].Source != "manual" || got[2].Version != "b5" || got[2].Kind != "rpc-server" {
+		if got[2].Source != "manual" || got[2].Version != "b5" || got[2].Kind != "rpc-server" || got[2].RPCProtocol != "" {
 			t.Fatalf("a manual row must shadow an agent report of the same path: %+v", got[2])
 		}
 
