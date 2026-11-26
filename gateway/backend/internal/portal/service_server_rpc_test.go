@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 )
@@ -315,5 +316,72 @@ func TestUpdateServerRejectsNetbirdIPAsManualLANAddress(t *testing.T) {
 	other := "100.64.0.6"
 	if _, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANAddress: &other}); err != nil {
 		t.Fatalf("other CGNAT address must stay allowed: %v", err)
+	}
+}
+
+// serverAddressChanges is a ClusterStatusReader whose orchestration holds
+// address changes per server.
+type serverAddressChanges struct {
+	fakeClusterStatus
+	byServer map[string][]ServerLANAddressChangeDTO
+}
+
+func (r serverAddressChanges) AddressChangesForServer(serverID string) []ServerLANAddressChangeDTO {
+	return slices.Clone(r.byServer[serverID])
+}
+
+// TestServerDTOHidesHeadNameWithoutSpecAccess pins the server's address
+// changes: every change the orchestration holds for the server, in its
+// order, named by the head's gateway model only for a reader who may see the
+// head's spec -- a reader who sees the server but not the head, and a head
+// that is gone, get no name. Without a reader the list is empty, not null.
+func TestServerDTOHidesHeadNameWithoutSpecAccess(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.clusterAgents(a.ID)
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID)))
+
+	got, err := f.svc.GetServer(f.ctx, ownerToken(), a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LANAddressChanges == nil || len(got.LANAddressChanges) != 0 {
+		t.Fatalf("changes without a reader = %#v, want an empty list", got.LANAddressChanges)
+	}
+
+	at := clusterTestNow.Add(time.Minute)
+	changes := []ServerLANAddressChangeDTO{
+		{HeadSpecID: head.ID, From: "192.0.2.10", To: "192.0.2.11", At: at, Relaunched: true},
+		{HeadSpecID: "rspec_gone", From: "192.0.2.9", To: "192.0.2.10", At: at.Add(-time.Minute), Relaunched: true},
+	}
+	f.svc.SetClusterStatusReader(serverAddressChanges{byServer: map[string][]ServerLANAddressChangeDTO{a.ID: changes}})
+	// usr_other may see server A, but not the head's server and so not its spec.
+	if err := f.routes.SetServerOwners(f.ctx, a.ID, []string{"usr_owner", "usr_other"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err = f.svc.GetServer(f.ctx, ownerToken(), a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := slices.Clone(changes)
+	named[0].HeadName = "big"
+	if !reflect.DeepEqual(got.LANAddressChanges, named) {
+		t.Fatalf("owner changes = %+v, want %+v", got.LANAddressChanges, named)
+	}
+	other, err := f.svc.GetServer(f.ctx, otherToken(), a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(other.LANAddressChanges, changes) {
+		t.Fatalf("other changes = %+v, want no head names", other.LANAddressChanges)
+	}
+	list, err := f.svc.ListServers(f.ctx, otherToken())
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(list.Data, func(s ServerDTO) bool { return s.ID == a.ID })
+	if i < 0 || !reflect.DeepEqual(list.Data[i].LANAddressChanges, changes) {
+		t.Fatalf("listed servers = %+v, want A with no head names", list.Data)
 	}
 }

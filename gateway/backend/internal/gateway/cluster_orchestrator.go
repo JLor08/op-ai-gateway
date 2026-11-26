@@ -128,6 +128,7 @@ var telemetryDetailedCauses = map[string]bool{
 // orchestration branches on.
 const (
 	clusterNetworkMesh     = "mesh"
+	clusterNetworkLAN      = "lan"
 	clusterTransportDirect = "direct"
 )
 
@@ -357,6 +358,9 @@ type clusterOrchestrator struct {
 	keptUpGen uint64
 	keptUpOK  bool
 	docGen    uint64
+	// plansGen is the docGen the plans of the known lan heads were last read
+	// again at (refreshLANPlans). Guarded by mu.
+	plansGen uint64
 }
 
 // clusterHeadState is what the orchestration knows of one head.
@@ -396,6 +400,10 @@ type clusterHeadState struct {
 	resume bool
 	// breaches are the breaches the members report now (ClusterStatusDTO).
 	breaches []portal.ClusterBreachDTO
+	// addressChanges are the lan address changes seen between two of the
+	// head's plans (recordAddressChangesLocked), newest first, at most
+	// portal.ClusterAddressChangesKept. In memory only.
+	addressChanges []portal.ClusterAddressChangeDTO
 	// releasing counts the member releases of the head under way outside a
 	// start or a stop; releasesDone, when set, is closed once none is left. A
 	// start waits for them before it ensures the members, so no release
@@ -505,6 +513,7 @@ func (o *clusterOrchestrator) ClusterStatus(head string) portal.ClusterStatusDTO
 		out.CooldownUntil = &until
 	}
 	out.Breaches = slices.Clone(st.breaches)
+	out.AddressChanges = cloneAddressChanges(st.addressChanges)
 	return out
 }
 
@@ -735,14 +744,19 @@ func (o *clusterOrchestrator) plan(ctx context.Context, head string) (portal.Clu
 	return plan, nil
 }
 
-// rememberPlanLocked keeps plan as st's last plan when it is not withheld; the
-// caller holds o.mu.
+// rememberPlanLocked keeps plan as st's last plan when it is not withheld,
+// recording the lan address changes since the last plan kept
+// (recordAddressChangesLocked); the caller holds o.mu.
 func (o *clusterOrchestrator) rememberPlanLocked(st *clusterHeadState, plan portal.ClusterPlan) {
 	if plan.WithheldReason != "" {
 		return
 	}
+	if st.lastPlan != nil {
+		o.recordAddressChangesLocked(st, *st.lastPlan, plan)
+	}
 	p := plan
 	p.Members = slices.Clone(plan.Members)
+	p.HeadIdentity = slices.Clone(plan.HeadIdentity)
 	st.lastPlan = &p
 }
 
@@ -1731,15 +1745,18 @@ func (o *clusterOrchestrator) observeStatus(serverID string, prev, next []Runtim
 // -- except one an operator stopped, and, during the boot grace, one whose
 // servers have not all reported, since the gateway cannot yet tell
 // whether that cluster still runs. A head whose spec is gone is forgotten.
-// Each start runs in the background, bounded by its own bounds and the
-// server's lifetime; the pass itself only reads.
-func (o *clusterOrchestrator) Reconcile(ctx context.Context) {
+// After a runtime document changed, it also reads again the plan of every
+// lan head it knows (refreshLANPlans), so a running cluster's address change
+// is noticed. Each start runs in the background, bounded by its own bounds
+// and the server's lifetime; the pass itself only reads.
+func (o *clusterOrchestrator) Reconcile(parent context.Context) {
 	if o == nil {
 		return
 	}
-	o.closeSessions(ctx)
+	o.closeSessions(parent)
 	o.retainServers()
-	ctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
+	defer o.refreshLANPlans(parent)
+	ctx, cancel := context.WithTimeout(parent, clusterReadTimeout)
 	defer cancel()
 	o.liftChangedBlocks(ctx)
 	heads, err := o.keptUpHeads(ctx)

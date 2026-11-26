@@ -5,6 +5,7 @@ package portal
 
 import (
 	"context"
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"slices"
 	"time"
@@ -21,25 +22,30 @@ const ClusterWithheldHeadDisabled = "runtime.cluster_head_disabled"
 // documents push for it. WithheldReason is the derivation's reason when the
 // cluster is not pushed (a ClusterWithheld* code); Members is then empty.
 // Network, Transport and Generation are the head's cluster block's.
+// HeadIdentity is how the members' documents know the head: its addresses,
+// or the one name the member agents resolve (empty while withheld).
 type ClusterPlan struct {
 	Head           RuntimeActionScope
 	WithheldReason string
 	Network        string
 	Transport      string
 	Generation     string
+	HeadIdentity   []string
 	Members        []ClusterPlanMember
 }
 
 // ClusterPlanMember is one member of a ClusterPlan: its position in the
 // member order, its server and that server's server_agent application (the
 // agent router the member routes are sent to), the agent spec id of its
-// rpc_server spec and that spec's startup timeout.
+// rpc_server spec, that spec's startup timeout and the address the head
+// dials it at (the host of its entry in the head's endpoint list).
 type ClusterPlanMember struct {
 	Position              int
 	Server                routing.AIServer
 	Application           routing.Application
 	SpecID                string
 	StartupTimeoutSeconds int
+	Address               string
 }
 
 // ClusterPlan returns headSpecID's plan, built from the same derivation the
@@ -78,6 +84,7 @@ func (s *Service) ClusterPlan(ctx context.Context, headSpecID string) (ClusterPl
 		return plan, nil
 	}
 	plan.Network, plan.Transport, plan.Generation = d.head.Network, d.head.Transport, d.head.Generation
+	plan.HeadIdentity = slices.Clone(d.headIdentity)
 	rows, _, err := s.routes.ClusterMembers(ctx, head.ID)
 	if err != nil {
 		return ClusterPlan{}, err
@@ -120,13 +127,14 @@ func (s *Service) clusterPlanMember(ctx context.Context, row routing.ClusterMemb
 	}
 	return ClusterPlanMember{
 		Position: row.Position, Server: srv, Application: app,
-		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds,
+		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds, Address: d.addresses[row.ServerID],
 	}, "", nil
 }
 
 func withheldPlan(plan ClusterPlan, reason string) ClusterPlan {
 	plan.WithheldReason = reason
 	plan.Network, plan.Transport, plan.Generation = "", "", ""
+	plan.HeadIdentity = nil
 	plan.Members = []ClusterPlanMember{}
 	return plan
 }
@@ -281,6 +289,52 @@ type ClusterStatusDTO struct {
 	// is refused until the budget is raised, the split changed, or the stored
 	// usage reset. Derived by the portal from the stored usage on every read.
 	PeaksAboveBudget []ClusterPeakAboveBudgetDTO `json:"peaks_above_budget,omitempty"`
+	// AddressChanges are the recent changes of a lan cluster's addresses, as
+	// the orchestration saw them between two plans of the head, newest first
+	// (at most ClusterAddressChangesKept): a member's dial address or the
+	// head's identity. Held in memory only, so a gateway restart starts the
+	// list empty.
+	AddressChanges []ClusterAddressChangeDTO `json:"address_changes"`
+}
+
+// ClusterAddressChangesKept is how many address changes the orchestration
+// keeps per head: the notice describes recent changes, not an audit trail.
+const ClusterAddressChangesKept = 5
+
+// ClusterAddressChangeDTO is one change of a lan cluster's addresses: a
+// member's dial address (by Position), or the head's identity (Head, no
+// position) -- the addresses the members accept the head from, joined by
+// ", ". Server and ServerID name the server whose address changed. A
+// member's change relaunches the head (the address is in its endpoint
+// list); the head's identity is applied live by the members' agents, so
+// Relaunched is false for it. A member on a server the reader may not
+// manage keeps its position, the time and Relaunched only: the server and
+// its addresses are facts about that server.
+type ClusterAddressChangeDTO struct {
+	Position   *int      `json:"position,omitempty"`
+	Head       bool      `json:"head"`
+	Server     string    `json:"server"`
+	ServerID   string    `json:"server_id"`
+	From       string    `json:"from"`
+	To         string    `json:"to"`
+	At         time.Time `json:"at"`
+	Relaunched bool      `json:"relaunched"`
+}
+
+// ServerLANAddressChangeDTO is one ClusterAddressChangeDTO as the server
+// whose address changed shows it: the head of the cluster (HeadSpecID, and
+// HeadName -- the head's gateway model name, "" when the reader may not see
+// the head's spec), whether the server is that cluster's head (AsHead: its
+// identity changed) or a member (its dial address changed), and the change
+// itself.
+type ServerLANAddressChangeDTO struct {
+	HeadSpecID string    `json:"head_spec_id"`
+	HeadName   string    `json:"head_name"`
+	AsHead     bool      `json:"as_head"`
+	From       string    `json:"from"`
+	To         string    `json:"to"`
+	At         time.Time `json:"at"`
+	Relaunched bool      `json:"relaunched"`
 }
 
 // The resources of a ClusterPeakAboveBudgetDTO.
@@ -346,11 +400,14 @@ type ClusterFailureDTO struct {
 }
 
 // ClusterStatusReader is the gateway's cluster orchestration as the portal
-// reads it: the state of one head, cold for a head it knows nothing about.
-// The gateway injects it (SetClusterStatusReader), so the portal does not
-// depend on the gateway package.
+// reads it: the state of one head, cold for a head it knows nothing about,
+// and the address changes it holds for one server across every cluster the
+// server takes part in, newest first (HeadName left empty: the portal names
+// the head for its reader). The gateway injects it (SetClusterStatusReader),
+// so the portal does not depend on the gateway package.
 type ClusterStatusReader interface {
 	ClusterStatus(headSpecID string) ClusterStatusDTO
+	AddressChangesForServer(serverID string) []ServerLANAddressChangeDTO
 }
 
 // ClusterMeshDriftHandler is what the gateway's cluster orchestration offers
@@ -377,7 +434,8 @@ func (s *Service) SetClusterStatusReader(r ClusterStatusReader) {
 // state, and invalid while the derivation withholds the head (withheld != "")
 // whatever the orchestration last saw. A breach of a member at one of the
 // hidden positions (a server the reader may not manage) keeps only its
-// position.
+// position; an address change of such a member keeps its position, time and
+// relaunch.
 func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int) *ClusterStatusDTO {
 	st := ClusterStatusDTO{State: ClusterStateCold, Members: []ClusterMemberStatusDTO{}}
 	if s.clusterStatus != nil {
@@ -399,7 +457,62 @@ func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int) *
 		}
 		st.Breaches = breaches
 	}
+	st.AddressChanges = redactAddressChanges(st.AddressChanges, hidden)
 	return &st
+}
+
+// redactAddressChanges is changes with every change of a member at one of
+// the hidden positions cut down to its position, time and relaunch, in a new
+// list (never nil).
+func redactAddressChanges(changes []ClusterAddressChangeDTO, hidden []int) []ClusterAddressChangeDTO {
+	out := make([]ClusterAddressChangeDTO, len(changes))
+	for i, c := range changes {
+		if c.Position != nil && slices.Contains(hidden, *c.Position) {
+			c = ClusterAddressChangeDTO{Position: c.Position, At: c.At, Relaunched: c.Relaunched}
+		}
+		out[i] = c
+	}
+	return out
+}
+
+// serverLANAddressChanges is serverID's address changes as the cluster
+// orchestration holds them (ClusterStatusReader.AddressChangesForServer),
+// each named by its head's gateway model name when p may see the head's spec
+// -- the check every runtime-spec read makes (authorizeMapping) -- and left
+// unnamed otherwise: a head beyond p's rights, a head that is gone, and a
+// head whose name cannot be read (best effort, so a failed lookup never
+// fails the server's read). Each head is looked up once. Never nil; empty
+// without a reader.
+func (s *Service) serverLANAddressChanges(ctx context.Context, p auth.Token, serverID string) []ServerLANAddressChangeDTO {
+	out := []ServerLANAddressChangeDTO{}
+	if s.clusterStatus == nil {
+		return out
+	}
+	names := map[string]string{}
+	for _, c := range s.clusterStatus.AddressChangesForServer(serverID) {
+		name, ok := names[c.HeadSpecID]
+		if !ok {
+			name = s.visibleHeadName(ctx, p, c.HeadSpecID)
+			names[c.HeadSpecID] = name
+		}
+		c.HeadName = name
+		out = append(out, c)
+	}
+	return out
+}
+
+// visibleHeadName is the gateway model name of the head spec headSpecID when
+// p may see that spec, else "".
+func (s *Service) visibleHeadName(ctx context.Context, p auth.Token, headSpecID string) string {
+	spec, ok, err := s.routes.RuntimeSpecByID(ctx, headSpecID)
+	if err != nil || !ok {
+		return ""
+	}
+	mapping, _, _, err := s.authorizeMapping(ctx, p, spec.MappingID)
+	if err != nil {
+		return ""
+	}
+	return mapping.GatewayModelName
 }
 
 // stopDriftedClusters hands a drift of NetBird's Default policy to the

@@ -124,6 +124,11 @@ type clusterDerivation struct {
 	reason  string
 	head    *AgentClusterHeadDTO
 	members map[string]AgentRuntimeSpecDTO
+	// addresses is each member server's dial address (the host of its
+	// endpoint), headIdentity how the members know the head: its addresses,
+	// or the name they resolve. The plan carries both (ClusterPlan).
+	addresses    map[string]string
+	headIdentity []string
 	// hold: the viewing server's own agent declaration is unknown, so its
 	// document is held rather than served without the cluster.
 	hold bool
@@ -619,7 +624,13 @@ type memberGenerationPart struct {
 func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, members []derivedMember, network, transport string, headIPs []string, headDomain string) (clusterDerivation, error) {
 	block := &AgentClusterHeadDTO{Endpoints: make([]AgentClusterEndpointDTO, 0, len(members)), Transport: transport, Network: network}
 	parts := make([]memberGenerationPart, 0, len(members))
-	out := clusterDerivation{head: block, members: make(map[string]AgentRuntimeSpecDTO, len(members))}
+	out := clusterDerivation{
+		head: block, members: make(map[string]AgentRuntimeSpecDTO, len(members)),
+		addresses: make(map[string]string, len(members)), headIdentity: slices.Clone(headIPs),
+	}
+	if headDomain != "" {
+		out.headIdentity = append(out.headIdentity, headDomain)
+	}
 	for _, m := range members {
 		spec, err := s.memberAgentSpec(ctx, head.ID, m, transport, headIPs, headDomain)
 		if errors.Is(err, ErrRuntimeSpecArgsInvalid) || errors.Is(err, ErrRuntimeSpecEnvInvalid) {
@@ -654,6 +665,7 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 			Bind: m.bindIP, Port: m.row.Port,
 		})
 		out.members[m.server.ID] = spec
+		out.addresses[m.server.ID] = m.address
 	}
 	raw, err := json.Marshal(parts)
 	if err != nil {
