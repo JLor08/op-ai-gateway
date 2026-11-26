@@ -2191,11 +2191,25 @@ per server, none on the head's server); then rights and consent, member specs,
 member binaries, network and transport, and the member GPUs (an Apple GPU needs
 a GPU budget; a known non-NVIDIA GPU needs an estimate on an automatic member,
 and `--tensor-split` on the head, unless the agent measures it per process. It
-does so only for a member whose host reports `linux` and only AMD GPUs and whose
-`device_backend` is `rocm` or `auto`: the agent launches that member with ROCm
-device names, so it runs only as a ROCm/HIP process, which the KFD measurer
-sees. A Windows host, a mixed host, a GPU the report does not name as AMD and a
-Vulkan `rpc-server` are not measured and still need both); last of all,
+does so only for a member whose host's telemetry OS is `linux` (the
+`runtime.GOOS` of its last sample; the hardware report's own `os` is a platform
+string such as `ubuntu 24.04` and names no family) and whose hardware report
+lists only AMD GPUs and whose `device_backend` is `rocm` or `auto`: the agent
+launches that member with ROCm device names, so it runs only as a ROCm/HIP
+process, which the KFD measurer sees. A Windows host, a host without telemetry,
+a mixed host, a GPU the report does not name as AMD and a Vulkan `rpc-server`
+are not measured and still need both. The check reads the report, not the
+agent's measurer: the agent chooses its GPU vendors and measurer from the tools
+on its `PATH` (`nvidia-smi` present selects the NVIDIA vendor and the
+compute-apps measurer ahead of the KFD), while the report lists only GPUs whose
+collector succeeded. On a Linux AMD host with a leftover `nvidia-smi` that finds
+no GPU the member is exempt, yet `auto` resolves to Vulkan and an explicit
+`rocm` member is not measured, so it stays unknown-demand until the operator
+gives an estimate. A manual member spec write re-checks only its own estimate
+rule, not the `--tensor-split` rule of a head that already uses it: switching a
+used spec's `device_backend` from `rocm` to `vulkan` leaves a stored head
+without `--tensor-split` that a fresh save would refuse, as a later change of
+the GPU set or the hardware does); last of all,
 automatic members need the head binary's
 version known (`runtime_spec.cluster_head_binary_version_unknown`). Rights are
 needed on every member server the write keeps or adds; removing members, turning
