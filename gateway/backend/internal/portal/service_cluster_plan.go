@@ -435,9 +435,12 @@ func (s *Service) SetClusterStatusReader(r ClusterStatusReader) {
 // state, and invalid while the derivation withholds the head (withheld != "")
 // whatever the orchestration last saw. A breach of a member at one of the
 // hidden positions (a server the reader may not manage) keeps only its
-// position; an address change of such a member keeps its position, time and
-// relaunch.
-func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int) *ClusterStatusDTO {
+// position: breaches are current, so their positions are today's. An address
+// change of a member on a server mayManage refuses keeps its position, time
+// and relaunch: a change keeps the position it was recorded at, which after a
+// reorder or a removal may be another member's now, so it is redacted by its
+// server, never by its position.
+func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int, mayManage func(serverID string) bool) *ClusterStatusDTO {
 	st := ClusterStatusDTO{State: ClusterStateCold, Members: []ClusterMemberStatusDTO{}}
 	if s.clusterStatus != nil {
 		st = s.clusterStatus.ClusterStatus(headSpecID)
@@ -458,22 +461,44 @@ func (s *Service) headClusterStatus(headSpecID, withheld string, hidden []int) *
 		}
 		st.Breaches = breaches
 	}
-	st.AddressChanges = redactAddressChanges(st.AddressChanges, hidden)
+	st.AddressChanges = redactAddressChanges(st.AddressChanges, mayManage)
 	return &st
 }
 
-// redactAddressChanges is changes with every change of a member at one of
-// the hidden positions cut down to its position, time and relaunch, in a new
-// list (never nil).
-func redactAddressChanges(changes []ClusterAddressChangeDTO, hidden []int) []ClusterAddressChangeDTO {
+// redactAddressChanges is changes with every member change on a server
+// mayManage refuses cut down to its position, time and relaunch, in a new
+// list (never nil). The head's own changes are the head's, which the reader
+// is reading, and stay whole.
+func redactAddressChanges(changes []ClusterAddressChangeDTO, mayManage func(serverID string) bool) []ClusterAddressChangeDTO {
 	out := make([]ClusterAddressChangeDTO, len(changes))
 	for i, c := range changes {
-		if c.Position != nil && slices.Contains(hidden, *c.Position) {
+		if !c.Head && !mayManage(c.ServerID) {
 			c = ClusterAddressChangeDTO{Position: c.Position, At: c.At, Relaunched: c.Relaunched}
 		}
 		out[i] = c
 	}
 	return out
+}
+
+// addressChangeVisibility is the mayManage of headClusterStatus for p: a
+// current member's server as fillClusterMemberDTOs decided it, and any other
+// server (a member that has left the cluster since its change was recorded)
+// by the same check, asked once per server.
+func (s *Service) addressChangeVisibility(ctx context.Context, p auth.Token, members []clusterMemberState) func(serverID string) bool {
+	known := make(map[string]bool, len(members))
+	for _, m := range members {
+		if m.found {
+			known[m.server.ID] = m.visible
+		}
+	}
+	return func(serverID string) bool {
+		if v, ok := known[serverID]; ok {
+			return v
+		}
+		v := serverID != "" && (isSystem(p) || s.callerManagesServer(ctx, p, serverID))
+		known[serverID] = v
+		return v
+	}
 }
 
 // serverLANAddressChanges is serverID's address changes as the cluster

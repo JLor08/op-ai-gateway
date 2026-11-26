@@ -882,8 +882,11 @@ Conventions worth stating, because each is a judgement call a client depends on:
   in the head's endpoint list — a head that is not formed relaunches nothing
   and its next start dials the new address — and `false` for the head's
   identity, which the members' agents apply live). A breach or peak of a member the caller may not see keeps only its
-  `position`; such a member's address change keeps its `position`, `at` and
-  `relaunched`. A restarted gateway starts from `cold`, with no address
+  `position`; an address change of a member on a server the caller may not
+  manage keeps its `position` (the one recorded with the change, which a
+  later reorder or removal does not update), `at` and `relaunched`. That rule
+  follows the change's server, not its position, so it also covers a member
+  that has left the cluster since. A restarted gateway starts from `cold`, with no address
   changes, and learns a running cluster again from the agents' telemetry. Beside it the head carries the read-only cluster
   totals `cluster_vram_total_mb` / `cluster_ram_total_mb` (the head's own
   effective demand plus every member's, each part `max(measured, estimate)`),
