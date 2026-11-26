@@ -142,6 +142,7 @@ var migrations = []migration{
 	{version: 107, name: "application_decision_modes", up: migration107Up},
 	{version: 108, name: "token_decisions_confidence_normalize", up: migration108Up},
 	{version: 109, name: "runtime_spec_execution_mode", up: migration109Up},
+	{version: 110, name: "server_lan_interfaces", up: migration110Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4812,4 +4813,25 @@ func migration109Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return nil
+}
+
+// migration110Up adds the agent-reported LAN interface list and the LAN
+// address source to ai_servers: lan_interfaces (” = never reported, '[]' =
+// reported empty), lan_source and lan_interface_id. It then backfills the
+// source so an existing setup resolves exactly as before: a server that already
+// carries a lan_address is 'manual', every other one 'auto'. The backfill only
+// touches rows still at the ” default, so a replay never rewrites a choice.
+func migration110Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"lan_interfaces text not null default ''",
+		"lan_source text not null default ''",
+		"lan_interface_id text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "ai_servers", col); err != nil {
+			return err
+		}
+	}
+	return execTx(ctx, tx, dl, `update ai_servers
+		set lan_source = case when lan_address <> '' then 'manual' else 'auto' end
+		where lan_source = ''`)
 }

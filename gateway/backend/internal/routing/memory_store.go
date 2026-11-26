@@ -261,7 +261,7 @@ func (m *MemoryStore) CreateAIServer(_ context.Context, host AIServer) error {
 }
 
 // UpdateAIServer mirrors the SQL full-row update, which leaves netbird_ip to
-// the NetBird state writes.
+// the NetBird state writes and lan_interfaces to UpdateServerLANInterfaces.
 func (m *MemoryStore) UpdateAIServer(_ context.Context, host AIServer) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -271,6 +271,7 @@ func (m *MemoryStore) UpdateAIServer(_ context.Context, host AIServer) error {
 	}
 	updated := copyAIServer(host)
 	updated.NetbirdIP = stored.NetbirdIP
+	updated.LANInterfaces = stored.LANInterfaces
 	m.servers[host.ID] = updated
 	return nil
 }
@@ -393,6 +394,20 @@ func (m *MemoryStore) ClearServerNetbirdIP(_ context.Context, id string) error {
 		return storeerr.ErrNotFound
 	}
 	server.NetbirdIP = ""
+	m.servers[id] = server
+	return nil
+}
+
+// UpdateServerLANInterfaces mirrors the SQL targeted UPDATE: it sets only the
+// reported interface list. An unknown id is ErrNotFound.
+func (m *MemoryStore) UpdateServerLANInterfaces(_ context.Context, id, interfacesJSON string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	server, ok := m.servers[id]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	server.LANInterfaces = interfacesJSON
 	m.servers[id] = server
 	return nil
 }

@@ -77,7 +77,13 @@ on every spec, `device_backend` (`auto` default). `ai_servers` gains
 `netbird_ip` (the mesh IPv4 the peer sync records; the full-row server update never writes it), `lan_address` (an IPv4
 literal or `''`), `lan_bind_only`, `rpc_member_enabled` and
 `rpc_allowed_head_groups` (a JSON array of admin-group ids, `'[]'` = the
-server's own admin groups). The service layer normalises an empty
+server's own admin groups), plus the LAN address source (migration 110):
+`lan_source` (`auto`, `interface` or `manual`; `''` reads as `auto`),
+`lan_interface_id` (the chosen reported interface under `interface`) and
+`lan_interfaces` (the agent-reported LAN interface list as a sanitized JSON
+array; `''` = never reported, `'[]'` = reported empty). `lan_interfaces` is
+written only by `UpdateServerLANInterfaces`, never by the full-row server
+update. The service layer normalises an empty
 `member_mode`, `device_backend` or consent list to its default on every write
 and reads an empty one as that default.
 
@@ -651,6 +657,7 @@ catch-all `model_override`, which has its own column).
 | # | Migration | Purpose |
 |---|---|---|
 | 109 | `runtime_spec_execution_mode` | Adds `execution_mode text not null default 'native'` and `wsl_distro text not null default ''` to `agent_runtime_specs` through `addColumnIfMissing`, on both dialects (#381, [ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged)): where the agent runs the spec (`native` or `wsl`) and, for `wsl`, the WSL2 distribution. Both are operator-owned and written by `UpsertRuntimeSpec` on every save; the SQL store writes an unset mode as `native` (an explicit `''` insert would bypass the column default), and the portal reads a stored `''` as `native` too. A native spec stores `''` as its distro whatever the request carried. The defaults are the whole upgrade story: every existing row reads back as a native spec with no distro, so its pushed runtime document, which carries an `execution` block only for a `wsl` spec, stays byte-for-byte what it was. No backfill; append-only, so a fresh install gets the columns by replaying this migration. |
+| 110 | `server_lan_interfaces` | Adds `lan_interfaces`, `lan_source` and `lan_interface_id` (all `text not null default ''`) to `ai_servers` through `addColumnIfMissing`, then backfills `lan_source` where it is still `''`: `manual` for a server that already has a `lan_address`, `auto` for every other one, so an existing setup resolves exactly as before. `lan_interfaces` stays `''` (never reported) until an agent reports. The backfill touches only rows still at the default, so a replay never rewrites a later choice. |
 
 ### Responses live timings
 

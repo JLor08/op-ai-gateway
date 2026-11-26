@@ -1960,6 +1960,18 @@ func (_d *RoutingStoreWithTracing) UpdateServerHTTPSSwitchOverride(ctx context.C
 	return _d.Store.UpdateServerHTTPSSwitchOverride(ctx, id, override)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateServerLANInterfaces(ctx context.Context, id string, interfacesJSON string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateServerLANInterfaces")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateServerLANInterfaces(ctx, id, interfacesJSON)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateServerLastSeen(ctx context.Context, id string, lastSeenAt time.Time, updatedAt time.Time) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateServerLastSeen")
 	defer span.End()
