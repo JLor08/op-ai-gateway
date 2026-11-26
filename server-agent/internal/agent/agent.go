@@ -484,7 +484,17 @@ import (
 // hostpower endpoint's certificate by SHA-256. No wire change, so no
 // agent.Features entry. This is the ONE bump for the whole branch; later
 // commits on it do not bump again.
-const Version = "0.25.0"
+//
+// 0.25.0 -> 0.25.1 is the single bump for the agent key and the LAN
+// interfaces. PATCH: the agent gains the agent_key option (OP_AGENT_AGENT_KEY),
+// seals each spec's api_token in its runtime-config disk cache with a subkey
+// of it (closes #61), and reports its LAN interface candidates on the
+// telemetry sample (`interfaces`, keyed ids with a key, name ids without).
+// The gateway reads the new sample field when present and an old agent simply
+// sends none, so nothing is negotiated and no agent.Features entry is added.
+// This is the ONE bump for the whole branch; later commits on it do not bump
+// again.
+const Version = "0.25.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

@@ -18,7 +18,9 @@ All three are opt-in or self-limiting by design: tracing defaults to fully disab
 (every span dropped before it is built), payload capture is a separate explicit
 opt-in (see the capture chapter), and the ServerAgent never reports anything that
 identifies the physical machine (no serials, board/chassis UUIDs, or MAC
-addresses).
+addresses). A hardware address leaves the host only as a keyed hash, the opaque
+`id` of an entry in the sample's LAN interface list (§8.2.8), keyed with a
+host-local secret the gateway never sees.
 
 ## 8.2 Server-Agent telemetry collection
 
@@ -154,6 +156,10 @@ Privacy is a schema-level guarantee, documented on `sample.SystemReport`
 board/chassis UUID, or MAC-address field at all — there is nothing to strip. GPU
 `UUID` and `pci_bus_id` are the identifier-like exceptions (device and slot
 addresses, not personal or host identity).
+The one place a hardware address is used at all is the LAN interface list on the
+telemetry sample (§8.2.8), and there only as a keyed hash: the raw MAC never
+leaves the host, and `SystemReport` still carries none
+([ADR-119](../09-architecture-decisions.md#adr-119--a-host-local-agent-key-keyed-interface-ids-and-a-sealed-token-cache-a-lan-servers-address-follows-its-reported-interfaces)).
 
 ### 8.2.6 Optional inference-server scraping
 
@@ -191,6 +197,39 @@ therefore matches replies by **Echo `Seq` + the echoed payload bytes**
 (`pingPayload = "op-gw-ping"`) instead, which round-trip unchanged on every
 platform. This is used for on-demand reachability probes (e.g. NetBird peer checks),
 independent of the ServerAgent telemetry stream.
+
+### 8.2.8 LAN interface candidates
+
+`collector.InterfaceCollector` (`server-agent/internal/collector/netif.go`)
+lists the host's **LAN address candidates** for a `lan` RPC cluster
+([Networking & Mesh §12](networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)):
+every interface that is up, not loopback and not a NetBird `wt<n>` interface,
+with its IPv4 addresses minus `100.64.0.0/10`, link-local and loopback; an
+interface left without an address is not listed. Each entry carries `id`,
+`id_kind`, `name`, `ipv4` (numeric order), `virtual` (a name prefix such as
+`docker`, `br-`, `veth`, `vEthernet`, `tun`, `utun` or `wg`) and `preferred`,
+set on exactly one entry of a non-empty list: the interface that carries the
+source address of the default IPv4 route first, then an RFC 1918 address, then a
+physical interface, then the name. The `id` is what a stored choice matches:
+with an `agent_key` configured (`id_kind: keyed`) the first 16 bytes, as hex, of
+HMAC-SHA256 over the hardware address under the interface-id subkey (the name
+alone for an interface without one, the address plus the name when several
+candidates share one, as VLAN sub-interfaces do), so it survives a rename and
+cannot be reversed without the key; without a key (`id_kind: name`) the name.
+
+The list is live state, not inventory, so it rides on the periodic **telemetry
+sample** (`interfaces`, a pointer: `[]` is a reported empty list, an absent
+field means unchanged). The agent enumerates every 5 s and sends a list only
+when it differs from the last delivered one and has stayed unchanged for 10 s,
+so a flapping link or a starting container does not churn the gateway; a
+reconnect and the system-report cadence send the current list again, since a
+delivery only means the transport accepted the sample. The gateway keeps at most 32 interfaces
+of 8 addresses each, drops every address in `100.64.0.0/10` or equal to the
+server's `netbird_ip`, and writes the result through the targeted writer
+`UpdateServerLANInterfaces` (`ai_servers.lan_interfaces`, migration 116) only
+when it changed. It re-derives the server's `lan` clusters only when the
+effective LAN address, the head identity addresses or the fallback state
+changed; an old agent sends no field and the row stays "never reported" ([ADR-119](../09-architecture-decisions.md#adr-119--a-host-local-agent-key-keyed-interface-ids-and-a-sealed-token-cache-a-lan-servers-address-follows-its-reported-interfaces)).
 
 ## 8.3 Telemetry ingest: agent → gateway
 

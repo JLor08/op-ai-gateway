@@ -10,6 +10,10 @@ import "time"
 // SystemReport is a static hardware inventory the agent collects once at startup
 // and sends on connect + periodically. It NEVER contains serials, board/chassis
 // UUIDs, or MAC addresses (privacy). GPU UUID is allowed (a device id, not PII).
+// A hardware address leaves the host only as a keyed hash: the opaque id of a
+// NetInterface on the telemetry sample, HMAC-SHA256 under a subkey of the
+// host-local agent_key (without a key the id is the interface name). The raw
+// MAC never leaves the host, and this report carries no hardware address at all.
 type SystemReport struct {
 	CollectedAt  time.Time  `json:"collected_at"`
 	AgentVersion string     `json:"agent_version"`

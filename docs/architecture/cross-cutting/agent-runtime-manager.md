@@ -7346,8 +7346,10 @@ mirror). Three different cadences share the one collect cycle:
   injects no credential of its own and forwards `Authorization` verbatim, not
   that the agent holds no token at all — it does, from the runtime-config push
   that carries `${API_TOKEN}`'s resolved value. A mismatch between how the
-  agent comments on that value and how it actually persists it is tracked
-  separately as issue #61 — narrower, and not a reason this design needed to
+  agent comments on that value and how it actually persists it was tracked
+  separately as issue #61 (closed by
+  [ADR-119](../09-architecture-decisions.md#adr-119--a-host-local-agent-key-keyed-interface-ids-and-a-sealed-token-cache-a-lan-servers-address-follows-its-reported-interfaces):
+  the cached token is sealed with the agent key) — narrower, and not a reason this design needed to
   route a credential through `Status`. Once the gateway's probe
   establishes a real verdict this way, the persisted layers (1–2 of
   [Telemetry, Usage Analytics & Observability
