@@ -147,9 +147,10 @@ export interface ClusterCandidate {
   rpc_binary?: string;
   rpc_binary_version?: string;
   member_specs?: RPCMemberSpec[];
-  // Automatic: the server has a ggml-rpc-server of the head binary's version
-  // (rpc_binary names it). Manual: at least one listed member spec's binary
-  // is not of another version. Absent from an older gateway.
+  // Automatic: the server has a ggml-rpc-server of the head binary's RPC
+  // protocol or version (rpc_binary names it). Manual: at least one listed
+  // member spec's binary is not of another version. Absent from an older
+  // gateway.
   compatible?: boolean;
   // Manual: the listed member specs whose binary is of another version than
   // the head binary's; the save refuses them.

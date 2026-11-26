@@ -14,8 +14,8 @@ export interface CandidatesState {
   loading: boolean;
   failed: boolean;
   candidates: ClusterCandidate[];
-  // Whether the head binary's version is known; automatic members are
-  // matched on it.
+  // Whether the head binary's version or RPC protocol is known; automatic
+  // members are matched on it.
   headKnown: boolean;
   // The head binary's ggml RPC protocol, '' when unknown.
   headRpcProtocol: string;
@@ -124,6 +124,8 @@ export function offeredCandidates(
 /**
  * The automatic candidates the gateway rejected (compatible === false) and
  * that are no member yet; the picker lists them disabled with the reason.
+ * A rejection for an unknown head version is left out: it applies to every
+ * candidate alike, and the editor's head-version alert explains it once.
  */
 export function rejectedCandidates(
   state: CandidatesState,
@@ -132,6 +134,7 @@ export function rejectedCandidates(
   return state.candidates.filter(
     (c) =>
       c.compatible === false &&
+      c.incompatible_reason !== 'head_version_unknown' &&
       !c.member_specs &&
       !c.incompatible_member_specs &&
       !taken.has(c.server_id),

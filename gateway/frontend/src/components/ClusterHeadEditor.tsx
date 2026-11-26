@@ -384,8 +384,6 @@ function rejectReasonText(c: ClusterCandidate, headProtocol: string, t: Translat
       return t.clusterRejectBuildMismatch;
     case 'version_unknown':
       return t.clusterRejectVersionUnknown;
-    case 'head_version_unknown':
-      return t.clusterRejectHeadVersionUnknown;
     default:
       return t.clusterRejectNoRpcBinary;
   }

@@ -81,7 +81,7 @@ describe('the picker offer', () => {
     expect(offeredCandidates(list, new Set(['d'])).map((c) => c.server_id)).toEqual(['a', 'c']);
   });
 
-  it('lists only automatic rejected candidates that are no member yet', () => {
+  it('lists only automatic rejected candidates that are no member yet, unless the head is unknown', () => {
     const list = state([
       { server_id: 'a', server_name: 'A', compatible: false, incompatible_reason: 'no_rpc_binary' },
       { server_id: 'b', server_name: 'B', compatible: true },
@@ -93,6 +93,14 @@ describe('the picker offer', () => {
       },
       { server_id: 'd', server_name: 'D', compatible: false, member_specs: [spec('s1')] },
       { server_id: 'e', server_name: 'E' },
+      // An unknown head version rejects every candidate alike; the editor's
+      // head-version alert explains it once instead of one line per server.
+      {
+        server_id: 'f',
+        server_name: 'F',
+        compatible: false,
+        incompatible_reason: 'head_version_unknown',
+      },
     ]);
     expect(rejectedCandidates(list, new Set(['c'])).map((c) => c.server_id)).toEqual(['a']);
   });
