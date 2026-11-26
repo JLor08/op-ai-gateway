@@ -1714,6 +1714,14 @@ type ServerDTO struct {
 	// cluster traffic; LANBindOnly makes an RPC member listen on it only.
 	LANAddress  string `json:"lan_address"`
 	LANBindOnly bool   `json:"lan_bind_only"`
+	// LANSource is the stored LAN address source (auto, interface or
+	// manual; "" never leaves the service, a pre-migration row reads as
+	// manual with a lan_address, else auto). LANInterfaceID is the chosen
+	// reported interface under "interface". LAN is the effective resolution
+	// derived from them and the last agent-reported interface list.
+	LANSource      string           `json:"lan_source"`
+	LANInterfaceID string           `json:"lan_interface_id"`
+	LAN            LANResolutionDTO `json:"lan"`
 	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC
 	// member; RPCAllowedHeadGroups are the admin-group ids whose heads may
 	// use it. Always a non-nil list.
@@ -1804,7 +1812,12 @@ type UpdateServerRequest struct {
 	PriceUnit *string `json:"price_unit,omitempty"`
 	// RPC cluster settings; same validation as on create. A supplied empty
 	// LANAddress or head-group list clears the value.
-	LANAddress           *string   `json:"lan_address,omitempty"`
+	LANAddress *string `json:"lan_address,omitempty"`
+	// LANSource (auto, interface or manual) and LANInterfaceID choose where
+	// the LAN address comes from. A lan_address without lan_source selects
+	// manual; clearing it under manual selects auto.
+	LANSource            *string   `json:"lan_source,omitempty"`
+	LANInterfaceID       *string   `json:"lan_interface_id,omitempty"`
 	LANBindOnly          *bool     `json:"lan_bind_only,omitempty"`
 	RPCMemberEnabled     *bool     `json:"rpc_member_enabled,omitempty"`
 	RPCAllowedHeadGroups *[]string `json:"rpc_allowed_head_groups,omitempty"`
@@ -4201,6 +4214,7 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		Pue:                         pue,
 		PriceUnit:                   priceUnit,
 		LANAddress:                  lanAddress,
+		LANSource:                   lanSourceForNewServer(lanAddress),
 		LANBindOnly:                 req.LANBindOnly != nil && *req.LANBindOnly,
 		RPCMemberEnabled:            req.RPCMemberEnabled != nil && *req.RPCMemberEnabled,
 		RPCAllowedHeadGroups:        encodeRPCHeadGroups(headGroups),
@@ -4363,7 +4377,31 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 		if err != nil {
 			return ServerDTO{}, err
 		}
+		if v != "" && v == server.NetbirdIP {
+			// A NetBird address is never a LAN address.
+			return ServerDTO{}, ErrServerLANAddressInvalid
+		}
 		server.LANAddress = v
+		switch {
+		case req.LANSource != nil:
+		case v != "":
+			server.LANSource = routing.LANSourceManual
+		case configuredLANSource(server) == routing.LANSourceManual:
+			server.LANSource = routing.LANSourceAuto
+		}
+	}
+	if req.LANSource != nil {
+		src := strings.TrimSpace(*req.LANSource)
+		if src != routing.LANSourceAuto && src != routing.LANSourceInterface && src != routing.LANSourceManual {
+			return ServerDTO{}, ErrServerLANSourceInvalid
+		}
+		server.LANSource = src
+	}
+	if req.LANInterfaceID != nil {
+		server.LANInterfaceID = strings.TrimSpace(*req.LANInterfaceID)
+	}
+	if configuredLANSource(server) == routing.LANSourceInterface && server.LANInterfaceID == "" {
+		return ServerDTO{}, ErrServerLANInterfaceRequired
 	}
 	if req.LANBindOnly != nil {
 		server.LANBindOnly = *req.LANBindOnly
@@ -5033,6 +5071,9 @@ func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, va
 		NetbirdIP:                   server.NetbirdIP,
 		LANAddress:                  server.LANAddress,
 		LANBindOnly:                 server.LANBindOnly,
+		LANSource:                   configuredLANSource(server),
+		LANInterfaceID:              server.LANInterfaceID,
+		LAN:                         lanResolutionDTOOf(server),
 		RPCMemberEnabled:            server.RPCMemberEnabled,
 		RPCAllowedHeadGroups:        decodeRPCHeadGroups(server.RPCAllowedHeadGroups),
 		// NetbirdSetupKey / NetbirdSetupCommand are display-once and deliberately

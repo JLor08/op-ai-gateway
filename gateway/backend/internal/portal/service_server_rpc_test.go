@@ -189,3 +189,131 @@ func TestServerHeadGroupsPersistAndLegacyEmpty(t *testing.T) {
 		t.Fatalf("legacy DTO heads = %#v, %v; want empty non-nil", got.RPCAllowedHeadGroups, err)
 	}
 }
+
+func TestUpdateServerLANSourceRoundTrip(t *testing.T) {
+	svc, routeStore := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	if srv.LANSource != "auto" || srv.LANInterfaceID != "" {
+		t.Fatalf("fresh server source = %q/%q, want auto", srv.LANSource, srv.LANInterfaceID)
+	}
+	src, id := "interface", "if-1"
+	got, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANSource: &src, LANInterfaceID: &id})
+	if err != nil || got.LANSource != "interface" || got.LANInterfaceID != "if-1" {
+		t.Fatalf("update = %+v, %v", got, err)
+	}
+	stored, _ := routeStore.AIServerByID(ctx, srv.ID)
+	if stored.LANSource != "interface" || stored.LANInterfaceID != "if-1" {
+		t.Fatalf("stored = %q/%q", stored.LANSource, stored.LANInterfaceID)
+	}
+	// Id already stored: switching source alone is enough.
+	auto := "auto"
+	if got, err = svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANSource: &auto}); err != nil || got.LANSource != "auto" {
+		t.Fatalf("to auto = %+v, %v", got, err)
+	}
+	src = "interface"
+	if got, err = svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANSource: &src}); err != nil || got.LANSource != "interface" {
+		t.Fatalf("back to interface with stored id = %+v, %v", got, err)
+	}
+}
+
+func TestUpdateServerRejectsBadLANSource(t *testing.T) {
+	svc, _ := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	bad := "dhcp"
+	if _, err := svc.UpdateServer(context.Background(), systemAdminToken(), srv.ID, UpdateServerRequest{LANSource: &bad}); !errors.Is(err, ErrServerLANSourceInvalid) {
+		t.Fatalf("err = %v, want ErrServerLANSourceInvalid", err)
+	}
+}
+
+func TestUpdateServerInterfaceSourceNeedsID(t *testing.T) {
+	svc, _ := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	src, empty := "interface", "  "
+	for _, req := range []UpdateServerRequest{{LANSource: &src}, {LANSource: &src, LANInterfaceID: &empty}} {
+		if _, err := svc.UpdateServer(context.Background(), systemAdminToken(), srv.ID, req); !errors.Is(err, ErrServerLANInterfaceRequired) {
+			t.Fatalf("err = %v, want ErrServerLANInterfaceRequired", err)
+		}
+	}
+}
+
+func TestServerDTOCarriesLANResolution(t *testing.T) {
+	svc, routeStore := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	if srv.LAN.IdentityIPs == nil || srv.LAN.Interfaces == nil {
+		t.Fatalf("slices must not be nil: %+v", srv.LAN)
+	}
+	list := `[{"id":"if-1","id_kind":"name","name":"eth0","ipv4":["192.0.2.10"],"virtual":false,"preferred":true}]`
+	if err := routeStore.UpdateServerLANInterfaces(ctx, srv.ID, list); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.GetServer(ctx, systemAdminToken(), srv.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.LAN.Reported || len(got.LAN.Interfaces) != 1 || got.LAN.Interfaces[0].Name != "eth0" {
+		t.Fatalf("lan = %+v", got.LAN)
+	}
+}
+
+func TestUpdateServerTypedLANAddressSwitchesToManual(t *testing.T) {
+	svc, _ := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	lan := "192.0.2.7"
+	got, err := svc.UpdateServer(context.Background(), systemAdminToken(), srv.ID, UpdateServerRequest{LANAddress: &lan})
+	if err != nil || got.LANSource != "manual" || got.LAN.Source != "manual" || got.LAN.Address != lan {
+		t.Fatalf("got = %+v, %v", got, err)
+	}
+}
+
+func TestUpdateServerClearedLANAddressSwitchesToAuto(t *testing.T) {
+	svc, _ := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	lan, empty := "192.0.2.7", ""
+	ctx := context.Background()
+	if _, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANAddress: &lan}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANAddress: &empty})
+	if err != nil || got.LANSource != "auto" || got.LANAddress != "" {
+		t.Fatalf("got = %+v, %v", got, err)
+	}
+	// Clearing under interface keeps the source.
+	src, id := "interface", "if-1"
+	if _, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANSource: &src, LANInterfaceID: &id}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANAddress: &empty})
+	if err != nil || got.LANSource != "interface" {
+		t.Fatalf("got = %+v, %v", got, err)
+	}
+}
+
+func TestCreateServerWithLANAddressIsManual(t *testing.T) {
+	svc, _ := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	lan := "192.0.2.8"
+	dto, err := svc.CreateServer(context.Background(), adminToken(), CreateServerRequest{
+		Name: "S", Domain: "s.example.test", AdminGroupIDs: []string{testAdminGroupID}, LANAddress: &lan,
+	})
+	if err != nil || dto.LANSource != "manual" || dto.LAN.Source != "manual" {
+		t.Fatalf("dto = %+v, %v", dto, err)
+	}
+}
+
+func TestUpdateServerRejectsNetbirdIPAsManualLANAddress(t *testing.T) {
+	svc, routeStore := newServerTestService(t, time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC))
+	ctx := context.Background()
+	srv := createTestServer(t, svc, "S", "s.example.test")
+	if err := routeStore.UpdateServerNetbirdState(ctx, srv.ID, "s.example.test", "peer-1", "100.64.0.5", true); err != nil {
+		t.Fatal(err)
+	}
+	same := "100.64.0.5"
+	if _, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANAddress: &same}); !errors.Is(err, ErrServerLANAddressInvalid) {
+		t.Fatalf("err = %v, want ErrServerLANAddressInvalid", err)
+	}
+	other := "100.64.0.6"
+	if _, err := svc.UpdateServer(ctx, systemAdminToken(), srv.ID, UpdateServerRequest{LANAddress: &other}); err != nil {
+		t.Fatalf("other CGNAT address must stay allowed: %v", err)
+	}
+}

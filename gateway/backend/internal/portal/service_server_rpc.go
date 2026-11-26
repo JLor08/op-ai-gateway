@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"strings"
 )
@@ -15,6 +16,49 @@ import (
 // ErrServerLANAddressInvalid rejects a lan_address that is neither empty nor
 // an IPv4 literal (no host names, ports, prefixes or IPv6).
 var ErrServerLANAddressInvalid = errors.New("server.lan_address_invalid")
+
+// ErrServerLANSourceInvalid rejects a lan_source other than auto, interface
+// or manual.
+var ErrServerLANSourceInvalid = errors.New("server.lan_source_invalid")
+
+// ErrServerLANInterfaceRequired rejects the interface source without a
+// lan_interface_id (in the request or already stored).
+var ErrServerLANInterfaceRequired = errors.New("server.lan_interface_required")
+
+// lanSourceForNewServer is the source of a created server: manual with an
+// address, else "" (reads as auto, exactly like a migrated row without one).
+func lanSourceForNewServer(lanAddress string) string {
+	if lanAddress != "" {
+		return routing.LANSourceManual
+	}
+	return ""
+}
+
+// LANResolutionDTO is the wire form of LANResolution on every server
+// response. Slices are never null.
+type LANResolutionDTO struct {
+	Source        string             `json:"source"`
+	Address       string             `json:"address"`
+	InterfaceID   string             `json:"interface_id"`
+	InterfaceName string             `json:"interface_name"`
+	Fallback      bool               `json:"fallback"`
+	IdentityIPs   []string           `json:"identity_ips"`
+	Reported      bool               `json:"reported"`
+	KeyedIDs      bool               `json:"keyed_ids"`
+	Interfaces    []LANInterfaceView `json:"interfaces"`
+}
+
+func lanResolutionDTOOf(srv routing.AIServer) LANResolutionDTO {
+	r := LANResolutionOf(srv)
+	d := LANResolutionDTO(r)
+	if d.IdentityIPs == nil {
+		d.IdentityIPs = []string{}
+	}
+	if d.Interfaces == nil {
+		d.Interfaces = []LANInterfaceView{}
+	}
+	return d
+}
 
 // normalizeLANAddress trims raw and accepts "" (unset) or a plain IPv4
 // literal. An IPv4-mapped IPv6 form is rejected so the stored value is always

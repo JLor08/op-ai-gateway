@@ -451,6 +451,8 @@ var portalServerErrRows = []errRow{
 	{err: portal.ErrGPUBudgetInvalid, status: http.StatusBadRequest, code: "server.gpu_budget_invalid", msg: "gpu budget index/budget_mb must be >= 0 and index must be unique"},
 	{err: portal.ErrServerEnergyConfigInvalid, status: http.StatusBadRequest, code: "server.energy_config_invalid", msg: "estimated_watts, idle_watts, price_per_kwh and pue must be >= 0"},
 	{err: portal.ErrServerLANAddressInvalid, status: http.StatusBadRequest, code: "server.lan_address_invalid", msg: "lan_address must be empty or an IPv4 address"},
+	{err: portal.ErrServerLANSourceInvalid, status: http.StatusBadRequest, code: "server.lan_source_invalid", msg: "lan_source must be auto, interface or manual"},
+	{err: portal.ErrServerLANInterfaceRequired, status: http.StatusBadRequest, code: "server.lan_interface_required", msg: "lan_interface_id is required for the interface source"},
 	{err: portal.ErrServerAdminGroupRequired, status: http.StatusBadRequest, code: "server.admin_group_required", msg: "at least one admin group is required"},
 	{err: portal.ErrServerAdminGroupInvalid, status: http.StatusBadRequest, code: "server.admin_group_invalid", msg: "admin group is invalid"},
 	{err: portal.ErrServerAdminGroupParentMismatch, status: http.StatusBadRequest, code: "server.admin_group_parent_mismatch", msg: "admin groups must share one parent system group"},
