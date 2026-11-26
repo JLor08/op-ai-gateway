@@ -912,9 +912,11 @@ export function ClusterHeadEditor({
               {t.clusterLanAddressHint}
             </Typography>
           )}
-          {network === 'lan' && headServer.netbird_enabled && !headServer.lan_address && (
-            <Alert severity="warning">{t.clusterLanAddressHeadMissing}</Alert>
-          )}
+          {network === 'lan' &&
+            headServer.netbird_enabled &&
+            !(headServer.lan ? headServer.lan.address : headServer.lan_address) && (
+              <Alert severity="warning">{t.clusterLanAddressHeadMissing}</Alert>
+            )}
 
           <SelectField
             id="cluster-transport"

@@ -190,6 +190,61 @@ describe('ClusterProgress', () => {
     expect(items[2]).toHaveTextContent(t.clusterBreachHidden(t.clusterStatusMemberHidden(2)));
   });
 
+  it('renders address changes with from, to and relaunch', () => {
+    const at = '2026-01-01T09:00:00Z';
+    render(
+      <ClusterProgress
+        spec={head({
+          state: 'formed',
+          phase: 'formed',
+          members: [],
+          address_changes: [
+            {
+              position: 0,
+              head: false,
+              server: 'Alpha',
+              server_id: 'srv-a',
+              from: '192.0.2.1',
+              to: '192.0.2.2',
+              at,
+              relaunched: true,
+            },
+            {
+              head: true,
+              server: 'Head',
+              server_id: 'srv-h',
+              from: '198.51.100.1',
+              to: '198.51.100.2',
+              at,
+              relaunched: false,
+            },
+            {
+              position: 1,
+              head: false,
+              server: '',
+              server_id: '',
+              from: '',
+              to: '',
+              at,
+              relaunched: false,
+            },
+          ],
+        })}
+        t={t}
+      />,
+    );
+    const box = screen.getByTestId('cluster-address-changes');
+    expect(within(box).getByText(t.clusterAddressChangesTitle)).toBeInTheDocument();
+    const items = within(box).getAllByTestId('cluster-address-change');
+    expect(items[0]).toHaveTextContent(
+      t.clusterAddressChangeMember('Alpha', '192.0.2.1', '192.0.2.2', formatDate(at, ''), true),
+    );
+    expect(items[1]).toHaveTextContent(
+      t.clusterAddressChangeHead('Head', '198.51.100.1', '198.51.100.2', formatDate(at, ''), false),
+    );
+    expect(items[2]).toHaveTextContent(t.clusterStatusMemberHidden(2));
+  });
+
   it('names a breach of an unknown kind without inventing a meaning', () => {
     render(
       <ClusterProgress

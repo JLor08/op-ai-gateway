@@ -139,9 +139,53 @@ export type PortalServer = {
   // present on the real wire DTO.
   netbird_ip?: string;
   lan_address?: string;
+  // How lan_address is chosen: '' (unset; manual when lan_address is set, else
+  // auto), 'auto', 'interface' (lan_interface_id) or 'manual'. Optional like
+  // the rest so existing fixtures compile.
+  lan_source?: string;
+  lan_interface_id?: string;
+  // The gateway's resolution of the LAN address and the agent's reported
+  // interfaces, plus the recent address changes of this server (newest first
+  // is the UI's job).
+  lan?: LanResolution;
+  lan_address_changes?: ServerLanAddressChange[];
   lan_bind_only?: boolean;
   rpc_member_enabled?: boolean;
   rpc_allowed_head_groups?: string[];
+};
+
+export type LanInterface = {
+  id: string;
+  id_kind: string;
+  name: string;
+  ipv4: string[];
+  virtual: boolean;
+  preferred: boolean;
+};
+
+// `source` is the EFFECTIVE source (it can read "domain" or "auto" after a
+// fallback), not the stored choice.
+export type LanResolution = {
+  source: string;
+  address: string;
+  interface_id: string;
+  interface_name: string;
+  fallback: boolean;
+  identity_ips: string[];
+  reported: boolean;
+  keyed_ids: boolean;
+  interfaces: LanInterface[];
+};
+
+// head_spec_id and head_name are both "" when the reader may not see the head.
+export type ServerLanAddressChange = {
+  head_spec_id: string;
+  head_name: string;
+  as_head: boolean;
+  from: string;
+  to: string;
+  at: string;
+  relaunched: boolean;
 };
 
 // CreateServer response = the server DTO plus the display-once setup key and a
@@ -232,6 +276,8 @@ export type UpdateServerRequest = {
   // must be empty or an IPv4 literal (else server.lan_address_invalid); an
   // empty lan_address or head-group list clears the value.
   lan_address?: string;
+  lan_source?: 'auto' | 'interface' | 'manual';
+  lan_interface_id?: string;
   lan_bind_only?: boolean;
   rpc_member_enabled?: boolean;
   rpc_allowed_head_groups?: string[];

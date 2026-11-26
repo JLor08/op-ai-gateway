@@ -50,6 +50,20 @@ export interface ClusterBreachView {
   at?: string;
 }
 
+export interface ClusterAddressChangeView {
+  /** The head's own address change (otherwise a member's). */
+  head: boolean;
+  /** Absent for the head. */
+  position?: number;
+  /** The visible server's name; undefined for a hidden one. */
+  server?: string;
+  /** Empty for a position the caller may not see. */
+  from: string;
+  to: string;
+  at: string;
+  relaunched: boolean;
+}
+
 export interface ClusterPeakView {
   position: number;
   /** The visible member's server name; undefined for a hidden or unknown one. */
@@ -71,6 +85,8 @@ export interface ClusterStatusView {
   failure?: ClusterFailureView;
   /** The policy breaches the members' agents report now, in the gateway's order. */
   breaches: ClusterBreachView[];
+  /** LAN address changes of the head and its members, in the gateway's order. */
+  addressChanges: ClusterAddressChangeView[];
   /** Stored member peaks above their host's budget; each refuses the member's next start. */
   peaks: ClusterPeakView[];
   /** The head is cold and nothing about it is worth a line. */
@@ -140,6 +156,15 @@ export function clusterStatusView(spec: RuntimeSpec | undefined): ClusterStatusV
     ...(p.stored_mb ? { storedMb: p.stored_mb } : {}),
     ...(p.ceiling_mb ? { ceilingMb: p.ceiling_mb } : {}),
   }));
+  const addressChanges: ClusterAddressChangeView[] = (status.address_changes ?? []).map((c) => ({
+    head: c.head,
+    ...(c.position === undefined ? {} : { position: c.position }),
+    ...(c.server ? { server: c.server } : {}),
+    from: c.from,
+    to: c.to,
+    at: c.at,
+    relaunched: c.relaunched,
+  }));
   return {
     state: status.state,
     phase: status.phase,
@@ -148,6 +173,7 @@ export function clusterStatusView(spec: RuntimeSpec | undefined): ClusterStatusV
     cooldownUntil: status.state === 'cooling_down' ? status.cooldown_until : undefined,
     failure: status.state === 'cooling_down' || status.state === 'invalid' ? failure : undefined,
     breaches,
+    addressChanges,
     peaks,
     // A stored peak refuses the next start of a cold head, and a breach can
     // outlive the cluster, so either is worth a line.
@@ -155,6 +181,7 @@ export function clusterStatusView(spec: RuntimeSpec | undefined): ClusterStatusV
       status.state === 'cold' &&
       members.length === 0 &&
       breaches.length === 0 &&
+      addressChanges.length === 0 &&
       peaks.length === 0,
   };
 }

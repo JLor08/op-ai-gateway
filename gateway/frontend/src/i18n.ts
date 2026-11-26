@@ -17,6 +17,7 @@ type PortalMessageValue =
   | ((a: number, b: AudioConcurrencyLimit | '') => string)
   | ((a: number, b: number, c: number | null) => string)
   | ((a: string, b: string, c: string) => string)
+  | ((a: string, b: string, c: string, d: string, e: boolean) => string)
   | ((a: string, b: number, c: number) => string)
   | ((a: string, b: number, c: number, d: number) => string);
 
@@ -2443,6 +2444,10 @@ const de = {
   errorSettingsNetbirdDirectClusterExists:
     'Ein direkter Mesh-RPC-Cluster existiert. Auf Relay umstellen oder entfernen, bevor Richtlinienverwaltung, Standard-Sperre oder deren Durchsetzung abgeschaltet wird.',
   errorServerLanAddressInvalid: 'Die LAN-Adresse muss leer oder eine IPv4-Adresse sein.',
+  errorServerLanSourceInvalid: 'Die Quelle der LAN-Adresse ist ungültig.',
+  errorServerLanInterfaceRequired: 'Für diese Quelle muss eine Schnittstelle gewählt werden.',
+  errorClusterLanInterfaceMissing:
+    'Die gewählte LAN-Schnittstelle eines Mitglieds wird vom Agent nicht gemeldet.',
   errorClusterLanAckRequired:
     'Direkter Transport in einem LAN-Cluster legt den RPC-Port jedes Mitglieds ohne Authentifizierung offen; im Bereich „RPC-Cluster“ des Heads die Offenlegung bestätigen.',
   errorClusterMemberInUse: 'Das Mitglied wird von einem Cluster-Head verwendet.',
@@ -2502,6 +2507,32 @@ const de = {
   serverLanAddressHelp: 'Optionale IPv4-Adresse dieses Servers im LAN; Grundlage für LAN-Cluster.',
   serverLanBindOnlyLabel: 'RPC-Mitglieder nur auf dieser Adresse lauschen lassen',
   serverLanBindOnlyHelp: 'Ohne diese Option lauschen LAN-Mitglieder auf allen Adressen (0.0.0.0).',
+  serverLanSourceLabel: 'Quelle der LAN-Adresse',
+  serverLanSourceHelp:
+    'Welche Adresse dieses Servers LAN-Cluster verwenden: automatisch, eine vom Agent gemeldete Schnittstelle oder eine feste IPv4-Adresse.',
+  serverLanSourceAuto: (address: string, iface: string) =>
+    iface ? `Automatisch – ${address} (${iface})` : `Automatisch – ${address}`,
+  serverLanSourceAutoDomain: (domain: string) => `Automatisch – Hostname ${domain}`,
+  serverLanSourceAutoNone: 'Automatisch – nicht auflösbar',
+  serverLanSourceManual: 'Feste Adresse (manuell)',
+  serverLanInterfaceVirtual: 'virtuell',
+  serverLanInterfaceMissing: 'fehlt',
+  serverLanFallbackWarning: (missing: string, address: string) =>
+    `Die gewählte Schnittstelle ${missing} wurde vom Agent nicht gemeldet. Ersatzweise wird ${address || 'keine Adresse'} verwendet.`,
+  serverLanAgentKeyHint:
+    'Die Schnittstellen sind nur über ihren Namen erkennbar. Mit einem agent_key in der Agent-Konfiguration bleibt die Auswahl auch nach einer Umbenennung stabil.',
+  serverLanNotReportedHint:
+    'Der Agent meldet keine Schnittstellen (zu alt). Es stehen nur „Automatisch“ und die manuelle Adresse zur Auswahl.',
+  serverLanAddressChangesTitle: 'Letzte Adresswechsel',
+  serverLanAddressChangeEntry: (
+    from: string,
+    to: string,
+    at: string,
+    cluster: string,
+    relaunched: boolean,
+  ) =>
+    `${at}: ${from || '—'} → ${to || '—'} (${cluster}, ${relaunched ? 'Cluster neu gestartet' : 'Cluster nicht neu gestartet'})`,
+  serverLanAddressChangeUnnamedCluster: 'ein Cluster',
   errorClusterStartFailed:
     'Der Cluster konnte nicht gestartet werden. Die Logs der Mitglieder und des Heads zeigen den Grund.',
   errorClusterUnavailable:
@@ -2596,6 +2627,23 @@ const de = {
   },
   clusterBreachHidden: (member: string) => `${member}: ein Verstoß wurde gemeldet`,
   clusterBreachOther: (member: string, kind: string) => `${member}: Verstoß (${kind})`,
+  clusterAddressChangesTitle: 'Adresswechsel der Mitglieder',
+  clusterAddressChangeMember: (
+    server: string,
+    from: string,
+    to: string,
+    at: string,
+    relaunched: boolean,
+  ) =>
+    `${server}: LAN-Adresse ${from || '—'} → ${to || '—'} (${at}${relaunched ? ', neu gestartet' : ', nicht neu gestartet'})`,
+  clusterAddressChangeHead: (
+    server: string,
+    from: string,
+    to: string,
+    at: string,
+    relaunched: boolean,
+  ) =>
+    `Head ${server}: LAN-Adresse ${from || '—'} → ${to || '—'} (${at}${relaunched ? ', neu gestartet' : ', nicht neu gestartet'})`,
   clusterBreachesCount: (n: number) => `Verstöße: ${n}`,
   clusterPeaksTitle: 'Gespeicherte Spitzenwerte über dem Budget',
   clusterPeaksHint:
@@ -6406,6 +6454,9 @@ const en: PortalMessages = {
   errorSettingsNetbirdDirectClusterExists:
     'A direct mesh RPC cluster exists. Switch it to relay or remove it before turning off policy management, deny-by-default or its enforcement.',
   errorServerLanAddressInvalid: 'The LAN address must be empty or an IPv4 address.',
+  errorServerLanSourceInvalid: 'The LAN address source is invalid.',
+  errorServerLanInterfaceRequired: 'This source needs an interface to be chosen.',
+  errorClusterLanInterfaceMissing: "A member's chosen LAN interface is not reported by its agent.",
   errorClusterLanAckRequired:
     'Direct transport in a LAN cluster exposes each member\'s RPC port unauthenticated; confirm the exposure in the head\'s "RPC cluster" section.',
   errorClusterMemberInUse: 'The member is used by a cluster head.',
@@ -6466,6 +6517,32 @@ const en: PortalMessages = {
     'Optional IPv4 address of this server on the LAN; the basis for LAN clusters.',
   serverLanBindOnlyLabel: 'Listen RPC members only on this address',
   serverLanBindOnlyHelp: 'Without this, LAN members listen on all addresses (0.0.0.0).',
+  serverLanSourceLabel: 'LAN address source',
+  serverLanSourceHelp:
+    'Which address of this server LAN clusters use: automatic, an interface the agent reports, or a fixed IPv4 address.',
+  serverLanSourceAuto: (address: string, iface: string) =>
+    iface ? `Automatic – ${address} (${iface})` : `Automatic – ${address}`,
+  serverLanSourceAutoDomain: (domain: string) => `Automatic – host name ${domain}`,
+  serverLanSourceAutoNone: 'Automatic – not resolvable',
+  serverLanSourceManual: 'Fixed address (manual)',
+  serverLanInterfaceVirtual: 'virtual',
+  serverLanInterfaceMissing: 'missing',
+  serverLanFallbackWarning: (missing: string, address: string) =>
+    `The chosen interface ${missing} is not reported by the agent. ${address || 'No address'} is used instead.`,
+  serverLanAgentKeyHint:
+    'Interfaces are identified by name only. With an agent_key in the agent configuration the choice survives a rename.',
+  serverLanNotReportedHint:
+    'The agent reports no interfaces (too old). Only "Automatic" and the manual address are available.',
+  serverLanAddressChangesTitle: 'Recent address changes',
+  serverLanAddressChangeEntry: (
+    from: string,
+    to: string,
+    at: string,
+    cluster: string,
+    relaunched: boolean,
+  ) =>
+    `${at}: ${from || '—'} → ${to || '—'} (${cluster}, ${relaunched ? 'cluster relaunched' : 'cluster not relaunched'})`,
+  serverLanAddressChangeUnnamedCluster: 'a cluster',
   errorClusterStartFailed:
     "The cluster failed to start. The members' and the head's logs show why.",
   errorClusterUnavailable:
@@ -6560,6 +6637,23 @@ const en: PortalMessages = {
   },
   clusterBreachHidden: (member: string) => `${member}: a breach was reported`,
   clusterBreachOther: (member: string, kind: string) => `${member}: breach (${kind})`,
+  clusterAddressChangesTitle: 'Member address changes',
+  clusterAddressChangeMember: (
+    server: string,
+    from: string,
+    to: string,
+    at: string,
+    relaunched: boolean,
+  ) =>
+    `${server}: LAN address ${from || '—'} → ${to || '—'} (${at}${relaunched ? ', relaunched' : ', not relaunched'})`,
+  clusterAddressChangeHead: (
+    server: string,
+    from: string,
+    to: string,
+    at: string,
+    relaunched: boolean,
+  ) =>
+    `Head ${server}: LAN address ${from || '—'} → ${to || '—'} (${at}${relaunched ? ', relaunched' : ', not relaunched'})`,
   clusterBreachesCount: (n: number) => `Breaches: ${n}`,
   clusterPeaksTitle: 'Stored peaks above budget',
   clusterPeaksHint:

@@ -744,6 +744,42 @@ describe('ClusterHeadEditor network and transport', () => {
     expect(clusterBodyFields(latest.value).lan_exposure_ack).toBe(true);
   });
 
+  it('flags a head whose effective LAN address is unresolvable', () => {
+    const lan = (address: string) =>
+      ({
+        source: 'auto',
+        address,
+        interface_id: '',
+        interface_name: '',
+        fallback: false,
+        identity_ips: [],
+        reported: true,
+        keyed_ids: true,
+        interfaces: [],
+      }) as PortalServer['lan'];
+    setup({
+      initial: state({ network: 'lan', transport: 'relay' }),
+      server: {
+        ...headServer,
+        netbird_enabled: true,
+        lan_address: '',
+        lan: lan(''),
+      } as PortalServer,
+    });
+    expect(screen.getByText(t.clusterLanAddressHeadMissing)).toBeInTheDocument();
+    cleanup();
+    setup({
+      initial: state({ network: 'lan', transport: 'relay' }),
+      server: {
+        ...headServer,
+        netbird_enabled: true,
+        lan_address: '',
+        lan: lan('192.0.2.10'),
+      } as PortalServer,
+    });
+    expect(screen.queryByText(t.clusterLanAddressHeadMissing)).not.toBeInTheDocument();
+  });
+
   it('flags a NetBird head without a LAN address in a LAN cluster', () => {
     setup({
       initial: state({ network: 'lan', transport: 'relay' }),
