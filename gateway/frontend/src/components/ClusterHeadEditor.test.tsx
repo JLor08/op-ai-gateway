@@ -307,6 +307,48 @@ describe('ClusterHeadEditor member binaries', () => {
   });
 });
 
+describe('ClusterHeadEditor rejected candidates', () => {
+  it('lists a protocol-mismatched server disabled with both protocols', async () => {
+    setup({
+      candidatesByBinary: {
+        '/opt/llama/llama-server': {
+          data: [
+            {
+              server_id: 'srv_a',
+              server_name: 'Alpha',
+              compatible: true,
+              rpc_binary: '/opt/llama/ggml-rpc-server',
+              rpc_binary_version: 'b1234',
+              rpc_binary_protocol: '10.0.2',
+            },
+            {
+              server_id: 'srv_b',
+              server_name: 'Beta',
+              compatible: false,
+              incompatible_reason: 'protocol_mismatch',
+              member_rpc_protocol: '9.0.0',
+            },
+          ],
+          head_binary_known: true,
+          head_rpc_protocol: '10.0.2',
+        },
+      },
+      headBinary: '/opt/llama/llama-server',
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterMemberServer }));
+    const listbox = within(screen.getByRole('listbox'));
+    const rejected = listbox.getByRole('option', { name: /Beta/ });
+    expect(rejected.textContent).toContain(t.clusterRejectProtocolMismatch('9.0.0', '10.0.2'));
+    expect(rejected.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(listbox.getByRole('option', { name: 'Alpha' }));
+    expect(screen.getByTestId('cluster-candidate-binary').textContent).toBe(
+      '/opt/llama/ggml-rpc-server (b1234) · RPC 10.0.2',
+    );
+  });
+});
+
 describe('ClusterHeadEditor head binary change', () => {
   const alpha = (compatible: boolean): ClusterCandidate => ({
     server_id: 'srv_a',
@@ -447,14 +489,18 @@ describe('ClusterHeadEditor head binary change', () => {
         '/opt/b2/llama-server',
       ),
     );
-    // Alpha has no matching ggml-rpc-server any more: the choice is gone and
-    // only Beta is offered.
+    // Alpha has no matching ggml-rpc-server any more: the choice is gone, Beta
+    // is offered and Alpha stays listed, disabled, with the reason.
     await waitFor(() =>
       expect(screen.queryByTestId('cluster-candidate-binary')).not.toBeInTheDocument(),
     );
     fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterMemberServer }));
     const options = within(screen.getByRole('listbox')).getAllByRole('option');
-    expect(options.map((o) => o.textContent)).toEqual(['—', 'Beta']);
+    expect(options.map((o) => o.textContent)).toEqual([
+      '—',
+      'Beta',
+      `Alpha — ${t.clusterCandidateRejected}: ${t.clusterRejectNoRpcBinary}`,
+    ]);
   });
 
   it('flags a manual member whose spec binary is of another version, and offers only matching specs', async () => {

@@ -2630,6 +2630,7 @@ const de = {
   binariesDeleteTitle: 'Binary entfernen?',
   binariesDeleteConfirm: 'Entfernen',
   binariesVersionUnknown: 'Version unbekannt',
+  binariesRpcProtocol: 'RPC-Protokoll',
   binariesNotAllowed: 'Vom Agent nicht erlaubt',
   binariesSaved: 'Binary gespeichert.',
   binariesDeleted: 'Binary entfernt.',
@@ -2820,6 +2821,15 @@ const de = {
   clusterCandidatesEmptyManual:
     'Kein Server steht zur Wahl. Er braucht eine freie, aktivierte Mitglieds-Spezifikation (Reiter „RPC“), die diesen Head zulässt.',
   clusterCandidatesFailed: 'Die möglichen Mitglieds-Server konnten nicht geladen werden.',
+  clusterCandidateRejected: 'nicht wählbar',
+  clusterRejectProtocolMismatch: (member: string, head: string) =>
+    `Protokoll ${member} statt ${head}`,
+  clusterRejectBuildMismatch:
+    'Der Build des ggml-rpc-server weicht vom Head-Binary ab (kein Protokoll bekannt).',
+  clusterRejectVersionUnknown:
+    'Die Versionen lassen sich nicht vergleichen (kein Protokoll, kein vergleichbarer Build).',
+  clusterRejectNoRpcBinary: 'Kein nutzbarer nativer ggml-rpc-server.',
+  clusterRejectHeadVersionUnknown: 'Version und Protokoll des Head-Binaries sind unbekannt.',
   clusterMemberNoMatchingRpcBinary:
     'Dieser Server hat keinen ggml-rpc-server in der Version des Head-Binaries; so lässt sich der Head nicht speichern.',
   clusterMemberNotOffered:
@@ -6768,6 +6778,7 @@ const en: PortalMessages = {
   binariesDeleteTitle: 'Remove binary?',
   binariesDeleteConfirm: 'Remove',
   binariesVersionUnknown: 'Version unknown',
+  binariesRpcProtocol: 'RPC protocol',
   binariesNotAllowed: 'Not allowed by the agent',
   binariesSaved: 'Binary saved.',
   binariesDeleted: 'Binary removed.',
@@ -6954,6 +6965,15 @@ const en: PortalMessages = {
   clusterCandidatesEmptyManual:
     'No server is available. It needs a free, enabled member spec ("RPC" tab) that admits this head.',
   clusterCandidatesFailed: 'The possible member servers could not be loaded.',
+  clusterCandidateRejected: 'not selectable',
+  clusterRejectProtocolMismatch: (member: string, head: string) =>
+    `protocol ${member} vs head ${head}`,
+  clusterRejectBuildMismatch:
+    'The ggml-rpc-server build differs from the head binary (no protocol known).',
+  clusterRejectVersionUnknown:
+    'The versions cannot be compared (no protocol, no comparable build).',
+  clusterRejectNoRpcBinary: 'No usable native ggml-rpc-server.',
+  clusterRejectHeadVersionUnknown: 'The head binary version and protocol are unknown.',
   clusterMemberNoMatchingRpcBinary:
     "This server has no ggml-rpc-server of the head binary's version; the head cannot be saved like this.",
   clusterMemberNotOffered:

@@ -32,7 +32,12 @@ function bin(over: Partial<ServerBinary>): ServerBinary {
 
 const inventory = [
   bin({}),
-  bin({ path: '/opt/llama/rpc-server', kind: 'rpc_server', effective_version: 'b1234' }),
+  bin({
+    path: '/opt/llama/rpc-server',
+    kind: 'rpc_server',
+    effective_version: 'b1234',
+    rpc_protocol: '10.0.2',
+  }),
   bin({ path: '/opt/old/llama-server', allowed: false, effective_version: '' }),
 ];
 
@@ -178,6 +183,12 @@ describe('BinaryPicker', () => {
     expect(screen.queryByText('/opt/llama/rpc-server')).toBeNull();
     expect(screen.getByText(t.binariesNotAllowed)).toBeTruthy();
     expect(screen.getByText(t.binariesVersionUnknown)).toBeTruthy();
+  });
+
+  it('shows the RPC protocol of an rpc_server option', () => {
+    render(<Harness kind="rpc_server" onValue={() => {}} />);
+    fireEvent.mouseDown(screen.getByLabelText('Binary'));
+    expect(screen.getByText(/RPC 10\.0\.2/)).toBeTruthy();
   });
 
   it('fills the value from a picked option', () => {

@@ -172,6 +172,7 @@ export function BinariesSection({
               <TableCell>{t.binariesColExecution}</TableCell>
               <TableCell>{t.binariesKind}</TableCell>
               <TableCell>{t.binariesVersion}</TableCell>
+              <TableCell>{t.binariesRpcProtocol}</TableCell>
               <TableCell>{t.binariesSource}</TableCell>
               <TableCell />
             </TableRow>
@@ -211,6 +212,7 @@ export function BinariesSection({
                       </Typography>
                     )}
                   </TableCell>
+                  <TableCell>{b.rpc_protocol || '—'}</TableCell>
                   <TableCell>{manual ? t.binariesSourceManual : t.binariesSourceAgent}</TableCell>
                   <TableCell align="right">
                     {manual ? (

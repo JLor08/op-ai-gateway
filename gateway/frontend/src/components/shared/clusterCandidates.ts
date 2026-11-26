@@ -17,13 +17,21 @@ export interface CandidatesState {
   // Whether the head binary's version is known; automatic members are
   // matched on it.
   headKnown: boolean;
+  // The head binary's ggml RPC protocol, '' when unknown.
+  headRpcProtocol: string;
 }
 
 // How long a changed head binary waits before the list is read again, so
 // typing a path does not read it once per key.
 export const CANDIDATES_DEBOUNCE_MS = 400;
 
-const idle: CandidatesState = { loading: false, failed: false, candidates: [], headKnown: true };
+const idle: CandidatesState = {
+  loading: false,
+  failed: false,
+  candidates: [],
+  headKnown: true,
+  headRpcProtocol: '',
+};
 
 // Where the head lives: its mapping once the spec is saved, else (a new spec)
 // the application it is created on.
@@ -76,6 +84,7 @@ export function useClusterCandidates(
               failed: false,
               candidates: res.data,
               headKnown: res.head_binary_known ?? true,
+              headRpcProtocol: res.head_rpc_protocol ?? '',
             });
           },
           () => {
@@ -110,6 +119,23 @@ export function offeredCandidates(
   taken: ReadonlySet<string>,
 ): ClusterCandidate[] {
   return state.candidates.filter((c) => candidateCompatible(c) && !taken.has(c.server_id));
+}
+
+/**
+ * The automatic candidates the gateway rejected (compatible === false) and
+ * that are no member yet; the picker lists them disabled with the reason.
+ */
+export function rejectedCandidates(
+  state: CandidatesState,
+  taken: ReadonlySet<string>,
+): ClusterCandidate[] {
+  return state.candidates.filter(
+    (c) =>
+      c.compatible === false &&
+      !c.member_specs &&
+      !c.incompatible_member_specs &&
+      !taken.has(c.server_id),
+  );
 }
 
 export type MemberProblem =

@@ -154,13 +154,28 @@ export interface ClusterCandidate {
   // Manual: the listed member specs whose binary is of another version than
   // the head binary's; the save refuses them.
   incompatible_member_specs?: string[];
+  // Automatic: the ggml RPC protocol of the matched rpc_binary.
+  rpc_binary_protocol?: string;
+  // Automatic, compatible === false: why the server cannot serve the head.
+  incompatible_reason?: ClusterIncompatibleReason;
+  // With protocol_mismatch: the protocol the member's rpc-server speaks.
+  member_rpc_protocol?: string;
 }
+
+export type ClusterIncompatibleReason =
+  | 'no_rpc_binary'
+  | 'protocol_mismatch'
+  | 'build_mismatch'
+  | 'version_unknown'
+  | 'head_version_unknown';
 
 // The candidates listing: the candidates and whether the head binary's
 // version is known (absent from an older gateway).
 export interface ClusterCandidateList {
   data: ClusterCandidate[];
   head_binary_known?: boolean;
+  // The ggml RPC protocol of the head binary; absent when unknown.
+  head_rpc_protocol?: string;
 }
 
 // One operator-supplied config file the agent writes into the spec's per-spec

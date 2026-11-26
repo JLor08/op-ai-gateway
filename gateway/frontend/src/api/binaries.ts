@@ -37,6 +37,9 @@ export interface ServerBinary {
   distro: string;
   // The path to execute: the Linux path for a WSL row, path for a native row.
   exec_path: string;
+  // The ggml RPC protocol version a ggml-rpc-server speaks ("10.0.2"), ''
+  // when unknown or not an rpc_server. Absent from an older gateway.
+  rpc_protocol?: string;
 }
 
 // POST: every field but path is the row's content. PUT: an absent field is

@@ -61,6 +61,7 @@ import {
   compatibleMemberSpecs,
   memberProblem,
   offeredCandidates,
+  rejectedCandidates,
   useClusterCandidates,
   type CandidatesState,
   type MemberProblem,
@@ -331,22 +332,31 @@ function pickerChoice(
   value: ClusterHeadState,
 ): {
   offered: ClusterCandidate[];
+  rejected: ClusterCandidate[];
   chosen: ClusterCandidate | undefined;
   chosenSpecs: RPCMemberSpec[];
   chosenSpecId: string;
   canAdd: boolean;
 } {
   if (!picker) {
-    return { offered: [], chosen: undefined, chosenSpecs: [], chosenSpecId: '', canAdd: false };
+    return {
+      offered: [],
+      rejected: [],
+      chosen: undefined,
+      chosenSpecs: [],
+      chosenSpecId: '',
+      canAdd: false,
+    };
   }
   const taken = new Set(value.members.map((m) => m.server_id));
   const offered = offeredCandidates(candidates, taken);
+  const rejected = rejectedCandidates(candidates, taken);
   const chosen = offered.find((c) => c.server_id === picker.serverId);
   const chosenSpecs = chosen ? compatibleMemberSpecs(chosen) : [];
   const chosenSpecId = pickedMemberSpecId(value.memberMode, chosenSpecs, picker.specId);
   const specReady = value.memberMode === 'automatic' || chosenSpecId !== '';
   const canAdd = chosen !== undefined && !candidates.loading && specReady;
-  return { offered, chosen, chosenSpecs, chosenSpecId, canAdd };
+  return { offered, rejected, chosen, chosenSpecs, chosenSpecId, canAdd };
 }
 
 // Whether automatic members cannot be matched because the head binary's
@@ -363,6 +373,22 @@ function memberProblemText(problem: MemberProblem | undefined, t: Translation): 
   if (problem === 'version_mismatch') return t.clusterMemberVersionMismatch;
   if (problem === 'spec_not_offered') return t.clusterMemberSpecNotOffered;
   return undefined;
+}
+
+// Why the gateway rejected an automatic candidate, in words.
+function rejectReasonText(c: ClusterCandidate, headProtocol: string, t: Translation): string {
+  switch (c.incompatible_reason) {
+    case 'protocol_mismatch':
+      return t.clusterRejectProtocolMismatch(c.member_rpc_protocol ?? '?', headProtocol || '?');
+    case 'build_mismatch':
+      return t.clusterRejectBuildMismatch;
+    case 'version_unknown':
+      return t.clusterRejectVersionUnknown;
+    case 'head_version_unknown':
+      return t.clusterRejectHeadVersionUnknown;
+    default:
+      return t.clusterRejectNoRpcBinary;
+  }
 }
 
 // The text of the network select's default option: the default the gateway
@@ -560,6 +586,7 @@ function MemberPicker({
   candidates,
   onPickerChange,
   offered,
+  rejected,
   chosen,
   chosenSpecs,
   memberMode,
@@ -572,6 +599,7 @@ function MemberPicker({
   candidates: CandidatesState;
   onPickerChange: (next: PickerState) => void;
   offered: ClusterCandidate[];
+  rejected: ClusterCandidate[];
   chosen: ClusterCandidate | undefined;
   chosenSpecs: RPCMemberSpec[];
   memberMode: ClusterMemberMode;
@@ -590,7 +618,7 @@ function MemberPicker({
             : t.clusterCandidatesEmptyManual}
         </Alert>
       )}
-      {offered.length > 0 && (
+      {(offered.length > 0 || rejected.length > 0) && (
         <SelectField
           id="cluster-member-server"
           label={t.clusterMemberServer}
@@ -607,11 +635,18 @@ function MemberPicker({
               {c.server_name}
             </option>
           ))}
+          {rejected.map((c) => (
+            <option key={c.server_id} value={c.server_id} disabled>
+              {`${c.server_name} — ${t.clusterCandidateRejected}: ${rejectReasonText(c, candidates.headRpcProtocol, t)}`}
+            </option>
+          ))}
         </SelectField>
       )}
       {chosen?.rpc_binary && (
         <Typography variant="caption" color="text.secondary" data-testid="cluster-candidate-binary">
-          {`${chosen.rpc_binary} (${chosen.rpc_binary_version || t.binariesVersionUnknown})`}
+          {`${chosen.rpc_binary} (${chosen.rpc_binary_version || t.binariesVersionUnknown})${
+            chosen.rpc_binary_protocol ? ` · RPC ${chosen.rpc_binary_protocol}` : ''
+          }`}
         </Typography>
       )}
       {memberMode === 'manual' && chosenSpecs.length > 1 && (
@@ -767,7 +802,7 @@ export function ClusterHeadEditor({
     setCandidatesReload((n) => n + 1);
   }
 
-  const { offered, chosen, chosenSpecs, chosenSpecId, canAdd } = pickerChoice(
+  const { offered, rejected, chosen, chosenSpecs, chosenSpecId, canAdd } = pickerChoice(
     picker,
     candidates,
     value,
@@ -1024,6 +1059,7 @@ export function ClusterHeadEditor({
               candidates={candidates}
               onPickerChange={setPicker}
               offered={offered}
+              rejected={rejected}
               chosen={chosen}
               chosenSpecs={chosenSpecs}
               memberMode={value.memberMode}
