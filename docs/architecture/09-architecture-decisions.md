@@ -14012,7 +14012,7 @@ upstream `api_token` in plaintext, while the code said the token was never persi
   next to `token`, and the agent only reads it. It never leaves the host: it is not sent to the gateway, not logged, not placed in a URL and
   not stored by the gateway. Every generated `server-agent.json` carries a fresh key, minted in the browser (`crypto.getRandomValues`) for
   the portal's copy and per response for `GET /api/agent/v1/download/config`; the gateway neither stores nor logs the downloaded one, and
-  the shared golden masks that one value
+  the shared golden tests inject a fixed fixture key in its place
   ([Configuration §8](cross-cutting/configuration.md#8-the-generated-serveragent-config-document-and-how-its-copies-stay-honest)).
 - **One key, one subkey per purpose.** The agent never uses the key directly: `internal/agentkey` derives a 32-byte subkey per purpose with
   HKDF-SHA256 (no salt, the purpose label as info). Today's purposes are `op-ai-gateway/interface-id/v1` and
@@ -14029,8 +14029,10 @@ upstream `api_token` in plaintext, while the code said the token was never persi
   12-byte nonce and its AES-256-GCM ciphertext under the runtime-cache subkey, with the spec id as additional data, so a copied cache file or
   backup no longer exposes it and a token moved to another spec does not open. Without a key the cache is plaintext with mode `0600` as
   before, and the code and docs now say so. An old plaintext cache is read and rewritten in the sealed form on the next persist; a sealed
-  token that does not open (key lost or changed, no key) reads as empty with a warning per spec that never carries the value, and the next gateway
-  document delivers it again. The wire push, the `${API_TOKEN}` expansion and the masking in reports are unchanged
+  token that does not open (key lost or changed, no key, a corrupt payload, a token moved to another spec) reads as empty with a warning per
+  spec that never carries the value, and the cached document drops its ETag: the gateway answers a conditional fetch naming the old ETag
+  with `304`, so the first fetch goes out unconditionally, counts as a changed document and is applied as one, which delivers the token
+  again on the first gateway contact. The wire push, the `${API_TOKEN}` expansion and the masking in reports are unchanged
   ([Agent-Managed Model Runtime §8.1](cross-cutting/agent-runtime-manager.md#81-gateway-mode-push-poll-and-a-disk-cache)).
 - **The LAN address source.** Per server the gateway stores `lan_source` (`auto`, `interface` or `manual`), `lan_interface_id` and the last
   reported list (`lan_interfaces`, migration 116, written only by the targeted ingest writer; the source fields only by the portal save).

@@ -49,9 +49,14 @@ func sealCacheTokens(cfg Config, key []byte) (Config, error) {
 
 // openCacheTokens reverses sealCacheTokens on a config read from the cache.
 // A token without the prefix is kept (an old plaintext cache). A prefixed
-// token that cannot be opened, or one met with no key, becomes "" so the spec
-// stays and the gateway's next document refills the token. It logs per spec,
-// never the value.
+// token that cannot be opened (another or no key, a corrupt payload, a token
+// moved to another spec) becomes "" so the spec stays, and the document's
+// ETag is cleared: the cached document is then no longer the gateway's
+// document, so the first fetch goes out without If-None-Match (the gateway
+// would answer 304 to the old ETag and never deliver the token again) and
+// counts as changed, and the manager does not short-circuit it as the
+// document it already applied (owner.applyConfig). It logs per spec, never
+// the value.
 func openCacheTokens(cfg Config, key []byte) Config {
 	var gcm cipher.AEAD
 	if len(key) > 0 {
@@ -65,6 +70,7 @@ func openCacheTokens(cfg Config, key []byte) Config {
 		plain, ok := openCacheToken(gcm, tok, cfg.Specs[i].ID)
 		if !ok {
 			slog.Warn("runtime: cached api_token could not be opened; waiting for the gateway", "spec_id", cfg.Specs[i].ID)
+			cfg.ETag = ""
 		}
 		cfg.Specs[i].APIToken = plain
 	}
