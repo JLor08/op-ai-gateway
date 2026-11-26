@@ -4937,11 +4937,11 @@ func migration114Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 }
 
 // migration116Up adds the agent-reported LAN interface list and the LAN
-// address source to ai_servers: lan_interfaces (” = never reported, '[]' =
-// reported empty), lan_source and lan_interface_id. It then backfills the
+// address source to ai_servers: lan_interfaces (the empty string = never reported,
+// '[]' = reported empty), lan_source and lan_interface_id. It then backfills the
 // source so an existing setup resolves exactly as before: a server that already
 // carries a lan_address is 'manual', every other one 'auto'. The backfill only
-// touches rows still at the ” default, so a replay never rewrites a choice.
+// touches rows still at the empty-string default, so a replay never rewrites a choice.
 func migration116Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	for _, col := range []string{
 		"lan_interfaces text not null default ''",

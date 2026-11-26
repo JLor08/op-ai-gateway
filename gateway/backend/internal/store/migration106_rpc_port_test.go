@@ -54,9 +54,6 @@ func TestMigration106MakesMemberPortsUnique(t *testing.T) {
 	})
 }
 
-// seedRPCHeadSpecAtV105 is seedRPCHeadSpec for a database still at version 105:
-// the store's own writers name columns migration 107 added, so the chain is
-// inserted with the baseline columns only.
 // seedBaselineServerAt seeds a plain active server through the baseline column
 // set, so it works on a pre-head schema (CreateAIServer names every column).
 func seedBaselineServerAt(ctx context.Context, t *testing.T, s *SQLStore, id string, now time.Time) {
@@ -67,6 +64,9 @@ func seedBaselineServerAt(ctx context.Context, t *testing.T, s *SQLStore, id str
 	})
 }
 
+// seedRPCHeadSpecAtV105 is seedRPCHeadSpec for a database still at version 105:
+// the store's own writers name columns migration 107 added, so the chain is
+// inserted with the baseline columns only.
 func seedRPCHeadSpecAtV105(ctx context.Context, t *testing.T, s *SQLStore, key string, now time.Time) string {
 	t.Helper()
 	seedBaselineServerAt(ctx, t, s, "srv_head_"+key, now)
