@@ -2218,8 +2218,11 @@ pass after a pushed document also reads again the plan of every `lan` head the
 orchestration holds a plan of; that read only records the notice and starts,
 stops or pushes nothing. The same record shows on the head's
 `cluster_status.address_changes` and, per server across all its clusters, on
-the server's `lan_address_changes`; the head is named there only for a caller
-who may see its runtime spec.
+the server's `lan_address_changes`; the head is named there (spec id and
+model) only for a caller who may see its runtime spec, and is anonymous
+otherwise. The refresh keeps its own baseline of the addresses: it never
+replaces the plan a running head was started with, which the watchdog follows
+and a stop releases.
 
 **Member usage.** A member's agent measures its `ggml-rpc-server` like any child
 while the head holds it, and the gateway keeps the values on the membership row

@@ -1725,8 +1725,8 @@ type ServerDTO struct {
 	// LANAddressChanges are the recent changes of the server's lan cluster
 	// addresses the gateway's cluster orchestration saw, across every
 	// cluster the server takes part in, newest first: as a member its dial
-	// address, as a head its identity. A head the reader may not see has no
-	// HeadName. In memory only: a gateway restart starts it empty. Always a
+	// address, as a head its identity. A head the reader may not see is
+	// anonymous: no HeadSpecID and no HeadName. In memory only: a gateway restart starts it empty. Always a
 	// non-nil list.
 	LANAddressChanges []ServerLANAddressChangeDTO `json:"lan_address_changes"`
 	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC

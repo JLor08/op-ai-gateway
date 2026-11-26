@@ -332,9 +332,10 @@ func (r serverAddressChanges) AddressChangesForServer(serverID string) []ServerL
 
 // TestServerDTOHidesHeadNameWithoutSpecAccess pins the server's address
 // changes: every change the orchestration holds for the server, in its
-// order, named by the head's gateway model only for a reader who may see the
-// head's spec -- a reader who sees the server but not the head, and a head
-// that is gone, get no name. Without a reader the list is empty, not null.
+// order, naming the head (spec id and gateway model) only for a reader who
+// may see the head's spec -- for a reader who sees the server but not the
+// head, and for a head that is gone, the head is anonymous: no spec id, no
+// name. Without a reader the list is empty, not null.
 func TestServerDTOHidesHeadNameWithoutSpecAccess(t *testing.T) {
 	f := newClusterFixture(t)
 	a := f.member("A")
@@ -366,22 +367,27 @@ func TestServerDTOHidesHeadNameWithoutSpecAccess(t *testing.T) {
 	}
 	named := slices.Clone(changes)
 	named[0].HeadName = "big"
+	named[1].HeadSpecID = ""
 	if !reflect.DeepEqual(got.LANAddressChanges, named) {
 		t.Fatalf("owner changes = %+v, want %+v", got.LANAddressChanges, named)
+	}
+	anonymous := slices.Clone(changes)
+	for i := range anonymous {
+		anonymous[i].HeadSpecID = ""
 	}
 	other, err := f.svc.GetServer(f.ctx, otherToken(), a.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(other.LANAddressChanges, changes) {
-		t.Fatalf("other changes = %+v, want no head names", other.LANAddressChanges)
+	if !reflect.DeepEqual(other.LANAddressChanges, anonymous) {
+		t.Fatalf("other changes = %+v, want anonymous heads", other.LANAddressChanges)
 	}
 	list, err := f.svc.ListServers(f.ctx, otherToken())
 	if err != nil {
 		t.Fatal(err)
 	}
 	i := slices.IndexFunc(list.Data, func(s ServerDTO) bool { return s.ID == a.ID })
-	if i < 0 || !reflect.DeepEqual(list.Data[i].LANAddressChanges, changes) {
-		t.Fatalf("listed servers = %+v, want A with no head names", list.Data)
+	if i < 0 || !reflect.DeepEqual(list.Data[i].LANAddressChanges, anonymous) {
+		t.Fatalf("listed servers = %+v, want A with anonymous heads", list.Data)
 	}
 }

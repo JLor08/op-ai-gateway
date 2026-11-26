@@ -402,8 +402,13 @@ type clusterHeadState struct {
 	breaches []portal.ClusterBreachDTO
 	// addressChanges are the lan address changes seen between two of the
 	// head's plans (recordAddressChangesLocked), newest first, at most
-	// portal.ClusterAddressChangesKept. In memory only.
+	// portal.ClusterAddressChangesKept. In memory only. addrPlan is the plan
+	// the next change is judged against: the last plan kept, by a start, a
+	// stop or the refresh (refreshLANPlans) -- which updates only addrPlan,
+	// never lastPlan, so the watchdog and the releases keep judging a running
+	// head by the plan it was started with.
 	addressChanges []portal.ClusterAddressChangeDTO
+	addrPlan       *portal.ClusterPlan
 	// releasing counts the member releases of the head under way outside a
 	// start or a stop; releasesDone, when set, is closed once none is left. A
 	// start waits for them before it ensures the members, so no release
@@ -745,19 +750,23 @@ func (o *clusterOrchestrator) plan(ctx context.Context, head string) (portal.Clu
 }
 
 // rememberPlanLocked keeps plan as st's last plan when it is not withheld,
-// recording the lan address changes since the last plan kept
-// (recordAddressChangesLocked); the caller holds o.mu.
+// and as the baseline of its address changes, recording those since the
+// baseline before (noteAddressPlanLocked); the caller holds o.mu.
 func (o *clusterOrchestrator) rememberPlanLocked(st *clusterHeadState, plan portal.ClusterPlan) {
 	if plan.WithheldReason != "" {
 		return
 	}
-	if st.lastPlan != nil {
-		o.recordAddressChangesLocked(st, *st.lastPlan, plan)
-	}
+	p := copyPlan(plan)
+	st.lastPlan = &p
+	o.noteAddressPlanLocked(st, plan)
+}
+
+// copyPlan is plan with its own member and head identity slices.
+func copyPlan(plan portal.ClusterPlan) portal.ClusterPlan {
 	p := plan
 	p.Members = slices.Clone(plan.Members)
 	p.HeadIdentity = slices.Clone(plan.HeadIdentity)
-	st.lastPlan = &p
+	return p
 }
 
 // membersOf returns plan's members, or, when the derivation withholds the head

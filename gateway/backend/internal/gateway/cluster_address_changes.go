@@ -11,12 +11,23 @@ import (
 )
 
 // The address-change notice of lan clusters: the orchestration compares each
-// plan it keeps of a head with the one before (rememberPlanLocked) and
+// plan it keeps of a head with the one before (clusterHeadState.addrPlan) and
 // records every changed member dial address and every changed head identity,
 // newest first, a few per head. The record lives in memory only -- it
 // describes recent changes, not an audit trail -- and shows on the head's
 // cluster_status (ClusterStatus) and on each server whose address changed
 // (AddressChangesForServer).
+
+// noteAddressPlanLocked records the lan address changes from st's address
+// baseline to plan, which is not withheld, and makes plan the baseline. The
+// caller holds o.mu.
+func (o *clusterOrchestrator) noteAddressPlanLocked(st *clusterHeadState, plan portal.ClusterPlan) {
+	if st.addrPlan != nil {
+		o.recordAddressChangesLocked(st, *st.addrPlan, plan)
+	}
+	p := copyPlan(plan)
+	st.addrPlan = &p
+}
 
 // recordAddressChangesLocked records the lan address changes from prev to
 // next, two plans of st's head that are not withheld: the head's identity
@@ -112,13 +123,17 @@ func (o *clusterOrchestrator) AddressChangesForServer(serverID string) []portal.
 }
 
 // refreshLANPlans reads again, once per runtime document change (docGen),
-// the plan of every lan head the orchestration keeps a plan of, and keeps
-// each that is not withheld (rememberPlanLocked): a running cluster is
-// started and stopped by nothing when one of its addresses changes, so
-// without this pass its change would only be noticed at its next start or
-// stop. It only reads and records: it starts, stops, restages and pushes
-// nothing, and leaves the head's state and gate view as they were. A read
-// that fails is skipped; the next document change reads again.
+// the plan of every lan head the orchestration holds an address baseline of,
+// and notes each that is not withheld against it (noteAddressPlanLocked): a
+// running cluster is started and stopped by nothing when one of its
+// addresses changes, so without this pass its change would only be noticed
+// at its next start or stop. It only records the notice: it starts, stops,
+// restages and pushes nothing, and leaves the head's last plan (what the
+// watchdog follows and a stop releases), its state and its gate view as
+// they were. A head whose baseline moved while its plan was read -- a start
+// or a stop kept a newer derivation meanwhile -- is skipped, so an older
+// read never records a change back. A read that fails is skipped; the next
+// document change reads again.
 func (o *clusterOrchestrator) refreshLANPlans(ctx context.Context) {
 	o.mu.Lock()
 	if o.plansGen == o.docGen {
@@ -126,24 +141,28 @@ func (o *clusterOrchestrator) refreshLANPlans(ctx context.Context) {
 		return
 	}
 	o.plansGen = o.docGen
-	var heads []string
+	bases := map[string]*portal.ClusterPlan{}
 	for head, st := range o.heads {
-		if st.lastPlan != nil && st.lastPlan.Network == clusterNetworkLAN {
-			heads = append(heads, head)
+		if st.addrPlan != nil && st.addrPlan.Network == clusterNetworkLAN {
+			bases[head] = st.addrPlan
 		}
 	}
 	o.mu.Unlock()
+	heads := make([]string, 0, len(bases))
+	for head := range bases {
+		heads = append(heads, head)
+	}
 	slices.Sort(heads)
 	for _, head := range heads {
 		rctx, cancel := context.WithTimeout(ctx, clusterReadTimeout)
 		plan, err := o.deps.portal.ClusterPlan(rctx, head)
 		cancel()
-		if err != nil {
+		if err != nil || plan.WithheldReason != "" {
 			continue
 		}
 		o.mu.Lock()
-		if st := o.heads[head]; st != nil {
-			o.rememberPlanLocked(st, plan)
+		if st := o.heads[head]; st != nil && st.addrPlan == bases[head] {
+			o.noteAddressPlanLocked(st, plan)
 		}
 		o.mu.Unlock()
 	}

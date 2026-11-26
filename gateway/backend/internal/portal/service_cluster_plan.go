@@ -324,8 +324,8 @@ type ClusterAddressChangeDTO struct {
 
 // ServerLANAddressChangeDTO is one ClusterAddressChangeDTO as the server
 // whose address changed shows it: the head of the cluster (HeadSpecID, and
-// HeadName -- the head's gateway model name, "" when the reader may not see
-// the head's spec), whether the server is that cluster's head (AsHead: its
+// HeadName -- the head's gateway model name; both "" when the reader may not
+// see the head's spec, so that head stays anonymous: "a cluster"), whether the server is that cluster's head (AsHead: its
 // identity changed) or a member (its dial address changed), and the change
 // itself.
 type ServerLANAddressChangeDTO struct {
@@ -478,42 +478,49 @@ func redactAddressChanges(changes []ClusterAddressChangeDTO, hidden []int) []Clu
 
 // serverLANAddressChanges is serverID's address changes as the cluster
 // orchestration holds them (ClusterStatusReader.AddressChangesForServer),
-// each named by its head's gateway model name when p may see the head's spec
-// -- the check every runtime-spec read makes (authorizeMapping) -- and left
-// unnamed otherwise: a head beyond p's rights, a head that is gone, and a
-// head whose name cannot be read (best effort, so a failed lookup never
-// fails the server's read). Each head is looked up once. Never nil; empty
-// without a reader.
+// each naming its head -- spec id and gateway model name -- when p may see
+// the head's spec (the check every runtime-spec read makes,
+// authorizeMapping), and anonymous otherwise, with both left empty: a head
+// beyond p's rights, a head that is gone, and a head whose name cannot be
+// read (best effort, so a failed lookup never fails the server's read).
+// Each head is looked up once. Never nil; empty without a reader.
 func (s *Service) serverLANAddressChanges(ctx context.Context, p auth.Token, serverID string) []ServerLANAddressChangeDTO {
 	out := []ServerLANAddressChangeDTO{}
 	if s.clusterStatus == nil {
 		return out
 	}
-	names := map[string]string{}
+	type headName struct {
+		name    string
+		visible bool
+	}
+	names := map[string]headName{}
 	for _, c := range s.clusterStatus.AddressChangesForServer(serverID) {
-		name, ok := names[c.HeadSpecID]
+		n, ok := names[c.HeadSpecID]
 		if !ok {
-			name = s.visibleHeadName(ctx, p, c.HeadSpecID)
-			names[c.HeadSpecID] = name
+			n.name, n.visible = s.visibleHeadName(ctx, p, c.HeadSpecID)
+			names[c.HeadSpecID] = n
 		}
-		c.HeadName = name
+		c.HeadName = n.name
+		if !n.visible {
+			c.HeadSpecID = ""
+		}
 		out = append(out, c)
 	}
 	return out
 }
 
-// visibleHeadName is the gateway model name of the head spec headSpecID when
-// p may see that spec, else "".
-func (s *Service) visibleHeadName(ctx context.Context, p auth.Token, headSpecID string) string {
+// visibleHeadName is the gateway model name of the head spec headSpecID and
+// true when p may see that spec, else "" and false.
+func (s *Service) visibleHeadName(ctx context.Context, p auth.Token, headSpecID string) (string, bool) {
 	spec, ok, err := s.routes.RuntimeSpecByID(ctx, headSpecID)
 	if err != nil || !ok {
-		return ""
+		return "", false
 	}
 	mapping, _, _, err := s.authorizeMapping(ctx, p, spec.MappingID)
 	if err != nil {
-		return ""
+		return "", false
 	}
-	return mapping.GatewayModelName
+	return mapping.GatewayModelName, true
 }
 
 // stopDriftedClusters hands a drift of NetBird's Default policy to the

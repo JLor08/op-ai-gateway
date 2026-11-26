@@ -1543,8 +1543,10 @@ func TestOrchestratorRecordsNothingForUnchangedPlan(t *testing.T) {
 // makes the next reconciler pass read the plan of every lan head the
 // orchestration knows, and a pass without a document change reads none.
 // The refresh only records: with the plan unchanged it does nothing at all,
-// and with a changed plan it records the notice and asks no agent, runs no
-// policy pass, and leaves the head's state, phase and gate view alone.
+// and with a changed plan -- an address and the membership -- it records the
+// notice and asks no agent, runs no policy pass, and leaves the head's state,
+// phase, gate view and last plan alone, so the watchdog keeps following the
+// members the head was started with.
 func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
 	f := lanAddressFixture(t)
 	f.readPlan()
@@ -1554,7 +1556,9 @@ func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
 	f.o.markFormed(orchHead, plan)
 	f.o.mu.Lock()
 	view := f.o.views[orchHead]
+	last := copyPlan(*f.o.heads[orchHead].lastPlan)
 	f.o.mu.Unlock()
+	watched := f.o.watchViews()
 	reads := func() int {
 		f.portal.mu.Lock()
 		defer f.portal.mu.Unlock()
@@ -1581,6 +1585,15 @@ func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
 		if !reflect.DeepEqual(got, view) {
 			t.Fatalf("%s: gate view = %+v, want %+v as before", when, got, view)
 		}
+		f.o.mu.Lock()
+		gotLast := copyPlan(*f.o.heads[orchHead].lastPlan)
+		f.o.mu.Unlock()
+		if !reflect.DeepEqual(gotLast, last) {
+			t.Fatalf("%s: last plan = %+v, want the plan the head was started with", when, gotLast)
+		}
+		if got := f.o.watchViews(); !reflect.DeepEqual(got, watched) {
+			t.Fatalf("%s: watch views = %+v, want %+v as before", when, got, watched)
+		}
 	}
 
 	before := reads()
@@ -1594,7 +1607,13 @@ func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
 	}
 	untouched("unchanged plan")
 
-	f.editPlan(func(p *portal.ClusterPlan) { p.Members[0].Address = "192.0.2.30" })
+	f.editPlan(func(p *portal.ClusterPlan) {
+		p.Members[0].Address = "192.0.2.30"
+		p.Members = append(p.Members, portal.ClusterPlanMember{
+			Position: 2, Server: routing.AIServer{ID: orchMemberServer(2), Name: "Member 2"},
+			SpecID: orchMemberSpec(2), StartupTimeoutSeconds: 5, Address: "192.0.2.12",
+		})
+	})
 	before = reads()
 	f.o.Reconcile(context.Background())
 	if n := reads() - before; n != 0 {
@@ -1660,5 +1679,40 @@ func TestAddressChangesForServerCollectsAcrossClusters(t *testing.T) {
 	}
 	if got := f.o.AddressChangesForServer("srv_unknown"); got == nil || len(got) != 0 {
 		t.Fatalf("changes of an unknown server = %#v, want an empty list", got)
+	}
+}
+
+// TestRefreshSkipsAHeadWhoseBaselineMovedDuringTheRead pins the refresh
+// against an out-of-order remember: while it reads a head's plan, a start
+// keeps a newer derivation (an address that changed again). The refresh's
+// older read is dropped, so no change back to the older address is recorded
+// and the newer baseline stays.
+func TestRefreshSkipsAHeadWhoseBaselineMovedDuringTheRead(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	f.editPlan(func(p *portal.ClusterPlan) { p.Members[0].Address = "192.0.2.20" })
+	f.portal.mu.Lock()
+	newer := copyPlan(f.portal.plan)
+	newer.Members[0].Address = "192.0.2.40"
+	f.portal.afterPlan = func(*orchPortal) {
+		// A start remembers the newer derivation while the refresh's read
+		// of the older one is still on its way back.
+		f.o.mu.Lock()
+		f.o.rememberPlanLocked(f.o.headState(orchHead), newer)
+		f.o.mu.Unlock()
+	}
+	f.portal.mu.Unlock()
+
+	f.o.DocumentsChanged()
+	f.o.Reconcile(context.Background())
+	got := f.o.ClusterStatus(orchHead).AddressChanges
+	if len(got) != 1 || got[0].From != "192.0.2.10" || got[0].To != "192.0.2.40" {
+		t.Fatalf("address changes = %+v, want only the start's change to 192.0.2.40", got)
+	}
+	f.o.mu.Lock()
+	base := f.o.heads[orchHead].addrPlan.Members[0].Address
+	f.o.mu.Unlock()
+	if base != "192.0.2.40" {
+		t.Fatalf("baseline address = %s, want the newer 192.0.2.40", base)
 	}
 }
