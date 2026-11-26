@@ -96,6 +96,20 @@ type Sample struct {
 	// binaries") still travels as [] while nil means "unchanged since the
 	// last sample" and omits the field.
 	Binaries *[]BinaryInfo `json:"binaries,omitempty"`
+	// Interfaces lists the host's LAN address candidates. A pointer so an
+	// empty list still travels as [] while nil means "unchanged" (omitted).
+	Interfaces *[]NetInterface `json:"interfaces,omitempty"`
+}
+
+// NetInterface is one LAN address candidate on the host. The raw MAC never
+// appears: ID is a keyed digest when the agent has a key, else the name.
+type NetInterface struct {
+	ID        string   `json:"id"`
+	IDKind    string   `json:"id_kind"` // "keyed" | "name"
+	Name      string   `json:"name"`
+	IPv4      []string `json:"ipv4"` // sorted; primary first
+	Virtual   bool     `json:"virtual"`
+	Preferred bool     `json:"preferred"` // exactly one or none per list
 }
 
 // RuntimeGPUSample is one GPU's measured VRAM usage for a managed process,
