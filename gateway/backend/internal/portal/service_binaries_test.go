@@ -288,6 +288,8 @@ func TestBinaryIdentityUnknownHygiene(t *testing.T) {
 		{"override build 0, commit unknown", routing.ServerBinary{VersionOverride: "1.1.0-dev (build 0, commit unknown)", Commit: "2bc46ba", Build: "5"}, "", ""},
 		{"override b0", routing.ServerBinary{VersionOverride: "b0", Build: "5"}, "", ""},
 		{"override build 0 with a commit", routing.ServerBinary{VersionOverride: "1.1.0 (build 0, commit 2bc46ba)"}, "2bc46ba", ""},
+		{"build 5, commit unknown", routing.ServerBinary{Commit: "unknown", Build: "5"}, "", "5"},
+		{"override build 5, commit unknown", routing.ServerBinary{VersionOverride: "1.1.0-dev (build 5, commit unknown)", Commit: "2bc46ba", Build: "7"}, "", "5"},
 	} {
 		c, b := binaryIdentity(tc.b)
 		if c != tc.wantCommit || b != tc.wantBld {
@@ -371,7 +373,7 @@ func TestMatchingRPCBinarySkipsProtocolMismatch(t *testing.T) {
 	}
 }
 
-// rpcBinaryRejection explains a server without a match, in the order
+// scanRPCBinaries explains a server without a match, in the order
 // no_rpc_binary, protocol_mismatch, build_mismatch, version_unknown.
 func TestRPCBinaryRejection(t *testing.T) {
 	ctx := context.Background()
@@ -409,9 +411,9 @@ func TestRPCBinaryRejection(t *testing.T) {
 		if err := store.ReplaceAgentServerBinaries(ctx, server.ID, tc.rows); err != nil {
 			t.Fatal(err)
 		}
-		reason, prot, err := svc.rpcBinaryRejection(ctx, server.ID, tc.head)
-		if err != nil || reason != tc.reason || prot != tc.prot {
-			t.Errorf("%s: rejection = %q %q %v, want %q %q", tc.name, reason, prot, err, tc.reason, tc.prot)
+		scan, err := svc.scanRPCBinaries(ctx, server.ID, tc.head)
+		if err != nil || scan.matched || scan.reason != tc.reason || scan.memberProtocol != tc.prot {
+			t.Errorf("%s: scan = %+v %v, want reason %q protocol %q", tc.name, scan, err, tc.reason, tc.prot)
 		}
 	}
 }

@@ -923,3 +923,37 @@ func TestAgentRuntimeConfigPeerFeaturesFromPersistedVersion(t *testing.T) {
 		})
 	}
 }
+
+// The issue's headline case (#441): a head llama-server built from git (a
+// commit) and a member ggml-rpc-server built from the source tarball (build
+// 0, commit unknown) that speak the same RPC protocol form a cluster: the
+// member is derived with that binary and the cluster is not withheld.
+func TestAgentRuntimeConfigDerivesProtocolOnlyMember(t *testing.T) {
+	f := newClusterFixture(t)
+	f.agentBinaries(f.head.ID, false, routing.ServerBinary{
+		Path: protoHeadBinary, Kind: BinaryKindLlamaServer,
+		Version: "version: 7000 (abcdef1)", Commit: "abcdef1", Build: "7000", RPCProtocol: "10.0.2",
+	})
+	a := f.member("A")
+	const tarballRPC = "/opt/src/ggml-rpc-server"
+	f.agentBinaries(a.ID, true, routing.ServerBinary{
+		Path: tarballRPC, Kind: BinaryKindRPCServer,
+		Version: "version: 1.1.0-dev (build 0, commit unknown)", Commit: "unknown", Build: "0", RPCProtocol: "10.0.2",
+	})
+	f.clusterAgents(a.ID)
+	req := clusterHeadRequest(autoMember(a.ID, 0))
+	req.Binary = protoHeadBinary
+	head := f.mustPut(req)
+
+	if r := f.withheldReason(); r != "" {
+		t.Fatalf("withheld reason = %q, want none", r)
+	}
+	hs, ok := specByID(f.config(f.head.ID), head.ID)
+	if !ok || hs.Cluster == nil || len(hs.Cluster.Endpoints) != 1 {
+		t.Fatalf("head spec = %+v ok=%v, want a cluster with one endpoint", hs, ok)
+	}
+	ms, ok := specByID(f.config(a.ID), automaticMemberSpecID(head.ID, a.ID))
+	if !ok || ms.Binary != tarballRPC {
+		t.Fatalf("member spec = %+v ok=%v, want binary %s", ms, ok, tarballRPC)
+	}
+}

@@ -2258,7 +2258,7 @@ func (s *Service) candidateHeadFor(ctx context.Context, headServerID, headSpecID
 // clusterCandidate builds srv's candidate entry in mode; ok is false when
 // srv cannot serve the head as a member. An automatic candidate without a
 // ggml-rpc-server the head can drive is still listed, not Compatible, with
-// the reason (rpcBinaryRejection).
+// the reason (scanRPCBinaries).
 func (s *Service) clusterCandidate(ctx context.Context, p auth.Token, srv routing.AIServer, mode string, head candidateHead) (ClusterCandidateDTO, bool, error) {
 	c := ClusterCandidateDTO{ServerID: srv.ID, ServerName: srv.Name}
 	if mode != memberModeAutomatic {
@@ -2275,17 +2275,20 @@ func (s *Service) clusterCandidate(ctx context.Context, p auth.Token, srv routin
 		c.IncompatibleReason = rpcRejectHeadVersionUnknown
 		return c, true, nil
 	}
-	match, ok, err := s.MatchingRPCBinary(ctx, srv.ID, head.binary)
+	// One read of the inventory decides the entry: a match or its reason
+	// from two reads could disagree (a report landing in between) and leave
+	// an entry neither compatible nor explained.
+	scan, err := s.scanRPCBinaries(ctx, srv.ID, head.binary)
 	if err != nil {
 		return c, false, err
 	}
-	if ok {
-		c.RPCBinary, c.RPCBinaryVersion, c.Compatible = match.Path, match.EffectiveVersion(), true
-		c.RPCBinaryProtocol = rpcProtocolOf(match)
+	if scan.matched {
+		c.RPCBinary, c.RPCBinaryVersion, c.Compatible = scan.match.Path, scan.match.EffectiveVersion(), true
+		c.RPCBinaryProtocol = rpcProtocolOf(scan.match)
 		return c, true, nil
 	}
-	c.IncompatibleReason, c.MemberRPCProtocol, err = s.rpcBinaryRejection(ctx, srv.ID, head.binary)
-	return c, err == nil, err
+	c.IncompatibleReason, c.MemberRPCProtocol = scan.reason, scan.memberProtocol
+	return c, true, nil
 }
 
 // manualCandidate fills c's free member specs and marks the ones whose

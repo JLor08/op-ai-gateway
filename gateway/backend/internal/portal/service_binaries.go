@@ -598,11 +598,3 @@ func (s *Service) MatchingRPCBinary(ctx context.Context, serverID string, head r
 	scan, err := s.scanRPCBinaries(ctx, serverID, head)
 	return scan.match, scan.matched, err
 }
-
-// rpcBinaryRejection explains why serverID has no rpc_server binary for
-// head: one of the rpcReject* reasons, with the member's protocol for a
-// protocol mismatch; "" when it has one.
-func (s *Service) rpcBinaryRejection(ctx context.Context, serverID string, head routing.ServerBinary) (reason, memberProtocol string, err error) {
-	scan, err := s.scanRPCBinaries(ctx, serverID, head)
-	return scan.reason, scan.memberProtocol, err
-}

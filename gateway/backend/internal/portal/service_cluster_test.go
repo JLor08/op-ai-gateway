@@ -2053,3 +2053,50 @@ func TestClusterVersionMismatchNamesProtocols(t *testing.T) {
 		t.Fatalf("warnings = %v: a protocol match is no unknown version", dto.ClusterWarnings)
 	}
 }
+
+// swappingBinaryRoutes hands out a server's inventory once as stored, then
+// swapped: the inventory changing between two reads of one candidate entry.
+type swappingBinaryRoutes struct {
+	routing.Store
+	serverID string
+	reads    int
+	swapped  []routing.ServerBinary
+}
+
+func (r *swappingBinaryRoutes) ServerBinaries(ctx context.Context, serverID string) ([]routing.ServerBinary, error) {
+	if serverID != r.serverID {
+		return r.Store.ServerBinaries(ctx, serverID)
+	}
+	r.reads++
+	if r.reads > 1 {
+		return r.swapped, nil
+	}
+	return r.Store.ServerBinaries(ctx, serverID)
+}
+
+// An automatic candidate is decided on one read of its server's inventory:
+// a report landing between a match attempt and the rejection must not yield
+// an entry that is neither compatible nor explained.
+func TestClusterCandidateReadsTheInventoryOnce(t *testing.T) {
+	f := newClusterFixture(t)
+	f.agentBinaries(f.head.ID, false, routing.ServerBinary{Path: protoHeadBinary, Kind: BinaryKindLlamaServer, Commit: "abcdef1", RPCProtocol: "10.0.2"})
+	m := f.member("M")
+	f.agentBinaries(m.ID, true, routing.ServerBinary{Path: "/opt/old/ggml-rpc-server", Kind: BinaryKindRPCServer, Commit: "abcdef1", RPCProtocol: "10.0.1"})
+	swap := &swappingBinaryRoutes{Store: f.svc.routes, serverID: m.ID, swapped: []routing.ServerBinary{
+		{ServerID: m.ID, Path: "/opt/new/ggml-rpc-server", Kind: BinaryKindRPCServer, Source: routing.BinarySourceAgent, Allowed: true, RPCProtocol: "10.0.2"},
+	}}
+	f.svc.routes = swap
+	list, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", protoHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Candidates) != 1 {
+		t.Fatalf("candidates = %+v", list.Candidates)
+	}
+	if c := list.Candidates[0]; c.Compatible || c.IncompatibleReason != "protocol_mismatch" || c.MemberRPCProtocol != "10.0.1" {
+		t.Fatalf("candidate = %+v, want the first read's protocol mismatch", c)
+	}
+	if swap.reads != 1 {
+		t.Fatalf("inventory reads = %d, want 1", swap.reads)
+	}
+}
