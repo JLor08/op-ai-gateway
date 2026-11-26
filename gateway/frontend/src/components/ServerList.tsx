@@ -164,11 +164,14 @@ function LanSourceEditor({
         helperText={t.serverLanSourceHelp}
       >
         <option value="auto">{autoLabel}</option>
-        {interfaces.map((i) => (
-          <option value={`${LAN_IF_PREFIX}${i.id}`} key={i.id}>
-            {`${i.name} — ${i.ipv4.join(', ')}${i.virtual ? ` (${t.serverLanInterfaceVirtual})` : ''}`}
-          </option>
-        ))}
+        {interfaces.map((i) => {
+          const virtualSuffix = i.virtual ? ` (${t.serverLanInterfaceVirtual})` : '';
+          return (
+            <option value={`${LAN_IF_PREFIX}${i.id}`} key={i.id}>
+              {`${i.name} — ${i.ipv4.join(', ')}${virtualSuffix}`}
+            </option>
+          );
+        })}
         {missingId && (
           <option value={storedChoice}>{`${missingId} (${t.serverLanInterfaceMissing})`}</option>
         )}

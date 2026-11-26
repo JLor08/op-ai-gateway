@@ -50,29 +50,9 @@ type agentNetInterface struct {
 func sanitizeNetInterfaces(in []agentNetInterface, netbirdIP string) []agentNetInterface {
 	out := make([]agentNetInterface, 0, min(len(in), maxLANInterfaces))
 	for _, n := range in {
-		if n.IDKind != lanIDKindKeyed && n.IDKind != lanIDKindName {
-			continue
+		if clean, ok := sanitizeNetInterface(n, netbirdIP); ok {
+			out = append(out, clean)
 		}
-		id := clampLANString(n.ID)
-		if id == "" {
-			continue
-		}
-		var ips []string
-		for _, raw := range n.IPv4 {
-			if len(ips) >= maxLANInterfaceIPv4s {
-				break
-			}
-			if ip, ok := lanCandidateIPv4(raw, netbirdIP); ok && !slices.Contains(ips, ip) {
-				ips = append(ips, ip)
-			}
-		}
-		if len(ips) == 0 {
-			continue
-		}
-		out = append(out, agentNetInterface{
-			ID: id, IDKind: n.IDKind, Name: clampLANString(n.Name), IPv4: ips,
-			Virtual: n.Virtual, Preferred: n.Preferred,
-		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Name != out[j].Name {
@@ -83,14 +63,54 @@ func sanitizeNetInterfaces(in []agentNetInterface, netbirdIP string) []agentNetI
 	if len(out) > maxLANInterfaces {
 		out = out[:maxLANInterfaces]
 	}
-	preferred := false
-	for i := range out {
-		if out[i].Preferred && preferred {
-			out[i].Preferred = false
-		}
-		preferred = preferred || out[i].Preferred
-	}
+	keepFirstPreferred(out)
 	return out
+}
+
+// sanitizeNetInterface cleans one reported interface; ok is false when it has
+// an unknown id_kind, an empty id or no usable address.
+func sanitizeNetInterface(n agentNetInterface, netbirdIP string) (agentNetInterface, bool) {
+	if n.IDKind != lanIDKindKeyed && n.IDKind != lanIDKindName {
+		return agentNetInterface{}, false
+	}
+	id := clampLANString(n.ID)
+	if id == "" {
+		return agentNetInterface{}, false
+	}
+	ips := filterLANIPv4s(n.IPv4, netbirdIP)
+	if len(ips) == 0 {
+		return agentNetInterface{}, false
+	}
+	return agentNetInterface{
+		ID: id, IDKind: n.IDKind, Name: clampLANString(n.Name), IPv4: ips,
+		Virtual: n.Virtual, Preferred: n.Preferred,
+	}, true
+}
+
+// filterLANIPv4s keeps the distinct LAN-candidate addresses, at most
+// maxLANInterfaceIPv4s of them, in report order.
+func filterLANIPv4s(raws []string, netbirdIP string) []string {
+	var ips []string
+	for _, raw := range raws {
+		if len(ips) >= maxLANInterfaceIPv4s {
+			break
+		}
+		if ip, ok := lanCandidateIPv4(raw, netbirdIP); ok && !slices.Contains(ips, ip) {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
+
+// keepFirstPreferred clears Preferred on every entry after the first one.
+func keepFirstPreferred(list []agentNetInterface) {
+	seen := false
+	for i := range list {
+		if list[i].Preferred && seen {
+			list[i].Preferred = false
+		}
+		seen = seen || list[i].Preferred
+	}
 }
 
 func lanCandidateIPv4(raw, netbirdIP string) (string, bool) {

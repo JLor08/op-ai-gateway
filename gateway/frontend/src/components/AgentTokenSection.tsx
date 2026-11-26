@@ -49,6 +49,10 @@ function newAgentKey(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// The Windows path named in the generated config's WSL comment; String.raw keeps
+// the single backslash without an escape inside the big template below.
+const WSL_CONFIG_PATH = String.raw`%UserProfile%\.wslconfig`;
+
 // buildServerAgentConfig produces a ready-to-use, ANNOTATED server-agent.json:
 // gateway_url + token filled in and every other key pre-set to the agent's own
 // default, each preceded by an English comment explaining it. Output is JSONC — the
@@ -265,7 +269,7 @@ export function buildServerAgentConfig(
   // refuses every WSL spec. "root" is refused too -- the agent never hands a
   // gateway-supplied command line or environment to a root process.
   // WSL models also need networkingMode=mirrored under [wsl2] in the Windows
-  // user's %UserProfile%\\.wslconfig (then wsl --shutdown): the agent reaches
+  // user's ${WSL_CONFIG_PATH} (then wsl --shutdown): the agent reaches
   // them at 127.0.0.1:<port> from Windows, and in a live test the default NAT
   // mode did not forward that port, so the spec stayed "starting" until its
   // startup timeout. See the server-agent README, "WSL2 workloads".

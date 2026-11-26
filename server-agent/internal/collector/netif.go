@@ -88,41 +88,18 @@ func (c *InterfaceCollector) Collect(ctx context.Context) ([]sample.NetInterface
 	if err != nil {
 		return nil, err
 	}
-	var route netip.Addr
-	if ip, rerr := c.routeSource(); rerr == nil {
-		if a, ok := netip.AddrFromSlice(ip); ok {
-			route = a.Unmap()
-		}
-	}
+	route := c.defaultRoute()
 
 	var cands []ifCandidate
 	for _, ifc := range ifs {
-		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 || netbirdName.MatchString(ifc.Name) {
+		if !isLANCandidateInterface(ifc) {
 			continue
 		}
 		raw, aerr := c.addrs(ifc)
 		if aerr != nil {
 			continue
 		}
-		var addrs []netip.Addr
-		for _, a := range raw {
-			var ip net.IP
-			switch v := a.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			na, ok := netip.AddrFromSlice(ip)
-			if !ok {
-				continue
-			}
-			na = na.Unmap()
-			if !na.Is4() || cgnatPrefix.Contains(na) || linkLocalPrefix.Contains(na) || loopbackPrefix.Contains(na) {
-				continue
-			}
-			addrs = append(addrs, na)
-		}
+		addrs := lanIPv4Addrs(raw)
 		if len(addrs) == 0 {
 			continue
 		}
@@ -139,6 +116,57 @@ func (c *InterfaceCollector) Collect(ctx context.Context) ([]sample.NetInterface
 		out[best].Preferred = true
 	}
 	return out, nil
+}
+
+// defaultRoute returns the default-route source address, or the zero Addr.
+func (c *InterfaceCollector) defaultRoute() netip.Addr {
+	ip, err := c.routeSource()
+	if err != nil {
+		return netip.Addr{}
+	}
+	a, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.Addr{}
+	}
+	return a.Unmap()
+}
+
+// isLANCandidateInterface drops down, loopback and NetBird interfaces.
+func isLANCandidateInterface(ifc net.Interface) bool {
+	if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+		return false
+	}
+	return !netbirdName.MatchString(ifc.Name)
+}
+
+// lanIPv4Addrs extracts the IPv4 addresses that can be LAN candidates (no
+// CGNAT, link-local or loopback).
+func lanIPv4Addrs(raw []net.Addr) []netip.Addr {
+	var addrs []netip.Addr
+	for _, a := range raw {
+		na, ok := addrIP(a)
+		if !ok || !na.Is4() || cgnatPrefix.Contains(na) || linkLocalPrefix.Contains(na) || loopbackPrefix.Contains(na) {
+			continue
+		}
+		addrs = append(addrs, na)
+	}
+	return addrs
+}
+
+// addrIP converts a net.Addr to an unmapped netip.Addr.
+func addrIP(a net.Addr) (netip.Addr, bool) {
+	var ip net.IP
+	switch v := a.(type) {
+	case *net.IPNet:
+		ip = v.IP
+	case *net.IPAddr:
+		ip = v.IP
+	}
+	na, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	return na.Unmap(), true
 }
 
 func (c *InterfaceCollector) build(ifc net.Interface, addrs []netip.Addr, route netip.Addr) ifCandidate {
