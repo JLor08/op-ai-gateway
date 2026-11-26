@@ -603,7 +603,9 @@ capacity probe, fail-closed but silently breaking measurement. Injection is
 the mirror image: when the gateway assembles the pushed runtime-config
 document for a spec, it resolves the same mode to a **decrypted** value and
 sets it on the wire `Spec.api_token` field, which is what `${API_TOKEN}`
-substitutes agent-side. Same token on both sides because the gateway is the
+substitutes agent-side. The agent also keeps that value in its runtime-config disk cache
+(sealed with the `agent_key` when set, plaintext 0600 otherwise;
+[§8.1](#81-gateway-mode-push-poll-and-a-disk-cache)). Same token on both sides because the gateway is the
 one party that holds it; no router change was needed on either the gateway or
 the agent, because the agent's router already forwards the inbound
 `Authorization` header verbatim to the selected child. That same verbatim
@@ -2156,7 +2158,8 @@ this section is the mechanics (`internal/portal/service_cluster*.go`,
 the launch spec form's cluster part; on each member server's **RPC** tab (its
 `rpc_member_enabled` and consent groups, its manual member specs under
 `/api/portal/servers/{id}/rpc-members`, and the live member rows); on each
-server's `lan_address` / `lan_bind_only`; and on each server's **Binaries** tab
+server's LAN address source (`lan_source`, `lan_interface_id`, `lan_address`)
+and `lan_bind_only`; and on each server's **Binaries** tab
 (the inventory, §3.6). The RPC tab is hidden for a file-mode agent, which
 ignores the gateway's documents, member specs and RPC membership alike. The spec
 PUT is a full document: a write that omits `cluster_enabled` turns the cluster
@@ -2261,9 +2264,13 @@ type-specific probes it; and the `rpc` block (head spec id, transport, bind
 address and port, the head's addresses or the domain the member agent resolves,
 cache switch). The
 addresses follow the network: a mesh member is dialled and bound at its mesh
-IPv4; a LAN member is dialled at `lan_address`, else `Domain` (never the
-`Domain` of a NetBird-enabled server), and binds `0.0.0.0`, or `lan_address`
-alone with `lan_bind_only`. A head's own idle timeout is derived from its
+IPv4; a LAN member is dialled at its effective LAN address (its manual
+`lan_address`, its chosen or most likely agent-reported interface, else the
+`Domain` of a non-NetBird server; [Networking §12](networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)),
+and binds `0.0.0.0`, or that address alone with `lan_bind_only`. A LAN head is
+recognised by its manual `lan_address`, by every IPv4 it reports when its
+source is an interface or `auto` (unless it resolves to its `Domain`), or by
+its `Domain`. A head's own idle timeout is derived from its
 measured start and benchmark cold start like a replicable spec's, since its cold
 start waits for every member.
 
@@ -2303,10 +2310,12 @@ stage that finds a reason stops it:
 5. **The head's own address** in the resolved network (the stored choice, else
    the default): `.cluster_mesh_unavailable` (in `mesh`, the head server has
    NetBird off or no tracking group) or `.cluster_address_unknown` (no mesh IP;
-   in `lan`, neither `lan_address` nor a usable `Domain`).
-6. **Each member's address, then its bind address**, in member order: the same
-   two reasons, plus `.cluster_address_unknown` for a member with
-   `lan_bind_only` and no `lan_address`.
+   in `lan`, no effective LAN address and no usable `Domain`).
+6. **Each member's bind address, then its address**, in member order:
+   `.cluster_lan_interface_missing` for a member with `lan_bind_only` whose
+   chosen interface its agent no longer reports (it is never moved to the
+   fallback), `.cluster_address_unknown` for one with `lan_bind_only` and no
+   effective LAN address, then the two reasons of stage 5.
 7. **Transport**: `.cluster_direct_unavailable` (direct `mesh` without the
    NetBird policy preconditions), then `.cluster_lan_ack_required` (direct `lan`
    without the head's acknowledgement).
@@ -2351,6 +2360,27 @@ spec is gone is forgotten. The orchestration's state
 is in memory; a restarted gateway learns a running cluster again from the
 agents' telemetry and reports `cold` until then. Its read view is the head's
 `cluster_status` ([HTTP API Surface](../reference/api-surface.md)).
+
+**Address-change notice.** Each time the orchestration keeps a plan of a `lan`
+head that is not withheld, it compares it with the plan it kept before and
+records every member server whose dial address changed (`relaunched: true`
+while the head is formed: the address is in the head's endpoint list, so the
+head's agent relaunches the head; `false` for a head that is not formed, whose
+next start dials the new address) and a changed head identity (`relaunched: false`: the members' agents
+apply it live). A head's first plan, a withheld plan, a reordered, added or
+removed member and a `mesh` cluster record nothing. A head keeps its five
+newest changes, in memory only, so a gateway restart starts empty: the notice
+describes recent changes, not an audit trail. Since a running cluster is
+started and stopped by nothing when one of its addresses changes, a reconciler
+pass after a pushed document also reads again the plan of every `lan` head the
+orchestration holds a plan of; that read only records the notice and starts,
+stops or pushes nothing. The same record shows on the head's
+`cluster_status.address_changes` and, per server across all its clusters, on
+the server's `lan_address_changes`; the head is named there (spec id and
+model) only for a caller who may see its runtime spec, and is anonymous
+otherwise. The refresh keeps its own baseline of the addresses: it never
+replaces the plan a running head was started with, which the watchdog follows
+and a stop releases.
 
 **Member usage.** A member's agent measures its `ggml-rpc-server` like any child
 while the head holds it, and the gateway keeps the values on the membership row
@@ -6416,7 +6446,7 @@ Delivery is layered, and the layering is the whole reliability story:
 |---|---|
 | WS `runtime_config` frame | Latency optimisation. Carries the **complete document plus its ETag** as payload — never a delta, never a command. Every frame is self-contained, idempotent and last-wins; the agent applies it only if the ETag differs. The gateway pushes through **one worker per server** (`runtimeConfigPusher`, `internal/gateway/runtime_config_push.go`): a document is derived only after the previous one for the server was enqueued, so every connection gets the server's documents **in derive order**, and after every portal write a document derived after it follows, so the **last one reflects the latest write**. Writes during a pass or its spacing wait coalesce into one more document. After a pass that enqueued a frame the worker waits 250 ms (`pushRuntimeConfigSpacing`) before its next pass, so two documents for one server leave at least 250 ms apart; the first after a quiet period leaves at once. An agent before 0.8.1 can still end on an older document: its runtime sync is single-flight, so a document that arrives while a sync runs is dropped, and the agent rests on the older one until the next push or its poll. From 0.8.1 the agent owes a trailing sync instead (below). The spacing covers a sync shorter than 250 ms on an agent before 0.8.1 and applies to every agent, because the gateway cannot tell them apart without a feature flag ([ADR-048](../09-architecture-decisions.md#adr-048--the-runtime-config-push-is-one-worker-per-server-a-document-is-derived-only-after-the-previous-one-was-enqueued-the-last-reflects-the-latest-write-and-frames-are-spaced); [Risks §11.1](../11-risks-and-technical-debt.md#111-operational-risks)). A full per-connection queue drops the frame (logged at Debug) with no error. |
 | `GET /api/agent/v1/runtime-config` | The authoritative path: startup, every reconnect, POST-transport agents, and the 60 s poll backstop. A missed frame is harmless by construction. |
-| On-disk cache | The last known-good document, loaded at construction **strictly before any gateway contact**, so managed processes start after a host reboot while the gateway is unreachable. |
+| On-disk cache | The last known-good document, loaded at construction **strictly before any gateway contact**, so managed processes start after a host reboot while the gateway is unreachable. The document carries each spec's decrypted upstream `api_token`, because a managed child with `${API_TOKEN}` must start after an agent restart during a gateway outage. With an `agent_key` configured the token is **AES-256-GCM sealed** in the cache (`sealed:v1:` prefix, key = the `op-ai-gateway/runtime-cache/v1` subkey, AAD = spec ID); a sealed token that cannot be opened (other key, no key, a corrupt payload, a token moved to another spec) is dropped to empty with a Warn that never carries the value, the spec stays, and the cached document's ETag is cleared, so the first gateway fetch is unconditional (a conditional one would get `304` for the unchanged document), counts as changed and refills the token on the first gateway contact. Without an `agent_key` the token is stored **plaintext** in the 0600 cache file. An old plaintext cache is read as-is and resealed on the next write. |
 
 Switching to deltas to save bandwidth would make frame delivery order and
 completeness load-bearing, which the reconnect path cannot guarantee. Old agents
@@ -7317,8 +7347,10 @@ mirror). Three different cadences share the one collect cycle:
   injects no credential of its own and forwards `Authorization` verbatim, not
   that the agent holds no token at all — it does, from the runtime-config push
   that carries `${API_TOKEN}`'s resolved value. A mismatch between how the
-  agent comments on that value and how it actually persists it is tracked
-  separately as issue #61 — narrower, and not a reason this design needed to
+  agent comments on that value and how it actually persists it was tracked
+  separately as issue #61 (closed by
+  [ADR-119](../09-architecture-decisions.md#adr-119--a-host-local-agent-key-keyed-interface-ids-and-a-sealed-token-cache-a-lan-servers-address-follows-its-reported-interfaces):
+  the cached token is sealed with the agent key) — narrower, and not a reason this design needed to
   route a credential through `Status`. Once the gateway's probe
   establishes a real verdict this way, the persisted layers (1–2 of
   [Telemetry, Usage Analytics & Observability

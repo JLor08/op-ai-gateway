@@ -484,7 +484,17 @@ import (
 // hostpower endpoint's certificate by SHA-256. No wire change, so no
 // agent.Features entry. This is the ONE bump for the whole branch; later
 // commits on it do not bump again.
-const Version = "0.25.0"
+//
+// 0.25.0 -> 0.25.1 is the single bump for the agent key and the LAN
+// interfaces. PATCH: the agent gains the agent_key option (OP_AGENT_AGENT_KEY),
+// seals each spec's api_token in its runtime-config disk cache with a subkey
+// of it (closes #61), and reports its LAN interface candidates on the
+// telemetry sample (`interfaces`, keyed ids with a key, name ids without).
+// The gateway reads the new sample field when present and an old agent simply
+// sends none, so nothing is negotiated and no agent.Features entry is added.
+// This is the ONE bump for the whole branch; later commits on it do not bump
+// again.
+const Version = "0.25.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -1017,6 +1027,10 @@ type Agent struct {
 	cacheSizes *cacheSizer
 	// binaries inventories the allowed runtime binaries off the collect loop.
 	binaries *binaryInventory
+	// netifCollector enumerates the LAN interfaces; nil disables reporting.
+	netifCollector *collector.InterfaceCollector
+	// ifaces decides when the interface list rides on the sample.
+	ifaces *interfaceInventory
 }
 
 // SetCertProxyDriver installs the optional cert_mode=proxy driver. Call it once
@@ -1043,13 +1057,16 @@ func (a *Agent) SetCertProxyDriver(d certProxyDriver) {
 // New's and SetCertProxyDriver's docs above for the exact per-field disabled
 // behavior each one preserves.
 type Deps struct {
-	Host          collector.HostCollector
-	GPUs          []collector.GPUCollector
-	Scraper       collector.Scraper
-	Loaded        collector.LoadedModelLister
-	Power         collector.PowerCollector
-	Temp          collector.TempCollector
-	Poster        poster
+	Host    collector.HostCollector
+	GPUs    []collector.GPUCollector
+	Scraper collector.Scraper
+	Loaded  collector.LoadedModelLister
+	Power   collector.PowerCollector
+	Temp    collector.TempCollector
+	Poster  poster
+	// Interfaces reports the host's LAN interfaces on the telemetry sample;
+	// nil (the default) reports none.
+	Interfaces    *collector.InterfaceCollector
 	CertSync      certSyncer
 	TrustSync     trustSyncer
 	ProxyDriver   certProxyDriver
@@ -1131,6 +1148,8 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		hostInfo:        d.HostInfo,
 		gatewayFeatures: d.GatewayFeatures,
 		now:             time.Now,
+		netifCollector:  d.Interfaces,
+		ifaces:          newInterfaceInventory(),
 		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries, wslProbeConfig{Exe: cfg.RuntimeWSLExe, User: cfg.RuntimeWSLUser}),
 		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket},
 	}
@@ -1302,6 +1321,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.sendSystemReport(ctx)
 			a.resendRuntimeReport(ctx)
 			a.resendBinaries()
+			a.resendInterfaces()
 		case <-certTickerC:
 			a.triggerCertSync(ctx)
 		case <-a.certWake:
@@ -1317,6 +1337,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				// A nil wake is the transport's (re)connect: whatever was
 				// in flight on the old connection may never have arrived.
 				a.resendBinaries()
+				a.resendInterfaces()
 			}
 			a.triggerRuntimeSync(ctx, data)
 		case data := <-a.runtimeLogWake:
@@ -1352,6 +1373,14 @@ func (a *Agent) Run(ctx context.Context) error {
 func (a *Agent) resendBinaries() {
 	if a.binaries != nil {
 		a.binaries.resend()
+	}
+}
+
+// resendInterfaces makes the next sample carry the LAN interface list again
+// (interfaceInventory.resend); a no-op without a collector.
+func (a *Agent) resendInterfaces() {
+	if a.netifCollector != nil && a.ifaces != nil {
+		a.ifaces.resend()
 	}
 }
 
@@ -2829,10 +2858,20 @@ func (a *Agent) collectOnce(ctx context.Context) {
 	if a.binaries != nil {
 		s.Binaries, binDelivered = a.binaries.pending()
 	}
+	ifaceDelivered := func() { /* no interface list is attached, so there is no delivery to record */ }
+	if a.netifCollector != nil && a.ifaces != nil {
+		a.ifaces.refresh(ctx, a.netifCollector)
+		if p := a.ifaces.pending(); p != nil {
+			s.Interfaces = p
+			sum := interfaceSum(*p)
+			ifaceDelivered = func() { a.ifaces.delivered(sum) }
+		}
+	}
 	if err := a.poster.Post(ctx, &s); err != nil {
 		slog.Warn("telemetry push failed", "err", err)
 	} else {
 		binDelivered()
+		ifaceDelivered()
 		slog.Debug("telemetry pushed")
 	}
 }

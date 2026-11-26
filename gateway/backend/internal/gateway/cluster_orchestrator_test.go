@@ -13,6 +13,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -1480,5 +1481,326 @@ func TestClusterParkBoundCountsTheSettleForMeshOnly(t *testing.T) {
 	lan := f.o.parkBound(time.Second, time.Second, false)
 	if mesh := f.o.parkBound(time.Second, time.Second, true); mesh != lan+f.o.t.policySettle {
 		t.Fatalf("mesh bound = %v, want the lan bound %v plus the %v settle", mesh, lan, f.o.t.policySettle)
+	}
+}
+
+// lanAddressFixture is an orchestration over a lan cluster of two members
+// whose plan carries the derived addresses: the members dial 192.0.2.10 and
+// 192.0.2.11, and the head is known to them by 192.0.2.1.
+func lanAddressFixture(t *testing.T) *orchFixture {
+	t.Helper()
+	f := newOrchFixture(t, 2, "relay", "lan")
+	f.portal.plan.Head.Server.Name = "Head"
+	f.portal.plan.HeadIdentity = []string{"192.0.2.1"}
+	for i := range f.portal.plan.Members {
+		f.portal.plan.Members[i].Server.Name = fmt.Sprintf("Member %d", i)
+		f.portal.plan.Members[i].Address = fmt.Sprintf("192.0.2.1%d", i)
+	}
+	return f
+}
+
+// readPlan has the orchestration read the head's plan, as a start does.
+func (f *orchFixture) readPlan() {
+	f.t.Helper()
+	if _, err := f.o.plan(context.Background(), orchHead); err != nil {
+		f.t.Fatalf("plan: %v", err)
+	}
+}
+
+func (f *orchFixture) editPlan(edit func(p *portal.ClusterPlan)) {
+	f.portal.mu.Lock()
+	defer f.portal.mu.Unlock()
+	edit(&f.portal.plan)
+}
+
+// TestOrchestratorRecordsMemberAddressChange pins the notice of a member's
+// new dial address: the first plan of a head records nothing, a later plan
+// whose member dials another address records the change by position with
+// the member's server, the old and the new address and the time. It says
+// the head relaunched only when the head is formed (the address is in its
+// endpoint list); a cold head relaunched nothing.
+func TestOrchestratorRecordsMemberAddressChange(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
+		t.Fatalf("first plan recorded %+v, want nothing", got)
+	}
+	f.advance(time.Minute)
+	f.editPlan(func(p *portal.ClusterPlan) { p.Members[1].Address = "192.0.2.21" })
+	f.readPlan()
+	coldAt := f.clock()
+
+	f.portal.mu.Lock()
+	plan := f.portal.plan
+	f.portal.mu.Unlock()
+	f.o.markFormed(orchHead, plan)
+	f.advance(time.Minute)
+	f.editPlan(func(p *portal.ClusterPlan) { p.Members[1].Address = "192.0.2.31" })
+	f.readPlan()
+
+	pos := 1
+	want := []portal.ClusterAddressChangeDTO{
+		{
+			Position: &pos, Server: "Member 1", ServerID: orchMemberServer(1),
+			From: "192.0.2.21", To: "192.0.2.31", At: f.clock(), Relaunched: true,
+		},
+		{
+			Position: &pos, Server: "Member 1", ServerID: orchMemberServer(1),
+			From: "192.0.2.11", To: "192.0.2.21", At: coldAt, Relaunched: false,
+		},
+	}
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; !reflect.DeepEqual(got, want) {
+		t.Fatalf("address changes = %+v, want %+v (formed: relaunched; cold: not)", got, want)
+	}
+}
+
+// TestOrchestratorRecordsHeadIdentityChangeWithoutRelaunch pins the notice of
+// a head whose identity changed: the members' agents apply it live, so the
+// change is recorded as the head's, with no position, and no relaunch.
+func TestOrchestratorRecordsHeadIdentityChangeWithoutRelaunch(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	f.advance(time.Minute)
+	f.editPlan(func(p *portal.ClusterPlan) { p.HeadIdentity = []string{"192.0.2.1", "198.51.100.1"} })
+	f.readPlan()
+
+	want := []portal.ClusterAddressChangeDTO{{
+		Head: true, Server: "Head", ServerID: orchHeadServer,
+		From: "192.0.2.1", To: "192.0.2.1, 198.51.100.1", At: f.clock(), Relaunched: false,
+	}}
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; !reflect.DeepEqual(got, want) {
+		t.Fatalf("address changes = %+v, want %+v", got, want)
+	}
+}
+
+// TestOrchestratorKeepsFiveNewestAddressChanges pins the bound of the notice:
+// a head keeps its five newest changes, newest first.
+func TestOrchestratorKeepsFiveNewestAddressChanges(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	for i := range 7 {
+		f.advance(time.Minute)
+		f.editPlan(func(p *portal.ClusterPlan) { p.Members[0].Address = fmt.Sprintf("10.0.0.%d", i+1) })
+		f.readPlan()
+	}
+	got := f.o.ClusterStatus(orchHead).AddressChanges
+	if len(got) != 5 {
+		t.Fatalf("address changes = %+v, want the 5 newest", got)
+	}
+	for i, c := range got {
+		if want := fmt.Sprintf("10.0.0.%d", 7-i); c.To != want {
+			t.Fatalf("change %d = %+v, want to %s (newest first)", i, c, want)
+		}
+	}
+}
+
+// TestOrchestratorRecordsNothingForUnchangedPlan pins what is no address
+// change: the same plan read again, a withheld plan in between (the
+// derivation, not the address, changed), and a member address of a mesh
+// cluster (only lan addresses are reported).
+func TestOrchestratorRecordsNothingForUnchangedPlan(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	f.readPlan()
+	f.editPlan(func(p *portal.ClusterPlan) { p.Generation = "gen2" })
+	f.readPlan()
+	f.portal.mu.Lock()
+	f.portal.withheld = portal.ClusterWithheldAddressUnknown
+	f.portal.mu.Unlock()
+	_, _ = f.o.plan(context.Background(), orchHead)
+	f.portal.mu.Lock()
+	f.portal.withheld = ""
+	f.portal.mu.Unlock()
+	f.readPlan()
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
+		t.Fatalf("address changes = %+v, want none", got)
+	}
+
+	m := newOrchFixture(t, 1, "relay", "mesh")
+	m.portal.plan.Members[0].Address = "100.64.0.10"
+	m.readPlan()
+	m.editPlan(func(p *portal.ClusterPlan) { p.Members[0].Address = "100.64.0.11" })
+	m.readPlan()
+	if got := m.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
+		t.Fatalf("mesh address changes = %+v, want none", got)
+	}
+}
+
+// TestReconcileRecordsAddressChangeOfARunningHead pins that a running head's
+// address change is noticed although nothing starts it: a pushed document
+// makes the next reconciler pass read the plan of every lan head the
+// orchestration knows, and a pass without a document change reads none.
+// The refresh only records: with the plan unchanged it does nothing at all,
+// and with a changed plan -- an address and the membership -- it records the
+// notice and asks no agent, runs no policy pass, and leaves the head's state,
+// phase, gate view and last plan alone, so the watchdog keeps following the
+// members the head was started with.
+func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	f.portal.mu.Lock()
+	plan := f.portal.plan
+	f.portal.mu.Unlock()
+	f.o.markFormed(orchHead, plan)
+	f.o.mu.Lock()
+	view := f.o.views[orchHead]
+	last := copyPlan(*f.o.heads[orchHead].lastPlan)
+	f.o.mu.Unlock()
+	watched := f.o.watchViews()
+	reads := func() int {
+		f.portal.mu.Lock()
+		defer f.portal.mu.Unlock()
+		return f.portal.planReads
+	}
+	untouched := func(when string) {
+		t.Helper()
+		if calls := f.agent.recorded(); len(calls) != 0 {
+			t.Fatalf("%s: agent calls = %q, want none", when, calls)
+		}
+		f.portal.mu.Lock()
+		reconciles, version := f.portal.reconciles, f.portal.version
+		f.portal.mu.Unlock()
+		if reconciles != 0 || version != 0 {
+			t.Fatalf("%s: policy passes = %d, document version = %d, want none", when, reconciles, version)
+		}
+		st := f.o.ClusterStatus(orchHead)
+		if st.State != portal.ClusterStateFormed || st.Phase != portal.ClusterPhaseFormed {
+			t.Fatalf("%s: state = %s/%s, want formed as before", when, st.State, st.Phase)
+		}
+		f.o.mu.Lock()
+		got := f.o.views[orchHead]
+		f.o.mu.Unlock()
+		if !reflect.DeepEqual(got, view) {
+			t.Fatalf("%s: gate view = %+v, want %+v as before", when, got, view)
+		}
+		f.o.mu.Lock()
+		gotLast := copyPlan(*f.o.heads[orchHead].lastPlan)
+		f.o.mu.Unlock()
+		if !reflect.DeepEqual(gotLast, last) {
+			t.Fatalf("%s: last plan = %+v, want the plan the head was started with", when, gotLast)
+		}
+		if got := f.o.watchViews(); !reflect.DeepEqual(got, watched) {
+			t.Fatalf("%s: watch views = %+v, want %+v as before", when, got, watched)
+		}
+	}
+
+	before := reads()
+	f.o.DocumentsChanged()
+	f.o.Reconcile(context.Background())
+	if n := reads() - before; n != 1 {
+		t.Fatalf("plan reads after a document change = %d, want one refresh", n)
+	}
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
+		t.Fatalf("unchanged refresh recorded %+v, want nothing", got)
+	}
+	untouched("unchanged plan")
+
+	f.editPlan(func(p *portal.ClusterPlan) {
+		p.Members[0].Address = "192.0.2.30"
+		p.Members = append(p.Members, portal.ClusterPlanMember{
+			Position: 2, Server: routing.AIServer{ID: orchMemberServer(2), Name: "Member 2"},
+			SpecID: orchMemberSpec(2), StartupTimeoutSeconds: 5, Address: "192.0.2.12",
+		})
+	})
+	before = reads()
+	f.o.Reconcile(context.Background())
+	if n := reads() - before; n != 0 {
+		t.Fatalf("plan reads without a document change = %d, want none", n)
+	}
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
+		t.Fatalf("address changes = %+v, want none before a document changed", got)
+	}
+
+	f.o.DocumentsChanged()
+	f.o.Reconcile(context.Background())
+	got := f.o.ClusterStatus(orchHead).AddressChanges
+	if len(got) != 1 || got[0].From != "192.0.2.10" || got[0].To != "192.0.2.30" || !got[0].Relaunched {
+		t.Fatalf("address changes = %+v, want the member's change", got)
+	}
+	untouched("changed plan")
+}
+
+// TestAddressChangesForServerCollectsAcrossClusters pins the server's view of
+// the notices: one server that is a member of two heads and the head of a
+// third gets every change of its own, newest first, each with its head and
+// whether it was the head; another server's change is not listed.
+func TestAddressChangesForServerCollectsAcrossClusters(t *testing.T) {
+	f := newOrchFixture(t, 1, "relay", "lan")
+	const shared = "srv_shared"
+	member := func(pos int, id, addr string) portal.ClusterPlanMember {
+		return portal.ClusterPlanMember{Position: pos, Server: routing.AIServer{ID: id, Name: id}, Address: addr}
+	}
+	planOf := func(head, headServer string, identity []string, members ...portal.ClusterPlanMember) portal.ClusterPlan {
+		return portal.ClusterPlan{
+			Head:    portal.RuntimeActionScope{Server: routing.AIServer{ID: headServer, Name: headServer}, Spec: routing.RuntimeSpec{ID: head}},
+			Network: "lan", Transport: "relay", HeadIdentity: identity, Members: members,
+		}
+	}
+	remember := func(plan portal.ClusterPlan) {
+		f.o.mu.Lock()
+		defer f.o.mu.Unlock()
+		st := f.o.headState(plan.Head.Spec.ID)
+		st.formed = plan.Head.Spec.ID == "rspec_a" // b is cold: its change relaunched nothing
+		f.o.rememberPlanLocked(st, plan)
+	}
+	remember(planOf("rspec_a", "srv_ha", []string{"192.0.2.1"}, member(0, shared, "192.0.2.50"), member(1, "srv_x", "192.0.2.60")))
+	remember(planOf("rspec_b", "srv_hb", []string{"192.0.2.2"}, member(0, "srv_y", "192.0.2.70"), member(1, shared, "192.0.2.50")))
+	remember(planOf("rspec_c", shared, []string{"192.0.2.50"}, member(0, "srv_z", "192.0.2.80")))
+
+	f.advance(time.Minute)
+	remember(planOf("rspec_a", "srv_ha", []string{"192.0.2.1"}, member(0, shared, "192.0.2.51"), member(1, "srv_x", "192.0.2.61")))
+	atA := f.clock()
+	f.advance(time.Minute)
+	remember(planOf("rspec_c", shared, []string{"192.0.2.51"}, member(0, "srv_z", "192.0.2.80")))
+	atC := f.clock()
+	f.advance(time.Minute)
+	remember(planOf("rspec_b", "srv_hb", []string{"192.0.2.2"}, member(0, "srv_y", "192.0.2.70"), member(1, shared, "192.0.2.51")))
+	atB := f.clock()
+
+	want := []portal.ServerLANAddressChangeDTO{
+		{HeadSpecID: "rspec_b", From: "192.0.2.50", To: "192.0.2.51", At: atB},
+		{HeadSpecID: "rspec_c", AsHead: true, From: "192.0.2.50", To: "192.0.2.51", At: atC},
+		{HeadSpecID: "rspec_a", From: "192.0.2.50", To: "192.0.2.51", At: atA, Relaunched: true},
+	}
+	if got := f.o.AddressChangesForServer(shared); !reflect.DeepEqual(got, want) {
+		t.Fatalf("changes of %s = %+v, want %+v", shared, got, want)
+	}
+	if got := f.o.AddressChangesForServer("srv_unknown"); got == nil || len(got) != 0 {
+		t.Fatalf("changes of an unknown server = %#v, want an empty list", got)
+	}
+}
+
+// TestRefreshSkipsAHeadWhoseBaselineMovedDuringTheRead pins the refresh
+// against an out-of-order remember: while it reads a head's plan, a start
+// keeps a newer derivation (an address that changed again). The refresh's
+// older read is dropped, so no change back to the older address is recorded
+// and the newer baseline stays.
+func TestRefreshSkipsAHeadWhoseBaselineMovedDuringTheRead(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	f.editPlan(func(p *portal.ClusterPlan) { p.Members[0].Address = "192.0.2.20" })
+	f.portal.mu.Lock()
+	newer := copyPlan(f.portal.plan)
+	newer.Members[0].Address = "192.0.2.40"
+	f.portal.afterPlan = func(*orchPortal) {
+		// A start remembers the newer derivation while the refresh's read
+		// of the older one is still on its way back.
+		f.o.mu.Lock()
+		f.o.rememberPlanLocked(f.o.headState(orchHead), newer)
+		f.o.mu.Unlock()
+	}
+	f.portal.mu.Unlock()
+
+	f.o.DocumentsChanged()
+	f.o.Reconcile(context.Background())
+	got := f.o.ClusterStatus(orchHead).AddressChanges
+	if len(got) != 1 || got[0].From != "192.0.2.10" || got[0].To != "192.0.2.40" {
+		t.Fatalf("address changes = %+v, want only the start's change to 192.0.2.40", got)
+	}
+	f.o.mu.Lock()
+	base := f.o.heads[orchHead].addrPlan.Members[0].Address
+	f.o.mu.Unlock()
+	if base != "192.0.2.40" {
+		t.Fatalf("baseline address = %s, want the newer 192.0.2.40", base)
 	}
 }

@@ -5,7 +5,9 @@ package portal
 
 import (
 	"errors"
+	"net"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -54,6 +56,157 @@ func TestClusterPlanFollowsTheDerivation(t *testing.T) {
 		if !ok || m.StartupTimeoutSeconds != doc.StartupTimeoutSeconds || m.StartupTimeoutSeconds <= 0 {
 			t.Fatalf("member %d startup = %d, want the pushed %d", i, m.StartupTimeoutSeconds, doc.StartupTimeoutSeconds)
 		}
+	}
+}
+
+// TestClusterPlanCarriesTheDerivedAddresses pins the addresses a plan
+// carries for the address-change notice: each member's dial address as the
+// head's endpoint list has it, and the head's identity as the members'
+// documents carry it (its addresses, else the name the members resolve).
+func TestClusterPlanCarriesTheDerivedAddresses(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	f.clusterAgents(a.ID, b.ID)
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID), autoMember(b.ID)))
+	plan, err := f.svc.ClusterPlan(f.ctx, head.ID)
+	if err != nil || plan.WithheldReason != "" {
+		t.Fatalf("ClusterPlan = (%+v, %v), want a derivable cluster", plan, err)
+	}
+	hs, ok := specByID(f.config(f.head.ID), head.ID)
+	if !ok || hs.Cluster == nil || len(hs.Cluster.Endpoints) != 2 {
+		t.Fatal("head document carries no cluster of two")
+	}
+	for i, m := range plan.Members {
+		host, _, err := net.SplitHostPort(hs.Cluster.Endpoints[i].Address)
+		if err != nil || m.Address == "" || m.Address != host {
+			t.Fatalf("member %d address = %q, want the endpoint's host %q", i, m.Address, host)
+		}
+		doc, ok := specByID(f.config(m.Server.ID), m.SpecID)
+		if !ok || doc.RPC == nil {
+			t.Fatalf("member %d document carries no rpc block", i)
+		}
+		want := append(slices.Clone(doc.RPC.HeadIPs), doc.RPC.HeadDomain)
+		if doc.RPC.HeadDomain == "" {
+			want = slices.Clone(doc.RPC.HeadIPs)
+		}
+		if len(want) == 0 || !slices.Equal(plan.HeadIdentity, want) {
+			t.Fatalf("head identity = %v, want %v", plan.HeadIdentity, want)
+		}
+	}
+}
+
+// TestClusterStatusRedactsHiddenAddressChanges pins the address changes on a
+// head's cluster_status: a change of a member on a server the reader may not
+// manage keeps its position, time and relaunch only -- never the server or
+// its addresses -- while a visible member's change and the head's own are
+// shown whole.
+func TestClusterStatusRedactsHiddenAddressChanges(t *testing.T) {
+	f := newClusterFixture(t)
+	mine := f.member("Mine")
+	foreign := f.foreignServer("Foreign")
+	head, err := f.put(systemToken(), clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID)))
+	if err != nil {
+		t.Fatalf("system save: %v", err)
+	}
+	at := clusterTestNow.Add(time.Minute)
+	p0, p1 := 0, 1
+	changes := []ClusterAddressChangeDTO{
+		{Position: &p1, Server: "Foreign", ServerID: foreign.ID, From: "192.0.2.20", To: "192.0.2.21", At: at, Relaunched: true},
+		{Head: true, Server: "Head", ServerID: f.head.ID, From: "192.0.2.1", To: "192.0.2.2", At: at},
+		{Position: &p0, Server: "Mine", ServerID: mine.ID, From: "192.0.2.10", To: "192.0.2.11", At: at, Relaunched: true},
+	}
+	f.svc.SetClusterStatusReader(fakeClusterStatus{head.ID: {
+		State: ClusterStateFormed, Members: []ClusterMemberStatusDTO{}, AddressChanges: changes,
+	}})
+	got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClusterAddressChangeDTO{{Position: &p1, At: at, Relaunched: true}, changes[1], changes[2]}
+	if got.ClusterStatus == nil || !reflect.DeepEqual(got.ClusterStatus.AddressChanges, want) {
+		t.Fatalf("owner address changes = %+v, want the hidden member's left out", got.ClusterStatus)
+	}
+	if changes[0].From != "192.0.2.20" {
+		t.Fatal("redaction wrote through to the reader's list")
+	}
+	sys, err := f.svc.GetRuntimeSpec(f.ctx, systemToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sys.ClusterStatus == nil || !reflect.DeepEqual(sys.ClusterStatus.AddressChanges, changes) {
+		t.Fatalf("system address changes = %+v, want all of them", sys.ClusterStatus)
+	}
+}
+
+// TestClusterStatusRedactsAddressChangesByServerAfterReorder pins that the
+// redaction follows the recorded change's server, not its position: an
+// entry keeps the position it had when it was recorded, so after a reorder
+// a hidden member's change sits at a position a visible member holds now,
+// and a visible member's change at a hidden one.
+func TestClusterStatusRedactsAddressChangesByServerAfterReorder(t *testing.T) {
+	f := newClusterFixture(t)
+	mine := f.member("Mine")
+	foreign := f.foreignServer("Foreign")
+	// Now: Mine at 0, Foreign at 1. Recorded while it was Foreign at 0, Mine at 1.
+	head, err := f.put(systemToken(), clusterHeadRequest(autoMember(mine.ID), autoMember(foreign.ID)))
+	if err != nil {
+		t.Fatalf("system save: %v", err)
+	}
+	at := clusterTestNow.Add(time.Minute)
+	p0, p1 := 0, 1
+	changes := []ClusterAddressChangeDTO{
+		{Position: &p0, Server: "Foreign", ServerID: foreign.ID, From: "192.0.2.20", To: "192.0.2.21", At: at, Relaunched: true},
+		{Position: &p1, Server: "Mine", ServerID: mine.ID, From: "192.0.2.10", To: "192.0.2.11", At: at, Relaunched: true},
+	}
+	f.svc.SetClusterStatusReader(fakeClusterStatus{head.ID: {
+		State: ClusterStateFormed, Members: []ClusterMemberStatusDTO{}, AddressChanges: changes,
+	}})
+	got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClusterAddressChangeDTO{{Position: &p0, At: at, Relaunched: true}, changes[1]}
+	if got.ClusterStatus == nil || !reflect.DeepEqual(got.ClusterStatus.AddressChanges, want) {
+		t.Fatalf("owner address changes = %+v, want Foreign's redacted and Mine's whole", got.ClusterStatus.AddressChanges)
+	}
+}
+
+// TestClusterStatusRedactsAddressChangesOfRemovedMembers pins a change
+// recorded for a member that has left the cluster since: shown whole when
+// the reader may manage that server, redacted when not, whatever position
+// it was recorded at.
+func TestClusterStatusRedactsAddressChangesOfRemovedMembers(t *testing.T) {
+	f := newClusterFixture(t)
+	mine := f.member("Mine")
+	gone := f.member("Gone")
+	foreign := f.foreignServer("Foreign")
+	head, err := f.put(systemToken(), clusterHeadRequest(autoMember(mine.ID)))
+	if err != nil {
+		t.Fatalf("system save: %v", err)
+	}
+	at := clusterTestNow.Add(time.Minute)
+	p1, p2 := 1, 2
+	changes := []ClusterAddressChangeDTO{
+		{Position: &p1, Server: "Foreign", ServerID: foreign.ID, From: "192.0.2.20", To: "192.0.2.21", At: at},
+		{Position: &p2, Server: "Gone", ServerID: gone.ID, From: "192.0.2.30", To: "192.0.2.31", At: at},
+	}
+	f.svc.SetClusterStatusReader(fakeClusterStatus{head.ID: {
+		State: ClusterStateFormed, Members: []ClusterMemberStatusDTO{}, AddressChanges: changes,
+	}})
+	got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ClusterAddressChangeDTO{{Position: &p1, At: at}, changes[1]}
+	if got.ClusterStatus == nil || !reflect.DeepEqual(got.ClusterStatus.AddressChanges, want) {
+		t.Fatalf("owner address changes = %+v, want the removed foreign member's redacted", got.ClusterStatus.AddressChanges)
+	}
+	sys, err := f.svc.GetRuntimeSpec(f.ctx, systemToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sys.ClusterStatus == nil || !reflect.DeepEqual(sys.ClusterStatus.AddressChanges, changes) {
+		t.Fatalf("system address changes = %+v, want all of them", sys.ClusterStatus.AddressChanges)
 	}
 }
 
@@ -117,6 +270,8 @@ func (f fakeClusterStatus) ClusterStatus(headSpecID string) ClusterStatusDTO {
 	}
 	return ClusterStatusDTO{State: ClusterStateCold, Members: []ClusterMemberStatusDTO{}}
 }
+
+func (f fakeClusterStatus) AddressChangesForServer(string) []ServerLANAddressChangeDTO { return nil }
 
 // TestRuntimeSpecShowsClusterStatus pins the read-only cluster_status on a
 // head's document: the orchestration's state as the injected reader reports

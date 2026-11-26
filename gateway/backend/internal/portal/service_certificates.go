@@ -2072,7 +2072,7 @@ func (s *Service) SetServerCertificateOverride(ctx context.Context, token auth.T
 		return ServerDTO{}, err
 	}
 	server.CertificateOverride = normalized
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, token, server)
 }
 
 // SetServerHTTPSSwitchOverride sets a server's https-auto-switch opt-in/opt-out
@@ -2099,5 +2099,5 @@ func (s *Service) SetServerHTTPSSwitchOverride(ctx context.Context, token auth.T
 		return ServerDTO{}, err
 	}
 	server.HTTPSSwitchOverride = normalized
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, token, server)
 }

@@ -3241,6 +3241,306 @@ describe('ServerList managed_runtime_only control', () => {
     expect(updateServer.mock.calls[0][1].lan_address).toBe('');
   });
 
+  describe('LAN address source', () => {
+    const iface = (id: string, name: string, ipv4: string[], virtual = false) => ({
+      id,
+      id_kind: 'agent_key',
+      name,
+      ipv4,
+      virtual,
+      preferred: false,
+    });
+    const lan = (over: Record<string, unknown> = {}) => ({
+      source: 'auto',
+      address: '192.0.2.10',
+      interface_id: 'if-eth0',
+      interface_name: 'eth0',
+      fallback: false,
+      identity_ips: [],
+      reported: true,
+      keyed_ids: true,
+      interfaces: [
+        iface('if-eth0', 'eth0', ['192.0.2.10']),
+        iface('if-br0', 'br0', ['198.51.100.4', '198.51.100.5'], true),
+      ],
+      ...over,
+    });
+    const lanServer = (over: Record<string, unknown> = {}) =>
+      ({
+        ...makeServer('srv-e', 'healthy'),
+        lan_source: 'auto',
+        lan_interface_id: '',
+        lan_address: '',
+        lan: lan(),
+        lan_address_changes: [],
+        ...over,
+      }) as PortalServer;
+    const sourceSelect = () => screen.getByRole('combobox', { name: t.serverLanSourceLabel });
+    const optionNames = () =>
+      within(screen.getByRole('listbox'))
+        .getAllByRole('option')
+        .map((o) => o.textContent);
+
+    it('offers auto, every reported interface and manual', () => {
+      // NetBird-enabled: a non-NetBird server with a domain words auto by the domain.
+      renderForm(managedApi({}), [lanServer({ netbird_enabled: true })]);
+      openEditForm();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()).toEqual([
+        t.serverLanSourceAuto('192.0.2.10', 'eth0'),
+        'eth0 — 192.0.2.10',
+        `br0 — 198.51.100.4, 198.51.100.5 (${t.serverLanInterfaceVirtual})`,
+        t.serverLanSourceManual,
+      ]);
+    });
+
+    it('words a domain-based automatic choice by the domain', () => {
+      const server = lanServer({ lan: lan({ source: 'domain', address: '', interface_name: '' }) });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      expect(sourceSelect()).toHaveTextContent(t.serverLanSourceAutoDomain(server.domain));
+    });
+
+    it('does not claim auto resolves to the stored manual or interface address', () => {
+      const manual = lanServer({
+        lan_source: 'manual',
+        lan_address: '203.0.113.9',
+        netbird_enabled: true,
+        lan: lan({
+          source: 'manual',
+          address: '203.0.113.9',
+          interface_id: '',
+          interface_name: '',
+        }),
+      });
+      renderForm(managedApi({}), [manual]);
+      openEditForm();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()[0]).toBe(t.serverLanSourceAuto('192.0.2.10', 'eth0'));
+      cleanup();
+      const stored = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'if-br0',
+        netbird_enabled: true,
+        lan: lan({ source: 'interface', address: '198.51.100.4', interface_name: 'br0' }),
+      });
+      renderForm(managedApi({}), [stored]);
+      openEditForm();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()[0]).toBe(t.serverLanSourceAuto('192.0.2.10', 'eth0'));
+    });
+
+    it('words auto by the domain for a non-NetBird server even with a stored manual choice', () => {
+      const server = lanServer({
+        lan_source: 'manual',
+        lan_address: '203.0.113.9',
+        netbird_enabled: false,
+        lan: lan({ source: 'manual', address: '203.0.113.9' }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()[0]).toBe(t.serverLanSourceAutoDomain(server.domain));
+    });
+
+    it('opens a typed address with an empty source as manual and does not PATCH it untouched', async () => {
+      const server = lanServer({ lan_source: '', lan_address: '203.0.113.9', lan: undefined });
+      const updateServer = echoUpdate(server);
+      renderForm(managedApi({ updateServer }), [server]);
+      openEditForm();
+      expect(sourceSelect()).toHaveTextContent(t.serverLanSourceManual);
+      fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+      await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+      expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_source');
+      expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_address');
+    });
+
+    it('names the dialed host name in a domain fallback and no id when none is stored', () => {
+      const server = lanServer({
+        lan_source: 'auto',
+        lan: lan({ source: 'domain', fallback: true, address: '', interface_id: 'if-eth0' }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      expect(
+        screen.getByText(t.serverLanFallbackWarningUnnamed(server.domain)),
+      ).toBeInTheDocument();
+    });
+
+    it('PATCHes lan_source and lan_interface_id only when changed', async () => {
+      const server = lanServer();
+      const updateServer = echoUpdate(server);
+      renderForm(managedApi({ updateServer }), [server]);
+      openEditForm();
+      fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+      await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+      const untouched = updateServer.mock.calls[0][1];
+      expect(untouched).not.toHaveProperty('lan_source');
+      expect(untouched).not.toHaveProperty('lan_interface_id');
+      expect(untouched).not.toHaveProperty('lan_address');
+
+      cleanup();
+      updateServer.mockClear();
+      renderForm(managedApi({ updateServer }), [server]);
+      openEditForm();
+      fireEvent.mouseDown(sourceSelect());
+      fireEvent.click(screen.getByRole('option', { name: 'eth0 — 192.0.2.10' }));
+      fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+      await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+      expect(updateServer.mock.calls[0][1]).toMatchObject({
+        lan_source: 'interface',
+        lan_interface_id: 'if-eth0',
+      });
+    });
+
+    it('PATCHes manual with the typed address', async () => {
+      const server = lanServer();
+      const updateServer = echoUpdate(server);
+      renderForm(managedApi({ updateServer }), [server]);
+      openEditForm();
+      expect(screen.queryByLabelText(t.serverLanAddressLabel)).not.toBeInTheDocument();
+      fireEvent.mouseDown(sourceSelect());
+      fireEvent.click(screen.getByRole('option', { name: t.serverLanSourceManual }));
+      fireEvent.change(screen.getByLabelText(t.serverLanAddressLabel), {
+        target: { value: '203.0.113.7' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+      await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+      expect(updateServer.mock.calls[0][1]).toMatchObject({
+        lan_source: 'manual',
+        lan_address: '203.0.113.7',
+      });
+    });
+
+    it('keeps a missing stored interface selectable and warns about the fallback', () => {
+      const server = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'if-gone',
+        lan: lan({ source: 'auto', fallback: true }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      expect(sourceSelect()).toHaveTextContent(`if-gone (${t.serverLanInterfaceMissing})`);
+      expect(
+        screen.getByText(t.serverLanFallbackWarning('if-gone', '192.0.2.10')),
+      ).toBeInTheDocument();
+    });
+
+    it('shows a choice stored by name as the keyed interface it resolved to', async () => {
+      // Stored while ids were names; the agent now reports keyed ids and the
+      // gateway resolved the stored name to the keyed interface.
+      const server = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'eth0',
+        netbird_enabled: true,
+        lan: lan({ source: 'interface', fallback: false, interface_id: 'if-eth0' }),
+      });
+      const updateServer = echoUpdate(server);
+      renderForm(managedApi({ updateServer }), [server]);
+      openEditForm();
+      expect(sourceSelect()).toHaveTextContent('eth0 — 192.0.2.10');
+      expect(sourceSelect()).not.toHaveTextContent(t.serverLanInterfaceMissing);
+      expect(
+        screen.queryByText(t.serverLanFallbackWarning('eth0', '192.0.2.10')),
+      ).not.toBeInTheDocument();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()).not.toContain(`eth0 (${t.serverLanInterfaceMissing})`);
+      fireEvent.keyDown(screen.getByRole('listbox'), { key: 'Escape' });
+      fireEvent.click(screen.getByRole('button', { name: t.serverActionSave }));
+      await waitFor(() => expect(updateServer).toHaveBeenCalledTimes(1));
+      expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_source');
+      expect(updateServer.mock.calls[0][1]).not.toHaveProperty('lan_interface_id');
+    });
+
+    it('matches a choice stored by name against the reported names', () => {
+      const server = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'br0',
+        netbird_enabled: true,
+        lan: lan({
+          source: 'interface',
+          fallback: false,
+          interface_id: '',
+          address: '198.51.100.4',
+        }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      expect(sourceSelect()).toHaveTextContent('br0 — 198.51.100.4, 198.51.100.5');
+      expect(sourceSelect()).not.toHaveTextContent(t.serverLanInterfaceMissing);
+    });
+
+    it('words auto by the domain for a non-NetBird server whose chosen interface is missing', () => {
+      const server = lanServer({
+        lan_source: 'interface',
+        lan_interface_id: 'if-gone',
+        netbird_enabled: false,
+        lan: lan({ source: 'auto', fallback: true }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()[0]).toBe(t.serverLanSourceAutoDomain(server.domain));
+    });
+
+    it('shows the agent_key hint when ids are name-based', () => {
+      renderForm(managedApi({}), [lanServer({ lan: lan({ keyed_ids: false }) })]);
+      openEditForm();
+      expect(screen.getByText(t.serverLanAgentKeyHint)).toBeInTheDocument();
+      expect(screen.queryByText(t.serverLanNotReportedHint)).not.toBeInTheDocument();
+    });
+
+    it('does not show the agent_key hint without interfaces', () => {
+      renderForm(managedApi({}), [lanServer({ lan: lan({ keyed_ids: true, interfaces: [] }) })]);
+      openEditForm();
+      expect(screen.queryByText(t.serverLanAgentKeyHint)).not.toBeInTheDocument();
+    });
+
+    it('offers only auto and manual when the agent reports no interfaces', () => {
+      const server = lanServer({
+        netbird_enabled: true,
+        lan: lan({ reported: false, interfaces: [], address: '', interface_name: '' }),
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      expect(screen.getByText(t.serverLanNotReportedHint)).toBeInTheDocument();
+      fireEvent.mouseDown(sourceSelect());
+      expect(optionNames()).toEqual([t.serverLanSourceAutoNone, t.serverLanSourceManual]);
+    });
+
+    it("lists the server's address changes from every cluster, newest first, at most 5", () => {
+      const change = (i: number, head_name: string, relaunched: boolean) => ({
+        head_spec_id: head_name ? `spec-${i}` : '',
+        head_name,
+        as_head: false,
+        from: `192.0.2.${i}`,
+        to: `192.0.2.${i + 1}`,
+        at: `2026-01-0${i}T09:00:00Z`,
+        relaunched,
+      });
+      const server = lanServer({
+        lan_address_changes: [
+          change(1, 'Alpha', true),
+          change(2, '', false),
+          change(3, 'Beta', true),
+          change(4, 'Gamma', false),
+          change(5, 'Delta', true),
+          change(6, 'Epsilon', true),
+        ],
+      });
+      renderForm(managedApi({}), [server]);
+      openEditForm();
+      const box = screen.getByTestId('server-lan-address-changes');
+      expect(within(box).getByText(t.serverLanAddressChangesTitle)).toBeInTheDocument();
+      const items = within(box).getAllByRole('listitem');
+      expect(items).toHaveLength(5);
+      expect(items[0]).toHaveTextContent('Epsilon');
+      expect(items[0]).toHaveTextContent('192.0.2.6 → 192.0.2.7');
+      expect(items[4]).toHaveTextContent(t.serverLanAddressChangeUnnamedCluster);
+      expect(box).not.toHaveTextContent('Alpha');
+    });
+  });
+
   it('shows the NetBird mesh IP read-only when the server has one', async () => {
     const server = { ...makeServer('srv-e', 'healthy'), netbird_ip: '100.64.0.5' };
     renderForm(managedApi({ updateServer: echoUpdate(server) }), [server]);

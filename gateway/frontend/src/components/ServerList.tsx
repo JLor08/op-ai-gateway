@@ -46,7 +46,7 @@ import type {
 } from '../api';
 import { PortalApiError } from '../api';
 import type { Translation, MessageKey, PortalApi, BadgeStatus } from './shared/types';
-import { formatPortalError } from './shared/format';
+import { formatDate, formatPortalError } from './shared/format';
 import { StatusChip } from './shared/StatusChip';
 import { Panel } from './shared/Panel';
 import { PageTitle } from './shared/PageTitle';
@@ -87,6 +87,145 @@ const SERVER_LIST_POLL_MS = 5000;
 // helperText slot of its own, so the two halves are wired by id -- the reason
 // must be announced on focus, not hidden behind a hover.
 const MANAGED_RUNTIME_ONLY_HELP_ID = 'server-managed-runtime-only-help';
+const LAN_IF_PREFIX = 'if:';
+const LAN_CHANGES_SHOWN = 5;
+
+// The selector value a stored server stands for: '' means manual when a
+// lan_address is stored, auto otherwise (servers that predate the source).
+function lanChoiceOf(server: PortalServer): string {
+  const source = server.lan_source || (server.lan_address ? 'manual' : 'auto');
+  if (source === 'interface') return `${LAN_IF_PREFIX}${storedInterfaceId(server)}`;
+  return source === 'manual' ? 'manual' : 'auto';
+}
+
+// The reported interface a stored interface choice stands for. The gateway
+// matches the stored id against the reported ids, then against the names (a
+// choice made while ids were names survives an agent_key being added), so a
+// stored name the gateway resolved is that interface's keyed id here too, not
+// a missing one. Anything else stays the stored id (missing, or unreported).
+function storedInterfaceId(server: PortalServer): string {
+  const stored = server.lan_interface_id ?? '';
+  const lan = server.lan;
+  const interfaces = lan?.reported ? lan.interfaces : [];
+  if (stored === '' || interfaces.some((i) => i.id === stored)) return stored;
+  if (lan?.source === 'interface' && !lan.fallback && lan.interface_id) {
+    if (interfaces.some((i) => i.id === lan.interface_id)) return lan.interface_id;
+  }
+  return interfaces.find((i) => i.name === stored)?.id ?? stored;
+}
+
+function LanSourceEditor({
+  server,
+  t,
+  choice,
+  onChoice,
+  address,
+  onAddress,
+}: Readonly<{
+  server: PortalServer;
+  t: Translation;
+  choice: string;
+  onChoice: (v: string) => void;
+  address: string;
+  onAddress: (v: string) => void;
+}>) {
+  const lan = server.lan;
+  const interfaces = lan?.reported ? lan.interfaces : [];
+  const storedChoice = lanChoiceOf(server);
+  const missingId =
+    storedChoice.startsWith(LAN_IF_PREFIX) &&
+    !interfaces.some((i) => `${LAN_IF_PREFIX}${i.id}` === storedChoice)
+      ? storedChoice.slice(LAN_IF_PREFIX.length)
+      : '';
+  // What "Automatic" would pick, which is not what the stored choice resolves
+  // to: the effective address only counts when the effective source is auto.
+  // A non-NetBird server with a domain dials its domain under auto, checked
+  // first: a missing chosen interface falls back to an interface pick (source
+  // auto), which Automatic itself would not dial on such a server.
+  let autoLabel = t.serverLanSourceAutoNone;
+  if (lan?.source === 'domain' || (!server.netbird_enabled && server.domain)) {
+    autoLabel = t.serverLanSourceAutoDomain(server.domain);
+  } else if (lan?.source === 'auto' && lan.address) {
+    autoLabel = t.serverLanSourceAuto(lan.address, lan.interface_name);
+  } else if (lan) {
+    const pick = interfaces.find((i) => i.preferred) ?? interfaces.find((i) => !i.virtual);
+    if (pick?.ipv4[0]) autoLabel = t.serverLanSourceAuto(pick.ipv4[0], pick.name);
+  }
+  const changes = [...(server.lan_address_changes ?? [])]
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+    .slice(0, LAN_CHANGES_SHOWN);
+  return (
+    <>
+      <SelectField
+        id="server-lan-source"
+        label={t.serverLanSourceLabel}
+        value={choice}
+        onChange={(e) => onChoice(e.target.value)}
+        helperText={t.serverLanSourceHelp}
+      >
+        <option value="auto">{autoLabel}</option>
+        {interfaces.map((i) => {
+          const virtualSuffix = i.virtual ? ` (${t.serverLanInterfaceVirtual})` : '';
+          return (
+            <option value={`${LAN_IF_PREFIX}${i.id}`} key={i.id}>
+              {`${i.name} — ${i.ipv4.join(', ')}${virtualSuffix}`}
+            </option>
+          );
+        })}
+        {missingId && (
+          <option value={storedChoice}>{`${missingId} (${t.serverLanInterfaceMissing})`}</option>
+        )}
+        <option value="manual">{t.serverLanSourceManual}</option>
+      </SelectField>
+      {choice === 'manual' && (
+        <Field
+          id="server-lan-address"
+          label={t.serverLanAddressLabel}
+          value={address}
+          onChange={(e) => onAddress(e.target.value)}
+          helperText={t.serverLanAddressHelp}
+        />
+      )}
+      {lan?.fallback && (
+        <Alert severity="warning">
+          {(() => {
+            const target = lan.source === 'domain' ? server.domain : lan.address;
+            return missingId
+              ? t.serverLanFallbackWarning(missingId, target)
+              : t.serverLanFallbackWarningUnnamed(target);
+          })()}
+        </Alert>
+      )}
+      {lan && !lan.reported && <Alert severity="info">{t.serverLanNotReportedHint}</Alert>}
+      {lan?.reported && !lan.keyed_ids && lan.interfaces.length > 0 && (
+        <Alert severity="info">{t.serverLanAgentKeyHint}</Alert>
+      )}
+      {changes.length > 0 && (
+        <Box data-testid="server-lan-address-changes">
+          <Typography variant="subtitle2">{t.serverLanAddressChangesTitle}</Typography>
+          <Box component="ul" sx={{ m: 0, pl: 3 }}>
+            {changes.map((c) => (
+              <Typography
+                component="li"
+                variant="body2"
+                key={`${c.head_spec_id}|${c.at}|${c.from}|${c.to}|${c.as_head}`}
+              >
+                {t.serverLanAddressChangeEntry(
+                  c.from,
+                  c.to,
+                  formatDate(c.at, c.at),
+                  c.head_name || t.serverLanAddressChangeUnnamedCluster,
+                  c.relaunched,
+                )}
+              </Typography>
+            ))}
+          </Box>
+        </Box>
+      )}
+    </>
+  );
+}
+
 const LAN_BIND_ONLY_HELP_ID = 'server-lan-bind-only-help';
 
 const serverStatusClassByKey: Record<ServerStatus, BadgeStatus> = {
@@ -300,6 +439,9 @@ export function ServerList({
   // and an empty lan_address means "clear".
   const [lanAddress, setLanAddress] = useState('');
   const [lanAddressSeed, setLanAddressSeed] = useState('');
+  // The source selector's value: 'auto', 'manual' or `if:<interface id>`.
+  const [lanChoice, setLanChoice] = useState('auto');
+  const [lanChoiceSeed, setLanChoiceSeed] = useState('auto');
   const [lanBindOnly, setLanBindOnly] = useState(false);
   const [lanBindOnlySeed, setLanBindOnlySeed] = useState(false);
   // Admin-group linkage (Phase B, spec 2026-08-10): the admin-tier groups the
@@ -605,6 +747,9 @@ export function ServerList({
     setManagedRuntimeOnlySeed(Boolean(server.managed_runtime_only));
     setLanAddress(server.lan_address ?? '');
     setLanAddressSeed(server.lan_address ?? '');
+    const choice = lanChoiceOf(server);
+    setLanChoice(choice);
+    setLanChoiceSeed(choice);
     setLanBindOnly(Boolean(server.lan_bind_only));
     setLanBindOnlySeed(Boolean(server.lan_bind_only));
     setEditAdminGroupIds(server.admin_groups.map((g) => g.id));
@@ -761,7 +906,17 @@ export function ServerList({
       if (managedRuntimeOnly !== managedRuntimeOnlySeed) {
         body.managed_runtime_only = managedRuntimeOnly;
       }
-      if (lanAddress.trim() !== lanAddressSeed) body.lan_address = lanAddress.trim();
+      if (lanChoice !== lanChoiceSeed) {
+        if (lanChoice === 'auto' || lanChoice === 'manual') {
+          body.lan_source = lanChoice;
+        } else {
+          body.lan_source = 'interface';
+          body.lan_interface_id = lanChoice.slice(LAN_IF_PREFIX.length);
+        }
+      }
+      if (lanChoice === 'manual' && lanAddress.trim() !== lanAddressSeed) {
+        body.lan_address = lanAddress.trim();
+      }
       if (lanBindOnly !== lanBindOnlySeed) body.lan_bind_only = lanBindOnly;
       const updated = await api.updateServer(mode.server.id, body);
       setServers((current) => current.map((row) => (row.id === updated.id ? updated : row)));
@@ -1330,12 +1485,13 @@ export function ServerList({
                     readOnly
                   />
                 )}
-                <Field
-                  id="server-lan-address"
-                  label={t.serverLanAddressLabel}
-                  value={lanAddress}
-                  onChange={(e) => setLanAddress(e.target.value)}
-                  helperText={t.serverLanAddressHelp}
+                <LanSourceEditor
+                  server={editServer}
+                  t={t}
+                  choice={lanChoice}
+                  onChoice={setLanChoice}
+                  address={lanAddress}
+                  onAddress={setLanAddress}
                 />
                 <Box>
                   <FormControlLabel

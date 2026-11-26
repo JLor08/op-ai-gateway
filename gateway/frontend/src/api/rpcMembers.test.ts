@@ -92,3 +92,15 @@ describe('serversApi RPC cluster settings', () => {
     });
   });
 });
+
+describe('serversApi LAN source', () => {
+  it('PATCHes lan_source and lan_interface_id', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({ id: 'srv_1' }));
+    await createPortalApi(fetcher).updateServer('srv_1', {
+      lan_source: 'interface',
+      lan_interface_id: 'if-eth0',
+    });
+    const [, init] = fetcher.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ lan_source: 'interface', lan_interface_id: 'if-eth0' });
+  });
+});

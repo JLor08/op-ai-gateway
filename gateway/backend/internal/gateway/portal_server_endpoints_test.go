@@ -313,3 +313,22 @@ func TestHandlePortalServerUpdateLANAddressInvalidReturns400(t *testing.T) {
 		t.Fatalf("error code = %q, want server.lan_address_invalid", code)
 	}
 }
+
+// TestHandlePortalServerUpdateLANSourceInvalidReturns400 proves a bad
+// lan_source and an interface source without an id map to their 400 codes.
+func TestHandlePortalServerUpdateLANSourceInvalidReturns400(t *testing.T) {
+	env := newServerOverrideGatewayEnv(t)
+	for body, want := range map[string]string{
+		`{"lan_source":"dhcp"}`:      "server.lan_source_invalid",
+		`{"lan_source":"interface"}`: "server.lan_interface_required",
+	} {
+		rec := httptest.NewRecorder()
+		env.srv.ServeHTTP(rec, newJSONRequest(http.MethodPatch, "/api/portal/servers/"+env.srvHealthy, body))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400, body = %s", body, rec.Code, rec.Body.String())
+		}
+		if code := errorBodyOf(t, rec); code != want {
+			t.Fatalf("%s: error code = %q, want %s", body, code, want)
+		}
+	}
+}

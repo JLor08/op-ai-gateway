@@ -91,8 +91,8 @@ var writeCacheFile = writeFileAtomic
 // any point leaves whatever was previously at path untouched.
 //
 // The runtime-config cache and the config files a spec provisions (#257,
-// writeSpecConfigFiles) share it: both are non-secret files the agent owns and
-// both need the same all-or-nothing replacement.
+// writeSpecConfigFiles) share it: both are files the agent owns and both need
+// the same all-or-nothing replacement.
 func writeFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -127,7 +127,7 @@ func writeFileAtomic(path string, data []byte) error {
 // last-known-good config. A missing file, a read error, or a parse error
 // (a corrupted or hand-edited cache) all just mean "no usable cache yet" --
 // never a construction-time failure.
-func loadCachedConfig(path string) (Config, bool) {
+func loadCachedConfig(path string, key []byte) (Config, bool) {
 	if path == "" {
 		return Config{}, false
 	}
@@ -140,7 +140,7 @@ func loadCachedConfig(path string) (Config, bool) {
 		slog.Debug("runtime: runtime-config disk cache parse failed; ignoring stale cache", "path", path, "error", err)
 		return Config{}, false
 	}
-	return cfg, true
+	return openCacheTokens(cfg, key), true
 }
 
 // GatewaySource fetches the runtime-config document from
@@ -172,6 +172,7 @@ type GatewaySource struct {
 	http  *http.Client
 
 	cachePath string
+	cacheKey  []byte // agent-key subkey sealing api_token in the disk cache; nil = plaintext 0600
 
 	mu                  sync.Mutex
 	cached              Config // last known-good config: from the disk cache, a live fetch, or a WS push
@@ -192,6 +193,15 @@ type GatewaySource struct {
 // still returns a real config via Load's own transient-error path instead
 // of an empty one.
 func NewGatewaySource(gatewayURL, token string, client *http.Client, cachePath string) *GatewaySource {
+	return NewGatewaySourceWithCacheKey(gatewayURL, token, client, cachePath, nil)
+}
+
+// NewGatewaySourceWithCacheKey is NewGatewaySource with a 32-byte cacheKey
+// (an agent-key subkey) that seals every spec's api_token in the disk cache.
+// A nil key keeps the plaintext 0600 cache. The token stays cached at all
+// because a managed child with ${API_TOKEN} must start after an agent restart
+// during a gateway outage.
+func NewGatewaySourceWithCacheKey(gatewayURL, token string, client *http.Client, cachePath string, cacheKey []byte) *GatewaySource {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -200,9 +210,10 @@ func NewGatewaySource(gatewayURL, token string, client *http.Client, cachePath s
 		token:     token,
 		http:      client,
 		cachePath: cachePath,
+		cacheKey:  cacheKey,
 		cached:    emptyConfig(),
 	}
-	if cfg, ok := loadCachedConfig(cachePath); ok {
+	if cfg, ok := loadCachedConfig(cachePath, cacheKey); ok {
 		s.cached = cfg
 		s.etag = cfg.ETag
 	}
@@ -310,7 +321,12 @@ func (s *GatewaySource) persist(cfg Config) {
 	if s.cachePath == "" {
 		return
 	}
-	raw, err := json.Marshal(cfg)
+	sealed, err := sealCacheTokens(cfg, s.cacheKey)
+	if err != nil {
+		slog.Debug("runtime: seal runtime config tokens for disk cache failed; cache not written", "error", err)
+		return
+	}
+	raw, err := json.Marshal(sealed)
 	if err != nil {
 		slog.Debug("runtime: marshal runtime config for disk cache failed", "error", err)
 		return

@@ -21,7 +21,7 @@ func TestMigration106MakesMemberPortsUnique(t *testing.T) {
 		ctx := context.Background()
 		head := seedRPCHeadSpecAtV105(ctx, t, s, "m1", now)
 		head2 := seedRPCHeadSpecAtV105(ctx, t, s, "m2", now)
-		seedBinariesServer(ctx, t, s, "srv_mig", now)
+		seedBaselineServerAt(ctx, t, s, "srv_mig", now)
 		row := func(h string, port int) []routing.ClusterMember {
 			return []routing.ClusterMember{{HeadSpecID: h, Position: 0, ServerID: "srv_mig", DeviceBackend: "auto", Port: port}}
 		}
@@ -54,12 +54,22 @@ func TestMigration106MakesMemberPortsUnique(t *testing.T) {
 	})
 }
 
+// seedBaselineServerAt seeds a plain active server through the baseline column
+// set, so it works on a pre-head schema (CreateAIServer names every column).
+func seedBaselineServerAt(ctx context.Context, t *testing.T, s *SQLStore, id string, now time.Time) {
+	t.Helper()
+	seedBaselineServer(ctx, t, s, routing.AIServer{
+		ID: id, Name: id, Provider: routing.ProviderVLLM, Endpoint: "http://" + id + ":8000",
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	})
+}
+
 // seedRPCHeadSpecAtV105 is seedRPCHeadSpec for a database still at version 105:
 // the store's own writers name columns migration 107 added, so the chain is
 // inserted with the baseline columns only.
 func seedRPCHeadSpecAtV105(ctx context.Context, t *testing.T, s *SQLStore, key string, now time.Time) string {
 	t.Helper()
-	seedBinariesServer(ctx, t, s, "srv_head_"+key, now)
+	seedBaselineServerAt(ctx, t, s, "srv_head_"+key, now)
 	seedBaselineApplication(ctx, t, s, routing.Application{
 		ID: "app_" + key, ServerID: "srv_head_" + key, Type: routing.ProviderServerAgent, Port: 8081, Scheme: "http",
 		APIFlavors: []string{routing.APIFlavorOpenAI}, Status: routing.ServerStatusActive,

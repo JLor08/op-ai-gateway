@@ -124,6 +124,10 @@ type agentTelemetryRequest struct {
 	// (the agent omits it unless it changed), an empty array means the agent
 	// allows no binaries and replaces the agent rows with nothing.
 	Binaries *[]agentBinarySample `json:"binaries,omitempty"`
+	// Interfaces is the agent's LAN interface list. Same three states as
+	// Binaries: absent leaves the stored list alone, an empty array records
+	// "reported, none".
+	Interfaces *[]agentNetInterface `json:"interfaces,omitempty"`
 }
 
 // agentRuntimeGPUSample is one GPU's measured VRAM inside an
@@ -2331,6 +2335,9 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// Best-effort replacement of the agent-reported binary inventory. A
 	// no-op unless this sample carries the field. Never rejects the sample.
 	s.writeBackBinaries(ctx, serverID, req.Binaries, now)
+	// Best-effort write of the agent-reported LAN interfaces; notifies the
+	// server's clusters only when its effective LAN address changed.
+	s.writeBackLANInterfaces(ctx, serverID, req.Interfaces)
 	s.maybeFireReactivation(ctx, server)
 	return nil
 }

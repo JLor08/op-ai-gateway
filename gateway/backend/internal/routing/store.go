@@ -266,6 +266,19 @@ type AIServer struct {
 	// LANBindOnly makes a member listen on LANAddress only instead of every
 	// interface (migration 103).
 	LANBindOnly bool
+	// LANSource says where the server's effective LAN address comes from
+	// (migration 116): LANSourceAuto (derive it), LANSourceInterface (the
+	// reported interface named by LANInterfaceID) or LANSourceManual
+	// (LANAddress as typed). "" (a row written before migration 116) is read
+	// as manual when LANAddress is set, else as auto. Routing never reads it.
+	LANSource string
+	// LANInterfaceID is the stable id of the chosen reported interface under
+	// LANSourceInterface ("" otherwise).
+	LANInterfaceID string
+	// LANInterfaces is the agent-reported LAN interface list (migration 116): a
+	// sanitized JSON array, "" = never reported, "[]" = reported empty. Written
+	// only by UpdateServerLANInterfaces, never by UpdateAIServer.
+	LANInterfaces string
 	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC
 	// cluster member (migration 103).
 	RPCMemberEnabled bool
@@ -1383,16 +1396,25 @@ type Certificate struct {
 	UpdatedAt         time.Time
 }
 
+// The LAN address sources a server can resolve its LANAddress from.
+const (
+	LANSourceAuto      = "auto"
+	LANSourceInterface = "interface"
+	LANSourceManual    = "manual"
+)
+
 // ServerStore is AI-Server CRUD plus the cross-cutting per-server admin
 // surfaces (owner list, admin-group links, system-group containment,
 // certificate/https-switch overrides, energy config). NetBird peer-sync state
 // lives in NetbirdStateStore; agent tokens live in AgentTokenStore.
 type ServerStore interface {
 	CreateAIServer(ctx context.Context, host AIServer) error
-	// UpdateAIServer writes the server row from host, except netbird_ip: the
-	// mesh address is written only by the NetBird state writes below
-	// (UpdateServerNetbirdState, UpdateServerNetbirdLink, ClearServerNetbirdIP),
-	// so a full-row write from a stale read cannot bring an old one back.
+	// UpdateAIServer writes the server row from host, except netbird_ip and
+	// lan_interfaces: the mesh address is written only by the NetBird state
+	// writes below (UpdateServerNetbirdState, UpdateServerNetbirdLink,
+	// ClearServerNetbirdIP) and the reported interface list only by
+	// UpdateServerLANInterfaces, so a full-row write from a stale read cannot
+	// bring an old value back.
 	UpdateAIServer(ctx context.Context, host AIServer) error
 	// UpdateServerLastSeen writes only last_seen_at and updated_at, the agent
 	// telemetry heartbeat, so a sample cannot write back a row it read before
@@ -1436,6 +1458,15 @@ type ServerStore interface {
 	// (deduped by server id). An empty groupIDs returns an empty slice
 	// without issuing a query.
 	ServersByAdminGroups(ctx context.Context, groupIDs []string) ([]AIServer, error)
+}
+
+// LANInterfacesStore is the targeted write of the agent-reported LAN interface
+// list.
+type LANInterfacesStore interface {
+	// UpdateServerLANInterfaces writes only lan_interfaces (a sanitized JSON
+	// array, "[]" = reported empty) with a targeted UPDATE, so it cannot race a
+	// concurrent full-row write. An unknown id is ErrNotFound.
+	UpdateServerLANInterfaces(ctx context.Context, id, interfacesJSON string) error
 }
 
 // NetbirdStateStore is the set of targeted per-column UPDATEs that keep a
@@ -3663,6 +3694,7 @@ type VendorAccountStore interface {
 // SQLStore satisfy it structurally, with no change at the call site.
 type Store interface {
 	ServerStore
+	LANInterfacesStore
 	NetbirdStateStore
 	AgentTokenStore
 	TelemetryStore

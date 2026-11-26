@@ -148,6 +148,7 @@ var migrations = []migration{
 	{version: 113, name: "runtime_spec_process_tree", up: migration113Up},
 	{version: 114, name: "vendor_account_groups", up: migration114Up},
 	{version: 115, name: "user_chat_vendor_access", up: migration115Up},
+	{version: 116, name: "server_lan_interfaces", up: migration116Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4933,4 +4934,25 @@ func migration114Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 		}
 	}
 	return addColumnIfMissing(ctx, tx, dl, "usage_events", "vendor_group_id text not null default ''")
+}
+
+// migration116Up adds the agent-reported LAN interface list and the LAN
+// address source to ai_servers: lan_interfaces (the empty string = never reported,
+// '[]' = reported empty), lan_source and lan_interface_id. It then backfills the
+// source so an existing setup resolves exactly as before: a server that already
+// carries a lan_address is 'manual', every other one 'auto'. The backfill only
+// touches rows still at the empty-string default, so a replay never rewrites a choice.
+func migration116Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range []string{
+		"lan_interfaces text not null default ''",
+		"lan_source text not null default ''",
+		"lan_interface_id text not null default ''",
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, "ai_servers", col); err != nil {
+			return err
+		}
+	}
+	return execTx(ctx, tx, dl, `update ai_servers
+		set lan_source = case when lan_address <> '' then 'manual' else 'auto' end
+		where lan_source = ''`)
 }

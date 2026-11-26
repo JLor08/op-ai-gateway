@@ -482,6 +482,26 @@ func TestPutClusterSaveChecks(t *testing.T) {
 			f.netbirdReady(r.ClusterMembers[0].ServerID, "100.64.0.2")
 			f.updateServer(r.ClusterMembers[0].ServerID, func(s *routing.AIServer) { s.LANAddress = "192.0.2.10" })
 		}), nil},
+		{"lan with a NetBird member and a reported interface", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			f.netbirdReady(r.ClusterMembers[0].ServerID, "100.64.0.2")
+			f.lanInterfaces(r.ClusterMembers[0].ServerID, lanEth1)
+		}), nil},
+		{"lan with a NetBird member reporting only its NetBird address", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			f.netbirdReady(r.ClusterMembers[0].ServerID, "192.0.2.40")
+			f.lanInterfaces(r.ClusterMembers[0].ServerID, LANInterfaceView{ID: "k-wt0", IDKind: "keyed", Name: "wt0", IPv4: []string{"192.0.2.40"}})
+		}), ErrClusterLANAddressRequired},
+		{"lan with a NetBird member on a manual source without an address", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			f.netbirdReady(r.ClusterMembers[0].ServerID, "100.64.0.2")
+			f.updateServer(r.ClusterMembers[0].ServerID, func(s *routing.AIServer) { s.LANSource = routing.LANSourceManual })
+			f.lanInterfaces(r.ClusterMembers[0].ServerID, lanEth1)
+		}), ErrClusterLANAddressRequired},
+		{"lan with a NetBird member whose chosen interface is missing", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
+			f.netbirdReady(r.ClusterMembers[0].ServerID, "100.64.0.2")
+			f.updateServer(r.ClusterMembers[0].ServerID, func(s *routing.AIServer) {
+				s.LANSource, s.LANInterfaceID = routing.LANSourceInterface, "k-gone"
+			})
+			f.lanInterfaces(r.ClusterMembers[0].ServerID, lanEth1)
+		}), nil},
 		{"direct mesh without policy enforcement", with(func(f *clusterFixture, r *PutRuntimeSpecRequest) {
 			f.netbirdReady(f.head.ID, "100.64.0.1")
 			f.netbirdReady(r.ClusterMembers[0].ServerID, "100.64.0.2")

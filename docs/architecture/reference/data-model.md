@@ -77,7 +77,13 @@ on every spec, `device_backend` (`auto` default). `ai_servers` gains
 `netbird_ip` (the mesh IPv4 the peer sync records; the full-row server update never writes it), `lan_address` (an IPv4
 literal or `''`), `lan_bind_only`, `rpc_member_enabled` and
 `rpc_allowed_head_groups` (a JSON array of admin-group ids, `'[]'` = the
-server's own admin groups). The service layer normalises an empty
+server's own admin groups), plus the LAN address source (migration 116):
+`lan_source` (`auto`, `interface` or `manual`; `''` reads as `auto`),
+`lan_interface_id` (the chosen reported interface under `interface`) and
+`lan_interfaces` (the agent-reported LAN interface list as a sanitized JSON
+array; `''` = never reported, `'[]'` = reported empty). `lan_interfaces` is
+written only by `UpdateServerLANInterfaces`, never by the full-row server
+update. The service layer normalises an empty
 `member_mode`, `device_backend` or consent list to its default on every write
 and reads an empty one as that default.
 
@@ -676,6 +682,7 @@ catch-all `model_override`, which has its own column).
 | 111 | `token_claude_code_usage_display` | Adds `api_tokens.claude_code_usage_display` (`integer not null default 0`) through `addColumnIfMissing`, on both dialects (#407): the per-token opt-in to the Claude Code secret shape, which makes Claude Code show the usage limits. Written at creation and by secret rotation only (`RotateUserTokenSecret` sets it in the same statement as the new hash and prefix); a metadata update never changes it. The default is the whole upgrade story: every existing token reads back `0` = opaque secret. No backfill; append-only. |
 | 112 | `token_usage_limit_switches` | Adds `api_tokens.send_usage_limits` and `api_tokens.codex_model_switch_prompt` (each `integer not null default 0`) through `addColumnIfMissing` (#420): the per-token opt-ins for the usage-limit headers and for the Codex CLI model-switch popup. `send_usage_limits` is backfilled from `claude_code_usage_display` (`update api_tokens set send_usage_limits = 1 where claude_code_usage_display = 1`), so a token that already shows the limits in Claude Code keeps showing them; everything else, and every `codex_model_switch_prompt`, lands on `0` = off. The backfill is idempotent; append-only. |
 | 113 | `runtime_spec_process_tree` | Adds `agent_runtime_specs.process_tree` (`text not null default 'direct'`) through `addColumnIfMissing`, on both dialects (#424, [ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)): `direct` (today's process handling) or `job` (the opt-in Windows job-object process tree, [Agent-Managed Model Runtime §3.9](../cross-cutting/agent-runtime-manager.md#39-the-windows-process-tree-process_tree)). Operator-owned, written by `UpsertRuntimeSpec` on every save; the SQL and memory stores write an unset value as `direct` (an explicit `''` insert would bypass the column default), and the portal reads a stored `''` as `direct`. The default is the whole upgrade story: every existing row reads back `direct`, and the pushed runtime document, which carries `process_tree` only for a `job` spec, stays byte-for-byte what it was. No backfill; append-only. |
+| 116 | `server_lan_interfaces` | Adds `lan_interfaces`, `lan_source` and `lan_interface_id` (all `text not null default ''`) to `ai_servers` through `addColumnIfMissing`, then backfills `lan_source` where it is still `''`: `manual` for a server that already has a `lan_address`, `auto` for every other one, so an existing setup resolves exactly as before. `lan_interfaces` stays `''` (never reported) until an agent reports. The backfill touches only rows still at the default, so a replay never rewrites a later choice. |
 
 ### Responses live timings
 

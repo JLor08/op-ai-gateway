@@ -111,6 +111,19 @@ export interface ClusterPeakAboveBudget {
   ceiling_mb?: number;
 }
 
+// A member's (or the head's) LAN address change recorded on the cluster. A
+// position the caller may not see arrives redacted: no server, from or to.
+export interface ClusterAddressChange {
+  position?: number;
+  head: boolean;
+  server: string;
+  server_id: string;
+  from: string;
+  to: string;
+  at: string;
+  relaunched: boolean;
+}
+
 // The gateway's orchestration state of one cluster head (Go ClusterStatusDTO).
 export interface ClusterStatus {
   state: ClusterState;
@@ -121,6 +134,7 @@ export interface ClusterStatus {
   // Absent when there is none (and from an older gateway).
   breaches?: ClusterBreach[];
   peaks_above_budget?: ClusterPeakAboveBudget[];
+  address_changes?: ClusterAddressChange[];
 }
 
 // A server a head may add as a member (Go ClusterCandidateDTO). Automatic

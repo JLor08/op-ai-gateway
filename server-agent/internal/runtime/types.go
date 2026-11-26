@@ -104,7 +104,10 @@ type Spec struct {
 	// APIToken is the DECRYPTED upstream token the gateway resolved for this
 	// spec's api_token_mode (empty for off / app-unset). The agent substitutes
 	// it wherever the operator wrote ${API_TOKEN} in Env/Args, and masks it in
-	// the reported command. Never persisted by the agent; redacted in file-mode
+	// the reported command. The agent's runtime-config disk cache keeps a copy
+	// so a restart during a gateway outage can still launch ${API_TOKEN}
+	// children: AES-256-GCM sealed with an agent_key subkey when the agent has
+	// one, else plaintext in the 0600 cache file. Redacted in file-mode
 	// reports (report.go).
 	APIToken string `json:"api_token"`
 	// APITokenHeader is the header the agent's OWN probes of this child

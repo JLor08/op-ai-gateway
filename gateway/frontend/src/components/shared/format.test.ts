@@ -1134,6 +1134,7 @@ const clusterWireCodes = [
   // The reasons a cluster head is withheld from its agent
   // (RuntimeSpec.cluster_withheld_reason).
   'runtime.cluster_address_unknown',
+  'runtime.cluster_lan_interface_missing',
   'runtime.cluster_direct_unavailable',
   'runtime.cluster_member_consent_withdrawn',
   'runtime.cluster_member_disabled',
@@ -1188,6 +1189,8 @@ const clusterWireCodes = [
   'binary.agent_owned',
   'binary.request_failed',
   'server.lan_address_invalid',
+  'server.lan_source_invalid',
+  'server.lan_interface_required',
   // Gateway runtime codes.
   'runtime.cluster_lan_ack_required',
   'runtime.cluster_member_in_use',

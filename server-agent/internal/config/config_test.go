@@ -1409,6 +1409,9 @@ func TestGeneratedAgentConfigLoadsToDocumentedDefaults(t *testing.T) {
 	if cfg.Token != "fixture-token" {
 		t.Errorf("Token = %q", cfg.Token)
 	}
+	if cfg.AgentKey != testAgentKey {
+		t.Errorf("AgentKey = %q, want the fixture key", cfg.AgentKey)
+	}
 	if cfg.Transport != TransportWebSocket {
 		t.Errorf("Transport = %q, want websocket", cfg.Transport)
 	}
@@ -1940,6 +1943,52 @@ func TestRuntimeAllowlistWarningsLookAlikes(t *testing.T) {
 	}
 	if strings.Contains(w[0], "containment stays on") || !strings.Contains(w[2], "containment stays on") {
 		t.Errorf("containment clause wrong: %v", w)
+	}
+}
+
+const testAgentKey = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+
+func TestAgentKeyPrecedence(t *testing.T) {
+	envKey := strings.Repeat("ab", 32)
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x","agent_key":"  `+testAgentKey+`  "}`)
+
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load(file): %v", err)
+	}
+	if cfg.AgentKey != testAgentKey {
+		t.Errorf("AgentKey = %q, want the trimmed file value", cfg.AgentKey)
+	}
+
+	cfg, err = Load([]string{"-config", path}, func(k string) string {
+		if k == "OP_AGENT_AGENT_KEY" {
+			return "  " + envKey + "\n"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("Load(env): %v", err)
+	}
+	if cfg.AgentKey != envKey {
+		t.Errorf("AgentKey = %q, want the trimmed env value to win", cfg.AgentKey)
+	}
+}
+
+func TestAgentKeyValidation(t *testing.T) {
+	base := []string{"-gateway-url=https://gw.example", "-token=x"}
+	for _, bad := range []string{testAgentKey[:63], testAgentKey + "0", strings.Repeat("zz", 32)} {
+		_, err := Load(base, func(k string) string {
+			if k == "OP_AGENT_AGENT_KEY" {
+				return bad
+			}
+			return ""
+		})
+		if err == nil || !strings.Contains(err.Error(), "agent_key must be 64 hex characters (32 bytes)") {
+			t.Errorf("Load with key %q: err = %v", bad, err)
+		}
+	}
+	if _, err := Load(base, func(string) string { return "" }); err != nil {
+		t.Errorf("an absent key must load: %v", err)
 	}
 }
 

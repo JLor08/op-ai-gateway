@@ -1808,6 +1808,21 @@ type ServerDTO struct {
 	// cluster traffic; LANBindOnly makes an RPC member listen on it only.
 	LANAddress  string `json:"lan_address"`
 	LANBindOnly bool   `json:"lan_bind_only"`
+	// LANSource is the stored LAN address source (auto, interface or
+	// manual; "" never leaves the service, a pre-migration row reads as
+	// manual with a lan_address, else auto). LANInterfaceID is the chosen
+	// reported interface under "interface". LAN is the effective resolution
+	// derived from them and the last agent-reported interface list.
+	LANSource      string           `json:"lan_source"`
+	LANInterfaceID string           `json:"lan_interface_id"`
+	LAN            LANResolutionDTO `json:"lan"`
+	// LANAddressChanges are the recent changes of the server's lan cluster
+	// addresses the gateway's cluster orchestration saw, across every
+	// cluster the server takes part in, newest first: as a member its dial
+	// address, as a head its identity. A head the reader may not see is
+	// anonymous: no HeadSpecID and no HeadName. In memory only: a gateway restart starts it empty. Always a
+	// non-nil list.
+	LANAddressChanges []ServerLANAddressChangeDTO `json:"lan_address_changes"`
 	// RPCMemberEnabled offers the server as an automatic llama.cpp RPC
 	// member; RPCAllowedHeadGroups are the admin-group ids whose heads may
 	// use it. Always a non-nil list.
@@ -1898,7 +1913,12 @@ type UpdateServerRequest struct {
 	PriceUnit *string `json:"price_unit,omitempty"`
 	// RPC cluster settings; same validation as on create. A supplied empty
 	// LANAddress or head-group list clears the value.
-	LANAddress           *string   `json:"lan_address,omitempty"`
+	LANAddress *string `json:"lan_address,omitempty"`
+	// LANSource (auto, interface or manual) and LANInterfaceID choose where
+	// the LAN address comes from. A lan_address without lan_source selects
+	// manual; clearing it under manual selects auto.
+	LANSource            *string   `json:"lan_source,omitempty"`
+	LANInterfaceID       *string   `json:"lan_interface_id,omitempty"`
 	LANBindOnly          *bool     `json:"lan_bind_only,omitempty"`
 	RPCMemberEnabled     *bool     `json:"rpc_member_enabled,omitempty"`
 	RPCAllowedHeadGroups *[]string `json:"rpc_allowed_head_groups,omitempty"`
@@ -4171,7 +4191,7 @@ func (s *Service) ListServers(ctx context.Context, principal auth.Token) (Server
 	values, settingsOK := s.systemSettingsSnapshot(ctx)
 	out := make([]ServerDTO, 0, len(servers))
 	for _, srv := range servers {
-		dto, err := s.serverDTOWith(ctx, srv, values, settingsOK)
+		dto, err := s.serverDTOWith(ctx, principal, srv, values, settingsOK)
 		if err != nil {
 			return ServerListResponse{}, err
 		}
@@ -4327,6 +4347,7 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		Pue:                         pue,
 		PriceUnit:                   priceUnit,
 		LANAddress:                  lanAddress,
+		LANSource:                   lanSourceForNewServer(lanAddress),
 		LANBindOnly:                 req.LANBindOnly != nil && *req.LANBindOnly,
 		RPCMemberEnabled:            req.RPCMemberEnabled != nil && *req.RPCMemberEnabled,
 		RPCAllowedHeadGroups:        encodeRPCHeadGroups(headGroups),
@@ -4354,7 +4375,7 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 	if netbirdEnabled {
 		sk, hookErr := s.generateNetbirdSetupKey(ctx, netbirdCfg, server, "")
 		if hookErr != nil {
-			dto, dtoErr := s.serverDTO(ctx, server)
+			dto, dtoErr := s.serverDTO(ctx, principal, server)
 			if dtoErr != nil {
 				return ServerDTO{}, dtoErr
 			}
@@ -4365,7 +4386,7 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		// Mirror the hook's store writes onto the local struct so the create response
 		// DTO reflects them (the setup key marks the peer portal-managed).
 		server.NetbirdPeerManaged = true
-		dto, dtoErr := s.serverDTO(ctx, server)
+		dto, dtoErr := s.serverDTO(ctx, principal, server)
 		if dtoErr != nil {
 			return ServerDTO{}, dtoErr
 		}
@@ -4373,7 +4394,7 @@ func (s *Service) CreateServer(ctx context.Context, principal auth.Token, req Cr
 		dto.NetbirdSetupCommand = netbirdSetupCommand(netbirdCfg.URL, sk.Key)
 		return dto, nil
 	}
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, principal, server)
 }
 
 func (s *Service) GetServer(ctx context.Context, principal auth.Token, id string) (ServerDTO, error) {
@@ -4381,7 +4402,7 @@ func (s *Service) GetServer(ctx context.Context, principal auth.Token, id string
 	if err != nil {
 		return ServerDTO{}, err
 	}
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, principal, server)
 }
 
 func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id string, req UpdateServerRequest) (ServerDTO, error) {
@@ -4489,7 +4510,31 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 		if err != nil {
 			return ServerDTO{}, err
 		}
+		if v != "" && v == server.NetbirdIP {
+			// A NetBird address is never a LAN address.
+			return ServerDTO{}, ErrServerLANAddressInvalid
+		}
 		server.LANAddress = v
+		switch {
+		case req.LANSource != nil:
+		case v != "":
+			server.LANSource = routing.LANSourceManual
+		case configuredLANSource(server) == routing.LANSourceManual:
+			server.LANSource = routing.LANSourceAuto
+		}
+	}
+	if req.LANSource != nil {
+		src := strings.TrimSpace(*req.LANSource)
+		if src != routing.LANSourceAuto && src != routing.LANSourceInterface && src != routing.LANSourceManual {
+			return ServerDTO{}, ErrServerLANSourceInvalid
+		}
+		server.LANSource = src
+	}
+	if req.LANInterfaceID != nil {
+		server.LANInterfaceID = strings.TrimSpace(*req.LANInterfaceID)
+	}
+	if configuredLANSource(server) == routing.LANSourceInterface && server.LANInterfaceID == "" {
+		return ServerDTO{}, ErrServerLANInterfaceRequired
 	}
 	if req.LANBindOnly != nil {
 		server.LANBindOnly = *req.LANBindOnly
@@ -4571,7 +4616,7 @@ func (s *Service) UpdateServer(ctx context.Context, principal auth.Token, id str
 	if nameChanged && server.NetbirdEnabled && server.NetbirdPeerID != "" {
 		server.Domain, server.NetbirdConnected = s.reconcileServerPeerName(ctx, server.ID, server.NetbirdPeerID, server.Name, server.Domain, server.NetbirdConnected)
 	}
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, principal, server)
 }
 
 // SetServerAdminGroups replaces a server's linked admin-group set (Phase B,
@@ -4651,7 +4696,7 @@ func (s *Service) SetServerAdminGroups(ctx context.Context, principal auth.Token
 		}
 		server.SystemGroupID = systemGroupID
 	}
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, principal, server)
 }
 
 // ServerAdminGroupCandidates lists the admin-tier groups the caller may
@@ -4845,7 +4890,7 @@ func (s *Service) SetServerEnergyConfig(ctx context.Context, principal auth.Toke
 	if err != nil {
 		return ServerDTO{}, err
 	}
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, principal, server)
 }
 
 // authorizeServer loads the server and returns ErrServerNotFound unless the
@@ -5062,9 +5107,11 @@ func (s *Service) validateAdminGroupScope(ctx context.Context, principal auth.To
 	return ids, systemGroupID, nil
 }
 
-// serverDTO renders ONE server, reading the system settings for itself. Every
-// single-server path uses this; ListServers uses serverDTOWith so that N servers
-// share ONE settings read.
+// serverDTO renders ONE server for principal, reading the system settings for
+// itself. Every single-server path uses this; ListServers uses serverDTOWith so
+// that N servers share ONE settings read. The principal only decides which
+// heads its lan_address_changes name (serverLANAddressChanges); the caller has
+// already authorized the server.
 //
 // The settings are threaded rather than re-read per server for a reason that is
 // not performance (one read is ~33 us): ListServers rendered N servers from N
@@ -5073,9 +5120,9 @@ func (s *Service) validateAdminGroupScope(ctx context.Context, principal auth.To
 // under the new one. One read per request makes the list internally consistent.
 // cmd/gateway/app_health.go already takes exactly this shape per pass, and says
 // in its own comment that it mirrors serverDTO; this makes that true.
-func (s *Service) serverDTO(ctx context.Context, server routing.AIServer) (ServerDTO, error) {
+func (s *Service) serverDTO(ctx context.Context, principal auth.Token, server routing.AIServer) (ServerDTO, error) {
 	values, ok := s.systemSettingsSnapshot(ctx)
-	return s.serverDTOWith(ctx, server, values, ok)
+	return s.serverDTOWith(ctx, principal, server, values, ok)
 }
 
 // systemSettingsSnapshot reads the settings once, returning ok=false when there
@@ -5096,7 +5143,7 @@ func (s *Service) systemSettingsSnapshot(ctx context.Context) (map[string]string
 	return values, true
 }
 
-func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, values map[string]string, settingsOK bool) (ServerDTO, error) {
+func (s *Service) serverDTOWith(ctx context.Context, principal auth.Token, server routing.AIServer, values map[string]string, settingsOK bool) (ServerDTO, error) {
 	ownerIDs, err := s.routes.ServerOwners(ctx, server.ID)
 	if err != nil {
 		return ServerDTO{}, err
@@ -5159,6 +5206,10 @@ func (s *Service) serverDTOWith(ctx context.Context, server routing.AIServer, va
 		NetbirdIP:                   server.NetbirdIP,
 		LANAddress:                  server.LANAddress,
 		LANBindOnly:                 server.LANBindOnly,
+		LANSource:                   configuredLANSource(server),
+		LANInterfaceID:              server.LANInterfaceID,
+		LAN:                         lanResolutionDTOOf(server),
+		LANAddressChanges:           s.serverLANAddressChanges(ctx, principal, server.ID),
 		RPCMemberEnabled:            server.RPCMemberEnabled,
 		RPCAllowedHeadGroups:        decodeRPCHeadGroups(server.RPCAllowedHeadGroups),
 		// NetbirdSetupKey / NetbirdSetupCommand are display-once and deliberately

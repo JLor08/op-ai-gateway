@@ -26,8 +26,9 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
 			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
-			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups,
+			lan_source, lan_interface_id, lan_interfaces
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		host.ID,
 		host.Name,
 		host.Domain,
@@ -65,6 +66,9 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 		host.LANBindOnly,
 		host.RPCMemberEnabled,
 		host.RPCAllowedHeadGroups,
+		host.LANSource,
+		host.LANInterfaceID,
+		host.LANInterfaces,
 	)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
@@ -75,8 +79,9 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 	return nil
 }
 
-// UpdateAIServer writes the server row from host, except netbird_ip, which
-// only the NetBird state writes set (see routing.ServerStore).
+// UpdateAIServer writes the server row from host, except netbird_ip (only the
+// NetBird state writes set it) and lan_interfaces (only
+// UpdateServerLANInterfaces sets it); see routing.ServerStore.
 func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
@@ -87,7 +92,8 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 			netbird_ping_exclude = ?, agent_presence_timeout_seconds = ?,
 			estimated_watts = ?, idle_watts = ?, price_per_kwh = ?, pue = ?, price_unit = ?, system_group_id = ?,
 			certificate_override = ?, https_switch_override = ?, runtime_max_processes = ?, managed_runtime_only = ?,
-			lan_address = ?, lan_bind_only = ?, rpc_member_enabled = ?, rpc_allowed_head_groups = ?
+			lan_address = ?, lan_bind_only = ?, rpc_member_enabled = ?, rpc_allowed_head_groups = ?,
+			lan_source = ?, lan_interface_id = ?
 		where id = ?`,
 		host.Name,
 		host.Domain,
@@ -123,6 +129,8 @@ func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer)
 		host.LANBindOnly,
 		host.RPCMemberEnabled,
 		host.RPCAllowedHeadGroups,
+		host.LANSource,
+		host.LANInterfaceID,
 		host.ID,
 	)
 	if err != nil {
@@ -140,7 +148,8 @@ func (s *SQLiteStore) AIServerByID(ctx context.Context, id string) (routing.AISe
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
 			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
-			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups
+			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups,
+			lan_source, lan_interface_id, lan_interfaces
 		from ai_servers
 		where id = ?`, id)
 	return scanAIServer(row)
@@ -155,7 +164,8 @@ func (s *SQLiteStore) AIServers(ctx context.Context) ([]routing.AIServer, error)
 			netbird_ping_exclude, agent_presence_timeout_seconds,
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
 			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
-			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups
+			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups,
+			lan_source, lan_interface_id, lan_interfaces
 		from ai_servers
 		order by id`)
 	if err != nil {
@@ -251,6 +261,15 @@ func (s *SQLiteStore) ClearServerNetbirdIP(ctx context.Context, id string) error
 	result, err := s.exec(ctx, `update ai_servers set netbird_ip = '' where id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("clear server netbird ip: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateServerLANInterfaces writes only lan_interfaces, with a targeted UPDATE.
+func (s *SQLiteStore) UpdateServerLANInterfaces(ctx context.Context, id, interfacesJSON string) error {
+	result, err := s.exec(ctx, `update ai_servers set lan_interfaces = ? where id = ?`, interfacesJSON, id)
+	if err != nil {
+		return fmt.Errorf("update server lan interfaces: %w", err)
 	}
 	return requireAffected(result)
 }
@@ -428,7 +447,8 @@ func (s *SQLiteStore) ServersByOwner(ctx context.Context, userID string) ([]rout
 			s.netbird_ping_exclude, s.agent_presence_timeout_seconds,
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
 			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only,
-			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups
+			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups,
+			s.lan_source, s.lan_interface_id, s.lan_interfaces
 		from ai_servers s
 		join server_owners o on o.server_id = s.id
 		where o.user_id = ?
@@ -552,7 +572,8 @@ func (s *SQLiteStore) ServersByAdminGroups(ctx context.Context, groupIDs []strin
 			s.netbird_ping_exclude, s.agent_presence_timeout_seconds,
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
 			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only,
-			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups
+			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups,
+			s.lan_source, s.lan_interface_id, s.lan_interfaces
 		from ai_servers s
 		join server_admin_groups g on g.server_id = s.id
 		where g.group_id in (`+strings.Join(placeholders, ",")+`)
@@ -850,6 +871,9 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 		&lanBindOnly,
 		&rpcMemberEnabled,
 		&host.RPCAllowedHeadGroups,
+		&host.LANSource,
+		&host.LANInterfaceID,
+		&host.LANInterfaces,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.AIServer{}, ErrNotFound

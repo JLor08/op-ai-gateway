@@ -554,7 +554,7 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 		if err != nil {
 			return ServerDTO{}, err
 		}
-		return s.serverDTO(ctx, server)
+		return s.serverDTO(ctx, principal, server)
 	}
 	if err := s.routes.UpdateServerNetbirdLink(ctx, id, enabled, peerID); err != nil {
 		return ServerDTO{}, err
@@ -630,7 +630,7 @@ func (s *Service) SetServerNetbird(ctx context.Context, principal auth.Token, id
 	if err != nil {
 		return ServerDTO{}, err
 	}
-	return s.serverDTO(ctx, server)
+	return s.serverDTO(ctx, principal, server)
 }
 
 // pushNetbirdGroups reconciles a linked peer's NetBird POLICY group membership to

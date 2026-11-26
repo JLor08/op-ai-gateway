@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"op-ai-server-agent/internal/agent"
+	"op-ai-server-agent/internal/agentkey"
 	"op-ai-server-agent/internal/certinstall"
 	"op-ai-server-agent/internal/client"
 	"op-ai-server-agent/internal/collector"
@@ -282,11 +283,17 @@ func main() {
 	// operator estimate.
 	mgr.SetWSLVMPIDs(collector.NewWSLVMWorkerPIDs())
 
+	agentKey, err := agentkey.Parse(cfg.AgentKey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "server-agent: %v\n", err)
+		os.Exit(2) //nolint:gocritic // exitAfterDefer: startup failure; process is exiting
+	}
+	deps.Interfaces = collector.NewInterfaceCollector(agentKey.Subkey(agentkey.PurposeInterfaceID))
 	var src runtimectl.Source
 	if cfg.RuntimeSource == config.RuntimeSourceFile {
 		src = runtimectl.NewFileSource(cfg.RuntimeConfigPath)
 	} else {
-		src = runtimectl.NewGatewaySource(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath)
+		src = runtimectl.NewGatewaySourceWithCacheKey(cfg.GatewayURL, cfg.Token, trustStore.HTTPClient(30*time.Second), cfg.RuntimeCachePath, agentKey.Subkey(agentkey.PurposeRuntimeCache))
 	}
 	var reporter runtimectl.RuntimeReporter // nil when the poster cannot report (never asserted unchecked)
 	if r, ok := deps.Poster.(runtimectl.RuntimeReporter); ok {
@@ -348,7 +355,8 @@ func main() {
 		"verbose", cfg.Verbose,
 		"transport", cfg.Transport,
 		"cert_mode", cfg.CertMode,
-		"runtime_source", cfg.RuntimeSource)
+		"runtime_source", cfg.RuntimeSource,
+		"agent_key_configured", cfg.AgentKey != "")
 	// runtime_manager activation is no longer known synchronously at this
 	// point (fix round 1, I3: no more one-shot startup probe) -- the
 	// Driver's own Sync logs the transition itself the first time it

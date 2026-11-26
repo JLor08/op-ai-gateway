@@ -56,6 +56,10 @@ const (
 	ClusterWithheldMeshUnavailable   = "runtime.cluster_mesh_unavailable"
 	ClusterWithheldDirectUnavailable = "runtime.cluster_direct_unavailable"
 	ClusterWithheldLANAckRequired    = "runtime.cluster_lan_ack_required"
+	// ClusterWithheldLANInterfaceMissing: a member that listens on its LAN
+	// address only (lan_bind_only) has chosen an interface its agent no
+	// longer reports; it is never moved to a fallback interface.
+	ClusterWithheldLANInterfaceMissing = "runtime.cluster_lan_interface_missing"
 	// ClusterWithheldMemberSpecInvalid: a manual member spec's stored args or
 	// env cannot be read (store data, not operator input).
 	ClusterWithheldMemberSpecInvalid = "runtime.cluster_member_spec_invalid"
@@ -120,6 +124,11 @@ type clusterDerivation struct {
 	reason  string
 	head    *AgentClusterHeadDTO
 	members map[string]AgentRuntimeSpecDTO
+	// addresses is each member server's dial address (the host of its
+	// endpoint), headIdentity how the members know the head: its addresses,
+	// or the name they resolve. The plan carries both (ClusterPlan).
+	addresses    map[string]string
+	headIdentity []string
 	// hold: the viewing server's own agent declaration is unknown, so its
 	// document is held rather than served without the cluster.
 	hold bool
@@ -241,10 +250,12 @@ func (s *Service) deriveClusterNetwork(ctx context.Context, head routing.Runtime
 		return cn, reason, nil
 	}
 	for i := range members {
-		if members[i].address, reason = clusterAddress(members[i].server, cn.network); reason != "" {
+		// The bind address first: a bind-only member's missing interface is
+		// the more specific reason when it also leaves no address to dial.
+		if members[i].bindIP, reason = memberBindIP(members[i].server, cn.network); reason != "" {
 			return cn, reason, nil
 		}
-		if members[i].bindIP, reason = memberBindIP(members[i].server, cn.network); reason != "" {
+		if members[i].address, reason = clusterAddress(members[i].server, cn.network); reason != "" {
 			return cn, reason, nil
 		}
 	}
@@ -513,8 +524,9 @@ func (s *Service) resolveAutomaticMemberBinary(ctx context.Context, m *derivedMe
 
 // clusterAddress is the address a head dials srv's member at: in mesh the
 // mesh IPv4 (NetBird must be on with a tracking group), in lan the server's
-// lan_address, else its Domain -- except on a NetBird-enabled server, whose
-// Domain the peer sync rewrites to the NetBird name.
+// effective LAN address (LANResolutionOf), else its Domain -- except on a
+// NetBird-enabled server, whose Domain the peer sync rewrites to the NetBird
+// name.
 func clusterAddress(srv routing.AIServer, network string) (addr, reason string) {
 	if network == clusterNetworkMesh {
 		if !srv.NetbirdEnabled || srv.NetbirdGroupID == "" {
@@ -525,45 +537,61 @@ func clusterAddress(srv routing.AIServer, network string) (addr, reason string) 
 		}
 		return srv.NetbirdIP, ""
 	}
-	if srv.LANAddress != "" {
-		return srv.LANAddress, ""
+	res := LANResolutionOf(srv)
+	switch {
+	case res.Address != "":
+		return res.Address, ""
+	case res.Source == LANSourceDomain:
+		return strings.TrimSpace(srv.Domain), ""
 	}
-	domain := strings.TrimSpace(srv.Domain)
-	if srv.NetbirdEnabled || domain == "" {
-		return "", ClusterWithheldAddressUnknown
-	}
-	return domain, ""
+	return "", ClusterWithheldAddressUnknown
 }
 
 // memberBindIP is the address srv's member (or its relay) listens on: the
-// mesh IPv4 exactly in mesh; in lan every interface, or only lan_address
-// when the server asks to listen there alone (and then that address must be
-// known, never silently widened to every interface).
+// mesh IPv4 exactly in mesh; in lan every interface, or only the effective
+// LAN address when the server asks to listen there alone. That address must
+// then be known and must not be a fallback: a missing chosen interface
+// withholds the member (ClusterWithheldLANInterfaceMissing) rather than move
+// it to another network, and an unknown address is never silently widened to
+// every interface.
 func memberBindIP(srv routing.AIServer, network string) (ip, reason string) {
 	if network == clusterNetworkMesh {
 		return srv.NetbirdIP, ""
 	}
-	if srv.LANBindOnly {
-		if srv.LANAddress == "" {
-			return "", ClusterWithheldAddressUnknown
-		}
-		return srv.LANAddress, ""
+	if !srv.LANBindOnly {
+		return "0.0.0.0", ""
 	}
-	return "0.0.0.0", ""
+	res := LANResolutionOf(srv)
+	if res.Fallback {
+		return "", ClusterWithheldLANInterfaceMissing
+	}
+	if res.Address == "" {
+		return "", ClusterWithheldAddressUnknown
+	}
+	return res.Address, ""
 }
 
 // clusterHeadIdentity is how a member recognises its head: the head's mesh
-// IPv4 in mesh; in lan its lan_address, else its Domain for the member agent
-// to resolve.
+// IPv4 in mesh; in lan its LANResolution.IdentityIPs (the manual address, or
+// every reported IPv4 of a head on an interface source, fallback included:
+// a multi-homed head may reach a member through another NIC), else its Domain
+// for the member agent to resolve.
 func clusterHeadIdentity(headServer routing.AIServer, network string) (ips []string, domain, reason string) {
-	addr, reason := clusterAddress(headServer, network)
-	if reason != "" {
-		return nil, "", reason
+	if network != clusterNetworkLAN {
+		addr, reason := clusterAddress(headServer, network)
+		if reason != "" {
+			return nil, "", reason
+		}
+		return []string{addr}, "", ""
 	}
-	if network == clusterNetworkLAN && headServer.LANAddress == "" {
-		return []string{}, addr, ""
+	res := LANResolutionOf(headServer)
+	switch {
+	case res.Address != "":
+		return res.IdentityIPs, "", ""
+	case res.Source == LANSourceDomain:
+		return []string{}, strings.TrimSpace(headServer.Domain), ""
 	}
-	return []string{addr}, "", ""
+	return nil, "", ClusterWithheldAddressUnknown
 }
 
 // memberGenerationPart is one member's share of the head's generation:
@@ -596,7 +624,13 @@ type memberGenerationPart struct {
 func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, members []derivedMember, network, transport string, headIPs []string, headDomain string) (clusterDerivation, error) {
 	block := &AgentClusterHeadDTO{Endpoints: make([]AgentClusterEndpointDTO, 0, len(members)), Transport: transport, Network: network}
 	parts := make([]memberGenerationPart, 0, len(members))
-	out := clusterDerivation{head: block, members: make(map[string]AgentRuntimeSpecDTO, len(members))}
+	out := clusterDerivation{
+		head: block, members: make(map[string]AgentRuntimeSpecDTO, len(members)),
+		addresses: make(map[string]string, len(members)), headIdentity: slices.Clone(headIPs),
+	}
+	if headDomain != "" {
+		out.headIdentity = append(out.headIdentity, headDomain)
+	}
 	for _, m := range members {
 		spec, err := s.memberAgentSpec(ctx, head.ID, m, transport, headIPs, headDomain)
 		if errors.Is(err, ErrRuntimeSpecArgsInvalid) || errors.Is(err, ErrRuntimeSpecEnvInvalid) {
@@ -631,6 +665,7 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 			Bind: m.bindIP, Port: m.row.Port,
 		})
 		out.members[m.server.ID] = spec
+		out.addresses[m.server.ID] = m.address
 	}
 	raw, err := json.Marshal(parts)
 	if err != nil {

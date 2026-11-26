@@ -159,7 +159,8 @@ transport) listens on a port the gateway allocates from **26000–26999** on tha
 server (below every default ephemeral range, so no process that lets the kernel
 pick its port ever holds it), bound to the server's mesh IPv4 in a `mesh` cluster, and in a `lan`
 cluster to every interface or, with `lan_bind_only`, to the server's
-`lan_address`. A host firewall must let the head's host reach that port; in a
+effective LAN address (its manual `lan_address` or its chosen agent-reported
+interface's IPv4). A host firewall must let the head's host reach that port; in a
 mesh the gateway's managed `op-gw-rpc-<server id>` NetBird policy grants exactly
 that ([`gateway/deploy/README-netbird.md`](../../gateway/deploy/README-netbird.md)
 §6.1). The member's agent needs `ggml-rpc-server` (and the head's agent

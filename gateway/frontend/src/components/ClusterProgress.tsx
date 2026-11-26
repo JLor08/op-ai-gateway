@@ -7,6 +7,7 @@ import type { Translation } from './shared/types';
 import { formatChatRunErrorCode, formatDate } from './shared/format';
 import {
   clusterStatusView,
+  type ClusterAddressChangeView,
   type ClusterBreachView,
   type ClusterFailureView,
   type ClusterMemberView,
@@ -69,6 +70,21 @@ function breachText(b: ClusterBreachView, t: Translation): string {
   if (b.kind === 'peer') return t.clusterBreachPeer(who, b.peer ?? '—', at);
   if (b.kind === 'foreign_hold') return t.clusterBreachForeignHold(who, at);
   return t.clusterBreachOther(who, b.kind);
+}
+
+function addressChangeText(c: ClusterAddressChangeView, t: Translation): string {
+  const at = formatDate(c.at, c.at);
+  if (c.head) {
+    return t.clusterAddressChangeHead(
+      c.server ?? t.clusterStatusHead,
+      c.from,
+      c.to,
+      at,
+      c.relaunched,
+    );
+  }
+  const who = c.server ?? t.clusterStatusMemberHidden((c.position ?? 0) + 1);
+  return t.clusterAddressChangeMember(who, c.from, c.to, at, c.relaunched);
 }
 
 function peakText(p: ClusterPeakView, t: Translation): string {
@@ -245,6 +261,22 @@ export function ClusterProgress({
           {keyedLines(view.breaches, (b) => breachText(b, t)).map((line) => (
             <Typography key={line.key} variant="body2" data-testid="cluster-breach">
               {line.text}
+            </Typography>
+          ))}
+        </Alert>
+      )}
+      {view.addressChanges.length > 0 && (
+        <Alert severity="info" data-testid="cluster-address-changes">
+          <Typography variant="body2" sx={{ fontWeight: 600 }}>
+            {t.clusterAddressChangesTitle}
+          </Typography>
+          {view.addressChanges.map((c, i) => (
+            <Typography
+              key={`${c.position ?? 'head'}|${c.at}|${i}`}
+              variant="body2"
+              data-testid="cluster-address-change"
+            >
+              {addressChangeText(c, t)}
             </Typography>
           ))}
         </Alert>

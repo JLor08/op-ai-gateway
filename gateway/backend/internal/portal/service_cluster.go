@@ -924,10 +924,12 @@ func netbirdMeshReady(s routing.AIServer) bool {
 }
 
 // lanAddressKnown reports whether a server has a LAN address for a lan
-// cluster: its lan_address, else its Domain -- except on a NetBird-enabled
-// server, whose Domain the peer sync rewrites to the NetBird DNS name.
+// cluster: an effective LAN address (LANResolutionOf), else its Domain --
+// except on a NetBird-enabled server, whose Domain the peer sync rewrites to
+// the NetBird DNS name.
 func lanAddressKnown(s routing.AIServer) bool {
-	return s.LANAddress != "" || (!s.NetbirdEnabled && strings.TrimSpace(s.Domain) != "")
+	res := LANResolutionOf(s)
+	return res.Address != "" || res.Source == LANSourceDomain
 }
 
 // defaultClusterNetwork is mesh when every server is mesh-ready, else lan.
@@ -1648,7 +1650,7 @@ func (s *Service) withClusterView(ctx context.Context, p auth.Token, headServer 
 	if !dto.ClusterEnabled {
 		return dto, nil
 	}
-	return s.withClusterHeadState(ctx, dto, headServer, members, network, hidden)
+	return s.withClusterHeadState(ctx, p, dto, headServer, members, network, hidden)
 }
 
 // fillClusterMemberDTOs sets each member's visibility for p and dto's member
@@ -1688,12 +1690,12 @@ func withClusterNetworkDefault(dto *RuntimeSpecDTO, headServer routing.AIServer,
 
 // withClusterHeadState fills an enabled head's withheld reason, its status
 // with the stored peaks above budget, and its warnings.
-func (s *Service) withClusterHeadState(ctx context.Context, dto RuntimeSpecDTO, headServer routing.AIServer, members []clusterMemberState, network string, hidden []int) (RuntimeSpecDTO, error) {
+func (s *Service) withClusterHeadState(ctx context.Context, p auth.Token, dto RuntimeSpecDTO, headServer routing.AIServer, members []clusterMemberState, network string, hidden []int) (RuntimeSpecDTO, error) {
 	var err error
 	if dto.ClusterWithheldReason, err = s.clusterWithheldReason(ctx, dto.ID, headServer); err != nil {
 		return dto, err
 	}
-	dto.ClusterStatus = s.headClusterStatus(dto.ID, dto.ClusterWithheldReason, hidden)
+	dto.ClusterStatus = s.headClusterStatus(dto.ID, dto.ClusterWithheldReason, hidden, s.addressChangeVisibility(ctx, p, members))
 	if dto.ClusterStatus.PeaksAboveBudget, err = s.peaksAboveBudget(ctx, members); err != nil {
 		return dto, err
 	}

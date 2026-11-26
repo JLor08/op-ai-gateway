@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"op-ai-gateway/internal/routing"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -102,6 +103,70 @@ func TestConformanceUpdateAIServerLeavesNetbirdIP(t *testing.T) {
 			t.Fatalf("clear changed more than netbird_ip: %+v", got)
 		}
 		if err := s.ClearServerNetbirdIP(ctx, "srv_nope"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unknown server = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestConformanceUpdateAIServerLeavesLANInterfaces pins that the agent-reported
+// interface list is written only by UpdateServerLANInterfaces: a full-row
+// update from an older read carrying a stale list leaves the reported one,
+// while the operator's choice (lan_source, lan_interface_id) is part of the
+// full-row write.
+func TestConformanceUpdateAIServerLeavesLANInterfaces(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		stale := seedNarrowWriterServer(ctx, t, s, now)
+		reported := `[{"id":"if-1","name":"eth0","ipv4":["192.0.2.10"]}]`
+		if err := s.UpdateServerLANInterfaces(ctx, stale.ID, reported); err != nil {
+			t.Fatalf("report: %v", err)
+		}
+		stale.Name = "srv-renamed"
+		stale.LANSource = routing.LANSourceInterface
+		stale.LANInterfaceID = "if-1"
+		stale.LANInterfaces = `[]`
+		if err := s.UpdateAIServer(ctx, stale); err != nil {
+			t.Fatalf("full update: %v", err)
+		}
+		got, err := s.AIServerByID(ctx, stale.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Name != "srv-renamed" || got.LANInterfaces != reported {
+			t.Fatalf("name/lan_interfaces = %q/%q, want srv-renamed/%q", got.Name, got.LANInterfaces, reported)
+		}
+		if got.LANSource != routing.LANSourceInterface || got.LANInterfaceID != "if-1" {
+			t.Fatalf("lan_source/lan_interface_id = %q/%q, want interface/if-1", got.LANSource, got.LANInterfaceID)
+		}
+	})
+}
+
+// TestConformanceUpdateServerLANInterfacesNarrowWriter pins the targeted
+// write: only lan_interfaces changes, and an unknown id is ErrNotFound.
+func TestConformanceUpdateServerLANInterfacesNarrowWriter(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		srv := seedNarrowWriterServer(ctx, t, s, now)
+		before, err := s.AIServerByID(ctx, srv.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		list := `[{"id":"if-2","name":"eth1","ipv4":["198.51.100.4"]}]`
+		if err := s.UpdateServerLANInterfaces(ctx, srv.ID, list); err != nil {
+			t.Fatalf("UpdateServerLANInterfaces: %v", err)
+		}
+		got, err := s.AIServerByID(ctx, srv.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := before
+		want.LANInterfaces = list
+		if !reflect.DeepEqual(normalizeServerForCompare(got), normalizeServerForCompare(want)) {
+			t.Fatalf("writer changed more than lan_interfaces:\n got %+v\nwant %+v", got, want)
+		}
+		if err := s.UpdateServerLANInterfaces(ctx, "srv_nope", list); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("unknown server = %v, want ErrNotFound", err)
 		}
 	})

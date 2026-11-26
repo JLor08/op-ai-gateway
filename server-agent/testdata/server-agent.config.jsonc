@@ -9,6 +9,12 @@
   // (e.g. chmod 600) because it holds the token.
   "token": "fixture-token",
 
+  // A random local secret (64 hex characters = 32 bytes) generated with this
+  // file. The agent derives per-purpose subkeys from it; it never leaves this
+  // host and is never sent to the gateway. Keep this file private. Empty
+  // disables the features that need it.
+  "agent_key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+
   // Telemetry transport: "websocket" (default; one persistent connection, cheap
   // for high-frequency sending) or "post" (one HTTP POST per sample).
   "transport": "websocket",

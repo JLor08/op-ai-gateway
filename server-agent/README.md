@@ -71,6 +71,7 @@ lists have no flag form (env, comma-separated, or the file), and
 | `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` | — (file/env only) | `runtime_allow_binary_dirs` | `false` | When on, each `runtime_allowed_binaries` entry's **parent directory** is treated as an allowed `work_dir` prefix without listing it in `runtime_allowed_dirs` — convenient when a model's `work_dir` sits beside its binary. Same operator-only provenance as the allowlists. The auto-added dirs use the same subtree containment as explicit entries. **Footgun:** turning it on while `runtime_allowed_dirs` is empty flips `work_dir` from "any is accepted" to "only the binary directories and their subtrees" (a spec with no `work_dir` still runs beside its binary either way). |
 | `OP_AGENT_RUNTIME_WSL_EXE` | — (file/env only) | `runtime_wsl_exe` | `C:\Program Files\WSL\wsl.exe` on Windows, empty elsewhere | The `wsl.exe` the agent launches WSL2-hosted model processes through (specs whose execution mode is `wsl`). Empty means WSL is not configured and every WSL spec is refused. Operator-only. |
 | `OP_AGENT_RUNTIME_WSL_USER` | — (file/env only) | `runtime_wsl_user` | empty | The distro user every WSL process runs as (`wsl.exe -u`). Required for WSL specs; `root` is refused, since no gateway-supplied command line or environment may run with UID 0. |
+| `OP_AGENT_AGENT_KEY` | — (file/env only) | `agent_key` | — (empty) | A local secret, exactly 64 hex characters (32 bytes), from which the agent derives per-purpose subkeys (HKDF-SHA256). It never leaves the host: it is not sent to the gateway, logged or placed in a URL. Generated into every config the portal produces. A malformed value fails startup; empty disables the features that need it. No flag form, since a command-line secret shows in `ps`. |
 | `OP_AGENT_WSL_RAM_RESERVE_MB` | — (env only) | — (env only) | `1024` | RAM (MB) held back from the WSL2 VM's pool that WSL specs are admitted against. `0` is a real value; a negative or malformed value falls back to the default. Operator-only. |
 | `OP_AGENT_RUNTIME_CACHE` | `-runtime-cache` | `runtime_cache` | `server-agent-runtime.cache.json` next to the binary | Where the last known-good runtime-config document is cached, so the agent can start (and keep) model processes before its first successful gateway contact. A relative config-file value is resolved beside that config file. |
 | `OP_AGENT_CONFIG_FILES_DIR` | `-config-files-dir` | `config_files_dir` | `server-agent-config-files` next to the binary | Base directory under which the agent writes the config files a managed runtime spec asks for, one subdirectory per spec. Operator-only: the gateway supplies a file's relative name and content, never where on this host it is written. Point it at a directory of your choosing to keep these files out of the agent's own directory. A relative config-file value is resolved beside that config file. |
@@ -112,6 +113,16 @@ with the per-server agent token (the gateway fills `token` from your bearer and
 curl -fL -H "Authorization: Bearer <per-server-agent-token>" \
   https://gw.example/api/agent/v1/download/config -o server-agent.json
 ```
+
+Every generated file carries a **fresh** `agent_key`. When you replace an
+existing `server-agent.json` with a newly downloaded one, **copy the old
+`agent_key` into the new file** (or keep `OP_AGENT_AGENT_KEY` as it was). A
+different key changes every keyed interface id, so a LAN interface chosen in the
+portal reads as missing until you choose it again, and under `lan_bind_only` a
+cluster member on that server is withheld meanwhile. It also makes the sealed
+API tokens in the runtime-config cache unreadable; the agent drops them and
+fetches them again from the gateway on its next contact, so a managed model that
+needs `${API_TOKEN}` cannot start before the gateway is reachable.
 
 The example below is a hand-written **abbreviation** with a few values filled
 in, not that generated document: the generated one carries *every* key in the

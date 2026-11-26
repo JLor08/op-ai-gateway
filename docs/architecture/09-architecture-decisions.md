@@ -890,7 +890,8 @@ would leak into all of them; and the "the agent holds no token" premise that
 motivated probing the child directly turned out false anyway — the
 runtime-config push already carries the resolved `${API_TOKEN}` value
 agent-side (a mismatch between how the agent comments on that value and how
-it actually persists it is tracked separately as issue #61, and does not
+it actually persists it was tracked separately as issue #61, since closed by
+[ADR-119](#adr-119--a-host-local-agent-key-keyed-interface-ids-and-a-sealed-token-cache-a-lan-servers-address-follows-its-reported-interfaces), and does not
 change this decision's reasoning). The accurate invariant was never about
 what the agent holds; it is
 that the **router** injects no credential of its own and forwards
@@ -11721,6 +11722,11 @@ one device more or less shifts every later name. The gateway already owns launch
 accounting for single-host models; a cluster needs all of them to span hosts, and a careless design either exposes an
 unauthenticated port to the network, lets one head take another's member, or points device names at the wrong card.
 
+**Amended by [ADR-119](#adr-119--a-host-local-agent-key-keyed-interface-ids-and-a-sealed-token-cache-a-lan-servers-address-follows-its-reported-interfaces) (the LAN address source).** Wherever (b) below says `lan_address`, a `lan` cluster now reads the
+server's effective LAN address: its manual `lan_address`, its chosen or most likely agent-reported interface, else the `Domain` of a
+non-NetBird server. A NetBird-enabled server therefore needs a reported LAN interface or a manual `lan_address`, a bind-only member whose
+chosen interface is missing is withheld, and a head on an interface source identifies itself with every IPv4 it reports.
+
 **Decision — thirteen choices, taken together. Migrations 103–106; agent 0.18.0, feature `rpc_cluster` on both sides.**
 
 - **(a) The gateway configures, orders, holds, accounts and secures; it is never on the RPC data path.** A head is an
@@ -13986,3 +13992,102 @@ guest must be able to verify the host without any CA, host name or gateway invol
   [Deployment view §7.5](07-deployment-view.md#75-server-agent-deployment),
   [Config env](reference/config-env.md),
   [Agent README](../../server-agent/README.md#https-with-a-pinned-certificate-both-modes).
+
+## ADR-119 — A host-local agent key, keyed interface ids and a sealed token cache; a `lan` server's address follows its reported interfaces
+
+**Context.** A llama.cpp RPC cluster on the `lan` network
+([ADR-096](#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster))
+reaches each member at its `lan_address`, else at its `Domain`. On a NetBird-enabled server the peer sync rewrites `Domain` to the NetBird
+DNS name, so an admin had to type the server's LAN IPv4 by hand, and a typed address goes stale with the next DHCP lease and is easy to get
+wrong on a host with several networks. Letting the agent report its interfaces fixes that, but an interface needs an identity that survives a
+reboot, an address change and ideally a rename, and the obvious stable identity, the MAC, is exactly what the agent's reports have never
+carried ([Telemetry §8.2.5](cross-cutting/telemetry-usage-observability.md#825-static-hardware-inventory)); an unkeyed hash of it would not
+help, because the MAC space is small enough to brute-force. Separately, issue #61: the agent's runtime-config disk cache held each spec's
+upstream `api_token` in plaintext, while the code said the token was never persisted. Both need a secret that stays on the host.
+
+**Decision.**
+
+- **The agent key.** A new agent setting `agent_key` (env `OP_AGENT_AGENT_KEY`, deliberately no flag, since a command line is visible to
+  other local users): 32 random bytes as 64 hex characters; any other non-empty value is a startup error. It lives in the agent's config file
+  next to `token`, and the agent only reads it. It never leaves the host: it is not sent to the gateway, not logged, not placed in a URL and
+  not stored by the gateway. Every generated `server-agent.json` carries a fresh key, minted in the browser (`crypto.getRandomValues`) for
+  the portal's copy and per response for `GET /api/agent/v1/download/config`; the gateway neither stores nor logs the downloaded one, and
+  the shared golden tests inject a fixed fixture key in its place
+  ([Configuration §8](cross-cutting/configuration.md#8-the-generated-serveragent-config-document-and-how-its-copies-stay-honest)).
+- **One key, one subkey per purpose.** The agent never uses the key directly: `internal/agentkey` derives a 32-byte subkey per purpose with
+  HKDF-SHA256 (no salt, the purpose label as info). Today's purposes are `op-ai-gateway/interface-id/v1` and
+  `op-ai-gateway/runtime-cache/v1`; a later purpose is a new label, and no purpose can weaken another.
+- **Keyed interface ids.** The agent reports its LAN candidates on the telemetry sample (`interfaces`; who qualifies and when the list is
+  sent: [Telemetry §8.2.8](cross-cutting/telemetry-usage-observability.md#828-lan-interface-candidates)). With a key an entry's `id` is
+  the first 16 bytes, as hex, of HMAC-SHA256 under the interface-id subkey over the hardware address (`id_kind: keyed`): it survives a
+  rename, differs between hosts for the same adapter, and cannot be reversed from the gateway's database. An interface without a hardware
+  address hashes its name; when several candidates share one hardware address (VLAN and macvlan sub-interfaces) each also mixes in its name,
+  so their ids stay distinct. Without a key the `id` is the name (`id_kind: name`), and a renamed adapter loses its choice. The privacy rule
+  is amended accordingly: a hardware address may leave the host only as such a keyed hash, and `SystemReport` still carries none.
+- **The sealed token cache (closes #61).** The token stays in the cache, because a managed child with `${API_TOKEN}` must still start after
+  an agent restart while the gateway is unreachable. With a key, each spec's token is written as `sealed:v1:` plus the base64 of a random
+  12-byte nonce and its AES-256-GCM ciphertext under the runtime-cache subkey, with the spec id as additional data, so a copied cache file or
+  backup no longer exposes it and a token moved to another spec does not open. Without a key the cache is plaintext with mode `0600` as
+  before, and the code and docs now say so. An old plaintext cache is read and rewritten in the sealed form on the next persist; a sealed
+  token that does not open (key lost or changed, no key, a corrupt payload, a token moved to another spec) reads as empty with a warning per
+  spec that never carries the value, and the cached document drops its ETag: the gateway answers a conditional fetch naming the old ETag
+  with `304`, so the first fetch goes out unconditionally, counts as a changed document and is applied as one, which delivers the token
+  again on the first gateway contact. The wire push, the `${API_TOKEN}` expansion and the masking in reports are unchanged
+  ([Agent-Managed Model Runtime §8.1](cross-cutting/agent-runtime-manager.md#81-gateway-mode-push-poll-and-a-disk-cache)).
+- **The LAN address source.** Per server the gateway stores `lan_source` (`auto`, `interface` or `manual`), `lan_interface_id` and the last
+  reported list (`lan_interfaces`, migration 116, written only by the targeted ingest writer; the source fields only by the portal save).
+  The **effective LAN address** is derived from the row alone (`portal.LANResolutionOf`), so a restarted gateway derives clusters before an
+  agent reconnects, and it replaces `lan_address` everywhere a `lan` cluster read it: the head's dial address, the bind address under
+  `lan_bind_only` and the network checks. Resolution order:
+  - `manual`: the typed `lan_address`; without one, today's behaviour (the `Domain` of a server that is not NetBird-enabled, else none).
+  - `interface`: the first IPv4 of the reported interface whose id is `lan_interface_id`, else of the one with that name (so a choice made
+    while ids were names survives a key being added). If it is missing from the report the resolution is a **fallback** to the `auto`
+    interface pick, which the portal shows as a warning naming the fallback; with no candidate at all, a non-NetBird server's `Domain`,
+    else none. The choice applies again as soon as the interface returns.
+  - `auto`: a server that is not NetBird-enabled and has a `Domain` keeps dialing its `Domain`, even once its agent reports interfaces;
+    otherwise the agent's preferred interface, else the first non-virtual one, else no address (`ClusterWithheldAddressUnknown`).
+  - An address in `100.64.0.0/10` or equal to the server's `netbird_ip` is never a candidate, and an unreadable stored list reads as not
+    reported.
+- **`lan_bind_only` never falls back.** A bind-only member whose chosen interface is missing is withheld
+  (`runtime.cluster_lan_interface_missing`) instead of listening on the fallback, which may be a wider network; an unknown address is never
+  widened to `0.0.0.0`. As a head such a server still identifies itself with the fallback: the rule guards only what it listens on.
+- **Head identity.** A head on an `auto` or `interface` source identifies itself to its members with every reported IPv4 (deduplicated, in
+  numeric order), since a multi-homed head may reach a member through another NIC; a `manual` head with exactly its `lan_address`, a head
+  on its `Domain` with the name the member agent resolves.
+- **Rebuild and notice.** An effective-address change re-derives and pushes every `lan` cluster the server takes part in, and relaunches
+  exactly what the existing launch comparison relaunches: a member's dial address is in the head's endpoint list, so a formed head
+  relaunches; a member relaunches only when its bind address changes; a head identity change is applied live by the member agents. A
+  member's dial address or the head identity that differs between two plans of a head is recorded, newest first, five per head and in
+  memory only, on the head's `cluster_status.address_changes` and the server's `lan_address_changes`, with whether a relaunch followed.
+- **Migration of existing rows.** Migration 116 sets `manual` for a server that already has a `lan_address` and `auto` for every other one,
+  so an existing setup resolves exactly as before and the rollout relaunches no cluster. A save that types a `lan_address` without a source
+  becomes `manual`, and a `manual` address equal to the server's `netbird_ip` is refused (`server.lan_address_invalid`).
+
+**Alternatives rejected.**
+- *An unkeyed hash of the MAC as the interface id:* reversible by brute force over the MAC space, so it would carry the MAC in all but name.
+- *A key the gateway stores (or derives the ids with):* the stored ids would then be reversible from the gateway's own database, and a gateway
+  compromise would open every agent's token cache.
+- *The interface name as the only id:* simplest, but Windows renames adapters ("Ethernet 2"), and the choice would silently move to the
+  fallback; it remains the keyless fallback.
+- *Storing the chosen interface's IPv4:* the address is exactly what changes with a new lease; the choice is the interface, the address is
+  derived.
+- *Reporting interfaces in the `SystemReport`:* that inventory is collected once at startup and re-sent every 30 minutes, too static for a
+  DHCP change; the sample carries the list when it changes.
+- *Dropping the token from the cache (#61's other option):* a managed child that needs `${API_TOKEN}` would no longer start after an agent
+  restart during a gateway outage, which is what the cache is for.
+- *Moving every server to its reported interface on upgrade:* it would change the address of every non-NetBird server that dials its
+  `Domain` today and relaunch its clusters; `auto` keeps the `Domain` there, and whoever wants an interface picks it.
+
+**Consequences.**
+- An agent without `agent_key` keeps working with the weaker fallbacks (name ids, plaintext cache), and the portal shows a hint on a server
+  whose agent reports interfaces with name ids; a name-based choice still resolves by name after a key is added, without a re-pick.
+- Losing or changing the key reads stored keyed choices as missing (fallback with warning) until re-picked, and drops the cached tokens
+  until the next gateway contact; both recover on their own or with one re-pick.
+- A NetBird-enabled server joins a `lan` cluster with a reported LAN interface and no typed address; `mesh` clusters are unchanged, and the
+  feature is IPv4 only.
+- Agent version 0.25.1 (PATCH): the new sample field is read when present and an old agent sends none, so nothing is negotiated and no
+  `agent.Features` entry is added.
+- → [Networking & Mesh §12](cross-cutting/networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc),
+  [Telemetry §8.2.8](cross-cutting/telemetry-usage-observability.md#828-lan-interface-candidates),
+  [Agent-Managed Model Runtime §8.1](cross-cutting/agent-runtime-manager.md#81-gateway-mode-push-poll-and-a-disk-cache),
+  [Data model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md), [Config env](reference/config-env.md).

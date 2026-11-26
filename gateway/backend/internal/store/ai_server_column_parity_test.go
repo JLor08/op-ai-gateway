@@ -67,6 +67,12 @@ var aiServerParityOverrides = [3][aiServerParityRows]string{
 	{"exclude", "include", "include", "include"}, // https_switch_override
 }
 
+// aiServerParityLANSources varies lan_source per row over its whole
+// vocabulary, never "" (the zero value could not catch an omitted column).
+var aiServerParityLANSources = [aiServerParityRows]string{
+	routing.LANSourceAuto, routing.LANSourceInterface, routing.LANSourceManual, routing.LANSourceInterface,
+}
+
 // aiServerParityBoolNames names the aiServerParityBools rows in select-list
 // order -- the ONE list of the ai_servers integer-boolean columns, shared by
 // TestAIServerParityFixtureDistinguishesEverySameTypedPair and the schema-
@@ -163,7 +169,9 @@ func TestConformanceAIServerReadersAgreeOnEveryColumn(t *testing.T) {
 				NetbirdIP: "100.64.0." + strconv.Itoa(10+i), LANAddress: "192.168.1." + strconv.Itoa(20+i),
 				LANBindOnly: aiServerParityBools[6][i], RPCMemberEnabled: aiServerParityBools[7][i],
 				RPCAllowedHeadGroups: `["ugrp_head_` + idx + `"]`,
-				Provider:             routing.ProviderVLLM, Endpoint: "http://cols" + idx + ".example.test:800" + idx,
+				LANSource:            aiServerParityLANSources[i], LANInterfaceID: "lan-if-" + idx,
+				LANInterfaces: `[{"id":"lan-if-` + idx + `","name":"eth` + idx + `","ipv4":["192.0.2.` + strconv.Itoa(30+i) + `"]}]`,
+				Provider:      routing.ProviderVLLM, Endpoint: "http://cols" + idx + ".example.test:800" + idx,
 				Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
 				LastSeenAt: &lastSeen, CreatedAt: now, UpdatedAt: now,
 			})
@@ -324,7 +332,7 @@ func TestAIServersSchemaColumnsAllCovered(t *testing.T) {
 			seeded: []string{
 				"agent_presence_timeout_seconds", "certificate_override", "created_at", "domain",
 				"endpoint", "estimated_watts", "health_status", "https_switch_override", "id",
-				"idle_watts", "lan_address", "last_seen_at", "name", "netbird_group_id", "netbird_group_ids",
+				"idle_watts", "lan_address", "lan_interface_id", "lan_interfaces", "lan_source", "last_seen_at", "name", "netbird_group_id", "netbird_group_ids",
 				"netbird_ip", "netbird_peer_id", "netbird_policy_override", "netbird_setup_key_id", "price_per_kwh",
 				"price_unit", "provider", "pue", "rpc_allowed_head_groups", "runtime_max_processes", "server_path_suffix",
 				"status", "system_group_id", "updated_at",

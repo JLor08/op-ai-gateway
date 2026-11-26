@@ -157,6 +157,14 @@ can import another:
 | `server-agent/internal/config/config.go` (`fileConfig`) | Defines what the agent will actually read. |
 | `server-agent/README.md` | Documents the same keys for the operator. |
 
+Every generated document carries a fresh **`agent_key`**: 32 random bytes as 64
+hex characters, minted per download (`newAgentConfigKey` on the gateway,
+`crypto.getRandomValues` in the portal). It is deliberately not part of the
+shared config material (`agentConfigMaterial`), which stays identical between the
+token responses and the direct download. The key is a host-local secret: the
+gateway does not store or log it, and the agent derives per-purpose subkeys from
+it (`internal/agentkey`; env `OP_AGENT_AGENT_KEY`, no flag).
+
 One checked-in golden, **`server-agent/testdata/server-agent.config.jsonc`**,
 now joins them. It lives in the `server-agent` module because that module owns
 the file format, and four checks hang off it:
