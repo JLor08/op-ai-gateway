@@ -132,6 +132,11 @@ export function BinaryPicker({
             <Typography component="span" variant="caption" color="text.secondary">
               {option.effective_version || t.binariesVersionUnknown}
             </Typography>
+            {option.rpc_protocol && (
+              <Typography component="span" variant="caption" color="text.secondary">
+                {`· RPC ${option.rpc_protocol}`}
+              </Typography>
+            )}
             {!option.allowed && (
               <Typography component="span" variant="caption" color="warning.main">
                 {t.binariesNotAllowed}

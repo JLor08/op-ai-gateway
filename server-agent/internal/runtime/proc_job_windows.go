@@ -369,3 +369,19 @@ func ctrlBreakViaAttach(pid int) error {
 	}
 	return nil
 }
+
+// StartKillableTree starts cmd, suspended, in a kill-on-close job object (the
+// process_tree "job" machinery) and returns a func that terminates and closes
+// the job, so a wrapper's grandchildren die with it. For a short-lived probe of
+// a binary (the agent's rpc-server protocol probe) that must not leave
+// anything behind; the kill is safe to call more than once.
+func StartKillableTree(cmd *exec.Cmd) (kill func(), err error) {
+	c, err := startInJob(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		_ = c.kill()
+		_ = c.close()
+	}, nil
+}

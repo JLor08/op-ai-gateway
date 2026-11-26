@@ -11,6 +11,7 @@ import (
 	"op-ai-gateway/internal/store"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -56,17 +57,21 @@ var (
 // EffectiveVersion is the version the gateway acts on: the operator's
 // override when set, else the detected one.
 type ServerBinaryDTO struct {
-	Path             string    `json:"path"`
-	Kind             string    `json:"kind"`
-	Version          string    `json:"version"`
-	VersionOverride  string    `json:"version_override"`
-	EffectiveVersion string    `json:"effective_version"`
-	Build            string    `json:"build"`
-	Commit           string    `json:"commit"`
-	VersionSource    string    `json:"version_source"`
-	Source           string    `json:"source"`
-	Allowed          bool      `json:"allowed"`
-	ReportedAt       time.Time `json:"reported_at"`
+	Path             string `json:"path"`
+	Kind             string `json:"kind"`
+	Version          string `json:"version"`
+	VersionOverride  string `json:"version_override"`
+	EffectiveVersion string `json:"effective_version"`
+	Build            string `json:"build"`
+	Commit           string `json:"commit"`
+	VersionSource    string `json:"version_source"`
+	Source           string `json:"source"`
+	Allowed          bool   `json:"allowed"`
+	// RPCProtocol is the RPC protocol version ("X.Y.Z") the agent probed:
+	// an rpc_server's own, a llama_server's from the rpc_server in its
+	// directory; "" when unknown, and always "" on a manual row.
+	RPCProtocol string    `json:"rpc_protocol"`
+	ReportedAt  time.Time `json:"reported_at"`
 	// Execution is "native" or "wsl", derived from Path. Distro is the WSL
 	// distro ("" for native); ExecPath is what a run spec's binary field
 	// takes: the Linux path for a WSL row, Path itself for a native one.
@@ -128,7 +133,8 @@ func serverBinaryDTO(b routing.ServerBinary) ServerBinaryDTO {
 		Execution: execution, Distro: distro, ExecPath: execPath,
 		Path: b.Path, Kind: b.Kind, Version: b.Version, VersionOverride: b.VersionOverride,
 		EffectiveVersion: b.EffectiveVersion(), Build: b.Build, Commit: b.Commit,
-		VersionSource: b.VersionSource, Source: b.Source, Allowed: b.Allowed, ReportedAt: b.ReportedAt,
+		VersionSource: b.VersionSource, Source: b.Source, Allowed: b.Allowed, RPCProtocol: b.RPCProtocol,
+		ReportedAt: b.ReportedAt,
 	}
 }
 
@@ -364,8 +370,9 @@ func (s *Service) BinaryVersionFor(ctx context.Context, serverID, binaryPath str
 
 var (
 	// versionBuildCommitRE reads "(build 1, commit 2bc46ba)" out of a
-	// version string, the form llama-server --version prints.
-	versionBuildCommitRE = regexp.MustCompile(`(?i)build\s+(\d+)\s*,\s*commit\s+([0-9a-f]{7,40})`)
+	// version string, the form llama-server --version prints; a source
+	// tarball build prints "commit unknown".
+	versionBuildCommitRE = regexp.MustCompile(`(?i)build\s+(\d+)\s*,\s*commit\s+([0-9a-f]{7,40}|unknown)`)
 	versionTagRE         = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])b(\d+)(?:$|[^0-9a-z])`)
 	versionHexRE         = regexp.MustCompile(`(?i)(?:^|[^0-9a-z])([0-9a-f]{7,40})(?:$|[^0-9a-z])`)
 	hasHexLetterRE       = regexp.MustCompile(`(?i)[a-f]`)
@@ -379,27 +386,42 @@ var (
 // binaryIdentity is what matching compares: the commit and the build, taken
 // from the row's own fields or, when the operator overrode the version, read
 // out of the override text (the detected fields describe the wrong build
-// then).
+// then). A build without git metadata (a source tarball) prints "build 0,
+// commit unknown": both count as absent, from the fields and from an
+// override alike, so two such builds never look identical.
 func binaryIdentity(b routing.ServerBinary) (commit, build string) {
 	if b.VersionOverride == "" {
-		return strings.ToLower(strings.TrimSpace(b.Commit)), normalizeBuild(b.Build)
+		return normalizeCommit(b.Commit), normalizeBuild(b.Build)
 	}
 	v := b.VersionOverride
 	if m := versionBuildCommitRE.FindStringSubmatch(v); m != nil {
-		return strings.ToLower(m[2]), normalizeBuild(m[1])
+		return normalizeCommit(m[2]), normalizeBuild(m[1])
 	}
 	if m := versionTagRE.FindStringSubmatch(v); m != nil {
 		build = normalizeBuild(m[1])
 	}
 	if m := versionHexRE.FindStringSubmatch(v); m != nil && hasHexLetterRE.MatchString(m[1]) {
-		commit = strings.ToLower(m[1])
+		commit = normalizeCommit(m[1])
 	}
 	return commit, build
 }
 
+// normalizeCommit lowercases a commit; "unknown" is no commit.
+func normalizeCommit(c string) string {
+	c = strings.ToLower(strings.TrimSpace(c))
+	if c == "unknown" {
+		return ""
+	}
+	return c
+}
+
+// normalizeBuild strips a build's "b" prefix; build 0 is no build.
 func normalizeBuild(b string) string {
-	b = strings.ToLower(strings.TrimSpace(b))
-	return strings.TrimPrefix(b, "b")
+	b = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(b)), "b")
+	if strings.TrimLeft(b, "0") == "" {
+		return ""
+	}
+	return b
 }
 
 // commitsMatch is case-insensitive equality, also accepting a prefix match
@@ -415,45 +437,202 @@ func commitsMatch(a, b string) bool {
 	return len(short) >= 7 && strings.HasPrefix(long, short)
 }
 
-// binariesSameVersion reports whether two binaries are the same build: commit
-// equality when both have a commit, else build equality when both have a
-// build, else unknown (false).
-func binariesSameVersion(a, b routing.ServerBinary) bool {
-	ac, ab := binaryIdentity(a)
-	bc, bb := binaryIdentity(b)
-	if ac != "" && bc != "" {
-		return commitsMatch(ac, bc)
+// rpcCompat is how a head's llama-server and a member's ggml-rpc-server
+// relate (rpcCompatibility).
+type rpcCompat int
+
+const (
+	// rpcCompatUnknown: nothing comparable on the two binaries.
+	rpcCompatUnknown rpcCompat = iota
+	// rpcCompatIdentical: the same build (commit, else build number).
+	rpcCompatIdentical
+	// rpcCompatProtocol: another build speaking the same RPC protocol.
+	rpcCompatProtocol
+	// rpcMismatchProtocol: both report an RPC protocol, and they differ.
+	rpcMismatchProtocol
+	// rpcMismatchBuild: no protocol on one side, and the known,
+	// comparable build identities differ.
+	rpcMismatchBuild
+)
+
+// compatible reports a pair the head can drive: identical or the same
+// protocol.
+func (c rpcCompat) compatible() bool { return c == rpcCompatIdentical || c == rpcCompatProtocol }
+
+// mismatch reports a pair known not to talk to each other.
+func (c rpcCompat) mismatch() bool { return c == rpcMismatchProtocol || c == rpcMismatchBuild }
+
+// rpcProtocolOf is b's RPC protocol when well-formed, else "".
+func rpcProtocolOf(b routing.ServerBinary) string {
+	if routing.ValidRPCProtocol(b.RPCProtocol) {
+		return b.RPCProtocol
 	}
-	if ab != "" && bb != "" {
-		return ab == bb
-	}
-	return false
+	return ""
 }
 
-// MatchingRPCBinary returns the rpc_server binary on serverID whose version
-// equals head's (commit, else build); with several matches the first by path.
+// rpcCompatibility relates head (a llama_server) and member (an
+// rpc_server). When both report an RPC protocol it decides: equal (all of
+// X.Y.Z -- llama.cpp checks only major and minor, but a patch bump has
+// shifted the op numbers) is compatible, identical when the build identity
+// matches too; different is a protocol mismatch. Otherwise the build
+// identity decides: commit equality when both have a commit, else build
+// equality when both have a build -- identical when equal, a build mismatch
+// when not -- else unknown. The protocol is the binary's own (probed from
+// the rpc-server), so a version override does not touch it.
+func rpcCompatibility(head, member routing.ServerBinary) rpcCompat {
+	identity := buildIdentityCompat(head, member)
+	hp, mp := rpcProtocolOf(head), rpcProtocolOf(member)
+	switch {
+	case hp == "" || mp == "":
+		return identity
+	case hp != mp:
+		return rpcMismatchProtocol
+	case identity == rpcCompatIdentical:
+		return rpcCompatIdentical
+	}
+	return rpcCompatProtocol
+}
+
+// buildIdentityCompat compares the build identities alone: identical,
+// build mismatch, or unknown when the two carry no identity of the same
+// kind.
+func buildIdentityCompat(a, b routing.ServerBinary) rpcCompat {
+	ac, ab := binaryIdentity(a)
+	bc, bb := binaryIdentity(b)
+	var same bool
+	switch {
+	case ac != "" && bc != "":
+		same = commitsMatch(ac, bc)
+	case ab != "" && bb != "":
+		same = ab == bb
+	default:
+		return rpcCompatUnknown
+	}
+	if same {
+		return rpcCompatIdentical
+	}
+	return rpcMismatchBuild
+}
+
+// The incompatible_reason values of an automatic cluster candidate.
+const (
+	rpcRejectNoBinary           = "no_rpc_binary"
+	rpcRejectProtocolMismatch   = "protocol_mismatch"
+	rpcRejectBuildMismatch      = "build_mismatch"
+	rpcRejectVersionUnknown     = "version_unknown"
+	rpcRejectHeadVersionUnknown = "head_version_unknown"
+)
+
+// rpcMemberScan is what one read of a server's inventory says about its
+// ggml-rpc-servers against a head binary: the best compatible row, else why
+// there is none.
+type rpcMemberScan struct {
+	match          routing.ServerBinary
+	matched        bool
+	reason         string
+	memberProtocol string
+}
+
+// scanRPCBinaries reads serverID's eligible rpc_server rows against head.
 // Agent-reported rows the agent does not allow are skipped (they would fail
 // to start); manual rows carry no allowlist status and stay eligible. A
-// wsl:// row is never a match: an automatic member runs natively, and a WSL
-// binary cannot serve as a cluster member. ok is
-// false when the server has none, or the versions are unknown.
-func (s *Service) MatchingRPCBinary(ctx context.Context, serverID string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
-	rows, err := s.routes.ServerBinaries(ctx, serverID) // ordered by path
+// wsl:// row is never eligible: an automatic member runs natively, and a WSL
+// binary cannot serve as a cluster member. Among compatible rows an
+// identical build wins over a protocol match, then the first by path.
+// Without one the reason is, in this order: no eligible row, a protocol
+// mismatch (naming the first mismatching row's protocol by path), a build
+// mismatch, else unknown versions; a head without any version is
+// head_version_unknown before the inventory is read.
+func (s *Service) scanRPCBinaries(ctx context.Context, serverID string, head routing.ServerBinary) (rpcMemberScan, error) {
+	if !binaryVersionKnown(head) {
+		return rpcMemberScan{reason: rpcRejectHeadVersionUnknown}, nil
+	}
+	rows, err := s.routes.ServerBinaries(ctx, serverID)
 	if err != nil {
-		return routing.ServerBinary{}, false, err
+		return rpcMemberScan{}, err
 	}
-	var best routing.ServerBinary
-	found := false
+	slices.SortFunc(rows, func(a, b routing.ServerBinary) int { return strings.Compare(a.Path, b.Path) })
+	var t rpcScanTally
 	for _, b := range rows {
-		if b.Kind != BinaryKindRPCServer || !binariesSameVersion(head, b) || isWSLBinaryPath(b.Path) {
-			continue
-		}
-		if b.Source == routing.BinarySourceAgent && !b.Allowed {
-			continue
-		}
-		if !found || b.Path < best.Path {
-			best, found = b, true
-		}
+		t.add(head, b)
 	}
-	return best, found, nil
+	return t.result(), nil
+}
+
+// rpcScanTally accumulates the rows of one scanRPCBinaries pass: the best
+// compatible row so far and the evidence for the reason if none is found.
+// It is split out so the per-row decision and the final verdict are each
+// small enough to read on their own.
+type rpcScanTally struct {
+	out              rpcMemberScan
+	best             rpcCompat
+	eligible         bool
+	protocolMismatch bool
+	buildMismatch    bool
+}
+
+// rpcMemberEligible reports whether b may serve as an automatic cluster
+// member: an rpc_server row, not under wsl://, and -- for agent-reported
+// rows -- allowed by the agent. Manual rows carry no allowlist status.
+func rpcMemberEligible(b routing.ServerBinary) bool {
+	if b.Kind != BinaryKindRPCServer || isWSLBinaryPath(b.Path) {
+		return false
+	}
+	return b.Source != routing.BinarySourceAgent || b.Allowed
+}
+
+// add folds one row (in path order) into the tally against head.
+func (t *rpcScanTally) add(head, b routing.ServerBinary) {
+	if !rpcMemberEligible(b) {
+		return
+	}
+	t.eligible = true
+	switch c := rpcCompatibility(head, b); {
+	case c.compatible():
+		t.keepIfBetter(b, c)
+	case c == rpcMismatchProtocol:
+		if !t.protocolMismatch {
+			t.out.memberProtocol = rpcProtocolOf(b)
+		}
+		t.protocolMismatch = true
+	case c == rpcMismatchBuild:
+		t.buildMismatch = true
+	}
+}
+
+// keepIfBetter records b as the match when there is none yet, or when it is
+// an identical build and the current match is not (identical beats a mere
+// protocol match; among equals the first by path stays).
+func (t *rpcScanTally) keepIfBetter(b routing.ServerBinary, c rpcCompat) {
+	if !t.out.matched || (c == rpcCompatIdentical && t.best != rpcCompatIdentical) {
+		t.out.match, t.out.matched, t.best = b, true, c
+	}
+}
+
+// result is the scan: the match, else the reason in the documented order.
+func (t *rpcScanTally) result() rpcMemberScan {
+	out := t.out
+	switch {
+	case out.matched:
+		out.memberProtocol = ""
+	case !t.eligible:
+		out.reason = rpcRejectNoBinary
+	case t.protocolMismatch:
+		out.reason = rpcRejectProtocolMismatch
+	case t.buildMismatch:
+		out.reason = rpcRejectBuildMismatch
+	default:
+		out.reason = rpcRejectVersionUnknown
+	}
+	return out
+}
+
+// MatchingRPCBinary returns the rpc_server binary on serverID that head's
+// llama-server can drive (rpcCompatibility): an identical build before one
+// of the same RPC protocol, then the first by path, among the eligible rows
+// (scanRPCBinaries). ok is false when the server has none, or the versions
+// are unknown.
+func (s *Service) MatchingRPCBinary(ctx context.Context, serverID string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
+	scan, err := s.scanRPCBinaries(ctx, serverID, head)
+	return scan.match, scan.matched, err
 }

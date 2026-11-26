@@ -21,6 +21,7 @@ const (
 	maxBinaryFieldBytes   = 256
 	binaryVersionSrcAgent = "agent"
 	binaryVersionSrcPath  = "path"
+	binaryWSLScheme       = "wsl://"
 )
 
 // agentBinarySample is one entry of the telemetry sample's binaries field,
@@ -33,11 +34,15 @@ type agentBinarySample struct {
 	Commit        string `json:"commit"`
 	VersionSource string `json:"version_source"`
 	Allowed       bool   `json:"allowed"`
+	// RPCProtocol is the protocol version "X.Y.Z" the agent probed from an
+	// rpc_server binary; absent when it did not or could not.
+	RPCProtocol string `json:"rpc_protocol"`
 }
 
 // sanitizeBinarySamples turns the reported entries into inventory rows:
 // entries without a plausible path are dropped, an unknown kind becomes
 // "other", an unknown version source becomes "", text fields are clamped,
+// a malformed RPC protocol becomes "" (see routing.ValidRPCProtocol),
 // duplicate paths keep the first entry and the list is capped.
 func sanitizeBinarySamples(in []agentBinarySample, serverID string, now time.Time) []routing.ServerBinary {
 	out := make([]routing.ServerBinary, 0, min(len(in), maxBinariesPerSample))
@@ -63,10 +68,14 @@ func sanitizeBinarySamples(in []agentBinarySample, serverID string, now time.Tim
 		if src != binaryVersionSrcAgent && src != binaryVersionSrcPath {
 			src = ""
 		}
+		protocol := b.RPCProtocol
+		if !routing.ValidRPCProtocol(protocol) {
+			protocol = ""
+		}
 		out = append(out, routing.ServerBinary{
 			ServerID: serverID, Path: b.Path, Kind: kind,
 			Version: clampBinaryField(b.Version), Build: clampBinaryField(b.Build), Commit: clampBinaryField(b.Commit),
-			VersionSource: src, Allowed: b.Allowed, ReportedAt: now,
+			VersionSource: src, Allowed: b.Allowed, RPCProtocol: protocol, ReportedAt: now,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
@@ -134,7 +143,7 @@ func binaryInventoryChanged(stored, rows []routing.ServerBinary) bool {
 		written++
 		b, ok := agent[r.Path]
 		if !ok || b.Kind != r.Kind || b.Version != r.Version || b.Build != r.Build || b.Commit != r.Commit ||
-			b.VersionSource != r.VersionSource || b.Allowed != r.Allowed {
+			b.VersionSource != r.VersionSource || b.Allowed != r.Allowed || b.RPCProtocol != r.RPCProtocol {
 			return true
 		}
 	}
@@ -160,6 +169,17 @@ func binaryInventoryChanged(stored, rows []routing.ServerBinary) bool {
 // keeps the sibling's last identity for as long as the agent reports the
 // path. The cluster start's own version and banner checks still catch a
 // mismatch.
+//
+// The RPC protocol follows the same idea on its own (keepKnownRPCProtocols,
+// after the identity above is settled): a re-report of an rpc_server row that
+// carries no protocol (the agent's protocol probe failed or timed out) keeps
+// the protocol the row had while its version, build and commit equal the
+// stored row's, so the portal's protocol matching does not flap to "unknown"
+// and back; a binary replaced at the path whose --version probe failed too
+// keeps the replaced binary's identity and so its protocol, as above. A
+// report that carries one replaces it. A llama_server row never
+// keeps its own; it takes the protocol of its directory's rpc_server rows
+// (deriveLlamaServerProtocols).
 func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
 	known := make(map[string]routing.ServerBinary, len(stored))
 	for _, b := range stored {
@@ -178,4 +198,93 @@ func keepKnownBinaryVersions(rows, stored []routing.ServerBinary) {
 			r.Version, r.Build, r.Commit, r.VersionSource = b.Version, b.Build, b.Commit, b.VersionSource
 		}
 	}
+	keepKnownRPCProtocols(rows, stored)
+	deriveLlamaServerProtocols(rows)
+}
+
+// keepKnownRPCProtocols carries the stored RPC protocol of an agent
+// rpc_server row over to a re-report of the same path that has none, as
+// long as the re-report (with the identity keepKnownBinaryVersions kept)
+// carries the stored row's version, build and commit. Another identity is
+// another binary at that path -- replaced, its first protocol probe failed --
+// whose protocol is unknown until a probe succeeds; keeping the replaced
+// binary's would match clusters on a protocol the file may not speak.
+func keepKnownRPCProtocols(rows, stored []routing.ServerBinary) {
+	known := make(map[string]routing.ServerBinary, len(stored))
+	for _, b := range stored {
+		if b.Source == routing.BinarySourceAgent && b.Kind == portal.BinaryKindRPCServer && b.RPCProtocol != "" {
+			known[b.Path] = b
+		}
+	}
+	for i := range rows {
+		r := &rows[i]
+		if r.Kind != portal.BinaryKindRPCServer || r.RPCProtocol != "" {
+			continue
+		}
+		if b, ok := known[r.Path]; ok && r.Version == b.Version && r.Build == b.Build && r.Commit == b.Commit {
+			r.RPCProtocol = b.RPCProtocol
+		}
+	}
+}
+
+// deriveLlamaServerProtocols gives every protocol-less llama_server row the
+// protocol of the rpc_server rows in its directory (binarySiblingDirKey) --
+// the agent's pairing, redone on the rows as written so that a kept
+// rpc_server protocol reaches its llama-server too. Without it a restart
+// whose rpc-server probe fails would leave the rpc_server row its protocol
+// but strip the llama_server row's, withholding exactly the protocol-only
+// clusters (head and member of different builds) until the probe succeeds.
+// The rpc_server rows of the directory must agree; rows of different
+// protocols, or none carrying one, leave the llama_server without one.
+func deriveLlamaServerProtocols(rows []routing.ServerBinary) {
+	protoByDir, disagree := rpcProtocolsByDir(rows)
+	for i := range rows {
+		r := &rows[i]
+		if r.Kind != portal.BinaryKindLlamaServer || r.RPCProtocol != "" {
+			continue
+		}
+		if dir := binarySiblingDirKey(r.Path); dir != "" && !disagree[dir] {
+			r.RPCProtocol = protoByDir[dir]
+		}
+	}
+}
+
+// rpcProtocolsByDir collects the RPC protocol of the rpc_server rows per
+// directory (binarySiblingDirKey) and which directories hold rpc_server rows
+// of differing protocols. It is split out of deriveLlamaServerProtocols so
+// the survey of the rpc_server side and the assignment to llama_server rows
+// stay two readable steps.
+func rpcProtocolsByDir(rows []routing.ServerBinary) (protoByDir map[string]string, disagree map[string]bool) {
+	protoByDir = map[string]string{}
+	disagree = map[string]bool{}
+	for _, r := range rows {
+		if r.Kind != portal.BinaryKindRPCServer || r.RPCProtocol == "" {
+			continue
+		}
+		dir := binarySiblingDirKey(r.Path)
+		if dir == "" {
+			continue
+		}
+		if p, seen := protoByDir[dir]; seen && p != r.RPCProtocol {
+			disagree[dir] = true
+		}
+		protoByDir[dir] = r.RPCProtocol
+	}
+	return protoByDir, disagree
+}
+
+// binarySiblingDirKey is the directory a reported path sits in, the key the
+// agent pairs binaries by: everything before the last "/" or "\" (the
+// agent reports Windows paths with either), a wsl://<distro> prefix included
+// so two distros never pair. "" for a path without a directory.
+func binarySiblingDirKey(p string) string {
+	prefix, rest := "", p
+	if strings.HasPrefix(p, binaryWSLScheme) {
+		prefix, rest = binaryWSLScheme, p[len(binaryWSLScheme):]
+	}
+	i := strings.LastIndexAny(rest, "/\\")
+	if i < 0 {
+		return ""
+	}
+	return prefix + rest[:i]
 }

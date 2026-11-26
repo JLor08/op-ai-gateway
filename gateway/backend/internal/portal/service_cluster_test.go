@@ -1901,3 +1901,202 @@ func TestSetServerNetbirdRefusalNotifiesNobody(t *testing.T) {
 		t.Fatalf("notified = %v for a refused link", got)
 	}
 }
+
+// agentBinaries replaces serverID's agent-reported inventory with rows
+// (Allowed, as the agent reports them), dropping the manual rpc-server
+// f.member adds when dropManualRPC is set.
+func (f *clusterFixture) agentBinaries(serverID string, dropManualRPC bool, rows ...routing.ServerBinary) {
+	f.t.Helper()
+	if dropManualRPC {
+		if err := f.routes.DeleteManualServerBinary(f.ctx, serverID, clusterRPCBinary); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	for i := range rows {
+		rows[i].Allowed = true
+	}
+	if err := f.routes.ReplaceAgentServerBinaries(f.ctx, serverID, rows); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+const protoHeadBinary = "/opt/llama-p/llama-server"
+
+// A rejected automatic candidate stays listed, not compatible, with the
+// reason; a match names its binary's protocol, and the list the head's.
+func TestClusterCandidatesExplainRejection(t *testing.T) {
+	f := newClusterFixture(t)
+	f.mustPut(PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Args: []string{"-m", "/m.gguf"}})
+	f.agentBinaries(f.head.ID, false, routing.ServerBinary{Path: protoHeadBinary, Kind: BinaryKindLlamaServer, Commit: "abcdef1", Build: "7000", RPCProtocol: "10.0.2"})
+	match := f.member("Match")
+	f.agentBinaries(match.ID, true, routing.ServerBinary{Path: "/opt/src/ggml-rpc-server", Kind: BinaryKindRPCServer, Commit: "unknown", Build: "0", RPCProtocol: "10.0.2"})
+	proto := f.member("Proto")
+	f.agentBinaries(proto.ID, true, routing.ServerBinary{Path: "/opt/old/ggml-rpc-server", Kind: BinaryKindRPCServer, Commit: "abcdef1", RPCProtocol: "10.0.1"})
+	none := f.member("None")
+	f.agentBinaries(none.ID, true)
+	build := f.member("Build") // manual row, clusterCommit, no protocol
+	unknown := f.member("Unknown")
+	f.agentBinaries(unknown.ID, true, routing.ServerBinary{Path: "/opt/x/ggml-rpc-server", Kind: BinaryKindRPCServer, Commit: "unknown", Build: "0"})
+
+	list, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", protoHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !list.HeadBinaryKnown || list.HeadRPCProtocol != "10.0.2" {
+		t.Fatalf("head known %v, protocol %q", list.HeadBinaryKnown, list.HeadRPCProtocol)
+	}
+	byID := map[string]ClusterCandidateDTO{}
+	for _, c := range list.Candidates {
+		byID[c.ServerID] = c
+	}
+	if c := byID[match.ID]; !c.Compatible || c.RPCBinary != "/opt/src/ggml-rpc-server" || c.RPCBinaryProtocol != "10.0.2" || c.IncompatibleReason != "" {
+		t.Errorf("match = %+v", c)
+	}
+	for id, want := range map[string][2]string{
+		proto.ID:   {"protocol_mismatch", "10.0.1"},
+		none.ID:    {"no_rpc_binary", ""},
+		build.ID:   {"build_mismatch", ""},
+		unknown.ID: {"version_unknown", ""},
+	} {
+		c, ok := byID[id]
+		if !ok || c.Compatible || c.RPCBinary != "" || c.IncompatibleReason != want[0] || c.MemberRPCProtocol != want[1] {
+			t.Errorf("candidate %s = %+v (listed %v), want reason %q protocol %q", id, c, ok, want[0], want[1])
+		}
+	}
+
+	// The save agrees: the protocol mismatch is refused, the match accepted.
+	req := clusterHeadRequest(autoMember(proto.ID))
+	req.Binary = protoHeadBinary
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrClusterMemberNoMatchingBinary) || !strings.Contains(err.Error(), "10.0.2") {
+		t.Fatalf("save with Proto = %v, want %v naming the head's protocol", err, ErrClusterMemberNoMatchingBinary)
+	}
+	req.ClusterMembers = []ClusterMemberDTO{autoMember(match.ID)}
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatalf("save with Match = %v", err)
+	}
+
+	// An unknown head version is the reason of every automatic candidate.
+	headless, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", "/somewhere/llama-server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headless.HeadBinaryKnown || headless.HeadRPCProtocol != "" || len(headless.Candidates) != 5 {
+		t.Fatalf("unknown head = %+v", headless)
+	}
+	for _, c := range headless.Candidates {
+		if c.Compatible || c.IncompatibleReason != "head_version_unknown" {
+			t.Errorf("unknown head: candidate = %+v", c)
+		}
+	}
+}
+
+// A head binary with a probed protocol but no build identity (a source
+// tarball build) is known: automatic members match it on the protocol.
+func TestClusterCandidatesHeadKnownByProtocolOnly(t *testing.T) {
+	f := newClusterFixture(t)
+	f.agentBinaries(f.head.ID, false, routing.ServerBinary{Path: protoHeadBinary, Kind: BinaryKindLlamaServer, Version: "version: 1.1.0-dev (build 0, commit unknown)", Commit: "unknown", Build: "0", RPCProtocol: "10.0.2"})
+	member := f.member("Git")
+	f.agentBinaries(member.ID, true, routing.ServerBinary{Path: "/opt/git/ggml-rpc-server", Kind: BinaryKindRPCServer, Commit: "abcdef1", Build: "7000", RPCProtocol: "10.0.2"})
+	list, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", protoHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !list.HeadBinaryKnown || list.HeadRPCProtocol != "10.0.2" || len(list.Candidates) != 1 || !list.Candidates[0].Compatible || list.Candidates[0].RPCBinaryProtocol != "10.0.2" {
+		t.Fatalf("list = %+v", list)
+	}
+	req := clusterHeadRequest(autoMember(member.ID))
+	req.Binary = protoHeadBinary
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatalf("save = %v, want success", err)
+	}
+}
+
+// A manual member whose binary speaks another protocol is flagged and
+// refused naming both protocols; one of the same protocol and another
+// commit is accepted without the version-unknown warning.
+func TestClusterVersionMismatchNamesProtocols(t *testing.T) {
+	f := newClusterFixture(t)
+	f.mustPut(PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Args: []string{"-m", "/m.gguf"}})
+	f.agentBinaries(f.head.ID, false, routing.ServerBinary{Path: protoHeadBinary, Kind: BinaryKindLlamaServer, Commit: "abcdef1", RPCProtocol: "10.0.2"})
+	srv := f.member("Manual")
+	const oldRPC, newRPC = "/opt/old/ggml-rpc-server", "/opt/new/ggml-rpc-server"
+	f.agentBinaries(srv.ID, false,
+		routing.ServerBinary{Path: oldRPC, Kind: BinaryKindRPCServer, Commit: "abcdef1", RPCProtocol: "10.0.1"},
+		routing.ServerBinary{Path: newRPC, Kind: BinaryKindRPCServer, Commit: "9999fff", RPCProtocol: "10.0.2"})
+	bad, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), srv.ID, "", PutRPCMemberSpecRequest{Binary: oldRPC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), srv.ID, "", PutRPCMemberSpecRequest{Binary: newRPC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "manual", protoHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Candidates) != 1 || !slices.Equal(list.Candidates[0].IncompatibleMemberSpecs, []string{bad.ID}) {
+		t.Fatalf("manual candidates = %+v", list.Candidates)
+	}
+	req := clusterHeadRequest(ClusterMemberDTO{ServerID: srv.ID, MemberSpecID: bad.ID})
+	req.Binary, req.MemberMode = protoHeadBinary, "manual"
+	_, err = f.put(ownerToken(), req)
+	if !errors.Is(err, ErrClusterVersionMismatch) || !strings.Contains(err.Error(), "protocol 10.0.1") || !strings.Contains(err.Error(), "10.0.2") {
+		t.Fatalf("save with the old protocol = %v, want %v naming both protocols", err, ErrClusterVersionMismatch)
+	}
+	req.ClusterMembers = []ClusterMemberDTO{{ServerID: srv.ID, MemberSpecID: good.ID}}
+	dto, err := f.put(ownerToken(), req)
+	if err != nil {
+		t.Fatalf("save with the same protocol = %v", err)
+	}
+	if slices.Contains(dto.ClusterWarnings, ClusterWarnMemberVersionUnknown) {
+		t.Fatalf("warnings = %v: a protocol match is no unknown version", dto.ClusterWarnings)
+	}
+}
+
+// swappingBinaryRoutes hands out a server's inventory once as stored, then
+// swapped: the inventory changing between two reads of one candidate entry.
+type swappingBinaryRoutes struct {
+	routing.Store
+	serverID string
+	reads    int
+	swapped  []routing.ServerBinary
+}
+
+func (r *swappingBinaryRoutes) ServerBinaries(ctx context.Context, serverID string) ([]routing.ServerBinary, error) {
+	if serverID != r.serverID {
+		return r.Store.ServerBinaries(ctx, serverID)
+	}
+	r.reads++
+	if r.reads > 1 {
+		return r.swapped, nil
+	}
+	return r.Store.ServerBinaries(ctx, serverID)
+}
+
+// An automatic candidate is decided on one read of its server's inventory:
+// a report landing between a match attempt and the rejection must not yield
+// an entry that is neither compatible nor explained.
+func TestClusterCandidateReadsTheInventoryOnce(t *testing.T) {
+	f := newClusterFixture(t)
+	f.agentBinaries(f.head.ID, false, routing.ServerBinary{Path: protoHeadBinary, Kind: BinaryKindLlamaServer, Commit: "abcdef1", RPCProtocol: "10.0.2"})
+	m := f.member("M")
+	f.agentBinaries(m.ID, true, routing.ServerBinary{Path: "/opt/old/ggml-rpc-server", Kind: BinaryKindRPCServer, Commit: "abcdef1", RPCProtocol: "10.0.1"})
+	swap := &swappingBinaryRoutes{Store: f.svc.routes, serverID: m.ID, swapped: []routing.ServerBinary{
+		{ServerID: m.ID, Path: "/opt/new/ggml-rpc-server", Kind: BinaryKindRPCServer, Source: routing.BinarySourceAgent, Allowed: true, RPCProtocol: "10.0.2"},
+	}}
+	f.svc.routes = swap
+	list, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", protoHeadBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Candidates) != 1 {
+		t.Fatalf("candidates = %+v", list.Candidates)
+	}
+	if c := list.Candidates[0]; c.Compatible || c.IncompatibleReason != "protocol_mismatch" || c.MemberRPCProtocol != "10.0.1" {
+		t.Fatalf("candidate = %+v, want the first read's protocol mismatch", c)
+	}
+	if swap.reads != 1 {
+		t.Fatalf("inventory reads = %d, want 1", swap.reads)
+	}
+}

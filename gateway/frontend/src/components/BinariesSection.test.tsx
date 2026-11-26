@@ -61,6 +61,16 @@ function setup(rows: ServerBinary[], over: Record<string, unknown> = {}) {
 afterEach(cleanup);
 
 describe('BinariesSection', () => {
+  it('shows the RPC protocol of a binary, a dash when there is none', async () => {
+    setup([
+      bin({ path: '/opt/llama/ggml-rpc-server', kind: 'rpc_server', rpc_protocol: '10.0.2' }),
+      bin({ path: '/opt/llama/other-server', rpc_protocol: '' }),
+    ]);
+    expect(await screen.findByText(t.binariesRpcProtocol)).toBeTruthy();
+    expect(screen.getByText('10.0.2')).toBeTruthy();
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0);
+  });
+
   it('lists agent and manual rows with kind and effective version', async () => {
     setup([bin(), manual]);
     const row = (await screen.findByText('/opt/llama/llama-server')).closest('tr') as HTMLElement;

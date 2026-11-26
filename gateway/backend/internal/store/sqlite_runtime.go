@@ -598,7 +598,7 @@ func scanServerRuntimeReport(row rowScanner) (routing.ServerRuntimeReport, error
 // non-nil, empty when none.
 func (s *SQLiteStore) ServerBinaries(ctx context.Context, serverID string) ([]routing.ServerBinary, error) {
 	rows, err := s.query(ctx, `
-		select server_id, path, kind, version, version_override, build, "commit", version_source, source, allowed, reported_at
+		select server_id, path, kind, version, version_override, build, "commit", version_source, source, allowed, rpc_protocol, reported_at
 		from server_binaries where server_id = ? order by path`, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("list server binaries: %w", err)
@@ -609,7 +609,7 @@ func (s *SQLiteStore) ServerBinaries(ctx context.Context, serverID string) ([]ro
 		var b routing.ServerBinary
 		var allowed int64
 		if err := rows.Scan(&b.ServerID, &b.Path, &b.Kind, &b.Version, &b.VersionOverride, &b.Build, &b.Commit,
-			&b.VersionSource, &b.Source, &allowed, &b.ReportedAt); err != nil {
+			&b.VersionSource, &b.Source, &allowed, &b.RPCProtocol, &b.ReportedAt); err != nil {
 			return nil, fmt.Errorf("scan server binary: %w", err)
 		}
 		b.Allowed = allowed != 0
@@ -690,14 +690,14 @@ func (s *SQLiteStore) staleAgentBinaryPaths(ctx context.Context, tx *sql.Tx, ser
 func (s *SQLiteStore) upsertAgentBinaries(ctx context.Context, tx *sql.Tx, serverID string, rows []routing.ServerBinary) error {
 	for _, r := range rows {
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
-			insert into server_binaries (server_id, path, kind, version, build, "commit", version_source, source, allowed, reported_at)
-			values (?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?)
+			insert into server_binaries (server_id, path, kind, version, build, "commit", version_source, source, allowed, rpc_protocol, reported_at)
+			values (?, ?, ?, ?, ?, ?, ?, 'agent', ?, ?, ?)
 			on conflict(server_id, path) do update set
 				kind = excluded.kind, version = excluded.version, build = excluded.build,
 				"commit" = excluded."commit", version_source = excluded.version_source,
-				allowed = excluded.allowed, reported_at = excluded.reported_at
+				allowed = excluded.allowed, rpc_protocol = excluded.rpc_protocol, reported_at = excluded.reported_at
 			where server_binaries.source = 'agent'`),
-			sanitizeArgs([]any{serverID, r.Path, r.Kind, r.Version, r.Build, r.Commit, r.VersionSource, r.Allowed, r.ReportedAt})...); err != nil {
+			sanitizeArgs([]any{serverID, r.Path, r.Kind, r.Version, r.Build, r.Commit, r.VersionSource, r.Allowed, r.RPCProtocol, r.ReportedAt})...); err != nil {
 			return fmt.Errorf("upsert agent binary: %w", err)
 		}
 	}

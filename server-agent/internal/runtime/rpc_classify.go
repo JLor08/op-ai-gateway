@@ -131,9 +131,9 @@ type memberBanner struct {
 	Devices  []string
 }
 
-// memberBannerStart begins the line of an rpc-server's banner that carries its
+// RPCServerBannerStart begins the line of an rpc-server's banner that carries its
 // protocol version.
-const memberBannerStart = "Starting RPC server v"
+const RPCServerBannerStart = "Starting RPC server v"
 
 var memberDeviceLine = regexp.MustCompile(`^  ([A-Za-z0-9_]+): `)
 
@@ -148,8 +148,8 @@ func parseMemberBanner(lines []string) (memberBanner, bool) {
 	for _, line := range lines {
 		line = strings.TrimRight(line, "\r")
 		switch {
-		case strings.HasPrefix(line, memberBannerStart):
-			b = memberBanner{Protocol: strings.TrimSpace(strings.TrimPrefix(line, memberBannerStart))}
+		case strings.HasPrefix(line, RPCServerBannerStart):
+			b = memberBanner{Protocol: strings.TrimSpace(strings.TrimPrefix(line, RPCServerBannerStart))}
 			started, inDevices = true, false
 		case !started:
 		case strings.HasPrefix(line, "Devices:"):
@@ -192,7 +192,7 @@ func awaitMemberBanner(proc *runningProc, deadline time.Time) (memberBanner, boo
 		if b, ok := parseMemberBanner(strings.Split(tail, "\n")); ok {
 			return b, true
 		}
-		if !strings.Contains(tail, memberBannerStart) || !time.Now().Before(stop) {
+		if !strings.Contains(tail, RPCServerBannerStart) || !time.Now().Before(stop) {
 			return memberBanner{}, false
 		}
 		select {

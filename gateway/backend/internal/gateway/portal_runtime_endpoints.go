@@ -68,7 +68,8 @@ func (s *Server) handlePortalMappingRuntimeSpec(w http.ResponseWriter, r *http.R
 // handlePortalClusterCandidates serves GET
 // /api/portal/mappings/{mappingID}/runtime/cluster-candidates?mode=automatic|manual&binary=<path>:
 // the servers the cluster head on that mapping may add as members, as
-// {"data": [...], "head_binary_known": bool}. binary is the head binary the
+// {"data": [...], "head_binary_known": bool, "head_rpc_protocol": string}
+// (clusterCandidatesBody). binary is the head binary the
 // operator's form has (empty: the stored spec's). Authorization (the head's
 // mapping, each candidate server, member consent) happens inside
 // portal.Service.ClusterCandidates.
@@ -82,7 +83,18 @@ func (s *Server) handlePortalClusterCandidates(w http.ResponseWriter, r *http.Re
 		writePortalRuntimeSpecError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"data": list.Candidates, "head_binary_known": list.HeadBinaryKnown})
+	writeJSON(w, http.StatusOK, clusterCandidatesBody(list))
+}
+
+// clusterCandidatesBody is both cluster-candidates listings' answer:
+// {"data": [...], "head_binary_known": bool}, plus "head_rpc_protocol" when
+// the head binary's RPC protocol is known.
+func clusterCandidatesBody(list portal.ClusterCandidateList) map[string]any {
+	body := map[string]any{"data": list.Candidates, "head_binary_known": list.HeadBinaryKnown}
+	if list.HeadRPCProtocol != "" {
+		body["head_rpc_protocol"] = list.HeadRPCProtocol
+	}
+	return body
 }
 
 // handlePortalClusterMemberResetUsage serves POST
@@ -253,8 +265,8 @@ var portalClusterErrRows = []errRow{
 	{err: portal.ErrClusterMemberSpecTaken, status: http.StatusConflict, code: "runtime_spec.cluster_member_spec_taken", msgFn: clusterErrDetail(portal.ErrClusterMemberSpecTaken, "the member spec serves another cluster head")},
 	{err: portal.ErrClusterMemberSpecDisabled, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_spec_disabled", msgFn: clusterErrDetail(portal.ErrClusterMemberSpecDisabled, "the member spec is disabled")},
 	{err: portal.ErrClusterMemberRPCDisabled, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_rpc_disabled", msgFn: clusterErrDetail(portal.ErrClusterMemberRPCDisabled, "the server does not offer RPC membership in its runtime settings")},
-	{err: portal.ErrClusterMemberNoMatchingBinary, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_no_matching_binary", msgFn: clusterErrDetail(portal.ErrClusterMemberNoMatchingBinary, "the member server has no ggml-rpc-server of the head binary's version")},
-	{err: portal.ErrClusterVersionMismatch, status: http.StatusBadRequest, code: "runtime_spec.cluster_version_mismatch", msgFn: clusterErrDetail(portal.ErrClusterVersionMismatch, "the member binary's version differs from the head binary's")},
+	{err: portal.ErrClusterMemberNoMatchingBinary, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_no_matching_binary", msgFn: clusterErrDetail(portal.ErrClusterMemberNoMatchingBinary, "the member server has no ggml-rpc-server of the head binary's version or RPC protocol")},
+	{err: portal.ErrClusterVersionMismatch, status: http.StatusBadRequest, code: "runtime_spec.cluster_version_mismatch", msgFn: clusterErrDetail(portal.ErrClusterVersionMismatch, "the member binary's RPC protocol or version differs from the head binary's")},
 	{err: portal.ErrClusterMeshUnavailable, status: http.StatusBadRequest, code: "runtime_spec.cluster_mesh_unavailable", msgFn: clusterErrDetail(portal.ErrClusterMeshUnavailable, "a mesh cluster needs NetBird with a tracking group and a known mesh IP on the head and every member")},
 	{err: portal.ErrClusterLANAddressRequired, status: http.StatusBadRequest, code: "runtime_spec.cluster_lan_address_required", msgFn: clusterErrDetail(portal.ErrClusterLANAddressRequired, "a lan cluster needs a LAN address on every server: a manual lan_address, a reported LAN interface, or (without NetBird) its Domain")},
 	{err: portal.ErrClusterDirectUnavailable, status: http.StatusBadRequest, code: "runtime_spec.cluster_direct_unavailable", msg: "direct transport in a mesh cluster needs NetBird policy management with deny-by-default on and enforced, and the Default policy seen disabled; use relay"},

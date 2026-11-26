@@ -2412,9 +2412,9 @@ const de = {
   errorClusterMemberRpcDisabled:
     'Der Server bietet in seinen Runtime-Einstellungen keine RPC-Mitgliedschaft an.',
   errorClusterMemberNoMatchingBinary:
-    'Der Mitglieds-Server hat keinen ggml-rpc-server in der Version des Head-Binaries.',
+    'Der Mitglieds-Server hat keinen ggml-rpc-server mit dem RPC-Protokoll oder der Version des Head-Binaries.',
   errorClusterVersionMismatch:
-    'Die Version des Mitglieds-Binaries weicht von der des Head-Binaries ab.',
+    'RPC-Protokoll oder Version des Mitglieds-Binaries weichen von denen des Head-Binaries ab.',
   errorClusterMeshUnavailable:
     'Ein Mesh-Cluster braucht NetBird mit Tracking-Gruppe und bekannter Mesh-IP bei Head und allen Mitgliedern.',
   errorClusterLanAddressRequired:
@@ -2426,7 +2426,7 @@ const de = {
   errorClusterTensorSplitRequired:
     'Ein Head mit einem Mitglied auf einer GPU, deren VRAM der Agent nicht messen kann, braucht --tensor-split.',
   errorClusterHeadBinaryVersionUnknown:
-    'Die Version des Head-Binaries ist unbekannt. Im Tab „Binaries“ seine Version eintragen.',
+    'Version und RPC-Protokoll des Head-Binaries sind unbekannt. Im Tab „Binaries“ seine Version eintragen.',
   errorClusterPortExhausted:
     'Auf dem Mitglieds-Server ist im RPC-Portbereich 26000-26999 kein Port mehr frei.',
   errorClusterFlagEqualsForm:
@@ -2630,6 +2630,7 @@ const de = {
   binariesDeleteTitle: 'Binary entfernen?',
   binariesDeleteConfirm: 'Entfernen',
   binariesVersionUnknown: 'Version unbekannt',
+  binariesRpcProtocol: 'RPC-Protokoll',
   binariesNotAllowed: 'Vom Agent nicht erlaubt',
   binariesSaved: 'Binary gespeichert.',
   binariesDeleted: 'Binary entfernt.',
@@ -2816,16 +2817,24 @@ const de = {
   clusterMemberSpecPick: 'Dieser Server hat mehrere freie Mitglieds-Spezifikationen; eine wählen.',
   clusterMemberAddConfirm: 'Hinzufügen',
   clusterCandidatesEmptyAutomatic:
-    'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server in der Version des Head-Binaries, dessen Version bekannt sein muss.',
+    'Kein Server steht zur Wahl. Er braucht die RPC-Mitgliedschaft in seinen Runtime-Einstellungen (Reiter „RPC“) und einen ggml-rpc-server mit dem RPC-Protokoll oder der Version des Head-Binaries; eines von beiden muss bekannt sein.',
   clusterCandidatesEmptyManual:
     'Kein Server steht zur Wahl. Er braucht eine freie, aktivierte Mitglieds-Spezifikation (Reiter „RPC“), die diesen Head zulässt.',
   clusterCandidatesFailed: 'Die möglichen Mitglieds-Server konnten nicht geladen werden.',
+  clusterCandidateRejected: 'nicht wählbar',
+  clusterRejectProtocolMismatch: (member: string, head: string) =>
+    `Protokoll ${member} statt ${head}`,
+  clusterRejectBuildMismatch:
+    'Der Build des ggml-rpc-server weicht vom Head-Binary ab (kein Protokoll bekannt).',
+  clusterRejectVersionUnknown:
+    'Die Versionen lassen sich nicht vergleichen (kein Protokoll, kein vergleichbarer Build).',
+  clusterRejectNoRpcBinary: 'Kein nutzbarer nativer ggml-rpc-server.',
   clusterMemberNoMatchingRpcBinary:
-    'Dieser Server hat keinen ggml-rpc-server in der Version des Head-Binaries; so lässt sich der Head nicht speichern.',
+    'Dieser Server hat keinen ggml-rpc-server mit dem RPC-Protokoll oder der Version des Head-Binaries; so lässt sich der Head nicht speichern.',
   clusterMemberNotOffered:
     'Dieser Server bietet diesem Head keine RPC-Mitgliedschaft an (Reiter „RPC“ des Servers); so lässt sich der Head nicht speichern.',
   clusterMemberVersionMismatch:
-    'Das Binary dieser Mitglieds-Spezifikation hat eine andere Version als das Head-Binary; so lässt sich der Head nicht speichern.',
+    'Das Binary dieser Mitglieds-Spezifikation hat ein anderes RPC-Protokoll oder eine andere Version als das Head-Binary; so lässt sich der Head nicht speichern.',
   clusterMemberSpecNotOffered:
     'Diese Mitglieds-Spezifikation steht dem Head nicht mehr zur Verfügung (deaktiviert, Zustimmung entzogen oder von einem anderen Head belegt); so lässt sich der Head nicht speichern.',
   clusterMemberRemove: 'Mitglied entfernen',
@@ -6555,8 +6564,9 @@ const en: PortalMessages = {
   errorClusterMemberRpcDisabled:
     'The server does not offer RPC membership in its runtime settings.',
   errorClusterMemberNoMatchingBinary:
-    "The member server has no ggml-rpc-server of the head binary's version.",
-  errorClusterVersionMismatch: "The member binary's version differs from the head binary's.",
+    "The member server has no ggml-rpc-server of the head binary's RPC protocol or version.",
+  errorClusterVersionMismatch:
+    "The member binary's RPC protocol or version differs from the head binary's.",
   errorClusterMeshUnavailable:
     'A mesh cluster needs NetBird with a tracking group and a known mesh IP on the head and every member.',
   errorClusterLanAddressRequired:
@@ -6567,7 +6577,7 @@ const en: PortalMessages = {
   errorClusterTensorSplitRequired:
     'A head with a member on a GPU whose VRAM the agent cannot measure needs --tensor-split.',
   errorClusterHeadBinaryVersionUnknown:
-    "The head binary's version is unknown. Set this binary's version in the Binaries tab.",
+    "The head binary's version and RPC protocol are unknown. Set this binary's version in the Binaries tab.",
   errorClusterPortExhausted:
     'The member server has no free port left in the RPC range 26000-26999.',
   errorClusterFlagEqualsForm:
@@ -6768,6 +6778,7 @@ const en: PortalMessages = {
   binariesDeleteTitle: 'Remove binary?',
   binariesDeleteConfirm: 'Remove',
   binariesVersionUnknown: 'Version unknown',
+  binariesRpcProtocol: 'RPC protocol',
   binariesNotAllowed: 'Not allowed by the agent',
   binariesSaved: 'Binary saved.',
   binariesDeleted: 'Binary removed.',
@@ -6950,16 +6961,24 @@ const en: PortalMessages = {
   clusterMemberSpecPick: 'This server has several free member specs; pick one.',
   clusterMemberAddConfirm: 'Add',
   clusterCandidatesEmptyAutomatic:
-    'No server is available. It needs RPC membership in its runtime settings ("RPC" tab) and a ggml-rpc-server of the head binary\'s version, which must be known.',
+    'No server is available. It needs RPC membership in its runtime settings ("RPC" tab) and a ggml-rpc-server of the head binary\'s RPC protocol or version, one of which must be known.',
   clusterCandidatesEmptyManual:
     'No server is available. It needs a free, enabled member spec ("RPC" tab) that admits this head.',
   clusterCandidatesFailed: 'The possible member servers could not be loaded.',
+  clusterCandidateRejected: 'not selectable',
+  clusterRejectProtocolMismatch: (member: string, head: string) =>
+    `protocol ${member} vs head ${head}`,
+  clusterRejectBuildMismatch:
+    'The ggml-rpc-server build differs from the head binary (no protocol known).',
+  clusterRejectVersionUnknown:
+    'The versions cannot be compared (no protocol, no comparable build).',
+  clusterRejectNoRpcBinary: 'No usable native ggml-rpc-server.',
   clusterMemberNoMatchingRpcBinary:
-    "This server has no ggml-rpc-server of the head binary's version; the head cannot be saved like this.",
+    "This server has no ggml-rpc-server of the head binary's RPC protocol or version; the head cannot be saved like this.",
   clusterMemberNotOffered:
     'This server does not offer RPC membership to this head (the server\'s "RPC" tab); the head cannot be saved like this.',
   clusterMemberVersionMismatch:
-    "This member spec's binary is a different version than the head binary; the head cannot be saved like this.",
+    "This member spec's binary speaks another RPC protocol or is another version than the head binary; the head cannot be saved like this.",
   clusterMemberSpecNotOffered:
     'This member spec is no longer available to the head (disabled, its consent withdrawn, or taken by another head); the head cannot be saved like this.',
   clusterMemberRemove: 'Remove member',

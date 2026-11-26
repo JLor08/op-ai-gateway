@@ -494,7 +494,16 @@ import (
 // sends none, so nothing is negotiated and no agent.Features entry is added.
 // This is the ONE bump for the whole branch; later commits on it do not bump
 // again.
-const Version = "0.25.1"
+//
+// 0.25.1 -> 0.25.2 is the single bump for the RPC protocol probe. PATCH: the
+// agent starts each native ggml-rpc-server once on a loopback port with
+// `-d CPU`, reads its protocol version from the startup banner and reports it
+// as `rpc_protocol` on the binaries[] entries of the rpc_server and the
+// llama_server in its directory (#441). The gateway reads the field when
+// present and an old agent simply sends none, so nothing is negotiated and no
+// agent.Features entry is added. This is the ONE bump for the whole branch;
+// later commits on it do not bump again.
+const Version = "0.25.2"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

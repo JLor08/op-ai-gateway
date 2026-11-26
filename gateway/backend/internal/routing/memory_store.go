@@ -3252,6 +3252,7 @@ func (m *MemoryStore) ReplaceAgentServerBinaries(_ context.Context, serverID str
 }
 
 // UpsertManualServerBinary mirrors the SQL upsert guarded by source='manual'.
+// A manual row never carries an RPC protocol (the SQL insert writes none).
 func (m *MemoryStore) UpsertManualServerBinary(_ context.Context, b ServerBinary) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3262,7 +3263,7 @@ func (m *MemoryStore) UpsertManualServerBinary(_ context.Context, b ServerBinary
 	if had && prev.Source != BinarySourceManual {
 		return storeerr.ErrConflict
 	}
-	b.Source, b.VersionSource = BinarySourceManual, BinarySourceManual
+	b.Source, b.VersionSource, b.RPCProtocol = BinarySourceManual, BinarySourceManual, ""
 	if had {
 		b.VersionOverride = prev.VersionOverride
 	}

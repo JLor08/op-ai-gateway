@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"op-ai-gateway/internal/inference"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -3383,7 +3384,10 @@ type ServerGPUBudget struct {
 // VersionOverride the operator's correction of it, kept apart so a fresh
 // agent report never erases it; use EffectiveVersion for the one to act on.
 // VersionSource is how Version was determined: "agent", "path" or "manual".
-// Allowed is the agent-reported allowlist status.
+// Allowed is the agent-reported allowlist status. RPCProtocol is the
+// RPC protocol version ("X.Y.Z") the agent probed (migration 117): an
+// rpc_server's own, a llama_server's taken from the rpc_server in its
+// directory; "" = unknown, and always "" for manual rows.
 type ServerBinary struct {
 	ServerID        string
 	Path            string
@@ -3395,8 +3399,18 @@ type ServerBinary struct {
 	VersionSource   string
 	Source          string
 	Allowed         bool
+	RPCProtocol     string
 	ReportedAt      time.Time
 }
+
+// rpcProtocolPattern is the shape of a probed RPC protocol version.
+var rpcProtocolPattern = regexp.MustCompile(`^\d{1,3}\.\d{1,3}\.\d{1,3}$`)
+
+// ValidRPCProtocol reports whether s is a well-formed RPC protocol version:
+// exactly three dot-separated numbers of one to three digits ("10.0.2").
+// Ingest stores anything else as "" and the portal matching trusts only a
+// valid value.
+func ValidRPCProtocol(s string) bool { return rpcProtocolPattern.MatchString(s) }
 
 // The server_binaries.source values.
 const (

@@ -649,7 +649,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -705,7 +705,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -874,7 +874,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1086,7 +1086,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1301,7 +1301,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-115-migrations),
+[§4](reference/data-model.md#4-migration-history-117-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1527,7 +1527,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-115-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-117-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1674,7 +1674,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-115-migrations),
+[§4](reference/data-model.md#4-migration-history-117-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3645,7 +3645,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-117-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3875,7 +3875,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-117-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4907,7 +4907,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5033,7 +5033,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-115-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5179,7 +5179,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-115-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-117-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7693,7 +7693,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-115-migrations),
+[Data Model](reference/data-model.md#4-migration-history-117-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7916,7 +7916,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-115-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-117-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8057,7 +8057,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-115-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-117-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8321,7 +8321,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-115-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-117-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -11727,6 +11727,11 @@ server's effective LAN address: its manual `lan_address`, its chosen or most lik
 non-NetBird server. A NetBird-enabled server therefore needs a reported LAN interface or a manual `lan_address`, a bind-only member whose
 chosen interface is missing is withheld, and a head on an interface source identifies itself with every IPv4 it reports.
 
+**Amended by [ADR-120](#adr-120--match-rpc-cluster-binaries-on-the-probed-protocol-version) (matching on the RPC protocol).** Point (d)
+below matches head and member binaries on the build identity alone. They are now compared on the RPC protocol the agent probes from
+each native `ggml-rpc-server` first (full `X.Y.Z` equality), the build identity only where a side has no protocol; `build 0` and `commit
+unknown` count as no identity, and a server without a compatible binary is listed with the reason instead of only as incompatible.
+
 **Decision — thirteen choices, taken together. Migrations 103–106; agent 0.18.0, feature `rpc_cluster` on both sides.**
 
 - **(a) The gateway configures, orders, holds, accounts and secures; it is never on the RPC data path.** A head is an
@@ -12184,7 +12189,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-115-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-117-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -13648,7 +13653,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 
 **Decision.**
 
-- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-115-migrations))
+- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-117-migrations))
   holds the same JSON as `api_tokens.vendor_provider_access` and goes through the same codec, validated like a token policy against the user's own
   reach. `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}` (`store.ChatSessionVendorAccess`), so every existing user keeps
   today's behavior with no backfill. An explicit save whose encoding would be `''` is stored as `{"all":false}`, so "no providers" never collapses into
@@ -13697,7 +13702,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 - → [External Vendor Accounts §11.4](cross-cutting/external-vendor-accounts.md#114-who-is-restricted-api-tokens-and-the-owners-chat-session-policy),
   [Security, Auth & RBAC §5](cross-cutting/security-auth-rbac.md),
   [HTTP API surface](reference/api-surface.md),
-  [Data model](reference/data-model.md#4-migration-history-115-migrations).
+  [Data model](reference/data-model.md#4-migration-history-117-migrations).
 
 ## ADR-115 — VM CPU power via a host-attributed synthetic RAPL tree over virtiofs
 
@@ -14099,3 +14104,90 @@ upstream `api_token` in plaintext, while the code said the token was never persi
   [Telemetry §8.2.8](cross-cutting/telemetry-usage-observability.md#828-lan-interface-candidates),
   [Agent-Managed Model Runtime §8.1](cross-cutting/agent-runtime-manager.md#81-gateway-mode-push-poll-and-a-disk-cache),
   [Data model](reference/data-model.md), [HTTP API Surface](reference/api-surface.md), [Config env](reference/config-env.md).
+
+## ADR-120 — Match RPC cluster binaries on the probed protocol version
+
+**Context.** [ADR-096](#adr-096--llamacpp-rpc-cluster-mode-the-gateway-starts-members-first-and-stays-off-the-data-path-transport-and-network-are-chosen-per-cluster) (d) gives an
+automatic member the member server's `ggml-rpc-server` whose commit, else build, equals the head binary's. That identity is the wrong key
+twice over. A build without git metadata (a source tarball) prints `version: 1.1.0-dev (build 0, commit unknown)`: it never matches a git
+build of the same source, and `commit unknown` matched every other tarball build whatever its source. And it is stricter than the real
+contract, so two builds of different commits that speak the same wire protocol were never offered, and the portal hid a rejected server
+without saying why. What llama.cpp actually checks is the **RPC protocol version** (`RPC_PROTO_MAJOR/MINOR/PATCH`, llama.cpp master,
+2026-11-26):
+
+- The llama.cpp semver (`LLAMA_VERSION_*`, e.g. `1.1.0-dev`) is not aligned with it: 0.3.0, 0.4.1, 0.6.0 and 0.9.0 each span a protocol
+  major change (0.9.0 alone went 8.0.1 → 9.0.0 → 10.0.0), so equal llama major.minor is no usable rule.
+- In the handshake only the server reports its version, and the client accepts it when the majors are equal and the server's minor is not
+  above its own. The patch is not checked, yet 8.0.0 → 8.0.1 inserted `GGML_OP_TOP_K_MASK` mid-enum and shifted the op numbers: a patch
+  difference can compute wrong results without any error.
+- `ggml-rpc-server` prints `Starting RPC server vX.Y.Z` on stderr at the start of `ggml_backend_rpc_start_server`, before it initialises
+  devices or binds. It has no `--version`, and `llama-server` does not print its own protocol.
+
+**Decision.**
+
+1. **The agent probes native rpc-servers.** For every allowed native `rpc_server` it runs `<bin> -d CPU -H 127.0.0.1 -p <free port>`,
+   reads the combined output until the banner, then kills the process tree. Timeout 10 s, a minimal environment, and the cache (path, size,
+   mtime) and retry backoff of the `--version` probe; no banner yields no protocol, and with `-d CPU` no GPU is exposed as an RPC device
+   or allocated (the build still loads and enumerates its GPU backends).
+2. **No probe in WSL.** A `wsl://` `rpc_server` is never run for its protocol: a WSL rpc-server is never a cluster member, and killing a
+   process inside a distro through `wsl.exe` is not reliable.
+3. **Sibling pairing per directory, both directions.** Binaries in one directory are one build: an `rpc_server` takes version, build and
+   commit from the agent-versioned `llama_server` beside it (else its path) and keeps its own probed protocol; a `llama_server` keeps its
+   own `--version` identity and takes the protocol the protocol-carrying `rpc_server`s beside it agree on; when they report different
+   protocols it has none, since which one its build speaks is unknown. Without a `llama-server` the rpc-server has only its protocol (and
+   what its path says); without an rpc-server the `llama-server` has none. Pairing never crosses directories, so several installations on
+   one host stay independent.
+4. **Wire and storage.** `rpc_protocol` (`X.Y.Z`, else empty) on the agent sample's `binaries[]` entry, `routing.ServerBinary.RPCProtocol`,
+   `server_binaries.rpc_protocol` (migration 117) and the portal's binaries DTO; ingest stores a malformed value as empty, and manual rows
+   have none.
+5. **Compatibility of a head binary H (`llama_server`) and a member binary M (`rpc_server`).** When both have a protocol: equal in all of
+   `X.Y.Z` is compatible (*identical* when the build identity matches too, else a *protocol* match), different is a **protocol mismatch**.
+   Otherwise the build identity as before (commit, else build): equal is *identical*, both known, comparable and different is a **build
+   mismatch**, anything else **unknown**.
+6. **Identity hygiene.** A commit `unknown` (any case) and build `0` count as absent, also inside a version override.
+7. **A head is known** when it has a build identity or a protocol.
+8. **Automatic members** take, among the server's eligible `rpc_server` rows, a compatible one: identical before protocol, then by path.
+   A server with none is still listed, `compatible: false`, with `incompatible_reason` (`no_rpc_binary`, `protocol_mismatch`,
+   `build_mismatch`, `version_unknown`, `head_version_unknown`) and, for a protocol mismatch, `member_rpc_protocol`; the listing carries
+   `head_rpc_protocol`, and a match `rpc_binary_protocol`.
+9. **Manual members.** The save refuses a protocol or build mismatch (`runtime_spec.cluster_version_mismatch`, naming both protocols for a
+   protocol mismatch); an unknown pair keeps the advisory `cluster_member_version_unknown`.
+10. **Portal.** The binaries table and the binary picker show the protocol; the cluster candidate picker lists rejected automatic candidates,
+    disabled, with the reason instead of hiding them.
+11. **Ingest retention.** An `rpc_server` re-report without a protocol keeps the stored one while its version, build and commit (after
+    the version retention) equal the stored row's; another identity is another binary at that path, whose protocol is unknown until its
+    probe succeeds (the trade-off of the version retention: the runtime banner check is the net). A `llama_server` row never keeps its
+    own, since its protocol came from a sibling that may be gone; instead ingest redoes the agent's pairing on the rows it writes and gives
+    a protocol-less `llama_server` the protocol its directory's `rpc_server` rows agree on (kept ones included; the directory is the path
+    up to the last `/` or `\`, a `wsl://<distro>` prefix included). No `rpc_server` row beside it, or rows of different protocols, leave
+    it without one.
+12. **No relaunch.** The protocol is not part of the head's `generation`.
+
+**Alternatives rejected.**
+- *llama.cpp's own tolerance (equal major, member minor not above the head's):* the patch is unchecked upstream although a patch bump
+  has shifted the op enum, so full equality is the only safe rule.
+- *Equal llama.cpp major.minor:* the semver crosses protocol majors within one minor.
+- *A build → protocol lookup table in the gateway:* it goes stale with every upstream bump and cannot place an identity-less build at all.
+- *An upstream `--version` for `ggml-rpc-server`:* not ours to ship, and old builds would still need the banner.
+- *Pairing across directories (any `rpc-server` of the host):* two installations would lend each other the wrong protocol.
+
+**Consequences.**
+- Same source built from git and from a tarball now pairs (both report the same protocol); different commits with one protocol are
+  offered and accepted; a different protocol is not offered and is shown with both protocols; a head without a protocol needs a build
+  identity, else every automatic candidate shows `head_version_unknown`.
+- With an old agent (no protocol anywhere) matching is as before except the hygiene: two `commit unknown` builds no longer count as
+  identical, so a cluster that only matched that way is withheld (`cluster_member_no_matching_binary`) until its agents report protocols,
+  and a member row whose generation carried `unknown` or `0` relaunches its head once.
+- WSL rpc-servers carry no protocol, which costs nothing: they are never members.
+- The generation is unchanged, so learning a protocol, or losing one where the build identity still matches, relaunches no cluster.
+  Losing the protocol a cluster matched on alone (head and member of different builds, a git and a tarball build say) withholds it: the
+  head and its members leave the agents' documents and stop until the protocol is back. The transient case does not get there: an agent
+  restart whose rpc-server probe fails keeps the `rpc_server` row's protocol (decision 11), and the `llama_server` beside it takes it from
+  there instead of dropping its own. The agent's runtime check (`runtime.cluster_version_mismatch`) stays the net for a stale inventory.
+- The hygiene changes two outcomes beyond automatic matching: a version override `… (build N, commit unknown)` now yields build N as its
+  identity (before, `unknown` was its commit and mismatched every real one), and a manual member pair of a `commit unknown` / `build 0`
+  binary and one with a real commit, refused before as a version mismatch, is now an unknown pair and only warns
+  (`cluster_member_version_unknown`).
+- Agent version 0.25.2 (PATCH): the new field is read when present and an old agent sends none, so nothing is negotiated.
+- → [Agent-Managed Model Runtime §3.6, §3.7](cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster),
+  [HTTP API Surface](reference/api-surface.md), [Data model](reference/data-model.md).

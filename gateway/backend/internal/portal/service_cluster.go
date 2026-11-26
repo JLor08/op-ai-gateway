@@ -141,33 +141,43 @@ type ClusterMemberDTO struct {
 }
 
 // ClusterCandidateDTO is a server a head may add as a member. In automatic
-// mode RPCBinary/RPCBinaryVersion name the server's ggml-rpc-server that
-// matches the head's binary; in manual mode MemberSpecs lists the server's
-// free member specs.
+// mode RPCBinary/RPCBinaryVersion/RPCBinaryProtocol name the server's
+// ggml-rpc-server that the head's binary can drive; in manual mode
+// MemberSpecs lists the server's free member specs.
 type ClusterCandidateDTO struct {
-	ServerID         string             `json:"server_id"`
-	ServerName       string             `json:"server_name"`
-	RPCBinary        string             `json:"rpc_binary,omitempty"`
-	RPCBinaryVersion string             `json:"rpc_binary_version,omitempty"`
-	MemberSpecs      []RPCMemberSpecDTO `json:"member_specs,omitempty"`
-	// Compatible: in automatic mode, the server has a ggml-rpc-server of the
-	// head binary's version (RPCBinary names it); false when it offers
-	// membership but has none, or the head binary's version is unknown. In
-	// manual mode, at least one listed member spec is not in
-	// IncompatibleMemberSpecs.
+	ServerID          string             `json:"server_id"`
+	ServerName        string             `json:"server_name"`
+	RPCBinary         string             `json:"rpc_binary,omitempty"`
+	RPCBinaryVersion  string             `json:"rpc_binary_version,omitempty"`
+	RPCBinaryProtocol string             `json:"rpc_binary_protocol,omitempty"`
+	MemberSpecs       []RPCMemberSpecDTO `json:"member_specs,omitempty"`
+	// Compatible: in automatic mode, the server has a ggml-rpc-server the
+	// head binary can drive -- the same build, or the same RPC protocol
+	// (RPCBinary names it); false when it offers membership but has none, or
+	// the head binary's version is unknown. In manual mode, at least one
+	// listed member spec is not in IncompatibleMemberSpecs.
 	Compatible bool `json:"compatible"`
+	// IncompatibleReason says, for an automatic candidate that is not
+	// Compatible, why: no_rpc_binary (no eligible ggml-rpc-server),
+	// protocol_mismatch (MemberRPCProtocol is the first such binary's
+	// protocol by path), build_mismatch, version_unknown, or
+	// head_version_unknown.
+	IncompatibleReason string `json:"incompatible_reason,omitempty"`
+	MemberRPCProtocol  string `json:"member_rpc_protocol,omitempty"`
 	// IncompatibleMemberSpecs lists, in manual mode, the member specs whose
-	// binary's known version differs from the head binary's: the save
-	// refuses them with runtime_spec.cluster_version_mismatch.
+	// binary has a known RPC protocol or build mismatch with the head
+	// binary: the save refuses them with runtime_spec.cluster_version_mismatch.
 	IncompatibleMemberSpecs []string `json:"incompatible_member_specs,omitempty"`
 }
 
-// ClusterCandidateList is ClusterCandidates' answer: the candidates and
-// whether the head binary's version is known (automatic members are matched
-// on it).
+// ClusterCandidateList is ClusterCandidates' answer: the candidates,
+// whether the head binary's version (build identity or RPC protocol) is
+// known (automatic members are matched on it), and the head binary's RPC
+// protocol ("" when unknown).
 type ClusterCandidateList struct {
 	Candidates      []ClusterCandidateDTO
 	HeadBinaryKnown bool
+	HeadRPCProtocol string
 }
 
 // clusterPlan is the cluster part of one runtime-spec write: the columns of
@@ -783,27 +793,19 @@ func (s *Service) checkClusterMemberSpecs(ctx context.Context, entries []cluster
 	return nil
 }
 
-// binaryVersionKnown reports whether b carries a commit or a build to match
-// on.
+// binaryVersionKnown reports whether b carries something to match on: a
+// commit, a build, or an RPC protocol.
 func binaryVersionKnown(b routing.ServerBinary) bool {
 	commit, build := binaryIdentity(b)
-	return commit != "" || build != ""
-}
-
-// binaryVersionsComparable reports whether a and b carry the same kind of
-// identity (both a commit, or both a build), so a difference is a real one.
-func binaryVersionsComparable(a, b routing.ServerBinary) bool {
-	ac, ab := binaryIdentity(a)
-	bc, bb := binaryIdentity(b)
-	return (ac != "" && bc != "") || (ab != "" && bb != "")
+	return commit != "" || build != "" || rpcProtocolOf(b) != ""
 }
 
 // checkClusterMemberBinaries is steps 6 and 7 of validateClusterHead. Head
-// and members must run the same llama.cpp build (same RPC protocol and graph
-// cache limits), so automatic members get the ggml-rpc-server matching the
-// head binary's version and need the head's version known; a manual member's
-// binary is the operator's choice and refused only when both versions are
-// known and differ. headVersionUnknown reports automatic members with no
+// and members must speak the same RPC protocol, so automatic members get a
+// ggml-rpc-server the head binary can drive (rpcCompatibility: the same
+// build, or the same protocol) and need the head's version known; a manual
+// member's binary is the operator's choice and refused only on a known
+// protocol or build mismatch. headVersionUnknown reports automatic members with no
 // head version to match them on; the caller refuses that last of all.
 func (s *Service) checkClusterMemberBinaries(ctx context.Context, headServerID, headBinary string, entries []clusterEntry) (headVersionUnknown bool, err error) {
 	head, headListed, err := s.BinaryVersionFor(ctx, headServerID, headBinary)
@@ -849,35 +851,48 @@ func requireRPCMembership(entries []clusterEntry) error {
 	return nil
 }
 
-// checkAutomaticMemberBinary requires a ggml-rpc-server of the head binary's
-// version on an automatic entry's server.
+// checkAutomaticMemberBinary requires a ggml-rpc-server the head binary can
+// drive on an automatic entry's server.
 func (s *Service) checkAutomaticMemberBinary(ctx context.Context, e clusterEntry, head routing.ServerBinary) error {
 	_, ok, err := s.MatchingRPCBinary(ctx, e.server.ID, head)
 	if err != nil {
 		return err
 	}
 	if !ok {
+		if p := rpcProtocolOf(head); p != "" {
+			return fmt.Errorf("%w: server %q has no ggml-rpc-server of version %s or RPC protocol %s",
+				ErrClusterMemberNoMatchingBinary, e.server.Name, head.EffectiveVersion(), p)
+		}
 		return fmt.Errorf("%w: server %q has no ggml-rpc-server of version %s", ErrClusterMemberNoMatchingBinary, e.server.Name, head.EffectiveVersion())
 	}
 	return nil
 }
 
-// checkManualMemberBinary refuses a manual entry's binary whose known
-// version differs from the head binary's; an unknown one only warns.
+// checkManualMemberBinary refuses a manual entry's binary on a known
+// protocol or build mismatch with the head binary (naming both protocols,
+// else both versions); an unknown pair only warns.
 func (s *Service) checkManualMemberBinary(ctx context.Context, e clusterEntry, head routing.ServerBinary) error {
-	member, mismatch, err := s.memberBinaryMismatch(ctx, e.server.ID, e.spec.Binary, head)
+	member, listed, err := s.BinaryVersionFor(ctx, e.server.ID, e.spec.Binary)
 	if err != nil {
 		return err
 	}
-	if mismatch {
+	if !listed {
+		return nil
+	}
+	switch rpcCompatibility(head, member) {
+	case rpcMismatchProtocol:
+		return fmt.Errorf("%w: member binary %s on server %q speaks RPC protocol %s, the head's speaks %s",
+			ErrClusterVersionMismatch, e.spec.Binary, e.server.Name, rpcProtocolOf(member), rpcProtocolOf(head))
+	case rpcMismatchBuild:
 		return fmt.Errorf("%w: member binary %s on server %q is version %s, the head's is %s",
 			ErrClusterVersionMismatch, e.spec.Binary, e.server.Name, member.EffectiveVersion(), head.EffectiveVersion())
 	}
 	return nil
 }
 
-// mismatchedMemberSpecs lists the ids of specs on serverID whose binary's
-// known version differs from head's, reading the server's inventory once.
+// mismatchedMemberSpecs lists the ids of specs on serverID whose binary the
+// save refuses against head (memberVersionDiffers), reading the server's
+// inventory once.
 func (s *Service) mismatchedMemberSpecs(ctx context.Context, serverID string, specs []RPCMemberSpecDTO, head routing.ServerBinary) ([]string, error) {
 	rows, err := s.routes.ServerBinaries(ctx, serverID)
 	if err != nil {
@@ -899,22 +914,12 @@ func (s *Service) mismatchedMemberSpecs(ctx context.Context, serverID string, sp
 	return out, nil
 }
 
-// memberBinaryMismatch reads a manual member's binary on serverID and reports
-// whether its known version differs from head's (memberVersionDiffers).
-func (s *Service) memberBinaryMismatch(ctx context.Context, serverID, memberBinary string, head routing.ServerBinary) (routing.ServerBinary, bool, error) {
-	member, listed, err := s.BinaryVersionFor(ctx, serverID, memberBinary)
-	if err != nil {
-		return member, false, err
-	}
-	return member, memberVersionDiffers(member, listed, head), nil
-}
-
 // memberVersionDiffers is the manual member rule the save check and the
-// candidates listing share: a listed member binary whose known version
-// differs from head's. An unlisted binary or an unknown version is no
-// mismatch (it only warns).
+// candidates listing share: a listed member binary with a known protocol or
+// build mismatch against head (rpcCompatibility). An unlisted binary or an
+// unknown pair is no mismatch (it only warns).
 func memberVersionDiffers(member routing.ServerBinary, listed bool, head routing.ServerBinary) bool {
-	return listed && binaryVersionKnown(member) && binaryVersionsComparable(head, member) && !binariesSameVersion(head, member)
+	return listed && rpcCompatibility(head, member).mismatch()
 }
 
 // netbirdMeshReady reports whether a server can take part in a mesh
@@ -1936,9 +1941,10 @@ func deviceListWarning(scan clusterArgScan, headHasGPUs bool) string {
 }
 
 // manualMemberVersionUnknown reports whether a manual member's binary
-// version cannot be compared with the head's: either is unlisted or carries
-// no version, or they carry different kinds of identity. An automatic member
-// is never reported (its binary matches the head's by construction).
+// cannot be compared with the head's: either is unlisted, or neither a
+// protocol pair nor a build identity of the same kind relates them
+// (rpcCompatUnknown). An automatic member is never reported (its binary
+// matches the head's by construction).
 func (s *Service) manualMemberVersionUnknown(ctx context.Context, m clusterMemberState, head routing.ServerBinary, headListed bool) (bool, error) {
 	if m.row.MemberSpecID == "" {
 		return false, nil
@@ -1947,7 +1953,7 @@ func (s *Service) manualMemberVersionUnknown(ctx context.Context, m clusterMembe
 	if err != nil {
 		return false, err
 	}
-	return !headListed || !ok || !binaryVersionKnown(head) || !binaryVersionKnown(member) || !binaryVersionsComparable(head, member), nil
+	return !headListed || !ok || rpcCompatibility(head, member) == rpcCompatUnknown, nil
 }
 
 // memberWarnings adds one member's warnings: a CPU member without
@@ -2120,10 +2126,11 @@ func (s *Service) addOtherMemberSpecGPUUses(ctx context.Context, m clusterMember
 // that the caller manages and whose consent admits the head (for every
 // caller, system scope included; an empty consent list means the member
 // server's own admin groups). In automatic mode a server must offer RPC
-// membership; it is Compatible when it has a ggml-rpc-server matching the
-// head binary's version. In manual mode it must have enabled member specs
-// that serve no other head, which are listed with the ones whose binary's
-// version differs from the head binary's. headBinary is the head binary to
+// membership; it is Compatible when it has a ggml-rpc-server the head binary
+// can drive (the same build or RPC protocol), else it carries the reason. In
+// manual mode it must have enabled member specs that serve no other head,
+// which are listed with the ones whose binary has a known RPC protocol or
+// build mismatch with the head binary. headBinary is the head binary to
 // match against, as the operator's form has it; empty means the stored
 // spec's. Its version is read from the head server's inventory exactly as the
 // save checks read it, so the list and the save agree. Sorted by server name.
@@ -2183,7 +2190,11 @@ func (s *Service) listClusterCandidates(ctx context.Context, p auth.Token, headS
 	if err != nil {
 		return ClusterCandidateList{}, err
 	}
-	return ClusterCandidateList{Candidates: out, HeadBinaryKnown: head.known}, nil
+	list := ClusterCandidateList{Candidates: out, HeadBinaryKnown: head.known}
+	if head.known {
+		list.HeadRPCProtocol = rpcProtocolOf(head.binary)
+	}
+	return list, nil
 }
 
 // clusterCandidatesFor builds the candidate entries of every server other
@@ -2216,8 +2227,9 @@ func (s *Service) clusterCandidatesFor(ctx context.Context, p auth.Token, headSe
 }
 
 // candidateHead is what ClusterCandidates reads of the head: its stored
-// spec's id, its binary's inventory row and whether that carries a version,
-// and its server's admin groups.
+// spec's id, its binary's inventory row and whether that carries a version
+// (binaryVersionKnown: a build identity or an RPC protocol), and its
+// server's admin groups.
 type candidateHead struct {
 	specID string
 	binary routing.ServerBinary
@@ -2244,7 +2256,9 @@ func (s *Service) candidateHeadFor(ctx context.Context, headServerID, headSpecID
 }
 
 // clusterCandidate builds srv's candidate entry in mode; ok is false when
-// srv cannot serve the head as a member.
+// srv cannot serve the head as a member. An automatic candidate without a
+// ggml-rpc-server the head can drive is still listed, not Compatible, with
+// the reason (scanRPCBinaries).
 func (s *Service) clusterCandidate(ctx context.Context, p auth.Token, srv routing.AIServer, mode string, head candidateHead) (ClusterCandidateDTO, bool, error) {
 	c := ClusterCandidateDTO{ServerID: srv.ID, ServerName: srv.Name}
 	if mode != memberModeAutomatic {
@@ -2258,15 +2272,22 @@ func (s *Service) clusterCandidate(ctx context.Context, p auth.Token, srv routin
 		return c, false, err
 	}
 	if !head.known {
+		c.IncompatibleReason = rpcRejectHeadVersionUnknown
 		return c, true, nil
 	}
-	match, ok, err := s.MatchingRPCBinary(ctx, srv.ID, head.binary)
+	// One read of the inventory decides the entry: a match or its reason
+	// from two reads could disagree (a report landing in between) and leave
+	// an entry neither compatible nor explained.
+	scan, err := s.scanRPCBinaries(ctx, srv.ID, head.binary)
 	if err != nil {
 		return c, false, err
 	}
-	if ok {
-		c.RPCBinary, c.RPCBinaryVersion, c.Compatible = match.Path, match.EffectiveVersion(), true
+	if scan.matched {
+		c.RPCBinary, c.RPCBinaryVersion, c.Compatible = scan.match.Path, scan.match.EffectiveVersion(), true
+		c.RPCBinaryProtocol = rpcProtocolOf(scan.match)
+		return c, true, nil
 	}
+	c.IncompatibleReason, c.MemberRPCProtocol = scan.reason, scan.memberProtocol
 	return c, true, nil
 }
 

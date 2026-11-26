@@ -446,8 +446,9 @@ func (s *Service) serverRunsAgentApplication(ctx context.Context, serverID strin
 }
 
 // resolveMemberBinaries sets each member's binary: an automatic member runs
-// its server's ggml-rpc-server whose version matches the head binary's
-// (MatchingRPCBinary, read now, so an inventory change moves it), a manual
+// its server's ggml-rpc-server the head binary can drive (MatchingRPCBinary:
+// the same build or RPC protocol, read now, so an inventory change moves
+// it), a manual
 // member its spec's binary with whatever version the inventory knows.
 func (s *Service) resolveMemberBinaries(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer, members []derivedMember) (string, error) {
 	headBin := lazyHeadBinary{serverID: headServer.ID, path: head.Binary}
@@ -500,7 +501,7 @@ func (s *Service) resolveManualMemberBinary(ctx context.Context, m *derivedMembe
 }
 
 // resolveAutomaticMemberBinary sets an automatic member's binary: its
-// server's ggml-rpc-server of the head binary's version.
+// server's ggml-rpc-server the head binary can drive (MatchingRPCBinary).
 // ClusterWithheldNoMatchingBinary when the head's version is unknown or no
 // such binary is listed.
 func (s *Service) resolveAutomaticMemberBinary(ctx context.Context, m *derivedMember, headBin *lazyHeadBinary) (string, error) {

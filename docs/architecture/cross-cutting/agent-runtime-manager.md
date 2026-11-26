@@ -2080,18 +2080,48 @@ The telemetry sample carries a top-level `binaries` list: one entry per path in
 the agent's local `runtime_allowed_binaries` (the gateway can never widen it),
 native and `wsl://` entries alike, with `kind` (`llama_server`, `rpc_server`, `vllm` or `other`, from the file name alone,
 case-insensitive, without `.exe`), `version`, `build`, `commit`,
-`version_source` and `allowed`. Versions are derived without trusting the
-gateway: only a `llama-server` or a `vllm` is ever executed, as `<path> --version` with no
+`version_source`, `allowed` and `rpc_protocol`. Versions are derived without trusting the
+gateway: only a `llama-server` or a `vllm` is executed as `<path> --version` (a native `rpc-server` is run differently, see below), with no
 shell, a 10 s timeout (60 s for `vllm`, whose start-up imports a large Python stack) and a minimal environment (only what is needed to find
 shared libraries, so no secret reaches the child); its `version: X (build N,
 commit H)` line gives `version_source: agent`; when the run fails or prints no
 such line, the path-derived version below applies instead. A `vllm` takes the
 version from the **last** non-empty output line shaped like `0.11.2` or `v0.11.2` (it
-prints log and warning lines around it), with no build or commit. An `rpc-server` is
-never executed: it inherits the version of a `llama-server` in the same
+prints log and warning lines around it), with no build or commit. An `rpc-server` has
+no `--version`, so it never gets one of its own: it inherits the version of a `llama-server` in the same
 directory (`agent`), else whatever its path says (`path`: a `b<digits>` tag as
 the build, a 7 to 40 character hex segment containing at least one a-f letter as
-the commit), else it has no version. A run that yields a version is cached by
+the commit), else it has no version.
+
+**RPC protocol (`rpc_protocol`).** Build identity does not say whether a head and
+a member speak the same RPC wire protocol, so the agent also reads the protocol
+version (`X.Y.Z`, the one `ggml-rpc-server` prints as `Starting RPC server vX.Y.Z`
+before it initialises devices or binds its port). For every allowed **native**
+`rpc-server` it runs `<path> -d CPU -H 127.0.0.1 -p <free loopback port>` (no
+shell, minimal environment, `-d CPU` so no GPU is exposed as an RPC device or allocated), reads the
+combined output until the banner line, kills the process at once and reports the
+protocol; output without a well-formed banner yields none. The run is in its own
+process group (a job object on Windows) that is killed as a whole, so a wrapper
+script that does not `exec` leaves no rpc-server bound to the port behind, on the
+banner, the timeout and a plain exit alike; a descendant that left the group
+(`setsid`) survives the kill, so on the timeout the probe closes its end of the
+output pipe and returns within the 5 s wait delay instead of waiting for that
+descendant. A build that prints no `vX.Y.Z` banner yields no protocol: it either
+exits at once (an older build rejecting `-d`, say) or is killed at the probe
+timeout, and is retried on the backoff below (30 s doubling to 1 h). It uses the same 10 s
+timeout, (path, size, mtime) cache and retry backoff as the `--version` run. A
+`wsl://` `rpc-server` is never run (a process inside a distro cannot be killed
+reliably through `wsl.exe`, and a WSL rpc-server is never a cluster member) and
+carries no protocol. Binaries in one directory are one build, so the protocol is
+paired per directory in both directions: the `rpc-server` keeps its own protocol
+(and inherits version, build and commit as above), and the `llama-server` takes the
+protocol the protocol-carrying `rpc-server`s of its directory agree on, none when
+they report different ones (which of them its build speaks is unknown). Pairing never
+crosses directories; a `llama-server` with no probed `rpc-server` beside it, and any
+other kind, has no `rpc_protocol` (the field is omitted when empty, and an agent
+older than 0.25.2 never sends it).
+
+A run that yields a version is cached by
 (path, size, mtime) for good. One that does not (the timeout on a loaded host,
 a failed exec, output without the line) is retried for the same bytes after a
 backoff, 30 s after the first failure and doubling up to an hour: a missing
@@ -2211,7 +2241,8 @@ used spec's `device_backend` from `rocm` to `vulkan` leaves a stored head
 without `--tensor-split` that a fresh save would refuse, as a later change of
 the GPU set or the hardware does); last of all,
 automatic members need the head binary's
-version known (`runtime_spec.cluster_head_binary_version_unknown`). Rights are
+version known: a commit, a build or a probed RPC protocol
+(`runtime_spec.cluster_head_binary_version_unknown`). Rights are
 needed on every member server the write keeps or adds; removing members, turning
 the cluster off included, needs the head's rights only, as deleting the head
 does: removal only frees the member host, consent protects additions. Off a
@@ -2236,6 +2267,39 @@ save: `cluster_rpc_devices_not_first`, `cluster_mmdev_missing`,
 `cluster_member_budget_below_device`, `cluster_member_gpu_overlap`,
 `cluster_relay_mesh_deny_by_default_off` and `cluster_member_version_unknown`; a
 member the reader may not see adds none.
+
+**Matching member binaries** (`rpcCompatibility`, `service_binaries.go`). The
+contract between a head and a member is llama.cpp's RPC protocol, so a head
+binary (`llama_server`) and a member binary (`rpc_server`) are compared on it
+first. When both inventory rows carry an `rpc_protocol` (§3.6), it decides
+alone: equal in all of `X.Y.Z` is compatible (*identical* when the build
+identity matches too, else a *protocol* match), different is a **protocol
+mismatch**. llama.cpp's handshake checks only that the majors are equal and
+the member's minor is not above the head's, but a patch bump has inserted an
+op mid-enum and shifted the op numbers, so the gateway requires full
+equality. When either row lacks a protocol, the build identity decides as
+before: the commit when both have one, else the build when both have one, so
+equal is *identical* and different a **build mismatch**; anything else is
+**unknown**. A commit `unknown` (any case) and build `0`, which a source
+tarball build prints, count as absent, in the detected fields and in a
+version override alike; the protocol is the binary's own and an override
+does not change it. An automatic member takes, among its server's eligible
+`rpc_server` rows (native, and allowed when agent-reported), a compatible one,
+an identical build before a protocol match, then the first by path. A manual
+member's binary is refused on a protocol mismatch (the message names both
+protocols) or a build mismatch (`runtime_spec.cluster_version_mismatch`, the
+message names both versions), and an unknown pair only warns
+(`cluster_member_version_unknown`). The candidate listing for the head form
+uses the same rule: an automatic server without a compatible binary is still
+listed, not `compatible`, with `incompatible_reason` (`no_rpc_binary`,
+`protocol_mismatch` with the member's protocol, `build_mismatch`,
+`version_unknown`, `head_version_unknown`), and a match names its binary's
+protocol ([HTTP API Surface](../reference/api-surface.md)). The protocol is
+not part of the head's `generation`, so learning one relaunches nothing;
+losing the one a cluster matched on alone withholds that cluster (stage 4
+below), which ingest's retention keeps from happening on a transient probe
+failure. The agent's runtime check stays the net
+([ADR-120](../09-architecture-decisions.md#adr-120--match-rpc-cluster-binaries-on-the-probed-protocol-version)).
 
 **Ports.** Each member gets an RPC (or relay) port from 26000–26999 on its
 server: the lowest one no application port, TLS proxy port, fixed `listen_port`
@@ -2269,12 +2333,13 @@ document carries the `cluster` block: one endpoint per member in member order
 or 1 for a CPU member, which exposes its CPU device), the transport, the
 network, and `generation`, a digest of every member launch input the
 endpoints do not show (binaries and versions, args, env, the cache switch,
-device backends, GPU selections, bind addresses and ports): whatever relaunches
+device backends, GPU selections, bind addresses and ports; not the RPC
+protocol, which a probe can learn or lose without the binary changing): whatever relaunches
 a member relaunches the head, which would otherwise lose the member mid-request.
 For a member server it carries one `rpc_server` spec per membership: the manual
 spec's id, or `rpca_<head spec id>_<server id>`; the binary (an automatic
-member's `ggml-rpc-server` matching the head binary's version, read on every
-derivation, so an inventory change moves it); `-t <threads>` for an automatic
+member's `ggml-rpc-server` the head binary can drive (Matching member binaries
+above), read on every derivation, so an inventory change moves it); `-t <threads>` for an automatic
 member, the manual spec's own args and env otherwise; the GPUs with their demand
 and the RAM demand, each `max(stored usage, estimate)`; a 60 s startup and a
 60 s idle timeout; the generic type and the role `other`, so nothing
@@ -2314,17 +2379,24 @@ stage that finds a reason stops it:
    `server_agent` application on the member server), `.cluster_port_unknown`;
    each member runs all five before the next member is looked at.
 4. **Binaries, over all members**: `.cluster_member_no_matching_binary` when an
-   automatic member's server has no **native** `ggml-rpc-server` of the head
-   binary's version, and also when the **head** binary's own version is unknown (no
-   inventory row, or one with neither commit nor build), since then nothing can
-   match. A manual member takes its spec's binary and never fails here. An agent
+   automatic member's server has no **native** `ggml-rpc-server` the head
+   binary can drive (Matching member binaries above), and also when the
+   **head** binary's own version is unknown (no inventory row, or one with
+   neither commit nor build nor RPC protocol), since then nothing can match. A manual member takes its spec's binary and never fails here. An agent
    re-report of a binary without a probed version (a `--version` probe that
    failed or timed out, reported with no version or only what the path says)
    keeps the probed version, build and commit its inventory row already had, so
    one failed probe neither withholds the host's clusters nor moves a head's
    generation; since the inventory carries no file identity, a binary replaced
    at the same path whose probe fails keeps the old identity until a probe
-   succeeds.
+   succeeds. The RPC protocol is kept the same way, for an `rpc_server` row
+   only and only while its re-reported version, build and commit (after that
+   retention) equal the stored row's: another identity is another binary,
+   whose protocol is unknown until its probe succeeds. A protocol-less
+   `llama_server` row takes the protocol its directory's `rpc_server` rows
+   agree on (kept ones included; none without such a row or when they
+   differ), so an agent restart whose rpc-server probe fails withholds no
+   cluster that matched on the protocol alone.
 5. **The head's own address** in the resolved network (the stored choice, else
    the default): `.cluster_mesh_unavailable` (in `mesh`, the head server has
    NetBird off or no tracking group) or `.cluster_address_unknown` (no mesh IP;
@@ -3036,7 +3108,7 @@ object** ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-str
 **Verified on hardware (2026-11-23):** the job-mode start (suspended start, job, resume) works with `strata.cmd` as the binary; `${HOST_GPU_IDS_MAIN_LAST}` resolved to `0,1,2` for GPUs declared `2,0,1` and Strata logged a layer split across GPUs `[0, 1, 2]` (main card last); ready in 38 s; the live log shows the server's output including its JSONL `starting`/`ready` events; the agent's authenticated metrics and context probes both succeeded (context 262144); per-GPU VRAM is attributed over the whole tree (the engine is a grandchild, so per-root attribution would read about 0); a chat completion through the gateway answered. **Stop verified on hardware (2026-11-23, agent 0.21.0, 3 GPUs):** the portal's stop delivered Ctrl-Break and Strata logged `stopping` (`reason: "sigbreak"`), `draining` (0 pending, 3 s deadline) and `stopped` (`drained: true`, `cancelled_requests: 0`, `exit_code: 0`) about 2.7 s after the stop, inside the 5 s kill grace; cmd.exe then printed its localized "Terminate batch job (Y/N)?" prompt to the live log and the root exited about 0.1 s later with exit code -1, and the spec state became `stopped` (intentional stop, restarts 0). The prompt does not block the stop; its only side effects are a cosmetic log line and a root exit code of -1 instead of 0. VRAM was freed on all three GPUs within about 2 s (host totals 24.5/32.9/33.3 GB to 0.3/0.0/0.0 GB) and host RAM in use fell from 22.1 to 10.6 GB, so the engine and vision processes ended; leftover non-GPU processes (cmd.exe, python.exe) were not inspected in Task Manager. `strata.cmd` stays the documented binary and the `python.exe` fallback is not needed. **Known RAM under-count:** the spec's measured RAM (private working set summed over the job) read 7.7 GB while host RAM in use fell by about 11.5 GB at stop; pages that are not private working set (locked or mapped model pages, the file cache, driver allocations) are not counted. **Still pending:** the RAM figure against Task Manager beyond the above, Claude Code and Codex round trips, the Windows-tagged unit tests and the console-less (service) agent path. Everything else below is compiled and vetted for Windows (`GOOS=windows go vet`, `golangci-lint`); the Windows-tagged tests (`proc_job_windows_test.go`) are ones CI cannot run (§13).
 
 **The field.** `process_tree` is `direct` (the default, today's behaviour) or `job`
-(migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-115-migrations)).
+(migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-117-migrations)).
 The gateway refuses any other value (400 `runtime_spec.process_tree_invalid`) and
 pushes `"process_tree": "job"` only for a job spec, omitting it for `direct`, so every
 existing document and its ETag are byte-identical. The agent reads an absent or empty
