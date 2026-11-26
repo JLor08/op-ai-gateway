@@ -40,6 +40,8 @@ type interfaceInventory struct {
 	observed bool
 	sentHash [32]byte
 	sentOnce bool
+	sentList []sample.NetInterface
+	everSent bool
 }
 
 func newInterfaceInventory() *interfaceInventory {
@@ -78,10 +80,19 @@ func (i *interfaceInventory) pending() *[]sample.NetInterface {
 	if !i.observed {
 		return nil
 	}
-	if i.sentOnce {
-		if i.sentHash == i.curHash || i.now().Sub(i.curSince) < interfaceStableFor {
+	stable := i.now().Sub(i.curSince) >= interfaceStableFor
+	switch {
+	case !i.everSent:
+		// nothing was ever delivered: the first list goes out at once
+	case i.sentOnce:
+		if i.sentHash == i.curHash || !stable {
 			return nil
 		}
+	case !stable:
+		// a resend was requested but the list changed recently: repeat the
+		// last delivered list rather than report an unsettled one
+		list := append([]sample.NetInterface{}, i.sentList...)
+		return &list
 	}
 	list := append([]sample.NetInterface{}, i.current...)
 	return &list
@@ -91,7 +102,10 @@ func (i *interfaceInventory) pending() *[]sample.NetInterface {
 // accepted by the transport.
 func (i *interfaceInventory) delivered(sum [32]byte) {
 	i.mu.Lock()
-	i.sentHash, i.sentOnce = sum, true
+	if sum == i.curHash {
+		i.sentList = i.current
+	}
+	i.sentHash, i.sentOnce, i.everSent = sum, true, true
 	i.mu.Unlock()
 }
 

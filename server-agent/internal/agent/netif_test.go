@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
 	"op-ai-server-agent/internal/sample"
@@ -116,5 +117,63 @@ func TestSampleCarriesInterfacesOnlyOnChangeAndAfterResend(t *testing.T) {
 	a.collectOnce(context.Background())
 	if poster.last().Interfaces == nil {
 		t.Fatal("list not resent after resend")
+	}
+}
+
+func TestInterfaceInventoryResendRepeatsDeliveredListUntilChangeIsStable(t *testing.T) {
+	inv, clock := newTestInventory()
+	a, b := ifList("192.0.2.5"), ifList("198.51.100.7")
+	inv.observe(*clock, a)
+	inv.delivered(interfaceSum(*inv.pending()))
+
+	t0 := *clock
+	inv.observe(t0, b)
+	*clock = t0.Add(2 * time.Second)
+	inv.resend()
+	p := inv.pending()
+	if p == nil || (*p)[0].IPv4[0] != "192.0.2.5" {
+		t.Fatalf("resend of an unsettled change must repeat the delivered list: %v", p)
+	}
+	inv.delivered(interfaceSum(*p))
+	if inv.pending() != nil {
+		t.Fatal("pending right after the repeat")
+	}
+	*clock = t0.Add(interfaceStableFor)
+	p = inv.pending()
+	if p == nil || (*p)[0].IPv4[0] != "198.51.100.7" {
+		t.Fatalf("stable change not reported: %v", p)
+	}
+	inv.delivered(interfaceSum(*p))
+	inv.resend()
+	if p = inv.pending(); p == nil || (*p)[0].IPv4[0] != "198.51.100.7" {
+		t.Fatalf("resend after delivery lost the new list: %v", p)
+	}
+}
+
+type failOncePoster struct {
+	capturePoster
+	fail bool
+}
+
+func (p *failOncePoster) Post(ctx context.Context, s *sample.Sample) error {
+	_ = p.capturePoster.Post(ctx, s)
+	if p.fail {
+		p.fail = false
+		return errors.New("push failed")
+	}
+	return nil
+}
+
+func TestSampleResendsInterfacesAfterFailedPost(t *testing.T) {
+	poster := &failOncePoster{fail: true}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, Interfaces: collector.NewInterfaceCollector(nil)})
+	a.collectOnce(context.Background())
+	a.collectOnce(context.Background())
+	if poster.samples[0].Interfaces == nil || poster.samples[1].Interfaces == nil {
+		t.Fatal("list must be attached again after a failed post")
+	}
+	a.collectOnce(context.Background())
+	if poster.samples[2].Interfaces != nil {
+		t.Fatal("list resent after a successful post")
 	}
 }
