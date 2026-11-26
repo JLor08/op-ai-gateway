@@ -1428,8 +1428,9 @@ func (f *orchFixture) editPlan(edit func(p *portal.ClusterPlan)) {
 // TestOrchestratorRecordsMemberAddressChange pins the notice of a member's
 // new dial address: the first plan of a head records nothing, a later plan
 // whose member dials another address records the change by position with
-// the member's server, the old and the new address and the time, and says
-// the head relaunched (the address is in the head's endpoint list).
+// the member's server, the old and the new address and the time. It says
+// the head relaunched only when the head is formed (the address is in its
+// endpoint list); a cold head relaunched nothing.
 func TestOrchestratorRecordsMemberAddressChange(t *testing.T) {
 	f := lanAddressFixture(t)
 	f.readPlan()
@@ -1439,14 +1440,29 @@ func TestOrchestratorRecordsMemberAddressChange(t *testing.T) {
 	f.advance(time.Minute)
 	f.editPlan(func(p *portal.ClusterPlan) { p.Members[1].Address = "192.0.2.21" })
 	f.readPlan()
+	coldAt := f.clock()
+
+	f.portal.mu.Lock()
+	plan := f.portal.plan
+	f.portal.mu.Unlock()
+	f.o.markFormed(orchHead, plan)
+	f.advance(time.Minute)
+	f.editPlan(func(p *portal.ClusterPlan) { p.Members[1].Address = "192.0.2.31" })
+	f.readPlan()
 
 	pos := 1
-	want := []portal.ClusterAddressChangeDTO{{
-		Position: &pos, Server: "Member 1", ServerID: orchMemberServer(1),
-		From: "192.0.2.11", To: "192.0.2.21", At: f.clock(), Relaunched: true,
-	}}
+	want := []portal.ClusterAddressChangeDTO{
+		{
+			Position: &pos, Server: "Member 1", ServerID: orchMemberServer(1),
+			From: "192.0.2.21", To: "192.0.2.31", At: f.clock(), Relaunched: true,
+		},
+		{
+			Position: &pos, Server: "Member 1", ServerID: orchMemberServer(1),
+			From: "192.0.2.11", To: "192.0.2.21", At: coldAt, Relaunched: false,
+		},
+	}
 	if got := f.o.ClusterStatus(orchHead).AddressChanges; !reflect.DeepEqual(got, want) {
-		t.Fatalf("address changes = %+v, want %+v", got, want)
+		t.Fatalf("address changes = %+v, want %+v (formed: relaunched; cold: not)", got, want)
 	}
 }
 
@@ -1526,6 +1542,9 @@ func TestOrchestratorRecordsNothingForUnchangedPlan(t *testing.T) {
 // address change is noticed although nothing starts it: a pushed document
 // makes the next reconciler pass read the plan of every lan head the
 // orchestration knows, and a pass without a document change reads none.
+// The refresh only records: with the plan unchanged it does nothing at all,
+// and with a changed plan it records the notice and asks no agent, runs no
+// policy pass, and leaves the head's state, phase and gate view alone.
 func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
 	f := lanAddressFixture(t)
 	f.readPlan()
@@ -1533,9 +1552,54 @@ func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
 	plan := f.portal.plan
 	f.portal.mu.Unlock()
 	f.o.markFormed(orchHead, plan)
+	f.o.mu.Lock()
+	view := f.o.views[orchHead]
+	f.o.mu.Unlock()
+	reads := func() int {
+		f.portal.mu.Lock()
+		defer f.portal.mu.Unlock()
+		return f.portal.planReads
+	}
+	untouched := func(when string) {
+		t.Helper()
+		if calls := f.agent.recorded(); len(calls) != 0 {
+			t.Fatalf("%s: agent calls = %q, want none", when, calls)
+		}
+		f.portal.mu.Lock()
+		reconciles, version := f.portal.reconciles, f.portal.version
+		f.portal.mu.Unlock()
+		if reconciles != 0 || version != 0 {
+			t.Fatalf("%s: policy passes = %d, document version = %d, want none", when, reconciles, version)
+		}
+		st := f.o.ClusterStatus(orchHead)
+		if st.State != portal.ClusterStateFormed || st.Phase != portal.ClusterPhaseFormed {
+			t.Fatalf("%s: state = %s/%s, want formed as before", when, st.State, st.Phase)
+		}
+		f.o.mu.Lock()
+		got := f.o.views[orchHead]
+		f.o.mu.Unlock()
+		if !reflect.DeepEqual(got, view) {
+			t.Fatalf("%s: gate view = %+v, want %+v as before", when, got, view)
+		}
+	}
+
+	before := reads()
+	f.o.DocumentsChanged()
 	f.o.Reconcile(context.Background())
+	if n := reads() - before; n != 1 {
+		t.Fatalf("plan reads after a document change = %d, want one refresh", n)
+	}
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
+		t.Fatalf("unchanged refresh recorded %+v, want nothing", got)
+	}
+	untouched("unchanged plan")
+
 	f.editPlan(func(p *portal.ClusterPlan) { p.Members[0].Address = "192.0.2.30" })
+	before = reads()
 	f.o.Reconcile(context.Background())
+	if n := reads() - before; n != 0 {
+		t.Fatalf("plan reads without a document change = %d, want none", n)
+	}
 	if got := f.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
 		t.Fatalf("address changes = %+v, want none before a document changed", got)
 	}
@@ -1546,6 +1610,7 @@ func TestReconcileRecordsAddressChangeOfARunningHead(t *testing.T) {
 	if len(got) != 1 || got[0].From != "192.0.2.10" || got[0].To != "192.0.2.30" || !got[0].Relaunched {
 		t.Fatalf("address changes = %+v, want the member's change", got)
 	}
+	untouched("changed plan")
 }
 
 // TestAddressChangesForServerCollectsAcrossClusters pins the server's view of
@@ -1567,7 +1632,9 @@ func TestAddressChangesForServerCollectsAcrossClusters(t *testing.T) {
 	remember := func(plan portal.ClusterPlan) {
 		f.o.mu.Lock()
 		defer f.o.mu.Unlock()
-		f.o.rememberPlanLocked(f.o.headState(plan.Head.Spec.ID), plan)
+		st := f.o.headState(plan.Head.Spec.ID)
+		st.formed = plan.Head.Spec.ID == "rspec_a" // b is cold: its change relaunched nothing
+		f.o.rememberPlanLocked(st, plan)
 	}
 	remember(planOf("rspec_a", "srv_ha", []string{"192.0.2.1"}, member(0, shared, "192.0.2.50"), member(1, "srv_x", "192.0.2.60")))
 	remember(planOf("rspec_b", "srv_hb", []string{"192.0.2.2"}, member(0, "srv_y", "192.0.2.70"), member(1, shared, "192.0.2.50")))
@@ -1584,7 +1651,7 @@ func TestAddressChangesForServerCollectsAcrossClusters(t *testing.T) {
 	atB := f.clock()
 
 	want := []portal.ServerLANAddressChangeDTO{
-		{HeadSpecID: "rspec_b", From: "192.0.2.50", To: "192.0.2.51", At: atB, Relaunched: true},
+		{HeadSpecID: "rspec_b", From: "192.0.2.50", To: "192.0.2.51", At: atB},
 		{HeadSpecID: "rspec_c", AsHead: true, From: "192.0.2.50", To: "192.0.2.51", At: atC},
 		{HeadSpecID: "rspec_a", From: "192.0.2.50", To: "192.0.2.51", At: atA, Relaunched: true},
 	}

@@ -2205,16 +2205,18 @@ agents' telemetry and reports `cold` until then. Its read view is the head's
 
 **Address-change notice.** Each time the orchestration keeps a plan of a `lan`
 head that is not withheld, it compares it with the plan it kept before and
-records every member server whose dial address changed (`relaunched: true`:
-the address is in the head's endpoint list, so the head's agent relaunches the
-head) and a changed head identity (`relaunched: false`: the members' agents
+records every member server whose dial address changed (`relaunched: true`
+while the head is formed: the address is in the head's endpoint list, so the
+head's agent relaunches the head; `false` for a head that is not formed, whose
+next start dials the new address) and a changed head identity (`relaunched: false`: the members' agents
 apply it live). A head's first plan, a withheld plan, a reordered, added or
 removed member and a `mesh` cluster record nothing. A head keeps its five
 newest changes, in memory only, so a gateway restart starts empty: the notice
 describes recent changes, not an audit trail. Since a running cluster is
 started and stopped by nothing when one of its addresses changes, a reconciler
 pass after a pushed document also reads again the plan of every `lan` head the
-orchestration holds a plan of. The same record shows on the head's
+orchestration holds a plan of; that read only records the notice and starts,
+stops or pushes nothing. The same record shows on the head's
 `cluster_status.address_changes` and, per server across all its clusters, on
 the server's `lan_address_changes`; the head is named there only for a caller
 who may see its runtime spec.

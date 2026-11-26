@@ -305,8 +305,9 @@ const ClusterAddressChangesKept = 5
 // member's dial address (by Position), or the head's identity (Head, no
 // position) -- the addresses the members accept the head from, joined by
 // ", ". Server and ServerID name the server whose address changed. A
-// member's change relaunches the head (the address is in its endpoint
-// list); the head's identity is applied live by the members' agents, so
+// member's change relaunches a formed head (the address is in its endpoint
+// list), so Relaunched is true for it while the head is formed and false
+// otherwise; the head's identity is applied live by the members' agents, so
 // Relaunched is false for it. A member on a server the reader may not
 // manage keeps its position, the time and Relaunched only: the server and
 // its addresses are facts about that server.

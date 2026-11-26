@@ -22,7 +22,10 @@ import (
 // next, two plans of st's head that are not withheld: the head's identity
 // when it differs (applied live by the members' agents, so nothing
 // relaunches), and each member server's dial address when it differs (in
-// the head's endpoint list, so the head relaunches). A member is matched by
+// the head's endpoint list, so a formed head's agent relaunches it; a head
+// that is not formed relaunches nothing, and its next start dials the new
+// address). It only records: nothing is started, stopped or pushed. A
+// member is matched by
 // its server, so a reordered membership is no address change; a member
 // added or removed, a cluster that is or was no lan cluster, and an
 // address one plan lacks record nothing. The caller holds o.mu.
@@ -51,7 +54,7 @@ func (o *clusterOrchestrator) recordAddressChangesLocked(st *clusterHeadState, p
 		pos := m.Position
 		changes = append(changes, portal.ClusterAddressChangeDTO{
 			Position: &pos, Server: m.Server.Name, ServerID: m.Server.ID,
-			From: from, To: m.Address, At: at, Relaunched: true,
+			From: from, To: m.Address, At: at, Relaunched: st.formed,
 		})
 	}
 	if len(changes) == 0 {
@@ -113,7 +116,9 @@ func (o *clusterOrchestrator) AddressChangesForServer(serverID string) []portal.
 // each that is not withheld (rememberPlanLocked): a running cluster is
 // started and stopped by nothing when one of its addresses changes, so
 // without this pass its change would only be noticed at its next start or
-// stop. A read that fails is skipped; the next document change reads again.
+// stop. It only reads and records: it starts, stops, restages and pushes
+// nothing, and leaves the head's state and gate view as they were. A read
+// that fails is skipped; the next document change reads again.
 func (o *clusterOrchestrator) refreshLANPlans(ctx context.Context) {
 	o.mu.Lock()
 	if o.plansGen == o.docGen {

@@ -852,9 +852,10 @@ Conventions worth stating, because each is a judgement call a client depends on:
   plans of the head — a member's dial address by `position`, or the head's
   identity with `head: true` and no position, the addresses joined by `, `;
   each with `server`, `server_id`, `from`, `to`, `at` and `relaunched`,
-  `true` for a member's change, since its address is in the head's endpoint
-  list, and `false` for the head's identity, which the members' agents apply
-  live). A breach or peak of a member the caller may not see keeps only its
+  `true` for a member's change while the head is formed, since its address is
+  in the head's endpoint list — a head that is not formed relaunches nothing
+  and its next start dials the new address — and `false` for the head's
+  identity, which the members' agents apply live). A breach or peak of a member the caller may not see keeps only its
   `position`; such a member's address change keeps its `position`, `at` and
   `relaunched`. A restarted gateway starts from `cold`, with no address
   changes, and learns a running cluster again from the agents' telemetry. Beside it the head carries the read-only cluster
