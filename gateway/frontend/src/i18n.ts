@@ -1847,6 +1847,8 @@ const de = {
   // einen Pfad.
   runtimeLogsSourceLabel: 'Quelle',
   runtimeLogsSourceProcess: 'Prozess',
+  runtimeLogsFileIntro: (name: string) =>
+    `Die Zeilen, die der Modellprozess in die Log-Datei „${name}“ schreibt – bei mehreren Instanzen die jeder Instanz –, so wie sie geschrieben wurden. Der Agent liest die Datei mit, hält die Zeilen im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird vom Gateway gespeichert — weder auf der Festplatte noch in der Datenbank.`,
   runtimeLogsFileOpened: 'Datei geöffnet',
   runtimeLogsFileRotated: 'Datei rotiert – weiter in der neuen Datei',
   runtimeLogsFileTruncated: 'Datei gekürzt – erneut ab ihrem Anfang gelesen',
@@ -6112,6 +6114,8 @@ const en: PortalMessages = {
   // status names the setting to change, never a path.
   runtimeLogsSourceLabel: 'Source',
   runtimeLogsSourceProcess: 'Process',
+  runtimeLogsFileIntro: (name: string) =>
+    `The lines the model process writes to the log file "${name}" (with several instances, those of every instance), as they were written. The agent reads the file as it grows, keeps the lines in memory (across a crash, too) and only transmits them while this window is open. The gateway stores none of it — not on disk, not in the database.`,
   runtimeLogsFileOpened: 'File opened',
   runtimeLogsFileRotated: 'File rotated — continuing in the new file',
   runtimeLogsFileTruncated: 'File truncated — reading again from its start',

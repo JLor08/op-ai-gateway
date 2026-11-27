@@ -572,6 +572,10 @@ type ReportSpec = {
   setVisibleDevices: boolean;
   visibleDevicesMode: 'env' | 'args';
   idleTimeoutSeconds: number;
+  // #430: the names of the spec's declared log files, in order, for the log
+  // view's source row (a file-mode spec has no gateway document to read them
+  // from). See narrowReportLogFiles.
+  logFiles: string[];
 };
 
 type ReportConfig = {
@@ -584,6 +588,41 @@ type ReportConfig = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// The log-file rules the agent's own ParseConfig enforces (#430), re-checked
+// here because the report config is `unknown`: only names the agent could
+// have accepted become source tabs.
+const reportLogFileNamePattern = /^[A-Za-z0-9._-]{1,32}$/;
+const reportLogFilesMax = 4;
+
+/**
+ * The declared log file NAMES of a report spec's `log_files` (paths are not
+ * needed by the view). A name must match the agent's pattern and must not be
+ * the reserved `process`; a repeat (case-insensitively) is dropped; at most
+ * four are kept. An entry that is not a record with a string name is a shape
+ * the report should not have and flags the config as unrecognised.
+ */
+function narrowReportLogFiles(value: unknown, flag: { unrecognised: boolean }): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    flag.unrecognised = true;
+    return [];
+  }
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.name !== 'string') {
+      flag.unrecognised = true;
+      continue;
+    }
+    const key = entry.name.toLowerCase();
+    if (!reportLogFileNamePattern.test(entry.name) || key === 'process' || seen.has(key)) continue;
+    if (names.length >= reportLogFilesMax) break;
+    seen.add(key);
+    names.push(entry.name);
+  }
+  return names;
 }
 
 // A spec entry with no usable identity cannot be rendered as a row at all
@@ -627,6 +666,7 @@ function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): Repo
     visibleDevicesMode: value.visible_devices_mode === 'args' ? 'args' : 'env',
     idleTimeoutSeconds:
       typeof value.idle_timeout_seconds === 'number' ? value.idle_timeout_seconds : 0,
+    logFiles: narrowReportLogFiles(value.log_files, flag),
   };
 }
 
@@ -4539,8 +4579,10 @@ export function RuntimeAdminSection({
             ) : null}
             {/* #430: the end of each declared log file at the failed
                 generation, one section per file, as text. */}
-            {(err.log_file_tails ?? []).map((file) => (
-              <Fragment key={file.name}>
+            {(err.log_file_tails ?? []).map((file, i) => (
+              // Index-qualified: the gateway filters tail names by pattern but
+              // not for uniqueness, and each section is stateless text.
+              <Fragment key={`${i}:${file.name}`}>
                 <Typography variant="caption">{t.runtimeLastErrorLogFile(file.name)}:</Typography>
                 <Box
                   component="pre"
@@ -4809,6 +4851,16 @@ export function RuntimeAdminSection({
     },
   ];
 
+  // The declared log file names of the spec a status row belongs to: from the
+  // gateway's document, else -- a file-mode spec has none -- from the agent's
+  // report, whose spec `id` is the base spec ID a status row's `spec_id`
+  // carries (the agent reports specBase for every instance).
+  function logFileNamesFor(specId: string): string[] {
+    const spec = specByRuntimeId.get(specId);
+    if (spec) return (spec.log_files ?? []).map((f) => f.name);
+    return reportConfig?.specs.find((s) => s.id === specId)?.logFiles ?? [];
+  }
+
   function statusActions(row: RuntimeStatus): RowAction[] {
     // The log view comes FIRST, and before every gate below it, deliberately.
     // Reading what a process printed is not a write, so it is available in
@@ -4840,7 +4892,7 @@ export function RuntimeAdminSection({
             // It opens on the tab of the instance whose row was clicked.
             initialTab: instanceIndex(row),
             // #430: one source tab per declared log file, in declaration order.
-            logFiles: (specByRuntimeId.get(row.spec_id)?.log_files ?? []).map((f) => f.name),
+            logFiles: logFileNamesFor(row.spec_id),
           }),
       },
     ];

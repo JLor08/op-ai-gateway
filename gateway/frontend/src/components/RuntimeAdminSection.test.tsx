@@ -14253,4 +14253,62 @@ describe('RuntimeAdminSection declared log files', () => {
     expect(text.indexOf('stderr says bye')).toBeLessThan(text.indexOf('engine: <b>fatal</b>'));
     expect(text.indexOf('engine: <b>fatal</b>')).toBeLessThan(text.indexOf('GET /health 500'));
   });
+
+  // A file-mode agent's specs exist only in its report; its declared log files
+  // reach the view from there, narrowed defensively (the config is unknown).
+  it("takes a file-mode spec's log files from the agent's report", async () => {
+    const { stream } = renderSection({
+      report: fileModeReport(
+        {
+          specs: [
+            {
+              id: 'spec_1',
+              model: 'app-model',
+              log_files: [
+                { name: 'engine', path: '${CONFIG_DIR}/engine.log' },
+                { name: 'Process', path: '/var/log/p.log' },
+                { name: 'ENGINE', path: '/var/log/dup.log' },
+                { name: 'bad/name', path: '/var/log/bad.log' },
+                { path: '/var/log/nameless.log' },
+                'not-a-record',
+                { name: 'a', path: '/var/log/a.log' },
+                { name: 'b', path: '/var/log/b.log' },
+                { name: 'c', path: '/var/log/c.log' },
+                { name: 'd', path: '/var/log/d.log' },
+              ],
+            },
+          ],
+        },
+        {},
+        { agent_version: '0.26.0', agent_features: ['runtime_manager', 'runtime_log_files'] },
+      ),
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'app-model' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('app-model');
+    fireEvent.click(inRowWith('app-model').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    const sources = within(dialog).getByRole('tablist', { name: t.runtimeLogsSourceLabel });
+    expect(
+      within(sources)
+        .getAllByRole('tab')
+        .map((tab) => tab.textContent),
+    ).toEqual([t.runtimeLogsSourceProcess, 'engine', 'a', 'b', 'c']);
+  });
+
+  it('shows no source row for a file-mode spec without log files', async () => {
+    const { stream } = renderSection({
+      report: fileModeReport({ specs: [{ id: 'spec_1', model: 'app-model' }] }),
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'app-model' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('app-model');
+    fireEvent.click(inRowWith('app-model').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).queryAllByRole('tablist')).toHaveLength(0);
+  });
 });

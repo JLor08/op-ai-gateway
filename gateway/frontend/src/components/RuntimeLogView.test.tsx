@@ -1160,6 +1160,112 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(logText()).toContain(t.runtimeLogsDropped(333));
     });
 
+    // Fix round 1: one stream must never evict another from the view. Each
+    // stream has its own bounded window, its own trim count and its own
+    // command-gap check.
+    it('keeps the process lines when a busy file overflows its own window', () => {
+      const h = renderLogView(false, undefined, { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { event: 'started', pid: 7 },
+          { text: 'proc-line\n' },
+          ...Array.from({ length: maxRenderedEntries + 10 }, () => ({
+            text: 'engine-line\n',
+            stream: 'engine',
+          })),
+        ],
+      });
+      expect(logText()).toContain('proc-line');
+      expect(screen.queryByText(t.runtimeLogsEmptyBuffer)).not.toBeInTheDocument();
+      // The file's trim is the file window's, not the process tab's.
+      expect(screen.queryByText(t.runtimeLogsTrimmed(120))).not.toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeCommandNotRetained)).not.toBeInTheDocument();
+
+      selectTab('engine');
+      // 10 entries of 'engine-line\n' (12 bytes each) left this window.
+      expect(screen.getByText(t.runtimeLogsTrimmed(120))).toBeInTheDocument();
+    });
+
+    it("keeps a file's status when a process flood overflows the process window", () => {
+      const h = renderLogView(false, undefined, { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [{ event: 'file_not_permitted', stream: 'engine' }],
+      });
+      h.batch({
+        spec_id: 'spec-a',
+        entries: Array.from({ length: maxRenderedEntries + 5 }, () => ({ text: 'p\n' })),
+      });
+      expect(screen.getByText(t.runtimeLogsTrimmed(10))).toBeInTheDocument();
+
+      selectTab('engine');
+      expect(screen.getByText(t.runtimeLogsFileNotPermitted)).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeLogsTrimmed(10))).not.toBeInTheDocument();
+    });
+
+    it('clears every stream on a second scrollback', () => {
+      const h = renderLogView(false, undefined, { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [{ text: 'old-engine\n', stream: 'engine' }],
+      });
+      h.batch({ spec_id: 'spec-a', scrollback: true, entries: [{ text: 'proc\n' }] });
+      selectTab('engine');
+      expect(logText()).not.toContain('old-engine');
+      expect(screen.getByText(t.runtimeLogsFileEmpty)).toBeInTheDocument();
+    });
+
+    it('states a status under All only when every instance shares it', () => {
+      const h = renderLogView(true, [0, 1], { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { event: 'file_opened', stream: 'engine', instance: 1 },
+          { event: 'file_not_permitted', stream: 'engine' },
+        ],
+      });
+      selectTab('engine');
+      // Instance 0's refusal is not instance 1's: All must not claim it for
+      // both (and in the other order, instance 1's file_opened must not read
+      // as having cleared instance 0's refusal).
+      expect(screen.queryByText(t.runtimeLogsFileNotPermitted)).not.toBeInTheDocument();
+      selectTab(t.runtimeLogsTabInstance(0));
+      expect(screen.getByText(t.runtimeLogsFileNotPermitted)).toBeInTheDocument();
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(screen.queryByText(t.runtimeLogsFileNotPermitted)).not.toBeInTheDocument();
+
+      h.batch({
+        spec_id: 'spec-a',
+        entries: [{ event: 'file_missing', stream: 'engine', instance: 1 }],
+      });
+      h.batch({ spec_id: 'spec-a', entries: [{ event: 'file_missing', stream: 'engine' }] });
+      selectTab(t.runtimeLogsTabAll);
+      expect(screen.getByText(t.runtimeLogsFileMissing)).toBeInTheDocument();
+    });
+
+    it('names a file tab by its file, with a neutral title, and the process tab as before', () => {
+      renderLogView(false, undefined, { logFiles: ['engine'] });
+      const title = () => screen.getByRole('heading').textContent;
+      expect(title()).toBe(`${t.runtimeLogsTitle} — qwen-coder`);
+      expect(screen.getByText(t.runtimeLogsIntro)).toBeInTheDocument();
+      expect(screen.getByRole('log')).toHaveAccessibleName(t.runtimeLogsTitle);
+
+      selectTab('engine');
+      expect(title()).toBe(`${t.runtimeLogs} — qwen-coder`);
+      expect(screen.getByText(t.runtimeLogsFileIntro('engine'))).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeLogsIntro)).not.toBeInTheDocument();
+      expect(screen.getByRole('log')).toHaveAccessibleName(t.runtimeLogs);
+    });
+
     it('opens on the process source every time, whichever source was selected when it closed', () => {
       const api = { subscribeRuntimeLogs: vi.fn(() => () => {}) };
       const props = {
