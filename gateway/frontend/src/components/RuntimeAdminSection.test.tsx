@@ -14170,3 +14170,87 @@ describe('RuntimeAdminSection strata run-config import', () => {
     expect(screen.queryByLabelText(t.runtimeSpecConfigFileName)).not.toBeInTheDocument();
   });
 });
+
+// #430: a spec's declared log files reach the live log as a second row of tabs,
+// and a failed generation's file tails reach the last-error tooltip.
+describe('RuntimeAdminSection declared log files', () => {
+  function renderWithLogFiles(report?: RuntimeReport, lastError?: RuntimeStatus['last_error']) {
+    const handles = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: fullSpec({
+          log_files: [
+            { name: 'engine', path: '${CONFIG_DIR}/engine.log' },
+            { name: 'access', path: '/var/log/model/access.log' },
+          ],
+        }),
+      },
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'app-model', last_error: lastError })],
+      ...(report ? { report } : {}),
+    });
+    handles.stream.setStatus('open');
+    return handles;
+  }
+
+  it("passes the spec's declared log files to the log view, in order", async () => {
+    renderWithLogFiles(
+      makeReport({ agent_version: '0.26.0', agent_features: ['runtime_log_files'] }),
+    );
+    await openStatusTab();
+    await screen.findByText('Alpha');
+    fireEvent.click(inRowWith('Alpha').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    const sources = within(dialog).getByRole('tablist', { name: t.runtimeLogsSourceLabel });
+    expect(
+      within(sources)
+        .getAllByRole('tab')
+        .map((tab) => tab.textContent),
+    ).toEqual([t.runtimeLogsSourceProcess, 'engine', 'access']);
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'engine' }));
+    expect(within(dialog).queryByText(t.runtimeLogsFileUnsupported)).not.toBeInTheDocument();
+  });
+
+  it('tells the log view when the agent lacks runtime_log_files', async () => {
+    renderWithLogFiles(makeReport({ agent_version: '0.25.2', agent_features: ['runtime_logs'] }));
+    await openStatusTab();
+    await screen.findByText('Alpha');
+    fireEvent.click(inRowWith('Alpha').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'engine' }));
+    expect(within(dialog).getByText(t.runtimeLogsFileUnsupported)).toBeInTheDocument();
+  });
+
+  it('renders one section per log file tail under the stderr tail, as text', async () => {
+    renderWithLogFiles(undefined, {
+      message: 'exited with code 1',
+      at: '2026-11-27T10:00:00Z',
+      exit_code: 1,
+      failures: 1,
+      stderr_tail: 'stderr says bye',
+      log_file_tails: [
+        { name: 'engine', tail: 'engine: <b>fatal</b> error' },
+        { name: 'access', tail: 'GET /health 500' },
+      ],
+    });
+    await openStatusTab();
+
+    fireEvent.mouseOver(await screen.findByText('exited with code 1'));
+    const tooltip = await screen.findByRole('tooltip');
+    expect(
+      within(tooltip).getByText(`${t.runtimeLastErrorLogFile('engine')}:`),
+    ).toBeInTheDocument();
+    expect(
+      within(tooltip).getByText(`${t.runtimeLastErrorLogFile('access')}:`),
+    ).toBeInTheDocument();
+    // Text, never HTML.
+    expect(within(tooltip).getByText('engine: <b>fatal</b> error')).toBeInTheDocument();
+    expect(tooltip.querySelector('b')).toBeNull();
+    expect(within(tooltip).getByText('GET /health 500')).toBeInTheDocument();
+    // Below the stderr tail, in the order the agent sent them.
+    const text = tooltip.textContent ?? '';
+    expect(text.indexOf('stderr says bye')).toBeLessThan(text.indexOf('engine: <b>fatal</b>'));
+    expect(text.indexOf('engine: <b>fatal</b>')).toBeLessThan(text.indexOf('GET /health 500'));
+  });
+});

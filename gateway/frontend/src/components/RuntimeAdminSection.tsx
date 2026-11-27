@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useCallback, useEffect, useMemo, useRef, useState, type SubmitEvent } from 'react';
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type SubmitEvent,
+} from 'react';
 import {
   Alert,
   Box,
@@ -2295,6 +2303,9 @@ export function RuntimeAdminSection({
     allInstances: boolean;
     instances: number[];
     initialTab: number;
+    // #430: the names of the spec's declared log files, which add the view's
+    // source row.
+    logFiles: string[];
   } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   // The live-status Start and Stop requests in flight, keyed per action and
@@ -4526,6 +4537,19 @@ export function RuntimeAdminSection({
                 </Box>
               </>
             ) : null}
+            {/* #430: the end of each declared log file at the failed
+                generation, one section per file, as text. */}
+            {(err.log_file_tails ?? []).map((file) => (
+              <Fragment key={file.name}>
+                <Typography variant="caption">{t.runtimeLastErrorLogFile(file.name)}:</Typography>
+                <Box
+                  component="pre"
+                  sx={{ m: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontSize: 12 }}
+                >
+                  {file.tail}
+                </Box>
+              </Fragment>
+            ))}
           </Box>
         }
       >
@@ -4815,6 +4839,8 @@ export function RuntimeAdminSection({
             instances: logInstanceIndexes(statusRows, row.spec_id),
             // It opens on the tab of the instance whose row was clicked.
             initialTab: instanceIndex(row),
+            // #430: one source tab per declared log file, in declaration order.
+            logFiles: (specByRuntimeId.get(row.spec_id)?.log_files ?? []).map((f) => f.name),
           }),
       },
     ];
@@ -6971,6 +6997,10 @@ export function RuntimeAdminSection({
           allInstances={logSpec.allInstances}
           instances={logSpec.instances}
           initialTab={logSpec.initialTab}
+          logFiles={logSpec.logFiles}
+          // Before the report GET settles the agent's features are unknown;
+          // unknown is not "too old", so the file tabs do not say it is.
+          logFilesSupported={!reportReady || agentFeatures.includes('runtime_log_files')}
         />
       )}
     </>

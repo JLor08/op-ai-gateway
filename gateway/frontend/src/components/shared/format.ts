@@ -140,6 +140,10 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   // file and the rule, but a mapped code renders THIS label instead of it, so
   // the label states every rule rather than one.
   'runtime_spec.config_files_invalid': 'errorRuntimeSpecConfigFilesInvalid',
+  // #430: a log_files list the service refused (portalRuntimeSpecErrRows).
+  // As above, the label replaces the 400's own message, so it states every
+  // rule of validateRuntimeSpecLogFiles rather than one.
+  'runtime_spec.log_files_invalid': 'errorRuntimeSpecLogFilesInvalid',
   // #340: the instance settings' two refusals (portalRuntimeSpecErrRows): a
   // minimum above a set maximum or a count above the agent's cap of 64, and a
   // replicable spec on a fixed listen_port.

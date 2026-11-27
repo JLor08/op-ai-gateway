@@ -2,8 +2,8 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { maxRenderedEntries, RuntimeLogView } from './RuntimeLogView';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { fileStatus, maxRenderedEntries, RuntimeLogView, streamView } from './RuntimeLogView';
 import { messages, type Locale } from '../i18n';
 import type { RuntimeLogBatch, RuntimeLogState } from '../api';
 
@@ -20,7 +20,11 @@ afterEach(cleanup);
 for (const locale of ['de', 'en'] as readonly Locale[]) {
   const t = messages[locale];
 
-  function renderLogView(allInstances?: boolean, instances?: readonly number[]) {
+  function renderLogView(
+    allInstances?: boolean,
+    instances?: readonly number[],
+    files?: { logFiles?: readonly string[]; logFilesSupported?: boolean },
+  ) {
     let pushBatch: (batch: RuntimeLogBatch) => void = () => {};
     let pushState: (state: RuntimeLogState) => void = () => {};
     let unsubscribes = 0;
@@ -55,6 +59,8 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         title="qwen-coder"
         allInstances={allInstances}
         instances={instances}
+        logFiles={files?.logFiles}
+        logFilesSupported={files?.logFilesSupported}
       />,
     );
     return {
@@ -905,5 +911,313 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // what this pins is that "expanded" never crosses BETWEEN generations.)
       expect(screen.queryByText('40002')).not.toBeInTheDocument();
     });
+
+    // #430: a spec may declare log files the agent tails beside the process
+    // output; each is its own stream, and the view offers a second row of tabs
+    // -- the source -- below the instance row (design §11.1, variant B).
+    const sourceTabs = () =>
+      within(screen.getByRole('tablist', { name: t.runtimeLogsSourceLabel }))
+        .getAllByRole('tab')
+        .map((tab) => tab.textContent);
+
+    it('shows no source row for a spec without log files, so the dialog looks as before', () => {
+      const h = renderLogView();
+      h.state('streaming');
+      h.batch({ spec_id: 'spec-a', scrollback: true, entries: [{ text: 'plain output\n' }] });
+      expect(screen.queryAllByRole('tablist')).toHaveLength(0);
+      expect(screen.queryAllByRole('tab')).toHaveLength(0);
+      cleanup();
+
+      // An empty declaration is no declaration.
+      renderLogView(true, [0, 1], { logFiles: [] });
+      expect(screen.getAllByRole('tablist')).toHaveLength(1);
+      expect(
+        screen.queryByRole('tablist', { name: t.runtimeLogsSourceLabel }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('offers the process and one tab per declared file, and shows only the selected stream', () => {
+      const h = renderLogView(false, undefined, { logFiles: ['engine', 'access'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { event: 'started', pid: 7 },
+          { text: 'process says hi\n' },
+          { event: 'file_opened', stream: 'engine' },
+          { text: 'engine line\n', stream: 'engine' },
+          { text: 'access line\n', stream: 'access' },
+          // An undeclared stream is never rendered, in no tab.
+          { text: 'stray line\n', stream: 'other' },
+        ],
+      });
+      expect(sourceTabs()).toEqual([t.runtimeLogsSourceProcess, 'engine', 'access']);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsSourceProcess })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+      // No instance row for a spec that is not replicable.
+      expect(screen.getAllByRole('tablist')).toHaveLength(1);
+      for (const tab of screen.getAllByRole('tab')) {
+        expect(tab).toHaveAttribute('aria-controls', screen.getByRole('log').id);
+      }
+      expect(logText()).toContain('process says hi');
+      expect(logText()).not.toContain('engine line');
+      expect(logText()).not.toContain('stray line');
+
+      selectTab('engine');
+      expect(logText()).toContain(`── ${t.runtimeLogsFileOpened} ──`);
+      expect(logText()).toContain('engine line');
+      expect(logText()).not.toContain('process says hi');
+      expect(logText()).not.toContain(t.runtimeLogsProcessStarted(7));
+      expect(logText()).not.toContain('access line');
+      expect(logText()).not.toContain('stray line');
+      // The file has no generation marker of its own: no "command missing".
+      expect(screen.queryByText(t.runtimeCommandNotRetained)).not.toBeInTheDocument();
+
+      selectTab('access');
+      expect(logText()).toContain('access line');
+      expect(logText()).not.toContain('engine line');
+    });
+
+    it('renders the file markers as portal-authored lines', () => {
+      const h = renderLogView(false, undefined, { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { event: 'file_opened', stream: 'engine' },
+          { event: 'file_rotated', stream: 'engine' },
+          { event: 'file_truncated', stream: 'engine' },
+          { event: 'file_line_cut', stream: 'engine' },
+          { event: 'file_stale', stream: 'engine' },
+        ],
+      });
+      selectTab('engine');
+      for (const label of [
+        t.runtimeLogsFileOpened,
+        t.runtimeLogsFileRotated,
+        t.runtimeLogsFileTruncated,
+        t.runtimeLogsFileLineCut,
+        t.runtimeLogsFileStale,
+      ]) {
+        expect(logText()).toContain(`── ${label} ──`);
+      }
+    });
+
+    it('keeps the source across instance switches and the instance across source switches', () => {
+      const h = renderLogView(true, [0, 1], { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { text: 'zero process\n' },
+          { text: '[#1] one process\n', instance: 1 },
+          { text: 'zero engine\n', stream: 'engine' },
+          { text: '[#1] one engine\n', stream: 'engine', instance: 1 },
+        ],
+      });
+      expect(screen.getAllByRole('tablist')).toHaveLength(2);
+
+      selectTab('engine');
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(screen.getByRole('tab', { name: 'engine' })).toHaveAttribute('aria-selected', 'true');
+      expect(logText()).toContain('one engine');
+      expect(logText()).not.toContain('[#1]');
+      expect(logText()).not.toContain('zero engine');
+      expect(logText()).not.toContain('one process');
+
+      selectTab(t.runtimeLogsSourceProcess);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabInstance(1) })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+      expect(logText()).toContain('one process');
+      expect(logText()).not.toContain('one engine');
+    });
+
+    it('interleaves every instance of a file under All, each line with its [#k] prefix', () => {
+      const h = renderLogView(true, [0, 1], { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { text: 'zero engine\n', stream: 'engine' },
+          { text: '[#1] one engine\n', stream: 'engine', instance: 1 },
+          { text: 'zero process\n' },
+        ],
+      });
+      selectTab('engine');
+      expect(screen.getByRole('tab', { name: t.runtimeLogsTabAll })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+      expect(logText()).toContain('[#0] zero engine\n[#1] one engine\n');
+      expect(logText()).not.toContain('zero process');
+    });
+
+    it('says why a file tab is empty: waiting, not permitted, binary, missing', () => {
+      const cases: [string, string][] = [
+        ['file_waiting', t.runtimeLogsFileWaiting],
+        ['file_not_permitted', t.runtimeLogsFileNotPermitted],
+        ['file_binary', t.runtimeLogsFileBinary],
+        ['file_missing', t.runtimeLogsFileMissing],
+      ];
+      for (const [event, sentence] of cases) {
+        const h = renderLogView(false, undefined, { logFiles: ['engine'] });
+        h.state('streaming');
+        h.batch({
+          spec_id: 'spec-a',
+          scrollback: true,
+          entries: [{ text: 'process line\n' }, { event, stream: 'engine' }],
+        });
+        // The process tab says nothing about the file.
+        expect(screen.queryByText(sentence)).not.toBeInTheDocument();
+        selectTab('engine');
+        expect(screen.getByText(sentence)).toBeInTheDocument();
+        cleanup();
+      }
+    });
+
+    it('names the settings behind a status sentence, never a path', () => {
+      expect(t.runtimeLogsFileNotPermitted).toContain('runtime_allowed_log_dirs');
+      expect(t.runtimeLogsFileUnsupported).toContain('runtime_log_files');
+    });
+
+    it('drops the waiting sentence once the file is opened, and says a quiet file is empty', () => {
+      const h = renderLogView(false, undefined, { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [{ text: 'process line\n' }],
+      });
+      selectTab('engine');
+      // Nothing of the file has arrived at all.
+      expect(screen.getByText(t.runtimeLogsFileEmpty)).toBeInTheDocument();
+
+      h.batch({ spec_id: 'spec-a', entries: [{ event: 'file_waiting', stream: 'engine' }] });
+      expect(screen.getByText(t.runtimeLogsFileWaiting)).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeLogsFileEmpty)).not.toBeInTheDocument();
+
+      h.batch({ spec_id: 'spec-a', entries: [{ event: 'file_opened', stream: 'engine' }] });
+      expect(screen.queryByText(t.runtimeLogsFileWaiting)).not.toBeInTheDocument();
+      expect(screen.getByText(t.runtimeLogsFileEmpty)).toBeInTheDocument();
+
+      h.batch({ spec_id: 'spec-a', entries: [{ text: 'engine up\n', stream: 'engine' }] });
+      expect(screen.queryByText(t.runtimeLogsFileEmpty)).not.toBeInTheDocument();
+    });
+
+    it('shows the source row for an agent without runtime_log_files, and says why the file tab stays empty', () => {
+      const h = renderLogView(false, undefined, {
+        logFiles: ['engine'],
+        logFilesSupported: false,
+      });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [{ event: 'started', pid: 7 }, { text: 'process line\n' }],
+      });
+      expect(sourceTabs()).toEqual([t.runtimeLogsSourceProcess, 'engine']);
+      // The process tab is unchanged.
+      expect(logText()).toContain('process line');
+      expect(screen.queryByText(t.runtimeLogsFileUnsupported)).not.toBeInTheDocument();
+
+      selectTab('engine');
+      expect(screen.getByText(t.runtimeLogsFileUnsupported)).toBeInTheDocument();
+      expect(screen.queryByText(t.runtimeLogsFileEmpty)).not.toBeInTheDocument();
+    });
+
+    it('says the agent is too old in a file tab even while its whole buffer is empty', () => {
+      const h = renderLogView(true, [0, 1], { logFiles: ['engine'], logFilesSupported: false });
+      h.state('streaming');
+      h.batch({ spec_id: 'spec-a', scrollback: true, entries: [] });
+      selectTab('engine');
+      expect(screen.getByText(t.runtimeLogsFileUnsupported)).toBeInTheDocument();
+      selectTab(t.runtimeLogsTabInstance(1));
+      expect(screen.getByText(t.runtimeLogsFileUnsupported)).toBeInTheDocument();
+    });
+
+    it("shows a file stream's gap only in that file's tab", () => {
+      const h = renderLogView(false, undefined, { logFiles: ['engine'] });
+      h.state('streaming');
+      h.batch({
+        spec_id: 'spec-a',
+        scrollback: true,
+        entries: [
+          { text: 'process line\n' },
+          { dropped_bytes: 333, stream: 'engine' },
+          { text: 'engine line\n', stream: 'engine' },
+        ],
+      });
+      expect(logText()).not.toContain(t.runtimeLogsDropped(333));
+      selectTab('engine');
+      expect(logText()).toContain(t.runtimeLogsDropped(333));
+    });
+
+    it('opens on the process source every time, whichever source was selected when it closed', () => {
+      const api = { subscribeRuntimeLogs: vi.fn(() => () => {}) };
+      const props = {
+        onClose: () => {},
+        api,
+        t,
+        serverId: 'srv-1',
+        specId: 'spec-a',
+        title: 'qwen-coder',
+        logFiles: ['engine'],
+      };
+      const view = render(<RuntimeLogView open {...props} />);
+      selectTab('engine');
+      expect(screen.getByRole('tab', { name: 'engine' })).toHaveAttribute('aria-selected', 'true');
+      view.rerender(<RuntimeLogView open={false} {...props} />);
+      view.rerender(<RuntimeLogView open {...props} />);
+      expect(screen.getByRole('tab', { name: t.runtimeLogsSourceProcess })).toHaveAttribute(
+        'aria-selected',
+        'true',
+      );
+    });
   });
 }
+
+describe('streamView', () => {
+  it('keeps the process entries for the empty source and a declared stream for its name', () => {
+    const entries = [
+      { text: 'p\n' },
+      { text: 'e\n', stream: 'engine' },
+      { dropped_bytes: 3 },
+      { dropped_bytes: 4, stream: 'engine' },
+    ];
+    expect(streamView(entries, '')).toEqual([{ text: 'p\n' }, { dropped_bytes: 3 }]);
+    expect(streamView(entries, 'engine')).toEqual([
+      { text: 'e\n', stream: 'engine' },
+      { dropped_bytes: 4, stream: 'engine' },
+    ]);
+  });
+});
+
+describe('fileStatus', () => {
+  it('is the latest status among the shown entries, and none once the file is opened', () => {
+    expect(fileStatus([])).toBeNull();
+    expect(fileStatus([{ text: 'x\n' }, { event: 'file_rotated' }])).toBeNull();
+    expect(fileStatus([{ event: 'file_waiting' }])).toBe('waiting');
+    expect(fileStatus([{ event: 'file_waiting' }, { event: 'file_opened' }])).toBeNull();
+    expect(
+      fileStatus([{ event: 'file_waiting' }, { event: 'file_opened' }, { event: 'file_binary' }]),
+    ).toBe('binary');
+    expect(
+      fileStatus([
+        { event: 'file_opened' },
+        { text: 'a\n' },
+        { event: 'file_waiting' },
+        { event: 'file_missing' },
+        { event: 'file_rotated' },
+      ]),
+    ).toBe('missing');
+    expect(fileStatus([{ event: 'file_not_permitted' }])).toBe('not_permitted');
+  });
+});

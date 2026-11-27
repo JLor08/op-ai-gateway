@@ -714,7 +714,11 @@ export interface RuntimeStatus {
 //    failed, so it has no pid, will produce no output, and has no exit code
 //    coming. The portal owns the wording, which is why the set is closed -- an
 //    agent must not be able to put free text where the operator reads a
-//    portal-authored sentence.
+//    portal-authored sentence. An entry with a `stream` (#430) carries file
+//    events from the same closed set instead: the markers 'file_opened',
+//    'file_rotated', 'file_truncated', 'file_line_cut', 'file_stale', and the
+//    statuses 'file_waiting', 'file_not_permitted', 'file_binary',
+//    'file_missing'. A file entry has no pid, no exit code and no command.
 //
 // `command` appears ONLY on an opening marker ('started' / 'start_failed') and
 // carries that generation's resolved launch command. Render it as part of that
