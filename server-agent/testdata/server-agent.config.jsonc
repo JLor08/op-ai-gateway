@@ -238,9 +238,10 @@
 
   // Ceiling on the SUM of those buffers across every spec, in BYTES, so a
   // server with twenty specs is not twenty times the number above. 0 (the
-  // default) means 16777216 (16 MiB). The agent keeps at most
-  // total/per-spec buffers, evicting the least-recently-written one nobody is
-  // watching to stay inside the ceiling.
+  // default) means 16777216 (16 MiB). It is a hard bound over every ring --
+  // the process output and each declared log file have one of their own --
+  // kept by dropping whole specs nobody is watching, least-recently-written
+  // first. Raised to at least the number above plus 4 x 64 KiB.
   "runtime_log_buffer_total_bytes": 0,
 
   // Skip TLS certificate verification. Self-signed dev gateways only. Default false.

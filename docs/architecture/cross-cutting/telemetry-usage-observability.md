@@ -386,7 +386,9 @@ evidence is not stamped on a failed write:
   in the volatile runtime-status registry — see [API Compatibility &
   Inference §3.4](compatibility-and-inference.md#34-openai-images-generations)),
   and `last_error` of `{message, at, exit_code, failures,
-  stderr_tail}`. When a runtime driver is active it **also overrides
+  stderr_tail, code, log_file_tails}` (`log_file_tails`: the end of each declared
+  log file of the failed generation, agent 0.26.0,
+  [Agent-Managed Model Runtime §14.9](agent-runtime-manager.md#149-log-files)). When a runtime driver is active it **also overrides
   `loaded_models`** to
   contain only specs in state `running` — `starting` deliberately does not count,
   because prefer-loaded routing must never send traffic to a model that cannot
@@ -445,8 +447,9 @@ Two absent-vs-empty rules on `runtimes` are contracts, not incidental:
 
 The gateway-side runtime status this feeds is held in a **volatile in-RAM
 registry and never persisted** (a stderr tail can carry prompt fragments, which
-the payload-capture policy forbids at rest); `last_error.stderr_tail` is clamped
-on ingest.
+the payload-capture policy forbids at rest, and so can a log file's tail);
+`last_error.stderr_tail` and `last_error.log_file_tails` are clamped on ingest
+(`clampRuntimeLogFileTails`: at most four entries, each kept to its last 2048 bytes).
 
 **`gpus[]` has two independent consumers, and they answer different
 questions.** The write-back below persists it onto the spec's GPU row — the
@@ -1814,7 +1817,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-117-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-118-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -2318,7 +2321,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-117-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-118-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open

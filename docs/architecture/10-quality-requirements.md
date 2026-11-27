@@ -23,6 +23,7 @@ refine the quality goals in [1.3](01-introduction-and-goals.md#13-quality-goals)
 | Q9 | Agent portability | The agent runs on Linux/Windows/macOS, unprivileged. | It collects the richest telemetry each platform allows without elevated rights and degrades gracefully where a source needs privileges. |
 | Q10 | Availability | A transient dependency error occurs in a reconcile loop (cert/netbird/route). | The healthy resource is kept; only a definitive empty result tears it down. |
 | Q11 | Adaptability | A new backend model server or a new brand theme is added. | Model server: a new provider adapter behind the provider interface. Theme: a data-only theme dropped into the themes directory, no rebuild. |
+| Q12 | Security | A runtime spec names a log file the agent should not read: outside the instance's `${CONFIG_DIR}` and every `runtime_allowed_log_dirs` entry, or reached through `..`, a symlink, a junction, a hard link, a UNC or device path. | The agent refuses it (`file_not_permitted` on that file's stream) and never reads a byte; the refusal names the setting and a count, never a path; the start of the model is unaffected ([Agent-Managed Model Runtime §3.1.3](cross-cutting/agent-runtime-manager.md#313-runtime_allowed_log_dirs-which-files-the-agent-may-read), [ADR-121](09-architecture-decisions.md#adr-121--the-agent-may-read-files-the-gateway-names-under-these-rules)). |
 
 ## 10.3 How quality is verified
 

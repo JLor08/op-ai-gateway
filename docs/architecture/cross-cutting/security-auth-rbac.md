@@ -638,6 +638,19 @@ documenting: **once permitted directories are configured, a spec with an empty
 on every spec — otherwise every spec fails with an inexplicable
 `not_permitted`.
 
+What the agent may **read** for the gateway is a separate boundary with its own
+rules. A spec can name log files for the agent to tail into the live log
+(`log_files`, agent 0.26.0), and the agent opens one only strictly below the
+instance's own `${CONFIG_DIR}` or an entry of the agent-local
+`runtime_allowed_log_dirs` (**empty means `${CONFIG_DIR}` only**). Unlike the
+lexical `work_dir` check above, this containment is anchored: the open goes
+through an `os.Root` at the matched directory, so a symlink, junction or `..` out
+of it is refused by construction, and a file with more than one hard link is
+refused too. Refusals name the setting, never a path, and the agent masks literal
+occurrences of its own resolved secrets in the text before it is retained
+([Agent-Managed Model Runtime §3.1.3](agent-runtime-manager.md#313-runtime_allowed_log_dirs-which-files-the-agent-may-read),
+[ADR-121](../09-architecture-decisions.md#adr-121--the-agent-may-read-files-the-gateway-names-under-these-rules)).
+
 Authorization for runtime *writes* introduces no new RBAC rule: it is exactly the
 model-mapping write rule — `system` scope, membership in the server's owner list,
 or admin-group delegation carrying `can_manage_servers`. **Plain `admin` is not
