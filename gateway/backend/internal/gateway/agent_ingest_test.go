@@ -128,7 +128,7 @@ func specGPUVendors(t *testing.T, srv *Server, specID string) []string {
 	return out
 }
 
-func TestHardwareReportBackfillsLegacyVendorOnce(t *testing.T) {
+func TestHardwareReportBackfillsLegacyVendorAndRepeatIsQuiet(t *testing.T) {
 	ctx := context.Background()
 	srv := NewTestServer()
 	spy := &clusterNotifySpy{API: srv.Portal}

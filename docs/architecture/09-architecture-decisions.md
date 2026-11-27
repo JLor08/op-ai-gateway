@@ -14407,8 +14407,20 @@ members exist only for an agent with the second.
   deliberate (refuse rather than guess); the operator checks such hosts' specs before
   the upgrade ([Agent-Managed Model Runtime §3.10](cross-cutting/agent-runtime-manager.md#310-mixed-vendor-gpu-hosts)).
 - A host with both GPU tools on `PATH` but cards of one vendor resolved `auto` to
-  Vulkan before (tool detection); it now gets the native backend at the next
-  start, since `auto` follows the spec's GPUs and the reported cards.
+  Vulkan before (tool detection). Now per-spec `auto` resolves to the native
+  backend of the vendor the spec's GPUs resolve to; for legacy or backfilled rows
+  that is the agent's legacy vendor (the first detected tool of nvidia, amd,
+  apple). On an AMD-cards host with a stray `nvidia-smi` on `PATH` that vendor is
+  nvidia, so `auto` over legacy rows becomes `cuda` and explicit Vulkan specs are
+  refused as on a mixed host; the operator removes the stray tool or picks the AMD
+  cards explicitly.
+- **Known limit, first reading incomplete.** On a real NVIDIA+AMD host whose first
+  hardware reading missed one vendor (an `nvidia-smi` timeout at boot, say), a
+  Vulkan spec naming only the reported vendor's cards and started before the
+  missing vendor's first reading takes the single-vendor path: host-index Vulkan
+  names, or the legacy visibility variable without a Vulkan mapping. The window
+  closes with the first complete reading; a running spec keeps its launch until it
+  is relaunched. See [Risks and Technical Debt](11-risks-and-technical-debt.md).
 - Existing single-vendor hosts and configurations keep working with old and new
   agents: no relaunch on upgrade (the backfilled vendor equals the resolved one), no
   renumbering of AMD cards where KFD rank and rocm-smi card agreed (the AMD test VM),

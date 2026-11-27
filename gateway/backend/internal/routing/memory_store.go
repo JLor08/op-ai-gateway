@@ -4308,7 +4308,7 @@ func (m *MemoryStore) RPCSessionsAt(_ context.Context, headSpecID string, instan
 	return out, nil
 }
 
-// --- RuntimeStore: one-time GPU vendor backfill (#434) -----------------------
+// --- RuntimeStore: GPU vendor backfill (#434) ----------------------------------
 
 // BackfillServerGPUVendor mirrors the SQL transaction: everything runs under
 // one lock after the checks, so it is atomic here too.

@@ -3778,8 +3778,13 @@ refusals of this section apply eagerly from the 0.27.0 agent's first start:
   the spec is next saved in the portal;
 - a host with both GPU tools on `PATH` (`nvidia-smi` and `rocm-smi`) but cards
   of one vendor changes too: before #434 its `auto` specs resolved to Vulkan
-  from the tool detection; now `auto` follows the spec's own GPUs and the
-  reported cards and gives the native backend (`cuda`/`rocm`) at the next start;
+  from the tool detection; now `auto` resolves to the native backend of the
+  vendor the spec's GPUs resolve to, and for legacy or backfilled rows that is
+  the agent's legacy vendor (the first detected tool of nvidia, amd, apple).
+  On a host with AMD cards and a stray `nvidia-smi` on `PATH` the legacy vendor
+  is therefore nvidia: `auto` over legacy rows becomes `cuda`, and explicit
+  Vulkan specs are refused as on a mixed host. The operator removes the stray
+  tool or picks the AMD cards explicitly;
 - a literal `--device VulkanN` in a spec's args (numbered against the unfiltered
   enumeration) must be rewritten to `${VULKAN_DEVICES}`/`${DEVICES}` or to
   `Vulkan0..k-1` in declared order, on every host (§3.3).

@@ -423,11 +423,11 @@ func backfillVendors(ctx context.Context, t *testing.T, s routing.Store, seed ba
 }
 
 // TestConformanceBackfillServerGPUVendor pins, on every routing store, the
-// one-time backfill of legacy empty GPU vendors (#434): only the named
-// server's rows are rewritten, an explicit row shadows its empty twin, the
-// legacy vendor is recorded on every call, the review note only on a mixed
-// first rewrite, a second call is a no-op, and clearing the note keeps the
-// legacy vendor.
+// backfill of legacy empty GPU vendors (#434): only the named server's rows
+// are rewritten, an explicit row shadows its empty twin, the legacy vendor is
+// recorded on every call, the review note only when a mixed report rewrites
+// rows, a call with no empty rows left is a no-op, and clearing the note keeps
+// the legacy vendor.
 func TestConformanceBackfillServerGPUVendor(t *testing.T) {
 	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
 	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
