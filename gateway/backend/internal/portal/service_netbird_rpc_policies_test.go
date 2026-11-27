@@ -1041,6 +1041,8 @@ func TestNetbirdPoliciesSkipLoopbackMembers(t *testing.T) {
 	for _, id := range []string{"srv_a", "srv_b"} {
 		e.server(id)
 	}
+	features := e.svc.agentFeatures.(fakeAgentFeatures)
+	features["srv_a"] = append(features["srv_a"], AgentFeatureRPCClusterSameHost)
 	e.cluster("srv_a", "mesh", "direct", rpcMemberSeed{"srv_a", 47001}, rpcMemberSeed{"srv_b", 47002})
 	servers, err := e.routes.AIServers(e.ctx)
 	if err != nil {

@@ -37,8 +37,10 @@ type ClusterPlan struct {
 // ClusterPlanMember is one member of a ClusterPlan: its position in the
 // member order, its server and that server's server_agent application (the
 // agent router the member routes are sent to), the agent spec id of its
-// rpc_server spec, that spec's startup timeout and the address the head
-// dials it at (the host of its entry in the head's endpoint list).
+// rpc_server spec, that spec's startup timeout, the address the head dials
+// it at (the host of its entry in the head's endpoint list) and its own
+// transport -- the cluster's, except "direct" for a member on the head's
+// server, which runs on loopback inside a relay cluster too.
 type ClusterPlanMember struct {
 	Position              int
 	Server                routing.AIServer
@@ -46,6 +48,7 @@ type ClusterPlanMember struct {
 	SpecID                string
 	StartupTimeoutSeconds int
 	Address               string
+	Transport             string
 }
 
 // ClusterPlan returns headSpecID's plan, built from the same derivation the
@@ -130,6 +133,7 @@ func (s *Service) clusterPlanMember(ctx context.Context, row routing.ClusterMemb
 	return ClusterPlanMember{
 		Position: row.Position, Server: srv, Application: app,
 		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds, Address: derived.address,
+		Transport: spec.RPC.Transport,
 	}, "", nil
 }
 

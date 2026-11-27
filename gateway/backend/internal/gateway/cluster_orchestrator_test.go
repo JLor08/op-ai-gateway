@@ -1191,6 +1191,33 @@ func TestStopClusterCancelsRunningStart(t *testing.T) {
 	}
 }
 
+// TestEnsureClusterRestartsHeldLoopbackMemberInRelayCluster: a member on the
+// head's own server runs direct on loopback inside a relay cluster, so a hold
+// it still reports while its head is not running is a dead connection too
+// and is force-stopped before it is ensured; the relayed member is not.
+func TestEnsureClusterRestartsHeldLoopbackMemberInRelayCluster(t *testing.T) {
+	f := newOrchFixture(t, 2, "relay", "lan")
+	f.portal.plan.Members[0].Transport = "direct"
+	f.portal.plan.Members[1].Transport = "relay"
+	f.ackAll()
+	f.statuses.publish(orchMemberServer(0), []RuntimeStatusDTO{orchMemberRow(orchMemberSpec(0), orchHead)})
+	f.statuses.publish(orchMemberServer(1), []RuntimeStatusDTO{orchMemberRow(orchMemberSpec(1), orchHead)})
+	f.holdOnHeadEnsure(0, 1)
+
+	if err := f.o.Ensure(context.Background(), orchHead); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	calls := f.agent.recorded()
+	stop := slices.Index(calls, "member:stop:"+orchMemberSpec(0)+":force")
+	ensure := slices.Index(calls, "member:ensure:"+orchMemberSpec(0))
+	if stop < 0 || ensure < stop {
+		t.Fatalf("calls = %q, want the loopback member force-stopped before its ensure", calls)
+	}
+	if f.agent.count("member:stop:"+orchMemberSpec(1)) != 0 {
+		t.Fatalf("calls = %q, want the relayed member left alone", calls)
+	}
+}
+
 // TestDrainingHeadStillOccupiesItsMembers pins that a draining head still has
 // its process: its frame wakes no reconciler and keeps the cluster formed,
 // and a direct member it still holds is not force-stopped meanwhile.

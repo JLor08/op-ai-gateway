@@ -210,6 +210,9 @@ func (s *Service) deriveCluster(ctx context.Context, head routing.RuntimeSpec, h
 		d.hold = hold
 		return d, nil
 	}
+	if reason := s.sameHostFeatureReason(headServer.ID, states); reason != "" {
+		return withheld(reason), nil
+	}
 	members, reason, err := s.checkDerivedMembers(ctx, headServer.ID, states)
 	if err != nil || reason != "" {
 		return withheld(reason), err
@@ -365,6 +368,31 @@ func (s *Service) clusterFeatureReason(ctx context.Context, viewerID string, ser
 		return ClusterWithheldAgentTooOld, false, nil
 	}
 	return "", false, nil
+}
+
+// sameHostFeatureReason re-checks, on every derivation, what the save
+// required of a same-host cluster (clusterEntries): every server that runs a
+// member on the head's server, or more than one member of the head, has an
+// agent that declares AgentFeatureRPCClusterSameHost. One known to lack it
+// (an agent downgraded since the save) withholds the cluster as too old: it
+// would read the head's loopback connection as its own probe, or the second
+// member as the first. An agent whose declaration is unknown is left to the
+// rpc_cluster check before this one, which holds its own document until it
+// declares; once it does, its declaration change notifies the cluster again.
+func (s *Service) sameHostFeatureReason(headServerID string, states []clusterMemberState) string {
+	count := make(map[string]int, len(states))
+	for _, st := range states {
+		count[st.row.ServerID]++
+	}
+	for serverID, n := range count {
+		if serverID != headServerID && n < 2 {
+			continue
+		}
+		if s.agentFeatures.Known(serverID) && !s.agentFeatures.Has(serverID, AgentFeatureRPCClusterSameHost) {
+			return ClusterWithheldAgentTooOld
+		}
+	}
+	return ""
 }
 
 // serverFeatureReason is one server's feature reason: by its live

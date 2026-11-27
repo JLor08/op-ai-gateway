@@ -1065,6 +1065,7 @@ func TestSameHostMemberUsesLoopback(t *testing.T) {
 	plan, err := f.svc.ClusterPlan(f.ctx, head.ID)
 	if err != nil || plan.WithheldReason != "" || len(plan.Members) != 2 ||
 		plan.Members[0].Address != "127.0.0.1" || plan.Members[1].Address != "100.64.0.5" ||
+		plan.Members[0].Transport != "direct" || plan.Members[1].Transport != "direct" ||
 		!slices.Equal(plan.HeadIdentity, []string{"100.64.0.2"}) {
 		t.Fatalf("plan = %+v err=%v", plan, err)
 	}
@@ -1078,6 +1079,10 @@ func TestSameHostMemberUsesLoopback(t *testing.T) {
 	if local.RPC == nil || local.RPC.Transport != "direct" || local.RPC.BindIP != "127.0.0.1" ||
 		remote.RPC == nil || remote.RPC.Transport != "relay" {
 		t.Fatalf("relay cluster: same-host rpc = %+v, remote rpc = %+v", local.RPC, remote.RPC)
+	}
+	if plan, err = f.svc.ClusterPlan(f.ctx, head.ID); err != nil || plan.Transport != "relay" || len(plan.Members) != 2 ||
+		plan.Members[0].Transport != "direct" || plan.Members[1].Transport != "relay" {
+		t.Fatalf("relay plan = %+v err=%v, want member transports direct, relay", plan, err)
 	}
 
 	// Only same-host members: NetBird off on the head's server and the
@@ -1197,4 +1202,55 @@ func TestResyncedManualMemberKeepsBackfilledGPU(t *testing.T) {
 	if !members[0].RunStartedAt.IsZero() || !members[1].Stale || members[0].Stale || next[1].VRAMMeasuredMB != 0 {
 		t.Fatalf("another card: members = %+v gpus = %+v", members, next)
 	}
+}
+
+// TestSameHostClusterWithheldForDowngradedAgent: the derivation re-checks
+// rpc_cluster_same_host. A server that runs a member on the head's server, or
+// two members of one head, whose agent is known to lack the flag (downgraded
+// after the save) withholds the cluster as too old, and its document carries
+// no member spec of it.
+func TestSameHostClusterWithheldForDowngradedAgent(t *testing.T) {
+	t.Run("member on the head's server", func(t *testing.T) {
+		f := newClusterFixture(t)
+		f.sameHostAgent(f.head.ID)
+		head := f.mustPut(clusterHeadRequest(autoMember(f.head.ID, 1)))
+		if got := f.withheldReason(); got != "" {
+			t.Fatalf("flagged: withheld %q", got)
+		}
+		if _, ok := specByID(f.config(f.head.ID), automaticMemberSpecID(head.ID, f.head.ID)); !ok {
+			t.Fatal("flagged: the same-host member is not pushed")
+		}
+		f.svc.agentFeatures.(fakeAgentFeatures)[f.head.ID] = []string{"runtime_manager", AgentFeatureRPCCluster, AgentFeatureGPUVendorIdentity}
+		if got := f.withheldReason(); got != ClusterWithheldAgentTooOld {
+			t.Fatalf("unflagged: reason = %q, want %s", got, ClusterWithheldAgentTooOld)
+		}
+		doc := f.config(f.head.ID)
+		if got := rpcServerSpecs(doc); len(got) != 0 {
+			t.Fatalf("unflagged: member specs pushed %+v", got)
+		}
+		if hs, ok := specByID(doc, head.ID); ok && hs.Cluster != nil {
+			t.Fatalf("unflagged: head pushed with its cluster %+v", hs.Cluster)
+		}
+	})
+	t.Run("two members on one server", func(t *testing.T) {
+		f := newClusterFixture(t)
+		a := f.member("A")
+		f.sameHostAgent(a.ID)
+		f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(a.ID, 1)))
+		if got := f.withheldReason(); got != "" {
+			t.Fatalf("flagged: withheld %q", got)
+		}
+		f.svc.agentFeatures.(fakeAgentFeatures)[a.ID] = []string{"runtime_manager", AgentFeatureRPCCluster}
+		if got := f.withheldReason(); got != ClusterWithheldAgentTooOld {
+			t.Fatalf("unflagged: reason = %q, want %s", got, ClusterWithheldAgentTooOld)
+		}
+		if got := rpcServerSpecs(f.config(a.ID)); len(got) != 0 {
+			t.Fatalf("unflagged: member specs pushed %+v", got)
+		}
+		// One member per server needs no flag.
+		f.mustPut(clusterHeadRequest(autoMember(a.ID, 0)))
+		if got := f.withheldReason(); got != "" {
+			t.Fatalf("single member on an unflagged server: withheld %q", got)
+		}
+	})
 }
