@@ -691,6 +691,10 @@ type runtimeWaker interface {
 // portal click should feel like network latency, not the next 1s telemetry
 // tick... let alone the 60s runtime-config poll). *runtimectl.Driver
 // implements it (delegating to its Manager's own Transitions() channel).
+// hardwareVulkanProbe overrides the hardware inventory's vulkaninfo probe
+// (nil = the real one); tests set it so no test runs the host's vulkaninfo.
+var hardwareVulkanProbe func(context.Context) ([]collector.VulkanDevice, bool)
+
 // NewFromDeps derives it via a type assertion on d.RuntimeDriver, mirroring
 // how certWaker/trustWaker are derived from d.Poster.
 type runtimeTransitionsWaker interface {
@@ -1188,7 +1192,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		netifCollector:  d.Interfaces,
 		ifaces:          newInterfaceInventory(),
 		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries, wslProbeConfig{Exe: cfg.RuntimeWSLExe, User: cfg.RuntimeWSLUser}),
-		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket, VRAMMeasurable: d.VRAMMeasurable},
+		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket, VRAMMeasurable: d.VRAMMeasurable, Vulkan: hardwareVulkanProbe},
 	}
 	if cfg.HelperSocket != "" {
 		helper := collector.NewHelperHTTPClient(cfg.HelperSocket)

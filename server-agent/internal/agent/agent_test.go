@@ -5374,11 +5374,7 @@ func TestRunPushesDeviceTotalsBeforeTheBootRuntimeSync(t *testing.T) {
 		t.Fatal("no HostInfo had been pushed when the boot runtime sync began -- pinned/force_running specs would be admitted against no detected budgets")
 	}
 	want := runtimectl.HostInfo{GPUTotalsMB: map[runtimectl.GPUKey]int{{Index: 0}: 24000, {Index: 1}: 12288}, MemAvailableMB: 0}
-	got := drv.pushed[0]
-	// The Vulkan map comes from whatever vulkaninfo this host has; it is pinned
-	// by TestSeedHostInfoCarriesVulkanMap, not here.
-	got.Vulkan = runtimectl.VulkanMap{}
-	if !reflect.DeepEqual(got, want) {
+	if got := drv.pushed[0]; !reflect.DeepEqual(got, want) {
 		t.Errorf("first HostInfo push = %+v, want the boot seed %+v (device totals from the hardware inventory, RAM unknown)", got, want)
 	}
 }
@@ -5625,6 +5621,12 @@ func TestRuntimeGPUSamplesCarryVendor(t *testing.T) {
 	}
 }
 
+// init keeps every agent test off the host's real vulkaninfo: the inventory
+// sees "no vulkaninfo" unless a test installs its own probe.
+func init() {
+	hardwareVulkanProbe = func(context.Context) ([]collector.VulkanDevice, bool) { return nil, false }
+}
+
 func TestHardwareOptionsUseConfigMeasurability(t *testing.T) {
 	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
 		VRAMMeasurable: func() map[string][]string { return map[string][]string{"amd": {"rocm"}} },
@@ -5652,5 +5654,29 @@ func TestSeedHostInfoCarriesVulkanMap(t *testing.T) {
 	}
 	if got := sink.last(t).Vulkan; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Vulkan = %+v, want %+v", got, want)
+	}
+}
+
+// TestHostInfoCarriesVulkanFromBootAndEveryCycle pins that the later collectOnce
+// push still carries the map the boot seed stored.
+func TestHostInfoCarriesVulkanFromBootAndEveryCycle(t *testing.T) {
+	const mib = 1024 * 1024
+	zero := 0
+	sink := &fakeHostInfoSink{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
+		Host:     fakeHost{h: &sample.Host{MemTotalBytes: 64000 * mib, MemAvailableBytes: 8000 * mib}},
+		GPUs:     []collector.GPUCollector{fakeGPU{gpus: []sample.GPU{{Index: 0, Vendor: "amd", PCIBusID: "0000:02:00.0", MemTotalBytes: 24000 * mib}}}},
+		Poster:   &capturePoster{},
+		HostInfo: sink,
+	})
+	hw := sample.SystemReport{VulkanDeviceCount: 2, GPUs: []sample.GPUInfo{{Index: 0, Vendor: "amd", VulkanOrdinal: &zero, MemoryTotalBytes: 24000 * mib}}}
+	want := runtimectl.VulkanMap{Ordinals: map[runtimectl.GPUKey]int{{Vendor: runtimectl.ParseGPUVendor("amd"), Index: 0}: zero}, DeviceCount: 2}
+	a.seedHostInfo(&hw)
+	if got := sink.last(t).Vulkan; !reflect.DeepEqual(got, want) {
+		t.Fatalf("boot seed Vulkan = %+v, want %+v", got, want)
+	}
+	a.collectOnce(context.Background())
+	if got := sink.last(t).Vulkan; !reflect.DeepEqual(got, want) {
+		t.Fatalf("collectOnce Vulkan = %+v, want %+v", got, want)
 	}
 }

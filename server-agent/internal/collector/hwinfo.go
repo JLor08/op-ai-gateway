@@ -35,8 +35,10 @@ type HardwareOptions struct {
 	// measure per-process VRAM (cuda/rocm/vulkan). Nil = nothing measurable.
 	// Evaluated on every CollectHardware, after the GPU collectors ran.
 	VRAMMeasurable func() map[string][]string
-	// vulkan lists the Vulkan devices; nil = collectVulkan (test seam).
-	vulkan func(context.Context) ([]VulkanDevice, bool)
+	// Vulkan lists the Vulkan devices (ok=false: no vulkaninfo); nil =
+	// collectVulkan, which runs the host's vulkaninfo. A hook so tests are
+	// independent of the host's Vulkan tooling.
+	Vulkan func(context.Context) ([]VulkanDevice, bool)
 }
 
 // HelperMemoryModulesNeeded reports whether r lacks the memory modules that
@@ -120,7 +122,7 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 	if opts.VRAMMeasurable != nil {
 		measurable = opts.VRAMMeasurable()
 	}
-	vulkanFn := opts.vulkan
+	vulkanFn := opts.Vulkan
 	if vulkanFn == nil {
 		vulkanFn = collectVulkan
 	}

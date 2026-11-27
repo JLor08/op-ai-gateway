@@ -20,7 +20,7 @@ func (fakeGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
 }
 
 func TestCollectHardware(t *testing.T) {
-	r := CollectHardware(context.Background(), []GPUCollector{fakeGPUCollector{}}, "9.9.9", HardwareOptions{})
+	r := CollectHardware(context.Background(), []GPUCollector{fakeGPUCollector{}}, "9.9.9", HardwareOptions{Vulkan: noVulkan})
 	if r.AgentVersion != "9.9.9" {
 		t.Fatalf("agent_version = %q", r.AgentVersion)
 	}
@@ -81,11 +81,13 @@ func (f fixedGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
 
 func TestCollectHardwareCopiesVendor(t *testing.T) {
 	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
-	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", HardwareOptions{})
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", HardwareOptions{Vulkan: noVulkan})
 	if len(r.GPUs) != 1 || r.GPUs[0].Vendor != VendorAMD || r.GPUs[0].PCIBusID != "0000:02:00.0" {
 		t.Fatalf("%+v", r.GPUs)
 	}
 }
+
+func noVulkan(context.Context) ([]VulkanDevice, bool) { return nil, false }
 
 func vulkanFromFixture(t *testing.T, name string) func(context.Context) ([]VulkanDevice, bool) {
 	return func(context.Context) ([]VulkanDevice, bool) {
@@ -96,7 +98,7 @@ func vulkanFromFixture(t *testing.T, name string) func(context.Context) ([]Vulka
 func TestCollectHardwareFillsMeasurabilityAndVulkanOrdinal(t *testing.T) {
 	opts := HardwareOptions{
 		VRAMMeasurable: func() map[string][]string { return map[string][]string{"amd": {"rocm", "vulkan"}} },
-		vulkan:         vulkanFromFixture(t, "vulkaninfo-amd-2gpu.txt"),
+		Vulkan:         vulkanFromFixture(t, "vulkaninfo-amd-2gpu.txt"),
 	}
 	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
 	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
@@ -108,7 +110,8 @@ func TestCollectHardwareFillsMeasurabilityAndVulkanOrdinal(t *testing.T) {
 
 func TestCollectHardwareWithoutVulkaninfo(t *testing.T) {
 	opts := HardwareOptions{
-		vulkan: func(context.Context) ([]VulkanDevice, bool) { return nil, false },
+		Vulkan:         noVulkan,
+		VRAMMeasurable: func() map[string][]string { return map[string][]string{"nvidia": {"cuda"}} },
 	}
 	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
 	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
@@ -118,7 +121,7 @@ func TestCollectHardwareWithoutVulkaninfo(t *testing.T) {
 }
 
 func TestCollectHardwareNVIDIAVulkanCount(t *testing.T) {
-	opts := HardwareOptions{vulkan: vulkanFromFixture(t, "vulkaninfo-nvidia-2gpu.txt")}
+	opts := HardwareOptions{Vulkan: vulkanFromFixture(t, "vulkaninfo-nvidia-2gpu.txt")}
 	c := fixedGPUCollector{gpus: []sample.GPU{
 		{Index: 0, Vendor: VendorNVIDIA, PCIBusID: "0000:01:00.0"},
 		{Index: 1, Vendor: VendorNVIDIA, PCIBusID: "0000:02:00.0"},
