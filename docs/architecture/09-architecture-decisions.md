@@ -14249,7 +14249,10 @@ layout either.
 
 **Consequences.**
 - An operator who wants a server's log in the portal points it at `${CONFIG_DIR}/<file>` and declares that path; the agent creates the
-  instance directory if needed and removes a direct child of it before exec, so each generation's file is its own. Anything else needs
+  instance directory if needed and removes a direct child of it before exec, so each generation's file is its own. A `<file>` that is
+  one of the spec's config files is refused instead (by the gateway at submit time, by the agent at start time), because the removal
+  would delete the config file. The portal's Strata import points the engine log there only for an agent that declares
+  `runtime_log_files`: an older one writes `${CONFIG_DIR}` natively into config-file content, which is invalid JSON on Windows. Anything else needs
   an explicit `runtime_allowed_log_dirs` entry on that host and is tailed from its end as of the start, never removed.
 - Accepted residual windows: the lookup and the link-count read of the hard-link check are separate steps, exploitable only by a
   server that can link an outside file it could not read itself (macOS, or Linux without `fs.protected_hardlinks`); and the previous

@@ -1274,7 +1274,10 @@ list with more than four entries; a `name` that does not match
 case-insensitively; an empty `path`, one over 1024 bytes, one with a control
 character, or one naming `${API_TOKEN}` or `${AGENT_ENV:…}`; and a `path` that neither
 starts with `${CONFIG_DIR}` followed by `/`, `\` or the end, nor is an absolute POSIX
-or Windows path. Its message names the entry (by position or name) and the rule,
+or Windows path; and a `path` that is exactly `${CONFIG_DIR}/<name>` or
+`${CONFIG_DIR}\<name>` where `<name>` is one of the request's `config_files` names,
+compared case-insensitively (the agent removes a log file there before every start,
+which would delete the config file). Its message names the entry (by position or name) and the rule,
 **never the path**. These are early-feedback rules: which files the agent actually
 reads is decided on the agent, by its own policy and the agent-local
 `runtime_allowed_log_dirs`, which the gateway never sees.

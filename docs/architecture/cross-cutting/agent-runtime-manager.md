@@ -1815,10 +1815,12 @@ Shortened, with the paths redacted, the stored content looks like this:
 ```
 
 `model_name` is `${MODEL}`, so the id Strata lists can never drift from the mapping's
-upstream model, and the import always rewrites the source's `log` to
-`${CONFIG_DIR}/engine.log` and declares that file as the spec's log file `engine`
-(below and §14.9); on a Windows agent the forward-slash `${CONFIG_DIR}` above is what
-keeps this JSON valid. The card order is the file's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` (`strata serve` has no `--gpu` flag): the import drops the source's `gpu`,
+upstream model, and, when the server's agent declares `runtime_log_files`, the import
+rewrites the source's `log` to `${CONFIG_DIR}/engine.log` and declares that file as the
+spec's log file `engine` (below and §14.9); on a Windows agent the forward-slash
+`${CONFIG_DIR}` above is what keeps this JSON valid. An older agent writes the native
+`C:\…` form there, which is invalid JSON, so for it the import keeps `log` as written
+(§7.1). The card order is the file's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` (`strata serve` has no `--gpu` flag): the import drops the source's `gpu`,
 `gpu_roles`, `gpu_cards` and `gpu_order`, writes that `gpu` (none when the source named no cards) and sets `"gpu_order": "as_given"`. The key is
 never in the file; it travels as `STRATA_API_KEY=${API_TOKEN}` in `env`, and every key named
 `api_key` (any case, at any depth, e.g. inside `vision`, whatever its value) in the pasted
@@ -1873,9 +1875,15 @@ becomes `${CONFIG_DIR}/engine.log`, declared as `engine`; a run config with
 `replicas` gets one declaration per replica instead (`engine-r<i>` at
 `${CONFIG_DIR}/engine.r<i>.log`, the names Strata derives itself, at most four, the
 editor warning beyond that), and the Strata template's default declares `engine`
-too. A `${CONFIG_DIR}` file is the one log file the agent treats as the
-generation's own, and it gets three things an external path does not
-(`prepareLogFiles`, `manager_log_files.go`):
+too. A re-import replaces exactly the rows it declares (`engine`, `engine-r<i>`) and
+keeps the operator's others. All of this happens only while the server's agent
+declares `runtime_log_files` (`StrataImportOptions.declareEngineLog`; a report that
+has not settled counts as not declared): otherwise the import keeps the source's
+`log`, declares no log file and warns that the engine log can be shown once the
+agent is 0.26.0 or newer, and the template declares none (§7.1). A `${CONFIG_DIR}`
+file is the one log file the agent treats as the generation's own, and it gets
+three things an external path does not (`prepareLogFiles`,
+`manager_log_files.go`):
 
 - **The directory exists before exec.** If any declared file lies directly in the
   instance's `${CONFIG_DIR}`, the agent creates that directory (`0755`,
@@ -1890,7 +1898,13 @@ generation's own, and it gets three things an external path does not
   is a directory. A file in a **subdirectory** of `${CONFIG_DIR}` is tailed like
   an external path (from its end as of the start) and never removed, because the
   subdirectory could be a link the server planted. A file outside `${CONFIG_DIR}`
-  is never removed or truncated by the agent.
+  is never removed or truncated by the agent. A file directly in `${CONFIG_DIR}`
+  whose name is one of the spec's `config_files` (compared case-insensitively on
+  Windows, exactly elsewhere; `logFileShadowsConfigFile`) is neither removed nor
+  tailed: the agent has just written that config file for the child, so the
+  declaration is refused and its tab shows `file_not_permitted`. The gateway and
+  the portal refuse the overlap at submit time (§14.9); `ParseConfig` stays
+  permissive, so a file-mode document with it remains valid.
 - **A failed removal does not fail the start.** If the old file cannot be removed
   (a lingering process holds it without delete sharing, say), the name is stale:
   its tab gets a `file_stale` marker and the tail starts at the current end, so
@@ -6063,7 +6077,10 @@ no `log_file_tails`, and an older gateway, which would relay a file's text as
 process output, never receives one. The declaration is not launch-affecting: a
 change of it, like an edit of `log_files`, applies at each spec's next start, and
 it bypasses the ETag short-circuit like `runtime_instances`
-(`sameLogFileDeclarations`); the Warn is logged once per transition. The gateway
+(`sameLogFileDeclarations`); the Warn is logged once per transition. So a gateway
+that stops declaring the name does not stop a running generation's tailers (that
+applies at its next start), and the file history the agent already retains stays
+replayable. The gateway
 keeps `log_files` in the runtime document whatever the agent declares, an agent
 without the name ignores the field, and the portal reads the agent's declaration
 only to explain itself: the spec editor warns, without blocking the save, that the
@@ -6706,10 +6723,17 @@ branch.** `agent.Features` gained `runtime_log_files` (§7), the spec gained
 output included (§3.2), the forward-slash `${CONFIG_DIR}` in config-file content on
 Windows (§3.5), and the file-mode parse-error code `invalid_log_files` (§8.3).
 `TestAgentFeaturesDeclaresRuntimeLogFiles` pins the name, its `Since` and the
-version. In gateway mode there is **no upgrade order**: an older agent ignores `log_files` and
-sends no `stream`, no file event and no `log_file_tails`, so it behaves as before
-(the portal explains its empty file tabs), and an older gateway never sends
-`log_files`. A 0.26.0 agent in file mode whose local document declares `log_files`,
+version. In gateway mode there is **no upgrade order** for the field itself: an older agent
+ignores `log_files` and sends no `stream`, no file event and no `log_file_tails`, so it
+behaves as before (the portal explains its empty file tabs), and an older gateway never
+sends `log_files`. **The one exception is the Strata run-config import** (§3.5): it
+points the config file's `log` at `${CONFIG_DIR}/engine.log`, and an agent older than
+0.26.0 expands `${CONFIG_DIR}` in config-file content in its native form, which on
+Windows puts `C:\…` into a JSON string and makes `strata.json` invalid. The portal
+therefore rewrites `log` and declares the engine log only while the server's agent
+declares `runtime_log_files` (an unsettled report counts as not declared); for an
+older agent it keeps `log` as written and warns, and the Strata template declares no
+log file either. A 0.26.0 agent in file mode whose local document declares `log_files`,
 behind a gateway older than the feature, does not mix the streams either: that
 gateway does not declare `runtime_log_files`, so the agent treats the declaration
 as absent and tails nothing (§7). A current gateway behind an older agent receives exactly what it did;
@@ -11823,7 +11847,10 @@ enforced three times:
   `internal/portal/service_runtime.go`), the last validation in its order, which
   also refuses a control character and requires a path that starts with
   `${CONFIG_DIR}` followed by a separator or the end, or is absolute in POSIX or
-  Windows form; it answers `400 runtime_spec.log_files_invalid` with the entry and
+  Windows form, and refuses a path that is exactly `${CONFIG_DIR}/<name>` or
+  `${CONFIG_DIR}\<name>` for a `<name>` of the spec's own `config_files`
+  (case-insensitively, `logFilePathIsConfigFile`), because the agent removes such a
+  file before exec; it answers `400 runtime_spec.log_files_invalid` with the entry and
   the rule, **never the path**
   ([HTTP API Surface](../reference/api-surface.md)). The list is stored as opaque
   JSON in `agent_runtime_specs.log_files` (migration 118) and carried on the
@@ -11832,7 +11859,9 @@ enforced three times:
 - the agent's `ParseConfig` (`checkLogFiles`), whose failure is the file-mode
   parse-error code `invalid_log_files` (§8.3);
 - the agent's path policy at tail time (§3.1.3, and §3.8 for a `wsl` spec), which
-  alone knows `${CONFIG_DIR}` and the allowlist.
+  alone knows `${CONFIG_DIR}` and the allowlist, plus its refusal of a
+  `${CONFIG_DIR}` file named like one of the spec's config files (§3.5), which it
+  marks `file_not_permitted` instead of removing that file.
 
 The portal's spec editor (at most four rows of name and path) applies the
 gateway's rules, explains the `${CONFIG_DIR}/…` form and the allowlist in its hint,
@@ -11848,7 +11877,9 @@ generation start.
 - **Before exec** (`startProcess`): `prepareLogFiles` resolves every declaration,
   creates the instance's `${CONFIG_DIR}` if a file lies directly in it, and
   removes each such file, or marks its name stale when that fails (§3.5). A
-  refused name is only remembered: a log file never fails a start.
+  refused name — by the path policy, or because it names one of the spec's config
+  files (`logFileShadowsConfigFile`) — is only remembered: a log file never fails a
+  start.
   `endPredecessorGraces` then ends the grace of generation N−1's tailers for the
   same names (`fileTailer.EndGrace`), so their final read starts before N runs.
 - **After exec**, once the started marker is recorded: `startLogFileTailers`
