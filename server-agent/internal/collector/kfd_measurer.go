@@ -20,9 +20,11 @@ import (
 // gpu_id is KFD's opaque per-GPU identifier, not an index. The ordinal is the
 // GPU's rank among the KFD topology nodes that are GPUs (gpu_id 0 is a CPU
 // node), ordered by node number. That rank is the ROCr device ordinal that
-// ROCR_VISIBLE_DEVICES addresses, which is how the agent assigns AMD GPUs, and
-// it equals rocm-smi's cardN index, so the measured ordinal and the GPU the
-// collector reports line up.
+// ROCR_VISIBLE_DEVICES addresses. rocm-smi's cardN key is only assumed to
+// equal it (the DRM card numbering can include non-KFD devices), so the
+// collector joins the two on the PCI address (kfdPCIRanks) and numbers its
+// GPUs by rank; the measured ordinal and the reported GPU then line up by
+// construction.
 //
 // Attribution uses the same process-group boundary as groupNvidiaComputeApps:
 // each managed root leads its group, and a worker's VRAM is charged to its
@@ -41,6 +43,55 @@ const kfdVRAMPrefix = "vram_"
 type kfdGPUNode struct {
 	node  int
 	gpuID uint64
+}
+
+// kfdPCIRanks maps each KFD GPU node's PCI address to its rank (the ROCr
+// ordinal). Ranks count every GPU node, ordered by node number; a node without
+// a readable location_id gets no entry (no guess) but still occupies its rank.
+// An error means the topology itself is unreadable.
+func kfdPCIRanks(root string) (map[pciAddr]int, error) {
+	nodesDir := filepath.Join(root, "topology", "nodes")
+	entries, err := os.ReadDir(nodesDir)
+	if err != nil {
+		return nil, err
+	}
+	var gpus []kfdGPUNode
+	for _, e := range entries {
+		if g, ok := readKFDGPUNode(nodesDir, e.Name()); ok {
+			gpus = append(gpus, g)
+		}
+	}
+	sort.Slice(gpus, func(i, j int) bool { return gpus[i].node < gpus[j].node })
+	out := make(map[pciAddr]int, len(gpus))
+	for rank, g := range gpus {
+		props := readKFDProperties(filepath.Join(nodesDir, strconv.Itoa(g.node), "properties"))
+		loc, ok := props["location_id"]
+		if !ok {
+			continue
+		}
+		out[decodeKFDLocation(props["domain"], loc)] = rank
+	}
+	return out, nil
+}
+
+// readKFDProperties parses a node's "key value" properties file into numbers;
+// unparseable lines are skipped and an unreadable file yields an empty map.
+func readKFDProperties(path string) map[string]uint64 {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	props := make(map[string]uint64)
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		if v, err := strconv.ParseUint(f[1], 10, 64); err == nil {
+			props[f[0]] = v
+		}
+	}
+	return props
 }
 
 // kfdGPUOrdinals maps each GPU's KFD gpu_id to its ordinal under root. Nodes
