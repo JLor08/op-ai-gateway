@@ -8,13 +8,17 @@ import (
 	"errors"
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
-	"slices"
 	"strconv"
 	"strings"
 )
 
-// ErrClusterMemberNotFound (404): the server is no member of the head.
+// ErrClusterMemberNotFound (404): the server is no member of the head, or
+// the position named is no member of the head on that server.
 var ErrClusterMemberNotFound = errors.New("runtime_spec.cluster_member_not_found")
+
+// ErrClusterMemberAmbiguous (409): the head has several members on the server
+// and the request named no position to tell which one.
+var ErrClusterMemberAmbiguous = errors.New("runtime_spec.cluster_member_ambiguous")
 
 // automaticMemberSpecPrefix starts the agent spec id of an automatic member.
 const automaticMemberSpecPrefix = "rpca_"
@@ -79,17 +83,20 @@ func automaticMemberNth(m routing.ClusterMember, members []routing.ClusterMember
 }
 
 // AuthorizeClusterMemberUsageReset authorizes a reset of the stored usage of
-// the member on serverID of the cluster head on mappingID and returns that
-// membership row. A reset changes the demand pushed to the member's host, so
-// it needs management rights on the head's server (through its mapping) and
-// on the member's server, like a membership write. Refusals, in order: the
+// a member on serverID of the cluster head on mappingID and returns that
+// membership row: the member at position, else the server's one member of
+// the head. A reset changes the demand pushed to the member's host, so it
+// needs management rights on the head's server (through its mapping) and on
+// the member's server, like a membership write. Refusals, in order: the
 // head's mapping (ErrMappingNotFound, the no-leak collapse), a mapping
 // without a spec (ErrRuntimeSpecNotFound), the member's server
 // (ErrServerNotFound, the no-leak answer for a server the caller may not
-// manage), and a server that is no member of the head
-// (ErrClusterMemberNotFound). The gateway applies the reset itself, beside
-// the telemetry ingest that writes the same row.
-func (s *Service) AuthorizeClusterMemberUsageReset(ctx context.Context, principal auth.Token, mappingID, serverID string) (routing.ClusterMember, error) {
+// manage), a server that is no member of the head or a position that is no
+// member of the head on serverID (ErrClusterMemberNotFound), and no position
+// while the head has several members on serverID (ErrClusterMemberAmbiguous).
+// The gateway applies the reset itself, beside the telemetry ingest that
+// writes the same row.
+func (s *Service) AuthorizeClusterMemberUsageReset(ctx context.Context, principal auth.Token, mappingID, serverID string, position *int) (routing.ClusterMember, error) {
 	mapping, _, _, err := s.authorizeMapping(ctx, principal, mappingID)
 	if err != nil {
 		return routing.ClusterMember{}, err
@@ -108,9 +115,17 @@ func (s *Service) AuthorizeClusterMemberUsageReset(ctx context.Context, principa
 	if err != nil {
 		return routing.ClusterMember{}, err
 	}
-	i := slices.IndexFunc(members, func(m routing.ClusterMember) bool { return m.ServerID == serverID })
-	if i < 0 {
-		return routing.ClusterMember{}, ErrClusterMemberNotFound
+	var here []routing.ClusterMember
+	for _, m := range members {
+		if m.ServerID == serverID && (position == nil || m.Position == *position) {
+			here = append(here, m)
+		}
 	}
-	return members[i], nil
+	switch {
+	case len(here) == 0:
+		return routing.ClusterMember{}, ErrClusterMemberNotFound
+	case len(here) > 1:
+		return routing.ClusterMember{}, ErrClusterMemberAmbiguous
+	}
+	return here[0], nil
 }

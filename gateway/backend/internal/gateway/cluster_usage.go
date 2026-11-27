@@ -58,8 +58,11 @@ import (
 // on telemetry. A run nobody ended (the gateway was down when the head
 // stopped) is replaced by the next one, which replaces nothing of it.
 //
-// The same samples keep the session records (rpc_sessions): the hold of a
-// member by its head opens one, the end of the hold closes it. A restarted
+// The same samples keep the session records (rpc_sessions), one per head and
+// member server: the hold of a member by its head opens one, the end of the
+// last hold of the head's members on that server closes it. The member usage
+// itself is per member: by the head and the member's position, since a head
+// may have several members on one server. A restarted
 // gateway knows nothing of the sessions it left open, so the first sample of
 // each member server it receives syncs them with the store: a session still
 // held is adopted, any other open session of the server is closed -- also
@@ -203,10 +206,12 @@ func (u *clusterUsage) observe(ctx context.Context, serverID, legacyVendor strin
 			byID[r.SpecID] = r
 		}
 	}
+	// held is per head: the session record is the server's, held while any
+	// member of the head on serverID is.
 	held := make(map[string]bool, len(memberships))
 	for _, m := range memberships {
 		row, ok := u.heldRow(ctx, serverID, m, memberships, byID)
-		held[m.HeadSpecID] = ok
+		held[m.HeadSpecID] = held[m.HeadSpecID] || ok
 		if ok {
 			u.raise(ctx, m, row, legacyVendor)
 		}
@@ -265,25 +270,26 @@ func (u *clusterUsage) heldRow(ctx context.Context, serverID string, m routing.C
 	return row, true
 }
 
-// member reads the membership row of serverID under head and its GPU rows;
-// ok false when there is none.
-func (u *clusterUsage) member(ctx context.Context, head, serverID string) (routing.ClusterMember, []routing.ClusterMemberGPU, bool, error) {
+// member reads the membership row of head at position and its GPU rows; ok
+// false when there is none. A head may have several members on one server,
+// so a member is its position, never its server.
+func (u *clusterUsage) member(ctx context.Context, head string, position int) (routing.ClusterMember, []routing.ClusterMemberGPU, bool, error) {
 	members, gpus, err := u.store.ClusterMembers(ctx, head)
 	if err != nil {
 		return routing.ClusterMember{}, nil, false, err
 	}
-	i := slices.IndexFunc(members, func(m routing.ClusterMember) bool { return m.ServerID == serverID })
+	i := slices.IndexFunc(members, func(m routing.ClusterMember) bool { return m.Position == position })
 	if i < 0 {
 		return routing.ClusterMember{}, nil, false, nil
 	}
-	return members[i], gpusOf(gpus, serverID), true, nil
+	return members[i], gpusOf(gpus, position), true, nil
 }
 
-// gpusOf returns the GPU rows of serverID's member.
-func gpusOf(gpus []routing.ClusterMemberGPU, serverID string) []routing.ClusterMemberGPU {
+// gpusOf returns the GPU rows of the member at position.
+func gpusOf(gpus []routing.ClusterMemberGPU, position int) []routing.ClusterMemberGPU {
 	var out []routing.ClusterMemberGPU
 	for _, g := range gpus {
-		if g.ServerID == serverID {
+		if g.MemberPosition == position {
 			out = append(out, g)
 		}
 	}
@@ -304,12 +310,14 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 	}
 	unlock := u.locks.lock(headLockKey(m.HeadSpecID))
 	defer unlock()
-	cur, gpus, ok, err := u.member(ctx, m.HeadSpecID, m.ServerID)
+	cur, gpus, ok, err := u.member(ctx, m.HeadSpecID, m.Position)
 	if err != nil {
-		slog.Debug("cluster member usage: reading the membership failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+		slog.Debug("cluster member usage: reading the membership failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "err", err)
 		return
 	}
-	if !ok || cur.RunStartedAt.IsZero() {
+	// The member at m's position must still be m's: a membership rewrite
+	// in between may have put another server there.
+	if !ok || cur.ServerID != m.ServerID || cur.RunStartedAt.IsZero() {
 		return
 	}
 	peak, stored := raiseMeasured(&cur, gpus, legacyVendor, row.RAMMeasuredMB, vram)
@@ -320,7 +328,7 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 		cur.MeasuredAt = u.now()
 	}
 	if _, err := u.store.UpdateClusterMemberUsage(ctx, cur, gpus); err != nil {
-		slog.Debug("cluster member usage: write failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+		slog.Debug("cluster member usage: write failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "server_id", m.ServerID, "err", err)
 	}
 }
 
@@ -424,7 +432,7 @@ func (u *clusterUsage) runEnded(ctx context.Context, head string, run time.Time,
 		if !m.RunStartedAt.Equal(run) {
 			continue
 		}
-		if u.endMemberRun(ctx, m, gpusOf(gpus, m.ServerID), formed, now) && !slices.Contains(pushes, m.ServerID) {
+		if u.endMemberRun(ctx, m, gpusOf(gpus, m.Position), formed, now) && !slices.Contains(pushes, m.ServerID) {
 			pushes = append(pushes, m.ServerID)
 		}
 	}
@@ -447,13 +455,13 @@ func (u *clusterUsage) endMemberRun(ctx context.Context, m routing.ClusterMember
 		applied, err := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
 		if err != nil || !applied {
 			if err != nil {
-				slog.Warn("cluster member usage: replacing by the run's peak failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+				slog.Warn("cluster member usage: replacing by the run's peak failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "server_id", m.ServerID, "err", err)
 			}
 			return false
 		}
 	}
 	if _, err := u.store.EndClusterMemberRun(ctx, m.HeadSpecID, m.Position, m.RunStartedAt); err != nil {
-		slog.Warn("cluster member usage: recording a run's end failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+		slog.Warn("cluster member usage: recording a run's end failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "server_id", m.ServerID, "err", err)
 	}
 	return changed
 }
@@ -494,19 +502,21 @@ func replaceByRunPeak(m *routing.ClusterMember, gpus []routing.ClusterMemberGPU,
 	return changed
 }
 
-// reset clears the stored usage of serverID's member of head -- the stored
-// values, their stale mark and the current run's peaks; the run itself stays
-// open -- and pushes the member server's document, whose demand that
-// changes. store.ErrNotFound when serverID is no member of head.
-func (u *clusterUsage) reset(ctx context.Context, head, serverID string) error {
+// reset clears the stored usage of head's member at position on serverID --
+// the stored values, their stale mark and the current run's peaks; the run
+// itself stays open -- and pushes serverID's document, whose demand that
+// changes. store.ErrNotFound when head has no member at position, or the
+// member there is not on serverID (the server the reset was authorized for:
+// a membership rewrite since may have put another server's member there).
+func (u *clusterUsage) reset(ctx context.Context, head string, position int, serverID string) error {
 	if u == nil || u.store == nil {
 		return errClusterUsageUnavailable
 	}
 	unlock := u.locks.lock(headLockKey(head))
 	err := errClusterUsageContended
 	for range clusterUsageWriteAttempts {
-		m, gpus, ok, rerr := u.member(ctx, head, serverID)
-		if rerr == nil && !ok {
+		m, gpus, ok, rerr := u.member(ctx, head, position)
+		if rerr == nil && (!ok || m.ServerID != serverID) {
 			rerr = store.ErrNotFound
 		}
 		if rerr != nil {

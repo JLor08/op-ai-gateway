@@ -1600,6 +1600,32 @@ func TestOrchestratorRecordsHeadIdentityChangeWithoutRelaunch(t *testing.T) {
 	}
 }
 
+// TestOrchestratorRecordsNoLoopbackAddressChange pins what is no address
+// change in a cluster whose members run on the head's server: the head's
+// identity becomes loopback when every member does (and back when one moves
+// off), and a member's dial address becomes loopback when the head moves onto
+// its server. The source of the identity changed, not the head's or the
+// member's address, so nothing is recorded either way.
+func TestOrchestratorRecordsNoLoopbackAddressChange(t *testing.T) {
+	f := lanAddressFixture(t)
+	f.readPlan()
+	f.advance(time.Minute)
+	f.editPlan(func(p *portal.ClusterPlan) {
+		p.HeadIdentity = []string{"127.0.0.1"}
+		p.Members[0].Address = "127.0.0.1"
+	})
+	f.readPlan()
+	f.advance(time.Minute)
+	f.editPlan(func(p *portal.ClusterPlan) {
+		p.HeadIdentity = []string{"192.0.2.1"}
+		p.Members[0].Address = "192.0.2.10"
+	})
+	f.readPlan()
+	if got := f.o.ClusterStatus(orchHead).AddressChanges; len(got) != 0 {
+		t.Fatalf("address changes = %+v, want none for a move to or from loopback", got)
+	}
+}
+
 // TestOrchestratorKeepsFiveNewestAddressChanges pins the bound of the notice:
 // a head keeps its five newest changes, newest first.
 func TestOrchestratorKeepsFiveNewestAddressChanges(t *testing.T) {

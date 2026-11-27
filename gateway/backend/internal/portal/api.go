@@ -43,7 +43,7 @@ type API interface {
 	AuthorizeBenchmarkScope(context.Context, auth.Token, string, string) (routing.AIServer, []BenchmarkTargetView, error)
 	AuthorizeRunAsToken(context.Context, auth.Token, string) (auth.Token, error)
 	AuthorizeRuntimeAction(context.Context, auth.Token, string) (RuntimeActionScope, error)
-	AuthorizeClusterMemberUsageReset(context.Context, auth.Token, string, string) (routing.ClusterMember, error)
+	AuthorizeClusterMemberUsageReset(context.Context, auth.Token, string, string, *int) (routing.ClusterMember, error)
 	AuthorizeServerManage(context.Context, auth.Token, string) error
 	BeginVendorAccountConnect(context.Context, auth.Token, string) (string, error)
 	BeginVendorAccountDeviceConnect(context.Context, auth.Token, string) (string, string, error)

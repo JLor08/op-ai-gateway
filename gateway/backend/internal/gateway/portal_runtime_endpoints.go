@@ -15,6 +15,7 @@ import (
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/store"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -98,10 +99,14 @@ func clusterCandidatesBody(list portal.ClusterCandidateList) map[string]any {
 }
 
 // handlePortalClusterMemberResetUsage serves POST
-// /api/portal/mappings/{mappingID}/runtime/cluster-members/{serverID}/reset-usage:
-// it clears the stored usage of the member on serverID of the cluster head on
+// /api/portal/mappings/{mappingID}/runtime/cluster-members/{serverID}/reset-usage[?position=N]:
+// it clears the stored usage of a member on serverID of the cluster head on
 // that mapping (the way out of a stored peak above the member's budget, which
 // its next start would be refused for) and answers the head's runtime spec.
+// The optional position names the member when the head has several on
+// serverID; without it the server's one member is meant (409
+// cluster_member_ambiguous when there are several). A position that is no
+// non-negative integer names no member: 404 cluster_member_not_found.
 // Authorization -- the head's mapping and the member's server -- happens
 // inside portal.Service.AuthorizeClusterMemberUsageReset; the reset itself
 // runs beside the telemetry ingest that writes the same row (clusterUsage),
@@ -110,12 +115,17 @@ func (s *Server) handlePortalClusterMemberResetUsage(w http.ResponseWriter, r *h
 	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-	m, err := s.Portal.AuthorizeClusterMemberUsageReset(r.Context(), token, mappingID, serverID)
+	position, ok := resetUsagePosition(r)
+	if !ok {
+		writePortalRuntimeSpecError(w, portal.ErrClusterMemberNotFound)
+		return
+	}
+	m, err := s.Portal.AuthorizeClusterMemberUsageReset(r.Context(), token, mappingID, serverID, position)
 	if err != nil {
 		writePortalRuntimeSpecError(w, err)
 		return
 	}
-	if err := s.clusterUsage.reset(r.Context(), m.HeadSpecID, m.ServerID); err != nil {
+	if err := s.clusterUsage.reset(r.Context(), m.HeadSpecID, m.Position, m.ServerID); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// The member left between the authorization and the reset.
 			err = portal.ErrClusterMemberNotFound
@@ -129,6 +139,20 @@ func (s *Server) handlePortalClusterMemberResetUsage(w http.ResponseWriter, r *h
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
+}
+
+// resetUsagePosition reads the reset's optional "position" query parameter:
+// nil when absent, ok false when present but no non-negative integer.
+func resetUsagePosition(r *http.Request) (*int, bool) {
+	q := r.URL.Query()
+	if !q.Has("position") {
+		return nil, true
+	}
+	p, err := strconv.Atoi(q.Get("position"))
+	if err != nil || p < 0 {
+		return nil, false
+	}
+	return &p, true
 }
 
 // portalRuntimeSpecErrRows are writePortalRuntimeSpecError's mapper-specific
@@ -252,8 +276,10 @@ var portalRuntimeSpecErrRows = []errRow{
 }
 
 // portalClusterErrRows are the cluster head refusals of a runtime-spec write
-// and of the cluster-candidates listing. Every row is 400 except the three 409s
-// (a member spec another head uses, a member server without a free RPC
+// and of the cluster-candidates listing, and the member refusals of a usage
+// reset (the member's not-found, 404, and a server with several members of
+// the head and no position, 409). Every other row is 400 except the three
+// 409s (a member spec another head uses, a member server without a free RPC
 // port, a listen_port a member holds: well-formed, but in conflict with
 // other specs). Rows whose
 // refusal names the server or binary at fault surface the service's detail
@@ -261,6 +287,7 @@ var portalRuntimeSpecErrRows = []errRow{
 // the caller may not use is the shared server row.
 var portalClusterErrRows = []errRow{
 	{err: portal.ErrClusterMemberNotFound, status: http.StatusNotFound, code: "runtime_spec.cluster_member_not_found", msg: "the server is no member of this cluster head"},
+	{err: portal.ErrClusterMemberAmbiguous, status: http.StatusConflict, code: "runtime_spec.cluster_member_ambiguous", msg: "this cluster head has several members on the server: name one by its position"},
 	{err: portal.ErrClusterMemberModeInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_member_mode_invalid", msg: "member_mode must be \"automatic\" or \"manual\""},
 	{err: portal.ErrClusterNetworkInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_network_invalid", msg: "cluster_network must be \"mesh\" or \"lan\" (or empty for the default)"},
 	{err: portal.ErrClusterTransportInvalid, status: http.StatusBadRequest, code: "runtime_spec.cluster_transport_invalid", msg: "rpc_transport must be \"direct\" or \"relay\" (or empty for the default)"},

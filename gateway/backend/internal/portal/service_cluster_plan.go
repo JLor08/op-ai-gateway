@@ -355,12 +355,14 @@ const (
 )
 
 // ClusterPeakAboveBudgetDTO is one stored member peak above its ceiling: the
-// member's position, the resource, the GPU's host index for VRAM, the stored
-// value and the ceiling it exceeds. A member on a server the reader may not
+// member's position, the resource, the GPU for VRAM (its vendor -- the host's
+// legacy vendor for a vendor-less row, empty when that is unknown too -- and
+// its index), the stored value and the ceiling it exceeds. A member on a server the reader may not
 // manage shows only its position: the figures are facts about that server.
 type ClusterPeakAboveBudgetDTO struct {
 	Position  int    `json:"position"`
 	Resource  string `json:"resource,omitempty"`
+	GPUVendor string `json:"gpu_vendor,omitempty"`
 	GPUIndex  *int   `json:"gpu_index,omitempty"`
 	StoredMB  int    `json:"stored_mb,omitempty"`
 	CeilingMB int    `json:"ceiling_mb,omitempty"`

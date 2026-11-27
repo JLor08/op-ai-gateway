@@ -155,10 +155,10 @@ type derivedMember struct {
 	loopback bool
 }
 
-// loopbackAddr is where a member on the head's own server is dialed and
-// bound, and how it knows its head: nothing of it leaves the host, so it
+// ClusterLoopbackAddr is where a member on the head's own server is dialed
+// and bound, and how it knows its head: nothing of it leaves the host, so it
 // needs neither NetBird nor a LAN address and is outside both exposures.
-const loopbackAddr = "127.0.0.1"
+const ClusterLoopbackAddr = "127.0.0.1"
 
 // sameHostMember reports whether m runs on the head's server headServerID,
 // where it is addressed on loopback.
@@ -277,9 +277,9 @@ func (s *Service) deriveClusterNetwork(ctx context.Context, head routing.Runtime
 		return cn, "", err
 	}
 	if !remote {
-		cn.headIPs = []string{loopbackAddr}
+		cn.headIPs = []string{ClusterLoopbackAddr}
 		for i := range members {
-			members[i].bindIP, members[i].address = loopbackAddr, loopbackAddr
+			members[i].bindIP, members[i].address = ClusterLoopbackAddr, ClusterLoopbackAddr
 		}
 		return cn, "", nil
 	}
@@ -289,7 +289,7 @@ func (s *Service) deriveClusterNetwork(ctx context.Context, head routing.Runtime
 	}
 	for i := range members {
 		if members[i].loopback {
-			members[i].bindIP, members[i].address = loopbackAddr, loopbackAddr
+			members[i].bindIP, members[i].address = ClusterLoopbackAddr, ClusterLoopbackAddr
 			continue
 		}
 		// The bind address first: a bind-only member's missing interface is
@@ -793,7 +793,7 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 		},
 	}
 	if m.loopback {
-		spec.RPC.Transport, spec.RPC.HeadIPs, spec.RPC.HeadDomain = rpcTransportDirect, []string{loopbackAddr}, ""
+		spec.RPC.Transport, spec.RPC.HeadIPs, spec.RPC.HeadDomain = rpcTransportDirect, []string{ClusterLoopbackAddr}, ""
 	}
 	if m.row.MemberSpecID == "" {
 		if m.row.Threads > 0 {

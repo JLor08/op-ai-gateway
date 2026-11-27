@@ -1425,7 +1425,7 @@ func (s *Service) checkAppleMemberBudgets(ctx context.Context, e clusterEntry, h
 		if isApple(k) && !slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool {
 			return resolveLegacyGPUKey(routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}, legacy) == card && b.BudgetMB > 0
 		}) {
-			return e.refusal(ErrClusterMemberBudgetRequired, "GPU %d of server %q needs a GPU budget", k.Index, e.server.Name)
+			return e.refusal(ErrClusterMemberBudgetRequired, "%s of server %q needs a GPU budget", routing.GPUKey{Vendor: routing.GPUVendorApple, Index: k.Index}, e.server.Name)
 		}
 	}
 	return nil
@@ -2185,10 +2185,11 @@ func memberPeaksAboveBudget(m clusterMemberState, parts []ClusterMemberGPUDTO, g
 		})
 	}
 	for _, g := range parts {
-		if c := gpuCeilings[resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, m.server.GPULegacyVendor)]; c > 0 && g.VRAMMeasuredMB > c {
+		key := resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, m.server.GPULegacyVendor)
+		if c := gpuCeilings[key]; c > 0 && g.VRAMMeasuredMB > c {
 			index := g.Index
 			found = append(found, ClusterPeakAboveBudgetDTO{
-				Position: m.row.Position, Resource: ClusterPeakResourceVRAM, GPUIndex: &index, StoredMB: g.VRAMMeasuredMB, CeilingMB: c,
+				Position: m.row.Position, Resource: ClusterPeakResourceVRAM, GPUVendor: key.Vendor, GPUIndex: &index, StoredMB: g.VRAMMeasuredMB, CeilingMB: c,
 			})
 		}
 	}

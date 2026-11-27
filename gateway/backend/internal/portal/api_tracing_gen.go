@@ -233,7 +233,7 @@ func (_d *APIWithTracing) AuthorizeBenchmarkScope(ctx context.Context, t1 auth.T
 	return _d.API.AuthorizeBenchmarkScope(ctx, t1, s1, s2)
 }
 
-func (_d *APIWithTracing) AuthorizeClusterMemberUsageReset(ctx context.Context, t1 auth.Token, s1 string, s2 string) (c2 routing.ClusterMember, err error) {
+func (_d *APIWithTracing) AuthorizeClusterMemberUsageReset(ctx context.Context, t1 auth.Token, s1 string, s2 string, ip1 *int) (c2 routing.ClusterMember, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.AuthorizeClusterMemberUsageReset")
 	defer span.End()
 	defer func() {
@@ -242,7 +242,7 @@ func (_d *APIWithTracing) AuthorizeClusterMemberUsageReset(ctx context.Context, 
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.API.AuthorizeClusterMemberUsageReset(ctx, t1, s1, s2)
+	return _d.API.AuthorizeClusterMemberUsageReset(ctx, t1, s1, s2, ip1)
 }
 
 func (_d *APIWithTracing) AuthorizeRunAsToken(ctx context.Context, t1 auth.Token, s1 string) (t2 auth.Token, err error) {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"op-ai-gateway/internal/store"
 	"slices"
 	"sync"
 	"testing"
@@ -494,6 +495,137 @@ func TestResetMemberUsage(t *testing.T) {
 	}
 	if rec = rpcMemberDo(t, srv, http.MethodGet, base+usageGPUServer+"/reset-usage", ""); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("get = %d", rec.Code)
+	}
+}
+
+// seedSameServerMembers replaces the usage cluster's membership on s with two
+// automatic members of the head on usageGPUServer: position 0 on NVIDIA 0
+// (agent spec usageMemberSpec), position 1 on AMD 0 (the "_m2" id), each
+// with its own port.
+func seedSameServerMembers(t *testing.T, s routing.Store) {
+	t.Helper()
+	if err := s.SetClusterMembers(context.Background(), usageHead, []routing.ClusterMember{
+		{HeadSpecID: usageHead, Position: 0, ServerID: usageGPUServer, Port: 47001},
+		{HeadSpecID: usageHead, Position: 1, ServerID: usageGPUServer, Port: 47002},
+	}, []routing.ClusterMemberGPU{
+		{HeadSpecID: usageHead, MemberPosition: 0, ServerID: usageGPUServer, GPUVendor: routing.GPUVendorNVIDIA, GPUIndex: 0},
+		{HeadSpecID: usageHead, MemberPosition: 1, ServerID: usageGPUServer, GPUVendor: routing.GPUVendorAMD, GPUIndex: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// memberAt returns the stored membership row of head at position and its
+// GPU rows.
+func memberAt(t *testing.T, s routing.Store, head string, position int) (routing.ClusterMember, []routing.ClusterMemberGPU) {
+	t.Helper()
+	members, gpus, err := s.ClusterMembers(context.Background(), head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(members, func(m routing.ClusterMember) bool { return m.Position == position })
+	if i < 0 {
+		t.Fatalf("no member of %s at position %d", head, position)
+	}
+	var own []routing.ClusterMemberGPU
+	for _, g := range gpus {
+		if g.MemberPosition == position {
+			own = append(own, g)
+		}
+	}
+	return members[i], own
+}
+
+// vendorRow is a member's status row held by heldBy, measuring ramMB of RAM
+// and vramMB on the one GPU (vendor, index 0).
+func vendorRow(spec, heldBy string, ramMB int, vendor string, vramMB int) RuntimeStatusDTO {
+	r := usageRow(spec, heldBy, ramMB, map[int]int{0: vramMB})
+	r.GPUs[0].Vendor = vendor
+	return r
+}
+
+// TestClusterUsageTwoMembersOnOneServer pins member usage keyed by position:
+// two members of one head on one server, both held in one frame of that
+// server, each raise their own membership row and GPU row (NVIDIA 0 and AMD
+// 0 share an index, never a row), a formed run's end replaces each by its
+// own peak and clears each one's run, and the stale mark of one clears by
+// its own parts alone. The session record of the server stays open while
+// either member is held.
+func TestClusterUsageTwoMembersOnOneServer(t *testing.T) {
+	f := newUsageFixture(t)
+	seedSameServerMembers(t, f.store)
+	m0, _ := memberAt(t, f.store, usageHead, 0)
+	m0.RAMMeasuredMB, m0.Stale = 500, true
+	if applied, err := f.store.UpdateClusterMemberUsage(f.ctx, m0, nil); err != nil || !applied {
+		t.Fatalf("seed position 0: applied=%v err=%v", applied, err)
+	}
+	m1, g1 := memberAt(t, f.store, usageHead, 1)
+	m1.RAMMeasuredMB = 3000
+	g1[0].VRAMMeasuredMB = 9000
+	if applied, err := f.store.UpdateClusterMemberUsage(f.ctx, m1, g1); err != nil || !applied {
+		t.Fatalf("seed position 1: applied=%v err=%v", applied, err)
+	}
+	run := f.begin()
+
+	spec0, spec1 := usageMemberSpec(usageGPUServer), usageMemberSpec(usageGPUServer)+"_m2"
+	f.u.observe(f.ctx, usageGPUServer, "", []RuntimeStatusDTO{
+		vendorRow(spec0, usageHead, 1000, routing.GPUVendorNVIDIA, 5000),
+		vendorRow(spec1, usageHead, 2000, routing.GPUVendorAMD, 7000),
+	})
+	got0, gpus0 := memberAt(t, f.store, usageHead, 0)
+	got1, gpus1 := memberAt(t, f.store, usageHead, 1)
+	if got0.RAMMeasuredMB != 1000 || got0.RunPeakRAMMB != 1000 || len(gpus0) != 1 || gpus0[0].VRAMMeasuredMB != 5000 || gpus0[0].RunPeakVRAMMB != 5000 {
+		t.Fatalf("position 0 after the frame = %+v %+v, want RAM 1000 and NVIDIA 0 at 5000", got0, gpus0)
+	}
+	if got1.RAMMeasuredMB != 3000 || got1.RunPeakRAMMB != 2000 || len(gpus1) != 1 || gpus1[0].VRAMMeasuredMB != 9000 || gpus1[0].RunPeakVRAMMB != 7000 {
+		t.Fatalf("position 1 after the frame = %+v %+v, want stored 3000/9000 kept and run peaks 2000/7000", got1, gpus1)
+	}
+
+	// Position 1 released, position 0 still held: the server's session of
+	// the head stays open.
+	f.advance(time.Second)
+	f.u.observe(f.ctx, usageGPUServer, "", []RuntimeStatusDTO{
+		vendorRow(spec0, usageHead, 0, routing.GPUVendorNVIDIA, 0),
+		vendorRow(spec1, "", 0, routing.GPUVendorAMD, 0),
+	})
+	if open := f.openSessions(); !slices.Equal(open, []string{usageGPUServer}) {
+		t.Fatalf("open sessions = %v, want the server's while one member is held", open)
+	}
+
+	f.u.runEnded(f.ctx, usageHead, run, true)
+	got0, gpus0 = memberAt(t, f.store, usageHead, 0)
+	got1, gpus1 = memberAt(t, f.store, usageHead, 1)
+	if got0.RAMMeasuredMB != 1000 || gpus0[0].VRAMMeasuredMB != 5000 || got0.Stale || !got0.RunStartedAt.IsZero() {
+		t.Fatalf("position 0 after the run = %+v %+v, want its own peaks, not stale, run ended", got0, gpus0)
+	}
+	if got1.RAMMeasuredMB != 2000 || gpus1[0].VRAMMeasuredMB != 7000 || !got1.RunStartedAt.IsZero() {
+		t.Fatalf("position 1 after the run = %+v %+v, want its own peaks and its run ended", got1, gpus1)
+	}
+	if pushed := f.takePushes(); !slices.Equal(pushed, []string{usageGPUServer}) {
+		t.Fatalf("pushed %v, want the member server once", pushed)
+	}
+}
+
+// TestResetChecksTheMemberServer pins the reset's guard: the position names
+// the member, and the server the reset was authorized for must still be that
+// member's; a membership rewrite that put another server there in between
+// is the member's not-found, and nothing is reset or pushed.
+func TestResetChecksTheMemberServer(t *testing.T) {
+	f := newUsageFixture(t)
+	f.storeUsage(usageCPUServer, 3000, nil, false)
+	if err := f.u.reset(f.ctx, usageHead, 1, usageGPUServer); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("reset of position 1 for the GPU server = %v, want not found", err)
+	}
+	f.wantStored(usageCPUServer, 3000, nil)
+	if pushed := f.takePushes(); len(pushed) != 0 {
+		t.Fatalf("a refused reset pushed %v", pushed)
+	}
+	if err := f.u.reset(f.ctx, usageHead, 1, usageCPUServer); err != nil {
+		t.Fatal(err)
+	}
+	f.wantStored(usageCPUServer, 0, nil)
+	if pushed := f.takePushes(); !slices.Equal(pushed, []string{usageCPUServer}) {
+		t.Fatalf("pushed %v, want the member server", pushed)
 	}
 }
 

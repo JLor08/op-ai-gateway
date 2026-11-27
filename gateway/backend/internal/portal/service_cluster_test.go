@@ -281,6 +281,22 @@ func sortedIDs(ids ...string) []string {
 	return out
 }
 
+// TestAppleMemberBudgetRefusalNamesTheGPU pins the GPU an Apple member's
+// missing budget names: "Apple 0", the way a GPU reads for humans.
+func TestAppleMemberBudgetRefusalNamesTheGPU(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.hardware(a.ID, `{"os":"darwin 15.1","gpus":[{"index":0,"name":"Apple M2 Ultra"}]}`)
+	f.hostOS(a.ID, "darwin")
+	req := clusterHeadRequest(autoMember(a.ID))
+	req.ClusterMembers[0].GPUs = []ClusterMemberGPUDTO{{Index: 0, VRAMEstimateMB: 60000}}
+	req.Args = append(req.Args, "--tensor-split", "1,1")
+	_, err := f.put(ownerToken(), req)
+	if !errors.Is(err, ErrClusterMemberBudgetRequired) || !strings.Contains(err.Error(), "Apple 0 of server") {
+		t.Fatalf("PutRuntimeSpec = %v, want the budget refusal naming Apple 0", err)
+	}
+}
+
 // TestPutClusterSaveChecks pins one refusal per save code, in the order the
 // checks run.
 func TestPutClusterSaveChecks(t *testing.T) {

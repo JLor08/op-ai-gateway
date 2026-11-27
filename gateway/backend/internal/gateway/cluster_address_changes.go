@@ -29,6 +29,12 @@ func (o *clusterOrchestrator) noteAddressPlanLocked(st *clusterHeadState, plan p
 	st.addrPlan = &p
 }
 
+// loopbackIdentity reports whether a head identity is the loopback one: the
+// identity of a head whose members all run on its own server.
+func loopbackIdentity(identity []string) bool {
+	return slices.Equal(identity, []string{portal.ClusterLoopbackAddr})
+}
+
 // recordAddressChangesLocked records the lan address changes from prev to
 // next, two plans of st's head that are not withheld: the head's identity
 // when it differs (applied live by the members' agents, so nothing
@@ -36,10 +42,12 @@ func (o *clusterOrchestrator) noteAddressPlanLocked(st *clusterHeadState, plan p
 // the head's endpoint list, so a formed head's agent relaunches it; a head
 // that is not formed relaunches nothing, and its next start dials the new
 // address). It only records: nothing is started, stopped or pushed. A
-// member is matched by
-// its server, so a reordered membership is no address change; a member
-// added or removed, a cluster that is or was no lan cluster, and an
-// address one plan lacks record nothing. The caller holds o.mu.
+// member is matched by its server, so a reordered membership is no address
+// change; a member added or removed, a cluster that is or was no lan
+// cluster, and an address one plan lacks record nothing. Nor does an
+// identity or address that is or was loopback (a cluster, or a member, on
+// the head's own server): the source of the address changed, not the
+// head's or the member's address. The caller holds o.mu.
 func (o *clusterOrchestrator) recordAddressChangesLocked(st *clusterHeadState, prev, next portal.ClusterPlan) {
 	if prev.Network != clusterNetworkLAN || next.Network != clusterNetworkLAN {
 		return
@@ -47,7 +55,7 @@ func (o *clusterOrchestrator) recordAddressChangesLocked(st *clusterHeadState, p
 	at := o.deps.now()
 	var changes []portal.ClusterAddressChangeDTO
 	if prev.Head.Server.ID == next.Head.Server.ID && len(prev.HeadIdentity) > 0 && len(next.HeadIdentity) > 0 &&
-		!slices.Equal(prev.HeadIdentity, next.HeadIdentity) {
+		!slices.Equal(prev.HeadIdentity, next.HeadIdentity) && !loopbackIdentity(prev.HeadIdentity) && !loopbackIdentity(next.HeadIdentity) {
 		changes = append(changes, portal.ClusterAddressChangeDTO{
 			Head: true, Server: next.Head.Server.Name, ServerID: next.Head.Server.ID,
 			From: strings.Join(prev.HeadIdentity, ", "), To: strings.Join(next.HeadIdentity, ", "), At: at,
@@ -59,7 +67,7 @@ func (o *clusterOrchestrator) recordAddressChangesLocked(st *clusterHeadState, p
 			continue
 		}
 		from := prev.Members[i].Address
-		if from == "" || m.Address == "" || from == m.Address {
+		if from == "" || m.Address == "" || from == m.Address || from == portal.ClusterLoopbackAddr || m.Address == portal.ClusterLoopbackAddr {
 			continue
 		}
 		pos := m.Position

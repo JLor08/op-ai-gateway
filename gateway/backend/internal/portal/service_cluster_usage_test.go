@@ -145,8 +145,36 @@ func TestClusterStatusFlagsPeakAboveBudget(t *testing.T) {
 func peaksEqual(a, b []ClusterPeakAboveBudgetDTO) bool {
 	return slices.EqualFunc(a, b, func(x, y ClusterPeakAboveBudgetDTO) bool {
 		sameIndex := (x.GPUIndex == nil) == (y.GPUIndex == nil) && (x.GPUIndex == nil || *x.GPUIndex == *y.GPUIndex)
-		return sameIndex && x.Position == y.Position && x.Resource == y.Resource && x.StoredMB == y.StoredMB && x.CeilingMB == y.CeilingMB
+		return sameIndex && x.GPUVendor == y.GPUVendor && x.Position == y.Position && x.Resource == y.Resource && x.StoredMB == y.StoredMB && x.CeilingMB == y.CeilingMB
 	})
+}
+
+// TestPeakAboveBudgetNamesTheGPUVendor pins the GPU a VRAM peak names: its
+// vendor beside its index, so NVIDIA 0 and AMD 0 of one host are told apart;
+// a vendor-less row reads as the host's legacy vendor, and stays vendor-less
+// on a host that has none.
+func TestPeakAboveBudgetNamesTheGPUVendor(t *testing.T) {
+	m := clusterMemberState{
+		visible: true, found: true,
+		row:    routing.ClusterMember{Position: 2},
+		server: routing.AIServer{ID: "srv_mixed", GPULegacyVendor: routing.GPUVendorNVIDIA},
+	}
+	parts := []ClusterMemberGPUDTO{{Index: 0, VRAMMeasuredMB: 30000}, {Vendor: routing.GPUVendorAMD, Index: 0, VRAMMeasuredMB: 30000}}
+	ceilings := map[routing.GPUKey]int{{Vendor: routing.GPUVendorNVIDIA, Index: 0}: 20000, {Vendor: routing.GPUVendorAMD, Index: 0}: 10000}
+	zero := 0
+	want := []ClusterPeakAboveBudgetDTO{
+		{Position: 2, Resource: ClusterPeakResourceVRAM, GPUVendor: routing.GPUVendorNVIDIA, GPUIndex: &zero, StoredMB: 30000, CeilingMB: 20000},
+		{Position: 2, Resource: ClusterPeakResourceVRAM, GPUVendor: routing.GPUVendorAMD, GPUIndex: &zero, StoredMB: 30000, CeilingMB: 10000},
+	}
+	if got := memberPeaksAboveBudget(m, parts, ceilings, 0); !peaksEqual(got, want) {
+		t.Fatalf("mixed host peaks = %+v, want %+v", got, want)
+	}
+
+	m.server.GPULegacyVendor = ""
+	legacy := []ClusterPeakAboveBudgetDTO{{Position: 2, Resource: ClusterPeakResourceVRAM, GPUIndex: &zero, StoredMB: 30000, CeilingMB: 20000}}
+	if got := memberPeaksAboveBudget(m, parts[:1], map[routing.GPUKey]int{{Index: 0}: 20000}, 0); !peaksEqual(got, legacy) {
+		t.Fatalf("legacy host peaks = %+v, want %+v", got, legacy)
+	}
 }
 
 // TestAuthorizeClusterMemberUsageReset pins who may reset a member's stored
@@ -164,21 +192,58 @@ func TestAuthorizeClusterMemberUsageReset(t *testing.T) {
 		t.Fatalf("system save: %v", err)
 	}
 
-	m, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, mine.ID)
+	m, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, mine.ID, nil)
 	if err != nil || m.HeadSpecID != head.ID || m.ServerID != mine.ID {
 		t.Fatalf("own member = %+v err=%v", m, err)
 	}
-	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, foreign.ID); !errors.Is(err, ErrServerNotFound) {
+	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, foreign.ID, nil); !errors.Is(err, ErrServerNotFound) {
 		t.Fatalf("foreign member err = %v, want server not found", err)
 	}
-	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, systemToken(), f.mappingID, foreign.ID); err != nil {
+	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, systemToken(), f.mappingID, foreign.ID, nil); err != nil {
 		t.Fatalf("system on the foreign member: %v", err)
 	}
-	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, other.ID); !errors.Is(err, ErrClusterMemberNotFound) {
+	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, other.ID, nil); !errors.Is(err, ErrClusterMemberNotFound) {
 		t.Fatalf("no member err = %v, want the member's not-found", err)
 	}
-	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, otherToken(), f.mappingID, mine.ID); !errors.Is(err, ErrMappingNotFound) {
+	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, otherToken(), f.mappingID, mine.ID, nil); !errors.Is(err, ErrMappingNotFound) {
 		t.Fatalf("foreign head err = %v, want mapping not found", err)
+	}
+}
+
+// TestAuthorizeClusterMemberUsageResetByPosition pins the member a reset
+// names when a head has several members on one server: the server alone is
+// ambiguous, a position names the member there, and a position whose member
+// is on another server (or no member at all) is the member's not-found. A
+// position on a server with one member names that member as the server does.
+func TestAuthorizeClusterMemberUsageResetByPosition(t *testing.T) {
+	f := newClusterFixture(t)
+	a, b := f.member("A"), f.member("B")
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID), autoMember(b.ID)))
+	if err := f.routes.SetClusterMembers(f.ctx, head.ID, []routing.ClusterMember{
+		{HeadSpecID: head.ID, Position: 0, ServerID: a.ID, Port: 47001},
+		{HeadSpecID: head.ID, Position: 1, ServerID: a.ID, Port: 47002},
+		{HeadSpecID: head.ID, Position: 2, ServerID: b.ID, Port: 47001},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	at := func(p int) *int { return &p }
+
+	if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, a.ID, nil); !errors.Is(err, ErrClusterMemberAmbiguous) {
+		t.Fatalf("no position err = %v, want ambiguous", err)
+	}
+	if m, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, a.ID, at(1)); err != nil || m.Position != 1 || m.ServerID != a.ID {
+		t.Fatalf("position 1 = %+v err=%v", m, err)
+	}
+	for _, p := range []int{2, 9} {
+		if _, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, a.ID, at(p)); !errors.Is(err, ErrClusterMemberNotFound) {
+			t.Fatalf("position %d on A err = %v, want the member's not-found", p, err)
+		}
+	}
+	if m, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, b.ID, nil); err != nil || m.Position != 2 {
+		t.Fatalf("B without a position = %+v err=%v", m, err)
+	}
+	if m, err := f.svc.AuthorizeClusterMemberUsageReset(f.ctx, ownerToken(), f.mappingID, b.ID, at(2)); err != nil || m.Position != 2 {
+		t.Fatalf("B at 2 = %+v err=%v", m, err)
 	}
 }
 
