@@ -14057,6 +14057,14 @@ describe('RuntimeAdminSection process_tree control (#424)', () => {
     expect(putSpecs[0].body.process_tree).toBe('job');
   });
 
+  it('the strata template pre-fills the engine log file when the list is empty', async () => {
+    renderSection();
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.getByLabelText(t.runtimeSpecLogFileName)).toHaveValue('engine');
+    expect(screen.getByLabelText(t.runtimeSpecLogFilePath)).toHaveValue('${CONFIG_DIR}/engine.log');
+  });
+
   it('labels the process_tree_agent_unknown warning', async () => {
     renderSection({ warnings: ['process_tree_agent_unknown'] });
     expect(await screen.findByText(t.runtimeProcessTreeAgentUnknownWarning)).toBeInTheDocument();
@@ -14160,6 +14168,52 @@ describe('RuntimeAdminSection strata run-config import', () => {
     expect(indexes).toEqual(['2', '0', '1']);
     expect(screen.getByLabelText(t.runtimeSpecStartupTimeout)).toHaveValue(1905);
     expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('qwen3.8-flash-next-unsloth-q8_0');
+  });
+
+  it('fills the log-files list with the engine log and rewrites log in the file', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByLabelText(t.runtimeSpecLogFileName)).toHaveValue('engine');
+    expect(screen.getByLabelText(t.runtimeSpecLogFilePath)).toHaveValue('${CONFIG_DIR}/engine.log');
+    const content = screen.getByLabelText(t.runtimeSpecConfigFileContent) as HTMLTextAreaElement;
+    expect(JSON.parse(content.value).log).toBe('${CONFIG_DIR}/engine.log');
+  });
+
+  it('replaces engine* log rows on a second import and keeps the others', async () => {
+    await openImport();
+    const base = JSON.parse(strataFixtureText) as Record<string, unknown>;
+    const importText = (o: Record<string, unknown>) => {
+      fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+        target: { value: JSON.stringify(o) },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    };
+    const names = () =>
+      (screen.getAllByLabelText(t.runtimeSpecLogFileName) as HTMLInputElement[]).map(
+        (n) => n.value,
+      );
+    importText({ ...base, replicas: 2 });
+    expect(names()).toEqual(['engine-r0', 'engine-r1']);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecLogFileAdd }));
+    const all = screen.getAllByLabelText(t.runtimeSpecLogFileName);
+    fireEvent.change(all[2], { target: { value: 'access' } });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
+    importText({ ...base });
+    expect(names()).toEqual(['access', 'engine']);
+  });
+
+  it('warns when more than four replicas were capped', async () => {
+    await openImport();
+    const base = JSON.parse(strataFixtureText) as Record<string, unknown>;
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: JSON.stringify({ ...base, replicas: 6 }) },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByText(t.strataImportWarnLogFilesCapped)).toBeInTheDocument();
+    expect(screen.getAllByLabelText(t.runtimeSpecLogFileName)).toHaveLength(4);
   });
 
   it('shows an inline error and writes nothing for a bad paste', async () => {

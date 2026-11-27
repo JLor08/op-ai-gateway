@@ -3340,14 +3340,24 @@ export function RuntimeAdminSection({
         ),
       );
     }
+    // Replace this import's own rows (names starting with "engine"), keep the
+    // operator's others, and stay within the cap.
+    setLogFiles((rows) =>
+      [
+        ...rows.filter((r) => !r.name.startsWith('engine')),
+        ...result.logFiles.map((f) => ({ rowKey: makeRowKey(), name: f.name, path: f.path })),
+      ].slice(0, LOG_FILES_MAX),
+    );
     setStartupTimeoutSeconds(result.startupTimeoutSeconds);
     if (result.upstreamModel !== undefined && appName === '') setAppName(result.upstreamModel);
     setStrataImportError('');
     setStrataImportNotes([
       t.strataImportDone,
-      ...result.warnings.map((w) =>
-        w === 'layer_split_positional' ? t.strataImportWarnLayerSplit : t.strataImportWarnApiKey,
-      ),
+      ...result.warnings.map((w) => {
+        if (w === 'layer_split_positional') return t.strataImportWarnLayerSplit;
+        if (w === 'log_files_capped') return t.strataImportWarnLogFilesCapped;
+        return t.strataImportWarnApiKey;
+      }),
     ]);
     setStrataImportText('');
     setStrataImportOpen(false);
@@ -3775,6 +3785,9 @@ export function RuntimeAdminSection({
     setSpecResponsesMode(template.responsesMode);
     setSpecMessagesMode(template.messagesMode);
     setProcessTree(template.processTree);
+    if (logFiles.length === 0) {
+      setLogFiles(template.logFiles.map((f) => ({ rowKey: makeRowKey(), ...f })));
+    }
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {

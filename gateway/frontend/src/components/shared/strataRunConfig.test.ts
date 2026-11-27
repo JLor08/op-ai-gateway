@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import fixtureText from './__fixtures__/strata-launch-q8_0.json?raw';
+import { logFileIssues } from './logFiles';
 import { importStrataRunConfig, type StrataImport } from './strataRunConfig';
 
 const fixture = JSON.parse(fixtureText) as Record<string, unknown>;
@@ -40,7 +41,6 @@ describe('importStrataRunConfig', () => {
       'args',
       'cwd',
       'tokenizer',
-      'log',
       'lib_dirs',
       'vision',
       'layer_split',
@@ -52,6 +52,66 @@ describe('importStrataRunConfig', () => {
     }
     expect(file.engine_ready_s).toBe(1845);
     expect(file.args).toEqual(fixture.args);
+  });
+
+  it('rewrites the log key to the per-instance engine log and declares it', () => {
+    const r = ok(importStrataRunConfig(fixtureText));
+    const file = JSON.parse(r.fileContent) as Record<string, unknown>;
+    expect(file.log).toBe('${CONFIG_DIR}/engine.log');
+    expect(r.fileContent).not.toContain('q8_0-256k.engine.log');
+    expect(r.logFiles).toEqual([{ name: 'engine', path: '${CONFIG_DIR}/engine.log' }]);
+    expect(r.warnings).not.toContain('log_files_capped');
+  });
+
+  it('declares the log even when the source named none', () => {
+    const r = ok(run((o) => delete o.log));
+    expect((JSON.parse(r.fileContent) as Record<string, unknown>).log).toBe(
+      '${CONFIG_DIR}/engine.log',
+    );
+    expect(r.logFiles).toEqual([{ name: 'engine', path: '${CONFIG_DIR}/engine.log' }]);
+  });
+
+  it('declares one file per replica for a replica count, keeping log as is', () => {
+    const r = ok(run((o) => (o.replicas = 3)));
+    expect((JSON.parse(r.fileContent) as Record<string, unknown>).log).toBe(
+      '${CONFIG_DIR}/engine.log',
+    );
+    expect(r.logFiles).toEqual([
+      { name: 'engine-r0', path: '${CONFIG_DIR}/engine.r0.log' },
+      { name: 'engine-r1', path: '${CONFIG_DIR}/engine.r1.log' },
+      { name: 'engine-r2', path: '${CONFIG_DIR}/engine.r2.log' },
+    ]);
+    expect(r.warnings).not.toContain('log_files_capped');
+  });
+
+  it('declares one file per replica for a replica list', () => {
+    const r = ok(run((o) => (o.replicas = [{ gpu: [0] }, { gpu: [1] }])));
+    expect(r.logFiles.map((f) => f.name)).toEqual(['engine-r0', 'engine-r1']);
+  });
+
+  it('caps at 4 replica files and warns beyond that', () => {
+    const r = ok(run((o) => (o.replicas = 6)));
+    expect(r.logFiles.map((f) => f.name)).toEqual([
+      'engine-r0',
+      'engine-r1',
+      'engine-r2',
+      'engine-r3',
+    ]);
+    expect(r.warnings).toContain('log_files_capped');
+    const four = ok(run((o) => (o.replicas = 4)));
+    expect(four.warnings).not.toContain('log_files_capped');
+  });
+
+  it('treats one replica, or a non-count value, as the plain case', () => {
+    for (const v of [1, [{}], 0, -2, 2.5, 'x', null, []]) {
+      const r = ok(run((o) => (o.replicas = v)));
+      expect(r.logFiles).toEqual([{ name: 'engine', path: '${CONFIG_DIR}/engine.log' }]);
+    }
+  });
+
+  it('produces names and paths the log-file validation accepts', () => {
+    const r = ok(run((o) => (o.replicas = 6)));
+    expect(logFileIssues(r.logFiles)).toEqual(r.logFiles.map(() => null));
   });
 
   it('sets model_name to ${MODEL}, gpu_order to as_given, and pretty-prints', () => {

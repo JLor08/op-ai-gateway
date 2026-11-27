@@ -2,6 +2,7 @@
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
 import type { EndpointMode } from '../../api';
+import type { LogFile } from './logFiles';
 
 /**
  * The launch-spec form values a kind's template fills in. Only the fields a
@@ -24,6 +25,8 @@ export type RuntimeSpecDraft = {
   // Windows job-object process tree: Strata's launcher (strata.cmd) spawns a
   // child tree, and only a job stops it as a unit.
   processTree: 'direct' | 'job';
+  // The engine log the run-config import points `log` at (#430).
+  logFiles: LogFile[];
 };
 
 /**
@@ -73,5 +76,6 @@ export function strataSpecTemplate(): RuntimeSpecDraft {
     responsesMode: 'passthrough',
     messagesMode: 'passthrough',
     processTree: 'job',
+    logFiles: [{ name: 'engine', path: '${CONFIG_DIR}/engine.log' }],
   };
 }

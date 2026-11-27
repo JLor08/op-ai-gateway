@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
+import type { LogFile } from './logFiles';
+
 /**
  * Turns the JSON run config `strata launch` writes into the runtime spec's
  * config file (`strata.json`) plus the spec fields it proposes. Pure; the
  * stored file is a normal, editable config file afterwards.
  */
+export type StrataImportWarning = 'layer_split_positional' | 'api_key_dropped' | 'log_files_capped';
+
 export type StrataImport =
   | {
       ok: true;
@@ -13,7 +17,10 @@ export type StrataImport =
       gpuOrder: number[];
       startupTimeoutSeconds: number;
       upstreamModel?: string;
-      warnings: ('layer_split_positional' | 'api_key_dropped')[];
+      // The engine log(s) the rewritten `log` key produces, ready for the
+      // spec's log_files (#430).
+      logFiles: LogFile[];
+      warnings: StrataImportWarning[];
     }
   | { ok: false; error: 'invalid_json' | 'missing_exe' | 'missing_args' };
 
@@ -60,6 +67,37 @@ function withoutApiKeys(v: unknown, dropped: { count: number }): unknown {
   return out;
 }
 
+// The per-instance engine log. The agent provisions ${CONFIG_DIR} per
+// instance and writes it with forward slashes inside config-file content on
+// Windows, so the JSON stays valid.
+const CONFIG_DIR_PLACEHOLDER = '${CONFIG_DIR}';
+const ENGINE_LOG = `${CONFIG_DIR_PLACEHOLDER}/engine.log`;
+// runtimeSpecLogFilesMax: a spec declares at most this many files.
+const MAX_LOG_FILES = 4;
+
+// replicaCount reads the run config's `replicas` the way Strata's replica_cfg
+// does: a list is one entry per replica, a positive integer is a count.
+// Anything else (absent, 0, 1, non-integer) is the plain single-engine case.
+function replicaCount(v: unknown): number {
+  if (Array.isArray(v)) return v.length;
+  return typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : 1;
+}
+
+// Strata suffixes the log path itself when there are replicas
+// (serve/replicas.py _suffixed: engine.log -> engine.r<i>.log).
+function engineLogFiles(replicas: unknown): { logFiles: LogFile[]; capped: boolean } {
+  const n = replicaCount(replicas);
+  if (n < 2) return { logFiles: [{ name: 'engine', path: ENGINE_LOG }], capped: false };
+  const shown = Math.min(n, MAX_LOG_FILES);
+  return {
+    logFiles: Array.from({ length: shown }, (_, i) => ({
+      name: `engine-r${i}`,
+      path: `${CONFIG_DIR_PLACEHOLDER}/engine.r${i}.log`,
+    })),
+    capped: n > MAX_LOG_FILES,
+  };
+}
+
 function isIndex(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 0;
 }
@@ -102,7 +140,7 @@ export function importStrataRunConfig(text: string): StrataImport {
   }
   if (!Array.isArray(src.args)) return { ok: false, error: 'missing_args' };
 
-  const warnings: ('layer_split_positional' | 'api_key_dropped')[] = [];
+  const warnings: StrataImportWarning[] = [];
   const dropped = { count: 0 };
   const out = withoutApiKeys(src, dropped) as Record<string, unknown>;
   for (const k of Object.keys(out)) {
@@ -113,6 +151,12 @@ export function importStrataRunConfig(text: string): StrataImport {
   if (ls !== undefined && ls !== 'auto' && ls !== null && ls !== '') {
     warnings.push('layer_split_positional');
   }
+  // The source's `log` names an absolute path on the machine that ran
+  // `strata launch`, where the diagnostics are unreachable. Point it into the
+  // per-instance config directory and declare it for the live log.
+  out.log = ENGINE_LOG;
+  const { logFiles, capped } = engineLogFiles(src.replicas);
+  if (capped) warnings.push('log_files_capped');
   out.model_name = '${MODEL}';
   // `strata serve` has no --gpu flag, so the card list goes into the file. A
   // comma-separated string is valid JSON before the agent expands the
@@ -135,6 +179,7 @@ export function importStrataRunConfig(text: string): StrataImport {
     fileContent: JSON.stringify(out, null, 2),
     gpuOrder,
     startupTimeoutSeconds,
+    logFiles,
     ...(upstreamModel === undefined ? {} : { upstreamModel }),
     warnings,
   };

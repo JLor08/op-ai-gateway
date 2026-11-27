@@ -1636,6 +1636,8 @@ const de = {
     'layer_split ist positionsabhängig: Eine andere GPU-Reihenfolge ändert seine Bedeutung.',
   strataImportWarnApiKey:
     'api_key wurde nicht übernommen: Der Schlüssel gehört in das Token der Spec, nicht in die Datei.',
+  strataImportWarnLogFilesCapped:
+    'Mehr als 4 Replikate: Nur die Logs der ersten 4 wurden als Log-Dateien eingetragen.',
   strataImportDone: 'Importiert: strata.json, GPU-Reihenfolge und Startup-Timeout wurden gesetzt.',
   strataImportTooLarge: 'Die importierte Datei überschreitet das Limit von 64 KiB.',
   strataImportNoFreeSlot: 'Es ist kein Platz für eine weitere Konfigurationsdatei (Maximum 16).',
@@ -5912,6 +5914,8 @@ const en: PortalMessages = {
   strataImportWarnLayerSplit: 'layer_split is positional: reordering the GPUs changes its meaning.',
   strataImportWarnApiKey:
     'api_key was not imported: the key belongs in the spec token, not in the file.',
+  strataImportWarnLogFilesCapped:
+    'More than 4 replicas: only the logs of the first 4 were declared as log files.',
   strataImportDone: 'Imported: strata.json, the GPU order and the startup timeout were set.',
   strataImportTooLarge: 'The imported file exceeds the 64 KiB limit.',
   strataImportNoFreeSlot: 'There is no room for another config file (maximum 16).',

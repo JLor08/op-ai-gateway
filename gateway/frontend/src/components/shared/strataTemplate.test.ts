@@ -30,6 +30,7 @@ describe('strataSpecTemplate', () => {
       responsesMode: 'passthrough',
       messagesMode: 'passthrough',
       processTree: 'job',
+      logFiles: [{ name: 'engine', path: '${CONFIG_DIR}/engine.log' }],
     });
   });
 
@@ -39,6 +40,10 @@ describe('strataSpecTemplate', () => {
     first.env.EXTRA = 'x';
     expect(strataSpecTemplate().args).not.toContain('--lazy');
     expect(strataSpecTemplate().env).toEqual({ STRATA_API_KEY: '${API_TOKEN}' });
+  });
+  it('returns a fresh logFiles list on every call', () => {
+    strataSpecTemplate().logFiles.push({ name: 'x', path: '/x' });
+    expect(strataSpecTemplate().logFiles).toHaveLength(1);
   });
   it('passes no --gpu flag: strata serve has none, the card list is in the config file', () => {
     expect(strataSpecTemplate().args).not.toContain('--gpu');
