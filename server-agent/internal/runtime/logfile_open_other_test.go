@@ -6,6 +6,9 @@
 package runtime
 
 import (
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -23,4 +26,65 @@ func TestOpenLogFileRefusesFIFO(t *testing.T) {
 		t.Skipf("mkfifo: %v", err)
 	}
 	mustRefuseOpen(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/f.log"))
+}
+
+// TestOpenLogFileRaceAfterFinalPath drives the name changes a server can time
+// with inotify IN_OPEN to the one moment they matter: right after the agent
+// computed the opened file's final path (the afterLogFileFinalPath seam). The
+// file the agent holds must never be one whose inside name is gone while an
+// outside name remains, nor one that gained a second name; a file with no
+// name left is fs.ErrNotExist (the tailer retries it), not a refusal.
+func TestOpenLogFileRaceAfterFinalPath(t *testing.T) {
+	cases := []struct {
+		name     string
+		race     func(t *testing.T, inside, outsideDir string)
+		vanished bool
+	}{
+		{name: "inside name unlinked, outside link remains", race: func(t *testing.T, inside, outsideDir string) {
+			if err := os.Link(inside, filepath.Join(outsideDir, "moved")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(inside); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "second link added", race: func(t *testing.T, inside, outsideDir string) {
+			if err := os.Link(inside, filepath.Join(outsideDir, "extra")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "file removed entirely", vanished: true, race: func(t *testing.T, inside, _ string) {
+			if err := os.Remove(inside); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "rotated: a new file at the same name", vanished: true, race: func(t *testing.T, inside, _ string) {
+			if err := os.Remove(inside); err != nil {
+				t.Fatal(err)
+			}
+			mustWrite(t, inside, "gen2")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfgDir := filepath.Join(dir, "cfg")
+			inside := filepath.Join(cfgDir, "s1", "h.log")
+			outsideDir := filepath.Join(dir, "outside")
+			mustWrite(t, inside, "gen1")
+			mustWrite(t, filepath.Join(outsideDir, "keep"), "")
+			target := openTarget(t, cfgDir, nil, "${CONFIG_DIR}/h.log")
+			afterLogFileFinalPath = func() { tc.race(t, inside, outsideDir) }
+			t.Cleanup(func() { afterLogFileFinalPath = nil })
+
+			if tc.vanished {
+				_, err := openWithin(t, target)
+				if !errors.Is(err, fs.ErrNotExist) || errors.Is(err, errLogFileNotPermitted) {
+					t.Fatalf("openLogFile = %v, want fs.ErrNotExist and not a refusal", err)
+				}
+				return
+			}
+			mustRefuseOpen(t, target)
+		})
+	}
 }

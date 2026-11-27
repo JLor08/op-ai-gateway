@@ -302,13 +302,19 @@ func isRealDir(fi fs.FileInfo) bool {
 }
 
 // removeConfigDirLogFile removes target's file before exec (§5.3), the only
-// deletion the log-file feature performs. It re-verifies at call time that
-// target is a direct child of the instance config dir and that the dir is a
-// real directory chain under config_files_dir (resolveInstanceConfigDir), and
-// refuses (errLogFileNotPermitted) otherwise. The leaf is removed without
-// following it: os.Remove of a symlink removes the link, never its target. A
-// leaf that is a directory is refused rather than removed. A missing file is
-// not an error.
+// deletion the log-file feature performs. It refuses (errLogFileNotPermitted)
+// unless target is a direct child of the instance config dir and that dir is
+// a real directory chain under config_files_dir (resolveInstanceConfigDir),
+// re-verified at call time.
+//
+// The removal itself runs on a directory handle, not a path: the instance dir
+// is opened as an os.Root beneath an os.Root of the base, and that handle
+// must be os.SameFile with the dir just Lstat'd as a real directory. A server
+// that swaps its instance dir for a link after the check therefore gets a
+// refusal, never a deletion through the link; once the handle is verified,
+// later swaps no longer matter. The leaf is removed without following it
+// (Root.Remove of a symlink removes the link), a leaf that is a directory is
+// refused, and a missing dir or file is not an error.
 func removeConfigDirLogFile(target logFileTarget) error {
 	leaf := filepath.Clean(target.OpenPath)
 	if !target.InConfigDir || target.ConfigDir == "" || filepath.Dir(leaf) != target.ConfigDir {
@@ -320,7 +326,20 @@ func removeConfigDirLogFile(target logFileTarget) error {
 		}
 		return logRemoveRefusal(target, "is not in a real directory under config_files_dir")
 	}
-	fi, err := os.Lstat(leaf)
+	dirFi, err := os.Lstat(target.ConfigDir)
+	if err != nil || !isRealDir(dirFi) {
+		return logRemoveRefusal(target, "is not in a real directory under config_files_dir")
+	}
+	inst, err := openInstanceRoot(target.ConfigBase, target.ConfigDir)
+	if err != nil {
+		return logRemoveRefusal(target, "is in a directory the agent cannot open")
+	}
+	defer func() { _ = inst.Close() }()
+	if rfi, err := inst.Stat("."); err != nil || !os.SameFile(dirFi, rfi) {
+		return logRemoveRefusal(target, "is in a directory that changed while it was checked")
+	}
+	name := filepath.Base(leaf)
+	fi, err := inst.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
@@ -330,10 +349,25 @@ func removeConfigDirLogFile(target logFileTarget) error {
 	if fi.IsDir() {
 		return logRemoveRefusal(target, "is a directory")
 	}
-	if err := os.Remove(leaf); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := inst.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return openErr(err)
 	}
 	return nil
+}
+
+// openInstanceRoot opens dir as an os.Root, reached through an os.Root of
+// base, so the walk from base to dir cannot leave base.
+func openInstanceRoot(base, dir string) (*os.Root, error) {
+	rel, err := filepath.Rel(base, dir)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.OpenRoot(base)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = b.Close() }()
+	return b.OpenRoot(rel)
 }
 
 func logRemoveRefusal(target logFileTarget, reason string) error {
@@ -465,45 +499,73 @@ func underPseudoFS(p string) bool {
 }
 
 // openLogFile opens target read-only for tailing and runs the resolved half of
-// the policy (see the file comment): the platform open (openLogFileHandle)
-// never blocks and never hinders the server's writes, renames or deletes; the
-// opened file must be a regular file with exactly one hard link, whose final
-// path lies strictly inside one of target.Roots, each resolved the same way,
-// and outside the pseudo filesystems. On a refusal the file is closed and the
-// error wraps errLogFileNotPermitted; any other error (a missing file above
-// all) carries the OS cause without the path.
+// the policy (see the file comment). The platform open (openLogFileHandle)
+// never blocks, never hinders the server's writes, renames or deletes, and
+// refuses anything but a regular file. Then, in this order, because the
+// server can change the file's names while the agent looks:
+//
+//  1. the descriptor's link count must be 1 (checkLinkCount): a hard link
+//     inside an allowed directory to a file outside it has an inside final
+//     path, so no path check can see it;
+//  2. the final path (openedFinalPath) must still name THIS file: not a
+//     " (deleted)" readlink, and os.Lstat of it a regular file that
+//     os.SameFile matches with the descriptor. Without this, a server that
+//     unlinks the inside name right after the open leaves the agent with an
+//     outside file and an inside path;
+//  3. the link count is read again and must still be 1, so a name added or
+//     removed while 2 ran cannot slip through;
+//  4. the final path must lie strictly inside one of target.Roots, each
+//     resolved the same way, and outside the pseudo filesystems.
+//
+// On a refusal the file is closed and the error wraps errLogFileNotPermitted.
+// A file whose last name went away during these steps (link count 0) is
+// fs.ErrNotExist, like a file not created yet: the tailer retries it. Any
+// other error carries the OS cause without the path.
 func openLogFile(target logFileTarget) (*os.File, error) {
-	f, final, err := openLogFileHandle(target)
+	f, err := openLogFileHandle(target)
 	if err != nil {
 		return nil, err
 	}
-	if reason := checkOpenedLogFile(f, final, target); reason != "" {
+	if _, err := checkOpenedLogFile(f, target); err != nil {
 		_ = f.Close()
-		return nil, logOpenRefusal(target, final, reason)
+		return nil, err
 	}
 	return f, nil
 }
 
-// checkOpenedLogFile returns why the opened file f, whose final path is final,
-// is refused, or "" when it is permitted.
-func checkOpenedLogFile(f *os.File, final string, target logFileTarget) string {
-	fi, err := f.Stat()
+// afterLogFileFinalPath, when set, runs right after openLogFile has computed
+// the opened file's final path. It is a TEST SEAM only: the tests use it to
+// change the file's names at the one moment the race checks guard.
+var afterLogFileFinalPath func()
+
+// errLogFileVanished is the fs.ErrNotExist of a file whose last name was
+// removed while openLogFile looked at it.
+var errLogFileVanished = fmt.Errorf("runtime: open log file: the file was removed while it was opened: %w", fs.ErrNotExist)
+
+// checkOpenedLogFile runs steps 1-4 of openLogFile on the opened f and returns
+// the final path, or the refusal (or errLogFileVanished).
+func checkOpenedLogFile(f *os.File, target logFileTarget) (string, error) {
+	if err := checkLinkCount(f, target, ""); err != nil {
+		return "", err
+	}
+	final, err := openedFinalPath(f, target.OpenPath)
 	if err != nil {
-		return "cannot be inspected after opening"
+		return "", logOpenRefusal(target, "", "has a final path that cannot be determined")
 	}
-	if !fi.Mode().IsRegular() {
-		return "is not a regular file"
+	if afterLogFileFinalPath != nil {
+		afterLogFileFinalPath()
 	}
-	// A hard link inside an allowed directory to a file outside it has an
-	// inside final path: no path check can see it. A log file has one link.
-	if n, err := openedLinkCount(f); err != nil || n != 1 {
-		return "has more than one hard link (or its link count cannot be read)"
+	if err := bindFinalPath(f, target, final); err != nil {
+		return "", err
+	}
+	if err := checkLinkCount(f, target, final); err != nil {
+		return "", err
 	}
 	if hasTwoLeadingSeparators(final) || !filepath.IsAbs(final) {
-		return "resolves to a UNC, device or relative path"
+		return "", logOpenRefusal(target, final, "resolves to a UNC, device or relative path")
 	}
 	if underPseudoFS(final) {
-		return "resolves under a kernel pseudo filesystem (proc, sys or dev)"
+		return "", logOpenRefusal(target, final, "resolves under a kernel pseudo filesystem (proc, sys or dev)")
 	}
 	for _, root := range target.Roots {
 		var resolved string
@@ -517,10 +579,53 @@ func checkOpenedLogFile(f *os.File, final string, target logFileTarget) string {
 			continue // a root that does not exist, or may not be used, contains nothing
 		}
 		if strictlyWithinDir(final, resolved) {
-			return ""
+			return final, nil
 		}
 	}
-	return "resolves outside every allowed root"
+	return "", logOpenRefusal(target, final, "resolves outside every allowed root")
+}
+
+// checkLinkCount requires the descriptor's link count to be exactly 1; 0
+// means the file has no name left (errLogFileVanished).
+func checkLinkCount(f *os.File, target logFileTarget, final string) error {
+	n, err := openedLinkCount(f)
+	switch {
+	case err != nil:
+		return logOpenRefusal(target, final, "has a link count that cannot be read")
+	case n == 0:
+		return errLogFileVanished
+	case n != 1:
+		return logOpenRefusal(target, final, "has more than one hard link")
+	}
+	return nil
+}
+
+// bindFinalPath requires final to still name the file f is open on. When it
+// does not, a link count of 0 means the file is simply gone (rotated or
+// deleted: errLogFileVanished); anything else is a refusal, because the file
+// the agent holds is no longer the one the path check would vouch for.
+func bindFinalPath(f *os.File, target logFileTarget, final string) error {
+	refuse := func(reason string) error {
+		if n, err := openedLinkCount(f); err == nil && n == 0 {
+			return errLogFileVanished
+		}
+		return logOpenRefusal(target, final, reason)
+	}
+	if strings.HasSuffix(final, " (deleted)") {
+		return refuse("lost its name while it was opened")
+	}
+	lfi, err := os.Lstat(final)
+	if err != nil {
+		return refuse("lost its name while it was opened")
+	}
+	if !lfi.Mode().IsRegular() {
+		return refuse("has a final path that is not a regular file")
+	}
+	ofi, err := f.Stat()
+	if err != nil || !os.SameFile(ofi, lfi) {
+		return refuse("has a final path that names another file")
+	}
+	return nil
 }
 
 // logOpenRefusal is the refusal of an opened (or about-to-be-opened) file.

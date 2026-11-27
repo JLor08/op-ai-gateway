@@ -25,31 +25,30 @@ const (
 )
 
 // openLogFileHandle opens target.OpenPath read-only with full sharing for
-// openLogFile and returns the file with its final path. CreateFile without
-// FILE_FLAG_BACKUP_SEMANTICS cannot open a directory; GetFileType refuses
-// every handle that is not a disk file (a pipe, a console, a reserved device
-// name such as NUL or CON) before anything reads from it. The final path is
-// the handle's own (GetFinalPathNameByHandle), so it reflects every symlink
-// and junction actually followed and cannot be raced by a later swap.
-func openLogFileHandle(target logFileTarget) (*os.File, string, error) {
+// openLogFile. CreateFile without FILE_FLAG_BACKUP_SEMANTICS cannot open a
+// directory; GetFileType refuses every handle that is not a disk file (a
+// pipe, a console, a reserved device name such as NUL or CON) before anything
+// reads from it. The link count and the final path are openLogFile's steps.
+func openLogFileHandle(target logFileTarget) (*os.File, error) {
 	p16, err := windows.UTF16PtrFromString(target.OpenPath)
 	if err != nil {
-		return nil, "", logOpenRefusal(target, "", "is not a valid Windows path")
+		return nil, logOpenRefusal(target, "", "is not a valid Windows path")
 	}
 	h, err := windows.CreateFile(p16, windows.GENERIC_READ, logFileShareMode, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 	if err != nil {
-		return nil, "", openErr(err)
+		return nil, openErr(err)
 	}
 	if t, err := windows.GetFileType(h); err != nil || t != windows.FILE_TYPE_DISK {
 		_ = windows.CloseHandle(h)
-		return nil, "", logOpenRefusal(target, "", "is not a regular file")
+		return nil, logOpenRefusal(target, "", "is not a regular file")
 	}
-	final, err := finalPathByHandle(h)
-	if err != nil {
-		_ = windows.CloseHandle(h)
-		return nil, "", logOpenRefusal(target, "", "has a final path that cannot be determined")
-	}
-	return os.NewFile(uintptr(h), target.OpenPath), final, nil
+	return os.NewFile(uintptr(h), target.OpenPath), nil
+}
+
+// openedFinalPath is the final path of the handle f holds
+// (GetFinalPathNameByHandle): every symlink and junction actually followed.
+func openedFinalPath(f *os.File, _ string) (string, error) {
+	return finalPathByHandle(windows.Handle(f.Fd()))
 }
 
 // resolveLogRoot resolves an allowed root through the same API as the opened

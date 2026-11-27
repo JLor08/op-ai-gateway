@@ -13,40 +13,35 @@ import (
 	"syscall"
 )
 
-// openLogFileHandle opens target.OpenPath read-only for openLogFile and
-// returns the file with its final path. A pre-open stat refuses a target that
-// is not a regular file before open(2) can run a device's open side effects;
-// the authoritative check is openLogFile's fstat of the opened descriptor.
-// O_NONBLOCK makes the open itself never wait (a FIFO swapped in after the
-// stat would otherwise block until a writer appears); it is cleared once the
-// descriptor is known to be a regular file. O_NOCTTY keeps a terminal from
-// becoming the agent's controlling terminal.
-func openLogFileHandle(target logFileTarget) (*os.File, string, error) {
+// openLogFileHandle opens target.OpenPath read-only for openLogFile. A
+// pre-open stat refuses a target that is not a regular file before open(2)
+// can run a device's open side effects; the authoritative check is the fstat
+// of the opened descriptor. O_NONBLOCK makes the open itself never wait (a
+// FIFO swapped in after the stat would otherwise block until a writer
+// appears); it is cleared once the descriptor is known to be a regular file.
+// O_NOCTTY keeps a terminal from becoming the agent's controlling terminal.
+// The link count and the final path are openLogFile's steps, not this one's.
+func openLogFileHandle(target logFileTarget) (*os.File, error) {
 	fi, err := os.Stat(target.OpenPath)
 	if err != nil {
-		return nil, "", openErr(err)
+		return nil, openErr(err)
 	}
 	if !fi.Mode().IsRegular() {
-		return nil, "", logOpenRefusal(target, "", "is not a regular file")
+		return nil, logOpenRefusal(target, "", "is not a regular file")
 	}
 	f, err := os.OpenFile(target.OpenPath, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
 	if err != nil {
-		return nil, "", openErr(err)
+		return nil, openErr(err)
 	}
 	if ofi, err := f.Stat(); err != nil || !ofi.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, "", logOpenRefusal(target, "", "is not a regular file")
+		return nil, logOpenRefusal(target, "", "is not a regular file")
 	}
 	if err := clearNonblock(f); err != nil {
 		_ = f.Close()
-		return nil, "", openErr(err)
+		return nil, openErr(err)
 	}
-	final, err := openedFinalPath(f, target.OpenPath)
-	if err != nil {
-		_ = f.Close()
-		return nil, "", logOpenRefusal(target, "", "has a final path that cannot be determined")
-	}
-	return f, final, nil
+	return f, nil
 }
 
 // clearNonblock puts f's descriptor back into blocking mode. Through
@@ -65,12 +60,12 @@ func clearNonblock(f *os.File) error {
 }
 
 // openedFinalPath is the final path of the file f is open on. On Linux it is
-// the kernel's own answer for the descriptor (/proc/self/fd/N), so no swap of
-// the path after the open can make it name a different file. Elsewhere (and
-// on a Linux host without /proc) it is filepath.EvalSymlinks of the path,
-// bound to the descriptor by os.SameFile: if the path was swapped between the
-// open and the resolution, the resolved path names another file and is
-// refused instead of vouching for the wrong one.
+// the kernel's own answer for the descriptor (/proc/self/fd/N), which for a
+// name unlinked since the open ends in " (deleted)" -- openLogFile refuses
+// that. Elsewhere (and on a Linux host without /proc) it is
+// filepath.EvalSymlinks of the path. Either way openLogFile then binds the
+// result to the descriptor (os.Lstat + os.SameFile), so a path swapped after
+// the open cannot vouch for a different file.
 func openedFinalPath(f *os.File, openPath string) (string, error) {
 	if goruntime.GOOS == "linux" {
 		if p, err := fdPath(f); err == nil && filepath.IsAbs(p) {
