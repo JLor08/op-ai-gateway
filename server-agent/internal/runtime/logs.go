@@ -1749,6 +1749,30 @@ func (p *procLog) Flush() {
 	p.store.flushLocked(p)
 }
 
+// DiscardCarry drops what p's secret masker holds back, instead of resolving
+// it as Flush does, and returns how many bytes of the stream that removes
+// from the record. It is for a cut the reader of p's stream makes itself in
+// the middle of the text (a log-file tailer's line cut, or a skip past its
+// read-rate cap): the bytes after such a cut are not the continuation of the
+// held-back ones, so resolving them as the end of the stream would write a
+// secret's first part in clear. The count is what the caller reports as a
+// gap. Bytes inside a span that is still open are already represented by the
+// placeholder written when it opened, so they are not counted. A no-op
+// without a masker or carry.
+func (p *procLog) DiscardCarry() int {
+	if p.store == nil || p.specID == "" {
+		return 0
+	}
+	p.store.mu.Lock()
+	defer p.store.mu.Unlock()
+	n := len(p.carry.pending)
+	if p.carry.open {
+		n -= min(p.carry.end, n)
+	}
+	p.carry = maskCarry{}
+	return n
+}
+
 // prefixLinesLocked returns b as the text to record: b itself for instance 0,
 // and for a further instance b with p.prefix opening every line that starts in
 // it. A line starts at the generation's first byte and after every '\n'; the

@@ -5,13 +5,16 @@ package runtime
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -495,10 +498,19 @@ func TestTailerRateCapCountsDropped(t *testing.T) {
 	h := startHarness(t, target, func(c *tailerConfig) { c.TickBytes = tick })
 	h.waitFor("the first tick", func() bool { return h.dropped() > 0 && len(h.text()) > 0 })
 	h.stop()
-	if got := h.text(); got != string(data[len(data)-tick:]) {
-		t.Fatalf("text = %d bytes, want the newest %d bytes of the backlog", len(got), tick)
+	// The newest tick bytes, from the first line start in them: the skip
+	// point lies mid-line (13-byte lines), so the cut line's end is dropped.
+	newest := data[len(data)-tick:]
+	if data[len(data)-tick-1] != '\n' {
+		newest = newest[bytes.IndexByte(newest, '\n')+1:]
 	}
-	if got, want := h.dropped(), int64(len(data)-tick); got != want {
+	if len(newest) == tick {
+		t.Fatal("test setup: the skip point must lie mid-line")
+	}
+	if got := h.text(); got != string(newest) {
+		t.Fatalf("text = %d bytes %q..., want the %d newest bytes from a line start", len(got), got[:min(len(got), 40)], len(newest))
+	}
+	if got, want := h.dropped(), int64(len(data)-len(newest)); got != want {
 		t.Fatalf("dropped = %d, want %d", got, want)
 	}
 	// The gap sits where the bytes were skipped: before the text.
@@ -635,5 +647,317 @@ func TestTailerConstants(t *testing.T) {
 		logFileTickBytes != 64<<10 || logFileMaxLine != 16<<10 {
 		t.Fatalf("tailer constants = %v %v %d %d, want 250ms 2s 64KiB 16KiB",
 			logFileTailInterval, logFileTailGrace, logFileTickBytes, logFileMaxLine)
+	}
+}
+
+// --- fix round 1 ------------------------------------------------------------
+
+// TestTailerGraceNeverAdoptsTheNextGenerationsFile: in a crash loop the next
+// generation starts within this one's grace and recreates the ${CONFIG_DIR}
+// file. After Stop the tailer probes the path once, then only drains the
+// handle it holds: the new file's text never lands in this generation's
+// stream, and there is no file_rotated.
+func TestTailerGraceNeverAdoptsTheNextGenerationsFile(t *testing.T) {
+	target, path, _ := newTailerTarget(t, "engine.log")
+	mustWrite(t, path, "gen N running\n")
+	var opens atomic.Int64
+	h := startHarness(t, target, func(c *tailerConfig) {
+		c.Grace = 300 * time.Millisecond
+		c.Open = func(tg logFileTarget) (*os.File, error) { opens.Add(1); return openLogFile(tg) }
+	})
+	h.waitText("gen N running\n")
+	var late *os.File
+	if goruntime.GOOS != "windows" {
+		// The dying server still holds its file and writes after the name is
+		// gone: the held handle reads on.
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		late = f
+	}
+	appendFile(t, path, "gen N crash\n")
+	before := opens.Load()
+	done := h.tailer.Stop()
+	h.waitFor("the last probe after Stop", func() bool { return opens.Load() > before })
+	// Generation N+1 starts: removes the name, creates its own file.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, path, "gen N+1 first line\n")
+	if late != nil {
+		if _, err := late.WriteString("gen N last gasp\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(tailerWait):
+		t.Fatal("tailer did not finish")
+	}
+	if n := opens.Load() - before; n != 1 {
+		t.Fatalf("Open called %d times after Stop, want exactly the one last probe", n)
+	}
+	want := "[" + logEventFileOpened + "]gen N running\ngen N crash\n"
+	if late != nil {
+		want += "gen N last gasp\n"
+	}
+	if got := h.flat(); got != want {
+		t.Fatalf("stream = %q, want %q (no rotation into the next generation's file)", got, want)
+	}
+}
+
+// TestTailerEndGrace: EndGrace ends the tailer at once, without waiting out
+// the grace, and keeps the bytes already written; it is safe before or after
+// Stop and more than once.
+func TestTailerEndGrace(t *testing.T) {
+	t.Run("after Stop", func(t *testing.T) {
+		target, path, _ := newTailerTarget(t, "engine.log")
+		mustWrite(t, path, "x\n")
+		h := startHarness(t, target, func(c *tailerConfig) { c.Grace = time.Hour })
+		h.waitText("x\n")
+		appendFile(t, path, "kept\n")
+		done := h.tailer.Stop()
+		h.tailer.EndGrace()
+		h.tailer.EndGrace()
+		select {
+		case <-done:
+		case <-time.After(tailerWait):
+			t.Fatal("EndGrace did not end the grace")
+		}
+		if got := h.text(); got != "x\nkept\n" {
+			t.Fatalf("text = %q, want the bytes written before EndGrace kept", got)
+		}
+	})
+	t.Run("before Stop", func(t *testing.T) {
+		target, path, _ := newTailerTarget(t, "engine.log")
+		mustWrite(t, path, "x\n")
+		h := startHarness(t, target, func(c *tailerConfig) { c.Grace = time.Hour })
+		h.waitText("x\n")
+		appendFile(t, path, "kept\n")
+		h.tailer.EndGrace()
+		h.waitDone()
+		select {
+		case <-h.tailer.Stop():
+		default:
+			t.Fatal("Stop after EndGrace returned an open channel")
+		}
+		if got := h.text(); got != "x\nkept\n" {
+			t.Fatalf("text = %q, want the bytes written before EndGrace kept", got)
+		}
+	})
+	t.Run("never opened", func(t *testing.T) {
+		target, _, _ := newTailerTarget(t, "engine.log")
+		h := startHarness(t, target, func(c *tailerConfig) { c.Grace = time.Hour })
+		h.waitEvent(logEventFileWaiting)
+		h.tailer.Stop()
+		h.tailer.EndGrace()
+		h.waitDone()
+		if got, want := h.events(), []string{logEventFileWaiting, logEventFileMissing}; !slices.Equal(got, want) {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	})
+}
+
+// longSecret is a 39-byte secret: long enough that its first part alone is
+// a possible secret start the masker holds back.
+const longSecret = "hf_abcdefghijklmnopqrstuvwxyz0123456789"
+
+// maskedTailer starts a tailer whose stream masks longSecret.
+func maskedTailer(t *testing.T, target logFileTarget, mod func(*tailerConfig)) *tailerHarness {
+	t.Helper()
+	m := maskerFor(t, Spec{Args: []string{"${AGENT_ENV:HF_TOKEN}"}}, map[string]string{"HF_TOKEN": longSecret})
+	s := newTestLogStore(t, 1<<20, 0)
+	p := s.newInstanceProcMasked(tailerTestSpec, 0, m)
+	cfg := testTailerConfig(target, p.ForStream(tailerTestStream))
+	if mod != nil {
+		mod(&cfg)
+	}
+	h := &tailerHarness{t: t, store: s}
+	h.tailer = startFileTailer(cfg)
+	t.Cleanup(func() { h.stop() })
+	return h
+}
+
+// assertNoSecretFragment fails if any record, or the stream's text as a
+// whole, holds longSecret or any part of it of 8 bytes or more.
+func assertNoSecretFragment(t *testing.T, h *tailerHarness) {
+	t.Helper()
+	var frags []string
+	for i := 0; i+minMaskedSecretLen <= len(longSecret); i++ {
+		frags = append(frags, longSecret[i:i+minMaskedSecretLen])
+	}
+	assertRingClean(t, h.store, frags...)
+	text := h.text()
+	for _, f := range frags {
+		if strings.Contains(text, f) {
+			t.Fatalf("stream text %q holds the secret fragment %q", text, f)
+		}
+	}
+}
+
+// TestTailerLineCutDiscardsAStraddlingSecret: a secret straddling MaxLine
+// must not have its first part resolved in clear at the cut; the held-back
+// bytes are dropped and counted.
+func TestTailerLineCutDiscardsAStraddlingSecret(t *testing.T) {
+	target, path, _ := newTailerTarget(t, "engine.log")
+	mustWrite(t, path, strings.Repeat("x", 80)+longSecret+"\nnext\n")
+	h := maskedTailer(t, target, func(c *tailerConfig) { c.MaxLine = 100 })
+	h.waitText("next\n")
+	h.stop()
+	assertNoSecretFragment(t, h)
+	if got, want := h.flat(), "["+logEventFileOpened+"]"+strings.Repeat("x", 80)+"\n["+logEventFileLineCut+"]next\n"; got != want {
+		t.Fatalf("stream = %q, want %q", got, want)
+	}
+	if got := h.dropped(); got != 20 {
+		t.Fatalf("dropped = %d, want the 20 held-back bytes", got)
+	}
+}
+
+// TestTailerGapDiscardsAHeldBackSecretStart: a read that ends in a possible
+// secret start, followed by a skip past the rate cap, must not resolve that
+// start in clear.
+func TestTailerGapDiscardsAHeldBackSecretStart(t *testing.T) {
+	target, path, _ := newTailerTarget(t, "engine.log")
+	mustWrite(t, path, "key="+longSecret[:20])
+	h := maskedTailer(t, target, func(c *tailerConfig) { c.TickBytes = 1024 })
+	h.waitText("key=")
+	appendFile(t, path, longSecret[20:]+"\n"+strings.Repeat("filler\n", 1200))
+	h.waitFor("the skip", func() bool { return h.dropped() > 0 && strings.Contains(h.text(), "filler\n") })
+	h.stop()
+	assertNoSecretFragment(t, h)
+	if !strings.HasPrefix(h.text(), "key=filler\n") {
+		t.Fatalf("text = %q..., want key= then whole filler lines", h.text()[:min(len(h.text()), 40)])
+	}
+}
+
+// TestTailerGapResumesAfterASecretItCutThrough: a skip point inside a secret
+// resumes at the next line start, so the secret's end is never written.
+func TestTailerGapResumesAfterASecretItCutThrough(t *testing.T) {
+	target, path, _ := newTailerTarget(t, "engine.log")
+	const tick = 4096
+	tailLines := strings.Repeat("b\n", 2037) + "\n" // 4075 bytes
+	// The skip point lands 20 bytes before the secret's end.
+	content := strings.Repeat("filler\n", 10000) + longSecret + "\n" + tailLines
+	if got := len(longSecret) - 19 + 1 + len(tailLines); got != tick {
+		t.Fatalf("test setup: %d bytes after the skip point, want %d", got, tick)
+	}
+	mustWrite(t, path, content)
+	h := maskedTailer(t, target, func(c *tailerConfig) { c.TickBytes = tick })
+	h.waitText(tailLines)
+	h.stop()
+	assertNoSecretFragment(t, h)
+	if got := h.text(); got != tailLines {
+		t.Fatalf("text = %d bytes, want exactly the %d bytes after the cut line", len(got), len(tailLines))
+	}
+	if got, want := h.dropped(), int64(len(content)-len(tailLines)); got != want {
+		t.Fatalf("dropped = %d, want %d", got, want)
+	}
+}
+
+// TestTailerLastRefusalDrainsTheHeldHandleFirst: the reopen refusal that ends
+// the tailer comes after the held handle was read to its end.
+func TestTailerLastRefusalDrainsTheHeldHandleFirst(t *testing.T) {
+	target, path, _ := newTailerTarget(t, "engine.log")
+	mustWrite(t, path, "a\n")
+	var refused atomic.Int64
+	var lasting atomic.Bool
+	h := startHarness(t, target, func(c *tailerConfig) {
+		c.Open = func(tg logFileTarget) (*os.File, error) {
+			if !lasting.Load() {
+				return openLogFile(tg)
+			}
+			if refused.Add(1) == logFileReopenRefusals {
+				appendFile(t, path, "last words\n")
+			}
+			return nil, fmt.Errorf("%w: test refusal", errLogFileNotPermitted)
+		}
+	})
+	h.waitText("a\n")
+	lasting.Store(true)
+	h.waitDone()
+	if got, want := h.flat(), "["+logEventFileOpened+"]a\nlast words\n["+logEventFileNotPermitted+"]"; got != want {
+		t.Fatalf("stream = %q, want %q", got, want)
+	}
+}
+
+// slogCounter counts the records whose message contains match.
+type slogCounter struct {
+	match string
+	mu    sync.Mutex
+	n     int
+}
+
+func (c *slogCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (c *slogCounter) Handle(_ context.Context, r slog.Record) error {
+	if strings.Contains(r.Message, c.match) {
+		c.mu.Lock()
+		c.n++
+		c.mu.Unlock()
+	}
+	return nil
+}
+func (c *slogCounter) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *slogCounter) WithGroup(string) slog.Handler      { return c }
+
+func (c *slogCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+// TestTailerToggledOpenErrorIsLoggedOnce: an open error that comes and goes
+// (a lock taken and released) is logged once, not on every return.
+func TestTailerToggledOpenErrorIsLoggedOnce(t *testing.T) {
+	c := &slogCounter{match: "log file cannot be opened"}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(c))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	target, path, _ := newTailerTarget(t, "engine.log")
+	mustWrite(t, path, "a\n")
+	var calls atomic.Int64
+	h := startHarness(t, target, func(c *tailerConfig) {
+		c.Open = func(tg logFileTarget) (*os.File, error) {
+			if calls.Add(1)%2 == 0 {
+				return nil, errors.New("runtime: open log file: sharing violation")
+			}
+			return openLogFile(tg)
+		}
+	})
+	h.waitFor("20 toggles", func() bool { return calls.Load() >= 20 })
+	h.stop()
+	if n := c.count(); n != 1 {
+		t.Fatalf("logged %d times, want once", n)
+	}
+}
+
+// TestTailerLeavesNoGoroutine: once Stop's channel is closed, no goroutine
+// of the tailer is left, whichever way it ended.
+func TestTailerLeavesNoGoroutine(t *testing.T) {
+	before := goruntime.NumGoroutine()
+	target, path, _ := newTailerTarget(t, "a.log")
+	mustWrite(t, path, "a\n")
+	missing, _, _ := newTailerTarget(t, "b.log")
+	cfg := func(tg logFileTarget) tailerConfig {
+		return testTailerConfig(tg, NewLogStore(0, 0).newProc(tailerTestSpec).ForStream(tailerTestStream))
+	}
+	a, b := startFileTailer(cfg(target)), startFileTailer(cfg(missing))
+	c := startFileTailer(cfg(target))
+	c.EndGrace()
+	for _, tl := range []*fileTailer{a, b, c} {
+		select {
+		case <-tl.Stop():
+		case <-time.After(tailerWait):
+			t.Fatal("tailer did not finish")
+		}
+	}
+	deadline := time.Now().Add(tailerWait)
+	for goruntime.NumGoroutine() > before {
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines = %d after every tailer finished, want <= %d", goruntime.NumGoroutine(), before)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

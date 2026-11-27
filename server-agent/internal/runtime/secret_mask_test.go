@@ -366,3 +366,39 @@ func TestSecretMaskerMasksUnionOfOverlaps(t *testing.T) {
 		}
 	}
 }
+
+// TestDiscardCarryDropsTheHeldBackBytes: DiscardCarry clears a sibling's
+// held-back bytes without writing them, and counts only the bytes that no
+// placeholder already stands for.
+func TestDiscardCarryDropsTheHeldBackBytes(t *testing.T) {
+	m := maskerFor(t, Spec{Args: []string{"${AGENT_ENV:HF_TOKEN}"}}, map[string]string{"HF_TOKEN": "hf_abcdefgh123"})
+	s := NewLogStore(1<<20, 1<<20)
+	f := s.newInstanceProcMasked("spec", 0, m).ForStream("engine")
+
+	_, _ = f.Write([]byte("tok=hf_abcd"))
+	if n := f.DiscardCarry(); n != 7 {
+		t.Fatalf("DiscardCarry = %d, want the 7 held-back bytes", n)
+	}
+	_, _ = f.Write([]byte("efgh123\n"))
+	f.Flush()
+	if got := ringText(s, "spec", "engine"); got != "tok=efgh123\n" {
+		t.Fatalf("ring = %q, want the discarded bytes gone", got)
+	}
+
+	// An open span: the placeholder is written, the adjoining possible
+	// start is held back. Only the held-back bytes count.
+	_, _ = f.Write([]byte("hf_abcdefgh123hf_ab"))
+	if n := f.DiscardCarry(); n != 5 {
+		t.Fatalf("DiscardCarry = %d, want 5", n)
+	}
+	if n := f.DiscardCarry(); n != 0 {
+		t.Fatalf("second DiscardCarry = %d, want 0", n)
+	}
+	f.Flush()
+	if got := ringText(s, "spec", "engine"); got != "tok=efgh123\n${AGENT_ENV:HF_TOKEN}" {
+		t.Fatalf("ring = %q", got)
+	}
+	if n := (&procLog{}).DiscardCarry(); n != 0 {
+		t.Fatalf("DiscardCarry on a store-less procLog = %d", n)
+	}
+}

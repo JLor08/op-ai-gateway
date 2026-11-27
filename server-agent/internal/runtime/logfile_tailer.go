@@ -49,11 +49,23 @@ import (
 //   - not permitted: before the first successful open, file_not_permitted and
 //     the tailer ends. After one, it is retried on the next polls, because a
 //     rotation by link()+unlink() briefly gives the new file two links; only
-//     logFileReopenRefusals consecutive refusals end the tailer. The policy
+//     logFileReopenRefusals consecutive refusals end the tailer -- after the
+//     held handle was read to its end, so its last lines are kept. The policy
 //     logs each refusal itself, so a refused name is opened at most that many
 //     times: never once per poll for the rest of the generation.
-//   - any other error: retried quietly, logged once per change of state; it
-//     reads as waiting before the first open.
+//   - any other error: retried quietly; it reads as waiting before the first
+//     open. Each distinct error is logged once per tailer (at most
+//     logFileOpenErrLogs of them), however often it comes and goes.
+//
+// Stop and the grace: Stop starts the grace (2 s, the crash case). The first
+// poll after Stop is the LAST probe of the path; from then on the grace only
+// drains the handle already held, to its end, and never opens or adopts
+// another file. In a crash loop the next generation starts within this
+// generation's grace and recreates a ${CONFIG_DIR} file under the same name
+// (§5.3 removes the old name, this tailer's handle reads on); that file and
+// its text belong to the next generation's own tailer, never to this one.
+// EndGrace cuts the grace short with one final drain: the next generation's
+// start calls it on the previous generation's tailer of the same name.
 //
 // Text: the bytes are made safe before they are written -- invalid UTF-8
 // becomes U+FFFD and every control byte except \t \n \r is shown as \xNN
@@ -61,20 +73,32 @@ import (
 // renderer would interpret reaches the ring; the portal renders text, never
 // HTML. A character split across two reads is held back (at most three bytes)
 // and completed by the next read. A line longer than MaxLine bytes is cut:
-// its first MaxLine bytes and a newline are written, file_line_cut is
-// recorded, and the rest up to and including the next \n is discarded. Masking
-// (§8) happens in procLog.Write, so the tailer flushes the stream's masking
-// carry (procLog.Flush) before every marker, before a gap and at the end:
-// bytes on the two sides of a discontinuity can never form one value.
+// its first MaxLine bytes are written, then a newline THE TAILER INSERTS (it
+// is not in the file; it ends the cut line, so the marker and the next line
+// stand on their own lines and a further instance's next line gets its
+// prefix), then file_line_cut is recorded, and the rest of the line up to and
+// including its \n in the file is discarded.
+//
+// Masking (§8) happens in procLog.Write, which holds back a possible secret
+// start until the next bytes decide it. At a NATURAL boundary -- a rotation,
+// a truncation, the end -- the tailer resolves that carry (procLog.Flush)
+// before the marker: the stream really ends there. At a cut the tailer makes
+// ITSELF in the middle of the text -- a line cut, a skip past the rate cap --
+// the bytes after the cut are not the continuation, and resolving the carry
+// would write the first part of a secret straddling the cut in clear; there
+// the carry is DISCARDED (procLog.DiscardCarry) and counted as dropped. After
+// a skip, reading resumes at the next line start (the bytes up to and
+// including the next \n are dropped and counted too), so the end of a secret
+// the skip cut through is never written either.
 //
 // Binary: see looksBinary.
 //
 // Rate: at most TickBytes are read per poll (64 KiB per 250 ms = 256 KiB/s).
 // When more is waiting, the OLDER excess is skipped and counted with
-// LogStore.gap, and the newest TickBytes are read: the skipped bytes are then
-// reported exactly where they were ("missing immediately before" the text
-// that follows), and the lines a crashing server wrote last are the ones that
-// are kept. A rotated file's remainder and the new file share one poll's
+// LogStore.gap, and the newest TickBytes are read (from the first line start
+// in them): the skipped bytes are then reported exactly where they were
+// ("missing immediately before" the text that follows), and the lines a
+// crashing server wrote last are the ones that are kept. A rotated file's remainder and the new file share one poll's
 // budget; a new file the budget could not reach at all waits for the next
 // poll, where its backlog is capped the same way.
 //
@@ -93,6 +117,8 @@ const (
 	logFileReopenRefusals = 3
 	// logFileReadChunk is the read buffer of one tailer.
 	logFileReadChunk = 32 << 10
+	// logFileOpenErrLogs bounds the distinct open errors one tailer logs.
+	logFileOpenErrLogs = 4
 )
 
 // The binary heuristic (looksBinary): judged over a window of at least
@@ -117,13 +143,19 @@ type tailerConfig struct {
 }
 
 // fileTailer follows one declared file of one generation. Everything but the
-// two channels and the once is owned by the tailer's goroutine (before it
+// channels and the onces is owned by the tailer's goroutine (before it
 // starts, by startFileTailer).
 type fileTailer struct {
 	cfg      tailerConfig
 	stop     chan struct{}
 	stopOnce sync.Once
+	endGrace chan struct{} // EndGrace
+	endOnce  sync.Once
 	done     chan struct{}
+
+	stopping   bool // Stop was seen: the next poll is the last probe
+	probesDone bool // the grace: drain the held handle only
+	giveUp     bool // the last reopen refusal: drain, then file_not_permitted
 
 	f      *os.File    // the held handle; nil before the first open
 	fi     os.FileInfo // f's stat at open: its identity for os.SameFile
@@ -132,14 +164,16 @@ type fileTailer struct {
 	opened bool        // a file was opened at least once
 	ended  bool        // a final status (binary, not permitted) was recorded
 	waited bool        // file_waiting was recorded
-	// refusals counts consecutive refused reopens; openErr is the other
-	// open error last logged ("" when the last open was not one).
-	refusals int
-	openErr  string
+	// refusals counts consecutive refused reopens; loggedErrs are the other
+	// open errors already logged.
+	refusals   int
+	loggedErrs map[string]bool
 
 	// The text pipeline (see the file comment).
 	lineLen    int     // bytes of the current line written so far
 	discarding bool    // a cut line: discard to the next \n
+	resync     bool    // after a skip: drop to the next \n (counted)
+	pendingGap int64   // dropped bytes not yet recorded (LogStore.gap)
 	tail       [4]byte // an incomplete character held back from the last read
 	tailN      int
 	out        []byte // sanitised text not yet written
@@ -169,7 +203,7 @@ func startFileTailer(cfg tailerConfig) *fileTailer {
 	if cfg.Log == nil {
 		cfg.Log = &procLog{}
 	}
-	t := &fileTailer{cfg: cfg, stop: make(chan struct{}), done: make(chan struct{})}
+	t := &fileTailer{cfg: cfg, stop: make(chan struct{}), endGrace: make(chan struct{}), done: make(chan struct{})}
 	if f := t.probe(); f != nil {
 		t.adopt(f, cfg.StartAtEOF)
 	}
@@ -189,6 +223,16 @@ func startFileTailer(cfg tailerConfig) *fileTailer {
 func (t *fileTailer) Stop() <-chan struct{} {
 	t.stopOnce.Do(func() { close(t.stop) })
 	return t.done
+}
+
+// EndGrace ends the tailer without waiting out the grace: one final drain of
+// the held handle to its current end (capped like any poll), then the flush,
+// the close, and the channel Stop returns is closed. It does not wait for
+// that; Stop's channel does. Safe before or after Stop, and more than once.
+// Called before Stop it ends the tailer just the same, without the last
+// probe of the path.
+func (t *fileTailer) EndGrace() {
+	t.endOnce.Do(func() { close(t.endGrace) })
 }
 
 func (t *fileTailer) run() {
@@ -213,10 +257,15 @@ func (t *fileTailer) run() {
 		case <-ticker.C:
 		case <-stop:
 			stop = nil
+			t.stopping = true
 			timer = time.NewTimer(t.cfg.Grace)
 			grace = timer.C
 		case <-grace:
-			t.poll()
+			t.drain()
+			t.finish()
+			return
+		case <-t.endGrace:
+			t.drain()
 			t.finish()
 			return
 		}
@@ -225,29 +274,35 @@ func (t *fileTailer) run() {
 
 // poll is one step of the loop (see the file comment).
 func (t *fileTailer) poll() {
+	if t.probesDone {
+		t.drain()
+		return
+	}
+	if t.stopping {
+		t.probesDone = true // this is the last probe
+	}
 	nf := t.probe()
 	if t.ended {
 		return
 	}
-	if t.f == nil {
-		if nf != nil {
-			t.adopt(nf, false)
-		}
-		if t.f != nil {
-			budget := t.cfg.TickBytes
-			t.read(&budget)
-		}
-		return
+	if t.f == nil && nf != nil {
+		t.adopt(nf, false)
+		nf = nil
 	}
 	if nf != nil && t.isHeld(nf) {
 		_ = nf.Close()
 		nf = nil
 	}
 	budget := t.cfg.TickBytes
-	t.read(&budget)
-	if t.ended {
+	if t.f != nil {
+		t.read(&budget)
+	}
+	if t.ended || t.giveUp {
 		if nf != nil {
 			_ = nf.Close()
+		}
+		if !t.ended {
+			t.end(logEventFileNotPermitted)
 		}
 		return
 	}
@@ -271,26 +326,49 @@ func (t *fileTailer) probe() *os.File {
 	f, err := t.cfg.Open(t.cfg.Target)
 	switch {
 	case err == nil:
-		t.refusals, t.openErr = 0, ""
+		t.refusals = 0
 		return f
 	case errors.Is(err, errLogFileNotPermitted):
-		t.openErr = ""
 		t.refusals++
-		if !t.opened || t.refusals >= logFileReopenRefusals {
+		switch {
+		case !t.opened:
 			t.end(logEventFileNotPermitted)
+		case t.refusals >= logFileReopenRefusals:
+			t.giveUp = true // poll drains the held handle first
 		}
 	case errors.Is(err, fs.ErrNotExist):
-		t.refusals, t.openErr = 0, ""
+		t.refusals = 0
 		t.waiting()
 	default:
 		t.refusals = 0
-		if msg := err.Error(); msg != t.openErr {
-			t.openErr = msg
-			slog.Warn("runtime: log file cannot be opened; retrying", "spec", t.cfg.Log.specID, "log_file", t.cfg.Target.Name, "err", err)
-		}
+		t.logOpenErr(err)
 		t.waiting()
 	}
 	return nil
+}
+
+// logOpenErr logs an open error that is neither not-exist nor a refusal, once
+// per distinct error and tailer, and at most logFileOpenErrLogs of them: an
+// error that comes and goes (a lock taken and released) is logged once, not
+// on every return.
+func (t *fileTailer) logOpenErr(err error) {
+	msg := err.Error()
+	if t.loggedErrs[msg] || len(t.loggedErrs) >= logFileOpenErrLogs {
+		return
+	}
+	if t.loggedErrs == nil {
+		t.loggedErrs = map[string]bool{}
+	}
+	t.loggedErrs[msg] = true
+	slog.Warn("runtime: log file cannot be opened; retrying", "spec", t.cfg.Log.specID, "log_file", t.cfg.Target.Name, "err", err)
+}
+
+// drain reads the held handle, if any, for one poll's budget.
+func (t *fileTailer) drain() {
+	if t.f != nil {
+		budget := t.cfg.TickBytes
+		t.read(&budget)
+	}
 }
 
 // waiting records file_waiting the first time the file is found absent before
@@ -345,10 +423,10 @@ func (t *fileTailer) read(budget *int) {
 		return
 	}
 	if limit := int64(*budget); avail > limit {
-		t.boundary()
-		t.cfg.Log.store.gap(t.cfg.Log, avail-limit)
+		t.cut(avail - limit)
 		t.off += avail - limit
 		avail = limit
+		t.resync = !t.atLineStart()
 	}
 	if t.buf == nil {
 		t.buf = make([]byte, logFileReadChunk)
@@ -368,6 +446,29 @@ func (t *fileTailer) read(budget *int) {
 	t.writeOut()
 }
 
+// cut is a cut the tailer makes itself in the middle of the text, skipping
+// skipped bytes: the text so far is written, the incomplete character and
+// the masking carry it ends in are discarded, and all of it is counted as
+// dropped (recorded with the next text or at the next boundary). See the file
+// comment for why the carry is discarded rather than flushed.
+func (t *fileTailer) cut(skipped int64) {
+	t.writeOut()
+	t.pendingGap += skipped + int64(t.tailN) + int64(t.cfg.Log.DiscardCarry())
+	t.tailN = 0
+	t.lineLen, t.discarding = 0, false
+}
+
+// atLineStart reports whether t.off is the start of a line: offset 0, or the
+// byte before it is a \n. An unreadable byte counts as mid-line.
+func (t *fileTailer) atLineStart() bool {
+	if t.off == 0 {
+		return true
+	}
+	var b [1]byte
+	n, _ := t.f.ReadAt(b[:], t.off-1)
+	return n == 1 && b[0] == '\n'
+}
+
 // feed runs one read through the binary check and the line cut, into t.out.
 func (t *fileTailer) feed(b []byte) {
 	if t.looksBinary(b) {
@@ -375,6 +476,17 @@ func (t *fileTailer) feed(b []byte) {
 		return
 	}
 	for len(b) > 0 {
+		if t.resync {
+			i := indexNewline(b)
+			if i < 0 {
+				t.pendingGap += int64(len(b))
+				return
+			}
+			t.pendingGap += int64(i + 1)
+			b = b[i+1:]
+			t.resync = false
+			continue
+		}
 		if t.discarding {
 			i := indexNewline(b)
 			if i < 0 {
@@ -396,7 +508,11 @@ func (t *fileTailer) feed(b []byte) {
 		if t.lineLen+content > t.cfg.MaxLine {
 			keep := t.cfg.MaxLine - t.lineLen
 			t.sanitize(b[:keep])
-			t.sanitize([]byte{'\n'})
+			t.writeOut()
+			// A cut the tailer makes: a secret straddling it must not be
+			// resolved in clear (file comment), so the carry is dropped.
+			t.pendingGap += int64(t.cfg.Log.DiscardCarry())
+			t.sanitize([]byte{'\n'}) // the inserted newline (file comment)
 			t.mark(logEventFileLineCut)
 			t.discarding = true
 			b = b[keep:]
@@ -509,25 +625,38 @@ func (t *fileTailer) sanitize(b []byte) {
 	}
 }
 
-// writeOut writes the sanitised text gathered so far.
+// writeOut writes the sanitised text gathered so far, after the dropped
+// bytes it follows.
 func (t *fileTailer) writeOut() {
 	if len(t.out) > 0 {
+		t.writeGap()
 		_, _ = t.cfg.Log.Write(t.out)
 		t.out = t.out[:0]
 	}
 }
 
-// boundary ends the text before a discontinuity (a marker, a gap, the end): a
-// held-back incomplete character becomes U+FFFD, the text is written, the
-// stream's masking carry is flushed, and the line starts afresh.
+// writeGap records the dropped bytes not yet recorded, at this position.
+func (t *fileTailer) writeGap() {
+	if t.pendingGap > 0 {
+		t.cfg.Log.store.gap(t.cfg.Log, t.pendingGap)
+		t.pendingGap = 0
+	}
+}
+
+// boundary ends the text at a natural discontinuity (a marker, the end): a
+// held-back incomplete character becomes U+FFFD, the text and any dropped
+// count are written, the stream's masking carry is flushed (at a line cut it
+// was already discarded, so there is nothing left to flush), and the line
+// starts afresh.
 func (t *fileTailer) boundary() {
 	if t.tailN > 0 {
 		t.tailN = 0
 		t.out = utf8.AppendRune(t.out, utf8.RuneError)
 	}
 	t.writeOut()
+	t.writeGap()
 	t.cfg.Log.Flush()
-	t.lineLen, t.discarding = 0, false
+	t.lineLen, t.discarding, t.resync = 0, false, false
 }
 
 // mark records ev on the stream after a boundary.
