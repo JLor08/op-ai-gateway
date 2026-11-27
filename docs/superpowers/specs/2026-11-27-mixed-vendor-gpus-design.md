@@ -55,8 +55,10 @@ Non-goals
 Anti-goals (would be a failure even if everything "works")
 
 - Any behaviour change on a single-vendor host that the operator did not ask
-  for (other than `auto` now being decided per spec, which is identical on a
-  single-vendor host).
+  for. Two changes there are deliberate: `auto` is decided per spec (identical
+  result on a single-vendor host), and a `vulkan` spec with
+  `set_visible_devices` in env mode now gets `GGML_VK_VISIBLE_DEVICES` on
+  **every** host (operator decision, see §5.3).
 - A measured `0` (or a too-small measured value) silently overriding an
   operator estimate — the same rule ADR-031/ADR-113 already follow: no
   measurement is better than a wrong one.
@@ -118,9 +120,19 @@ host, and whether `GGML_VK_VISIBLE_DEVICES` preserves the listed order. See
 the PCI bus address as the cross-API anchor.**
 
 - `vendor` ∈ `nvidia`, `amd`, `apple`. The vendor-local index is what each
-  vendor's stack already uses (nvidia-smi index = CUDA ordinal; rocm-smi
-  `cardN` = ROCr ordinal), so mapping to `CUDA_VISIBLE_DEVICES` /
-  `ROCR_VISIBLE_DEVICES` stays trivial.
+  vendor's stack already uses, so mapping to `CUDA_VISIBLE_DEVICES` /
+  `ROCR_VISIBLE_DEVICES` stays trivial:
+  - NVIDIA: the nvidia-smi index (= CUDA ordinal), unchanged.
+  - AMD: the **KFD topology GPU rank** (= ROCr ordinal, what
+    `ROCR_VISIBLE_DEVICES` addresses), joined to the rocm-smi rows **by PCI
+    address** (KFD node `properties`: `domain` + `location_id` =
+    bus<<8 | device<<3 | function). Today the collector trusts the rocm-smi
+    `cardN` key to equal that rank (ADR-113's assumption). On the AMD test VM
+    they are equal (rocm-smi `card0`/`card1` = KFD ranks 0/1 = buses 1/2,
+    while the DRM `card0` is the virtual VGA), so existing hosts are not
+    renumbered; on a mixed host the PCI join removes the dependence on
+    rocm-smi's enumeration. Without a readable KFD topology the collector
+    falls back to the rocm-smi key. *(Design call after the builder check.)*
 - The PCI bus address (`pci_bus_id`, already reported by NVIDIA and AMD
   collectors) is what DRM fdinfo, Vulkan and Windows PDH speak; measurers and
   the Vulkan mapping resolve through it to the (vendor, index) key.
@@ -133,18 +145,25 @@ the PCI bus address as the cross-API anchor.**
 vendor". It is what old agents report, what old gateways send, and what
 existing database rows hold after the migration. Resolution rules:
 
-- Agent: a spec GPU or budget with an empty vendor resolves to the host's
-  single detected vendor. On a host with more than one detected vendor an
-  empty vendor is **ambiguous**: the spec is refused with a new stable error
-  (`gpu_vendor_ambiguous`) and a budget row with an empty vendor is ignored
-  (with a log line) rather than guessed.
-- Gateway: when a vendor-reporting agent's hardware report shows exactly one
-  vendor, the gateway rewrites that server's empty-vendor rows (spec GPUs,
-  budgets, RPC member GPUs, cluster member GPUs) to that vendor, once. When it
-  shows more than one vendor while empty-vendor rows exist, nothing is
-  rewritten; the portal shows a warning on the server and on each affected
-  spec asking the operator to re-pick the GPUs. *(Builder's call how the
-  warning is surfaced; it must not block unrelated saves.)*
+- The **legacy vendor** of a host is the vendor today's agent already treats
+  as "the" vendor: the first detected one in the fixed order NVIDIA, AMD,
+  Apple (`runtimeGPUVendor`, `pickLinuxVRAMMeasurer`). A host that already
+  reports two vendors today (an NVIDIA card plus a ROCm-visible AMD card)
+  therefore keeps exactly its current meaning: empty = NVIDIA.
+- Agent: a spec GPU or budget with an empty vendor resolves to the legacy
+  vendor. No refusal, no model goes offline on upgrade (Goal 6).
+- Gateway: on the first hardware report of a vendor-reporting agent, the
+  gateway rewrites that server's empty-vendor rows (spec GPUs, budgets, RPC
+  member GPUs, cluster member GPUs) to the legacy vendor computed from the
+  report with the same rule, once. Afterwards every stored row carries an
+  explicit vendor.
+- When that report shows more than one vendor, the portal shows an
+  informational note on the server that legacy GPU assignments were mapped to
+  the legacy vendor and should be reviewed. *(Builder's call how it is
+  surfaced; it never blocks a save.)*
+- *(Design call after the builder check: the earlier draft refused empty
+  vendors on mixed hosts, which would have taken existing two-vendor hosts
+  offline on upgrade.)*
 
 ## 5. Agent
 
@@ -183,6 +202,16 @@ and merges their results (keys never collide because they carry the vendor):
     a dropped card means "no measurement", i.e. the estimate stays.)*
   - KFD stays only as a fallback for a kernel whose amdgpu fdinfo lacks
     `drm-memory-vram`; it is never added to fdinfo values.
+  - **Measurability is reported, not assumed.** Each GPU in the hardware
+    report carries the backends whose per-process VRAM the agent can measure
+    on it (e.g. `vram_measurable: ["cuda","vulkan"]` for NVIDIA,
+    `["rocm","vulkan"]` for AMD with fdinfo, `["rocm"]` for AMD on the KFD
+    fallback, absent/empty when nothing). The agent determines fdinfo support
+    by a self-probe (open an amdgpu render node, read its own fdinfo for a
+    `drm-memory-vram` key). The gateway's estimate/`--tensor-split`
+    exemption (`memberGPUMeasurable`, `kfdHost`) uses this list when present
+    and keeps today's rule for reports without it. *(Design call after the
+    builder check.)*
 - **Windows:** unchanged (PDH, NVIDIA only).
 - The ~130 MiB KFD/fdinfo difference on ROCm is accepted; fdinfo is the one
   source that covers Vulkan, and ADR-084's max(measured, estimate) plus the
@@ -211,6 +240,16 @@ and merges their results (keys never collide because they carry the vendor):
   today's host-level rule. On a single-vendor host this is identical to today.
   On a mixed host a single-vendor spec now gets its native backend instead of
   Vulkan — a deliberate change.
+- **The Vulkan row applies on every host, single-vendor ones included**
+  (operator decision). Today a `vulkan` spec with `set_visible_devices` in env
+  mode gets `CUDA_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`, which the Vulkan
+  driver ignores, so its pinning has no effect. After this change it gets
+  `GGML_VK_VISIBLE_DEVICES` and its devices are `Vulkan0..` in declared order.
+  A spec with a literal `--device VulkanN` in its args must be adapted; the
+  architecture docs and the PR description say so. Without
+  `set_visible_devices` (or in args mode) a single-vendor host keeps today's
+  behaviour (host index = Vulkan index, documented caveat, unless the mapping
+  of §5.4 is available); a mixed host refuses it (§5.4).
 - `GGML_VK_VISIBLE_DEVICES` joins the vendor-independent set of variables a
   `set_visible_devices` spec may not hand-set (`visibleDevicesOwnedVars`); the
   portal enforces the same rule.
@@ -233,6 +272,19 @@ and merges their results (keys never collide because they carry the vendor):
   *(To verify — §9.)*
 - The mapping is part of the hardware report (`vulkan_ordinal` per GPU, absent
   when unknown) so the portal can show it.
+- A PCI address that appears more than once in `vulkaninfo` (two Vulkan
+  drivers for one card, e.g. AMDVLK and RADV) makes that card's mapping
+  **unavailable** rather than picking a driver. *(Design call.)*
+- Without injection, ggml-vulkan numbers its own **filtered** list (discrete
+  GPUs first, de-duplicated across drivers), which is not the loader order the
+  mapping is built from. Therefore, on a **mixed** host a Vulkan spec that
+  declares GPUs must run with `set_visible_devices` in env mode (the agent
+  injects `GGML_VK_VISIBLE_DEVICES` and the child's devices are `Vulkan0..`
+  in declared order); a Vulkan spec with GPUs but without that option is
+  refused there (`vulkan_visible_devices_required`). This removes every
+  "raw ordinal" path on mixed hosts. *(Design call after the builder check;
+  the builder confirms ggml-vulkan's selection rules against the pinned
+  llama.cpp source and the §9 VM checks.)*
 - Without `vulkaninfo`, or when a spec GPU's PCI address is missing from its
   output: a Vulkan spec on a **single-vendor** host falls back to today's
   behaviour (host index = Vulkan index, the documented caveat applies); on a
@@ -298,9 +350,9 @@ and merges their results (keys never collide because they carry the vendor):
 - The empty-vendor backfill and ambiguity warning from §4.
 - `gpuLooksNVIDIA` / `gpuLooksAMD` / `serverHostGPUs` use `vendor` when the
   report has it and keep the name heuristic only for vendor-less reports from
-  old agents. `kfdHost` ("every GPU is AMD") becomes per-GPU: an AMD GPU on a
-  Linux host with a flag-carrying agent is measurable regardless of the other
-  cards.
+  old agents. Measurability comes from the per-GPU `vram_measurable` list
+  (§5.2) for the spec's resolved backend; `kfdHost` ("every GPU is AMD")
+  remains only for reports without that list.
 - Budget drift check (`expected_uuid` / `expected_name`) compares the card at
   the same (vendor, index).
 
