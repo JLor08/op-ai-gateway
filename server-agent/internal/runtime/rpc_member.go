@@ -292,7 +292,7 @@ func (o *owner) memberDevicePlan(spec Spec) (devicePlan, error) {
 	if len(spec.GPUs) == 0 {
 		return devicePlan{}, nil
 	}
-	topo := o.topology()
+	topo := o.topology().forSpec(spec)
 	prefix, err := resolveDevicePrefix(spec, topo)
 	if err != nil {
 		return devicePlan{}, fmt.Errorf("runtime: %w", err)

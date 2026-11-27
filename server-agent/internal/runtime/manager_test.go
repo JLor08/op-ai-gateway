@@ -5449,3 +5449,60 @@ func TestFillDetectedBudgetsSkipsAppleKeysOnly(t *testing.T) {
 		t.Errorf("Budgets = %v, want %v (detected NVIDIA budget, none for the Apple GPU)", got, want)
 	}
 }
+
+// TestPartialReadingKeepsSpecVendorsMixed: a first reading that missed a
+// vendor (a cold nvidia-smi left only AMD in the totals and the Vulkan map)
+// must not make a real NVIDIA+AMD host look single-vendor for a spec that
+// names an NVIDIA card: the spec's own GPU keys prove that vendor, so a
+// Vulkan spec on nvidia:0 is refused rather than guessed.
+func TestPartialReadingKeepsSpecVendorsMixed(t *testing.T) {
+	skipOnWindows(t)
+	amdOnly := HostInfo{
+		GPUTotalsMB: map[GPUKey]int{{GPUVendorAMD, 0}: 16000},
+		Vulkan:      VulkanMap{Ordinals: map[GPUKey]int{{GPUVendorAMD, 0}: 0}, DeviceCount: 2},
+	}
+	for _, tc := range []struct {
+		name     string
+		inject   bool
+		wantCode string
+	}{
+		{"env injection", true, codeVulkanMappingUnavailable},
+		{"no injection", false, codeVulkanVisibleDevicesRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkTimings(t)
+			m := NewManager(ManagerOptions{
+				Policy:     allowlistPolicy(),
+				Getenv:     func(string) string { return "" },
+				GPUVendor:  GPUVendorNVIDIA,
+				GPUVendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD},
+			})
+			t.Cleanup(m.Close)
+			m.SetHostInfo(amdOnly)
+			spec := baseSpec("spec-a", "model-a")
+			spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA, VRAMMB: 1}}
+			spec.DeviceBackend = "vulkan"
+			spec.SetVisibleDevices = tc.inject
+			m.Apply(Config{Specs: []Spec{spec}})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, _, err := m.EnsureRunning(ctx, "model-a"); !errors.Is(err, ErrNotPermitted) {
+				t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted", err)
+			}
+			if st := statusFor(m, "spec-a"); st == nil || st.LastError == nil || st.LastError.Code != tc.wantCode {
+				t.Fatalf("Status()[spec-a] = %+v, want last_error code %s", st, tc.wantCode)
+			}
+		})
+	}
+
+	// A Vulkan RPC member on nvidia:0 is pinned through the Vulkan map as on
+	// a mixed host, so the missing ordinal refuses it too.
+	o := &owner{m: &Manager{}, gpuVendor: GPUVendorNVIDIA, gpuVendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}}
+	o.m.SetHostInfo(amdOnly)
+	member := Spec{Kind: SpecKindRPCServer, DeviceBackend: "vulkan", GPUs: []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}}}
+	var pe *GPUPlanError
+	if _, err := o.memberDevicePlan(member); !errors.As(err, &pe) || pe.Code != codeVulkanMappingUnavailable {
+		t.Fatalf("member plan err = %v, want %s", err, codeVulkanMappingUnavailable)
+	}
+}

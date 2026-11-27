@@ -14405,6 +14405,9 @@ members exist only for an agent with the second.
   literal `--device VulkanN` must be adapted. Decision 4 makes these refusals
   deliberate (refuse rather than guess); the operator checks such hosts' specs before
   the upgrade ([Agent-Managed Model Runtime §3.10](cross-cutting/agent-runtime-manager.md#310-mixed-vendor-gpu-hosts)).
+- A host with both GPU tools on `PATH` but cards of one vendor resolved `auto` to
+  Vulkan before (tool detection); it now gets the native backend at the next
+  start, since `auto` follows the spec's GPUs and the reported cards.
 - Existing single-vendor hosts and configurations keep working with old and new
   agents: no relaunch on upgrade (the backfilled vendor equals the resolved one), no
   renumbering of AMD cards where KFD rank and rocm-smi card agreed (the AMD test VM),

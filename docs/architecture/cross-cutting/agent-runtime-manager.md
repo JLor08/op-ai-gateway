@@ -3603,7 +3603,11 @@ when the GPUs it reported include both an NVIDIA and an AMD card
 (`GPUTopology.Mixed`; the vendors of the last-known GPU totals and the Vulkan map
 it hands the runtime, so an NVIDIA-only box that merely has `rocm-smi` installed is
 not mixed; only before the first GPU reading does the detection of GPU tools
-stand in), the one combination whose per-vendor numbering collides; the portal
+stand in), widened per spec by the vendors of the spec's own GPU keys
+(`GPUTopology.forSpec`: a spec naming an NVIDIA card proves the host has one,
+so a first reading that missed NVIDIA behind a timed-out `nvidia-smi` cannot
+make a real NVIDIA+AMD host look single-vendor to that spec's plan, its eager
+refusals, its Vulkan-token checks or an RPC member's pinning), the one combination whose per-vendor numbering collides; the portal
 calls it mixed when the stored hardware report lists both vendors. A mixed **Windows** host is out of
 scope: the agent has no Windows AMD collector.
 
@@ -3768,6 +3772,10 @@ refusals of this section apply eagerly from the 0.27.0 agent's first start:
 - a hand-set `GGML_VK_VISIBLE_DEVICES` in the env of a spec with
   `set_visible_devices` is refused when the agent starts the spec, not only when
   the spec is next saved in the portal;
+- a host with both GPU tools on `PATH` (`nvidia-smi` and `rocm-smi`) but cards
+  of one vendor changes too: before #434 its `auto` specs resolved to Vulkan
+  from the tool detection; now `auto` follows the spec's own GPUs and the
+  reported cards and gives the native backend (`cuda`/`rocm`) at the next start;
 - a literal `--device VulkanN` in a spec's args (numbered against the unfiltered
   enumeration) must be rewritten to `${VULKAN_DEVICES}`/`${DEVICES}` or to
   `Vulkan0..k-1` in declared order, on every host (§3.3).

@@ -118,6 +118,7 @@ type specDevices struct {
 }
 
 func newSpecDevices(spec Spec, topo GPUTopology) specDevices {
+	topo = topo.forSpec(spec) // the mixed-host checks below see the spec's own vendors too
 	plan, err := planDevices(spec, topo)
 	return specDevices{topo: topo, keys: planKeys(spec, topo), plan: plan, planErr: err}
 }

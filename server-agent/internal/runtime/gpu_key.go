@@ -117,6 +117,36 @@ type GPUTopology struct {
 	Vulkan  VulkanMap
 }
 
+// forSpec is t with the vendors of spec's own GPU keys (an empty vendor read
+// as Legacy) added to Vendors, in nvidia, amd, apple order. A spec naming a
+// card of a vendor proves the host has it, so a reading that missed that
+// vendor (a timed-out collector) never makes a real NVIDIA+AMD host look
+// single-vendor to the plan of a spec spanning or naming both. t is not
+// changed; idempotent.
+func (t GPUTopology) forSpec(spec Spec) GPUTopology {
+	present := make(map[GPUVendor]bool, len(gpuVendorPrecedence))
+	for _, v := range t.Vendors {
+		present[v] = true
+	}
+	added := false
+	for _, k := range planKeys(spec, t) {
+		if knownGPUVendor(k.Vendor) && !present[k.Vendor] {
+			present[k.Vendor], added = true, true
+		}
+	}
+	if !added {
+		return t
+	}
+	vendors := make(GPUVendors, 0, len(present))
+	for _, v := range gpuVendorPrecedence {
+		if present[v] {
+			vendors = append(vendors, v)
+		}
+	}
+	t.Vendors = vendors
+	return t
+}
+
 // Mixed reports whether the host has both an NVIDIA and an AMD GPU, the one
 // combination whose per-vendor device numbering collides.
 func (t GPUTopology) Mixed() bool {

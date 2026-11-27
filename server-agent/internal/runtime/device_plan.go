@@ -127,8 +127,10 @@ func joinInts(ns []int) string {
 }
 
 // planDevices decides backend prefix, visibility variable and device names for
-// one spec on this host.
+// one spec on this host. topo's vendors are widened by the spec's own GPU
+// vendors (GPUTopology.forSpec).
 func planDevices(spec Spec, topo GPUTopology) (devicePlan, error) {
+	topo = topo.forSpec(spec)
 	prefix, err := resolveDevicePrefix(spec, topo)
 	if err != nil {
 		return devicePlan{}, err
