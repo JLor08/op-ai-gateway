@@ -6,6 +6,7 @@ package runtime
 import (
 	"encoding/json"
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -65,5 +66,27 @@ func TestResolveLegacyGPUVendorsOnAGPULessHostIsANoOp(t *testing.T) {
 	cfg := Config{Specs: []Spec{{ID: "a", GPUs: []SpecGPU{{Index: 0}}}}}
 	if got := resolveLegacyGPUVendors(cfg, GPUVendorNone); !reflect.DeepEqual(got, cfg) {
 		t.Fatalf("resolved = %+v, want the input unchanged", got)
+	}
+}
+
+// The topology's vendors are the GPUs the agent reported (HostInfo), not the
+// GPU tools on PATH: an NVIDIA-only box with rocm-smi installed is not mixed
+// once its GPUs are known. Before the first host info detection stands.
+func TestTopologyVendorsFollowReportedGPUs(t *testing.T) {
+	o := &owner{m: &Manager{}, gpuVendor: GPUVendorNVIDIA, gpuVendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}}
+	if !o.topology().Mixed() {
+		t.Fatal("before any host info: detection says nvidia+amd, want mixed")
+	}
+	o.m.SetHostInfo(HostInfo{GPUTotalsMB: map[GPUKey]int{{GPUVendorNVIDIA, 0}: 24000, {GPUVendorNVIDIA, 1}: 24000}})
+	if got := o.topology().Vendors; !slices.Equal(got, GPUVendors{GPUVendorNVIDIA}) {
+		t.Fatalf("vendors with nvidia-only GPUs = %v, want [nvidia]", got)
+	}
+	// A vendor known only from the Vulkan map counts too.
+	o.m.SetHostInfo(HostInfo{
+		GPUTotalsMB: map[GPUKey]int{{GPUVendorAMD, 0}: 16000},
+		Vulkan:      VulkanMap{Ordinals: map[GPUKey]int{{GPUVendorNVIDIA, 0}: 0}, DeviceCount: 2},
+	})
+	if got := o.topology().Vendors; !slices.Equal(got, GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}) {
+		t.Fatalf("vendors = %v, want [nvidia amd] in precedence order", got)
 	}
 }

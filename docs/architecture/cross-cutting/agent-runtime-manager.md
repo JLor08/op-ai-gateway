@@ -2147,8 +2147,9 @@ from the vendors of the spec's own GPU rows ([§3.3](#33-set_visible_devices-tur
 NVIDIA only `cuda`, AMD only `rocm`, Apple only `metal`, NVIDIA and AMD
 `vulkan`. Since every GPU row names its vendor (#434), the agent no longer has
 to approximate "the vendor of the spec's GPUs" by "the vendors of the host";
-only a spec without GPUs still uses the host's detected vendor set
-(`collector.DetectGPUCollectors`: one vendor its native backend, several
+only a spec without GPUs still uses the host's vendor set (the vendors of the
+GPUs the agent reported, `collector.DetectGPUCollectors`' detection before the
+first reading: one vendor its native backend, several
 `vulkan`, none a hard error for any token that needs a GPU prefix). A backend
 that cannot drive one of the spec's GPUs is refused
 (`runtime.gpu_vendor_backend_mismatch`), and so is `sycl` across vendors. An
@@ -3598,9 +3599,12 @@ ways: one model per vendor side by side (a CUDA model on the NVIDIA cards, a ROC
 model on the AMD cards), or one model across both, as a single Vulkan
 `llama-server` or as an RPC cluster on that one host (a CUDA head and a ROCm
 `rpc-server` member, each on its native backend). The agent calls a host **mixed**
-when its detection found both an NVIDIA and an AMD GPU (`GPUTopology.Mixed`), the
-one combination whose per-vendor numbering collides; the portal calls it mixed when
-the stored hardware report lists both vendors. A mixed **Windows** host is out of
+when the GPUs it reported include both an NVIDIA and an AMD card
+(`GPUTopology.Mixed`; the vendors of the last-known GPU totals and the Vulkan map
+it hands the runtime, so an NVIDIA-only box that merely has `rocm-smi` installed is
+not mixed; only before the first GPU reading does the detection of GPU tools
+stand in), the one combination whose per-vendor numbering collides; the portal
+calls it mixed when the stored hardware report lists both vendors. A mixed **Windows** host is out of
 scope: the agent has no Windows AMD collector.
 
 **Identity.** Every GPU is a GPU key, (vendor, vendor-local index) (§5.1;

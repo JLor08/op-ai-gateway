@@ -977,14 +977,46 @@ func (m *Manager) SetHostInfo(hi HostInfo) {
 }
 
 // topology is the host's GPU topology for the per-spec device plan: the legacy
-// vendor, every detected vendor (the legacy one alone when only it was
-// given), and the Vulkan device mapping of the latest hardware report.
+// vendor, the host's vendors, and the Vulkan device mapping of the latest
+// hardware report. The vendors are those of the GPUs the agent reported
+// (reportedGPUVendors), as the portal sees them, so an NVIDIA-only box that
+// merely has rocm-smi installed is not "mixed"; only before any GPU was
+// reported do the detected ones stand in (the legacy one alone when only it
+// was given).
 func (o *owner) topology() GPUTopology {
-	vendors := o.gpuVendors
+	hi := o.hostInfo()
+	vendors := reportedGPUVendors(hi)
+	if len(vendors) == 0 {
+		vendors = o.gpuVendors
+	}
 	if len(vendors) == 0 && o.gpuVendor != GPUVendorNone {
 		vendors = GPUVendors{o.gpuVendor}
 	}
-	return GPUTopology{Legacy: o.gpuVendor, Vendors: vendors, Vulkan: o.hostInfo().Vulkan}
+	return GPUTopology{Legacy: o.gpuVendor, Vendors: vendors, Vulkan: hi.Vulkan}
+}
+
+// gpuVendorPrecedence is the order vendors are listed in: the legacy-vendor
+// precedence of detection (nvidia, amd, apple).
+var gpuVendorPrecedence = GPUVendors{GPUVendorNVIDIA, GPUVendorAMD, GPUVendorApple}
+
+// reportedGPUVendors lists, in gpuVendorPrecedence order, the vendors of the
+// GPUs in hi: its last-known GPU totals and its Vulkan map. Nil when hi names
+// no GPU of a recognised vendor.
+func reportedGPUVendors(hi HostInfo) GPUVendors {
+	present := make(map[GPUVendor]bool, len(gpuVendorPrecedence))
+	for k := range hi.GPUTotalsMB {
+		present[k.Vendor] = true
+	}
+	for k := range hi.Vulkan.Ordinals {
+		present[k.Vendor] = true
+	}
+	var out GPUVendors
+	for _, v := range gpuVendorPrecedence {
+		if present[v] {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // refuseExpansion records a start that placeholder expansion (or the member
