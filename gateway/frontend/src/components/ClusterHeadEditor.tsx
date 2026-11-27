@@ -691,6 +691,7 @@ export function ClusterHeadEditor({
   args,
   env,
   headHasGpus,
+  backendResolution,
   startupTimeoutSeconds,
   headBinary = '',
   headBinaryVersion = '',
@@ -712,6 +713,9 @@ export function ClusterHeadEditor({
   args: string[];
   env: Record<string, string>;
   headHasGpus: boolean;
+  // What the device backend resolves to for the head's GPUs and whether it
+  // cannot drive one of them (resolveAutoBackend, #434); absent shows neither.
+  backendResolution?: { resolved: DeviceBackend | null; mismatch: boolean };
   startupTimeoutSeconds: number;
   // The version of the head's binary from the server's inventory ('' when
   // unknown). Members carry no binary of their own: each runs the server's
@@ -890,6 +894,18 @@ export function ClusterHeadEditor({
           </option>
         ))}
       </SelectField>
+      {/* #434: what auto resolves to for the head's GPUs, and a backend that
+          cannot drive one of them (the spec form refuses that save). */}
+      {backendResolution?.mismatch && (
+        <Alert severity="warning">{t.runtimeBackendMismatchHint}</Alert>
+      )}
+      {!backendResolution?.mismatch &&
+        value.deviceBackend === 'auto' &&
+        backendResolution?.resolved && (
+          <Typography variant="caption" color="text.secondary">
+            {t.runtimeBackendResolvesTo(backendResolution.resolved)}
+          </Typography>
+        )}
       <FormControlLabel
         control={
           <Checkbox

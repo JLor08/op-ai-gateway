@@ -425,6 +425,10 @@ function renderSection(
     // running and a stop answers stopping.
     startRuntime?: PortalApi['startRuntime'];
     stopRuntime?: PortalApi['stopRuntime'];
+    // Fields of the server beyond the module default (#434: the legacy GPU
+    // vendor and its note).
+    server?: Partial<PortalServer>;
+    dismissGpuVendorNote?: PortalApi['dismissGpuVendorNote'];
   } = {},
 ) {
   const mappings = opts.mappings ?? [];
@@ -455,6 +459,7 @@ function renderSection(
   const serverForTest: PortalServer = {
     ...server,
     runtime_max_processes: opts.runtimeMaxProcesses,
+    ...opts.server,
   };
   // Captured from the subscribe call so a test can drive the live stream
   // frame by frame (both `snapshot` and `update` are full replacements).
@@ -693,6 +698,7 @@ function renderSection(
     resetClusterMemberUsage:
       opts.resetClusterMemberUsage ??
       vi.fn(async (mappingId: string) => storedSpecs[mappingId] as RuntimeSpec),
+    dismissGpuVendorNote: opts.dismissGpuVendorNote ?? vi.fn(async () => undefined),
   };
 
   const view = render(
@@ -2419,6 +2425,7 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       clusterCandidates: vi.fn(async () => ({ data: [] })),
       applicationClusterCandidates: vi.fn(async () => ({ data: [] })),
       resetClusterMemberUsage: vi.fn(async () => ({}) as never),
+      dismissGpuVendorNote: vi.fn(async () => undefined),
       startRuntime: vi.fn(async () => ({ instance: 0, state: 'running' as const })),
       stopRuntime: vi.fn(async () => ({ instance: 0, state: 'stopping' as const })),
     };
@@ -8582,6 +8589,9 @@ describe('RuntimeAdminSection set_visible_devices', () => {
     'cuda_visible_devices',
     'ROCR_VISIBLE_DEVICES',
     'Hip_Visible_Devices',
+    // #434: the Vulkan list the agent sets for a Vulkan spec.
+    'GGML_VK_VISIBLE_DEVICES',
+    'ggml_vk_visible_devices',
   ])('refuses the option alongside a hand-set %s', async (key) => {
     const { created, putSpecs } = renderSection();
     await openCreateWithVisibleDevices();
@@ -14438,5 +14448,222 @@ describe('RuntimeAdminSection declared log files', () => {
 
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).queryAllByRole('tablist')).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #434: mixed NVIDIA + AMD hosts. GPU indexes restart per vendor, so a card is
+// (vendor, index): the pickers, the budgets, the drift check and the live VRAM
+// all key on that pair, and the device backend says what auto resolves to.
+// ---------------------------------------------------------------------------
+
+describe('RuntimeAdminSection mixed-vendor GPUs', () => {
+  const mixedHardware = () =>
+    makeHardware([
+      {
+        index: 0,
+        vendor: 'nvidia',
+        name: 'NVIDIA GeForce RTX 4090',
+        uuid: 'GPU-nv0',
+        memory_total_bytes: 24 * 1024 * 1024 * 1024,
+      },
+      {
+        index: 0,
+        vendor: 'amd',
+        name: 'AMD Radeon RX 6800',
+        uuid: 'GPU-amd0',
+        memory_total_bytes: 16 * 1024 * 1024 * 1024,
+      },
+    ]);
+
+  async function openCreateForm() {
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    fireEvent.change(screen.getByLabelText(t.mappingAppName), { target: { value: 'app' } });
+    fireEvent.change(screen.getByLabelText(t.runtimeSpecBinary), {
+      target: { value: '/usr/bin/llama-server' },
+    });
+  }
+
+  async function pickGpu(rowIdx: number, name: RegExp) {
+    fireEvent.mouseDown(screen.getAllByRole('combobox', { name: t.runtimeSpecGpuPick })[rowIdx]);
+    fireEvent.click(await screen.findByRole('option', { name }));
+  }
+
+  it('lists NVIDIA 0 and AMD 0 as distinct choices and saves the vendor', async () => {
+    const { putSpecs } = renderSection({ hardware: mixedHardware() });
+    await openCreateForm();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+
+    fireEvent.mouseDown(await screen.findByRole('combobox', { name: t.runtimeSpecGpuPick }));
+    const labels = (await screen.findAllByRole('option')).map((o) => o.textContent ?? '');
+    expect(labels).toContain('NVIDIA 0 · NVIDIA GeForce RTX 4090 · nv0');
+    expect(labels).toContain('AMD 0 · AMD Radeon RX 6800 · amd0');
+    fireEvent.click(screen.getByRole('option', { name: /^AMD 0 · AMD Radeon RX 6800/ }));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.gpus).toEqual([
+      { vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+    ]);
+  });
+
+  it('keeps the same index of two vendors apart: neither a duplicate nor offered twice', async () => {
+    const { putSpecs } = renderSection({ hardware: mixedHardware() });
+    await openCreateForm();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    await pickGpu(0, /^NVIDIA 0/);
+    // Row 1 is offered only the card row 0 does not hold.
+    fireEvent.mouseDown(screen.getAllByRole('combobox', { name: t.runtimeSpecGpuPick })[1]);
+    const labels = (await screen.findAllByRole('option')).map((o) => o.textContent ?? '');
+    expect(labels.some((l) => l.startsWith('NVIDIA 0'))).toBe(false);
+    fireEvent.click(screen.getByRole('option', { name: /^AMD 0/ }));
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.gpus.map((g) => [g.vendor, g.index])).toEqual([
+      ['nvidia', 0],
+      ['amd', 0],
+    ]);
+  });
+
+  it('shows what auto resolves to and refuses a mismatch', async () => {
+    const { putSpecs, created } = renderSection({ hardware: mixedHardware() });
+    await openCreateForm();
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    await pickGpu(0, /^NVIDIA 0/);
+    expect(await screen.findByText(t.runtimeBackendResolvesTo('cuda'))).toBeInTheDocument();
+    await pickGpu(1, /^AMD 0/);
+    expect(await screen.findByText(t.runtimeBackendResolvesTo('vulkan'))).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: t.clusterDeviceBackend }));
+    fireEvent.click(await screen.findByRole('option', { name: 'cuda' }));
+    expect(await screen.findByText(t.runtimeBackendMismatchHint)).toBeInTheDocument();
+    expect(screen.queryByText(t.runtimeBackendResolvesTo('vulkan'))).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecCreate }));
+    await waitFor(() =>
+      expect(screen.getAllByText(t.runtimeBackendMismatchHint).length).toBeGreaterThan(1),
+    );
+    expect(created).toHaveLength(0);
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('reads a legacy row as the server legacy vendor for the backend and the picker', async () => {
+    renderSection({
+      hardware: mixedHardware(),
+      server: { gpu_legacy_vendor: 'nvidia' },
+      mappings: [makeMapping()],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          binary: '/usr/bin/llama-server',
+          gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+        }),
+      },
+    });
+    await waitForEnabledButton(t.runtimeSpecEditAction);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
+    expect(await screen.findByText(t.runtimeBackendResolvesTo('cuda'))).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }).textContent).toMatch(
+      /^NVIDIA 0 · /,
+    );
+  });
+
+  it('shows the live VRAM of the card at the same vendor and index', async () => {
+    renderSection({
+      mappings: [makeMapping({ id: 'map_mixed', gateway_model_name: 'gw-map_mixed' })],
+      specsByMappingId: {
+        map_mixed: makeSpec({
+          configured: true,
+          mapping_id: 'map_mixed',
+          id: 'spec_mixed',
+          gpus: [{ vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+        }),
+      },
+      statusRows: [
+        makeStatus({
+          spec_id: 'spec_mixed',
+          gpus: [
+            { vendor: 'nvidia', index: 0, vram_measured_mb: 5000 },
+            { vendor: 'amd', index: 0, vram_measured_mb: 7000 },
+          ],
+        }),
+      ],
+    });
+    await waitFor(() =>
+      expect(cellForColumn('gw-map_mixed', t.runtimeSpecGpus)).toHaveTextContent(
+        /^AMD 0: 7000 MB$/,
+      ),
+    );
+  });
+
+  it('prefills a budget row from a card, picks another vendor and saves the vendor', async () => {
+    const { putBudgets } = renderSection({ hardware: mixedHardware() });
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+
+    const pickers = await screen.findAllByRole('combobox', { name: t.runtimeSpecGpuPick });
+    expect(pickers.map((p) => p.textContent)).toEqual([
+      'NVIDIA 0 · NVIDIA GeForce RTX 4090 · nv0',
+      'AMD 0 · AMD Radeon RX 6800 · amd0',
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putBudgets).toHaveLength(1));
+    expect(putBudgets[0]).toEqual([
+      { vendor: 'nvidia', index: 0, budget_mb: 24576, expected_uuid: '', expected_name: '' },
+      { vendor: 'amd', index: 0, budget_mb: 16384, expected_uuid: '', expected_name: '' },
+    ]);
+  });
+
+  it('compares the budget drift with the card at the same vendor and index', async () => {
+    renderSection({
+      hardware: mixedHardware(),
+      gpuBudgets: [
+        {
+          vendor: 'amd',
+          index: 0,
+          budget_mb: 16000,
+          expected_uuid: 'GPU-amd0',
+          expected_name: 'AMD Radeon RX 6800',
+        },
+        {
+          vendor: 'nvidia',
+          index: 0,
+          budget_mb: 24000,
+          expected_uuid: 'GPU-old',
+          expected_name: 'NVIDIA GeForce RTX 3090',
+        },
+      ],
+    });
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    expect(
+      await screen.findByRole('button', { name: `${t.runtimeGpuDriftIconLabel}: NVIDIA 0` }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: `${t.runtimeGpuDriftIconLabel}: AMD 0` }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('shows and dismisses the legacy-mapping note', async () => {
+    const dismiss = vi.fn(async () => undefined);
+    renderSection({
+      server: { gpu_vendor_note: true, gpu_legacy_vendor: 'nvidia' },
+      dismissGpuVendorNote: dismiss,
+    });
+    expect(await screen.findByText(t.gpuLegacyMappedNote('NVIDIA'))).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.gpuLegacyMappedDismiss }));
+    await waitFor(() => expect(dismiss).toHaveBeenCalledWith('srv_1'));
+    await waitFor(() =>
+      expect(screen.queryByText(t.gpuLegacyMappedNote('NVIDIA'))).not.toBeInTheDocument(),
+    );
+  });
+
+  it('shows no legacy-mapping note once it is acknowledged', async () => {
+    renderSection({ server: { gpu_vendor_note: false, gpu_legacy_vendor: 'nvidia' } });
+    await screen.findByRole('button', { name: t.runtimeSpecCreate });
+    expect(screen.queryByText(t.gpuLegacyMappedNote('NVIDIA'))).not.toBeInTheDocument();
   });
 });

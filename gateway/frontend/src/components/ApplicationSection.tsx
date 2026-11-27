@@ -207,6 +207,8 @@ export function ApplicationSection({
     // Task 21 (matrix + server limits): forwarded the same way.
     | 'updateServer'
     | 'serverHardware'
+    // #434: the runtime screen's legacy GPU vendor note.
+    | 'dismissGpuVendorNote'
   >;
   server: PortalServer;
   onModelsChanged?: () => void;

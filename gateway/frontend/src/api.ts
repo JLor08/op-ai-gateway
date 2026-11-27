@@ -53,6 +53,7 @@ export * from './api/vendorAccountGroups';
 export * from './api/voiceChat';
 export * from './api/rpcMembers';
 export * from './api/binaries';
+export * from './api/gpus';
 
 export function createPortalApi(fetcher: Fetcher = fetch) {
   return {

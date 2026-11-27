@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { createPortalApi } from '../api';
 import {
   gpuDisplayName,
   gpuKey,
+  hostGpuVendor,
   hostIsMixed,
   reportVendors,
+  resolvedGpuKey,
   resolveAutoBackend,
   vendorLabel,
 } from './gpus';
@@ -37,6 +40,16 @@ describe('gpus', () => {
     expect(hostIsMixed([gpu('nvidia'), gpu('amd')])).toBe(true);
     expect(hostIsMixed([gpu('amd'), gpu('amd')])).toBe(false);
     expect(hostIsMixed([])).toBe(false);
+  });
+
+  it('reads the empty vendor as the host vendor', () => {
+    expect(hostGpuVendor('amd', [gpu('nvidia')])).toBe('amd');
+    expect(hostGpuVendor(undefined, [gpu('nvidia'), gpu('nvidia')])).toBe('nvidia');
+    expect(hostGpuVendor('', [gpu('nvidia'), gpu('amd')])).toBe('');
+    expect(hostGpuVendor(undefined, [gpu(undefined)])).toBe('');
+    expect(resolvedGpuKey('', 1, 'nvidia')).toBe('nvidia:1');
+    expect(resolvedGpuKey(undefined, 1, '')).toBe(':1');
+    expect(resolvedGpuKey('amd', 1, 'nvidia')).toBe('amd:1');
   });
 
   it('resolves auto by the GPUs vendors', () => {
@@ -70,5 +83,26 @@ describe('gpus', () => {
     });
     expect(resolveAutoBackend('sycl', ['nvidia'])).toEqual({ resolved: 'sycl', mismatch: false });
     expect(resolveAutoBackend('sycl', ['amd'])).toEqual({ resolved: 'sycl', mismatch: false });
+  });
+
+  it('ignores legacy vendorless entries', () => {
+    expect(resolveAutoBackend('auto', ['nvidia', ''])).toEqual({
+      resolved: 'cuda',
+      mismatch: false,
+    });
+    expect(resolveAutoBackend('auto', [''])).toEqual({ resolved: null, mismatch: false });
+    expect(resolveAutoBackend('cuda', [''])).toEqual({ resolved: 'cuda', mismatch: false });
+    expect(resolveAutoBackend('rocm', ['amd', ''])).toEqual({ resolved: 'rocm', mismatch: false });
+  });
+});
+
+describe('serversApi GPU vendor note', () => {
+  it('POSTs the dismissal for the URL-encoded server id and accepts 204', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    await expect(createPortalApi(fetcher).dismissGpuVendorNote('srv/1')).resolves.toBeUndefined();
+    const [url, init] = fetcher.mock.calls[0];
+    expect(url).toBe('/api/portal/servers/srv%2F1/gpu-vendor-note/dismiss');
+    expect(init.method).toBe('POST');
+    expect(init.headers['X-OP-CSRF']).toBe('1');
   });
 });

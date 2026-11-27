@@ -127,6 +127,15 @@ import { CoResidencyEditor, type CoResidencyItem } from './CoResidencyEditor';
 import { RuntimeLogView } from './RuntimeLogView';
 import { RpcMemberName, RpcMemberSection } from './RpcMemberSection';
 import { BinariesSection } from './BinariesSection';
+import { GpuVendorNote } from './GpuVendorNote';
+import {
+  type GpuVendor,
+  gpuDisplayName,
+  gpuKey,
+  hostGpuVendor,
+  resolveAutoBackend,
+  resolvedGpuKey,
+} from '../api';
 import { BinaryPicker, binaryVersionFor, useServerBinaries } from './shared/BinaryPicker';
 import {
   ClusterHeadEditor,
@@ -248,6 +257,10 @@ function makeRowKey(): string {
 
 type GpuRow = {
   rowKey: string;
+  // The card's vendor (#434): indexes restart per vendor, so the card is
+  // (vendor, index). '' is a row that names no vendor -- written before
+  // vendors existed, or typed by hand -- which the host's vendor stands for.
+  vendor: GpuVendor;
   index: number;
   vramEstimateMb: number;
   vramMeasuredMb: number;
@@ -572,7 +585,7 @@ type ReportSpec = {
   model: string;
   binary: string;
   args: string[];
-  gpus: { index: number; vramMb: number }[];
+  gpus: { vendor: GpuVendor; index: number; vramMb: number }[];
   pinned: boolean;
   setVisibleDevices: boolean;
   visibleDevicesMode: 'env' | 'args';
@@ -585,7 +598,7 @@ type ReportSpec = {
 
 type ReportConfig = {
   maxProcesses: number | null;
-  budgets: { index: number; budgetMb: number }[];
+  budgets: { vendor: GpuVendor; index: number; budgetMb: number }[];
   specs: ReportSpec[];
   /** Something, at some level, did not have the shape we expected. */
   unrecognised: boolean;
@@ -593,6 +606,12 @@ type ReportConfig = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// A report entry's GPU vendor (#434): one of the wire values, else '' -- the
+// legacy "the host's only vendor" an older agent's entries carry.
+function narrowReportVendor(value: unknown): GpuVendor {
+  return value === 'nvidia' || value === 'amd' || value === 'apple' ? value : '';
 }
 
 // The log-file rules the agent's own ParseConfig enforces (#430), re-checked
@@ -637,11 +656,15 @@ function narrowReportLogFiles(value: unknown, flag: { unrecognised: boolean }): 
 function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): ReportSpec | null {
   if (!isRecord(value)) return null;
   if (typeof value.id !== 'string' || value.id === '') return null;
-  const gpus: { index: number; vramMb: number }[] = [];
+  const gpus: ReportSpec['gpus'] = [];
   if (Array.isArray(value.gpus)) {
     for (const gpu of value.gpus) {
       if (isRecord(gpu) && typeof gpu.index === 'number') {
-        gpus.push({ index: gpu.index, vramMb: typeof gpu.vram_mb === 'number' ? gpu.vram_mb : 0 });
+        gpus.push({
+          vendor: narrowReportVendor(gpu.vendor),
+          index: gpu.index,
+          vramMb: typeof gpu.vram_mb === 'number' ? gpu.vram_mb : 0,
+        });
       } else {
         flag.unrecognised = true;
       }
@@ -712,7 +735,11 @@ function narrowReportConfig(config: unknown): ReportConfig {
         typeof entry.index === 'number' &&
         typeof entry.budget_mb === 'number'
       ) {
-        out.budgets.push({ index: entry.index, budgetMb: entry.budget_mb });
+        out.budgets.push({
+          vendor: narrowReportVendor(entry.vendor),
+          index: entry.index,
+          budgetMb: entry.budget_mb,
+        });
       } else {
         out.unrecognised = true;
       }
@@ -887,27 +914,52 @@ function executionModeLabel(mode: string, t: Translation): string {
 // is read; an absent or 0 live figure (UNKNOWN) drops out. A wsl spec meets
 // this first: its VRAM is known only once its start window settles, typically
 // after the list was loaded.
-function effectiveGpuVram(g: RuntimeSpecGPU, live?: RuntimeStatus): number {
-  return Math.max(liveGpuVram(live, g.index), g.vram_measured_mb, g.vram_estimate_mb);
+//
+// hostVendor (hostGpuVendor) is what an empty vendor stands for on this server,
+// on either side: a spec row saved before vendors existed and an older agent's
+// vendorless frame both name the host's vendor's card.
+function effectiveGpuVram(
+  g: RuntimeSpecGPU,
+  live: RuntimeStatus | undefined,
+  hostVendor: GpuVendor,
+): number {
+  return Math.max(liveGpuVram(live, g, hostVendor), g.vram_measured_mb, g.vram_estimate_mb);
 }
 
 // The live status frame's measured VRAM for one card, 0 when it carries none.
-function liveGpuVram(live: RuntimeStatus | undefined, index: number): number {
-  return live?.gpus?.find((g) => g.index === index)?.vram_measured_mb || 0;
+// The card is (vendor, index) (#434): a mixed host reports NVIDIA 0 and AMD 0.
+function liveGpuVram(
+  live: RuntimeStatus | undefined,
+  card: { vendor?: GpuVendor; index: number },
+  hostVendor: GpuVendor,
+): number {
+  const key = resolvedGpuKey(card.vendor, card.index, hostVendor);
+  return (
+    live?.gpus?.find((g) => resolvedGpuKey(g.vendor, g.index, hostVendor) === key)
+      ?.vram_measured_mb || 0
+  );
 }
 
 // Whether any declared card of spec has a measurement, durable or live.
-function anyGpuMeasured(spec: RuntimeSpec, live?: RuntimeStatus): boolean {
-  return spec.gpus.some((g) => g.vram_measured_mb > 0 || liveGpuVram(live, g.index) > 0);
+function anyGpuMeasured(
+  spec: RuntimeSpec,
+  live: RuntimeStatus | undefined,
+  hostVendor: GpuVendor,
+): boolean {
+  return spec.gpus.some((g) => g.vram_measured_mb > 0 || liveGpuVram(live, g, hostVendor) > 0);
 }
 
 // The sum of every GPU row's effective VRAM: what the spec demands across the
 // host's cards in total. A card whose demand is still unknown (0) adds nothing,
 // so the total of a partly unknown spec is a floor; 0 means every card is
 // unknown (or there is none).
-function totalGpuVram(spec: RuntimeSpec | undefined, live?: RuntimeStatus): number {
+function totalGpuVram(
+  spec: RuntimeSpec | undefined,
+  live: RuntimeStatus | undefined,
+  hostVendor: GpuVendor,
+): number {
   if (!spec) return 0;
-  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(g, live), 0);
+  return spec.gpus.reduce((sum, g) => sum + effectiveGpuVram(g, live, hostVendor), 0);
 }
 
 // RAM has no per-card rows: the larger of the agent's measurement and the
@@ -931,9 +983,22 @@ function effectiveRam(spec: RuntimeSpec | undefined, live?: RuntimeStatus): numb
   );
 }
 
-function formatGpus(spec: RuntimeSpec | undefined, live?: RuntimeStatus): string {
+function formatGpus(
+  spec: RuntimeSpec | undefined,
+  live: RuntimeStatus | undefined,
+  hostVendor: GpuVendor,
+): string {
   if (!spec || spec.gpus.length === 0) return '—';
-  return spec.gpus.map((g) => `${g.index}: ${effectiveGpuVram(g, live)} MB`).join(', ');
+  return spec.gpus
+    .map((g) => `${gpuCellLabel(g.vendor, g.index)}: ${effectiveGpuVram(g, live, hostVendor)} MB`)
+    .join(', ');
+}
+
+// A card in a compact list cell: "AMD 0" when the row names its vendor (#434),
+// the bare index when it does not -- a row saved before vendors existed reads
+// exactly as it always did.
+function gpuCellLabel(vendor: GpuVendor | undefined, index: number): string {
+  return vendor ? gpuDisplayName(vendor, index) : String(index);
 }
 
 // A megabyte quantity for the two summary columns: the em-dash when nothing is
@@ -1230,13 +1295,16 @@ function validatePlaceholders(values: string[], t: Translation): string | undefi
 // HIP_VISIBLE_DEVICES is included although the agent never SETS it: it selects
 // from what ROCR_VISIBLE_DEVICES already left visible, so combining a hand-set
 // HIP list with agent-managed ROCR filtering leaves the child with no usable
-// device. Runtime-specific selectors the agent neither sets nor filters through
-// (ONEAPI_DEVICE_SELECTOR, GPU_DEVICE_ORDINAL) are deliberately NOT here --
-// composing one of those with the option is the documented escape hatch.
+// device. GGML_VK_VISIBLE_DEVICES is the Vulkan backend's list, which the agent
+// sets for a Vulkan spec from the host's Vulkan ordinals (#434). Runtime-specific
+// selectors the agent neither sets nor filters through (ONEAPI_DEVICE_SELECTOR,
+// GPU_DEVICE_ORDINAL) are deliberately NOT here -- composing one of those with
+// the option is the documented escape hatch.
 const visibleDevicesOwnedVars = [
   'CUDA_VISIBLE_DEVICES',
   'ROCR_VISIBLE_DEVICES',
   'HIP_VISIBLE_DEVICES',
+  'GGML_VK_VISIBLE_DEVICES',
 ];
 
 // The placeholders that name every card of the spec (mirrors the backend's
@@ -1299,7 +1367,10 @@ function validateVisibleDevices(
 }
 
 /**
- * The first GPU index that appears more than once, or `null`.
+ * The first GPU key (gpuKey, #434: a card is its vendor and its index, and
+ * indexes restart per vendor) that appears more than once, or `null`. Callers
+ * pass resolved keys (resolvedGpuKey), so a row without a vendor and one naming
+ * the host's vendor at the same index collide, as they do server-side.
  *
  * Both server-side writes that carry per-GPU rows REFUSE a repeated index
  * outright -- `validateRuntimeSpecGPUs` and `SetServerGPUBudgets`, each
@@ -1313,13 +1384,20 @@ function validateVisibleDevices(
  * clear of collisions). So the collision is named here, before the write, in
  * the same validate-on-submit idiom the env and placeholder checks use.
  */
-function duplicateGpuIndex(indices: number[]): number | null {
-  const seen = new Set<number>();
-  for (const index of indices) {
-    if (seen.has(index)) return index;
-    seen.add(index);
+function duplicateGpuKey(keys: string[]): string | null {
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (seen.has(key)) return key;
+    seen.add(key);
   }
   return null;
+}
+
+// How a duplicateGpuKey result is named in the refusal: "NVIDIA 0", or
+// "GPU 0" for a key without a vendor.
+function gpuKeyDisplayName(key: string): string {
+  const sep = key.lastIndexOf(':');
+  return gpuDisplayName(key.slice(0, sep) as GpuVendor, Number(key.slice(sep + 1)));
 }
 
 /**
@@ -1329,12 +1407,16 @@ function duplicateGpuIndex(indices: number[]): number | null {
  * is the normal AI-server build, so `name` is a recognition aid and never a
  * handle: a list that reads as eight copies of "NVIDIA RTX 4090" has failed
  * even though every value behind it differs. The label is therefore built as
- * `GPU <index> · <name> · <handle>`:
+ * `<vendor> <index> · <name> · <handle>` (`NVIDIA 0`, `AMD 1`; `GPU <index>`
+ * for a report without vendors):
  *
  *  - the INDEX leads because it is the value being set. Whatever else the row
  *    shows, the operator must be able to see which number they just chose --
  *    and it is the only part that is always present, which is what makes the
- *    eight-identical-cards case work at all.
+ *    eight-identical-cards case work at all. Its VENDOR comes first (#434):
+ *    indexes restart per vendor, so on a mixed host "0" alone names two
+ *    cards. It shows whenever the report carries it, single-vendor hosts
+ *    included, so a label never changes meaning when a card is added.
  *  - the NAME is what a human recognises the card by.
  *  - the HANDLE (stableGpuHandle) is the tie-breaker, and it is the part worth
  *    extending: see its own note.
@@ -1346,7 +1428,7 @@ function duplicateGpuIndex(indices: number[]): number | null {
  * source -- the hardware inventory is static -- and it is not identity.)
  */
 function gpuOptionLabel(gpu: HardwareGPU): string {
-  const parts = [`GPU ${gpu.index}`];
+  const parts = [gpuDisplayName(gpu.vendor, gpu.index)];
   const name = gpu.name.trim();
   if (name) parts.push(name);
   const handle = stableGpuHandle(gpu);
@@ -1492,6 +1574,8 @@ export function RuntimeAdminSection({
     // from the same live-telemetry hardware report the Hardware tab reads.
     | 'updateServer'
     | 'serverHardware'
+    // #434: acknowledges the note that legacy GPU rows were mapped to a vendor.
+    | 'dismissGpuVendorNote'
     // The model-mapping tab renders the SAME edit mask an ordinary application
     // gets (`MappingForm`), context-size probe included -- "der selbe Edit" was
     // the requirement, and the probe fills a field IN that form rather than
@@ -1973,6 +2057,13 @@ export function RuntimeAdminSection({
   const hardware = useLatestFetch(() => api.serverHardware(server.id), [api, server.id]);
   const telemetryGpus: HardwareGPU[] =
     hardware.data?.available && hardware.data.report ? hardware.data.report.gpus : [];
+  // What a GPU row without a vendor stands for on this server (#434): the
+  // stored legacy vendor, else the report's only vendor. Every comparison of a
+  // row with a reported card, a live frame or a sibling row goes through
+  // resolvedGpuKey with it, so (vendor, index) is the card everywhere.
+  const hostVendor = hostGpuVendor(server.gpu_legacy_vendor, telemetryGpus);
+  const cardKey = (card: { vendor?: GpuVendor; index: number }) =>
+    resolvedGpuKey(card.vendor, card.index, hostVendor);
   // Whether the hardware fetch has actually SETTLED, as distinct from having
   // returned nothing yet. The spec form's GPU picker degrades to "this server
   // has reported no GPUs" when the list is empty, and flashing that sentence
@@ -2012,6 +2103,8 @@ export function RuntimeAdminSection({
   }, [gpuBudgetsError]);
   type BudgetRow = {
     rowKey: string;
+    // The card's vendor (#434), '' for a row that names none (GpuRow's rule).
+    vendor: GpuVendor;
     index: number;
     budgetMb: number;
     expectedUuid: string;
@@ -2046,6 +2139,7 @@ export function RuntimeAdminSection({
     setBudgetRows(
       gpuBudgetsData.map((b) => ({
         rowKey: makeRowKey(),
+        vendor: b.vendor ?? '',
         index: b.index,
         budgetMb: b.budget_mb,
         expectedUuid: b.expected_uuid,
@@ -2067,17 +2161,18 @@ export function RuntimeAdminSection({
   function addBudgetRow() {
     budgetRowsDirtyRef.current = true;
     setBudgetRows((rows) => {
-      const used = new Set(rows.map((r) => r.index));
       // Prefer the next telemetry-reported GPU not yet configured -- the
-      // agent already told us its index AND its total VRAM, so the operator
-      // shouldn't have to look either up
+      // agent already told us its vendor, index AND total VRAM, so the
+      // operator shouldn't have to look any of them up
       // (docs/architecture/cross-cutting/agent-runtime-manager.md §11.5).
-      const fromTelemetry = telemetryGpus.find((g) => !used.has(g.index));
+      const usedCards = new Set(rows.map(cardKey));
+      const fromTelemetry = telemetryGpus.find((g) => !usedCards.has(cardKey(g)));
       if (fromTelemetry) {
         return [
           ...rows,
           {
             rowKey: makeRowKey(),
+            vendor: fromTelemetry.vendor ?? '',
             index: fromTelemetry.index,
             budgetMb: Math.round(fromTelemetry.memory_total_bytes / (1024 * 1024)),
             expectedUuid: '',
@@ -2085,11 +2180,19 @@ export function RuntimeAdminSection({
           },
         ];
       }
+      const used = new Set(rows.map((r) => r.index));
       let index = 0;
       while (used.has(index)) index++;
       return [
         ...rows,
-        { rowKey: makeRowKey(), index, budgetMb: 0, expectedUuid: '', expectedName: '' },
+        {
+          rowKey: makeRowKey(),
+          vendor: '',
+          index,
+          budgetMb: 0,
+          expectedUuid: '',
+          expectedName: '',
+        },
       ];
     });
   }
@@ -2097,17 +2200,23 @@ export function RuntimeAdminSection({
     budgetRowsDirtyRef.current = true;
     setBudgetRows((rows) => rows.filter((_, i) => i !== idx));
   }
-  function updateBudgetRow(idx: number, patch: Partial<Pick<BudgetRow, 'index' | 'budgetMb'>>) {
+  function updateBudgetRow(
+    idx: number,
+    patch: Partial<Pick<BudgetRow, 'vendor' | 'index' | 'budgetMb'>>,
+  ) {
     budgetRowsDirtyRef.current = true;
     setBudgetRows((rows) =>
       rows.map((r, i) => {
         if (i !== idx) return r;
-        // Changing the index changes the row's identity: the loaded
-        // expected_* snapshot belonged to the OLD index and would misreport
-        // drift against whatever card now sits at the new one. The backend
-        // re-snapshots it from telemetry on save if the new index is
+        // Changing the card changes the row's identity: the loaded
+        // expected_* snapshot belonged to the OLD (vendor, index) and would
+        // misreport drift against whatever card now sits at the new one. The
+        // backend re-snapshots it from telemetry on save if the new card is
         // genuinely unconfigured.
-        if (patch.index !== undefined && patch.index !== r.index) {
+        if (
+          (patch.index !== undefined && patch.index !== r.index) ||
+          (patch.vendor !== undefined && patch.vendor !== r.vendor)
+        ) {
           return { ...r, ...patch, expectedUuid: '', expectedName: '' };
         }
         return { ...r, ...patch };
@@ -2124,26 +2233,52 @@ export function RuntimeAdminSection({
   // rocm-smi 4.x only (pre-4.0 rocm-smi reports none, Apple is a single
   // unified-memory device), so an absent UUID on either side means "no drift
   // detection available here", not "drift detected".
+  //
+  // The live card is the one at the row's own (vendor, index) (#434): on a
+  // mixed host NVIDIA 0 and AMD 0 are different cards, so an index-only lookup
+  // would compare the row against the other vendor's card and cry drift.
   function driftFor(row: BudgetRow): HardwareGPU | undefined {
     if (!row.expectedUuid) return undefined;
-    const live = telemetryGpus.find((g) => g.index === row.index);
+    const live = telemetryCard(row);
     if (!live?.uuid) return undefined;
     return live.uuid !== row.expectedUuid ? live : undefined;
   }
 
+  // The reported card a row names, by resolved (vendor, index).
+  function telemetryCard(row: { vendor?: GpuVendor; index: number }): HardwareGPU | undefined {
+    const key = cardKey(row);
+    return telemetryGpus.find((g) => cardKey(g) === key);
+  }
+
+  // The reported cards budget row `rowIdx` may be switched to, and the value
+  // its picker shows: gpuOptionsFor / gpuSelectValue's rules for the budget
+  // rows.
+  function budgetOptionsFor(rowIdx: number): HardwareGPU[] {
+    const taken = new Set(budgetRows.filter((_, i) => i !== rowIdx).map(cardKey));
+    return telemetryGpus.filter((g) => !taken.has(cardKey(g)));
+  }
+  function budgetSelectValue(row: BudgetRow, rowIdx: number): string {
+    const own = cardKey(row);
+    const card = budgetOptionsFor(rowIdx).find((g) => cardKey(g) === own);
+    return card ? gpuKey(card.vendor, card.index) : '';
+  }
+
   async function saveLimits() {
-    // Same collision check as the spec form's GPU rows, same reason: an index
+    // Same collision check as the spec form's GPU rows, same reason: a card
     // retyped onto another row's collides, the backend refuses the whole PUT
     // with a message that names neither row, and this Save is a FULL replace.
-    const duplicateGpu = duplicateGpuIndex(budgetRows.map((r) => r.index));
+    const duplicateGpu = duplicateGpuKey(budgetRows.map(cardKey));
     if (duplicateGpu !== null) {
-      showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      showError(`${t.runtimeGpuIndexDuplicate}: ${gpuKeyDisplayName(duplicateGpu)}`);
       return;
     }
     setLimitsBusy(true);
     try {
       const body: { budgets: GPUBudget[] } = {
         budgets: budgetRows.map((r) => ({
+          // A row without a vendor saves as it always did (no key); the
+          // backend reads it as the server's legacy vendor.
+          ...(r.vendor ? { vendor: r.vendor } : {}),
           index: r.index,
           budget_mb: r.budgetMb,
           expected_uuid: r.expectedUuid,
@@ -3046,14 +3181,17 @@ export function RuntimeAdminSection({
     };
   }, [api, editingSpecMappingId]);
 
-  // index -> that card's measured item, so a row finds its own number and
-  // never a sibling's. The run reports the indexes IT watched, which need not
-  // be the rows the spec declares today.
-  const vramMeasuredByIndex = useMemo(() => {
-    const byIndex = new Map<number, VRAMGPUItemDTO>();
-    for (const gpu of vramEvidence?.report.gpus ?? []) byIndex.set(gpu.index, gpu);
-    return byIndex;
-  }, [vramEvidence]);
+  // card (resolved vendor and index, #434) -> that card's measured item, so a
+  // row finds its own number and never a sibling's -- nor the other vendor's
+  // card at the same index. The run reports the cards IT watched, which need
+  // not be the rows the spec declares today.
+  const vramMeasuredByCard = useMemo(() => {
+    const byCard = new Map<string, VRAMGPUItemDTO>();
+    for (const gpu of vramEvidence?.report.gpus ?? []) {
+      byCard.set(resolvedGpuKey(gpu.vendor, gpu.index, hostVendor), gpu);
+    }
+    return byCard;
+  }, [vramEvidence, hostVendor]);
 
   function resetSpecFields() {
     setEnabled(true);
@@ -3142,6 +3280,7 @@ export function RuntimeAdminSection({
     setGpuRows(
       spec.gpus.map((g) => ({
         rowKey: makeRowKey(),
+        vendor: g.vendor ?? '',
         index: g.index,
         vramEstimateMb: g.vram_estimate_mb,
         vramMeasuredMb: g.vram_measured_mb,
@@ -3282,7 +3421,10 @@ export function RuntimeAdminSection({
       const used = new Set(rows.map((r) => r.index));
       let index = 0;
       while (used.has(index)) index++;
-      return [...rows, { rowKey: makeRowKey(), index, vramEstimateMb: 0, vramMeasuredMb: 0 }];
+      return [
+        ...rows,
+        { rowKey: makeRowKey(), vendor: '', index, vramEstimateMb: 0, vramMeasuredMb: 0 },
+      ];
     });
   }
   function removeGpuRow(idx: number) {
@@ -3291,9 +3433,13 @@ export function RuntimeAdminSection({
   // Deliberately does NOT reject a collision as it is typed: an operator
   // swapping two rows' indices has to pass through a colliding intermediate
   // state, and refusing the keystroke would make that edit impossible. The
-  // collision is caught at submit instead (duplicateGpuIndex), which is also
-  // where the backend's own refusal would land.
-  function updateGpuRow(idx: number, patch: Partial<Pick<GpuRow, 'index' | 'vramEstimateMb'>>) {
+  // collision is caught at submit instead (duplicateGpuKey), which is also
+  // where the backend's own refusal would land. A typed index keeps the row's
+  // vendor: the field edits which of that vendor's cards the row names.
+  function updateGpuRow(
+    idx: number,
+    patch: Partial<Pick<GpuRow, 'vendor' | 'index' | 'vramEstimateMb'>>,
+  ) {
     setGpuRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
   }
 
@@ -3344,6 +3490,7 @@ export function RuntimeAdminSection({
           (index) =>
             byIndex.get(index) ?? {
               rowKey: makeRowKey(),
+              vendor: '',
               index,
               vramEstimateMb: 0,
               vramMeasuredMb: 0,
@@ -3460,8 +3607,9 @@ export function RuntimeAdminSection({
    * measured nothing on. Offering a 0 there would put "this model is free"
    * into the admission arithmetic through the operator's own field.
    *
-   * Matched BY GPU INDEX, never by row position: the run reports the indexes it
-   * watched, and the rows may have been reordered, added to or removed since.
+   * Matched BY CARD (vendor and index, #434), never by row position: the run
+   * reports the cards it watched, and the rows may have been reordered, added
+   * to or removed since.
    *
    * And an index is not an identity, which is why the recorded card
    * fingerprint is COMPARED here rather than merely displayed. A driver reset
@@ -3473,13 +3621,10 @@ export function RuntimeAdminSection({
    * never read as "verified".
    */
   function renderVramApply(row: GpuRow, rowIdx: number) {
-    const item = vramMeasuredByIndex.get(row.index);
+    const item = vramMeasuredByCard.get(cardKey(row));
     const applicable = vramApplyNumber(item);
     if (!applicable) return null;
-    const check = vramCardCheck(
-      item,
-      telemetryGpus.find((gpu) => gpu.index === row.index),
-    );
+    const check = vramCardCheck(item, telemetryCard(row));
     if (check.state === 'drifted') {
       // No number field and no Apply: the measurement is real but belongs to
       // other hardware, and applying it would put a foreign card's cost into
@@ -3552,12 +3697,9 @@ export function RuntimeAdminSection({
    * row's own Remove button onto the line below and orphan it from its row.
    */
   function renderVramCardCheck(row: GpuRow) {
-    const item = vramMeasuredByIndex.get(row.index);
+    const item = vramMeasuredByCard.get(cardKey(row));
     if (!vramApplyNumber(item)) return null;
-    const check = vramCardCheck(
-      item,
-      telemetryGpus.find((gpu) => gpu.index === row.index),
-    );
+    const check = vramCardCheck(item, telemetryCard(row));
     if (check.state === 'drifted') return null;
     return (
       <Typography variant="caption" color="text.secondary" sx={{ width: '100%' }}>
@@ -3567,7 +3709,7 @@ export function RuntimeAdminSection({
   }
 
   // The reported GPUs row `rowIdx` may be switched to: every telemetry card
-  // except the ones a SIBLING row already holds. duplicateGpuIndex refuses a
+  // except the ones a SIBLING row already holds. duplicateGpuKey refuses a
   // collision at submit and the backend refuses it again, so offering an index
   // only to fail validation afterwards is worse than not offering it.
   //
@@ -3577,9 +3719,12 @@ export function RuntimeAdminSection({
   // on purpose: swapping two rows' indices has to pass through a colliding
   // intermediate state, and refusing the keystroke would make that edit
   // impossible. The picker simply never OFFERS one.
+  //
+  // A card is its resolved (vendor, index) (#434): NVIDIA 0 held by a sibling
+  // leaves AMD 0 on offer.
   function gpuOptionsFor(rowIdx: number): HardwareGPU[] {
-    const takenBySiblings = new Set(gpuRows.filter((_, i) => i !== rowIdx).map((r) => r.index));
-    return telemetryGpus.filter((g) => !takenBySiblings.has(g.index));
+    const takenBySiblings = new Set(gpuRows.filter((_, i) => i !== rowIdx).map(cardKey));
+    return telemetryGpus.filter((g) => !takenBySiblings.has(cardKey(g)));
   }
 
   // The select shows a card only when the row's index actually matches one the
@@ -3588,8 +3733,13 @@ export function RuntimeAdminSection({
   // leaves the select on its placeholder while the numeric field keeps the
   // real value -- honest in both halves, rather than the select silently
   // implying the index is something else.
+  //
+  // The option values are the cards' own gpuKey; a row without a vendor shows
+  // the host vendor's card at its index (resolvedGpuKey).
   function gpuSelectValue(row: GpuRow, rowIdx: number): string {
-    return gpuOptionsFor(rowIdx).some((g) => g.index === row.index) ? String(row.index) : '';
+    const own = cardKey(row);
+    const card = gpuOptionsFor(rowIdx).find((g) => cardKey(g) === own);
+    return card ? gpuKey(card.vendor, card.index) : '';
   }
 
   // The instance settings as typed, for instanceSettingsBody and
@@ -3660,7 +3810,10 @@ export function RuntimeAdminSection({
       // Only meaningful under 'random' mode; a stray true from a since-changed
       // mode would ask the backend to rotate a token that no longer applies.
       ...(apiTokenMode === 'random' && apiTokenRotate ? { api_token_rotate: true } : {}),
+      // A row without a vendor saves as it always did (no key); the backend
+      // reads it as the server's legacy vendor.
       gpus: gpuRows.map((r) => ({
+        ...(r.vendor ? { vendor: r.vendor } : {}),
         index: r.index,
         vram_estimate_mb: r.vramEstimateMb,
         vram_measured_mb: r.vramMeasuredMb,
@@ -3712,6 +3865,35 @@ export function RuntimeAdminSection({
       log_files: logFiles.map(({ name, path }) => ({ name, path })),
       ...clusterBodyFields(cluster),
     };
+  }
+
+  // The device backend the agent runs this spec with, and whether it cannot
+  // drive one of the spec's GPUs (#434): resolveAutoBackend over the rows'
+  // vendors, a row without one read as the server's stored legacy vendor --
+  // exactly the backend's reading (resolveSpecBackend), so the form never
+  // refuses a spec the backend accepts. A row naming no vendor on a server
+  // with no legacy vendor takes part in neither decision.
+  const legacyVendor: GpuVendor = server.gpu_legacy_vendor ?? '';
+  const backendResolution = resolveAutoBackend(
+    cluster.deviceBackend,
+    gpuRows.map((r) => r.vendor || legacyVendor),
+  );
+
+  // The save-time refusal of a mismatched backend, mirroring the backend's
+  // (runtime_spec.gpu_vendor_backend_mismatch) including its exemption: a save
+  // that leaves the stored spec's backend and GPUs as they are is not refused
+  // (refusalUnlessUnchanged), so a spec stored before the rule, or before its
+  // host turned mixed, can still be re-saved. The agent refuses it at launch.
+  function backendMismatchError(): string | undefined {
+    if (!backendResolution.mismatch) return undefined;
+    const stored = editingSpecMappingId ? specsById[editingSpecMappingId] : undefined;
+    if (stored?.configured) {
+      const keys = (gpus: { vendor?: GpuVendor; index: number }[]) =>
+        [...new Set(gpus.map((g) => gpuKey(g.vendor || legacyVendor, g.index)))].sort().join(',');
+      const sameBackend = (stored.device_backend || 'auto') === cluster.deviceBackend;
+      if (sameBackend && keys(stored.gpus) === keys(gpuRows)) return undefined;
+    }
+    return t.runtimeBackendMismatchHint;
   }
 
   // The cluster save checks the form can make itself (create and edit).
@@ -3832,9 +4014,9 @@ export function RuntimeAdminSection({
       showError(logFilesProblem);
       return;
     }
-    const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
+    const duplicateGpu = duplicateGpuKey(gpuRows.map(cardKey));
     if (duplicateGpu !== null) {
-      showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      showError(`${t.runtimeGpuIndexDuplicate}: ${gpuKeyDisplayName(duplicateGpu)}`);
       return;
     }
     const visibleDevicesError = validateVisibleDevices(
@@ -3857,6 +4039,11 @@ export function RuntimeAdminSection({
     const clusterProblem = clusterError(args, parsedEnv.env);
     if (clusterProblem) {
       showError(clusterProblem);
+      return;
+    }
+    const backendProblem = backendMismatchError();
+    if (backendProblem) {
+      showError(backendProblem);
       return;
     }
     setBusy(true);
@@ -3950,9 +4137,9 @@ export function RuntimeAdminSection({
       showError(logFilesProblem);
       return;
     }
-    const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
+    const duplicateGpu = duplicateGpuKey(gpuRows.map(cardKey));
     if (duplicateGpu !== null) {
-      showError(`${t.runtimeGpuIndexDuplicate}: GPU ${duplicateGpu}`);
+      showError(`${t.runtimeGpuIndexDuplicate}: ${gpuKeyDisplayName(duplicateGpu)}`);
       return;
     }
     const visibleDevicesError = validateVisibleDevices(
@@ -3975,6 +4162,11 @@ export function RuntimeAdminSection({
     const clusterProblem = clusterError(args, parsedEnv.env);
     if (clusterProblem) {
       showError(clusterProblem);
+      return;
+    }
+    const backendProblem = backendMismatchError();
+    if (backendProblem) {
+      showError(backendProblem);
       return;
     }
     setBusy(true);
@@ -4340,7 +4532,7 @@ export function RuntimeAdminSection({
     {
       id: 'gpus',
       label: t.runtimeSpecGpus,
-      value: (m) => formatGpus(specsById[m.id], statusForMapping(m)),
+      value: (m) => formatGpus(specsById[m.id], statusForMapping(m), hostVendor),
       filter: 'text',
       searchable: false,
     },
@@ -4378,7 +4570,7 @@ export function RuntimeAdminSection({
         const spec = specsById[m.id];
         const total = isClusterHead(spec)
           ? (spec?.cluster_vram_total_mb ?? 0)
-          : totalGpuVram(spec, statusForMapping(m));
+          : totalGpuVram(spec, statusForMapping(m), hostVendor);
         return total > 0 ? String(total) : '—';
       },
       render: (m) => {
@@ -4389,7 +4581,7 @@ export function RuntimeAdminSection({
               spec={spec}
               name={m.gateway_model_name}
               axis="vram"
-              ownMb={totalGpuVram(spec)}
+              ownMb={totalGpuVram(spec, undefined, hostVendor)}
               t={t}
             />
           );
@@ -4401,17 +4593,17 @@ export function RuntimeAdminSection({
         // cluster head (above) keeps the durable figures its cluster total is
         // built from; every other row takes the live frame into the max().
         const live = statusForMapping(m);
-        if (spec?.execution_mode === 'wsl' && anyGpuMeasured(spec, live)) {
+        if (spec?.execution_mode === 'wsl' && anyGpuMeasured(spec, live, hostVendor)) {
           return (
             <Box sx={{ display: 'grid', gap: 0.25, justifyItems: 'end' }}>
-              <span>{formatMb(totalGpuVram(spec, live))}</span>
+              <span>{formatMb(totalGpuVram(spec, live, hostVendor))}</span>
               <Typography variant="caption" color="text.secondary">
                 {t.runtimeStatusVRAMFromVM}
               </Typography>
             </Box>
           );
         }
-        return formatMb(totalGpuVram(spec, live));
+        return formatMb(totalGpuVram(spec, live, hostVendor));
       },
       filter: 'text',
       searchable: false,
@@ -5060,7 +5252,9 @@ export function RuntimeAdminSection({
       id: 'gpus',
       label: t.runtimeSpecGpus,
       value: (s) =>
-        s.gpus.length === 0 ? '—' : s.gpus.map((g) => `${g.index}: ${g.vramMb} MB`).join(', '),
+        s.gpus.length === 0
+          ? '—'
+          : s.gpus.map((g) => `${gpuCellLabel(g.vendor, g.index)}: ${g.vramMb} MB`).join(', '),
       searchable: false,
     },
     {
@@ -6317,7 +6511,7 @@ export function RuntimeAdminSection({
                   />
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveUp}: GPU ${row.index}`}
+                    aria-label={`${t.modelGroupMoveUp}: ${gpuDisplayName(row.vendor, row.index)}`}
                     disabled={idx === 0}
                     onClick={() => swapGpuRow(idx, -1)}
                   >
@@ -6325,7 +6519,7 @@ export function RuntimeAdminSection({
                   </IconButton>
                   <IconButton
                     size="small"
-                    aria-label={`${t.modelGroupMoveDown}: GPU ${row.index}`}
+                    aria-label={`${t.modelGroupMoveDown}: ${gpuDisplayName(row.vendor, row.index)}`}
                     disabled={idx === gpuRows.length - 1}
                     onClick={() => swapGpuRow(idx, 1)}
                   >
@@ -6343,14 +6537,17 @@ export function RuntimeAdminSection({
                       onChange={(e) => {
                         // The placeholder is a display state, not a choice:
                         // selecting it would otherwise blank the index.
-                        if (e.target.value === '') return;
-                        updateGpuRow(idx, { index: Number(e.target.value) });
+                        const card = gpuOptionsFor(idx).find(
+                          (g) => gpuKey(g.vendor, g.index) === e.target.value,
+                        );
+                        if (!card) return;
+                        updateGpuRow(idx, { vendor: card.vendor ?? '', index: card.index });
                       }}
                       sx={{ maxWidth: 340 }}
                     >
                       <option value="">{t.runtimeSpecGpuPickPlaceholder}</option>
                       {gpuOptionsFor(idx).map((g) => (
-                        <option value={String(g.index)} key={g.index}>
+                        <option value={gpuKey(g.vendor, g.index)} key={gpuKey(g.vendor, g.index)}>
                           {gpuOptionLabel(g)}
                         </option>
                       ))}
@@ -6450,6 +6647,7 @@ export function RuntimeAdminSection({
                 args={parseArgsText(argsText)}
                 env={parseEnvText(envText, t).env}
                 headHasGpus={gpuRows.length > 0}
+                backendResolution={backendResolution}
                 startupTimeoutSeconds={startupTimeoutSeconds}
                 headBinary={binary}
                 headBinaryVersion={binaryVersionFor(serverBinaries, binary.trim())}
@@ -6564,6 +6762,17 @@ export function RuntimeAdminSection({
         backLabel={t.back}
         items={[...trail, { label: application.endpoint }]}
       />
+      {/* #434: this server's GPU rows from before vendors existed were mapped
+          to one vendor; shown until an operator acknowledges it. */}
+      {server.gpu_vendor_note && (
+        <GpuVendorNote
+          t={t}
+          vendor={server.gpu_legacy_vendor}
+          onDismiss={() => api.dismissGpuVendorNote(server.id)}
+          onError={(err) => showError(formatPortalError(err, t))}
+          sx={{ mb: 2 }}
+        />
+      )}
       {/* Screen-wide facts, deliberately above the tab strip: which mode this
           server is in, why a configured runtime might be doing nothing, and
           how a restart sequence ended. All are true on every tab, so none may
@@ -6847,8 +7056,8 @@ export function RuntimeAdminSection({
                   </Typography>
                 ) : (
                   (reportConfig?.budgets ?? []).map((b) => (
-                    <Typography key={b.index} variant="body2">
-                      {`GPU ${b.index}: ${b.budgetMb} MB`}
+                    <Typography key={gpuKey(b.vendor, b.index)} variant="body2">
+                      {`${gpuDisplayName(b.vendor, b.index)}: ${b.budgetMb} MB`}
                     </Typography>
                   ))
                 )}
@@ -6896,6 +7105,34 @@ export function RuntimeAdminSection({
                       key={row.rowKey}
                       sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
                     >
+                      {/* The spec form's card picker, for the same reason
+                          (#434): on a mixed host an index alone names two
+                          cards, and the picked card's vendor is saved. */}
+                      {telemetryGpus.length > 0 && (
+                        <SelectField
+                          id={`runtime-budget-gpu-pick-${idx}`}
+                          label={t.runtimeSpecGpuPick}
+                          value={budgetSelectValue(row, idx)}
+                          onChange={(e) => {
+                            const card = budgetOptionsFor(idx).find(
+                              (g) => gpuKey(g.vendor, g.index) === e.target.value,
+                            );
+                            if (!card) return;
+                            updateBudgetRow(idx, { vendor: card.vendor ?? '', index: card.index });
+                          }}
+                          sx={{ maxWidth: 340 }}
+                        >
+                          <option value="">{t.runtimeSpecGpuPickPlaceholder}</option>
+                          {budgetOptionsFor(idx).map((g) => (
+                            <option
+                              value={gpuKey(g.vendor, g.index)}
+                              key={gpuKey(g.vendor, g.index)}
+                            >
+                              {gpuOptionLabel(g)}
+                            </option>
+                          ))}
+                        </SelectField>
+                      )}
                       <Field
                         id={`runtime-budget-index-${idx}`}
                         label={t.runtimeSpecGpuIndex}
@@ -6940,7 +7177,7 @@ export function RuntimeAdminSection({
                           <IconButton
                             size="small"
                             color="warning"
-                            aria-label={`${t.runtimeGpuDriftIconLabel}: GPU ${row.index}`}
+                            aria-label={`${t.runtimeGpuDriftIconLabel}: ${gpuDisplayName(row.vendor, row.index)}`}
                           >
                             <WarningAmberIcon fontSize="small" />
                           </IconButton>

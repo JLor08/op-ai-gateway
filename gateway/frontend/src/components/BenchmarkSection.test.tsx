@@ -1414,6 +1414,41 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.queryByText(t.benchmarkRunAt)).not.toBeInTheDocument();
     });
 
+    // #434: indexes restart per vendor, so a mixed host reports NVIDIA 0 and
+    // AMD 0. Each row names its card by vendor, and the two rows stay distinct
+    // (one React key per card, not per index).
+    it('names each card of a mixed-vendor host by vendor and index', async () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const card = (vendor: 'nvidia' | 'amd', measured: number) => ({
+        index: 0,
+        vendor,
+        baseline_used_mb: 1024,
+        delta_mb: 0,
+        measured_mb: measured,
+        fingerprint_kind: 'uuid',
+        attributable: true,
+      });
+      const vramRun: BenchmarkRunDTO = {
+        id: 'run_vram_mixed',
+        mapping_id: 'map_1',
+        server_id: 'srv_1',
+        created_at: '2026-09-01T10:00:00Z',
+        gen_tokens_per_second: 0,
+        prompt_tokens_per_second: 0,
+        load_time_ms: 0,
+        context_size: 0,
+        error: '',
+        kind: 'vram',
+        vram: vramReport({ gpus: [card('nvidia', 17000), card('amd', 13000)] }),
+      };
+      renderSection({ kind: 'server' }, { ...withMapping, runs: [vramRun] });
+      await screen.findByText(t.benchmarkVramRuns);
+      expect(screen.getByText('NVIDIA 0').closest('tr')).toHaveTextContent('17000');
+      expect(screen.getByText('AMD 0').closest('tr')).toHaveTextContent('13000');
+      expect(errorSpy.mock.calls.some((call) => String(call[0]).includes('same key'))).toBe(false);
+      errorSpy.mockRestore();
+    });
+
     it('renders a vram history row that reached no number as its reason', async () => {
       const vramRun: BenchmarkRunDTO = {
         id: 'run_vram_inconclusive',

@@ -372,6 +372,8 @@ export function ServerList({
     | 'serverAdminGroupCandidates'
     | 'serverAvailability'
     | 'serverHardware'
+    // #434: the runtime screen's legacy GPU vendor note.
+    | 'dismissGpuVendorNote'
     | 'serverPerfHistory'
     | 'serverResourceGroups'
     | 'servers'

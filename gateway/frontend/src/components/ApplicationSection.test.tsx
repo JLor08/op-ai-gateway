@@ -273,6 +273,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // runtime* defaults above.
       updateServer: vi.fn(async (id: string) => ({ ...activeServer, id })),
       serverHardware: vi.fn(async () => ({ available: false })),
+      dismissGpuVendorNote: vi.fn(async () => undefined),
     };
 
     render(

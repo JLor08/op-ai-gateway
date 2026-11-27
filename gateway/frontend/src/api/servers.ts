@@ -90,15 +90,15 @@ export type PortalServer = {
   admin_groups: { id: string; name: string }[];
   system_group_id: string;
   system_group_name: string;
+  // The vendor the legacy (vendorless) GPU rows of this server were mapped to,
+  // and whether the operator still has to acknowledge that mapping.
+  gpu_legacy_vendor?: GpuVendor;
+  gpu_vendor_note?: boolean;
   // Per-server certificate-management opt-in/opt-out override (certificates
   // feature): "" (follow cert_server_scope), "include" (opt in — meaningful
   // in "selected" scope), or "exclude" (opt out — meaningful in "all"
   // scope). Optional so existing PortalServer literal fixtures across the
   // test suite compile unchanged.
-  // The vendor the legacy (vendorless) GPU rows of this server were mapped to,
-  // and whether the operator still has to acknowledge that mapping.
-  gpu_legacy_vendor?: GpuVendor;
-  gpu_vendor_note?: boolean;
   certificate_override?: string;
   // Per-server https-auto-switch opt-in/opt-out override (P4): "" (follow
   // cert_https_switch_mode), "include" (opt in — meaningful in "selected"
