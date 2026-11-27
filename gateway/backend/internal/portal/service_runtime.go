@@ -2357,8 +2357,8 @@ func validateRuntimeSpecConfigFiles(files []ConfigFileDTO) (string, error) {
 //   - a name matching runtimeSpecLogFileNamePattern, unique case-insensitively
 //     and never "process" (case-insensitive), the process stream's own key;
 //   - a non-empty path of at most runtimeSpecLogFilePathMaxBytes bytes that
-//     starts with ${CONFIG_DIR} or is absolute on either platform, and carries
-//     no secret placeholder (the path travels in the clear and is reported).
+//     starts with ${CONFIG_DIR} (then a separator or the end) or is absolute on either platform, and carries
+//     no secret placeholder or control character (the path travels in the clear and is reported).
 //
 // Every refusal wraps ErrRuntimeSpecLogFilesInvalid and names the entry by
 // index or name, never quoting the path. The agent re-checks and applies its own
@@ -2394,13 +2394,17 @@ func validateRuntimeSpecLogFiles(files []LogFileDTO) (string, error) {
 			return "", fmt.Errorf("%w: the path of log file %q is longer than %d bytes",
 				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFilePathMaxBytes)
 		}
+		if strings.IndexFunc(f.Path, unicode.IsControl) >= 0 {
+			return "", fmt.Errorf("%w: the path of log file %q must not contain control characters",
+				ErrRuntimeSpecLogFilesInvalid, f.Name)
+		}
 		for _, placeholder := range runtimeSpecConfigFileSecretPlaceholders {
 			if strings.Contains(f.Path, placeholder) {
 				return "", fmt.Errorf("%w: the path of log file %q must not contain the secret placeholder %s",
 					ErrRuntimeSpecLogFilesInvalid, f.Name, placeholder)
 			}
 		}
-		if !strings.HasPrefix(f.Path, runtimeSpecLogFileConfigDir) && !isAbsPOSIXBinaryPath(f.Path) && !isAbsWindowsBinaryPath(f.Path) {
+		if !hasLogFileConfigDirRoot(f.Path) && !isAbsPOSIXBinaryPath(f.Path) && !isAbsWindowsBinaryPath(f.Path) {
 			return "", fmt.Errorf("%w: the path of log file %q must be absolute or start with %s",
 				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
 		}
@@ -2410,6 +2414,14 @@ func validateRuntimeSpecLogFiles(files []LogFileDTO) (string, error) {
 		return "", fmt.Errorf("%w: %w", ErrRuntimeSpecLogFilesInvalid, err)
 	}
 	return string(encoded), nil
+}
+
+// hasLogFileConfigDirRoot reports whether p is rooted at ${CONFIG_DIR}: the
+// prefix must be followed by a separator or the end, so "${CONFIG_DIR}x" is
+// not a path under the config directory.
+func hasLogFileConfigDirRoot(p string) bool {
+	rest, ok := strings.CutPrefix(p, runtimeSpecLogFileConfigDir)
+	return ok && (rest == "" || rest[0] == '/' || rest[0] == '\\')
 }
 
 // decodeRuntimeSpecLogFiles is the inverse of validateRuntimeSpecLogFiles'

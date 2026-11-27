@@ -58,6 +58,13 @@ func TestValidateRuntimeSpecLogFiles(t *testing.T) {
 		{name: "1025 byte path", files: []LogFileDTO{{Name: "a", Path: "/" + strings.Repeat("p", 1024)}}, wantInvalid: true, wantMsg: "1024"},
 		{name: "relative path", files: []LogFileDTO{{Name: "a", Path: "logs/x"}}, wantInvalid: true, wantMsg: "absolute"},
 		{name: "drive relative path", files: []LogFileDTO{{Name: "a", Path: `C:x.log`}}, wantInvalid: true},
+		{name: "NUL in path", files: []LogFileDTO{{Name: "a", Path: "/var/log/a\x00b"}}, wantInvalid: true, wantMsg: "control"},
+		{name: "newline in path", files: []LogFileDTO{{Name: "a", Path: "/var/log/a\nb"}}, wantInvalid: true, wantMsg: "control"},
+		{name: "DEL in path", files: []LogFileDTO{{Name: "a", Path: "/var/log/a\x7fb"}}, wantInvalid: true, wantMsg: "control"},
+		{name: "config dir glued to a name", files: []LogFileDTO{{Name: "a", Path: "${CONFIG_DIR}x"}}, wantInvalid: true, wantMsg: "absolute"},
+		{name: "config dir glued to a dotted name", files: []LogFileDTO{{Name: "a", Path: "${CONFIG_DIR}.log"}}, wantInvalid: true, wantMsg: "absolute"},
+		{name: "config dir alone", files: []LogFileDTO{{Name: "a", Path: "${CONFIG_DIR}"}}, wantJSON: `[{"name":"a","path":"${CONFIG_DIR}"}]`},
+		{name: "config dir with backslash", files: []LogFileDTO{{Name: "a", Path: `${CONFIG_DIR}\e.log`}}, wantJSON: `[{"name":"a","path":"${CONFIG_DIR}\\e.log"}]`},
 		{name: "API_TOKEN placeholder", files: []LogFileDTO{{Name: "a", Path: "${CONFIG_DIR}/${API_TOKEN}.log"}}, wantInvalid: true, wantMsg: "secret"},
 		{name: "AGENT_ENV placeholder", files: []LogFileDTO{{Name: "a", Path: "/var/${AGENT_ENV:HF_TOKEN}.log"}}, wantInvalid: true, wantMsg: "secret"},
 	}
