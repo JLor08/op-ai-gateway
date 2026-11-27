@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"op-ai-gateway/internal/routing"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -255,8 +256,8 @@ func TestMigration119FreshInstall(t *testing.T) {
 			{HeadSpecID: head, Position: 1, ServerID: "srv_m119f_a", DeviceBackend: "auto", Port: 47031},
 		}
 		gpus := []routing.ClusterMemberGPU{
-			{HeadSpecID: head, ServerID: "srv_m119f_a", GPUIndex: 0, VRAMEstimateMB: 1},
-			{HeadSpecID: head, ServerID: "srv_m119f_b", GPUIndex: 0, VRAMEstimateMB: 2},
+			{HeadSpecID: head, MemberPosition: 1, ServerID: "srv_m119f_a", GPUIndex: 0, VRAMEstimateMB: 1},
+			{HeadSpecID: head, MemberPosition: 0, ServerID: "srv_m119f_b", GPUIndex: 0, VRAMEstimateMB: 2},
 		}
 		if err := s.SetClusterMembers(ctx, head, members, gpus); err != nil {
 			t.Fatalf("set members: %v", err)
@@ -270,4 +271,45 @@ func TestMigration119FreshInstall(t *testing.T) {
 			t.Fatalf("read back: %+v err=%v", got, err)
 		}
 	})
+}
+
+// TestMigration119IgnoresUnrelatedForeignKeyViolations pins that SQLite's
+// post-rebuild foreign-key check is scoped to the five rebuilt tables: a
+// dangling row elsewhere (here a manual member spec whose server is gone,
+// written with foreign keys off as an old bug or a manual repair could have
+// left it) is not the rebuild's doing and must not abort the migration and
+// with it every later one.
+func TestMigration119IgnoresUnrelatedForeignKeyViolations(t *testing.T) {
+	ctx := context.Background()
+	s, err := OpenSQLite(filepath.Join(t.TempDir(), "c.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.migrateTo(ctx, 118); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`PRAGMA foreign_keys=OFF`,
+		`insert into rpc_member_specs (id, server_id, created_at, updated_at) values ('rpcm_dangling', 'srv_gone', '` +
+			now.Format(time.RFC3339) + `', '` + now.Format(time.RFC3339) + `')`,
+		`PRAGMA foreign_keys=ON`,
+	} {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	_ = conn.Close()
+
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("an unrelated dangling row must not abort migration 119: %v", err)
+	}
+	if n := countRows(ctx, t, s, "schema_migrations", "version = 119"); n != 1 {
+		t.Fatalf("migration 119 recorded %d times, want 1", n)
+	}
 }

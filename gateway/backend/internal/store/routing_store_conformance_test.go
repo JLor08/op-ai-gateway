@@ -2057,14 +2057,14 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		// The measured write targets gpu_index 0, which now sits at position 1
 		// (read index 1) — proving the write path keys on gpu_index while the
 		// read path keys on position.
-		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", 0, 21800); err != nil {
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", routing.GPUKey{Index: 0}, 21800); err != nil {
 			t.Fatalf("measured: %v", err)
 		}
 		gotGPUs, _ = s.RuntimeSpecGPUs(ctx, "rspec_rt2")
 		if gotGPUs[1].GPUIndex != 0 || gotGPUs[1].VRAMMeasuredMB != 21800 || gotGPUs[1].VRAMEstimateMB != 22000 {
 			t.Fatalf("measured must not clobber estimate: %+v", gotGPUs[1])
 		}
-		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", 7, 1); err != ErrNotFound {
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_rt2", routing.GPUKey{Index: 7}, 1); err != ErrNotFound {
 			t.Fatalf("measured on absent gpu row: want ErrNotFound, got %v", err)
 		}
 

@@ -117,7 +117,7 @@ func TestPutRuntimeSpecRoundTrip(t *testing.T) {
 	// satisfied by accident just because Go's zero value happens to look
 	// like "field omitted" -- it pins that the field is read from the
 	// stored row, never from the request, at all.
-	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, dto.ID, 0, 7500); err != nil {
+	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, dto.ID, routing.GPUKey{Index: 0}, 7500); err != nil {
 		t.Fatalf("seed measured value: %v", err)
 	}
 	dto2, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
@@ -1520,7 +1520,7 @@ func TestAgentRuntimeConfigAssembly(t *testing.T) {
 	}
 	// GPU 0 has a measured value on file -- must win over the estimate. GPU 1
 	// has no measurement -- must fall back to the estimate.
-	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, specA.ID, 0, 22500); err != nil {
+	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, specA.ID, routing.GPUKey{Index: 0}, 22500); err != nil {
 		t.Fatalf("seed measured value: %v", err)
 	}
 
@@ -1980,7 +1980,7 @@ func TestAgentRuntimeConfigPushesMaxOfMeasuredAndEstimate(t *testing.T) {
 			}
 			if tc.measured > 0 {
 				// The agent measured its own child and wrote it back.
-				if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, 0, tc.measured); err != nil {
+				if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, routing.GPUKey{Index: 0}, tc.measured); err != nil {
 					t.Fatalf("seed measured value: %v", err)
 				}
 			}

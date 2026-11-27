@@ -734,7 +734,8 @@ func (f *clusterFixture) usage(headID, serverID string, ramMB int, vram map[int]
 	}
 	members, _ := membersByServer(f.t, f, headID)
 	if _, err := f.routes.UpdateClusterMemberUsage(f.ctx, routing.ClusterMember{
-		HeadSpecID: headID, ServerID: serverID, RAMMeasuredMB: ramMB, MeasuredAt: clusterTestNow, RunPeakRAMMB: ramMB,
+		HeadSpecID: headID, Position: members[serverID].Position, ServerID: serverID,
+		RAMMeasuredMB: ramMB, MeasuredAt: clusterTestNow, RunPeakRAMMB: ramMB,
 		RunStartedAt: members[serverID].RunStartedAt,
 	}, gpus); err != nil {
 		f.t.Fatalf("usage: %v", err)

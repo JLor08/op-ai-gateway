@@ -224,10 +224,10 @@ func (s *SQLiteStore) SetRuntimeSpecGPUs(ctx context.Context, specID string, gpu
 	}
 	for _, g := range gpus {
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
-			insert into agent_runtime_spec_gpus (spec_id, gpu_index, vram_estimate_mb, vram_measured_mb, position)
-			values (?, ?, ?, ?, ?)`), specID, g.GPUIndex, g.VRAMEstimateMB, g.VRAMMeasuredMB, g.Position); err != nil {
-			// A duplicate GPUIndex within gpus hits the composite primary key
-			// (spec_id, gpu_index) here — a unique violation, not an FK
+			insert into agent_runtime_spec_gpus (spec_id, gpu_vendor, gpu_index, vram_estimate_mb, vram_measured_mb, position)
+			values (?, ?, ?, ?, ?, ?)`), specID, g.GPUVendor, g.GPUIndex, g.VRAMEstimateMB, g.VRAMMeasuredMB, g.Position); err != nil {
+			// A duplicate (GPUVendor, GPUIndex) within gpus hits the composite
+			// primary key (spec_id, gpu_vendor, gpu_index) here — a unique violation, not an FK
 			// violation (specID was already existence-checked above, and a
 			// GPU row has no other FK column), so only isUniqueViolation
 			// applies (mirrors UpsertRuntimeSpec/SetCoResidencyRules' error
@@ -243,8 +243,8 @@ func (s *SQLiteStore) SetRuntimeSpecGPUs(ctx context.Context, specID string, gpu
 
 func (s *SQLiteStore) RuntimeSpecGPUs(ctx context.Context, specID string) ([]routing.RuntimeSpecGPU, error) {
 	rows, err := s.query(ctx, `
-		select spec_id, gpu_index, vram_estimate_mb, vram_measured_mb, position
-		from agent_runtime_spec_gpus where spec_id = ? order by position, gpu_index`, specID)
+		select spec_id, gpu_vendor, gpu_index, vram_estimate_mb, vram_measured_mb, position
+		from agent_runtime_spec_gpus where spec_id = ? order by position, gpu_vendor, gpu_index`, specID)
 	if err != nil {
 		return nil, fmt.Errorf("list spec gpus: %w", err)
 	}
@@ -252,7 +252,7 @@ func (s *SQLiteStore) RuntimeSpecGPUs(ctx context.Context, specID string) ([]rou
 	out := make([]routing.RuntimeSpecGPU, 0)
 	for rows.Next() {
 		var g routing.RuntimeSpecGPU
-		if err := rows.Scan(&g.SpecID, &g.GPUIndex, &g.VRAMEstimateMB, &g.VRAMMeasuredMB, &g.Position); err != nil {
+		if err := rows.Scan(&g.SpecID, &g.GPUVendor, &g.GPUIndex, &g.VRAMEstimateMB, &g.VRAMMeasuredMB, &g.Position); err != nil {
 			return nil, fmt.Errorf("scan spec gpu: %w", err)
 		}
 		out = append(out, g)
@@ -263,10 +263,12 @@ func (s *SQLiteStore) RuntimeSpecGPUs(ctx context.Context, specID string) ([]rou
 	return out, nil
 }
 
-func (s *SQLiteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) error {
+// UpdateRuntimeSpecGPUMeasured writes the measurement to the row of exactly
+// (specID, key.Vendor, key.Index); ErrNotFound when there is none.
+func (s *SQLiteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, key routing.GPUKey, measuredMB int) error {
 	result, err := s.exec(ctx, `
 		update agent_runtime_spec_gpus set vram_measured_mb = ?
-		where spec_id = ? and gpu_index = ?`, measuredMB, specID, gpuIndex)
+		where spec_id = ? and gpu_vendor = ? and gpu_index = ?`, measuredMB, specID, key.Vendor, key.Index)
 	if err != nil {
 		return fmt.Errorf("update measured vram: %w", err)
 	}
@@ -446,10 +448,10 @@ func (s *SQLiteStore) SetServerGPUBudgets(ctx context.Context, serverID string, 
 	}
 	for _, b := range budgets {
 		if _, err := tx.ExecContext(ctx, s.dl.rebind(`
-			insert into ai_server_gpu_budgets (server_id, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at)
-			values (?, ?, ?, ?, ?, ?, ?)`), serverID, b.GPUIndex, b.BudgetMB, b.ExpectedUUID, b.ExpectedName, b.CreatedAt, b.UpdatedAt); err != nil {
-			// A duplicate GPUIndex within budgets hits the composite primary
-			// key (server_id, gpu_index) here — a unique violation, not an FK
+			insert into ai_server_gpu_budgets (server_id, gpu_vendor, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at)
+			values (?, ?, ?, ?, ?, ?, ?, ?)`), serverID, b.GPUVendor, b.GPUIndex, b.BudgetMB, b.ExpectedUUID, b.ExpectedName, b.CreatedAt, b.UpdatedAt); err != nil {
+			// A duplicate (GPUVendor, GPUIndex) within budgets hits the
+			// composite primary key (server_id, gpu_vendor, gpu_index) here — a unique violation, not an FK
 			// violation (serverID was already existence-checked above, and a
 			// budget row has no other FK column), so only isUniqueViolation
 			// applies (mirrors UpsertRuntimeSpec/SetCoResidencyRules' error
@@ -464,11 +466,11 @@ func (s *SQLiteStore) SetServerGPUBudgets(ctx context.Context, serverID string, 
 }
 
 // ServerGPUBudgets lists serverID's per-GPU VRAM budgets, ordered by GPU
-// index. Always non-nil, empty when none.
+// vendor, then index. Always non-nil, empty when none.
 func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]routing.ServerGPUBudget, error) {
 	rows, err := s.query(ctx, `
-		select server_id, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at
-		from ai_server_gpu_budgets where server_id = ? order by gpu_index`, serverID)
+		select server_id, gpu_vendor, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at
+		from ai_server_gpu_budgets where server_id = ? order by gpu_vendor, gpu_index`, serverID)
 	if err != nil {
 		return nil, fmt.Errorf("list gpu budgets: %w", err)
 	}
@@ -476,7 +478,7 @@ func (s *SQLiteStore) ServerGPUBudgets(ctx context.Context, serverID string) ([]
 	out := make([]routing.ServerGPUBudget, 0)
 	for rows.Next() {
 		var b routing.ServerGPUBudget
-		if err := rows.Scan(&b.ServerID, &b.GPUIndex, &b.BudgetMB, &b.ExpectedUUID, &b.ExpectedName, &b.CreatedAt, &b.UpdatedAt); err != nil {
+		if err := rows.Scan(&b.ServerID, &b.GPUVendor, &b.GPUIndex, &b.BudgetMB, &b.ExpectedUUID, &b.ExpectedName, &b.CreatedAt, &b.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan gpu budget: %w", err)
 		}
 		out = append(out, b)

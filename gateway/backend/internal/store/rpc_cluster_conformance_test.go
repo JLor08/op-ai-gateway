@@ -175,8 +175,8 @@ func TestConformanceRPCClusterMembership(t *testing.T) {
 			{HeadSpecID: head, Position: 0, ServerID: "srv_m1", MemberSpecID: "rpcm_1", DeviceBackend: "auto", Port: 47001},
 		}
 		gpus := []routing.ClusterMemberGPU{
-			{HeadSpecID: head, ServerID: "srv_m2", GPUIndex: 1, Position: 1, VRAMEstimateMB: 4000},
-			{HeadSpecID: head, ServerID: "srv_m2", GPUIndex: 0, Position: 0, VRAMEstimateMB: 6000},
+			{HeadSpecID: head, MemberPosition: 1, ServerID: "srv_m2", GPUIndex: 1, Position: 1, VRAMEstimateMB: 4000},
+			{HeadSpecID: head, MemberPosition: 1, ServerID: "srv_m2", GPUIndex: 0, Position: 0, VRAMEstimateMB: 6000},
 		}
 		if err := s.SetClusterMembers(ctx, "rspec_nope", members, gpus); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("unknown head: err=%v, want ErrNotFound", err)
@@ -229,11 +229,19 @@ func TestConformanceRPCClusterMembership(t *testing.T) {
 		if err := s.SetClusterMembers(ctx, head2, dupPos, nil); !errors.Is(err, ErrConflict) {
 			t.Fatalf("duplicate position: err=%v, want ErrConflict", err)
 		}
-		dupSrv := []routing.ClusterMember{
+		// One server may hold two members of a head (one per GPU vendor of a
+		// mixed host, #434): members are keyed by position, not by server.
+		twoOnOne := []routing.ClusterMember{
 			{HeadSpecID: head2, Position: 0, ServerID: "srv_m1"}, {HeadSpecID: head2, Position: 1, ServerID: "srv_m1"},
 		}
-		if err := s.SetClusterMembers(ctx, head2, dupSrv, nil); !errors.Is(err, ErrConflict) {
-			t.Fatalf("duplicate server: err=%v, want ErrConflict", err)
+		if err := s.SetClusterMembers(ctx, head2, twoOnOne, nil); err != nil {
+			t.Fatalf("two members on one server: %v", err)
+		}
+		if em, _, _ := s.ClusterMembers(ctx, head2); len(em) != 2 {
+			t.Fatalf("both members on one server must be stored: %+v", em)
+		}
+		if err := s.SetClusterMembers(ctx, head2, nil, nil); err != nil {
+			t.Fatalf("clear head2: %v", err)
 		}
 		reuse := []routing.ClusterMember{{HeadSpecID: head2, Position: 0, ServerID: "srv_m1", MemberSpecID: "rpcm_1"}}
 		if err := s.SetClusterMembers(ctx, head2, reuse, nil); !errors.Is(err, ErrConflict) {
@@ -284,7 +292,7 @@ func TestConformanceRPCClusterMembership(t *testing.T) {
 			t.Fatalf("gpu usage must touch only the given row's measured fields: %+v", gotG)
 		}
 		ghost := upd
-		ghost.ServerID = "srv_ghost"
+		ghost.Position = 9
 		if _, err := s.UpdateClusterMemberUsage(ctx, ghost, nil); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("usage on a missing row: err=%v, want ErrNotFound", err)
 		}
@@ -522,7 +530,7 @@ func TestConformanceRPCClusterMemberRuns(t *testing.T) {
 			{HeadSpecID: head, Position: 0, ServerID: "srv_r1", Port: 47001, RunPeakRAMMB: 50},
 			{HeadSpecID: head, Position: 1, ServerID: "srv_r2", Port: 47001},
 		}
-		gpus := []routing.ClusterMemberGPU{{HeadSpecID: head, ServerID: "srv_r1", GPUIndex: 0, RunPeakVRAMMB: 70}}
+		gpus := []routing.ClusterMemberGPU{{HeadSpecID: head, MemberPosition: 0, ServerID: "srv_r1", GPUIndex: 0, RunPeakVRAMMB: 70}}
 		if err := s.SetClusterMembers(ctx, head, members, gpus); err != nil {
 			t.Fatal(err)
 		}
@@ -576,14 +584,14 @@ func TestConformanceRPCClusterMemberRuns(t *testing.T) {
 		for i := range rewritten {
 			rewritten[i].RunStartedAt, rewritten[i].RunPeakRAMMB, rewritten[i].Stale = time.Time{}, 0, true
 		}
-		if err := s.SetClusterMembers(ctx, head, rewritten, []routing.ClusterMemberGPU{{HeadSpecID: head, ServerID: "srv_r1", GPUIndex: 0, VRAMMeasuredMB: 9000}}); err != nil {
+		if err := s.SetClusterMembers(ctx, head, rewritten, []routing.ClusterMemberGPU{{HeadSpecID: head, MemberPosition: 0, ServerID: "srv_r1", GPUIndex: 0, VRAMMeasuredMB: 9000}}); err != nil {
 			t.Fatal(err)
 		}
 		upd.Stale = false
 		if applied, err := s.UpdateClusterMemberUsage(ctx, upd, nil); err != nil || applied {
 			t.Fatalf("write across a rewrite: applied=%v err=%v, want refused", applied, err)
 		}
-		if ended, err := s.EndClusterMemberRun(ctx, head, "srv_r1", run); err != nil || ended {
+		if ended, err := s.EndClusterMemberRun(ctx, head, 0, run); err != nil || ended {
 			t.Fatalf("end of a reset run: ended=%v err=%v, want nothing ended", ended, err)
 		}
 		if got, _ = read(); !got["srv_r1"].Stale {
@@ -595,17 +603,17 @@ func TestConformanceRPCClusterMemberRuns(t *testing.T) {
 		if err := s.BeginClusterMemberRun(ctx, head, run2, 0); err != nil {
 			t.Fatal(err)
 		}
-		if ended, err := s.EndClusterMemberRun(ctx, head, "srv_r2", run); err != nil || ended {
+		if ended, err := s.EndClusterMemberRun(ctx, head, 1, run); err != nil || ended {
 			t.Fatalf("end of the old run: ended=%v err=%v", ended, err)
 		}
-		if ended, err := s.EndClusterMemberRun(ctx, head, "srv_r2", run2); err != nil || !ended {
+		if ended, err := s.EndClusterMemberRun(ctx, head, 1, run2); err != nil || !ended {
 			t.Fatalf("end of the current run: ended=%v err=%v", ended, err)
 		}
 		got, _ = read()
 		if !got["srv_r2"].RunStartedAt.IsZero() || !got["srv_r1"].RunStartedAt.Equal(run2) {
 			t.Fatalf("after the end = %+v", got)
 		}
-		if _, err := s.EndClusterMemberRun(ctx, head, "srv_ghost", run2); !errors.Is(err, ErrNotFound) {
+		if _, err := s.EndClusterMemberRun(ctx, head, 9, run2); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("end on a missing row: err=%v, want ErrNotFound", err)
 		}
 	})

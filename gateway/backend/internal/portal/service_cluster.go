@@ -1275,6 +1275,9 @@ func (s *Service) planMemberRow(ctx context.Context, i int, e clusterEntry, stor
 		measured = prev.RAMMeasuredMB > 0
 	}
 	gpus, gpusMeasured := memberGPURows(e, stored.gpuByKey[e.server.ID], kept, changed)
+	for j := range gpus {
+		gpus[j].MemberPosition = i // a GPU row belongs to the member at its position
+	}
 	if changed && (measured || gpusMeasured) {
 		row.Stale = true
 	}

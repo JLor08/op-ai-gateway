@@ -437,9 +437,9 @@ type countingMeasuredWriteStore struct {
 	updateCalls atomic.Int32
 }
 
-func (c *countingMeasuredWriteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex, measuredMB int) error {
+func (c *countingMeasuredWriteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, key routing.GPUKey, measuredMB int) error {
 	c.updateCalls.Add(1)
-	return c.MemoryStore.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
+	return c.MemoryStore.UpdateRuntimeSpecGPUMeasured(ctx, specID, key, measuredMB)
 }
 
 // TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue is F2's

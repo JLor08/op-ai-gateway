@@ -443,7 +443,7 @@ func (u *clusterUsage) endMemberRun(ctx context.Context, m routing.ClusterMember
 			return false
 		}
 	}
-	if _, err := u.store.EndClusterMemberRun(ctx, m.HeadSpecID, m.ServerID, m.RunStartedAt); err != nil {
+	if _, err := u.store.EndClusterMemberRun(ctx, m.HeadSpecID, m.Position, m.RunStartedAt); err != nil {
 		slog.Warn("cluster member usage: recording a run's end failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
 	}
 	return changed

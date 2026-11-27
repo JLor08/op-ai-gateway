@@ -1320,7 +1320,7 @@ func TestVRAMRunOwnershipGuard(t *testing.T) {
 	f.seedLatestSample()
 	f.drive(t)
 	f.provider.onStream = func() { f.used0.Store(21500 * oneMiB) }
-	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, 0, 19750); err != nil {
+	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, routing.GPUKey{Index: 0}, 19750); err != nil {
 		t.Fatalf("seed the agent's own measurement: %v", err)
 	}
 
@@ -1586,7 +1586,7 @@ func TestVRAMRunStrategyAReportsOnlyAPostLoadMeasurement(t *testing.T) {
 	// figure agrees with the delta this run will measure, because the two
 	// strategies are cross-checked against each other and this test is about
 	// the WATERMARK, not about a disagreement.
-	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, 0, 20800); err != nil {
+	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, routing.GPUKey{Index: 0}, 20800); err != nil {
 		t.Fatalf("seed the stored measurement: %v", err)
 	}
 	f.drive(t)
@@ -1622,7 +1622,7 @@ func TestVRAMRunStrategyANeverReportsAStaleStoredValue(t *testing.T) {
 	ctx := context.Background()
 	f := newVRAMFixture(t, vramFixtureOpts{})
 	f.seedLatestSample()
-	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, 0, 12345); err != nil {
+	if err := f.mem.UpdateRuntimeSpecGPUMeasured(ctx, f.targetSpec, routing.GPUKey{Index: 0}, 12345); err != nil {
 		t.Fatalf("seed the stored measurement: %v", err)
 	}
 	f.drive(t)

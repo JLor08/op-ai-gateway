@@ -117,7 +117,7 @@ func (s *SQLiteStore) DeleteRPCMemberSpec(ctx context.Context, id string) error 
 }
 
 // SetRPCMemberSpecGPUs atomically replaces specID's GPU rows. An unknown spec
-// is ErrNotFound, a duplicate gpu_index ErrConflict.
+// is ErrNotFound, a duplicate (gpu_vendor, gpu_index) ErrConflict.
 func (s *SQLiteStore) SetRPCMemberSpecGPUs(ctx context.Context, specID string, gpus []routing.RPCMemberSpecGPU) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -144,19 +144,20 @@ func (s *SQLiteStore) setRPCMemberSpecGPUsOn(ctx context.Context, tx *sql.Tx, sp
 	}
 	for _, g := range gpus {
 		if _, err := s.execOn(ctx, tx, `
-			insert into rpc_member_spec_gpus (spec_id, gpu_index, position, vram_estimate_mb)
-			values (?, ?, ?, ?)`, specID, g.GPUIndex, g.Position, g.VRAMEstimateMB); err != nil {
+			insert into rpc_member_spec_gpus (spec_id, gpu_vendor, gpu_index, position, vram_estimate_mb)
+			values (?, ?, ?, ?, ?)`, specID, g.GPUVendor, g.GPUIndex, g.Position, g.VRAMEstimateMB); err != nil {
 			return s.classifyRPCWrite(err, "insert rpc member spec gpu")
 		}
 	}
 	return nil
 }
 
-// RPCMemberSpecGPUs lists specID's GPU rows ordered by position, then index.
+// RPCMemberSpecGPUs lists specID's GPU rows ordered by position, then vendor
+// and index.
 func (s *SQLiteStore) RPCMemberSpecGPUs(ctx context.Context, specID string) ([]routing.RPCMemberSpecGPU, error) {
 	rows, err := s.query(ctx, `
-		select spec_id, gpu_index, position, vram_estimate_mb
-		from rpc_member_spec_gpus where spec_id = ? order by position, gpu_index`, specID)
+		select spec_id, gpu_vendor, gpu_index, position, vram_estimate_mb
+		from rpc_member_spec_gpus where spec_id = ? order by position, gpu_vendor, gpu_index`, specID)
 	if err != nil {
 		return nil, fmt.Errorf("list rpc member spec gpus: %w", err)
 	}
@@ -164,7 +165,7 @@ func (s *SQLiteStore) RPCMemberSpecGPUs(ctx context.Context, specID string) ([]r
 	out := make([]routing.RPCMemberSpecGPU, 0)
 	for rows.Next() {
 		var g routing.RPCMemberSpecGPU
-		if err := rows.Scan(&g.SpecID, &g.GPUIndex, &g.Position, &g.VRAMEstimateMB); err != nil {
+		if err := rows.Scan(&g.SpecID, &g.GPUVendor, &g.GPUIndex, &g.Position, &g.VRAMEstimateMB); err != nil {
 			return nil, fmt.Errorf("scan rpc member spec gpu: %w", err)
 		}
 		out = append(out, g)
@@ -177,10 +178,10 @@ func (s *SQLiteStore) RPCMemberSpecGPUs(ctx context.Context, specID string) ([]r
 
 // SetClusterMembers atomically replaces headSpecID's membership and GPU rows.
 // A failed insert rolls the whole replace back. An unknown head or member
-// server, or a GPU row on a server no member runs on, is ErrNotFound (foreign
-// key); a duplicate position or a manual member spec already used elsewhere
-// is ErrConflict (unique), and so is a second member on one server (see
-// setClusterMembersOn).
+// server, or a GPU row without a member of its position and server, is
+// ErrNotFound (foreign key); a duplicate position, a duplicate (member
+// position, vendor, index) or a manual member spec already used elsewhere is
+// ErrConflict (unique). One server may hold several members of a head.
 func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -203,15 +204,12 @@ func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, 
 // setClusterMembersOn replaces headSpecID's membership and GPU rows inside
 // tx; the caller has checked that the head exists.
 func (s *SQLiteStore) setClusterMembersOn(ctx context.Context, tx *sql.Tx, headSpecID string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
-	// A GPU row references its member by (head, member position); the
-	// position is that of the member on the row's server, which is unique
-	// per head in this API, so a second member on one server is a conflict.
-	positionOf := make(map[string]int, len(members))
+	// A GPU row references its member by (head, member position), which the
+	// foreign key enforces; server_id is a plain column, so that the row's
+	// server is its member's server is checked here.
+	serverAt := make(map[int]string, len(members))
 	for _, m := range members {
-		if _, dup := positionOf[m.ServerID]; dup {
-			return ErrConflict
-		}
-		positionOf[m.ServerID] = m.Position
+		serverAt[m.Position] = m.ServerID
 	}
 	// The GPU rows cascade from their membership row.
 	if _, err := s.execOn(ctx, tx, `delete from rpc_cluster_members where head_spec_id = ?`, headSpecID); err != nil {
@@ -229,16 +227,18 @@ func (s *SQLiteStore) setClusterMembersOn(ctx context.Context, tx *sql.Tx, headS
 			return s.classifyRPCWrite(err, "insert cluster member")
 		}
 	}
+	// The members are stored, so their positions are unique and serverAt
+	// names each one's server.
 	for _, g := range gpus {
-		memberPosition, ok := positionOf[g.ServerID]
-		if !ok {
-			return ErrNotFound // no member on the row's server: the foreign key's verdict
+		if server, ok := serverAt[g.MemberPosition]; ok && server != g.ServerID {
+			return ErrNotFound // no member of the row's position on the row's server
 		}
 		if _, err := s.execOn(ctx, tx, `
-			insert into rpc_cluster_member_gpus (head_spec_id, member_position, server_id, gpu_index, position,
+			insert into rpc_cluster_member_gpus (head_spec_id, member_position, server_id, gpu_vendor, gpu_index, position,
 				vram_estimate_mb, vram_measured_mb, run_peak_vram_mb)
-			values (?, ?, ?, ?, ?, ?, ?, ?)`,
-			headSpecID, memberPosition, g.ServerID, g.GPUIndex, g.Position, g.VRAMEstimateMB, g.VRAMMeasuredMB, g.RunPeakVRAMMB); err != nil {
+			values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			headSpecID, g.MemberPosition, g.ServerID, g.GPUVendor, g.GPUIndex, g.Position,
+			g.VRAMEstimateMB, g.VRAMMeasuredMB, g.RunPeakVRAMMB); err != nil {
 			return s.classifyRPCWrite(err, "insert cluster member gpu")
 		}
 	}
@@ -283,15 +283,17 @@ func (s *SQLiteStore) clusterMembersWhere(ctx context.Context, where, order stri
 }
 
 // ClusterMembers returns headSpecID's membership by position and its GPU rows
-// by server, position, index.
+// by member position, position, vendor, index.
 func (s *SQLiteStore) ClusterMembers(ctx context.Context, headSpecID string) ([]routing.ClusterMember, []routing.ClusterMemberGPU, error) {
 	members, err := s.clusterMembersWhere(ctx, `head_spec_id = ?`, `position`, headSpecID)
 	if err != nil {
 		return nil, nil, err
 	}
 	rows, err := s.query(ctx, `
-		select head_spec_id, server_id, gpu_index, position, vram_estimate_mb, vram_measured_mb, run_peak_vram_mb
-		from rpc_cluster_member_gpus where head_spec_id = ? order by server_id, position, gpu_index`, headSpecID)
+		select head_spec_id, member_position, server_id, gpu_vendor, gpu_index, position,
+			vram_estimate_mb, vram_measured_mb, run_peak_vram_mb
+		from rpc_cluster_member_gpus where head_spec_id = ?
+		order by member_position, position, gpu_vendor, gpu_index`, headSpecID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list cluster member gpus: %w", err)
 	}
@@ -299,7 +301,8 @@ func (s *SQLiteStore) ClusterMembers(ctx context.Context, headSpecID string) ([]
 	gpus := make([]routing.ClusterMemberGPU, 0)
 	for rows.Next() {
 		var g routing.ClusterMemberGPU
-		if err := rows.Scan(&g.HeadSpecID, &g.ServerID, &g.GPUIndex, &g.Position, &g.VRAMEstimateMB, &g.VRAMMeasuredMB, &g.RunPeakVRAMMB); err != nil {
+		if err := rows.Scan(&g.HeadSpecID, &g.MemberPosition, &g.ServerID, &g.GPUVendor, &g.GPUIndex, &g.Position,
+			&g.VRAMEstimateMB, &g.VRAMMeasuredMB, &g.RunPeakVRAMMB); err != nil {
 			return nil, nil, fmt.Errorf("scan cluster member gpu: %w", err)
 		}
 		gpus = append(gpus, g)
@@ -342,29 +345,30 @@ func utcTime(t time.Time) any {
 }
 
 // inRun is the where-clause fragment and its arguments that hold while the
-// membership row of (head, server) is in the run that started at startedAt
+// membership row of (head, position) is in the run that started at startedAt
 // (no run for the zero time).
-func inRun(headSpecID, serverID string, startedAt time.Time) (string, []any) {
+func inRun(headSpecID string, position int, startedAt time.Time) (string, []any) {
 	if startedAt.IsZero() {
-		return `head_spec_id = ? and server_id = ? and run_started_at is null`, []any{headSpecID, serverID}
+		return `head_spec_id = ? and position = ? and run_started_at is null`, []any{headSpecID, position}
 	}
-	return `head_spec_id = ? and server_id = ? and run_started_at = ?`, []any{headSpecID, serverID, utcTime(startedAt)}
+	return `head_spec_id = ? and position = ? and run_started_at = ?`, []any{headSpecID, position, utcTime(startedAt)}
 }
 
-// clusterMemberExists reports whether (head, server) has a membership row.
-func (s *SQLiteStore) clusterMemberExists(ctx context.Context, q *sql.Tx, headSpecID, serverID string) (bool, error) {
+// clusterMemberExists reports whether (head, position) has a membership row.
+func (s *SQLiteStore) clusterMemberExists(ctx context.Context, q *sql.Tx, headSpecID string, position int) (bool, error) {
 	var n int
-	if err := q.QueryRowContext(ctx, s.dl.rebind(`select count(*) from rpc_cluster_members where head_spec_id = ? and server_id = ?`),
-		headSpecID, serverID).Scan(&n); err != nil {
+	if err := q.QueryRowContext(ctx, s.dl.rebind(`select count(*) from rpc_cluster_members where head_spec_id = ? and position = ?`),
+		headSpecID, position).Scan(&n); err != nil {
 		return false, fmt.Errorf("check cluster member: %w", err)
 	}
 	return n > 0, nil
 }
 
 // UpdateClusterMemberUsage writes the measured fields of the membership row m
-// and of each given GPU row, in one transaction, while the row is in the run
-// m names (see the interface). A missing membership row is ErrNotFound; a GPU
-// row that does not exist is skipped (the usage of a card that left the
+// (by head and position) and of each given GPU row of that member (by m's
+// position, vendor and index), in one transaction, while the row is in the
+// run m names (see the interface). A missing membership row is ErrNotFound; a
+// GPU row that does not exist is skipped (the usage of a card that left the
 // membership is of no interest).
 func (s *SQLiteStore) UpdateClusterMemberUsage(ctx context.Context, m routing.ClusterMember, gpus []routing.ClusterMemberGPU) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -372,7 +376,7 @@ func (s *SQLiteStore) UpdateClusterMemberUsage(ctx context.Context, m routing.Cl
 		return false, fmt.Errorf("begin update cluster member usage: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	where, args := inRun(m.HeadSpecID, m.ServerID, m.RunStartedAt)
+	where, args := inRun(m.HeadSpecID, m.Position, m.RunStartedAt)
 	res, err := s.execOn(ctx, tx, `
 		update rpc_cluster_members set ram_measured_mb = ?, measured_at = ?, stale = ?, run_peak_ram_mb = ?
 		where `+where,
@@ -383,7 +387,7 @@ func (s *SQLiteStore) UpdateClusterMemberUsage(ctx context.Context, m routing.Cl
 	if n, err := res.RowsAffected(); err != nil {
 		return false, fmt.Errorf("update cluster member usage: %w", err)
 	} else if n == 0 {
-		exists, err := s.clusterMemberExists(ctx, tx, m.HeadSpecID, m.ServerID)
+		exists, err := s.clusterMemberExists(ctx, tx, m.HeadSpecID, m.Position)
 		if err != nil {
 			return false, err
 		}
@@ -395,8 +399,8 @@ func (s *SQLiteStore) UpdateClusterMemberUsage(ctx context.Context, m routing.Cl
 	for _, g := range gpus {
 		if _, err := s.execOn(ctx, tx, `
 			update rpc_cluster_member_gpus set vram_measured_mb = ?, run_peak_vram_mb = ?
-			where head_spec_id = ? and server_id = ? and gpu_index = ?`,
-			g.VRAMMeasuredMB, g.RunPeakVRAMMB, m.HeadSpecID, m.ServerID, g.GPUIndex); err != nil {
+			where head_spec_id = ? and member_position = ? and gpu_vendor = ? and gpu_index = ?`,
+			g.VRAMMeasuredMB, g.RunPeakVRAMMB, m.HeadSpecID, m.Position, g.GPUVendor, g.GPUIndex); err != nil {
 			return false, fmt.Errorf("update cluster member gpu usage: %w", err)
 		}
 	}
@@ -425,15 +429,15 @@ func (s *SQLiteStore) BeginClusterMemberRun(ctx context.Context, headSpecID stri
 	return tx.Commit()
 }
 
-// EndClusterMemberRun clears the run of (head, server) when it is the run
+// EndClusterMemberRun clears the run of (head, position) when it is the run
 // that started at startedAt, in one transaction.
-func (s *SQLiteStore) EndClusterMemberRun(ctx context.Context, headSpecID, serverID string, startedAt time.Time) (bool, error) {
+func (s *SQLiteStore) EndClusterMemberRun(ctx context.Context, headSpecID string, position int, startedAt time.Time) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin end cluster member run: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	where, args := inRun(headSpecID, serverID, startedAt)
+	where, args := inRun(headSpecID, position, startedAt)
 	res, err := s.execOn(ctx, tx, `
 		update rpc_cluster_members set run_started_at = null, run_head_instance = 0, run_peak_ram_mb = 0
 		where `+where, args...)
@@ -443,7 +447,7 @@ func (s *SQLiteStore) EndClusterMemberRun(ctx context.Context, headSpecID, serve
 	if n, err := res.RowsAffected(); err != nil {
 		return false, fmt.Errorf("end cluster member run: %w", err)
 	} else if n == 0 {
-		exists, err := s.clusterMemberExists(ctx, tx, headSpecID, serverID)
+		exists, err := s.clusterMemberExists(ctx, tx, headSpecID, position)
 		if err != nil {
 			return false, err
 		}
@@ -453,8 +457,8 @@ func (s *SQLiteStore) EndClusterMemberRun(ctx context.Context, headSpecID, serve
 		return false, nil
 	}
 	if _, err := s.execOn(ctx, tx, `
-		update rpc_cluster_member_gpus set run_peak_vram_mb = 0 where head_spec_id = ? and server_id = ?`,
-		headSpecID, serverID); err != nil {
+		update rpc_cluster_member_gpus set run_peak_vram_mb = 0 where head_spec_id = ? and member_position = ?`,
+		headSpecID, position); err != nil {
 		return false, fmt.Errorf("end cluster member gpu run: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

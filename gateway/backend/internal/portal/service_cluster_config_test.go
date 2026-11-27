@@ -446,6 +446,11 @@ func TestAgentRuntimeConfigNeverPartialEndpoints(t *testing.T) {
 		f, a, b, head := setup(t)
 		members, gpus, _ := f.routes.ClusterMembers(f.ctx, head.ID)
 		members[1].Position = 2
+		for i := range gpus {
+			if gpus[i].MemberPosition == 1 {
+				gpus[i].MemberPosition = 2 // a GPU row follows its member
+			}
+		}
 		if err := f.routes.SetClusterMembers(f.ctx, head.ID, members, gpus); err != nil {
 			t.Fatal(err)
 		}

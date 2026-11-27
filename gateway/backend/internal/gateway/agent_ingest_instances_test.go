@@ -192,9 +192,9 @@ func (s *instanceIngestStore) writes(list *[]string) []string {
 	return append([]string(nil), *list...)
 }
 
-func (s *instanceIngestStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex, measuredMB int) error {
-	s.record(&s.gpuWrites, fmt.Sprintf("%s/%d=%d", specID, gpuIndex, measuredMB))
-	return s.MemoryStore.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
+func (s *instanceIngestStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, key routing.GPUKey, measuredMB int) error {
+	s.record(&s.gpuWrites, fmt.Sprintf("%s/%d=%d", specID, key.Index, measuredMB))
+	return s.MemoryStore.UpdateRuntimeSpecGPUMeasured(ctx, specID, key, measuredMB)
 }
 
 func (s *instanceIngestStore) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) error {

@@ -8854,14 +8854,14 @@ func TestConformanceRuntimeSpecs(t *testing.T) {
 			t.Fatalf("gpus must read ordered by index: %v %+v", err, gotGPUs)
 		}
 		// Measurement write-back
-		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_1", 0, 21800); err != nil {
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_1", routing.GPUKey{Index: 0}, 21800); err != nil {
 			t.Fatalf("measured: %v", err)
 		}
 		gotGPUs, _ = s.RuntimeSpecGPUs(ctx, "rspec_1")
 		if gotGPUs[0].VRAMMeasuredMB != 21800 || gotGPUs[0].VRAMEstimateMB != 22000 {
 			t.Fatalf("measured must not clobber estimate: %+v", gotGPUs[0])
 		}
-		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_1", 7, 1); err != ErrNotFound {
+		if err := s.UpdateRuntimeSpecGPUMeasured(ctx, "rspec_1", routing.GPUKey{Index: 7}, 1); err != ErrNotFound {
 			t.Fatalf("measured on absent gpu row: want ErrNotFound, got %v", err)
 		}
 		// Duplicate GPUIndex within one set hits the composite primary key

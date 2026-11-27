@@ -14,10 +14,10 @@ import (
 
 // aiServerParityRows is how many ai_servers rows the column-parity fixture
 // seeds, and it is a computed minimum, not a round number: the select list
-// carries EIGHT bool columns, and two same-typed columns are only
+// carries NINE bool columns, and two same-typed columns are only
 // distinguishable by value if they differ in at least one seeded row, so each
 // bool column needs its own DISTINCT pattern across the rows. With r rows
-// there are 2^r patterns, so r must satisfy 2^r - 1 >= 8 (all-false is not a usable pattern) — four rows.
+// there are 2^r patterns, so r must satisfy 2^r - 1 >= 9 (all-false is not a usable pattern) — four rows.
 //
 // One row cannot work at all (every bool would have to hold the same value as
 // its neighbours), and two rows cover only 4 of the 6 columns' worth of
@@ -30,7 +30,7 @@ const aiServerParityRows = 4
 // aiServerParityBools is the bit-pattern table, one row per bool column in
 // SELECT-LIST order (netbird_enabled, netbird_connected, netbird_peer_managed,
 // netbird_allow_ping, netbird_ping_exclude, managed_runtime_only, lan_bind_only,
-// rpc_member_enabled) and one
+// rpc_member_enabled, gpu_vendor_note) and one
 // column per seeded server.
 //
 // Two properties are load-bearing and both are asserted by
@@ -43,7 +43,7 @@ const aiServerParityRows = 4
 //   - every row is true in at least one column, so a column dropped from a
 //     reader's select list (coming back as the false zero value) still shows
 //     up as a mismatch somewhere.
-var aiServerParityBools = [8][aiServerParityRows]bool{
+var aiServerParityBools = [9][aiServerParityRows]bool{
 	{true, true, false, false},  // netbird_enabled
 	{true, false, true, false},  // netbird_connected
 	{true, false, false, false}, // netbird_peer_managed
@@ -52,6 +52,7 @@ var aiServerParityBools = [8][aiServerParityRows]bool{
 	{false, false, true, false}, // managed_runtime_only
 	{false, false, false, true}, // lan_bind_only
 	{true, true, true, true},    // rpc_member_enabled
+	{false, true, false, true},  // gpu_vendor_note
 }
 
 // aiServerParityOverrides is the same table for the three 3-state override
@@ -73,6 +74,12 @@ var aiServerParityLANSources = [aiServerParityRows]string{
 	routing.LANSourceAuto, routing.LANSourceInterface, routing.LANSourceManual, routing.LANSourceInterface,
 }
 
+// aiServerParityLegacyVendors varies gpu_legacy_vendor per row over the known
+// vendors, never "" (the zero value could not catch an omitted column).
+var aiServerParityLegacyVendors = [aiServerParityRows]string{
+	routing.GPUVendorNVIDIA, routing.GPUVendorAMD, routing.GPUVendorApple, routing.GPUVendorAMD,
+}
+
 // aiServerParityBoolNames names the aiServerParityBools rows in select-list
 // order -- the ONE list of the ai_servers integer-boolean columns, shared by
 // TestAIServerParityFixtureDistinguishesEverySameTypedPair and the schema-
@@ -80,7 +87,7 @@ var aiServerParityLANSources = [aiServerParityRows]string{
 var aiServerParityBoolNames = []string{
 	"netbird_enabled", "netbird_connected", "netbird_peer_managed",
 	"netbird_allow_ping", "netbird_ping_exclude", "managed_runtime_only",
-	"lan_bind_only", "rpc_member_enabled",
+	"lan_bind_only", "rpc_member_enabled", "gpu_vendor_note",
 }
 
 // TestConformanceAIServerReadersAgreeOnEveryColumn closes a PRE-EXISTING
@@ -169,7 +176,8 @@ func TestConformanceAIServerReadersAgreeOnEveryColumn(t *testing.T) {
 				NetbirdIP: "100.64.0." + strconv.Itoa(10+i), LANAddress: "192.168.1." + strconv.Itoa(20+i),
 				LANBindOnly: aiServerParityBools[6][i], RPCMemberEnabled: aiServerParityBools[7][i],
 				RPCAllowedHeadGroups: `["ugrp_head_` + idx + `"]`,
-				LANSource:            aiServerParityLANSources[i], LANInterfaceID: "lan-if-" + idx,
+				GPULegacyVendor:      aiServerParityLegacyVendors[i], GPUVendorNote: aiServerParityBools[8][i],
+				LANSource: aiServerParityLANSources[i], LANInterfaceID: "lan-if-" + idx,
 				LANInterfaces: `[{"id":"lan-if-` + idx + `","name":"eth` + idx + `","ipv4":["192.0.2.` + strconv.Itoa(30+i) + `"]}]`,
 				Provider:      routing.ProviderVLLM, Endpoint: "http://cols" + idx + ".example.test:800" + idx,
 				Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy,
@@ -331,15 +339,11 @@ func TestAIServersSchemaColumnsAllCovered(t *testing.T) {
 			bools: aiServerParityBoolNames,
 			seeded: []string{
 				"agent_presence_timeout_seconds", "certificate_override", "created_at", "domain",
-				"endpoint", "estimated_watts", "health_status", "https_switch_override", "id",
+				"endpoint", "estimated_watts", "gpu_legacy_vendor", "health_status", "https_switch_override", "id",
 				"idle_watts", "lan_address", "lan_interface_id", "lan_interfaces", "lan_source", "last_seen_at", "name", "netbird_group_id", "netbird_group_ids",
 				"netbird_ip", "netbird_peer_id", "netbird_policy_override", "netbird_setup_key_id", "price_per_kwh",
 				"price_unit", "provider", "pue", "rpc_allowed_head_groups", "runtime_max_processes", "server_path_suffix",
 				"status", "system_group_id", "updated_at",
-			},
-			ignored: map[string]string{
-				"gpu_legacy_vendor": "struct fields land in E2: migration 119 adds the column before routing.AIServer has a field for it",
-				"gpu_vendor_note":   "struct fields land in E2: migration 119 adds the column before routing.AIServer has a field for it",
 			},
 		})
 	})

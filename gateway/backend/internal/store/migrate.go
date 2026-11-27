@@ -1890,7 +1890,10 @@ func migration40RawUp(ctx context.Context, s *SQLStore, version int, name string
 	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return fmt.Errorf("disable foreign_keys for migration %d: %w", version, err)
 	}
-	defer func() { _, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys=ON") }()
+	// The restore must run even when ctx is already cancelled (a migration
+	// aborted by a cancelled ctx): a pooled connection left with foreign keys
+	// off would silently skip referential integrity for whoever gets it next.
+	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA foreign_keys=ON") }()
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -5037,7 +5040,10 @@ func migration119RawUp(ctx context.Context, s *SQLStore, version int, name strin
 	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return fmt.Errorf("disable foreign_keys for migration %d: %w", version, err)
 	}
-	defer func() { _, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys=ON") }()
+	// The restore must run even when ctx is already cancelled (a migration
+	// aborted by a cancelled ctx): a pooled connection left with foreign keys
+	// off would silently skip referential integrity for whoever gets it next.
+	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA foreign_keys=ON") }()
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -5081,7 +5087,8 @@ var migration119MemberIndexes = []string{
 
 // migration119UpSQLite rebuilds the five tables (create <t>_new, copy, drop,
 // rename) in the column order Postgres reaches with `add column` (new columns
-// last), recreates rpc_cluster_members' indexes and checks every foreign key.
+// last), recreates rpc_cluster_members' indexes and checks the foreign keys of
+// the rebuilt tables.
 // The members are rebuilt before their GPU rows, whose copy reads each
 // member's position by (head_spec_id, server_id); a GPU row without a member
 // (impossible while foreign keys were enforced) fails the not-null
@@ -5212,26 +5219,36 @@ func migration119UpSQLite(ctx context.Context, tx *sql.Tx, dl dialect) error {
 			return err
 		}
 	}
-	return sqliteForeignKeyCheck(ctx, tx)
+	for _, r := range rebuilds {
+		if err := sqliteForeignKeyCheck(ctx, tx, r.table); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// sqliteForeignKeyCheck fails when `pragma foreign_key_check` reports any
-// row, naming the first violation: a rebuild done with foreign keys off must
-// leave none behind.
-func sqliteForeignKeyCheck(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
+// sqliteForeignKeyCheck fails when `pragma foreign_key_check(table)` reports
+// any row, naming the first violation: a rebuild done with foreign keys off
+// must leave none behind in the tables it rebuilt. It is scoped to table so a
+// pre-existing violation elsewhere in the database (one the rebuild did not
+// cause and cannot fix) does not abort the migration. The rebuilt tables are
+// checked as children; the only one that is also a parent,
+// rpc_cluster_members, is covered by checking its child
+// rpc_cluster_member_gpus.
+func sqliteForeignKeyCheck(ctx context.Context, tx *sql.Tx, table string) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check(`+table+`)`)
 	if err != nil {
-		return fmt.Errorf("foreign_key_check: %w", err)
+		return fmt.Errorf("foreign_key_check(%s): %w", table, err)
 	}
 	defer rows.Close()
 	if rows.Next() {
-		var table, parent string
+		var child, parent string
 		var rowid sql.NullInt64
 		var fkid int
-		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
-			return fmt.Errorf("scan foreign_key_check: %w", err)
+		if err := rows.Scan(&child, &rowid, &parent, &fkid); err != nil {
+			return fmt.Errorf("scan foreign_key_check(%s): %w", table, err)
 		}
-		return fmt.Errorf("foreign_key_check: %s row %d violates its foreign key to %s", table, rowid.Int64, parent)
+		return fmt.Errorf("foreign_key_check: %s row %d violates its foreign key to %s", child, rowid.Int64, parent)
 	}
 	return rows.Err()
 }

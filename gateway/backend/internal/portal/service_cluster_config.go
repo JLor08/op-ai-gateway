@@ -932,7 +932,10 @@ func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSp
 	nextOrder := make([]int, 0, len(rows))
 	measured := false
 	for pos, r := range rows {
-		g := routing.ClusterMemberGPU{HeadSpecID: used.HeadSpecID, ServerID: used.ServerID, GPUIndex: r.GPUIndex, Position: pos}
+		g := routing.ClusterMemberGPU{
+			HeadSpecID: used.HeadSpecID, MemberPosition: used.Position, ServerID: used.ServerID,
+			GPUVendor: r.GPUVendor, GPUIndex: r.GPUIndex, Position: pos,
+		}
 		if p, ok := prev[r.GPUIndex]; ok {
 			g.VRAMMeasuredMB, g.RunPeakVRAMMB = p.VRAMMeasuredMB, p.RunPeakVRAMMB
 			measured = measured || p.VRAMMeasuredMB > 0

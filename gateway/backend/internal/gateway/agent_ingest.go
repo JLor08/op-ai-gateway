@@ -1014,7 +1014,7 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, fold
 			if was, known := stored[index]; known && was == measured {
 				continue // already on file, byte for byte
 			}
-			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, index, measured); err != nil {
+			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, routing.GPUKey{Vendor: "", Index: index}, measured); err != nil {
 				// Tolerates ErrNotFound (a GPU row deleted out from under an
 				// in-flight sample) the same as any other failure here: log
 				// and move on, never reject the sample.

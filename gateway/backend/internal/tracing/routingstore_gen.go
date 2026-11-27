@@ -352,6 +352,18 @@ func (_d *RoutingStoreWithTracing) CreateVendorAccount(ctx context.Context, acc 
 	return _d.Store.CreateVendorAccount(ctx, acc)
 }
 
+func (_d *RoutingStoreWithTracing) CreateVendorAccountGroup(ctx context.Context, g _sourceRouting.VendorAccountGroup) (err error) {
+	ctx, span := Start(ctx, "routing.Store.CreateVendorAccountGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.CreateVendorAccountGroup(ctx, g)
+}
+
 func (_d *RoutingStoreWithTracing) DeleteAIServer(ctx context.Context, id string) (err error) {
 	ctx, span := Start(ctx, "routing.Store.DeleteAIServer")
 	defer span.End()
@@ -556,7 +568,19 @@ func (_d *RoutingStoreWithTracing) DeleteVendorAccount(ctx context.Context, id s
 	return _d.Store.DeleteVendorAccount(ctx, id)
 }
 
-func (_d *RoutingStoreWithTracing) EndClusterMemberRun(ctx context.Context, headSpecID string, serverID string, startedAt time.Time) (ended bool, err error) {
+func (_d *RoutingStoreWithTracing) DeleteVendorAccountGroup(ctx context.Context, id string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.DeleteVendorAccountGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.DeleteVendorAccountGroup(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) EndClusterMemberRun(ctx context.Context, headSpecID string, position int, startedAt time.Time) (ended bool, err error) {
 	ctx, span := Start(ctx, "routing.Store.EndClusterMemberRun")
 	defer span.End()
 	defer func() {
@@ -565,7 +589,7 @@ func (_d *RoutingStoreWithTracing) EndClusterMemberRun(ctx context.Context, head
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.Store.EndClusterMemberRun(ctx, headSpecID, serverID, startedAt)
+	return _d.Store.EndClusterMemberRun(ctx, headSpecID, position, startedAt)
 }
 
 func (_d *RoutingStoreWithTracing) GetCoResidencyMode(ctx context.Context, appID string) (c2 _sourceRouting.CoResidencyMode, err error) {
@@ -1660,6 +1684,18 @@ func (_d *RoutingStoreWithTracing) SetVendorAccountAdminGroup(ctx context.Contex
 	return _d.Store.SetVendorAccountAdminGroup(ctx, accountID, groupID)
 }
 
+func (_d *RoutingStoreWithTracing) SetVendorAccountGroupMembers(ctx context.Context, groupID string, accountIDs []string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.SetVendorAccountGroupMembers")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.SetVendorAccountGroupMembers(ctx, groupID, accountIDs)
+}
+
 func (_d *RoutingStoreWithTracing) SetVendorAccountModels(ctx context.Context, accountID string, models []_sourceRouting.VendorAccountModel) (err error) {
 	ctx, span := Start(ctx, "routing.Store.SetVendorAccountModels")
 	defer span.End()
@@ -1888,7 +1924,7 @@ func (_d *RoutingStoreWithTracing) UpdateResourceGroupSystemGroup(ctx context.Co
 	return _d.Store.UpdateResourceGroupSystemGroup(ctx, rgID, systemGroupID)
 }
 
-func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) (err error) {
+func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, key _sourceRouting.GPUKey, measuredMB int) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateRuntimeSpecGPUMeasured")
 	defer span.End()
 	defer func() {
@@ -1897,7 +1933,7 @@ func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecGPUMeasured(ctx context.Cont
 			span.SetStatus(codes.Error, err.Error())
 		}
 	}()
-	return _d.Store.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
+	return _d.Store.UpdateRuntimeSpecGPUMeasured(ctx, specID, key, measuredMB)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateRuntimeSpecRAMMeasured(ctx context.Context, specID string, measuredMB int) (err error) {
@@ -2126,6 +2162,18 @@ func (_d *RoutingStoreWithTracing) UpdateVendorAccount(ctx context.Context, acc 
 		}
 	}()
 	return _d.Store.UpdateVendorAccount(ctx, acc)
+}
+
+func (_d *RoutingStoreWithTracing) UpdateVendorAccountGroup(ctx context.Context, g _sourceRouting.VendorAccountGroup) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateVendorAccountGroup")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateVendorAccountGroup(ctx, g)
 }
 
 func (_d *RoutingStoreWithTracing) UpdateVendorAccountOperateFields(ctx context.Context, accountID string, patch _sourceRouting.VendorAccountOperatePatch) (err error) {
@@ -2366,6 +2414,42 @@ func (_d *RoutingStoreWithTracing) VendorAccountByID(ctx context.Context, id str
 		}
 	}()
 	return _d.Store.VendorAccountByID(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) VendorAccountGroupByID(ctx context.Context, id string) (v1 _sourceRouting.VendorAccountGroup, err error) {
+	ctx, span := Start(ctx, "routing.Store.VendorAccountGroupByID")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.VendorAccountGroupByID(ctx, id)
+}
+
+func (_d *RoutingStoreWithTracing) VendorAccountGroupMembers(ctx context.Context, groupID string) (va1 []_sourceRouting.VendorAccountGroupMember, err error) {
+	ctx, span := Start(ctx, "routing.Store.VendorAccountGroupMembers")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.VendorAccountGroupMembers(ctx, groupID)
+}
+
+func (_d *RoutingStoreWithTracing) VendorAccountGroupsByOwner(ctx context.Context, userID string) (va1 []_sourceRouting.VendorAccountGroup, err error) {
+	ctx, span := Start(ctx, "routing.Store.VendorAccountGroupsByOwner")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.VendorAccountGroupsByOwner(ctx, userID)
 }
 
 func (_d *RoutingStoreWithTracing) VendorAccountModels(ctx context.Context, accountID string) (va1 []_sourceRouting.VendorAccountModel, err error) {

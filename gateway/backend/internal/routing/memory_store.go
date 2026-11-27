@@ -136,8 +136,9 @@ type MemoryStore struct {
 	// -> its full set of per-GPU VRAM budgets. SetServerGPUBudgets atomically
 	// replaces the whole per-server set (delete-then-insert on the SQL side; a
 	// single map assignment here, already atomic under m.mu). Unordered on
-	// write; ServerGPUBudgets sorts by GPUIndex on read, mirroring the SQL
-	// `order by gpu_index` (same pattern as runtimeSpecGPUs/coresidency above).
+	// write; ServerGPUBudgets sorts by (GPUVendor, GPUIndex) on read,
+	// mirroring the SQL `order by gpu_vendor, gpu_index` (same pattern as
+	// runtimeSpecGPUs/coresidency above).
 	gpuBudgets map[string][]ServerGPUBudget
 	// serverBinaries mirrors server_binaries (migration 103): serverID -> path
 	// -> row. Deleted with the server, like the table's cascading FK.
@@ -279,6 +280,7 @@ func (m *MemoryStore) UpdateAIServer(_ context.Context, host AIServer) error {
 	updated := copyAIServer(host)
 	updated.NetbirdIP = stored.NetbirdIP
 	updated.LANInterfaces = stored.LANInterfaces
+	updated.GPULegacyVendor, updated.GPUVendorNote = stored.GPULegacyVendor, stored.GPUVendorNote
 	m.servers[host.ID] = updated
 	return nil
 }
@@ -2939,16 +2941,15 @@ func (m *MemoryStore) SetRuntimeSpecGPUs(_ context.Context, specID string, gpus 
 	if _, ok := m.runtimeSpecs[specID]; !ok {
 		return storeerr.ErrNotFound
 	}
-	// A duplicate GPUIndex within gpus would hit the composite primary key
-	// (spec_id, gpu_index) on the SQL side — reject it here too so both
-	// backends agree (mirrors sqlite_runtime.go's isUniqueViolation
-	// classification for the same insert).
-	seen := make(map[int]struct{}, len(gpus))
+	// A duplicate (GPUVendor, GPUIndex) within gpus would hit the composite
+	// primary key (spec_id, gpu_vendor, gpu_index) on the SQL side — reject it
+	// here too so both backends agree (mirrors sqlite_runtime.go's
+	// isUniqueViolation classification for the same insert).
+	seen := make(map[GPUKey]struct{}, len(gpus))
 	for _, g := range gpus {
-		if _, dup := seen[g.GPUIndex]; dup {
+		if !addOnce(seen, g.Key()) {
 			return storeerr.ErrConflict
 		}
-		seen[g.GPUIndex] = struct{}{}
 	}
 	stored := copyRuntimeSpecGPUs(gpus)
 	for i := range stored {
@@ -2959,8 +2960,8 @@ func (m *MemoryStore) SetRuntimeSpecGPUs(_ context.Context, specID string, gpus 
 }
 
 // RuntimeSpecGPUs returns specID's per-GPU VRAM rows ordered by Position,
-// with GPUIndex as a deterministic tiebreak (mirrors the SQL `order by
-// position, gpu_index`). The slice is deep-copied so the caller cannot alias
+// with GPUVendor and GPUIndex as a deterministic tiebreak (mirrors the SQL
+// `order by position, gpu_vendor, gpu_index`). The slice is deep-copied so the caller cannot alias
 // internal state.
 func (m *MemoryStore) RuntimeSpecGPUs(_ context.Context, specID string) ([]RuntimeSpecGPU, error) {
 	m.mu.RLock()
@@ -2970,20 +2971,20 @@ func (m *MemoryStore) RuntimeSpecGPUs(_ context.Context, specID string) ([]Runti
 		if out[i].Position != out[j].Position {
 			return out[i].Position < out[j].Position
 		}
-		return out[i].GPUIndex < out[j].GPUIndex
+		return lessGPUKey(out[i].Key(), out[j].Key())
 	})
 	return out, nil
 }
 
 // UpdateRuntimeSpecGPUMeasured writes back one agent measurement, touching
 // only VRAMMeasuredMB (VRAMEstimateMB, operator-owned, is never written
-// here). ErrNotFound when the (specID, gpuIndex) row does not exist.
-func (m *MemoryStore) UpdateRuntimeSpecGPUMeasured(_ context.Context, specID string, gpuIndex int, measuredMB int) error {
+// here). ErrNotFound when the (specID, key) row does not exist.
+func (m *MemoryStore) UpdateRuntimeSpecGPUMeasured(_ context.Context, specID string, key GPUKey, measuredMB int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rows := m.runtimeSpecGPUs[specID]
 	for i := range rows {
-		if rows[i].GPUIndex == gpuIndex {
+		if rows[i].Key() == key {
 			rows[i].VRAMMeasuredMB = measuredMB
 			return nil
 		}
@@ -3166,16 +3167,16 @@ func (m *MemoryStore) SetServerGPUBudgets(_ context.Context, serverID string, bu
 	if _, ok := m.servers[serverID]; !ok {
 		return storeerr.ErrNotFound
 	}
-	// A duplicate GPUIndex within budgets would hit the composite primary
-	// key (server_id, gpu_index) on the SQL side — reject it here too so
-	// both backends agree (mirrors sqlite_runtime.go's isUniqueViolation
-	// classification for the same insert).
-	seen := make(map[int]struct{}, len(budgets))
+	// A duplicate (GPUVendor, GPUIndex) within budgets would hit the
+	// composite primary key (server_id, gpu_vendor, gpu_index) on the SQL
+	// side — reject it here too so both backends agree (mirrors
+	// sqlite_runtime.go's isUniqueViolation classification for the same
+	// insert).
+	seen := make(map[GPUKey]struct{}, len(budgets))
 	for _, b := range budgets {
-		if _, dup := seen[b.GPUIndex]; dup {
+		if !addOnce(seen, GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}) {
 			return storeerr.ErrConflict
 		}
-		seen[b.GPUIndex] = struct{}{}
 	}
 	stored := make([]ServerGPUBudget, len(budgets))
 	copy(stored, budgets)
@@ -3187,7 +3188,7 @@ func (m *MemoryStore) SetServerGPUBudgets(_ context.Context, serverID string, bu
 }
 
 // ServerGPUBudgets returns serverID's per-GPU VRAM budgets, ordered by GPU
-// index (mirrors the SQL `order by gpu_index`). Always non-nil, empty when
+// vendor, then index (mirrors the SQL `order by gpu_vendor, gpu_index`). Always non-nil, empty when
 // none. The result is a fresh copy (ServerGPUBudget has no slice/pointer
 // fields, so a plain element copy suffices — mirrors
 // CoResidencyRulesByApplication's non-nil contract above).
@@ -3196,8 +3197,19 @@ func (m *MemoryStore) ServerGPUBudgets(_ context.Context, serverID string) ([]Se
 	defer m.mu.RUnlock()
 	out := make([]ServerGPUBudget, len(m.gpuBudgets[serverID]))
 	copy(out, m.gpuBudgets[serverID])
-	sort.Slice(out, func(i, j int) bool { return out[i].GPUIndex < out[j].GPUIndex })
+	sort.Slice(out, func(i, j int) bool {
+		return lessGPUKey(GPUKey{out[i].GPUVendor, out[i].GPUIndex}, GPUKey{out[j].GPUVendor, out[j].GPUIndex})
+	})
 	return out, nil
+}
+
+// lessGPUKey orders GPU keys by vendor, then index: the SQL `order by
+// gpu_vendor, gpu_index`.
+func lessGPUKey(a, b GPUKey) bool {
+	if a.Vendor != b.Vendor {
+		return a.Vendor < b.Vendor
+	}
+	return a.Index < b.Index
 }
 
 // --- RuntimeStore: per-server binary inventory (migration 103) ---------------
@@ -3722,15 +3734,19 @@ func (m *MemoryStore) deleteRPCServerStateLocked(serverID string) {
 	}
 	for head, members := range m.clusterMembers {
 		kept := make([]ClusterMember, 0, len(members))
+		gone := map[int]struct{}{}
 		for _, mem := range members {
 			if mem.ServerID != serverID {
 				kept = append(kept, mem)
+			} else {
+				gone[mem.Position] = struct{}{}
 			}
 		}
 		m.clusterMembers[head] = kept
+		// The GPU rows cascade from their member (head, member position).
 		gpus := make([]ClusterMemberGPU, 0, len(m.clusterMemberGPUs[head]))
 		for _, g := range m.clusterMemberGPUs[head] {
-			if g.ServerID != serverID {
+			if _, dropped := gone[g.MemberPosition]; !dropped {
 				gpus = append(gpus, g)
 			}
 		}
@@ -3792,8 +3808,8 @@ func (m *MemoryStore) DeleteRPCMemberSpec(_ context.Context, id string) error {
 	return nil
 }
 
-// SetRPCMemberSpecGPUs replaces specID's GPU rows (a duplicate GPUIndex is the
-// primary-key conflict the SQL side reports).
+// SetRPCMemberSpecGPUs replaces specID's GPU rows (a duplicate (GPUVendor,
+// GPUIndex) is the primary-key conflict the SQL side reports).
 func (m *MemoryStore) SetRPCMemberSpecGPUs(_ context.Context, specID string, gpus []RPCMemberSpecGPU) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3807,14 +3823,13 @@ func (m *MemoryStore) SetRPCMemberSpecGPUs(_ context.Context, specID string, gpu
 	return nil
 }
 
-// uniqueRPCMemberSpecGPUs reports whether every GPU index occurs once.
+// uniqueRPCMemberSpecGPUs reports whether every (vendor, index) occurs once.
 func uniqueRPCMemberSpecGPUs(gpus []RPCMemberSpecGPU) bool {
-	seen := make(map[int]struct{}, len(gpus))
+	seen := make(map[GPUKey]struct{}, len(gpus))
 	for _, g := range gpus {
-		if _, dup := seen[g.GPUIndex]; dup {
+		if !addOnce(seen, GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}) {
 			return false
 		}
-		seen[g.GPUIndex] = struct{}{}
 	}
 	return true
 }
@@ -3845,7 +3860,8 @@ func (m *MemoryStore) ReplaceRPCMemberSpec(_ context.Context, s RPCMemberSpec, g
 	return nil
 }
 
-// RPCMemberSpecGPUs lists specID's GPU rows by position, then index.
+// RPCMemberSpecGPUs lists specID's GPU rows by position, then vendor and
+// index.
 func (m *MemoryStore) RPCMemberSpecGPUs(_ context.Context, specID string) ([]RPCMemberSpecGPU, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -3855,7 +3871,7 @@ func (m *MemoryStore) RPCMemberSpecGPUs(_ context.Context, specID string) ([]RPC
 		if out[i].Position != out[j].Position {
 			return out[i].Position < out[j].Position
 		}
-		return out[i].GPUIndex < out[j].GPUIndex
+		return lessGPUKey(GPUKey{out[i].GPUVendor, out[i].GPUIndex}, GPUKey{out[j].GPUVendor, out[j].GPUIndex})
 	})
 	return out, nil
 }
@@ -3878,11 +3894,12 @@ func (m *MemoryStore) clusterPortTakenLocked(headSpecID, serverID string, port i
 
 // SetClusterMembers replaces headSpecID's membership and GPU rows, enforcing
 // by hand what the tables enforce: the head and every member server exist
-// (ErrNotFound), (head, position), (head, server), a non-empty
-// member_spec_id across all heads and a non-zero (server, port) across all
-// heads are unique (ErrConflict), and a GPU row
-// needs a membership row of its (head, server) in the same call (ErrNotFound).
-// Nothing is stored when any check fails.
+// (ErrNotFound), (head, position), a non-empty member_spec_id across all
+// heads and a non-zero (server, port) across all heads are unique
+// (ErrConflict), and a GPU row needs a membership row of its (head, member
+// position) on its server in the same call (ErrNotFound) and a unique
+// (member position, vendor, index) (ErrConflict). One server may hold
+// several members. Nothing is stored when any check fails.
 func (m *MemoryStore) SetClusterMembers(_ context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -3914,7 +3931,7 @@ func clusterMembersAsRead(stored []ClusterMember, storedGPUs []ClusterMemberGPU,
 	}
 	for _, e := range expect {
 		if !slices.ContainsFunc(stored, func(s ClusterMember) bool {
-			return s.ServerID == e.ServerID && s.RAMMeasuredMB == e.RAMMeasuredMB && s.Stale == e.Stale &&
+			return s.Position == e.Position && s.RAMMeasuredMB == e.RAMMeasuredMB && s.Stale == e.Stale &&
 				s.RunPeakRAMMB == e.RunPeakRAMMB && s.RunHeadInstance == e.RunHeadInstance && s.RunStartedAt.Equal(e.RunStartedAt)
 		}) {
 			return false
@@ -3922,7 +3939,8 @@ func clusterMembersAsRead(stored []ClusterMember, storedGPUs []ClusterMemberGPU,
 	}
 	for _, e := range expectGPUs {
 		if !slices.ContainsFunc(storedGPUs, func(s ClusterMemberGPU) bool {
-			return s.ServerID == e.ServerID && s.GPUIndex == e.GPUIndex && s.VRAMMeasuredMB == e.VRAMMeasuredMB &&
+			return s.MemberPosition == e.MemberPosition && s.GPUVendor == e.GPUVendor && s.GPUIndex == e.GPUIndex &&
+				s.VRAMMeasuredMB == e.VRAMMeasuredMB &&
 				s.RunPeakVRAMMB == e.RunPeakVRAMMB
 		}) {
 			return false
@@ -3936,11 +3954,11 @@ func (m *MemoryStore) setClusterMembersLocked(headSpecID string, members []Clust
 	if _, ok := m.runtimeSpecs[headSpecID]; !ok {
 		return storeerr.ErrNotFound
 	}
-	servers, err := m.checkClusterMembersLocked(headSpecID, members)
+	serverAt, err := m.checkClusterMembersLocked(headSpecID, members)
 	if err != nil {
 		return err
 	}
-	if err := checkClusterMemberGPUs(servers, gpus); err != nil {
+	if err := checkClusterMemberGPUs(serverAt, gpus); err != nil {
 		return err
 	}
 	storedM := make([]ClusterMember, len(members))
@@ -3959,21 +3977,21 @@ func (m *MemoryStore) setClusterMembersLocked(headSpecID string, members []Clust
 }
 
 // checkClusterMembersLocked enforces on members what the tables enforce,
-// member by member: the server exists, (head, position) and (head, server)
-// are unique, a non-zero port is free on its server, and a manual member
-// spec is used once across all heads. It returns the set of member servers.
-// The caller holds m.mu.
-func (m *MemoryStore) checkClusterMembersLocked(headSpecID string, members []ClusterMember) (map[string]struct{}, error) {
-	positions := make(map[int]struct{}, len(members))
-	servers := make(map[string]struct{}, len(members))
+// member by member: the server exists, (head, position) is unique, a
+// non-zero port is free on its server, and a manual member spec is used once
+// across all heads. It returns each member's server by position. The caller
+// holds m.mu.
+func (m *MemoryStore) checkClusterMembersLocked(headSpecID string, members []ClusterMember) (map[int]string, error) {
+	serverAt := make(map[int]string, len(members))
 	specs := make(map[string]struct{}, len(members))
 	for _, mem := range members {
 		if _, ok := m.servers[mem.ServerID]; !ok {
 			return nil, storeerr.ErrNotFound
 		}
-		if !addOnce(positions, mem.Position) || !addOnce(servers, mem.ServerID) {
+		if _, dup := serverAt[mem.Position]; dup {
 			return nil, storeerr.ErrConflict
 		}
+		serverAt[mem.Position] = mem.ServerID
 		if mem.Port != 0 && m.clusterPortTakenLocked(headSpecID, mem.ServerID, mem.Port) {
 			return nil, storeerr.ErrConflict
 		}
@@ -3984,7 +4002,7 @@ func (m *MemoryStore) checkClusterMembersLocked(headSpecID string, members []Clu
 			return nil, storeerr.ErrConflict
 		}
 	}
-	return servers, nil
+	return serverAt, nil
 }
 
 // addOnce adds k to set and reports whether it was not there yet.
@@ -4007,19 +4025,24 @@ func (m *MemoryStore) memberSpecUsedElsewhereLocked(headSpecID, memberSpecID str
 	return false
 }
 
-// checkClusterMemberGPUs requires a membership row in the same call for each
-// GPU row's server (ErrNotFound) and a unique (server, index) (ErrConflict).
-func checkClusterMemberGPUs(servers map[string]struct{}, gpus []ClusterMemberGPU) error {
-	gpuKeys := make(map[string]struct{}, len(gpus))
+// clusterMemberGPUKey is the primary key of a member GPU row within its head.
+type clusterMemberGPUKey struct {
+	position int
+	gpu      GPUKey
+}
+
+// checkClusterMemberGPUs requires, for each GPU row, a membership row in the
+// same call at its member position on its server (ErrNotFound) and a unique
+// (member position, vendor, index) (ErrConflict).
+func checkClusterMemberGPUs(serverAt map[int]string, gpus []ClusterMemberGPU) error {
+	gpuKeys := make(map[clusterMemberGPUKey]struct{}, len(gpus))
 	for _, g := range gpus {
-		if _, ok := servers[g.ServerID]; !ok {
+		if server, ok := serverAt[g.MemberPosition]; !ok || server != g.ServerID {
 			return storeerr.ErrNotFound
 		}
-		key := fmt.Sprintf("%s/%d", g.ServerID, g.GPUIndex)
-		if _, dup := gpuKeys[key]; dup {
+		if !addOnce(gpuKeys, clusterMemberGPUKey{g.MemberPosition, GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}}) {
 			return storeerr.ErrConflict
 		}
-		gpuKeys[key] = struct{}{}
 	}
 	return nil
 }
@@ -4029,7 +4052,7 @@ func sortClusterMembers(rows []ClusterMember) {
 }
 
 // ClusterMembers returns headSpecID's membership by position and its GPU rows
-// by server, position, index; both are always non-nil.
+// by member position, position, vendor, index; both are always non-nil.
 func (m *MemoryStore) ClusterMembers(_ context.Context, headSpecID string) ([]ClusterMember, []ClusterMemberGPU, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -4040,13 +4063,13 @@ func (m *MemoryStore) ClusterMembers(_ context.Context, headSpecID string) ([]Cl
 	copy(gpus, m.clusterMemberGPUs[headSpecID])
 	sort.Slice(gpus, func(i, j int) bool {
 		a, b := gpus[i], gpus[j]
-		if a.ServerID != b.ServerID {
-			return a.ServerID < b.ServerID
+		if a.MemberPosition != b.MemberPosition {
+			return a.MemberPosition < b.MemberPosition
 		}
 		if a.Position != b.Position {
 			return a.Position < b.Position
 		}
-		return a.GPUIndex < b.GPUIndex
+		return lessGPUKey(GPUKey{a.GPUVendor, a.GPUIndex}, GPUKey{b.GPUVendor, b.GPUIndex})
 	})
 	return members, gpus, nil
 }
@@ -4084,11 +4107,11 @@ func (m *MemoryStore) ClusterMemberBySpec(_ context.Context, memberSpecID string
 	return ClusterMember{}, false, nil
 }
 
-// clusterMemberIndexLocked returns the index of serverID's row among
+// clusterMemberIndexLocked returns the index of the row at position among
 // headSpecID's members, -1 when there is none. The caller holds m.mu.
-func (m *MemoryStore) clusterMemberIndexLocked(headSpecID, serverID string) int {
+func (m *MemoryStore) clusterMemberIndexLocked(headSpecID string, position int) int {
 	for i, mem := range m.clusterMembers[headSpecID] {
-		if mem.ServerID == serverID {
+		if mem.Position == position {
 			return i
 		}
 	}
@@ -4101,7 +4124,7 @@ func (m *MemoryStore) clusterMemberIndexLocked(headSpecID, serverID string) int 
 func (m *MemoryStore) UpdateClusterMemberUsage(_ context.Context, upd ClusterMember, gpus []ClusterMemberGPU) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	idx := m.clusterMemberIndexLocked(upd.HeadSpecID, upd.ServerID)
+	idx := m.clusterMemberIndexLocked(upd.HeadSpecID, upd.Position)
 	if idx < 0 {
 		return false, storeerr.ErrNotFound
 	}
@@ -4113,7 +4136,7 @@ func (m *MemoryStore) UpdateClusterMemberUsage(_ context.Context, upd ClusterMem
 	stored := m.clusterMemberGPUs[upd.HeadSpecID]
 	for _, g := range gpus {
 		for i := range stored {
-			if stored[i].ServerID == upd.ServerID && stored[i].GPUIndex == g.GPUIndex {
+			if stored[i].MemberPosition == upd.Position && stored[i].GPUVendor == g.GPUVendor && stored[i].GPUIndex == g.GPUIndex {
 				stored[i].VRAMMeasuredMB, stored[i].RunPeakVRAMMB = g.VRAMMeasuredMB, g.RunPeakVRAMMB
 			}
 		}
@@ -4128,7 +4151,7 @@ func (m *MemoryStore) setClusterMemberRunLocked(headSpecID string, idx int, star
 	row.RunStartedAt, row.RunHeadInstance, row.RunPeakRAMMB = startedAt, headInstance, 0
 	stored := m.clusterMemberGPUs[headSpecID]
 	for i := range stored {
-		if stored[i].ServerID == row.ServerID {
+		if stored[i].MemberPosition == row.Position {
 			stored[i].RunPeakVRAMMB = 0
 		}
 	}
@@ -4145,10 +4168,10 @@ func (m *MemoryStore) BeginClusterMemberRun(_ context.Context, headSpecID string
 }
 
 // EndClusterMemberRun clears the row's run when it is the run named.
-func (m *MemoryStore) EndClusterMemberRun(_ context.Context, headSpecID, serverID string, startedAt time.Time) (bool, error) {
+func (m *MemoryStore) EndClusterMemberRun(_ context.Context, headSpecID string, position int, startedAt time.Time) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	idx := m.clusterMemberIndexLocked(headSpecID, serverID)
+	idx := m.clusterMemberIndexLocked(headSpecID, position)
 	if idx < 0 {
 		return false, storeerr.ErrNotFound
 	}
