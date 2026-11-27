@@ -605,9 +605,13 @@ func instanceLinePrefix(k int) string {
 // LastError.StderrTail) or anything built from them; the placeholder it
 // leaves contains no newline, so the prefix step sees the same lines.
 //
-// The masker holds back up to its longest value minus one byte (p.carry) in
-// case a secret is split across two writes; those bytes land with the next
-// write or at flushLocked. A write that only grows the carry records nothing.
+// The masker holds back only the bytes that could still begin a secret split
+// across two writes (p.carry; at most its longest value minus one byte, plus
+// up to three to keep a character whole); those bytes land with the next
+// write or at flushLocked, so live delivery and Tail lag by at most them. A
+// write that only grows the carry records nothing. Bytes held back before
+// the generation's started marker land after it: a cosmetic reordering, as a
+// split secret must never be flushed early.
 //
 // Concurrency: the carry is a single byte sequence in the order writes take
 // the lock. os/exec hands a writer that is both Stdout and Stderr to a single
@@ -626,20 +630,16 @@ func (s *LogStore) write(p *procLog, b []byte) {
 		s.recordLocked(p, string(b))
 		return
 	}
-	var text string
-	text, p.carry = p.masker.mask(p.carry, b, false)
-	s.recordLocked(p, text)
+	s.recordLocked(p, p.masker.mask(&p.carry, b, false))
 }
 
 // flushLocked records whatever p's masker still holds back (the end of a
 // stream: nothing can complete a split value any more). The caller holds mu.
 func (s *LogStore) flushLocked(p *procLog) {
-	if len(p.carry) == 0 {
+	if p.carry.empty() {
 		return
 	}
-	text, _ := p.masker.mask(p.carry, nil, true)
-	p.carry = nil
-	s.recordLocked(p, text)
+	s.recordLocked(p, p.masker.mask(&p.carry, nil, true))
 }
 
 // recordLocked prefixes already-masked text and appends and queues it as one
@@ -1687,7 +1687,7 @@ func (s *LogStore) tailStream(specID, stream string, gen uint64, n int) string {
 //
 // masker is the generation's secret masker (#430 §8; nil when its launch
 // substituted no maskable secret), shared by every sibling; carry is THIS
-// stream's held-back tail (see LogStore.write), guarded by the store's mutex
+// stream's masking state (see LogStore.write), guarded by the store's mutex
 // like midLine, because a split secret can only be completed by the same
 // stream's next bytes.
 type procLog struct {
@@ -1700,7 +1700,7 @@ type procLog struct {
 	midLine  bool
 	stream   string
 	masker   *secretMasker
-	carry    []byte
+	carry    maskCarry
 }
 
 // ForStream returns a sibling of p that records on the stream name: the same
