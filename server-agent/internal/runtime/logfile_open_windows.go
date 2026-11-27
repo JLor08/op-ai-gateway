@@ -8,6 +8,7 @@ package runtime
 import (
 	"os"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/windows"
 )
@@ -96,11 +97,19 @@ func stripExtendedPathPrefix(p string) string {
 	return p
 }
 
-// fileIdentity would be (volume serial, file index) on Windows, but an
-// os.FileInfo does not expose them: its Sys() is a
-// *syscall.Win32FileAttributeData, and os keeps the volume and index private.
-// ok is therefore always false here; a caller detecting rotation uses
-// os.SameFile, which compares exactly those fields on Windows.
-func fileIdentity(os.FileInfo) (ino, dev uint64, ok bool) {
-	return 0, 0, false
+// openedLinkCount is the hard-link count of the file f is open on
+// (GetFileInformationByHandle's NumberOfLinks).
+func openedLinkCount(f *os.File) (uint64, error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil {
+		return 0, err
+	}
+	return uint64(info.NumberOfLinks), nil
+}
+
+// isReparsePoint reports FILE_ATTRIBUTE_REPARSE_POINT (a symlink, a junction,
+// a mount point) on an os.Lstat result.
+func isReparsePoint(fi os.FileInfo) bool {
+	d, ok := fi.Sys().(*syscall.Win32FileAttributeData)
+	return ok && d != nil && d.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0
 }

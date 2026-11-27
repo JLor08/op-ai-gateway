@@ -117,12 +117,18 @@ func resolveLogRoot(root string) (string, error) {
 	return filepath.EvalSymlinks(root)
 }
 
-// fileIdentity is the (inode, device) pair of fi, the identity the tailer
-// compares to detect a rotation. ok is false when fi carries no stat data.
-func fileIdentity(fi os.FileInfo) (ino, dev uint64, ok bool) {
-	st, isStat := fi.Sys().(*syscall.Stat_t)
-	if !isStat || st == nil {
-		return 0, 0, false
+// openedLinkCount is the hard-link count of the file f is open on (fstat).
+func openedLinkCount(f *os.File) (uint64, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
 	}
-	return uint64(st.Ino), uint64(st.Dev), true //nolint:unconvert // Ino and Dev are narrower than uint64 on some GOOS
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return 0, os.ErrInvalid
+	}
+	return uint64(st.Nlink), nil //nolint:unconvert // Nlink is narrower than uint64 on some GOOS
 }
+
+// isReparsePoint is a Windows notion; elsewhere a link is ModeSymlink.
+func isReparsePoint(os.FileInfo) bool { return false }

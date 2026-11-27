@@ -53,8 +53,10 @@ func TestResolveLogFile(t *testing.T) {
 			wantOpen: "/agent/cfg/s1/e.log", wantInCfg: true,
 		},
 		{
+			// Tailable, but not the generation's own: a subdirectory could be a
+			// link the server planted, so it is never removed (InConfigDir false).
 			name: "config dir nested file", spec: nativeLogSpec("s1"), path: "${CONFIG_DIR}/logs/e.log",
-			wantOpen: "/agent/cfg/s1/logs/e.log", wantInCfg: true,
+			wantOpen: "/agent/cfg/s1/logs/e.log",
 		},
 		{
 			name: "instance key config dir", spec: nativeLogSpec("s1#2"), path: "${CONFIG_DIR}/e.log",
@@ -108,7 +110,8 @@ func TestResolveLogFile(t *testing.T) {
 			name: "wsl entry never permits a native spec", spec: nativeLogSpec("s1"), entries: []string{"wsl://Ubuntu-24.04/var/log/*"},
 			path: "/var/log/x.log", wantSetting: true,
 		},
-		{name: "proc under root star", spec: nativeLogSpec("s1"), entries: []string{"/*"}, path: "/proc/self/environ"},
+		// "/*" reduces to "" and permits nothing: refused before the pseudo-FS check matters.
+		{name: "root star permits nothing, not even proc", spec: nativeLogSpec("s1"), entries: []string{"/*"}, path: "/proc/self/environ"},
 		{name: "proc under its own entry", spec: nativeLogSpec("s1"), entries: []string{"/proc/*"}, path: "/proc/self/environ"},
 		{name: "sys under its own entry", spec: nativeLogSpec("s1"), entries: []string{"/sys"}, path: "/sys/kernel/x"},
 		{name: "dev under its own entry", spec: nativeLogSpec("s1"), entries: []string{"/dev/*"}, path: "/dev/sda"},
@@ -134,7 +137,7 @@ func TestResolveLogFile(t *testing.T) {
 		},
 		{
 			name: "wsl config dir nested", spec: wslLogSpec("s1#3"), path: "${CONFIG_DIR}/a/e.log",
-			wantOpen: "/agent/cfg/s1#3/a/e.log", wantInCfg: true,
+			wantOpen: "/agent/cfg/s1#3/a/e.log",
 		},
 		{name: "wsl config dir dot-dot escape", spec: wslLogSpec("s1"), path: "${CONFIG_DIR}/../x.log", wantSetting: true},
 		{name: "wsl config dir backslash", spec: wslLogSpec("s1"), path: `${CONFIG_DIR}/a\..\..\x.log`},
@@ -186,6 +189,13 @@ func TestResolveLogFile(t *testing.T) {
 			path: `\\wsl.localhost\Ubuntu-24.04\home\u\x.log`,
 		},
 		{name: "wsl secret token", spec: wslLogSpec("s1"), path: "${CONFIG_DIR}/${API_TOKEN}.log"},
+		// The file of a WSL spec lives on the Windows side, so Windows naming
+		// rules apply on every GOOS.
+		{name: "wsl config dir reserved name", spec: wslLogSpec("s1"), path: "${CONFIG_DIR}/NUL"},
+		{name: "wsl config dir reserved name with extension", spec: wslLogSpec("s1"), path: "${CONFIG_DIR}/com1.log"},
+		{name: "wsl config dir trailing space", spec: wslLogSpec("s1"), path: "${CONFIG_DIR}/e.log "},
+		{name: "wsl mnt path trailing dot", spec: wslLogSpec("s1"), entries: []string{`C:\logs\*`}, path: "/mnt/c/logs/x.log."},
+		{name: "wsl mnt path reserved name", spec: wslLogSpec("s1"), entries: []string{`C:\logs\*`}, path: "/mnt/c/logs/aux"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -208,6 +218,9 @@ func TestResolveLogFile(t *testing.T) {
 			}
 			if got.Name != "e" || got.OpenPath != tc.wantOpen || got.InConfigDir != tc.wantInCfg {
 				t.Fatalf("resolveLogFile(%q) = %+v, want OpenPath %q InConfigDir %v", tc.path, got, tc.wantOpen, tc.wantInCfg)
+			}
+			if got.ConfigDir != "/agent/cfg/"+tc.spec.ID || got.ConfigBase != logTestCfgDir {
+				t.Fatalf("resolveLogFile(%q) = %+v, want ConfigDir %q ConfigBase %q", tc.path, got, "/agent/cfg/"+tc.spec.ID, logTestCfgDir)
 			}
 			if len(got.Roots) == 0 {
 				t.Fatalf("resolveLogFile(%q) returned no roots", tc.path)
@@ -441,34 +454,149 @@ func TestOpenLogFileRootIsSymlink(t *testing.T) {
 	mustOpenAndRead(t, openTarget(t, linkCfg, nil, "${CONFIG_DIR}/e.log"), "cfg via link")
 }
 
-// TestFileIdentity: the same file reports the same identity through two
-// stats, a different file a different one.
-func TestFileIdentity(t *testing.T) {
+// TestWindowsNameRefused pins the names Windows does not open as written; pure
+// string logic, so it runs on the Linux runner.
+func TestWindowsNameRefused(t *testing.T) {
+	for _, rel := range []string{
+		"NUL", "nul", "Nul.txt", "a/CON", `a\prn.log`, "AUX", "COM1", "com9.log", "LPT0", "COM¹", "lpt³.x",
+		"CONIN$", "conout$.txt", "NUL .txt", "x.log.", "x.log ", "dir./x.log", "x.log:stream", "x::$DATA", "..", "a/../b",
+	} {
+		if !windowsNameRefused(rel) {
+			t.Errorf("windowsNameRefused(%q) = false, want true", rel)
+		}
+	}
+	for _, rel := range []string{
+		"e.log", "a/b/e.log", `a\b\e.log`, "console.log", "nullable.log", "COM10", "LPT", "com", "auxiliary", ".hidden", "a.b.c",
+	} {
+		if windowsNameRefused(rel) {
+			t.Errorf("windowsNameRefused(%q) = true, want false", rel)
+		}
+	}
+}
+
+// TestOpenLogFileRefusesHardLink: a hard link inside ${CONFIG_DIR} to a file
+// outside has an inside final path, so only the link count can refuse it.
+func TestOpenLogFileRefusesHardLink(t *testing.T) {
 	if goruntime.GOOS == "windows" {
-		t.Skip("os.FileInfo carries no file index on Windows; see fileIdentity's doc")
+		t.Skip("covered by the Windows test file")
 	}
 	dir := t.TempDir()
-	a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
-	mustWrite(t, a, "a")
-	mustWrite(t, b, "b")
-	fa1, _ := os.Stat(a)
-	f, err := os.Open(a)
-	if err != nil {
-		t.Fatal(err)
+	cfgDir := filepath.Join(dir, "cfg")
+	outside := filepath.Join(dir, "outside", "secret.txt")
+	mustWrite(t, outside, "secret")
+	mustWrite(t, filepath.Join(cfgDir, "s1", "keep"), "")
+	if err := os.Link(outside, filepath.Join(cfgDir, "s1", "h.log")); err != nil {
+		t.Skipf("link: %v", err)
 	}
-	defer f.Close()
-	fa2, _ := f.Stat()
-	fb, _ := os.Stat(b)
-	i1, d1, ok1 := fileIdentity(fa1)
-	i2, d2, ok2 := fileIdentity(fa2)
-	i3, d3, ok3 := fileIdentity(fb)
-	if !ok1 || !ok2 || !ok3 {
-		t.Fatalf("fileIdentity not available: %v %v %v", ok1, ok2, ok3)
+	mustRefuseOpen(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/h.log"))
+}
+
+// TestRemoveConfigDirLogFile: the before-exec removal (§5.3) deletes only a
+// direct child of a REAL instance directory, and never follows a link.
+func TestRemoveConfigDirLogFile(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("creating symlinks needs a privilege on Windows; junctions are covered by the Windows test file")
 	}
-	if i1 != i2 || d1 != d2 {
-		t.Errorf("same file: (%d,%d) != (%d,%d)", i1, d1, i2, d2)
+	setup := func(t *testing.T) (dir, cfgDir, inst, elsewhere string) {
+		t.Helper()
+		dir = t.TempDir()
+		cfgDir = filepath.Join(dir, "cfg")
+		inst = filepath.Join(cfgDir, "s1")
+		elsewhere = filepath.Join(dir, "elsewhere")
+		mustWrite(t, filepath.Join(inst, "keep"), "")
+		mustWrite(t, filepath.Join(elsewhere, "x.log"), "precious")
+		return dir, cfgDir, inst, elsewhere
 	}
-	if i1 == i3 && d1 == d3 {
-		t.Errorf("different files share identity (%d,%d)", i1, d1)
+	mustExist := func(t *testing.T, p string) {
+		t.Helper()
+		if _, err := os.Lstat(p); err != nil {
+			t.Fatalf("%s should still exist: %v", p, err)
+		}
 	}
+	mustBeGone := func(t *testing.T, p string) {
+		t.Helper()
+		if _, err := os.Lstat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("%s should be gone: %v", p, err)
+		}
+	}
+	mustRefuseRemove := func(t *testing.T, target logFileTarget) {
+		t.Helper()
+		err := removeConfigDirLogFile(target)
+		if !errors.Is(err, errLogFileNotPermitted) {
+			t.Fatalf("removeConfigDirLogFile(%q) = %v, want a refusal", target.OpenPath, err)
+		}
+	}
+
+	t.Run("regular file is removed", func(t *testing.T) {
+		_, cfgDir, inst, _ := setup(t)
+		mustWrite(t, filepath.Join(inst, "e.log"), "old generation")
+		target := openTarget(t, cfgDir, nil, "${CONFIG_DIR}/e.log")
+		if !target.InConfigDir {
+			t.Fatalf("target %+v: want InConfigDir", target)
+		}
+		if err := removeConfigDirLogFile(target); err != nil {
+			t.Fatal(err)
+		}
+		mustBeGone(t, filepath.Join(inst, "e.log"))
+	})
+	t.Run("missing file is not an error", func(t *testing.T) {
+		_, cfgDir, _, _ := setup(t)
+		if err := removeConfigDirLogFile(openTarget(t, cfgDir, nil, "${CONFIG_DIR}/e.log")); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("missing instance dir is not an error", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := removeConfigDirLogFile(openTarget(t, filepath.Join(dir, "cfg"), nil, "${CONFIG_DIR}/e.log")); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("leaf symlink removes the link only", func(t *testing.T) {
+		_, cfgDir, inst, elsewhere := setup(t)
+		mustSymlink(t, filepath.Join(elsewhere, "x.log"), filepath.Join(inst, "e.log"))
+		if err := removeConfigDirLogFile(openTarget(t, cfgDir, nil, "${CONFIG_DIR}/e.log")); err != nil {
+			t.Fatal(err)
+		}
+		mustBeGone(t, filepath.Join(inst, "e.log"))
+		mustExist(t, filepath.Join(elsewhere, "x.log"))
+	})
+	t.Run("planted directory symlink as parent", func(t *testing.T) {
+		_, cfgDir, inst, elsewhere := setup(t)
+		mustSymlink(t, elsewhere, filepath.Join(inst, "sub"))
+		target := openTarget(t, cfgDir, nil, "${CONFIG_DIR}/sub/x.log")
+		if target.InConfigDir {
+			t.Fatalf("target %+v: a file in a subdirectory must not be InConfigDir", target)
+		}
+		mustRefuseRemove(t, target)
+		mustExist(t, filepath.Join(elsewhere, "x.log"))
+		// The forged target (InConfigDir forced) is refused by the re-check.
+		target.InConfigDir = true
+		mustRefuseRemove(t, target)
+		mustExist(t, filepath.Join(elsewhere, "x.log"))
+	})
+	t.Run("instance dir replaced by a symlink", func(t *testing.T) {
+		_, cfgDir, inst, elsewhere := setup(t)
+		if err := os.RemoveAll(inst); err != nil {
+			t.Fatal(err)
+		}
+		mustSymlink(t, elsewhere, inst)
+		target := openTarget(t, cfgDir, nil, "${CONFIG_DIR}/x.log")
+		mustRefuseRemove(t, target)
+		mustExist(t, filepath.Join(elsewhere, "x.log"))
+		// Nor does the linked instance dir make its target an allowed root.
+		mustRefuseOpen(t, target)
+	})
+	t.Run("leaf directory is refused", func(t *testing.T) {
+		_, cfgDir, inst, _ := setup(t)
+		if err := os.MkdirAll(filepath.Join(inst, "d.log"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustRefuseRemove(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/d.log"))
+	})
+	t.Run("external target is refused", func(t *testing.T) {
+		_, cfgDir, _, elsewhere := setup(t)
+		target := openTarget(t, cfgDir, []string{elsewhere}, filepath.Join(elsewhere, "x.log"))
+		mustRefuseRemove(t, target)
+		mustExist(t, filepath.Join(elsewhere, "x.log"))
+	})
 }

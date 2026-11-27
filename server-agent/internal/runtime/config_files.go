@@ -67,14 +67,24 @@ type plannedConfigFile struct {
 // ${AGENT_ENV:NAME} is refused without looking the variable up. An error names
 // the offending token's text, never any value.
 func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, _ func(string) string, configFilesDir string) (string, error) {
-	return expandNonSecretText(content, whatConfigFileContent, spec, port, vendor, vendors, configFilesDir)
+	return expandNonSecretText(content, surfaceConfigFileContent, spec, port, vendor, vendors, configFilesDir)
 }
 
-// The surfaces expandNonSecretText expands, as they appear in its errors.
+// nonSecretSurface names the surface expandNonSecretText expands, which its
+// errors name and which picks the wording of a secret-token refusal.
+type nonSecretSurface int
+
 const (
-	whatConfigFileContent = "config file content"
-	whatLogFilePath       = "log file path"
+	surfaceConfigFileContent nonSecretSurface = iota // config_files content (#257)
+	surfaceLogFilePath                               // a log_files path (#430)
 )
+
+func (s nonSecretSurface) String() string {
+	if s == surfaceLogFilePath {
+		return "log file path"
+	}
+	return "config file content"
+}
 
 // expandNonSecretText is the one expansion loop behind every surface that
 // resolves only the NON-SECRET placeholders: config file content (#257) and a
@@ -82,10 +92,10 @@ const (
 // its doc): resolveNonSecretToken for the non-secret tokens, ${API_TOKEN} and
 // every ${AGENT_ENV...} spelling a hard error, a malformed ${PORT...} a hard
 // error, every other "${...}" and all plain text passed through literally.
-// what names the surface in the errors (whatConfigFileContent or
-// whatLogFilePath), so a refusal says where the token was found. The agent
+// what names the surface in the errors, so a refusal says where the token was
+// found. The agent
 // environment is never read.
-func expandNonSecretText(text, what string, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (string, error) {
+func expandNonSecretText(text string, what nonSecretSurface, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (string, error) {
 	matches := placeholderPattern.FindAllStringIndex(text, -1)
 	if len(matches) == 0 {
 		return text, nil
@@ -132,11 +142,11 @@ func expandNonSecretText(text, what string, spec Spec, port int, vendor GPUVendo
 
 // secretTokenRefusalReason is the "why" of a secret-token refusal on surface
 // what. The config-file wording is the long-standing one, kept verbatim.
-func secretTokenRefusalReason(what string, agentEnv bool) string {
+func secretTokenRefusalReason(what nonSecretSurface, agentEnv bool) string {
 	switch {
-	case what == whatConfigFileContent && agentEnv:
+	case what == surfaceConfigFileContent && agentEnv:
 		return "a written file never carries a secret read from the agent environment (pass it through env instead)"
-	case what == whatConfigFileContent:
+	case what == surfaceConfigFileContent:
 		return "a written file never carries a secret (pass it through args or env instead)"
 	case agentEnv:
 		return "a path the agent reads is never built from a secret read from the agent environment"
