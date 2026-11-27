@@ -66,6 +66,7 @@ func main() {
 	logFile := flag.String("log-file", "", "if set, append -log-text to this file at startup (creating it), and -log-exit-text right before a scripted exit -- stands in for a server that writes its own log file instead of stdout/stderr (#430)")
 	logText := flag.String("log-text", "", "what -log-file gets at startup, with \\n read as a newline and {pid} as this process's PID")
 	logExitText := flag.String("log-exit-text", "", "what -log-file gets right before -crash-after or -exit-when ends the process (same escapes as -log-text): a crashing server's last lines")
+	logDelay := flag.Duration("log-delay", 0, "wait this long before appending -log-text, so a test can tell when this process's first line can appear at the earliest")
 	exitWhen := flag.String("exit-when", "", "if set, exit with -exit-code as soon as this file can be REMOVED by this process (polled every 10ms): the test decides the moment of the exit, and since the first process to remove the file consumes it, the next generation started with the same argv does not exit too")
 	flag.Parse()
 
@@ -91,7 +92,14 @@ func main() {
 		fmt.Print(strings.ReplaceAll(*printText, `\n`, "\n"))
 	}
 
-	appendLog(*logFile, *logText)
+	if *logDelay > 0 {
+		go func() {
+			time.Sleep(*logDelay)
+			appendLog(*logFile, *logText)
+		}()
+	} else {
+		appendLog(*logFile, *logText)
+	}
 
 	if *argvLog != "" {
 		if err := os.WriteFile(*argvLog, []byte(strings.Join(os.Args[1:], " ")), 0o644); err != nil {

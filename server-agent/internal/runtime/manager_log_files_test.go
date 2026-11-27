@@ -512,3 +512,176 @@ func TestManagerLogFileRetentionIsNotWrittenToDisk(t *testing.T) {
 		t.Fatalf("log-file text reached disk outside the server's own file at %v", offenders)
 	}
 }
+
+// TestManagerRetiredBurstRowEndsItsTailersGrace: a crashed burst instance is
+// retired (deleteState) when a request names it again, and the fresh state
+// starts generation N+1 at once. The log file is an external path, so N and
+// N+1 share one inode; N's tailers, still in their grace, must have been ended
+// by the deletion, or N's stream would read N+1's text for the rest of the
+// grace. The grace is 30 s, so only that ending can keep them apart here, and
+// N+1 writes its first line 200 ms after exec, beyond the documented
+// not-awaited window of that ending.
+func TestManagerRetiredBurstRowEndsItsTailersGrace(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setLogFileGrace(t, 30*time.Second)
+	ext := t.TempDir()
+	gate := filepath.Join(t.TempDir(), "exit-now")
+	policy := allowlistPolicy()
+	policy.AllowedLogDirs = []string{ext}
+	m := newLogFileManager(t, policy, t.TempDir())
+
+	logPath := filepath.Join(ext, "engine.log")
+	spec := replicableSpec("S", "m")
+	spec.Args = append(spec.Args, "-log-file", logPath, "-log-delay", "200ms",
+		"-log-text", `start {pid}\n`, "-log-exit-text", `last {pid}\n`, "-exit-when", gate, "-exit-code", "3")
+	spec.LogFiles = []LogFile{{Name: "engine", Path: logPath}}
+	m.Apply(Config{Specs: []Spec{spec}, ETag: "v1"})
+
+	// instGens is instance 1's generations and pids, from its started
+	// markers (instance 0 never runs here).
+	instGens := func() (gens []uint64, pids []int) {
+		for _, r := range streamRecords(m, "S", "") {
+			if r.event == logEventStarted && r.instance == 1 {
+				gens, pids = append(gens, r.gen), append(pids, r.pid)
+			}
+		}
+		return gens, pids
+	}
+
+	_, release := ensureModel(t, m, "m#1")
+	release()
+	var gens []uint64
+	var pids []int
+	waitUntil(t, 10*time.Second, "N's engine text", func() bool {
+		gens, pids = instGens()
+		return len(gens) == 1 && strings.Contains(genText(streamRecords(m, "S", "engine"), gens[0]), "start ")
+	})
+	if err := os.WriteFile(gate, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 10*time.Second, "instance 1 crashed", func() bool {
+		st := instanceStatus(m, "S", 1)
+		return st != nil && st.State == StateCrashed
+	})
+
+	// Named again: the crashed row is retired and N+1 starts in N's grace.
+	_, release = ensureModel(t, m, "m#1")
+	release()
+	waitUntil(t, 10*time.Second, "N+1's engine text", func() bool {
+		gens, pids = instGens()
+		return len(gens) == 2 && strings.Contains(genText(streamRecords(m, "S", "engine"), gens[1]), "start ")
+	})
+	// A few of N's polls (250 ms each) would have read N+1's line by now.
+	time.Sleep(time.Second)
+	recs := streamRecords(m, "S", "engine")
+	pidN, pidN1 := strconv.Itoa(pids[0]), strconv.Itoa(pids[1])
+	if got := genText(recs, gens[0]); got != "[#1] start "+pidN+"\n[#1] last "+pidN+"\n" {
+		t.Errorf("N's engine text = %q, want N's lines only", got)
+	}
+	if got := genText(recs, gens[1]); got != "[#1] start "+pidN1+"\n" {
+		t.Errorf("N+1's engine text = %q, want its own line", got)
+	}
+}
+
+// TestManagerPlainStopGetsNoLogFileTails: a plain intentional stop -- here an
+// admin stop of a generation still starting -- records no failure, so its
+// tails attach to nothing: the last_error that stays is the earlier crash's,
+// with that crash's own tails.
+func TestManagerPlainStopGetsNoLogFileTails(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	setLogFileGrace(t, 300*time.Millisecond)
+	dir := t.TempDir()
+	gate := filepath.Join(dir, "exit-now")
+	never := filepath.Join(dir, "never-healthy")
+	m := newLogFileManager(t, allowlistPolicy(), t.TempDir())
+
+	spec := logFileSpec("spec-stop", "stop-model",
+		"-health-gate", never, "-exit-when", gate, "-exit-code", "1",
+		"-log-text", `start {pid}\n`, "-log-exit-text", `last {pid}\n`)
+	spec.StartupTimeoutSeconds = 30
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	var gens []uint64
+	var pids []int
+	waitUntil(t, 10*time.Second, "generation N's engine text", func() bool {
+		gens, pids = startedGens(m, "spec-stop")
+		return len(gens) == 1 && strings.Contains(genText(streamRecords(m, "spec-stop", "engine"), gens[0]), "start ")
+	})
+	if err := os.WriteFile(gate, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pidN := strconv.Itoa(pids[0])
+	nTails := "start " + pidN + "\nlast " + pidN + "\n"
+	waitForLastError(t, m, "spec-stop", "N's last_error with its tails", func(le *LastError) bool {
+		return len(le.LogFileTails) == 1 && le.LogFileTails[0].Tail == nTails
+	})
+	waitUntil(t, 10*time.Second, "generation N+1's engine text", func() bool {
+		gens, _ = startedGens(m, "spec-stop")
+		return len(gens) == 2 && strings.Contains(genText(streamRecords(m, "spec-stop", "engine"), gens[1]), "start ")
+	})
+
+	stopped := spec
+	stopped.AdminState = "force_stopped"
+	m.Apply(Config{ETag: "e2", MaxProcesses: 1, Specs: []Spec{stopped}})
+	waitForState(t, m, "spec-stop", StateStopped)
+	deadline := time.Now().Add(3 * logFileGrace)
+	for time.Now().Before(deadline) {
+		s := statusFor(m, "spec-stop")
+		if s == nil || s.LastError == nil || s.LastError.Failures != 1 || len(s.LastError.LogFileTails) != 1 || s.LastError.LogFileTails[0].Tail != nTails {
+			t.Fatalf("after the stop, last_error = %+v, want N's crash with N's tails only", s)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestManagerStaleConfigDirLogTailsFromEOF: when the earlier run's
+// ${CONFIG_DIR} file cannot be removed (here: its directory is read-only), the
+// start goes ahead, the stream records file_stale, and the tailer starts at
+// the file's end, so the earlier run's lines are not shown as this run's.
+func TestManagerStaleConfigDirLogTailsFromEOF(t *testing.T) {
+	skipOnWindows(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permission that makes the removal fail")
+	}
+	shrinkTimings(t)
+	base := t.TempDir()
+	inst := filepath.Join(base, "spec-stale")
+	if err := os.MkdirAll(inst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inst, "engine.log"), []byte("an earlier run's line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(inst, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(inst, 0o755) })
+	m := newLogFileManager(t, allowlistPolicy(), base)
+
+	// Written 200 ms after exec, so it lands after the tailer's first open
+	// has taken the end of the file.
+	spec := logFileSpec("spec-stale", "stale-model", "-log-delay", "200ms", "-log-text", `this run {pid}\n`)
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	var gens []uint64
+	var pids []int
+	waitUntil(t, 10*time.Second, "this run's engine text", func() bool {
+		gens, pids = startedGens(m, "spec-stale")
+		return len(gens) == 1 && strings.Contains(genText(streamRecords(m, "spec-stale", "engine"), gens[0]), "this run")
+	})
+	recs := streamRecords(m, "spec-stale", "engine")
+	if got, want := genText(recs, gens[0]), "this run "+strconv.Itoa(pids[0])+"\n"; got != want {
+		t.Errorf("engine text = %q, want only this run's %q (tailed from the end)", got, want)
+	}
+	var events []string
+	for _, r := range recs {
+		if r.gen == gens[0] && r.event != "" {
+			events = append(events, r.event)
+		}
+	}
+	if len(events) < 2 || events[0] != logEventFileStale || events[1] != logEventFileOpened {
+		t.Errorf("engine events = %v, want %s then %s", events, logEventFileStale, logEventFileOpened)
+	}
+}

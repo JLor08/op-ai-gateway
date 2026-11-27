@@ -22,9 +22,11 @@ import (
 //     the name is stale and its tailer starts at the end of what is there,
 //     after a file_stale marker. The tailers of N-1 for the same names are told
 //     to end their grace now (endPredecessorGraces): N-1 is dead, so nothing
-//     more of it can arrive, and ending it before N exists keeps N's text out
-//     of N-1's stream even where both read one inode (an external path, a stale
-//     name).
+//     more of it can arrive, and its final read starts before N exists. That
+//     read is not awaited, so where both read one inode (an external path, a
+//     stale name) a few early bytes of N can still reach N-1's stream; a
+//     ${CONFIG_DIR} file N-1 held is fully separated. A deleted state ends its
+//     tailers' grace in deleteState.
 //   - After exec: one tailer per accepted declaration, writing into the
 //     generation's sibling stream (procLog.ForStream), which carries the
 //     generation, the instance prefix and the generation's secret masker.
@@ -64,7 +66,9 @@ const logFileTailBytes = 2048
 // logged and the start goes ahead; the tailer then reports file_waiting.
 //
 // Nothing here fails the start: a log file is a diagnostic, never a reason for
-// a model not to run.
+// a model not to run. The refused names are marked file_not_permitted only
+// once the exec has succeeded (startLogFileTailers), so a start whose exec
+// fails records no file_not_permitted for them.
 func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (targets []logFileTarget, refused []string, stale map[string]bool) {
 	configDir := ""
 	for _, lf := range spec.LogFiles {

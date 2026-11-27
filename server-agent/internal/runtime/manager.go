@@ -2866,6 +2866,19 @@ func (o *owner) signalTransition() {
 // state with no process, a removed state's exit -- so the doorbell is rung
 // here, and every deletion of a state goes through here.
 func (o *owner) deleteState(id string) {
+	// A deleted state's exited generations may still have log-file tailers in
+	// their post-exit grace (#430). Nothing would end it later -- the next
+	// generation, if any, starts under a fresh state with none -- so it ends
+	// now, before anything can start that generation: otherwise, on an
+	// external path or a stale name, the new generation's text could reach
+	// the old one's stream for the rest of the grace (a burst row retired and
+	// started again, retireIfSpent, a spec removed in backoff and re-added).
+	if st := o.specs[id]; st != nil {
+		for _, t := range st.graceTailers {
+			t.EndGrace()
+		}
+		st.graceTailers = nil
+	}
 	delete(o.specs, id)
 	o.signalTransition()
 }
@@ -4812,9 +4825,12 @@ func (o *owner) startProcess(st *specState) {
 
 	// The declared log files (#430), resolved with the port this launch
 	// really uses. Removing a ${CONFIG_DIR} file must happen before exec, so
-	// the server writes a fresh file of its own, and ending the predecessor's
-	// grace before exec keeps this generation's text out of its stream. A log
-	// file never fails the start (see prepareLogFiles).
+	// the server writes a fresh file of its own. The predecessor's grace is
+	// ended before exec too, so its final read starts before this generation
+	// runs; it is not awaited, so where both read one inode (an external path
+	// or a stale name) a few early bytes of this generation can still reach
+	// the predecessor's stream (see endPredecessorGraces). A log file never
+	// fails the start (see prepareLogFiles).
 	logTargets, logRefused, logStale := prepareLogFiles(spec, o.policy, port, o.gpuVendor, o.gpuVendors, o.configFilesDir)
 	endPredecessorGraces(st, logTargets)
 
