@@ -30,6 +30,12 @@ type SystemReport struct {
 	// CPU devices such as llvmpipe included; 0 means unknown or none.
 	// collector.CollectHardware fills it from vulkaninfo on a host with GPUs.
 	VulkanDeviceCount int `json:"vulkan_device_count,omitempty"`
+	// GPULegacyVendor is the vendor (nvidia, amd, apple) this agent's runtime
+	// gives a GPU without one: the first GPU tool it detected at startup, in
+	// the order nvidia, amd, apple. Empty on a host without a GPU tool. It
+	// comes from detection, not from GPUs, so a report that misses a vendor
+	// (a timed-out collector) still names the right one.
+	GPULegacyVendor string `json:"gpu_legacy_vendor,omitempty"`
 }
 
 // CPUInfo is the CPU section (from gopsutil cpu.Info + cpu.Counts).

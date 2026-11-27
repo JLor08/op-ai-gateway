@@ -40,6 +40,19 @@ func TestSanitizeSystemReportKeepsGPUVendorFields(t *testing.T) {
 	}
 }
 
+func TestSanitizeSystemReportLegacyVendor(t *testing.T) {
+	for raw, want := range map[string]string{` NVIDIA `: "nvidia", `amd`: "amd", `intel`: ""} {
+		var r agentSystemReport
+		if err := json.Unmarshal([]byte(`{"gpu_legacy_vendor":"`+raw+`"}`), &r); err != nil {
+			t.Fatal(err)
+		}
+		sanitizeSystemReport(&r, time.Now())
+		if r.GPULegacyVendor != want {
+			t.Errorf("gpu_legacy_vendor %q -> %q, want %q", raw, r.GPULegacyVendor, want)
+		}
+	}
+}
+
 func TestTelemetryGPUSampleCarriesVendorAndPCI(t *testing.T) {
 	req, _ := ingestReq(t, `{"host":{"cpu_util_pct":1},"gpus":[{"index":0,"name":"x","vendor":"AMD","pci_bus_id":"0000:01:00.0"},{"index":1,"vendor":"intel"}]}`)
 	s, err := telemetrySampleFromRequest(req, time.Now())

@@ -3628,17 +3628,26 @@ that already had an NVIDIA and a ROCm-visible AMD card keeps exactly its meaning
 legacy vendor **before** comparing or storing the document
 (`resolveLegacyGPUVendors`), so an upgraded gateway that makes the same vendor
 explicit pushes a spec equal to the resolved one and nothing relaunches; no model
-goes offline on the upgrade. The gateway makes it explicit once per server, from
-the **first vendor-reporting hardware report**: `BackfillServerGPUVendor` stores the
-report's legacy vendor in `ai_servers.gpu_legacy_vendor` on every such report, and
-rewrites that server's empty-vendor rows (its specs' GPU rows, its budgets, its
+goes offline on the upgrade. The agent reports its legacy vendor itself, as the
+hardware report's `gpu_legacy_vendor` (`runtimeGPUVendor`, the same startup
+detection the runtime resolves with), because the report's GPU list can be
+partial: `CollectHardware` drops a GPU collector that errors (2 s budget), so a
+cold `nvidia-smi` on an NVIDIA+AMD host yields an AMD-only list while the runtime
+still means NVIDIA by an empty vendor. The gateway makes the vendor explicit once
+per server, from the **first vendor-reporting hardware report**:
+`BackfillServerGPUVendor` stores the agent's `gpu_legacy_vendor` as is in
+`ai_servers.gpu_legacy_vendor` on every such report (never derived from the GPU
+list when present), and rewrites that server's empty-vendor rows (its specs' GPU rows, its budgets, its
 manual member specs' GPU rows, its cluster member GPU rows) to it in one
 transaction; an empty row whose owner already has an explicit row of that vendor
-at the same index is deleted instead (the explicit one wins). The legacy vendor is
+at the same index is deleted instead (the explicit one wins). A report that lists
+vendors but carries no `gpu_legacy_vendor` (no 0.27.0 agent sends one) falls back
+to the list's first of NVIDIA, AMD, Apple, but never moves the stored vendor down
+that order, so a partial report cannot turn a stored `nvidia` into `amd`. The legacy vendor is
 written again on every vendor-reporting report; a vendor-less report (an older
 agent) calls nothing, so it never re-derives or clears the stored legacy vendor,
 and a downgraded agent keeps being sent the rows it got. When the backfill rewrote rows and the
-report lists more than one vendor, it raises `ai_servers.gpu_vendor_note`: the
+report's GPUs list more than one vendor, it raises `ai_servers.gpu_vendor_note`: the
 portal shows an informational note on the server that legacy GPU assignments were
 mapped to the legacy vendor and should be reviewed, until an operator dismisses it
 (`POST /api/portal/servers/{id}/gpu-vendor-note/dismiss`); it never blocks a save.

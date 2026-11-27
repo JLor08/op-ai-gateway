@@ -5636,6 +5636,13 @@ func TestHardwareOptionsUseConfigMeasurability(t *testing.T) {
 	}
 }
 
+func TestHardwareOptionsCarryLegacyVendor(t *testing.T) {
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{GPULegacyVendor: "nvidia"})
+	if got := a.hardwareOptions().GPULegacyVendor; got != "nvidia" {
+		t.Fatal(got)
+	}
+}
+
 func TestSeedHostInfoCarriesVulkanMap(t *testing.T) {
 	sink := &fakeHostInfoSink{}
 	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{HostInfo: sink})

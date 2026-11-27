@@ -14326,9 +14326,10 @@ two RTX 2080 Ti, proprietary driver, kernel 6.12), llama.cpp from one commit:
    GPU row in the gateway carries the vendor (`gpu_vendor` in four primary keys,
    migration 119). An empty vendor keeps its old meaning, *the host's only vendor*,
    resolved to the **legacy vendor** (the first of NVIDIA, AMD, Apple the host has):
-   the agent resolves it before comparing a document, and the gateway rewrites a
-   server's empty-vendor rows to it once, from the first vendor-reporting hardware
-   report, persisting it (`ai_servers.gpu_legacy_vendor`) and raising a review note
+   the agent resolves it before comparing a document and reports it
+   (`gpu_legacy_vendor`, from its detection, since a timed-out collector leaves the
+   GPU list partial), and the gateway rewrites a server's empty-vendor rows to that
+   value once, from the first vendor-reporting hardware report, persisting it (`ai_servers.gpu_legacy_vendor`) and raising a review note
    (`gpu_vendor_note`) when that report shows several vendors.
 2. **Per-process VRAM is measured for both vendors at once.** On Linux a composite
    measurer merges NVIDIA compute-apps and one AMD measurer; for AMD a **DRM fdinfo

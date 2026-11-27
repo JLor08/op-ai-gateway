@@ -161,9 +161,14 @@ that declares `gpu_vendor_identity` (#434), three more, each `omitempty`:
 
 The report itself gains **`vulkan_device_count`**: how many Vulkan devices the
 probe saw, CPU devices such as llvmpipe included (they occupy ordinals); `0`
-or absent when unknown or not probed. The gateway sanitizes all four on ingest
+or absent when unknown or not probed. It also gains **`gpu_legacy_vendor`**:
+the vendor (`nvidia`, `amd`, `apple`) the agent's runtime gives a GPU without
+one, taken from the agent's startup detection rather than from `gpus`, which
+misses a vendor whose collector timed out; absent on a host without a GPU tool.
+The gateway backfills and stores exactly this value ([Agent-Managed Model Runtime §3.10](agent-runtime-manager.md#310-mixed-vendor-gpu-hosts)).
+The gateway sanitizes all five on ingest
 (unknown `vram_measurable` entries dropped, the list de-duplicated and sorted,
-a negative ordinal or count dropped) and stores them in `report_json`; the
+a negative ordinal or count dropped, an unknown legacy vendor dropped) and stores them in `report_json`; the
 portal's hardware table shows the vendor, the Vulkan ordinal and the
 measurable backends.
 

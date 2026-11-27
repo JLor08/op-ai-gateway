@@ -1635,7 +1635,7 @@ saves; the agent applies its own rule at launch. The server DTO carries
 The server hardware response's `report` (`GET /api/portal/servers/{id}/hardware`)
 carries, per GPU, `vendor`, `pci_bus_id`, `vram_measurable` (the backends the agent
 measures on the card: `cuda`, `rocm`, `vulkan`) and `vulkan_ordinal`, and at the top
-`vulkan_device_count`, each omitted when unknown, as the agent's system report
+`vulkan_device_count` and `gpu_legacy_vendor` (the agent's own legacy vendor), each omitted when unknown, as the agent's system report
 sends them ([Telemetry §8.2.5](../cross-cutting/telemetry-usage-observability.md#825-static-hardware-inventory));
 the agent's telemetry adds `vendor` to each GPU and to each runtime row's `gpus[]`.
 
@@ -2072,7 +2072,7 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 |---|---|---|
 | `/api/agent/v1/telemetry` | POST | Ingest one telemetry sample (POST transport) |
 | `/api/agent/v1/stream` | GET (WebSocket upgrade) | Persistent telemetry stream (WebSocket transport) + server-pushed doorbells (e.g. certificate updates) |
-| `/api/agent/v1/system-report` | POST | Ingest the static hardware inventory report (per GPU `vendor`, `vram_measurable`, `vulkan_ordinal`, and `vulkan_device_count`, from an agent with `gpu_vendor_identity`; a report that carries vendors also drives the one-time legacy-vendor backfill, [GPU vendors](#gpu-vendors-on-gpu-rows)) |
+| `/api/agent/v1/system-report` | POST | Ingest the static hardware inventory report (per GPU `vendor`, `vram_measurable`, `vulkan_ordinal`, and `vulkan_device_count` and `gpu_legacy_vendor`, from an agent with `gpu_vendor_identity`; a report that carries vendors also drives the one-time legacy-vendor backfill, which uses the agent's `gpu_legacy_vendor` as is and, without it, never moves the stored vendor down the NVIDIA, AMD, Apple order, [GPU vendors](#gpu-vendors-on-gpu-rows)) |
 | `/api/agent/v1/certificate` | GET | Fetch the agent's current mesh leaf certificate (cert modes `files`/`proxy`) |
 | `/api/agent/v1/ca` | GET | Fetch the internal CA bundle |
 | `/api/agent/v1/proxy-routes` | GET | Fetch the gateway-provided TLS proxy route topology (cert mode `proxy`) |

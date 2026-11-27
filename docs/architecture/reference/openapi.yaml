@@ -5004,6 +5004,15 @@ paths:
     post:
       tags: [agent]
       summary: Ingest the static hardware inventory report
+      description: >
+        The agent's static hardware inventory. From an agent with
+        gpu_vendor_identity each GPU carries vendor, vram_measurable and
+        vulkan_ordinal, and the report carries vulkan_device_count and
+        gpu_legacy_vendor (the vendor the agent's runtime gives a GPU without
+        one, from its startup detection). A report that names a vendor drives
+        the legacy-vendor backfill: gpu_legacy_vendor is stored as is; without
+        it the GPU list's first of nvidia, amd, apple is used, never one below
+        the stored vendor in that order.
       security: [{ agentToken: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:

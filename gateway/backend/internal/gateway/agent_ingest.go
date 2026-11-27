@@ -2087,6 +2087,11 @@ type agentSystemReport struct {
 	// VulkanDeviceCount is how many Vulkan devices the agent's probe saw; 0
 	// when unknown or not probed.
 	VulkanDeviceCount int `json:"vulkan_device_count,omitempty"`
+	// GPULegacyVendor is the vendor the agent's runtime gives a GPU without
+	// one (nvidia, amd, apple; "" = not reported or invalid). It comes from
+	// the agent's detection, so it is right even when a timed-out collector
+	// left a vendor out of GPUs; the legacy-vendor backfill uses it as is.
+	GPULegacyVendor string `json:"gpu_legacy_vendor,omitempty"`
 }
 
 type agentCPUInfo struct {
@@ -2687,6 +2692,7 @@ func sanitizeSystemReport(r *agentSystemReport, now time.Time) ([]byte, time.Tim
 	}
 
 	r.VulkanDeviceCount = nonNegI(r.VulkanDeviceCount)
+	r.GPULegacyVendor = sanitizeGPUVendor(r.GPULegacyVendor)
 
 	collectedAt := r.CollectedAt
 	if collectedAt.IsZero() {
@@ -2712,7 +2718,8 @@ func (s *Server) ingestSystemReport(ctx context.Context, serverID string, raw js
 	}
 	now := time.Now().UTC()
 	canonical, collectedAt := sanitizeSystemReport(&req, now)
-	if _, err := s.Routes.AIServerByID(ctx, serverID); err != nil {
+	server, err := s.Routes.AIServerByID(ctx, serverID)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			slog.Warn("agent system report rejected: unknown server", "server_id", serverID)
 			return errAgentUnknownServer
@@ -2725,36 +2732,56 @@ func (s *Server) ingestSystemReport(ctx context.Context, serverID string, raw js
 		slog.Error("agent system report: upsert failed", "server_id", serverID, "err", err)
 		return &storeTelemetryError{code: "agent.system_report_failed", message: "system report upsert failed", cause: err}
 	}
-	s.backfillGPUVendorFromReport(ctx, serverID, req.GPUs)
+	s.backfillGPUVendorFromReport(ctx, serverID, legacyVendorFromReport(&req, server.GPULegacyVendor), req.GPUs)
 	slog.Debug("agent system report stored", "server_id", serverID, "gpus", len(req.GPUs))
 	return nil
 }
 
-// backfillGPUVendorFromReport makes the server's legacy empty GPU vendor
-// explicit from a sanitized hardware report that carries vendors: the vendor
-// the empty one stands for is the report's first of nvidia, amd, apple, and a
-// host with more than one vendor raises the review note. A report without any
-// vendor (an agent without gpu_vendor_identity) calls nothing and never clears
-// what is stored. The store persists the legacy vendor on every call and
-// rewrites rows only the first time, so a repeated report costs one
-// transaction and no push. Best-effort: a failure is logged, never fails the
-// report it rode in on.
-//
-// When rows were rewritten the server's runtime document changes (its specs
-// and budgets), and so can its cluster heads' (the member GPU rows on this
-// server feed a head's document): the server is pushed itself, and
-// NotifyClustersOfServer pushes every server sharing a cluster with it.
-func (s *Server) backfillGPUVendorFromReport(ctx context.Context, serverID string, gpus []agentGPUInfo) {
+// legacyVendorFromReport picks the legacy vendor a sanitized hardware report
+// stands for. The agent's own gpu_legacy_vendor wins as is: it comes from the
+// agent's detection, while GPUs can miss a vendor whose collector timed out.
+// Without it (an older agent) the report's first of nvidia, amd, apple is
+// used, but never one below stored in that order, so a partial report cannot
+// move the stored vendor down. "" when the report names no vendor at all.
+func legacyVendorFromReport(r *agentSystemReport, stored string) string {
+	if r.GPULegacyVendor != "" {
+		return r.GPULegacyVendor
+	}
+	vendors := reportGPUVendors(r.GPUs)
+	if len(vendors) == 0 {
+		return ""
+	}
+	return routing.LegacyGPUVendor(append(vendors, stored))
+}
+
+// reportGPUVendors lists the distinct non-empty vendors of gpus, in order.
+func reportGPUVendors(gpus []agentGPUInfo) []string {
 	var vendors []string
 	for _, g := range gpus {
 		if g.Vendor != "" && !slices.Contains(vendors, g.Vendor) {
 			vendors = append(vendors, g.Vendor)
 		}
 	}
-	if len(vendors) == 0 {
+	return vendors
+}
+
+// backfillGPUVendorFromReport makes the server's legacy empty GPU vendor
+// explicit as legacy (legacyVendorFromReport), and a report whose GPUs carry
+// more than one vendor raises the review note. legacy "" (an agent without
+// gpu_vendor_identity) calls nothing and never clears what is stored. The
+// store persists the legacy vendor on every call and rewrites rows only the
+// first time, so a repeated report costs one transaction and no push.
+// Best-effort: a failure is logged, never fails the report it rode in on.
+//
+// When rows were rewritten the server's runtime document changes (its specs
+// and budgets), and so can its cluster heads' (the member GPU rows on this
+// server feed a head's document): the server is pushed itself, and
+// NotifyClustersOfServer pushes every server sharing a cluster with it.
+func (s *Server) backfillGPUVendorFromReport(ctx context.Context, serverID, legacy string, gpus []agentGPUInfo) {
+	if legacy == "" {
 		return
 	}
-	rewritten, err := s.Routes.BackfillServerGPUVendor(ctx, serverID, routing.LegacyGPUVendor(vendors), len(vendors) > 1)
+	rewritten, err := s.Routes.BackfillServerGPUVendor(ctx, serverID, legacy, len(reportGPUVendors(gpus)) > 1)
 	if err != nil {
 		slog.Warn("agent system report: gpu vendor backfill failed", "server_id", serverID, "err", err)
 		return

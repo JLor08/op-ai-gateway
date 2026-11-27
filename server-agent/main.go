@@ -269,6 +269,11 @@ func main() {
 	vramMeasurer := collector.NewVRAMMeasurer()
 	mgr.SetMeasurer(runtimeMeasurer(vramMeasurer))
 	deps.VRAMMeasurable = vramMeasurer.Measurable
+	// The hardware report names the runtime's legacy vendor (the same
+	// detection as GPUVendor above) so the gateway stores and backfills
+	// exactly the vendor this agent gives a GPU without one, never one
+	// guessed from a report a timed-out GPU collector left incomplete.
+	deps.GPULegacyVendor = string(runtimeGPUVendor(gpus))
 	// Per-process host-RAM measurement is the same kind of hardware capability
 	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
 	// private working set on it, and returns nil on a host that cannot read

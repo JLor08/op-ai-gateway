@@ -89,6 +89,26 @@ func TestCollectHardwareCopiesVendor(t *testing.T) {
 
 func noVulkan(context.Context) ([]VulkanDevice, bool) { return nil, false }
 
+type erroringGPUCollector struct{}
+
+func (erroringGPUCollector) Name() string    { return "nvidia-smi" }
+func (erroringGPUCollector) Available() bool { return true }
+func (erroringGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
+	return nil, context.DeadlineExceeded
+}
+
+// A collector that times out drops its GPUs from the report, but the legacy
+// vendor is the runtime's own (from the detection), so a partial AMD-only
+// report from a NVIDIA+AMD host still names nvidia.
+func TestCollectHardwareReportsRuntimeLegacyVendor(t *testing.T) {
+	amd := fixedGPUCollector{gpus: []sample.GPU{{Index: 0, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	opts := HardwareOptions{Vulkan: noVulkan, GPULegacyVendor: VendorNVIDIA}
+	r := CollectHardware(context.Background(), []GPUCollector{erroringGPUCollector{}, amd}, "x", opts)
+	if len(r.GPUs) != 1 || r.GPUs[0].Vendor != VendorAMD || r.GPULegacyVendor != VendorNVIDIA {
+		t.Fatalf("gpus=%+v legacy=%q", r.GPUs, r.GPULegacyVendor)
+	}
+}
+
 func vulkanFromFixture(t *testing.T, name string) func(context.Context) ([]VulkanDevice, bool) {
 	return func(context.Context) ([]VulkanDevice, bool) {
 		return parseVulkaninfo([]byte(readTestdata(t, name))), true

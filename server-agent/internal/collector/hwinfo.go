@@ -39,6 +39,9 @@ type HardwareOptions struct {
 	// collectVulkan, which runs the host's vulkaninfo. A hook so tests are
 	// independent of the host's Vulkan tooling.
 	Vulkan func(context.Context) ([]VulkanDevice, bool)
+	// GPULegacyVendor is the runtime's legacy GPU vendor (nvidia, amd,
+	// apple or ""), copied into the report's gpu_legacy_vendor unchanged.
+	GPULegacyVendor string
 }
 
 // HelperMemoryModulesNeeded reports whether r lacks the memory modules that
@@ -59,6 +62,9 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 		OS:           runtime.GOOS,
 		Arch:         runtime.GOARCH,
 		GPUs:         []sample.GPUInfo{},
+		// The runtime's legacy vendor, not one derived from the GPUs below:
+		// a collector that errors drops its GPUs from this report.
+		GPULegacyVendor: opts.GPULegacyVendor,
 	}
 
 	if infos, err := cpu.InfoWithContext(ctx); err == nil && len(infos) > 0 {

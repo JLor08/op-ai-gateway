@@ -1117,6 +1117,10 @@ type Deps struct {
 	// VRAMMeasurable reports which per-process VRAM sources work per vendor
 	// (the measurer's Measurable); it feeds the hardware report. Nil = none.
 	VRAMMeasurable func() map[string][]string
+	// GPULegacyVendor is the runtime's legacy GPU vendor (main.go's
+	// runtimeGPUVendor); the hardware report carries it as
+	// gpu_legacy_vendor. "" = no GPU tool detected.
+	GPULegacyVendor string
 	// GatewayFeatures carries the same typed-nil caveat as TrustSync: assign
 	// only a proven-non-nil value (main.go's *runtimectl.FeaturesClient
 	// always is), never a possibly-nil concrete pointer.
@@ -1192,7 +1196,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		netifCollector:  d.Interfaces,
 		ifaces:          newInterfaceInventory(),
 		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries, wslProbeConfig{Exe: cfg.RuntimeWSLExe, User: cfg.RuntimeWSLUser}),
-		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket, VRAMMeasurable: d.VRAMMeasurable, Vulkan: hardwareVulkanProbe},
+		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket, VRAMMeasurable: d.VRAMMeasurable, Vulkan: hardwareVulkanProbe, GPULegacyVendor: d.GPULegacyVendor},
 	}
 	if cfg.HelperSocket != "" {
 		helper := collector.NewHelperHTTPClient(cfg.HelperSocket)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"op-ai-gateway/internal/routing"
 	"slices"
 	"strings"
 	"testing"
@@ -156,6 +157,58 @@ func TestHardwareReportBackfillsLegacyVendorOnce(t *testing.T) {
 	}
 	if got := spy.take(); len(got) != 0 {
 		t.Fatalf("the repeated report notified %v, want nothing", got)
+	}
+}
+
+// withLegacyVendor adds the agent's own gpu_legacy_vendor to a gpuReportBody.
+func withLegacyVendor(body json.RawMessage, vendor string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"gpu_legacy_vendor":%q,`, vendor) + string(body[1:]))
+}
+
+// A NVIDIA+AMD host whose nvidia-smi timed out sends an AMD-only report; the
+// agent still names nvidia as its legacy vendor, and that is what the gateway
+// stores and rewrites the empty rows to.
+func TestPartialReportUsesAgentLegacyVendor(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_partial")
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", withLegacyVendor(gpuReportBody("amd"), " NVIDIA ")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := specGPUVendors(t, srv, "rspec_partial"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("spec GPU vendors = %v, want [nvidia] (the agent's legacy vendor)", got)
+	}
+	server, _ := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if server.GPULegacyVendor != "nvidia" {
+		t.Fatalf("server legacy vendor %q, want nvidia", server.GPULegacyVendor)
+	}
+}
+
+// A report without gpu_legacy_vendor never moves the stored legacy vendor
+// down the nvidia > amd > apple precedence: an AMD-only report after a stored
+// nvidia keeps nvidia, and a later empty row is rewritten to nvidia.
+func TestReportWithoutLegacyFieldNeverDowngrades(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_first")
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("nvidia", "amd")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	// An empty-vendor row written after the first backfill.
+	if err := srv.Routes.SetRuntimeSpecGPUs(ctx, "rspec_first", []routing.RuntimeSpecGPU{
+		{SpecID: "rspec_first", GPUIndex: 1, VRAMEstimateMB: 1000},
+	}); err != nil {
+		t.Fatalf("set spec gpus: %v", err)
+	}
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("amd")); err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	server, _ := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if server.GPULegacyVendor != "nvidia" {
+		t.Fatalf("server legacy vendor %q, want nvidia kept", server.GPULegacyVendor)
+	}
+	if got := specGPUVendors(t, srv, "rspec_first"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("later spec GPU vendors = %v, want [nvidia]", got)
 	}
 }
 
