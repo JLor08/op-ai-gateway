@@ -776,8 +776,9 @@ func TestStatusAndLastErrorJSONTags(t *testing.T) {
 // The table is the exhaustive reachable surface, not a sample. Config, Spec
 // and GPUBudget declare no custom UnmarshalJSON, so a malformed document can
 // only fail in two places: json.Unmarshal (syntax errors and type mismatches,
-// including the whole-document non-object cases) and the two structural
-// checks (duplicate spec id, bad config_files name). Each is covered below.
+// including the whole-document non-object cases) and the three structural
+// checks (duplicate spec id, bad config_files name, bad log_files). Each is
+// covered below.
 //
 // It also pins the literal wire VALUES. They are a three-sided contract --
 // this set, the gateway's allow-list (redactRuntimeReportParseError), and the
