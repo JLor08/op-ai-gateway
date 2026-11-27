@@ -1228,7 +1228,13 @@ export function ServerList({
           backLabel={t.back}
           items={[{ label: t.servers, onClick: () => setMode('list') }, { label: server.name }]}
         />
-        <HardwareSection key={`hw-${server.id}`} t={t} api={api} server={server} />
+        <HardwareSection
+          key={`hw-${server.id}`}
+          t={t}
+          api={api}
+          server={server}
+          onServerRefresh={refreshServers}
+        />
       </>
     );
   }

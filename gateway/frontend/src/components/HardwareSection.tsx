@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import {
+  Alert,
   Box,
   Table,
   TableBody,
@@ -17,6 +18,9 @@ import type { HardwareReport, PortalServer } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { Panel } from './shared/Panel';
 import { useLatestFetch } from './shared/useLatestFetch';
+import { GpuVendorNote } from './GpuVendorNote';
+import { gpuDisplayName, vendorLabel } from '../api';
+import { formatPortalError } from './shared/format';
 
 // formatBytes renders a byte count as GiB (one decimal), or "—" for 0.
 function formatBytes(n: number | undefined): string {
@@ -124,11 +128,16 @@ export function HardwareSection({
   t,
   api,
   server,
+  onServerRefresh,
 }: Readonly<{
   t: Translation;
-  api: Pick<PortalApi, 'serverHardware'>;
+  api: Pick<PortalApi, 'serverHardware' | 'dismissGpuVendorNote'>;
   server: PortalServer;
+  // Re-reads the server list after the legacy GPU note was dismissed, so the
+  // note does not return from a cached `server` prop.
+  onServerRefresh?: () => void;
 }>) {
+  const [noteError, setNoteError] = useState('');
   const hardware = useLatestFetch(() => api.serverHardware(server.id), [api, server.id]);
   const pending = hardware.status === 'idle' || hardware.status === 'loading';
   // A load failure and an available:false/no-report response both render the
@@ -153,6 +162,13 @@ export function HardwareSection({
       </Panel>
     );
   }
+
+  // The vendor, Vulkan and measurability columns appear only when the agent's
+  // report carries them, so a report from an older agent renders as before.
+  const gpus = report.gpus ?? [];
+  const showVendor = gpus.some((g) => vendorLabel(g.vendor ?? '') !== '');
+  const showVulkan = gpus.some((g) => typeof g.vulkan_ordinal === 'number');
+  const showMeasurable = gpus.some((g) => g.vram_measurable !== undefined);
 
   const collected = collectedAt ? new Date(collectedAt).toLocaleString() : '—';
 
@@ -252,6 +268,26 @@ export function HardwareSection({
 
       {report.gpus && report.gpus.length > 0 && (
         <Box sx={{ mt: 2 }}>
+          {/* #434: this server's GPU rows from before vendors existed were
+              mapped to one vendor; shown until an operator acknowledges it. */}
+          {server.gpu_vendor_note && (
+            <GpuVendorNote
+              t={t}
+              vendor={server.gpu_legacy_vendor}
+              onDismiss={async () => {
+                setNoteError('');
+                await api.dismissGpuVendorNote(server.id);
+                onServerRefresh?.();
+              }}
+              onError={(err) => setNoteError(formatPortalError(err, t))}
+              sx={{ mb: 1 }}
+            />
+          )}
+          {noteError && (
+            <Alert severity="error" sx={{ mb: 1 }}>
+              {noteError}
+            </Alert>
+          )}
           <Typography variant="subtitle2" sx={{ mb: 0.5 }}>
             {t.hardwareGpus}
           </Typography>
@@ -260,20 +296,36 @@ export function HardwareSection({
               <TableHead>
                 <TableRow>
                   <TableCell>{t.hardwareGpuIndex}</TableCell>
+                  {showVendor && <TableCell>{t.hardwareGpuVendor}</TableCell>}
                   <TableCell>{t.hardwareGpuName}</TableCell>
                   <TableCell>{t.hardwareGpuVram}</TableCell>
                   <TableCell>{t.hardwareGpuDriver}</TableCell>
                   <TableCell>{t.hardwareGpuUuid}</TableCell>
+                  {showVulkan && <TableCell>{t.hardwareVulkanOrdinal}</TableCell>}
+                  {showMeasurable && <TableCell>{t.hardwareVramMeasurable}</TableCell>}
                 </TableRow>
               </TableHead>
               <TableBody>
-                {report.gpus.map((g) => (
+                {gpus.map((g) => (
                   <TableRow key={`${g.index}-${g.name}`}>
-                    <TableCell>{g.index}</TableCell>
+                    <TableCell>{gpuDisplayName(g.vendor, g.index)}</TableCell>
+                    {showVendor && <TableCell>{dash(vendorLabel(g.vendor ?? ''))}</TableCell>}
                     <TableCell>{dash(g.name)}</TableCell>
                     <TableCell>{formatBytes(g.memory_total_bytes)}</TableCell>
                     <TableCell>{dash(g.driver_version)}</TableCell>
                     <TableCell>{dash(g.uuid)}</TableCell>
+                    {showVulkan && (
+                      <TableCell>
+                        {typeof g.vulkan_ordinal === 'number' ? `Vulkan #${g.vulkan_ordinal}` : '—'}
+                      </TableCell>
+                    )}
+                    {showMeasurable && (
+                      <TableCell>
+                        {g.vram_measurable && g.vram_measurable.length > 0
+                          ? g.vram_measurable.join(', ')
+                          : '—'}
+                      </TableCell>
+                    )}
                   </TableRow>
                 ))}
               </TableBody>
