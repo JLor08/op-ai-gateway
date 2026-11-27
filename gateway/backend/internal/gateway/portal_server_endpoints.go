@@ -448,7 +448,11 @@ var portalServerErrRows = []errRow{
 	{err: portal.ErrServerOwnerInvalid, status: http.StatusBadRequest, code: "server.owner_invalid", msg: "owner is invalid"},
 	{err: portal.ErrServerAgentPresenceTimeoutInvalid, status: http.StatusBadRequest, code: "server.agent_presence_timeout_invalid", msg: "agent presence timeout must be >= 0"},
 	{err: portal.ErrServerRuntimeLimitInvalid, status: http.StatusBadRequest, code: "server.runtime_limit_invalid", msg: "runtime_max_processes must be >= 0"},
-	{err: portal.ErrGPUBudgetInvalid, status: http.StatusBadRequest, code: "server.gpu_budget_invalid", msg: "gpu budget index/budget_mb must be >= 0 and index must be unique"},
+	{err: portal.ErrGPUBudgetInvalid, status: http.StatusBadRequest, code: "server.gpu_budget_invalid", msg: "gpu budget index/budget_mb must be >= 0 and each (vendor, index) must be unique"},
+	// The budget save normalizes each budget's GPU vendor like a runtime
+	// spec save, with the runtime spec's codes.
+	{err: portal.ErrRuntimeSpecGPUVendorInvalid, status: http.StatusBadRequest, code: "runtime_spec.gpu_vendor_invalid", msg: "unknown GPU vendor"},
+	{err: portal.ErrRuntimeSpecGPUVendorUnsupported, status: http.StatusBadRequest, code: "runtime_spec.gpu_vendor_unsupported", msg: "this server's agent does not support vendor-qualified GPUs yet"},
 	{err: portal.ErrServerEnergyConfigInvalid, status: http.StatusBadRequest, code: "server.energy_config_invalid", msg: "estimated_watts, idle_watts, price_per_kwh and pue must be >= 0"},
 	{err: portal.ErrServerLANAddressInvalid, status: http.StatusBadRequest, code: "server.lan_address_invalid", msg: "lan_address must be empty or an IPv4 address"},
 	{err: portal.ErrServerLANSourceInvalid, status: http.StatusBadRequest, code: "server.lan_source_invalid", msg: "lan_source must be auto, interface or manual"},

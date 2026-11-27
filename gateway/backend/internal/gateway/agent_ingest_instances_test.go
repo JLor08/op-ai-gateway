@@ -160,6 +160,31 @@ func TestIngestPushesTheRuntimeConfigWhenRuntimeExecWSLFlips(t *testing.T) {
 	spy.expectNoPush(t, "an unreadable declaration", "mock-host-qwen")
 }
 
+// TestIngestPushesTheRuntimeConfigWhenGPUVendorIdentityFlips pins the push
+// that follows a change of the agent's gpu_vendor_identity declaration: the
+// document carries GPU vendors, and a foreign vendor's rows, only for an agent
+// that declares it (portal pushedGPUVendor), so the declaration is an input of
+// the document and a sample that changes it pushes at once.
+func TestIngestPushesTheRuntimeConfigWhenGPUVendorIdentityFlips(t *testing.T) {
+	srv := NewTestServer()
+	spy := spyRuntimeConfigPushes(srv)
+	ingest := func(t *testing.T, capabilities string) {
+		t.Helper()
+		req, raw := ingestReq(t, `{"host":{"cpu_util_pct":1},"capabilities":`+capabilities+`}`)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+	}
+	ingest(t, `{"features":["runtime_manager"]}`)
+	spy.expectPush(t, "a first sample, which makes the declaration known", "mock-host-qwen")
+	ingest(t, `{"features":["runtime_manager","gpu_vendor_identity"]}`)
+	spy.expectPush(t, "gpu_vendor_identity declared", "mock-host-qwen")
+	ingest(t, `{"features":["runtime_manager","gpu_vendor_identity"]}`)
+	spy.expectNoPush(t, "the same declaration again", "mock-host-qwen")
+	ingest(t, `{"features":["runtime_manager"]}`)
+	spy.expectPush(t, "gpu_vendor_identity withdrawn", "mock-host-qwen")
+}
+
 // instanceIngestStore wraps a MemoryStore and records every write the
 // telemetry ingest's write-backs make, so a test can assert what was written
 // and how often, not only the final stored state (a fold and an alternating

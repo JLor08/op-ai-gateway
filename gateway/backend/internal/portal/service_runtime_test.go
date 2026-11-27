@@ -2245,7 +2245,7 @@ func TestPutRuntimeSpecSetVisibleDevicesRequiresGPUs(t *testing.T) {
 // one value, and a spec where both are present reads identically whichever one
 // wins. Refused, not silently resolved.
 //
-// The refusal is vendor-independent — all three owned variables, on every
+// The refusal is vendor-independent — all four owned variables, on every
 // host — because this gateway cannot know what hardware the target server has,
 // and the agent's rule is deliberately written to be the same one.
 func TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv(t *testing.T) {
@@ -2254,7 +2254,7 @@ func TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv(t *testing.T) {
 	svc, routeStore := newServerTestService(t, now)
 	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
 
-	for _, key := range []string{"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"} {
+	for _, key := range []string{"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GGML_VK_VISIBLE_DEVICES"} {
 		t.Run(key, func(t *testing.T) {
 			_, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
 				Binary:            "/usr/local/bin/llama-server",

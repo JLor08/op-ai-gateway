@@ -695,7 +695,7 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 	gpus := make([]AgentRuntimeSpecGPUDTO, 0, len(parts))
 	for _, g := range parts {
 		gpus = append(gpus, AgentRuntimeSpecGPUDTO{
-			Index: g.Index, VRAMMB: memberDemand(g.VRAMMeasuredMB, g.VRAMEstimateMB, m.row.Stale, gpuCeiling[g.Index]),
+			Vendor: g.Vendor, Index: g.Index, VRAMMB: memberDemand(g.VRAMMeasuredMB, g.VRAMEstimateMB, m.row.Stale, gpuCeiling[g.Index]),
 		})
 	}
 	spec := AgentRuntimeSpecDTO{
@@ -915,32 +915,35 @@ func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, row
 }
 
 // resyncedManualMember is resyncManualMemberGPUs' rewrite of the membership
-// rows read: used's GPU rows follow the spec's rows.
+// rows read: used's GPU rows follow the spec's rows, matched by GPU key
+// (vendor, index).
 func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSpecGPU, read []routing.ClusterMember, gpus []routing.ClusterMemberGPU) ([]routing.ClusterMember, []routing.ClusterMemberGPU) {
 	members := slices.Clone(read)
-	prev := map[int]routing.ClusterMemberGPU{}
-	var prevOrder []int
+	prev := map[routing.GPUKey]routing.ClusterMemberGPU{}
+	var prevOrder []routing.GPUKey
 	next := make([]routing.ClusterMemberGPU, 0, len(gpus)+len(rows))
 	for _, g := range gpus {
 		if g.ServerID == used.ServerID {
-			prev[g.GPUIndex] = g
-			prevOrder = append(prevOrder, g.GPUIndex)
+			key := routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}
+			prev[key] = g
+			prevOrder = append(prevOrder, key)
 			continue
 		}
 		next = append(next, g)
 	}
-	nextOrder := make([]int, 0, len(rows))
+	nextOrder := make([]routing.GPUKey, 0, len(rows))
 	measured := false
 	for pos, r := range rows {
 		g := routing.ClusterMemberGPU{
 			HeadSpecID: used.HeadSpecID, MemberPosition: used.Position, ServerID: used.ServerID,
 			GPUVendor: r.GPUVendor, GPUIndex: r.GPUIndex, Position: pos,
 		}
-		if p, ok := prev[r.GPUIndex]; ok {
+		key := routing.GPUKey{Vendor: r.GPUVendor, Index: r.GPUIndex}
+		if p, ok := prev[key]; ok {
 			g.VRAMMeasuredMB, g.RunPeakVRAMMB = p.VRAMMeasuredMB, p.RunPeakVRAMMB
 			measured = measured || p.VRAMMeasuredMB > 0
 		}
-		nextOrder = append(nextOrder, r.GPUIndex)
+		nextOrder = append(nextOrder, key)
 		next = append(next, g)
 	}
 	if !slices.Equal(prevOrder, nextOrder) {

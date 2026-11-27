@@ -2340,6 +2340,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	hadInstances := s.AgentFeatures.Has(serverID, runtimeInstancesFeature)
 	hadRPCCluster := s.AgentFeatures.Has(serverID, rpcClusterFeature)
 	hadExecWSL := s.AgentFeatures.Has(serverID, RuntimeExecWSLFeature)
+	hadGPUVendors := s.AgentFeatures.Has(serverID, portal.AgentFeatureGPUVendorIdentity)
 	if capsReadable {
 		s.AgentFeatures.Set(serverID, caps)
 	} else {
@@ -2358,8 +2359,12 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// pushes nothing: it holds the document. runtime_exec_wsl is the same kind
 	// of input: a wsl spec is withheld from an agent without it and held while
 	// the declaration is unknown, so a change of it moves the document too.
+	// gpu_vendor_identity as well: the GPU rows carry their vendor, and a
+	// foreign vendor's rows go out at all, only for an agent that declares it
+	// (portal pushedGPUVendor).
 	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances ||
-		slices.Contains(caps, RuntimeExecWSLFeature) != hadExecWSL) {
+		slices.Contains(caps, RuntimeExecWSLFeature) != hadExecWSL ||
+		slices.Contains(caps, portal.AgentFeatureGPUVendorIdentity) != hadGPUVendors) {
 		s.PushRuntimeConfig(serverID)
 	}
 	// A cluster is pushed only while every agent of it declares rpc_cluster

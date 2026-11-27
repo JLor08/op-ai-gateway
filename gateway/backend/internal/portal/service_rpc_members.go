@@ -147,6 +147,11 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 	if err != nil {
 		return "", false, err
 	}
+	// The GPU vendors are normalized after the request checks, the newest
+	// refusals of the request.
+	if req.GPUs, err = s.gpuVendorRulesWith(server.ID, server.GPULegacyVendor).normalizeSpecGPUVendors(req.GPUs); err != nil {
+		return "", false, err
+	}
 	groups, err := s.rpcMemberHeadGroups(ctx, server.ID, req.AllowedHeadGroups, prior)
 	if err != nil {
 		return "", false, err
@@ -184,7 +189,7 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 	}
 	gpuRows := make([]routing.RPCMemberSpecGPU, len(req.GPUs))
 	for i, g := range req.GPUs {
-		gpuRows[i] = routing.RPCMemberSpecGPU{SpecID: row.ID, GPUIndex: g.Index, Position: i, VRAMEstimateMB: g.VRAMEstimateMB}
+		gpuRows[i] = routing.RPCMemberSpecGPU{SpecID: row.ID, GPUVendor: g.Vendor, GPUIndex: g.Index, Position: i, VRAMEstimateMB: g.VRAMEstimateMB}
 	}
 	if err := s.routes.ReplaceRPCMemberSpec(ctx, row, gpuRows); err != nil {
 		return "", false, err
@@ -506,7 +511,7 @@ func (s *Service) rpcMemberSpecDTO(ctx context.Context, p auth.Token, spec routi
 	}
 	gpus := make([]RuntimeSpecGPUDTO, 0, len(rows))
 	for _, r := range rows {
-		gpus = append(gpus, RuntimeSpecGPUDTO{Index: r.GPUIndex, VRAMEstimateMB: r.VRAMEstimateMB})
+		gpus = append(gpus, RuntimeSpecGPUDTO{Vendor: r.GPUVendor, Index: r.GPUIndex, VRAMEstimateMB: r.VRAMEstimateMB})
 	}
 	backend := spec.DeviceBackend
 	if backend == "" {

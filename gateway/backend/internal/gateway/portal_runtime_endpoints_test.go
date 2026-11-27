@@ -1277,3 +1277,28 @@ func TestHandlePortalMappingRuntimeSpecPutBothDecisionModesInvalid(t *testing.T)
 		t.Fatalf("message = %q repeats the raw sentinel text", msg)
 	}
 }
+
+// TestVendorErrorsAreMappedInEveryTable: each save that normalizes GPU
+// vendors (the runtime spec, the GPU budgets through the server mapper, the
+// RPC member spec through its concatenated table) answers both vendor
+// refusals with their 400 and code, never the 500 fallback.
+func TestVendorErrorsAreMappedInEveryTable(t *testing.T) {
+	tables := map[string][]errRow{
+		"runtime spec": portalRuntimeSpecErrors,
+		"server":       portalServerErrRows,
+		"rpc member":   portalRPCMemberErrors,
+	}
+	codes := map[error]string{
+		portal.ErrRuntimeSpecGPUVendorInvalid:     "runtime_spec.gpu_vendor_invalid",
+		portal.ErrRuntimeSpecGPUVendorUnsupported: "runtime_spec.gpu_vendor_unsupported",
+	}
+	for name, tbl := range tables {
+		for err, code := range codes {
+			rec := httptest.NewRecorder()
+			writeMappedError(rec, err, tbl, http.StatusInternalServerError, "x", "x")
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"`+code+`"`) {
+				t.Fatalf("%s: %v -> %d %s, want 400 %s", name, err, rec.Code, rec.Body.String(), code)
+			}
+		}
+	}
+}

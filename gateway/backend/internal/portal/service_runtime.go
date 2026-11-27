@@ -221,6 +221,16 @@ var (
 	// AgentFeatureRuntimeProcessTreeJob. Silently running such a spec direct
 	// would leave the engine's descendants alive on stop. HTTP 400.
 	ErrRuntimeSpecProcessTreeUnsupported = errors.New("runtime_spec.process_tree_unsupported")
+	// ErrRuntimeSpecGPUVendorInvalid refuses a GPU row (of a spec, a GPU
+	// budget, an RPC member spec or a cluster member) whose vendor is not one
+	// of nvidia, amd, apple or empty, in any letter case (normalizeGPUVendor).
+	// HTTP 400.
+	ErrRuntimeSpecGPUVendorInvalid = errors.New("runtime_spec.gpu_vendor_invalid")
+	// ErrRuntimeSpecGPUVendorUnsupported refuses a GPU row with a vendor for
+	// a server whose agent is known not to declare
+	// AgentFeatureGPUVendorIdentity: the agent never receives the vendor, so
+	// the row would name whichever card its bare index is there. HTTP 400.
+	ErrRuntimeSpecGPUVendorUnsupported = errors.New("runtime_spec.gpu_vendor_unsupported")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -244,7 +254,8 @@ var (
 	// HTTP 400, checked before any store call like every other validation here.
 	ErrCoResidencyModeInvalid = errors.New("runtime_coresidency.mode_invalid")
 	// ErrGPUBudgetInvalid rejects a SetServerGPUBudgets entry with a negative
-	// index, a negative budget_mb, or an index repeated across entries.
+	// index, a negative budget_mb, or a GPU key (vendor, index) repeated
+	// across entries.
 	ErrGPUBudgetInvalid = errors.New("server.gpu_budget_invalid")
 	// ErrServerManagedRuntimeOnly rejects CreateApplication when the target
 	// server is ManagedRuntimeOnly and the requested type is not
@@ -504,9 +515,10 @@ func normalizeRuntimeSpecFlavors(raw []string) ([]string, error) {
 // verbatim); VRAMMeasuredMB is agent-owned and read-only on this API — see
 // the VRAM ownership rule on PutRuntimeSpec.
 type RuntimeSpecGPUDTO struct {
-	Index          int `json:"index"`
-	VRAMEstimateMB int `json:"vram_estimate_mb"`
-	VRAMMeasuredMB int `json:"vram_measured_mb"`
+	Vendor         string `json:"vendor"`
+	Index          int    `json:"index"`
+	VRAMEstimateMB int    `json:"vram_estimate_mb"`
+	VRAMMeasuredMB int    `json:"vram_measured_mb"`
 }
 
 // RuntimeSpecDTO is the portal-facing representation of a mapping's
@@ -1165,6 +1177,19 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	if err != nil {
 		return runtimeSpecWrite{}, err
 	}
+	// The GPU vendors are normalized after every request validation, the
+	// newest of them. A benchmark writer re-saves the stored rows as they
+	// are, so it is not refused for an agent that lacks the flag since.
+	vendors, err := s.gpuVendorRulesFor(ctx, app.ServerID)
+	if err != nil {
+		return runtimeSpecWrite{}, err
+	}
+	if principal == nil {
+		vendors.known = false
+	}
+	if req.GPUs, err = vendors.normalizeSpecGPUVendors(req.GPUs); err != nil {
+		return runtimeSpecWrite{}, err
+	}
 	if principal != nil {
 		// Port allocation and the one-head-per-manual-member rule are
 		// check-then-act across specs; serializing the operator writes keeps
@@ -1176,6 +1201,7 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	if err != nil {
 		return runtimeSpecWrite{}, err
 	}
+	prior.legacyVendor = vendors.legacy
 	spec, err := s.runtimeSpecRow(mapping.ID, req, fields, prior)
 	if err != nil {
 		return runtimeSpecWrite{}, err
@@ -1341,7 +1367,7 @@ func (s *Service) storeRuntimeSpec(ctx context.Context, spec routing.RuntimeSpec
 		return err
 	}
 	w.stored = true
-	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredByIndex)); err != nil {
+	if err := s.routes.SetRuntimeSpecGPUs(ctx, spec.ID, runtimeSpecGPURows(spec.ID, req.GPUs, prior.measuredFor)); err != nil {
 		return err
 	}
 	if !plan.writeMembers || prior.ok {
@@ -1768,11 +1794,20 @@ func runtimeSpecDecisionModes(req PutRuntimeSpecRequest) (decisions, systemOne r
 // runtimeSpecPrior is what a runtime-spec write keeps from the mapping's
 // stored spec: the row itself (ok is false when there is none -- its id,
 // created_at and measured RAM carry forward) and its measured VRAM per GPU
-// index.
+// key. legacyVendor is the server's legacy GPU vendor, under which an empty
+// vendor and the legacy vendor at one index are one card (lookupGPUKey).
 type runtimeSpecPrior struct {
-	spec            routing.RuntimeSpec
-	ok              bool
-	measuredByIndex map[int]int
+	spec          routing.RuntimeSpec
+	ok            bool
+	measuredByKey map[routing.GPUKey]int
+	legacyVendor  string
+}
+
+// measuredFor is the stored measured VRAM of the GPU key names, 0 for a GPU
+// without a stored row.
+func (p runtimeSpecPrior) measuredFor(key routing.GPUKey) int {
+	measured, _ := lookupGPUKey(p.measuredByKey, key, p.legacyVendor)
+	return measured
 }
 
 // priorRuntimeSpec is the read half of the read-then-upsert: an existing
@@ -1802,7 +1837,7 @@ func (s *Service) priorRuntimeSpec(ctx context.Context, mappingID, expectSpecID 
 	if expectSpecID != "" && existing.ID != expectSpecID {
 		return runtimeSpecPrior{}, ErrRuntimeSpecNotFound
 	}
-	prior := runtimeSpecPrior{spec: existing, ok: hadExisting, measuredByIndex: map[int]int{}}
+	prior := runtimeSpecPrior{spec: existing, ok: hadExisting, measuredByKey: map[routing.GPUKey]int{}}
 	if !hadExisting {
 		return prior, nil
 	}
@@ -1811,7 +1846,7 @@ func (s *Service) priorRuntimeSpec(ctx context.Context, mappingID, expectSpecID 
 		return runtimeSpecPrior{}, err
 	}
 	for _, g := range existingGPUs {
-		prior.measuredByIndex[g.GPUIndex] = g.VRAMMeasuredMB
+		prior.measuredByKey[g.Key()] = g.VRAMMeasuredMB
 	}
 	return prior, nil
 }
@@ -1967,19 +2002,20 @@ func (s *Service) runtimeSpecAPIToken(req PutRuntimeSpecRequest, stored string) 
 	}
 }
 
-// runtimeSpecGPURows builds a spec's GPU rows from the request: the request
-// array order becomes the stored Position, and VRAMMeasuredMB is the stored
-// value for an index that already had a row and 0 for a brand-new one (the
-// VRAM ownership rule on PutRuntimeSpec).
-func runtimeSpecGPURows(specID string, gpus []RuntimeSpecGPUDTO, measuredByIndex map[int]int) []routing.RuntimeSpecGPU {
+// runtimeSpecGPURows builds a spec's GPU rows from the request (its vendors
+// already normalized): the request array order becomes the stored Position,
+// and VRAMMeasuredMB is the stored value for a GPU key that already had a row
+// and 0 for a brand-new one (the VRAM ownership rule on PutRuntimeSpec).
+func runtimeSpecGPURows(specID string, gpus []RuntimeSpecGPUDTO, measuredFor func(routing.GPUKey) int) []routing.RuntimeSpecGPU {
 	rows := make([]routing.RuntimeSpecGPU, 0, len(gpus))
 	for i, g := range gpus {
 		rows = append(rows, routing.RuntimeSpecGPU{
 			SpecID:         specID,
+			GPUVendor:      g.Vendor,
 			GPUIndex:       g.Index,
 			Position:       i,
 			VRAMEstimateMB: g.VRAMEstimateMB,
-			VRAMMeasuredMB: measuredByIndex[g.Index],
+			VRAMMeasuredMB: measuredFor(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}),
 		})
 	}
 	return rows
@@ -2040,7 +2076,9 @@ func (s *Service) DeleteRuntimeSpec(ctx context.Context, principal auth.Token, m
 // HIP_VISIBLE_DEVICES is in the list although the agent never SETS it: it
 // selects from WHAT ROCR_VISIBLE_DEVICES ALREADY LEFT VISIBLE, so combining a
 // hand-set HIP list with agent-managed ROCR filtering is the double-filter
-// trap in its purest form (the child ends up with no usable device). Runtime-
+// trap in its purest form (the child ends up with no usable device).
+// GGML_VK_VISIBLE_DEVICES is the Vulkan backend's list, which the agent sets
+// for a Vulkan spec from the host's Vulkan ordinals (#434). Runtime-
 // specific selectors the agent neither sets nor filters through —
 // ONEAPI_DEVICE_SELECTOR, GPU_DEVICE_ORDINAL — are deliberately NOT here:
 // composing one of those (built from ${HOST_GPU_IDS}) with the option is the
@@ -2049,6 +2087,7 @@ var runtimeSpecVisibleDevicesVars = []string{
 	"CUDA_VISIBLE_DEVICES",
 	"ROCR_VISIBLE_DEVICES",
 	"HIP_VISIBLE_DEVICES",
+	"GGML_VK_VISIBLE_DEVICES",
 }
 
 // runtimeSpecDevicePlaceholders are the placeholders the agent expands that
@@ -2537,19 +2576,24 @@ func decodeRuntimeSpecConfigFiles(stored string) ([]ConfigFileDTO, error) {
 }
 
 // validateRuntimeSpecGPUs rejects a negative GPU index, a negative VRAM
-// estimate, or a GPU index repeated across entries — all ErrRuntimeSpecGPUInvalid,
-// checked BEFORE any store call (the store's own duplicate-index guard
-// returns ErrConflict, a storage-layer concern this method never surfaces).
+// estimate, or a GPU key (vendor, index) repeated across entries — all
+// ErrRuntimeSpecGPUInvalid, checked BEFORE any store call (the store's own
+// duplicate-key guard returns ErrConflict, a storage-layer concern this
+// method never surfaces). One index may appear once per vendor: NVIDIA 0 and
+// AMD 0 are two cards. The vendors are compared as sent; the save's vendor
+// normalization (gpuVendorRules.normalizeSpecGPUVendors) checks the
+// normalized keys again.
 func validateRuntimeSpecGPUs(gpus []RuntimeSpecGPUDTO) error {
-	seen := make(map[int]struct{}, len(gpus))
+	seen := make(map[routing.GPUKey]struct{}, len(gpus))
 	for _, g := range gpus {
 		if g.Index < 0 || g.VRAMEstimateMB < 0 {
 			return ErrRuntimeSpecGPUInvalid
 		}
-		if _, dup := seen[g.Index]; dup {
+		key := routing.GPUKey{Vendor: g.Vendor, Index: g.Index}
+		if _, dup := seen[key]; dup {
 			return ErrRuntimeSpecGPUInvalid
 		}
-		seen[g.Index] = struct{}{}
+		seen[key] = struct{}{}
 	}
 	return nil
 }
@@ -2601,6 +2645,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 	gpuDTOs := make([]RuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
 		gpuDTOs = append(gpuDTOs, RuntimeSpecGPUDTO{
+			Vendor:         g.GPUVendor,
 			Index:          g.GPUIndex,
 			VRAMEstimateMB: g.VRAMEstimateMB,
 			VRAMMeasuredMB: g.VRAMMeasuredMB,
@@ -2879,6 +2924,7 @@ func coResidencyDTO(mode routing.CoResidencyMode, rules []routing.CoResidencyRul
 // request value for either is always ignored (never trusted on the wire),
 // both on first creation and on every later PUT.
 type GPUBudgetDTO struct {
+	Vendor       string `json:"vendor"`
 	Index        int    `json:"index"`
 	BudgetMB     int    `json:"budget_mb"`
 	ExpectedUUID string `json:"expected_uuid"`
@@ -2905,55 +2951,73 @@ func (s *Service) GetServerGPUBudgets(ctx context.Context, principal auth.Token,
 }
 
 // SetServerGPUBudgets validates and atomically replaces serverID's whole
-// per-GPU budget set. index must be >= 0 and unique across the request;
-// budget_mb must be >= 0 (both ErrGPUBudgetInvalid, checked BEFORE any store
-// call).
+// per-GPU budget set. index must be >= 0 and each GPU key (vendor, index)
+// unique across the request; budget_mb must be >= 0 (both ErrGPUBudgetInvalid,
+// checked BEFORE any store call). Each vendor is normalized like a runtime
+// spec's (normalizeGPUVendor: ErrRuntimeSpecGPUVendorInvalid,
+// ErrRuntimeSpecGPUVendorUnsupported), after the shape checks.
 //
 // expected_uuid/expected_name ownership rule (mirrors PutRuntimeSpec's VRAM
 // ownership rule): they are a purely descriptive drift detector, never
-// client-writable. For an index that already has a stored row, this method
+// client-writable. For a GPU that already has a stored row, this method
 // PRESERVES its expected_* verbatim regardless of what the request carries --
 // drift detection is only meaningful against the ORIGINAL snapshot. For a
-// brand-new index, expected_* is snapshotted from the latest telemetry
-// sample's GPU list (see latestGPUSnapshotByIndex); when no sample exists
-// yet, it is left empty rather than failing the write.
+// brand-new GPU, expected_* is snapshotted from the latest telemetry
+// sample's card of the same (vendor, index) (see latestGPUSnapshotByKey);
+// when no sample exists yet, it is left empty rather than failing the write.
+// An empty vendor, on either side, is the server's legacy vendor's card.
 func (s *Service) SetServerGPUBudgets(ctx context.Context, principal auth.Token, serverID string, req SetGPUBudgetsRequest) ([]GPUBudgetDTO, error) {
 	server, err := s.authorizeServer(ctx, principal, serverID)
 	if err != nil {
 		return nil, err
 	}
-	seenIndex := make(map[int]bool, len(req.Budgets))
+	seenKey := make(map[routing.GPUKey]bool, len(req.Budgets))
 	for _, b := range req.Budgets {
 		if b.Index < 0 || b.BudgetMB < 0 {
 			return nil, ErrGPUBudgetInvalid
 		}
-		if seenIndex[b.Index] {
+		key := routing.GPUKey{Vendor: b.Vendor, Index: b.Index}
+		if seenKey[key] {
 			return nil, ErrGPUBudgetInvalid
 		}
-		seenIndex[b.Index] = true
+		seenKey[key] = true
+	}
+	vendors := s.gpuVendorRulesWith(server.ID, server.GPULegacyVendor)
+	budgets := slices.Clone(req.Budgets)
+	clear(seenKey)
+	for i := range budgets {
+		if budgets[i].Vendor, err = vendors.normalize(budgets[i].Vendor); err != nil {
+			return nil, err
+		}
+		key := vendors.resolve(routing.GPUKey{Vendor: budgets[i].Vendor, Index: budgets[i].Index})
+		if seenKey[key] {
+			return nil, ErrGPUBudgetInvalid
+		}
+		seenKey[key] = true
 	}
 	existing, err := s.routes.ServerGPUBudgets(ctx, server.ID)
 	if err != nil {
 		return nil, err
 	}
-	existingByIndex := make(map[int]routing.ServerGPUBudget, len(existing))
+	existingByKey := make(map[routing.GPUKey]routing.ServerGPUBudget, len(existing))
 	for _, b := range existing {
-		existingByIndex[b.GPUIndex] = b
+		existingByKey[routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}] = b
 	}
 	now := s.clock().UTC()
-	rows := make([]routing.ServerGPUBudget, 0, len(req.Budgets))
-	var snapshot map[int]routing.GPUSample // lazily loaded only if a brand-new index needs it
-	for _, b := range req.Budgets {
-		row := routing.ServerGPUBudget{ServerID: server.ID, GPUIndex: b.Index, BudgetMB: b.BudgetMB, UpdatedAt: now}
-		if prior, ok := existingByIndex[b.Index]; ok {
+	rows := make([]routing.ServerGPUBudget, 0, len(budgets))
+	var snapshot map[routing.GPUKey]routing.GPUSample // lazily loaded only if a brand-new GPU needs it
+	for _, b := range budgets {
+		key := routing.GPUKey{Vendor: b.Vendor, Index: b.Index}
+		row := routing.ServerGPUBudget{ServerID: server.ID, GPUVendor: b.Vendor, GPUIndex: b.Index, BudgetMB: b.BudgetMB, UpdatedAt: now}
+		if prior, ok := lookupGPUKey(existingByKey, key, vendors.legacy); ok {
 			row.ExpectedUUID = prior.ExpectedUUID
 			row.ExpectedName = prior.ExpectedName
 			row.CreatedAt = prior.CreatedAt
 		} else {
 			if snapshot == nil {
-				snapshot = s.latestGPUSnapshotByIndex(ctx, server.ID)
+				snapshot = s.latestGPUSnapshotByKey(ctx, server.ID)
 			}
-			if g, ok := snapshot[b.Index]; ok {
+			if g, ok := snapshot[vendors.resolve(key)]; ok {
 				row.ExpectedUUID = g.UUID
 				row.ExpectedName = g.Name
 			}
@@ -2975,21 +3039,27 @@ func (s *Service) SetServerGPUBudgets(ctx context.Context, principal auth.Token,
 	return gpuBudgetDTOs(stored), nil
 }
 
-// latestGPUSnapshotByIndex reads serverID's single most recent telemetry
+// latestGPUSnapshotByKey reads serverID's single most recent telemetry
 // sample (TelemetrySamples with limit=1 returns exactly the newest row --
-// DecimateTelemetrySamples' limit==1 case) and indexes its GPU list by
-// index, for SetServerGPUBudgets' new-row expected_uuid/expected_name
-// snapshot. Best-effort: any read error or the absence of a sample yields an
-// empty map (the caller then leaves expected_* empty), mirroring the
-// "leave the fields empty rather than failing" contract.
-func (s *Service) latestGPUSnapshotByIndex(ctx context.Context, serverID string) map[int]routing.GPUSample {
-	out := map[int]routing.GPUSample{}
+// DecimateTelemetrySamples' limit==1 case) and keys its GPU list by
+// (vendor, index), for SetServerGPUBudgets' new-row
+// expected_uuid/expected_name snapshot. A GPU without a vendor (from an agent
+// without gpu_vendor_identity) is keyed by the server's stored legacy vendor,
+// the card the empty vendor stands for. Best-effort: any read error or the
+// absence of a sample yields an empty map (the caller then leaves expected_*
+// empty), mirroring the "leave the fields empty rather than failing" contract.
+func (s *Service) latestGPUSnapshotByKey(ctx context.Context, serverID string) map[routing.GPUKey]routing.GPUSample {
+	out := map[routing.GPUKey]routing.GPUSample{}
 	samples, err := s.routes.TelemetrySamples(ctx, serverID, time.Time{}, s.clock().UTC(), 1)
 	if err != nil || len(samples) == 0 {
 		return out
 	}
+	legacy, err := s.serverLegacyGPUVendor(ctx, serverID)
+	if err != nil {
+		return out
+	}
 	for _, g := range samples[0].GPUs {
-		out[g.Index] = g
+		out[resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy)] = g
 	}
 	return out
 }
@@ -2999,7 +3069,7 @@ func (s *Service) latestGPUSnapshotByIndex(ctx context.Context, serverID string)
 func gpuBudgetDTOs(budgets []routing.ServerGPUBudget) []GPUBudgetDTO {
 	out := make([]GPUBudgetDTO, 0, len(budgets))
 	for _, b := range budgets {
-		out = append(out, GPUBudgetDTO{Index: b.GPUIndex, BudgetMB: b.BudgetMB, ExpectedUUID: b.ExpectedUUID, ExpectedName: b.ExpectedName})
+		out = append(out, GPUBudgetDTO{Vendor: b.GPUVendor, Index: b.GPUIndex, BudgetMB: b.BudgetMB, ExpectedUUID: b.ExpectedUUID, ExpectedName: b.ExpectedName})
 	}
 	return out
 }
@@ -3525,8 +3595,9 @@ func (s *Service) notifyRuntimeChangedForMapping(serverID, owningApplicationType
 // agentRuntimeSpecDTO. 0 means unknown (both source fields are 0), never
 // "needs no VRAM", mirroring RuntimeSpecGPUDTO's two source fields.
 type AgentRuntimeSpecGPUDTO struct {
-	Index  int `json:"index"`
-	VRAMMB int `json:"vram_mb"`
+	Vendor string `json:"vendor,omitempty"`
+	Index  int    `json:"index"`
+	VRAMMB int    `json:"vram_mb"`
 }
 
 // AgentRuntimeSpecDTO is one ENABLED launch spec inside the runtime-config
@@ -3687,8 +3758,9 @@ type AgentWSLExecutionDTO struct {
 // document -- mirrors GPUBudgetDTO but drops the portal-only drift-detector
 // fields (expected_uuid/expected_name) the agent has no use for.
 type AgentGPUBudgetDTO struct {
-	Index    int `json:"index"`
-	BudgetMB int `json:"budget_mb"`
+	Vendor   string `json:"vendor,omitempty"`
+	Index    int    `json:"index"`
+	BudgetMB int    `json:"budget_mb"`
 }
 
 // AgentRuntimeConfigDTO is the desired agent-managed runtime state for ONE
@@ -3892,6 +3964,18 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	// held (AgentRuntimeConfigDTO.AwaitsAgentFeatures).
 	_, featuresKnown := s.agentRunsInstances(serverID)
 	awaitsFeatures := false
+	// The GPU rows and budgets carry their vendor only for an agent that
+	// declares gpu_vendor_identity; an older one gets the rows it reads
+	// correctly, each index once (gpuVendorRules.pushedSpecGPUs). While the
+	// declaration is unknown, a document that would lose a row that way is
+	// held: served to a flagged agent, it would take a GPU away from a
+	// running model.
+	vendors := s.gpuVendorRulesWith(serverID, server.GPULegacyVendor)
+	pushGPUs := func(gpus []AgentRuntimeSpecGPUDTO) []AgentRuntimeSpecGPUDTO {
+		out, dropped := vendors.pushedSpecGPUs(gpus)
+		awaitsFeatures = awaitsFeatures || (dropped && !vendors.known)
+		return out
+	}
 	for _, spec := range specs {
 		if !spec.Enabled {
 			continue
@@ -3945,6 +4029,7 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
+		specDTO.GPUs = pushGPUs(specDTO.GPUs)
 		// The ONLY place the gateway decrypts the per-mapping token, and it does
 		// so fail-closed (see resolvePushToken). agentApp is guaranteed non-nil
 		// here -- the builder returns the empty document above when it is nil.
@@ -3990,9 +4075,14 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
+	for i := range members {
+		members[i].GPUs = pushGPUs(members[i].GPUs)
+	}
 	specDTOs = append(specDTOs, members...)
 	awaitsFeatures = awaitsFeatures || membersHold
 	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
+	budgets, budgetsDropped := vendors.pushedBudgets(budgets)
+	awaitsFeatures = awaitsFeatures || (budgetsDropped && !vendors.known)
 	dto := agentRuntimeConfigDTO(specDTOs, coresident, budgets, agentApp.Port, server.RuntimeMaxProcesses)
 	dto.AwaitsAgentFeatures = awaitsFeatures
 	return dto, nil
@@ -4150,7 +4240,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		if vram < g.VRAMEstimateMB {
 			vram = g.VRAMEstimateMB
 		}
-		gpuDTOs = append(gpuDTOs, AgentRuntimeSpecGPUDTO{Index: g.GPUIndex, VRAMMB: vram})
+		gpuDTOs = append(gpuDTOs, AgentRuntimeSpecGPUDTO{Vendor: g.GPUVendor, Index: g.GPUIndex, VRAMMB: vram})
 	}
 	// Host-RAM demand: the same max(measured, estimate) floor as the VRAM above,
 	// over the spec-level pair. Both 0 stays 0 (unknown).
@@ -4300,6 +4390,22 @@ const AgentFeatureRuntimeExecWSL = "runtime_exec_wsl"
 // gateway package defines its own constant as this one.
 const AgentFeatureRuntimeProcessTreeJob = "runtime_process_tree_job"
 
+// AgentFeatureGPUVendorIdentity is the feature an agent declares when it
+// reports each GPU's vendor and reads the vendor of a runtime document's GPU
+// rows and budgets (#434): one index exists once per vendor on a mixed NVIDIA
+// + AMD host. Agent-only: the gateway never declares it. The document carries
+// a GPU's vendor only for an agent that declares it (pushedGPUVendor), and a
+// save refuses a vendor for an agent known to lack it
+// (ErrRuntimeSpecGPUVendorUnsupported). The module's one spelling of the name.
+const AgentFeatureGPUVendorIdentity = "gpu_vendor_identity"
+
+// AgentFeatureRPCClusterSameHost is the feature an agent declares when it can
+// run an RPC cluster member on its cluster head's own host, or two members
+// on one host (#434: a mixed host's NVIDIA and AMD cards as separate
+// members). Agent-only, like AgentFeatureGPUVendorIdentity. The module's one
+// spelling of the name.
+const AgentFeatureRPCClusterSameHost = "rpc_cluster_same_host"
+
 // agentRunsWSL reports whether serverID's agent declares
 // AgentFeatureRuntimeExecWSL, and whether this gateway knows its declaration.
 // A nil reader reports (true, true): a service built without one has no
@@ -4379,7 +4485,7 @@ func agentRuntimeConfigDTO(specs []AgentRuntimeSpecDTO, coresident [][2]string, 
 	}
 	gpuBudgets := make([]AgentGPUBudgetDTO, 0, len(budgets))
 	for _, b := range budgets {
-		gpuBudgets = append(gpuBudgets, AgentGPUBudgetDTO{Index: b.GPUIndex, BudgetMB: b.BudgetMB})
+		gpuBudgets = append(gpuBudgets, AgentGPUBudgetDTO{Vendor: b.GPUVendor, Index: b.GPUIndex, BudgetMB: b.BudgetMB})
 	}
 	dto := AgentRuntimeConfigDTO{
 		RouterListen: routerListen,

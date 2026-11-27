@@ -280,6 +280,16 @@ const RuntimeGPUMainLastFeature = "runtime_gpu_main_last"
 // this side.
 const RuntimeProcessTreeJobFeature = portal.AgentFeatureRuntimeProcessTreeJob
 
+// gpu_vendor_identity and rpc_cluster_same_host (#434, mixed NVIDIA + AMD
+// hosts) are agent-declared only: the gateway declares nothing new for them,
+// so neither is on gatewayAgentFeatures. Their one spelling in this module is
+// the portal's (portal.AgentFeatureGPUVendorIdentity,
+// portal.AgentFeatureRPCClusterSameHost). The runtime-config document carries
+// GPU vendors, and a foreign vendor's GPU rows, only for an agent that
+// declares gpu_vendor_identity, and the ingest pushes the document when that
+// declaration changes; a portal save refuses a vendor for an agent known to
+// lack it.
+
 // multipartProxyFeature is the agent-declared capability meaning: this agent's
 // runtime router peeks the model out of a multipart/form-data body, so it can
 // route an image EDIT (POST /v1/images/edits, which is multipart) or an audio
