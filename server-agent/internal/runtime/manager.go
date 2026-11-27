@@ -1316,6 +1316,14 @@ type runningProc struct {
 	// start, stopped at the exit (manager_log_files.go). nil without log
 	// files.
 	tailers []*fileTailer
+	// failure is the last_error the owner recorded for THIS generation while
+	// it was still alive, right before killing it for that failure (a startup
+	// timeout, a relay that never listened, a device-count mismatch, a RAM
+	// bootstrap that was never measured; noteGenerationFailure). The exit is
+	// then intentional, yet that last_error describes this generation, so its
+	// log-file tails (#430 §9) attach to it under the same pointer-identity
+	// rule as a crash's. nil for every plain stop.
+	failure *LastError
 }
 
 // control is p.ctl, or the native control for a runningProc built without one.
@@ -4229,6 +4237,7 @@ func (o *owner) failBootstrapUnmeasured(st *specState) {
 	st.ramBootstrapBeats = 0
 	o.setState(st, StateStartFailed)
 	o.recordFailure(st, "runtime: RAM cold-start bootstrap never produced a measurement within the bootstrap deadline", -1, proc.log.Tail(2048))
+	noteGenerationFailure(st, proc)
 	o.failPending(st, ErrStartFailed)
 	o.terminateNow(st, proc)
 	o.enterBackoff(st)
@@ -5149,6 +5158,7 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		// requests with it would silently shrink the cluster. Refuse it before
 		// it is ever reported running; only a config change can fix it.
 		o.setTerminalVerdict(st, c.deviceMismatch, codeRPCDeviceCountMismatch)
+		noteGenerationFailure(st, c.proc)
 		o.terminateNow(st, c.proc)
 		return
 	}
@@ -5202,6 +5212,7 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, c.relayDown, 0, "")
 		st.lastError.Code = codeBindMismatch
+		noteGenerationFailure(st, c.proc)
 		st.bindMismatch = true
 		o.failPending(st, ErrStartFailed)
 		o.terminateNow(st, c.proc)
@@ -5213,6 +5224,7 @@ func (o *owner) handleStartResult(c cmdStartResult) {
 	tail := c.proc.log.Tail(2048)
 	o.setState(st, StateStartFailed)
 	o.recordFailure(st, "runtime: startup timed out waiting for health", 0, tail)
+	noteGenerationFailure(st, c.proc)
 	o.failPending(st, ErrStartTimeout)
 	o.terminateNow(st, c.proc)
 	// I2 fix: rate-limit retries of a spec that never becomes healthy
@@ -5250,14 +5262,16 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	proc := st.proc
 	// The generation's log-file tailers (#430) begin their grace first, for
 	// EVERY kind of exit, before anything below can start the next generation.
-	// tailsFor is the last_error this exit records, which their tails attach
-	// to once they are done (awaitLogFileTails); it stays nil for an exit that
-	// records none -- a stop, a removal -- and is set right where each failure
-	// branch below records its last_error, before anything else in this turn
-	// could replace it. A removed spec's tailers have no next generation and
+	// tailsFor is the last_error describing this generation's failure, which
+	// their tails attach to once they are done (awaitLogFileTails): the one a
+	// failure recorded before killing it (proc.failure, an intentional exit),
+	// or the one each failure branch below records, set right there, before
+	// anything else in this turn could replace it. It stays nil for a plain
+	// stop and a removal. A removed spec's tailers have no next generation and
 	// no reader left, so their grace ends at once.
-	var tailsFor *LastError
+	tailsFor := proc.failure
 	if st.removed {
+		tailsFor = nil
 		o.stopLogFileTailers(nil, proc)
 	} else {
 		o.stopLogFileTailers(st, proc)

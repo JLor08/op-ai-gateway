@@ -267,6 +267,34 @@ func TestManagerLogFileTailsInLastError(t *testing.T) {
 	}
 }
 
+// TestManagerLogFileTailsInStartTimeoutError: a generation that never becomes
+// healthy is killed by the owner for its startup timeout -- an INTENTIONAL
+// exit, whose last_error was recorded before the kill -- and that last_error
+// still gains the file's tails: the never-healthy server (a long load that
+// dies, or hangs) is the case a file log matters most for.
+func TestManagerLogFileTailsInStartTimeoutError(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	backoffBase, backoffCap = time.Minute, time.Minute
+	setLogFileGrace(t, 300*time.Millisecond)
+	m := newLogFileManager(t, allowlistPolicy(), t.TempDir())
+
+	spec := logFileSpec("spec-timeout", "timeout-model",
+		"-health-delay", "1m", "-log-text", `engine loading\nengine still loading\n`)
+	spec.StartupTimeoutSeconds = 1
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	le := waitForLastError(t, m, "spec-timeout", "the start timeout's last_error with log_file_tails", func(le *LastError) bool {
+		return len(le.LogFileTails) > 0
+	})
+	if !strings.Contains(le.Message, "startup timed out") {
+		t.Fatalf("tails attached to %+v, want the start timeout's own last_error", le)
+	}
+	if len(le.LogFileTails) != 1 || le.LogFileTails[0].Name != "engine" || le.LogFileTails[0].Tail != "engine loading\nengine still loading\n" {
+		t.Errorf("log_file_tails = %+v, want the engine file ending with its last line", le.LogFileTails)
+	}
+}
+
 // TestManagerLogFileTailsNotAttachedToALaterError: when last_error has been
 // replaced by the time a generation's tails are ready, the tails are dropped --
 // they never describe the later error. Here the next start attempt fails

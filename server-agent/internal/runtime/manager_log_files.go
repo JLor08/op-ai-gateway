@@ -30,9 +30,11 @@ import (
 //     generation, the instance prefix and the generation's secret masker.
 //   - At exit, of any kind, before anything can start N+1: every tailer is
 //     stopped (its grace begins) and kept on the specState until N+1 ends it.
-//     A crash's or failed start's last_error gets the tails once every tailer
-//     is done (awaitLogFileTails, handleLogFileTails), and only while it still
-//     describes N.
+//     A crash's or failed start's last_error -- or the one a failure recorded
+//     before killing N (a startup timeout and its kin, runningProc.failure)
+//     -- gets the tails once every tailer is done (awaitLogFileTails,
+//     handleLogFileTails), and only while it still describes N. A plain stop
+//     gets none.
 //
 // Shutdown: a tailer of an exit during Close, and every tailer still in its
 // grace when Close begins, is ended at once (EndGrace) -- the agent is going
@@ -100,6 +102,11 @@ func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, ven
 // st whose name the next generation declares again (targets), and forgets
 // every tailer that has finished. A name the next generation does not declare
 // keeps its grace: nothing of the next generation can reach that stream.
+// EndGrace is not awaited before the next generation's exec, so where both
+// generations read one inode (an external path or a stale name) a few early
+// bytes of the next generation can still reach the predecessor's stream; a
+// ${CONFIG_DIR} file is separated fully, because the predecessor holds the
+// unlinked inode and its grace never adopts the new file.
 func endPredecessorGraces(st *specState, targets []logFileTarget) {
 	keep := st.graceTailers[:0]
 	for _, t := range st.graceTailers {
@@ -229,6 +236,13 @@ func runeStart(s string) string {
 		}
 	}
 	return s
+}
+
+// noteGenerationFailure records st's current last_error as proc's own
+// failure: called right after a failure was recorded for a live generation
+// that the owner then kills for it (runningProc.failure).
+func noteGenerationFailure(st *specState, proc *runningProc) {
+	proc.failure = st.lastError
 }
 
 // cmdLogFileTails carries the log-file tails of one exited generation to the
