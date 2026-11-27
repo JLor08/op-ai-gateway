@@ -429,6 +429,9 @@ function renderSection(
     // vendor and its note).
     server?: Partial<PortalServer>;
     dismissGpuVendorNote?: PortalApi['dismissGpuVendorNote'];
+    // Asked to read the server again after a change of it (#434: the GPU
+    // vendor note's dismissal).
+    onServerRefresh?: () => void;
   } = {},
 ) {
   const mappings = opts.mappings ?? [];
@@ -712,6 +715,7 @@ function renderSection(
         // tests. Without it forwarded, the shared mask's one async loop is
         // testable on the ordinary screen and not on this tab.
         pollIntervalMs={0}
+        onServerRefresh={opts.onServerRefresh}
       />
     </ToastProvider>,
   );
@@ -896,7 +900,7 @@ describe('RuntimeAdminSection launch specs list', () => {
           binary: '/usr/local/bin/llama-server',
           pinned: true,
           idle_timeout_seconds: 300,
-          gpus: [{ index: 0, vram_estimate_mb: 22000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 22000, vram_measured_mb: 0 }],
         }),
       },
     });
@@ -919,20 +923,20 @@ describe('RuntimeAdminSection launch specs list', () => {
       map_measured_over: makeSpec({
         configured: true,
         mapping_id: 'map_measured_over',
-        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
+        gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
       }),
       // measured BELOW the estimate: the estimate stays as a floor (max), the
       // lower measurement does not replace it.
       map_estimate_floor: makeSpec({
         configured: true,
         mapping_id: 'map_estimate_floor',
-        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 5000 }],
+        gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 5000 }],
       }),
       // never measured (0 = unknown): the estimate.
       map_unmeasured: makeSpec({
         configured: true,
         mapping_id: 'map_unmeasured',
-        gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+        gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
       }),
       // two cards: 9000 (measured over estimate) + 3000 (never measured, so
       // its estimate) = 12000.
@@ -940,8 +944,8 @@ describe('RuntimeAdminSection launch specs list', () => {
         configured: true,
         mapping_id: 'map_pair',
         gpus: [
-          { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
-          { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+          { vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
+          { vendor: '', index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
         ],
       }),
       // no GPU rows at all: nothing to total.
@@ -1036,19 +1040,19 @@ describe('RuntimeAdminSection launch specs list', () => {
         id: 'spec_wsl_live',
         execution_mode: 'wsl',
         wsl_distro: 'Ubuntu-24.04',
-        gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+        gpus: [{ vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
       }),
       map_native_under: makeSpec({
         configured: true,
         mapping_id: 'map_native_under',
         id: 'spec_native_under',
-        gpus: [{ index: 0, vram_estimate_mb: 4000, vram_measured_mb: 5000 }],
+        gpus: [{ vendor: '', index: 0, vram_estimate_mb: 4000, vram_measured_mb: 5000 }],
       }),
       map_other_index: makeSpec({
         configured: true,
         mapping_id: 'map_other_index',
         id: 'spec_other_index',
-        gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+        gpus: [{ vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
       }),
     };
     const vramFrame = [
@@ -1318,7 +1322,7 @@ describe('RuntimeAdminSection launch specs list', () => {
           mapping_id: 'map_env',
           set_visible_devices: true,
           visible_devices_mode: 'env',
-          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
         }),
         map_args: makeSpec({
           configured: true,
@@ -1326,7 +1330,7 @@ describe('RuntimeAdminSection launch specs list', () => {
           set_visible_devices: true,
           visible_devices_mode: 'args',
           args: ['--device', '${CUDA_DEVICES}'],
-          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
         }),
       },
     });
@@ -2265,7 +2269,9 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       renderSection({
         mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-wsl' })],
         specsByMappingId: {
-          map_1: wslSpec({ gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }] }),
+          map_1: wslSpec({
+            gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
+          }),
         },
         report: wslReport,
       });
@@ -2283,7 +2289,9 @@ describe('RuntimeAdminSection create (mapping + spec)', () => {
       renderSection({
         mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'gw-wsl' })],
         specsByMappingId: {
-          map_1: wslSpec({ gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }] }),
+          map_1: wslSpec({
+            gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+          }),
         },
         report: wslReport,
       });
@@ -3173,9 +3181,9 @@ describe('RuntimeAdminSection GPU-row ordering', () => {
           // Save click below to actually reach the submit handler.
           binary: '/usr/bin/llama-server',
           gpus: [
-            { index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 },
-            { index: 1, vram_estimate_mb: 2000, vram_measured_mb: 0 },
-            { index: 2, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+            { vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 },
+            { vendor: '', index: 1, vram_estimate_mb: 2000, vram_measured_mb: 0 },
+            { vendor: '', index: 2, vram_estimate_mb: 3000, vram_measured_mb: 0 },
           ],
         }),
       },
@@ -4016,7 +4024,13 @@ describe('RuntimeAdminSection server limits wiring', () => {
         { index: 0, name: 'RTX 5090', uuid: 'GPU-live', memory_total_bytes: 0 },
       ]),
       gpuBudgets: [
-        { index: 0, budget_mb: 24000, expected_uuid: 'GPU-old', expected_name: 'RTX 4090' },
+        {
+          vendor: '',
+          index: 0,
+          budget_mb: 24000,
+          expected_uuid: 'GPU-old',
+          expected_name: 'RTX 4090',
+        },
       ],
     });
 
@@ -4037,7 +4051,13 @@ describe('RuntimeAdminSection server limits wiring', () => {
       // either side.
       hardware: makeHardware([{ index: 0, name: 'Apple M3 Max GPU', memory_total_bytes: 0 }]),
       gpuBudgets: [
-        { index: 0, budget_mb: 10000, expected_uuid: '', expected_name: 'Apple M2 Max GPU' },
+        {
+          vendor: '',
+          index: 0,
+          budget_mb: 10000,
+          expected_uuid: '',
+          expected_name: 'Apple M2 Max GPU',
+        },
       ],
     });
 
@@ -4050,7 +4070,9 @@ describe('RuntimeAdminSection server limits wiring', () => {
 
   it('saves the GPU budgets and the process limit together', async () => {
     const { putBudgets, updatedServers } = renderSection({
-      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      gpuBudgets: [
+        { vendor: '', index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
+      ],
       runtimeMaxProcesses: 2,
     });
 
@@ -4062,7 +4084,7 @@ describe('RuntimeAdminSection server limits wiring', () => {
 
     await waitFor(() => expect(putBudgets).toHaveLength(1));
     expect(putBudgets[0]).toEqual([
-      { index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
+      { vendor: '', index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
     ]);
     await waitFor(() => expect(updatedServers).toHaveLength(1));
     expect(updatedServers[0].body.runtime_max_processes).toBe(5);
@@ -4104,7 +4126,7 @@ function fullSpec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
     // spreading the LOADED spec, so a `false` here could not tell a preserved
     // value from a defaulted one.
     set_visible_devices: true,
-    gpus: [{ index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 }],
+    gpus: [{ vendor: '', index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 }],
     // Non-default on purpose, both of them: a body that silently dropped the
     // estimate would clear it on an override click, and one that echoed the
     // measurement back would hand an agent-owned number to the PUT.
@@ -6072,7 +6094,9 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       mappings: [makeMapping({ id: 'map_1' })],
       specsByMappingId: { map_1: fullSpec() },
       reportPending: true,
-      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      gpuBudgets: [
+        { vendor: '', index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
+      ],
     });
 
     await screen.findByText('gw-model');
@@ -6158,7 +6182,7 @@ describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block 
           set_visible_devices: true,
           visible_devices_mode: 'args',
           args: ['--device', '${CUDA_DEVICES}'],
-          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
         }),
       },
       report: makeReport({ agent_version: '0.3.0', agent_features: ['runtime_manager'] }),
@@ -6187,7 +6211,7 @@ describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block 
           set_visible_devices: true,
           visible_devices_mode: 'args',
           args: ['--device', '${METAL_DEVICES}'],
-          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
         }),
       },
       // makeHardware(...) reports os:'linux' (non-macOS) — see GOTCHAS.
@@ -6212,7 +6236,7 @@ describe('RuntimeAdminSection GPU-selection portal hints (advisory, never block 
           set_visible_devices: true,
           visible_devices_mode: 'args',
           args: ['--device', '${METAL_DEVICES}'],
-          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
         }),
       },
       hardware: makeHardware(
@@ -6924,7 +6948,9 @@ describe('RuntimeAdminSection failing GPU-budgets GET (task 22b, C1)', () => {
   it('hides the Save form when a RELOAD fails over an existing budget list', async () => {
     const en = messages.en;
     const { fakeApi, rerenderWithLocale } = renderSection({
-      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      gpuBudgets: [
+        { vendor: '', index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
+      ],
       gpuBudgetsFailsOnCall: 2,
       runtimeMaxProcesses: 2,
     });
@@ -7186,8 +7212,8 @@ describe('RuntimeAdminSection duplicate GPU index (task 22b, C5)', () => {
   it('refuses a GPU-budget save whose two rows share an index, before any write', async () => {
     const { fakeApi, putBudgets } = renderSection({
       gpuBudgets: [
-        { index: 0, budget_mb: 10000, expected_uuid: '', expected_name: '' },
-        { index: 1, budget_mb: 20000, expected_uuid: '', expected_name: '' },
+        { vendor: '', index: 0, budget_mb: 10000, expected_uuid: '', expected_name: '' },
+        { vendor: '', index: 1, budget_mb: 20000, expected_uuid: '', expected_name: '' },
       ],
     });
 
@@ -7931,7 +7957,9 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
   it('keeps an unsaved budget edit across a language switch', async () => {
     const en = messages.en;
     const { fakeApi, putBudgets, rerenderWithLocale } = renderSection({
-      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      gpuBudgets: [
+        { vendor: '', index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
+      ],
     });
 
     fireEvent.click(await screen.findByText(t.runtimeLimits));
@@ -7959,13 +7987,15 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
     fireEvent.click(screen.getByRole('button', { name: en.save }));
     await waitFor(() => expect(putBudgets).toHaveLength(1));
     expect(putBudgets[0]).toEqual([
-      { index: 0, budget_mb: 32000, expected_uuid: '', expected_name: '' },
+      { vendor: '', index: 0, budget_mb: 32000, expected_uuid: '', expected_name: '' },
     ]);
   });
 
   it('still re-seeds from the authoritative list a successful save feeds back', async () => {
     const { putBudgets } = renderSection({
-      gpuBudgets: [{ index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' }],
+      gpuBudgets: [
+        { vendor: '', index: 0, budget_mb: 40000, expected_uuid: '', expected_name: '' },
+      ],
     });
 
     fireEvent.click(await screen.findByText(t.runtimeLimits));
@@ -7975,7 +8005,7 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
     await waitFor(() => expect(putBudgets).toHaveLength(1));
     // Saved without a drift snapshot -- the loaded list had none.
     expect(putBudgets[0]).toEqual([
-      { index: 0, budget_mb: 32000, expected_uuid: '', expected_name: '' },
+      { vendor: '', index: 0, budget_mb: 32000, expected_uuid: '', expected_name: '' },
     ]);
 
     // The dirty flag must not survive the save, or the post-save list (which
@@ -7992,6 +8022,7 @@ describe('RuntimeAdminSection budget draft survives a re-seed (fix round 1, M9)'
     await waitFor(() => expect(putBudgets).toHaveLength(2));
     expect(putBudgets[1]).toEqual([
       {
+        vendor: '',
         index: 0,
         budget_mb: 16000,
         expected_uuid: 'GPU-0-UUID',
@@ -8318,9 +8349,9 @@ describe('RuntimeAdminSection row identity across a mid-list delete (Sonar S6479
   it('keeps every surviving GPU-budget row on its own values and its own DOM node', async () => {
     renderSection({
       gpuBudgets: [
-        { index: 0, budget_mb: 10000, expected_uuid: '', expected_name: '' },
-        { index: 1, budget_mb: 20000, expected_uuid: '', expected_name: '' },
-        { index: 2, budget_mb: 30000, expected_uuid: '', expected_name: '' },
+        { vendor: '', index: 0, budget_mb: 10000, expected_uuid: '', expected_name: '' },
+        { vendor: '', index: 1, budget_mb: 20000, expected_uuid: '', expected_name: '' },
+        { vendor: '', index: 2, budget_mb: 30000, expected_uuid: '', expected_name: '' },
       ],
     });
 
@@ -8475,7 +8506,7 @@ describe('RuntimeAdminSection spec GPU picker', () => {
     await waitFor(() => expect(created).toHaveLength(1));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.gpus).toEqual([
-      { index: 2, vram_estimate_mb: 18000, vram_measured_mb: 0 },
+      { vendor: '', index: 2, vram_estimate_mb: 18000, vram_measured_mb: 0 },
     ]);
   });
 
@@ -8549,7 +8580,9 @@ describe('RuntimeAdminSection set_visible_devices', () => {
 
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.set_visible_devices).toBe(true);
-    expect(putSpecs[0].body.gpus).toEqual([{ index: 3, vram_estimate_mb: 0, vram_measured_mb: 0 }]);
+    expect(putSpecs[0].body.gpus).toEqual([
+      { vendor: '', index: 3, vram_estimate_mb: 0, vram_measured_mb: 0 },
+    ]);
   });
 
   // Trap 2 lives here and nowhere else: nothing can ENFORCE that an argument
@@ -8681,7 +8714,7 @@ describe('RuntimeAdminSection visibility mode', () => {
           set_visible_devices: true,
           visible_devices_mode: 'env',
           args: ['--device', '${CUDA_DEVICES}'],
-          gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
         }),
       },
     });
@@ -8710,7 +8743,7 @@ describe('RuntimeAdminSection visibility mode', () => {
       visible_devices_mode: 'args',
       args,
       config_files: [{ name: 'strata.json', content }],
-      gpus: [{ index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
+      gpus: [{ vendor: '', index: 0, vram_estimate_mb: 1000, vram_measured_mb: 0 }],
     });
   }
 
@@ -9286,8 +9319,8 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
   const twoCardSpec = () =>
     fullSpec({
       gpus: [
-        { index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
-        { index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 },
+        { vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+        { vendor: '', index: 1, vram_estimate_mb: 22000, vram_measured_mb: 21500 },
       ],
     });
 
@@ -9339,11 +9372,11 @@ describe('RuntimeAdminSection per-GPU apply of a VRAM measurement (D4)', () => {
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.gpus).toEqual([
-      { index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+      { vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
       // The applied number landed in the ESTIMATE. `vram_measured_mb` still
       // carries the agent's value (the backend ignores it on write anyway) --
       // the affordance must never move a number into the agent's column.
-      { index: 1, vram_estimate_mb: 4096, vram_measured_mb: 21500 },
+      { vendor: '', index: 1, vram_estimate_mb: 4096, vram_measured_mb: 21500 },
     ]);
   });
 
@@ -11869,8 +11902,8 @@ describe('RuntimeAdminSection spec-level RAM estimate', () => {
     await openApiTokenSpecEdit({
       ram_estimate_mb: 2048,
       gpus: [
-        { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 },
-        { index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
+        { vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 },
+        { vendor: '', index: 1, vram_estimate_mb: 3000, vram_measured_mb: 0 },
       ],
     });
 
@@ -13506,7 +13539,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     server_id: 'srv_b',
     server_name: 'Beta',
     member_spec_id: '',
-    gpus: [{ index: 1, vram_estimate_mb: 8000, vram_measured_mb: 7000 }],
+    gpus: [{ vendor: '' as const, index: 1, vram_estimate_mb: 8000, vram_measured_mb: 7000 }],
     threads: 8,
     cache_enabled: true,
     device_backend: 'cuda' as const,
@@ -13664,7 +13697,7 @@ describe('RuntimeAdminSection cluster head round trip', () => {
         {
           ...visibleMember,
           ram_measured_mb: 0,
-          gpus: [{ index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
         },
         hiddenMember,
       ],
@@ -13683,12 +13716,30 @@ describe('RuntimeAdminSection cluster head round trip', () => {
     fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Beta` }));
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
 
-    await waitFor(() => expect(reset).toHaveBeenCalledWith('map_1', 'srv_b'));
+    // The member is named by its stored position too (#434).
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('map_1', 'srv_b', 0));
     await waitFor(() =>
       expect(screen.getByTestId('cluster-totals')).toHaveTextContent('VRAM ≥ 9000 MB'),
     );
     expect(screen.queryByText(`${t.clusterMemberMeasured} 900 MB`)).not.toBeInTheDocument();
     expect(view.putSpecs).toHaveLength(0);
+  });
+
+  it('resets a member by its stored position', async () => {
+    const atOne = { ...visibleMember, position: 1 };
+    const spec = headSpec({ cluster_members: [{ ...hiddenMember, position: 0 }, atOne] });
+    const reset = vi.fn(async () => spec);
+    renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: { map_1: spec },
+      resetClusterMemberUsage: reset,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberResetUsage}: Beta` }));
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('map_1', 'srv_b', 1));
   });
 
   it('shows the compact cluster status in the live-status cell', async () => {
@@ -14559,7 +14610,7 @@ describe('RuntimeAdminSection mixed-vendor GPUs', () => {
         map_1: makeSpec({
           configured: true,
           binary: '/usr/bin/llama-server',
-          gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
         }),
       },
     });
@@ -14599,7 +14650,7 @@ describe('RuntimeAdminSection mixed-vendor GPUs', () => {
     );
   });
 
-  it('prefills a budget row from a card, picks another vendor and saves the vendor', async () => {
+  it('prefills each budget row from a card and saves its vendor', async () => {
     const { putBudgets } = renderSection({ hardware: mixedHardware() });
     fireEvent.click(await screen.findByText(t.runtimeLimits));
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecGpuAdd }));
@@ -14647,11 +14698,13 @@ describe('RuntimeAdminSection mixed-vendor GPUs', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('shows and dismisses the legacy-mapping note', async () => {
+  it('shows and dismisses the legacy-mapping note, then has the server read again', async () => {
     const dismiss = vi.fn(async () => undefined);
+    const refresh = vi.fn();
     renderSection({
       server: { gpu_vendor_note: true, gpu_legacy_vendor: 'nvidia' },
       dismissGpuVendorNote: dismiss,
+      onServerRefresh: refresh,
     });
     expect(await screen.findByText(t.gpuLegacyMappedNote('NVIDIA'))).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: t.gpuLegacyMappedDismiss }));
@@ -14659,6 +14712,182 @@ describe('RuntimeAdminSection mixed-vendor GPUs', () => {
     await waitFor(() =>
       expect(screen.queryByText(t.gpuLegacyMappedNote('NVIDIA'))).not.toBeInTheDocument(),
     );
+    // The server prop is the parent's cached row: without a fresh read the
+    // note would come back with the next mount of this screen.
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not have the server read again when the dismissal fails', async () => {
+    const refresh = vi.fn();
+    renderSection({
+      server: { gpu_vendor_note: true, gpu_legacy_vendor: 'nvidia' },
+      dismissGpuVendorNote: vi.fn(async () => Promise.reject(new Error('nope'))),
+      onServerRefresh: refresh,
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.gpuLegacyMappedDismiss }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t.gpuLegacyMappedDismiss })).toBeEnabled(),
+    );
+    expect(screen.getByText(t.gpuLegacyMappedNote('NVIDIA'))).toBeInTheDocument();
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('switches a budget row to another vendor card and drops its drift snapshot', async () => {
+    const { putBudgets } = renderSection({
+      hardware: mixedHardware(),
+      gpuBudgets: [
+        {
+          vendor: 'nvidia',
+          index: 0,
+          budget_mb: 20000,
+          expected_uuid: 'GPU-nv0',
+          expected_name: 'NVIDIA GeForce RTX 4090',
+        },
+      ],
+    });
+    fireEvent.click(await screen.findByText(t.runtimeLimits));
+    const picker = await screen.findByRole('combobox', { name: t.runtimeSpecGpuPick });
+    expect(picker.textContent).toMatch(/^NVIDIA 0 · /);
+    fireEvent.mouseDown(picker);
+    fireEvent.click(await screen.findByRole('option', { name: /^AMD 0 · / }));
+    expect(screen.getByRole('combobox', { name: t.runtimeSpecGpuPick }).textContent).toMatch(
+      /^AMD 0 · /,
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putBudgets).toHaveLength(1));
+    // The snapshot named the NVIDIA card; the gateway takes a new one for AMD 0.
+    expect(putBudgets[0]).toEqual([
+      { vendor: 'amd', index: 0, budget_mb: 20000, expected_uuid: '', expected_name: '' },
+    ]);
+  });
+
+  // The backend refuses a backend that cannot drive one of the spec's GPUs
+  // unless the save leaves the stored spec's device-plan inputs unchanged
+  // (refusalUnlessUnchanged): the backend, the cards and whether the agent
+  // injects the visibility variable. The form mirrors that exactly.
+  describe('backend mismatch of a stored spec', () => {
+    const storedMismatch = () =>
+      makeSpec({
+        configured: true,
+        binary: '/usr/bin/llama-server',
+        device_backend: 'cuda',
+        gpus: [
+          { vendor: 'nvidia', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+          { vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+        ],
+      });
+
+    async function openStored() {
+      const view = renderSection({
+        hardware: mixedHardware(),
+        mappings: [makeMapping()],
+        specsByMappingId: { map_1: storedMismatch() },
+      });
+      await waitForEnabledButton(t.runtimeSpecEditAction);
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
+      await screen.findByLabelText(t.runtimeSpecBinary);
+      expect(screen.getByText(t.runtimeBackendMismatchHint)).toBeInTheDocument();
+      return view;
+    }
+
+    it('re-sends the unchanged spec', async () => {
+      const { putSpecs } = await openStored();
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.device_backend).toBe('cuda');
+      expect(putSpecs[0].body.gpus.map((g) => [g.vendor, g.index])).toEqual([
+        ['nvidia', 0],
+        ['amd', 0],
+      ]);
+    });
+
+    it('refuses the spec with a GPU removed', async () => {
+      const { putSpecs } = await openStored();
+      fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecGpuRemove })[0]);
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() =>
+        expect(screen.getAllByText(t.runtimeBackendMismatchHint).length).toBeGreaterThan(1),
+      );
+      expect(putSpecs).toHaveLength(0);
+    });
+
+    it('refuses the spec with a GPU added', async () => {
+      const { putSpecs } = await openStored();
+      fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() =>
+        expect(screen.getAllByText(t.runtimeBackendMismatchHint).length).toBeGreaterThan(1),
+      );
+      expect(putSpecs).toHaveLength(0);
+    });
+
+    it('refuses the spec once the agent would inject the visibility variable', async () => {
+      const { putSpecs } = await openStored();
+      fireEvent.click(screen.getByLabelText(t.runtimeSpecSetVisibleDevices));
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() =>
+        expect(screen.getAllByText(t.runtimeBackendMismatchHint).length).toBeGreaterThan(1),
+      );
+      expect(putSpecs).toHaveLength(0);
+    });
+  });
+
+  // The gateway reads a row without a vendor as the server's stored legacy
+  // vendor alone. With none stored, such a row and a vendor-qualified one at
+  // the same index are two keys there, so the form lets the save through
+  // although the report's only vendor would read them as one card.
+  it('checks duplicate cards with the stored legacy vendor only', async () => {
+    const { putSpecs } = renderSection({
+      hardware: makeHardware([
+        {
+          index: 0,
+          vendor: 'nvidia',
+          name: 'NVIDIA GeForce RTX 4090',
+          uuid: 'GPU-nv0',
+          memory_total_bytes: 24 * 1024 * 1024 * 1024,
+        },
+      ]),
+      mappings: [makeMapping()],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          binary: '/usr/bin/llama-server',
+          gpus: [
+            { vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+            { vendor: 'nvidia', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+          ],
+        }),
+      },
+    });
+    await waitForEnabledButton(t.runtimeSpecEditAction);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(screen.queryByText(new RegExp(t.runtimeGpuIndexDuplicate))).not.toBeInTheDocument();
+  });
+
+  it('refuses a vendorless row and the legacy vendor card at the same index', async () => {
+    const { putSpecs } = renderSection({
+      server: { gpu_legacy_vendor: 'nvidia' },
+      mappings: [makeMapping()],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          binary: '/usr/bin/llama-server',
+          gpus: [
+            { vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+            { vendor: 'nvidia', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+          ],
+        }),
+      },
+    });
+    await waitForEnabledButton(t.runtimeSpecEditAction);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(`${t.runtimeGpuIndexDuplicate}: NVIDIA 0`)).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
   });
 
   it('shows no legacy-mapping note once it is acknowledged', async () => {

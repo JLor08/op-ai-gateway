@@ -1369,8 +1369,10 @@ function validateVisibleDevices(
 /**
  * The first GPU key (gpuKey, #434: a card is its vendor and its index, and
  * indexes restart per vendor) that appears more than once, or `null`. Callers
- * pass resolved keys (resolvedGpuKey), so a row without a vendor and one naming
- * the host's vendor at the same index collide, as they do server-side.
+ * pass keys with a missing vendor read as the server's stored legacy vendor
+ * (legacyCardKey), exactly as the gateway reads them: a row without a vendor
+ * and one naming the legacy vendor at the same index collide there and here,
+ * and nothing collides here that the gateway accepts.
  *
  * Both server-side writes that carry per-GPU rows REFUSE a repeated index
  * outright -- `validateRuntimeSpecGPUs` and `SetServerGPUBudgets`, each
@@ -1528,6 +1530,7 @@ export function RuntimeAdminSection({
   application,
   trail = [],
   pollIntervalMs,
+  onServerRefresh,
 }: Readonly<{
   t: Translation;
   api: Pick<
@@ -1610,6 +1613,13 @@ export function RuntimeAdminSection({
    * rather than a saved prop.
    */
   pollIntervalMs?: number;
+  /**
+   * Asks the parent to read the server again after this screen changed it
+   * (#434: the GPU vendor note's dismissal). `server` is the parent's cached
+   * row, so without a fresh read the next mount of this screen would show the
+   * dismissed note again.
+   */
+  onServerRefresh?: () => void;
 }>) {
   const { showError, showSuccess } = useToast();
   const [tab, setTab] = useState<Tab>('specs');
@@ -2064,6 +2074,14 @@ export function RuntimeAdminSection({
   const hostVendor = hostGpuVendor(server.gpu_legacy_vendor, telemetryGpus);
   const cardKey = (card: { vendor?: GpuVendor; index: number }) =>
     resolvedGpuKey(card.vendor, card.index, hostVendor);
+  // The gateway's own reading of a row without a vendor: the server's stored
+  // legacy vendor alone, never a guess from the hardware report. The save-time
+  // checks that mirror a gateway refusal (the duplicate card, the backend
+  // mismatch) key on it, so the form never refuses what the gateway accepts;
+  // cardKey above is for display and for matching rows with reported cards.
+  const legacyVendor: GpuVendor = server.gpu_legacy_vendor ?? '';
+  const legacyCardKey = (card: { vendor?: GpuVendor; index: number }) =>
+    gpuKey(card.vendor || legacyVendor, card.index);
   // Whether the hardware fetch has actually SETTLED, as distinct from having
   // returned nothing yet. The spec form's GPU picker degrades to "this server
   // has reported no GPUs" when the list is empty, and flashing that sentence
@@ -2267,7 +2285,7 @@ export function RuntimeAdminSection({
     // Same collision check as the spec form's GPU rows, same reason: a card
     // retyped onto another row's collides, the backend refuses the whole PUT
     // with a message that names neither row, and this Save is a FULL replace.
-    const duplicateGpu = duplicateGpuKey(budgetRows.map(cardKey));
+    const duplicateGpu = duplicateGpuKey(budgetRows.map(legacyCardKey));
     if (duplicateGpu !== null) {
       showError(`${t.runtimeGpuIndexDuplicate}: ${gpuKeyDisplayName(duplicateGpu)}`);
       return;
@@ -2276,9 +2294,9 @@ export function RuntimeAdminSection({
     try {
       const body: { budgets: GPUBudget[] } = {
         budgets: budgetRows.map((r) => ({
-          // A row without a vendor saves as it always did (no key); the
-          // backend reads it as the server's legacy vendor.
-          ...(r.vendor ? { vendor: r.vendor } : {}),
+          // A row without a vendor goes back with the empty vendor the gateway
+          // sent it with; it reads that as the server's legacy vendor.
+          vendor: r.vendor,
           index: r.index,
           budget_mb: r.budgetMb,
           expected_uuid: r.expectedUuid,
@@ -3810,10 +3828,10 @@ export function RuntimeAdminSection({
       // Only meaningful under 'random' mode; a stray true from a since-changed
       // mode would ask the backend to rotate a token that no longer applies.
       ...(apiTokenMode === 'random' && apiTokenRotate ? { api_token_rotate: true } : {}),
-      // A row without a vendor saves as it always did (no key); the backend
-      // reads it as the server's legacy vendor.
+      // A row without a vendor goes back with the empty vendor the gateway sent
+      // it with; it reads that as the server's legacy vendor.
       gpus: gpuRows.map((r) => ({
-        ...(r.vendor ? { vendor: r.vendor } : {}),
+        vendor: r.vendor,
         index: r.index,
         vram_estimate_mb: r.vramEstimateMb,
         vram_measured_mb: r.vramMeasuredMb,
@@ -3873,7 +3891,6 @@ export function RuntimeAdminSection({
   // exactly the backend's reading (resolveSpecBackend), so the form never
   // refuses a spec the backend accepts. A row naming no vendor on a server
   // with no legacy vendor takes part in neither decision.
-  const legacyVendor: GpuVendor = server.gpu_legacy_vendor ?? '';
   const backendResolution = resolveAutoBackend(
     cluster.deviceBackend,
     gpuRows.map((r) => r.vendor || legacyVendor),
@@ -3881,17 +3898,27 @@ export function RuntimeAdminSection({
 
   // The save-time refusal of a mismatched backend, mirroring the backend's
   // (runtime_spec.gpu_vendor_backend_mismatch) including its exemption: a save
-  // that leaves the stored spec's backend and GPUs as they are is not refused
-  // (refusalUnlessUnchanged), so a spec stored before the rule, or before its
-  // host turned mixed, can still be re-saved. The agent refuses it at launch.
+  // that leaves the stored spec's device-plan inputs as they are is not
+  // refused (refusalUnlessUnchanged), so a spec stored before the rule, or
+  // before its host turned mixed, can still be re-saved; the agent refuses it
+  // at launch. The inputs are exactly the backend's devicePlanInputs: the
+  // device backend, the set of GPU cards (a row without a vendor read as the
+  // legacy vendor) and whether the agent injects the visibility variable
+  // (set_visible_devices in any mode but args). A change of any one of them
+  // is refused.
   function backendMismatchError(): string | undefined {
     if (!backendResolution.mismatch) return undefined;
     const stored = editingSpecMappingId ? specsById[editingSpecMappingId] : undefined;
     if (stored?.configured) {
       const keys = (gpus: { vendor?: GpuVendor; index: number }[]) =>
-        [...new Set(gpus.map((g) => gpuKey(g.vendor || legacyVendor, g.index)))].sort().join(',');
+        [...new Set(gpus.map(legacyCardKey))].sort().join(',');
+      const injects = (set: boolean | undefined, mode: string | undefined) =>
+        set === true && mode !== 'args';
       const sameBackend = (stored.device_backend || 'auto') === cluster.deviceBackend;
-      if (sameBackend && keys(stored.gpus) === keys(gpuRows)) return undefined;
+      const sameInjects =
+        injects(stored.set_visible_devices, stored.visible_devices_mode) ===
+        injects(setVisibleDevices, visibleDevicesMode);
+      if (sameBackend && sameInjects && keys(stored.gpus) === keys(gpuRows)) return undefined;
     }
     return t.runtimeBackendMismatchHint;
   }
@@ -3913,9 +3940,9 @@ export function RuntimeAdminSection({
   // A member usage reset is a write to the head's spec: the answer is the
   // head as it reads afterwards, and it takes a ticket like every other write
   // so a slower, earlier write cannot land over it (see beginSpecWrite).
-  async function resetClusterMemberUsage(mappingId: string, serverId: string) {
+  async function resetClusterMemberUsage(mappingId: string, serverId: string, position: number) {
     const ticket = beginSpecWrite(mappingId);
-    const spec = await api.resetClusterMemberUsage(mappingId, serverId);
+    const spec = await api.resetClusterMemberUsage(mappingId, serverId, position);
     commitSpecCache(mappingId, ticket, spec);
     return spec;
   }
@@ -4014,7 +4041,7 @@ export function RuntimeAdminSection({
       showError(logFilesProblem);
       return;
     }
-    const duplicateGpu = duplicateGpuKey(gpuRows.map(cardKey));
+    const duplicateGpu = duplicateGpuKey(gpuRows.map(legacyCardKey));
     if (duplicateGpu !== null) {
       showError(`${t.runtimeGpuIndexDuplicate}: ${gpuKeyDisplayName(duplicateGpu)}`);
       return;
@@ -4137,7 +4164,7 @@ export function RuntimeAdminSection({
       showError(logFilesProblem);
       return;
     }
-    const duplicateGpu = duplicateGpuKey(gpuRows.map(cardKey));
+    const duplicateGpu = duplicateGpuKey(gpuRows.map(legacyCardKey));
     if (duplicateGpu !== null) {
       showError(`${t.runtimeGpuIndexDuplicate}: ${gpuKeyDisplayName(duplicateGpu)}`);
       return;
@@ -6653,7 +6680,8 @@ export function RuntimeAdminSection({
                 headBinaryVersion={binaryVersionFor(serverBinaries, binary.trim())}
                 resetMemberUsage={
                   editingSpecMappingId && currentSpec?.configured
-                    ? (serverId) => resetClusterMemberUsage(editingSpecMappingId, serverId)
+                    ? (serverId, position) =>
+                        resetClusterMemberUsage(editingSpecMappingId, serverId, position)
                     : undefined
                 }
               />
@@ -6768,7 +6796,10 @@ export function RuntimeAdminSection({
         <GpuVendorNote
           t={t}
           vendor={server.gpu_legacy_vendor}
-          onDismiss={() => api.dismissGpuVendorNote(server.id)}
+          onDismiss={async () => {
+            await api.dismissGpuVendorNote(server.id);
+            onServerRefresh?.();
+          }}
           onError={(err) => showError(formatPortalError(err, t))}
           sx={{ mb: 2 }}
         />
@@ -7017,6 +7048,7 @@ export function RuntimeAdminSection({
           api={api}
           server={rpcSavedServer ?? server}
           statusRows={statusRows}
+          hardwareGpus={telemetryGpus}
           onServerSaved={(saved) => setRpcSaved({ server: saved, propKey: rpcContentKey })}
         />
       )}

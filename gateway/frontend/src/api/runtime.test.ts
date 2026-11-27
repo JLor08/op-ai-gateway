@@ -376,13 +376,17 @@ describe('runtimeApi manual start and stop', () => {
 // The RPC cluster additions: the cluster-candidates read and the request
 // shape of a cluster head save.
 describe('runtimeApi RPC cluster', () => {
-  it('POSTs a member usage reset with both ids URL-encoded and answers the head spec', async () => {
+  // #434: a head may have several members on one server, so the member is
+  // named by its position too; the portal always sends it.
+  it('POSTs a member usage reset with both ids URL-encoded and the position, and answers the head spec', async () => {
     const fetcher = vi
       .fn()
       .mockResolvedValue(jsonResponse({ id: 'spec_head', cluster_enabled: true }));
-    const got = await createPortalApi(fetcher).resetClusterMemberUsage('map/1', 'srv/b');
+    const got = await createPortalApi(fetcher).resetClusterMemberUsage('map/1', 'srv/b', 1);
     const [url, init] = fetcher.mock.calls[0];
-    expect(url).toBe('/api/portal/mappings/map%2F1/runtime/cluster-members/srv%2Fb/reset-usage');
+    expect(url).toBe(
+      '/api/portal/mappings/map%2F1/runtime/cluster-members/srv%2Fb/reset-usage?position=1',
+    );
     expect(init.method).toBe('POST');
     expect(init.headers['X-OP-CSRF']).toBe('1');
     expect(got).toMatchObject({ id: 'spec_head', cluster_enabled: true });
@@ -401,7 +405,7 @@ describe('runtimeApi RPC cluster', () => {
       ),
     );
     const err = await createPortalApi(fetcher)
-      .resetClusterMemberUsage('map_1', 'srv_x')
+      .resetClusterMemberUsage('map_1', 'srv_x', 0)
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PortalApiError);
     expect((err as PortalApiError).code).toBe('runtime_spec.cluster_member_not_found');

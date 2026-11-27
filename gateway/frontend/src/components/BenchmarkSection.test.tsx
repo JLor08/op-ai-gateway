@@ -1418,7 +1418,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
     // AMD 0. Each row names its card by vendor, and the two rows stay distinct
     // (one React key per card, not per index).
     it('names each card of a mixed-vendor host by vendor and index', async () => {
-      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      // Observes React's duplicate-key warning; every call still reaches the
+      // console, so an unrelated error is not swallowed.
+      const errorSpy = vi.spyOn(console, 'error');
       const card = (vendor: 'nvidia' | 'amd', measured: number) => ({
         index: 0,
         vendor,

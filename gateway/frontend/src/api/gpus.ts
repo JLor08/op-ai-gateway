@@ -36,6 +36,14 @@ export function gpuDisplayName(vendor: GpuVendor | undefined, index: number): st
   return `${label || 'GPU'} ${index}`;
 }
 
+// A reported GPU as a short picker label: "NVIDIA 0 · <name>", "GPU 0" for a
+// vendorless report's card without a name.
+export function gpuNameLabel(gpu: Pick<HardwareGPU, 'vendor' | 'index' | 'name'>): string {
+  const label = gpuDisplayName(gpu.vendor, gpu.index);
+  const name = gpu.name.trim();
+  return name ? `${label} · ${name}` : label;
+}
+
 // The distinct vendors of a hardware report, in the order nvidia, amd, apple.
 // GPUs without a vendor contribute nothing.
 export function reportVendors(gpus: HardwareGPU[]): GpuVendor[] {

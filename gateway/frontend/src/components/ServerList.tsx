@@ -759,6 +759,19 @@ export function ServerList({
     setMode({ kind: 'edit', server });
   }
 
+  // Reads the server rows again after a sub-view changed a server behind the
+  // list's back (#434: the runtime screen's GPU vendor note dismissal); the
+  // sub-views read their server from these rows. A failed read keeps the
+  // last-known rows, like the list poll.
+  function refreshServers() {
+    api
+      .servers()
+      .then((res) => setServers(res.data))
+      .catch(() => {
+        /* non-blocking -- the next list poll reads them again */
+      });
+  }
+
   // Shared onSaved callback for ServerEnergyPanel / ServerNetbirdLinkPanel /
   // ServerPolicyOverrides: update the row in the list + keep the edit-mode
   // context in sync with the fresh DTO (each panel already re-syncs its own
@@ -1154,6 +1167,7 @@ export function ServerList({
         api={api}
         server={server}
         onModelsChanged={onModelsChanged}
+        onServerRefresh={refreshServers}
         trail={[{ label: t.servers, onClick: () => setMode('list') }]}
       />
     );

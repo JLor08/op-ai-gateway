@@ -6,6 +6,7 @@ import { createPortalApi } from '../api';
 import {
   gpuDisplayName,
   gpuKey,
+  gpuNameLabel,
   hostGpuVendor,
   hostIsMixed,
   reportVendors,
@@ -27,6 +28,14 @@ describe('gpus', () => {
     expect(gpuDisplayName(undefined, 2)).toBe('GPU 2');
     expect(vendorLabel('amd')).toBe('AMD');
     expect(vendorLabel('')).toBe('');
+  });
+
+  it('labels a reported card for a picker', () => {
+    expect(gpuNameLabel({ vendor: 'amd', index: 1, name: ' RX 6800 ' })).toBe('AMD 1 · RX 6800');
+    expect(gpuNameLabel({ vendor: undefined, index: 0, name: 'RTX 4090' })).toBe(
+      'GPU 0 · RTX 4090',
+    );
+    expect(gpuNameLabel({ vendor: 'nvidia', index: 2, name: '  ' })).toBe('NVIDIA 2');
   });
 
   it('lists distinct vendors in a fixed order', () => {

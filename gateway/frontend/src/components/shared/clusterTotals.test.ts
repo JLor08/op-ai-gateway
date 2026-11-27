@@ -67,12 +67,12 @@ describe('clusterTotalsView', () => {
         cluster_members: [
           member({
             ram_estimate_mb: 1000,
-            gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+            gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
           }),
           member({
             position: 1,
             server_name: 'Beta',
-            gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+            gpus: [{ vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
           }),
         ],
       }),
@@ -115,8 +115,8 @@ describe('clusterTotalsView', () => {
         cluster_members: [
           member({
             gpus: [
-              { index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
-              { index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 },
+              { vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 },
+              { vendor: '', index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 },
             ],
             ram_estimate_mb: 1000,
             stale: true,
@@ -154,7 +154,7 @@ describe('clusterTotalsView', () => {
           member({
             server_name: 'Gpu',
             ram_estimate_mb: 1000,
-            gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+            gpus: [{ vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
           }),
         ],
       }),

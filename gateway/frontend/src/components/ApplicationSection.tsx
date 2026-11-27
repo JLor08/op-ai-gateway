@@ -152,6 +152,7 @@ export function ApplicationSection({
   api,
   server,
   onModelsChanged,
+  onServerRefresh,
   trail = [],
 }: Readonly<{
   t: Translation;
@@ -212,6 +213,9 @@ export function ApplicationSection({
   >;
   server: PortalServer;
   onModelsChanged?: () => void;
+  // Asks the parent to read the server again after a sub-view changed it
+  // (forwarded to RuntimeAdminSection, #434).
+  onServerRefresh?: () => void;
   trail?: BreadcrumbItem[];
 }>) {
   const {
@@ -717,6 +721,7 @@ export function ApplicationSection({
           server={server}
           application={app}
           trail={[...trail, { label: server.name, onClick: () => setMode('list') }]}
+          onServerRefresh={onServerRefresh}
         />
       );
     }

@@ -30,6 +30,7 @@ import type {
   ClusterMemberMode,
   ClusterNetwork,
   DeviceBackend,
+  GpuVendor,
   HardwareGPU,
   PortalServer,
   PutRuntimeSpecRequest,
@@ -37,6 +38,7 @@ import type {
   RpcTransport,
   RuntimeSpec,
 } from '../api';
+import { gpuDisplayName, gpuKey, gpuNameLabel, hostGpuVendor, resolvedGpuKey } from '../api';
 import type { MessageKey, PortalApi, Translation } from './shared/types';
 import { Field } from './shared/Field';
 import { ClusterProgress } from './ClusterProgress';
@@ -69,8 +71,14 @@ import {
 
 const deviceBackends: DeviceBackend[] = ['auto', 'cuda', 'rocm', 'vulkan', 'metal', 'sycl'];
 
-// A member as the form holds it: the wire entry plus a render identity.
+// A member as the form holds it: the wire entry plus a render identity. Its
+// position is the one it is stored at (a reset names the member by it, #434:
+// one server may serve the head more than once), or notStoredPosition for a
+// member added in the form; clusterBodyFields sends every visible member at
+// its list position.
 export type ClusterMemberRow = ClusterMember & { rowKey: string };
+
+const notStoredPosition = -1;
 
 export interface ClusterHeadState {
   enabled: boolean;
@@ -146,32 +154,50 @@ export function clusterBodyFields(
   };
 }
 
-// The stored usage of the member on serverId as the head reads after a
+// The stored usage of the member at position as the head reads after a
 // reset, put into the form: only the read-only measurements change (each
-// GPU's measured VRAM by host index, the measured RAM, when and whether it is
-// stale), so the operator's unsaved edits to the member stay.
+// GPU's measured VRAM by card, the measured RAM, when and whether it is
+// stale), so the operator's unsaved edits to the member stay. The member is
+// its stored position (#434: one server may serve the head more than once),
+// on the same server.
 export function mergeMemberUsage(
   s: ClusterHeadState,
   spec: RuntimeSpec,
-  serverId: string,
+  position: number,
 ): ClusterHeadState {
-  const fresh = (spec.cluster_members ?? []).find((m) => m.visible && m.server_id === serverId);
+  const fresh = (spec.cluster_members ?? []).find((m) => m.visible && m.position === position);
   if (!fresh) return s;
-  const vramByIndex = new Map((fresh.gpus ?? []).map((g) => [g.index, g.vram_measured_mb]));
+  const vramByCard = new Map(
+    (fresh.gpus ?? []).map((g) => [gpuKey(g.vendor, g.index), g.vram_measured_mb]),
+  );
   return {
     ...s,
     members: s.members.map((row) =>
-      row.visible && row.server_id === serverId
+      isStoredMember(row, fresh)
         ? {
             ...row,
             ram_measured_mb: fresh.ram_measured_mb,
             measured_at: fresh.measured_at,
             stale: fresh.stale,
-            gpus: row.gpus.map((g) => ({ ...g, vram_measured_mb: vramByIndex.get(g.index) ?? 0 })),
+            gpus: row.gpus.map((g) => ({
+              ...g,
+              vram_measured_mb: vramByCard.get(gpuKey(g.vendor, g.index)) ?? 0,
+            })),
           }
         : row,
     ),
   };
+}
+
+// Whether the form's row is the stored member m: the member stored at its
+// position on its server.
+function isStoredMember(row: ClusterMemberRow, m: ClusterMember): boolean {
+  return (
+    row.visible &&
+    row.position !== notStoredPosition &&
+    row.position === m.position &&
+    row.server_id === m.server_id
+  );
 }
 
 // Whether a stored member carries usage a reset would clear.
@@ -235,8 +261,9 @@ export function clusterSaveError(s: ClusterHeadState, facts: ClusterSaveFacts): 
     startupTimeoutSeconds: facts.startupTimeoutSeconds,
   });
   if (docError) return docError;
-  const servers = s.members.filter((m) => m.visible).map((m) => m.server_id);
-  if (new Set(servers).size !== servers.length) return 'errorClusterMemberServerTwice';
+  // One server twice, or the head's own server, is the gateway's to judge
+  // (#434): it allows both for an agent that runs same-host members
+  // (rpc_cluster_same_host), which only it knows, and refuses them otherwise.
   if (needsLanAck(s, facts.stored) && !s.lanAck) return 'errorClusterLanAckRequired';
   // The gateway lets a save through a member the caller cannot see only
   // while the membership and the head binary stay as stored: the binary
@@ -257,7 +284,9 @@ type HostGpus = HardwareGPU[] | 'unavailable' | 'failed';
 // A manual member spec as the picker offers it: id, devices and binary.
 function memberSpecLabel(s: RPCMemberSpec, t: Translation): string {
   const devices =
-    s.gpus.length === 0 ? t.rpcMemberCpu : s.gpus.map((g) => `GPU ${g.index}`).join(', ');
+    s.gpus.length === 0
+      ? t.rpcMemberCpu
+      : s.gpus.map((g) => gpuDisplayName(g.vendor, g.index)).join(', ');
   return `${s.id} · ${devices} · ${s.binary}`;
 }
 
@@ -266,17 +295,28 @@ function toCount(text: string): number {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-function gpuLabel(gpu: HardwareGPU): string {
-  const name = gpu.name.trim();
-  return name ? `GPU ${gpu.index} · ${name}` : `GPU ${gpu.index}`;
+// What a member GPU without a vendor stands for on its server (#434): the
+// only vendor the server's hardware report lists, '' without a report. The
+// member server's stored legacy vendor is not at hand here, so this serves
+// naming and the picker only; the gateway resolves the stored rows itself.
+function memberHostVendor(hostGpus: HostGpus | undefined): GpuVendor {
+  return Array.isArray(hostGpus) ? hostGpuVendor(undefined, hostGpus) : '';
 }
 
 // A member GPU as its rows show it: the picker's label when the member
-// server's hardware report names the GPU, else its index alone (no report,
-// a failed read, or a GPU the report does not list).
-function memberGpuLabel(index: number, hostGpus: HostGpus | undefined): string {
-  const gpu = Array.isArray(hostGpus) ? hostGpus.find((g) => g.index === index) : undefined;
-  return gpu ? gpuLabel(gpu) : `GPU ${index}`;
+// server's hardware report names the GPU (at the same vendor and index),
+// else its vendor and index alone (no report, a failed read, or a GPU the
+// report does not list).
+function memberGpuLabel(
+  g: { vendor: GpuVendor; index: number },
+  hostGpus: HostGpus | undefined,
+): string {
+  const hostVendor = memberHostVendor(hostGpus);
+  const key = resolvedGpuKey(g.vendor, g.index, hostVendor);
+  const gpu = Array.isArray(hostGpus)
+    ? hostGpus.find((h) => resolvedGpuKey(h.vendor, h.index, hostVendor) === key)
+    : undefined;
+  return gpu ? gpuNameLabel(gpu) : gpuDisplayName(g.vendor, g.index);
 }
 
 function swap<T>(items: T[], index: number, delta: number): T[] {
@@ -323,9 +363,14 @@ function useMemberHardware(
 }
 
 // What the open picker offers and what is chosen in it: the compatible
-// candidates that are no member yet, the chosen server, its compatible member
-// specs and the one to add, and whether the choice can be added (not while
-// the list is being read again).
+// candidates, the chosen server, its compatible member specs no member uses
+// yet and the one to add, and whether the choice can be added (not while the
+// list is being read again).
+//
+// A server stays on offer once it is a member (#434): one server may serve
+// the head more than once, and the gateway lists the head's own server only
+// for an agent that runs same-host members. A manual server stays on offer
+// while it has a member spec no member of the form uses.
 function pickerChoice(
   picker: PickerState | null,
   candidates: CandidatesState,
@@ -348,11 +393,18 @@ function pickerChoice(
       canAdd: false,
     };
   }
-  const taken = new Set(value.members.map((m) => m.server_id));
+  const usedSpecs = new Set(value.members.map((m) => m.member_spec_id).filter((id) => id !== ''));
+  const freeSpecs = (c: ClusterCandidate) =>
+    compatibleMemberSpecs(c).filter((spec) => !usedSpecs.has(spec.id));
+  const taken = new Set(
+    value.memberMode === 'manual'
+      ? candidates.candidates.filter((c) => freeSpecs(c).length === 0).map((c) => c.server_id)
+      : [],
+  );
   const offered = offeredCandidates(candidates, taken);
   const rejected = rejectedCandidates(candidates, taken);
   const chosen = offered.find((c) => c.server_id === picker.serverId);
-  const chosenSpecs = chosen ? compatibleMemberSpecs(chosen) : [];
+  const chosenSpecs = chosen ? freeSpecs(chosen) : [];
   const chosenSpecId = pickedMemberSpecId(value.memberMode, chosenSpecs, picker.specId);
   const specReady = value.memberMode === 'automatic' || chosenSpecId !== '';
   const canAdd = chosen !== undefined && !candidates.loading && specReady;
@@ -724,17 +776,22 @@ export function ClusterHeadEditor({
   // The head's binary as the form has it: the member candidates and the
   // members' compatibility are read for it, not for the stored binary.
   headBinary?: string;
-  // Clears the stored usage of the member on a server and answers the head's
-  // spec as it reads afterwards (the caller keeps that as the loaded spec).
-  // Without it, as for a spec not saved yet, no member offers a reset.
-  resetMemberUsage?: (serverId: string) => Promise<RuntimeSpec>;
+  // Clears the stored usage of the member at its stored position on a server
+  // and answers the head's spec as it reads afterwards (the caller keeps that
+  // as the loaded spec). Without it, as for a spec not saved yet, no member
+  // offers a reset.
+  resetMemberUsage?: (serverId: string, position: number) => Promise<RuntimeSpec>;
 }>) {
   const [pendingMode, setPendingMode] = useState<ClusterMemberMode | null>(null);
   const [pendingAck, setPendingAck] = useState<ClusterHeadState | null>(null);
   const [picker, setPicker] = useState<PickerState | null>(null);
   // Bumped when the picker opens, so it lists what is true now.
   const [candidatesReload, setCandidatesReload] = useState(0);
-  const [pendingReset, setPendingReset] = useState<{ serverId: string; name: string } | null>(null);
+  const [pendingReset, setPendingReset] = useState<{
+    serverId: string;
+    position: number;
+    name: string;
+  } | null>(null);
   const [resetBusy, setResetBusy] = useState(false);
   const [resetError, setResetError] = useState('');
   // A reset answers after the operator may have edited on: the merge reads
@@ -815,7 +872,7 @@ export function ClusterHeadEditor({
     if (!chosen || !canAdd) return;
     const row: ClusterMemberRow = {
       rowKey: nextRowKey(),
-      position: value.members.length,
+      position: notStoredPosition,
       server_id: chosen.server_id,
       server_name: chosen.server_name,
       member_spec_id: chosenSpecId,
@@ -840,9 +897,9 @@ export function ClusterHeadEditor({
     setResetBusy(true);
     setResetError('');
     try {
-      const spec = await resetMemberUsage(target.serverId);
+      const spec = await resetMemberUsage(target.serverId, target.position);
       if (mountedRef.current) {
-        onChangeRef.current(mergeMemberUsage(valueRef.current, spec, target.serverId));
+        onChangeRef.current(mergeMemberUsage(valueRef.current, spec, target.position));
       }
     } catch (e) {
       if (mountedRef.current) setResetError(formatPortalError(e, t));
@@ -852,12 +909,13 @@ export function ClusterHeadEditor({
   }
 
   // A reset clears a stored row, so it is offered only on a member as it is
-  // stored, and only where there is usage to clear.
+  // stored (its stored position on its server, isStoredMember), and only
+  // where there is usage to clear.
   const storedMembers = stored?.cluster_enabled ? (stored.cluster_members ?? []) : [];
-  const resettable = (serverId: string) =>
+  const resettable = (row: ClusterMemberRow) =>
     resetMemberUsage !== undefined &&
     mappingId !== '' &&
-    hasStoredUsage(storedMembers.find((m) => m.visible && m.server_id === serverId));
+    hasStoredUsage(storedMembers.find((m) => m.visible && isStoredMember(row, m)));
 
   const totals =
     stored?.cluster_enabled && stored.cluster_vram_total_mb !== undefined
@@ -1017,6 +1075,7 @@ export function ClusterHeadEditor({
                   locked={locked}
                   automatic={value.memberMode === 'automatic'}
                   hostGpus={hardwareByServer[m.server_id]}
+                  sameServer={m.server_id === headServer.id}
                   onMove={(delta) => patch({ members: swap(value.members, i, delta) })}
                   onRemove={() =>
                     patch({ members: value.members.filter((x) => x.rowKey !== m.rowKey) })
@@ -1024,10 +1083,11 @@ export function ClusterHeadEditor({
                   onPatch={(next) => patchMember(m.rowKey, next)}
                   problem={memberProblemText(memberProblem(m, value.memberMode, candidates), t)}
                   onResetUsage={
-                    resettable(m.server_id)
+                    resettable(m)
                       ? () =>
                           setPendingReset({
                             serverId: m.server_id,
+                            position: m.position,
                             name: m.server_name || m.server_id,
                           })
                       : undefined
@@ -1131,6 +1191,7 @@ function MemberRow({
   locked,
   automatic,
   hostGpus,
+  sameServer,
   onMove,
   onRemove,
   onPatch,
@@ -1146,6 +1207,9 @@ function MemberRow({
   automatic: boolean;
   // undefined while the server's hardware report loads.
   hostGpus?: HostGpus;
+  // The member runs on the head's own server (#434): it is reached over
+  // loopback.
+  sameServer: boolean;
   onMove: (delta: number) => void;
   onRemove: () => void;
   onPatch: (next: Partial<ClusterMember>) => void;
@@ -1156,8 +1220,15 @@ function MemberRow({
   problem?: string;
 }>) {
   const name = member.server_name || member.server_id;
-  const selected = new Set(member.gpus.map((g) => g.index));
-  const addable = (Array.isArray(hostGpus) ? hostGpus : []).filter((g) => !selected.has(g.index));
+  // A GPU is its (vendor, index) (#434): a row without a vendor holds the
+  // report's card of the server's only vendor at its index.
+  const hostVendor = memberHostVendor(hostGpus);
+  const cardKey = (g: { vendor?: GpuVendor; index: number }) =>
+    resolvedGpuKey(g.vendor, g.index, hostVendor);
+  const selected = new Set(member.gpus.map(cardKey));
+  const addable = (Array.isArray(hostGpus) ? hostGpus : []).filter(
+    (g) => !selected.has(cardKey(g)),
+  );
 
   function setGpus(gpus: ClusterMemberGPU[]) {
     onPatch({ gpus });
@@ -1185,7 +1256,7 @@ function MemberRow({
           <Typography component="span" variant="body2" color="text.secondary">
             {member.gpus.length === 0
               ? t.rpcMemberCpu
-              : member.gpus.map((g) => memberGpuLabel(g.index, hostGpus)).join(', ')}
+              : member.gpus.map((g) => memberGpuLabel(g, hostGpus)).join(', ')}
           </Typography>
         )}
         {member.port > 0 && (
@@ -1231,6 +1302,11 @@ function MemberRow({
           </IconButton>
         </Box>
       </Box>
+      {sameServer && (
+        <Typography variant="caption" color="text.secondary">
+          {t.clusterMemberSameServerNote}
+        </Typography>
+      )}
       {problem && (
         <Alert severity="error" data-testid="cluster-member-problem">
           {problem}
@@ -1246,61 +1322,64 @@ function MemberRow({
               {t.rpcMemberCpu}
             </Typography>
           )}
-          {member.gpus.map((g, gi) => (
-            <Box
-              key={g.index}
-              sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}
-            >
-              <IconButton
-                size="small"
-                aria-label={`${t.modelGroupMoveUp}: ${name} GPU ${g.index}`}
-                disabled={locked || gi === 0}
-                onClick={() => setGpus(swap(member.gpus, gi, -1))}
+          {member.gpus.map((g, gi) => {
+            const gpuName = `${name} ${gpuDisplayName(g.vendor, g.index)}`;
+            return (
+              <Box
+                key={gpuKey(g.vendor, g.index)}
+                sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}
               >
-                <ArrowUpwardIcon fontSize="small" />
-              </IconButton>
-              <IconButton
-                size="small"
-                aria-label={`${t.modelGroupMoveDown}: ${name} GPU ${g.index}`}
-                disabled={locked || gi === member.gpus.length - 1}
-                onClick={() => setGpus(swap(member.gpus, gi, 1))}
-              >
-                <ArrowDownwardIcon fontSize="small" />
-              </IconButton>
-              <Typography component="span" sx={{ minWidth: 64 }}>
-                {memberGpuLabel(g.index, hostGpus)}
-              </Typography>
-              <Field
-                id={`${member.rowKey}-gpu-${g.index}-vram`}
-                label={t.rpcMemberGpuVram}
-                inputProps={{ 'aria-label': `${name} GPU ${g.index}: ${t.rpcMemberGpuVram}` }}
-                type="number"
-                value={g.vram_estimate_mb ? String(g.vram_estimate_mb) : ''}
-                disabled={locked}
-                onChange={(e) =>
-                  setGpus(
-                    member.gpus.map((x) =>
-                      x.index === g.index ? { ...x, vram_estimate_mb: toCount(e.target.value) } : x,
-                    ),
-                  )
-                }
-                sx={{ maxWidth: 200 }}
-              />
-              {g.vram_measured_mb > 0 && (
-                <Typography component="span" variant="caption" color="text.secondary">
-                  {`${t.clusterMemberMeasured} ${g.vram_measured_mb} MB`}
+                <IconButton
+                  size="small"
+                  aria-label={`${t.modelGroupMoveUp}: ${gpuName}`}
+                  disabled={locked || gi === 0}
+                  onClick={() => setGpus(swap(member.gpus, gi, -1))}
+                >
+                  <ArrowUpwardIcon fontSize="small" />
+                </IconButton>
+                <IconButton
+                  size="small"
+                  aria-label={`${t.modelGroupMoveDown}: ${gpuName}`}
+                  disabled={locked || gi === member.gpus.length - 1}
+                  onClick={() => setGpus(swap(member.gpus, gi, 1))}
+                >
+                  <ArrowDownwardIcon fontSize="small" />
+                </IconButton>
+                <Typography component="span" sx={{ minWidth: 64 }}>
+                  {memberGpuLabel(g, hostGpus)}
                 </Typography>
-              )}
-              <IconButton
-                size="small"
-                aria-label={`${t.clusterMemberGpuRemove}: ${name} GPU ${g.index}`}
-                disabled={locked}
-                onClick={() => setGpus(member.gpus.filter((x) => x.index !== g.index))}
-              >
-                <CloseIcon fontSize="small" />
-              </IconButton>
-            </Box>
-          ))}
+                <Field
+                  id={`${member.rowKey}-gpu-${g.vendor || 'host'}-${g.index}-vram`}
+                  label={t.rpcMemberGpuVram}
+                  inputProps={{ 'aria-label': `${gpuName}: ${t.rpcMemberGpuVram}` }}
+                  type="number"
+                  value={g.vram_estimate_mb ? String(g.vram_estimate_mb) : ''}
+                  disabled={locked}
+                  onChange={(e) =>
+                    setGpus(
+                      member.gpus.map((x, xi) =>
+                        xi === gi ? { ...x, vram_estimate_mb: toCount(e.target.value) } : x,
+                      ),
+                    )
+                  }
+                  sx={{ maxWidth: 200 }}
+                />
+                {g.vram_measured_mb > 0 && (
+                  <Typography component="span" variant="caption" color="text.secondary">
+                    {`${t.clusterMemberMeasured} ${g.vram_measured_mb} MB`}
+                  </Typography>
+                )}
+                <IconButton
+                  size="small"
+                  aria-label={`${t.clusterMemberGpuRemove}: ${gpuName}`}
+                  disabled={locked}
+                  onClick={() => setGpus(member.gpus.filter((_, xi) => xi !== gi))}
+                >
+                  <CloseIcon fontSize="small" />
+                </IconButton>
+              </Box>
+            );
+          })}
           {hostGpus !== undefined && !(Array.isArray(hostGpus) && hostGpus.length > 0) && (
             <Typography variant="caption" color="text.secondary">
               {hostGpusNote(hostGpus, t)}
@@ -1313,8 +1392,19 @@ function MemberRow({
               value=""
               disabled={locked}
               onChange={(e) => {
-                const index = Number(e.target.value);
-                setGpus([...member.gpus, { index, vram_estimate_mb: 0, vram_measured_mb: 0 }]);
+                // The option is the card's own (vendor, index) (#434), and the
+                // row stores both.
+                const card = addable.find((g) => gpuKey(g.vendor, g.index) === e.target.value);
+                if (!card) return;
+                setGpus([
+                  ...member.gpus,
+                  {
+                    vendor: card.vendor ?? '',
+                    index: card.index,
+                    vram_estimate_mb: 0,
+                    vram_measured_mb: 0,
+                  },
+                ]);
               }}
               sx={{ maxWidth: 360 }}
             >
@@ -1322,8 +1412,8 @@ function MemberRow({
                 {'—'}
               </option>
               {addable.map((g) => (
-                <option key={g.index} value={String(g.index)}>
-                  {gpuLabel(g)}
+                <option key={gpuKey(g.vendor, g.index)} value={gpuKey(g.vendor, g.index)}>
+                  {gpuNameLabel(g)}
                 </option>
               ))}
             </SelectField>

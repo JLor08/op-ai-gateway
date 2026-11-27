@@ -192,6 +192,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       apps?: PortalApplication[];
       healthInterval?: number | 'error';
       server?: PortalServer;
+      onServerRefresh?: () => void;
     } = {},
   ) {
     const apps = opts.apps ?? [];
@@ -278,7 +279,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
 
     render(
       <ToastProvider>
-        <ApplicationSection t={t} api={fakeApi} server={activeServer} />
+        <ApplicationSection
+          t={t}
+          api={fakeApi}
+          server={activeServer}
+          onServerRefresh={opts.onServerRefresh}
+        />
       </ToastProvider>,
     );
     return { fakeApi, created, updated };
@@ -1832,6 +1838,21 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       // that name too now, but only inside its model-mapping tab -- and 'specs'
       // is the tab this screen opens on.
       expect(screen.queryByText(t.modelMappings)).not.toBeInTheDocument();
+    });
+
+    // #434: the runtime screen reads its server from the parent's rows, so a
+    // change it makes (the GPU vendor note's dismissal) asks for a fresh read.
+    it('forwards the server refresh to the runtime admin', async () => {
+      const refresh = vi.fn();
+      renderSection({
+        server: { ...server, gpu_vendor_note: true, gpu_legacy_vendor: 'amd' },
+        apps: [makeApp({ id: 'app_1', type: 'server_agent' })],
+        onServerRefresh: refresh,
+      });
+      await screen.findByText('https://s1.example.test:8000');
+      fireEvent.click(screen.getByRole('button', { name: t.mappingManage }));
+      fireEvent.click(await screen.findByRole('button', { name: t.gpuLegacyMappedDismiss }));
+      await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
     });
 
     it('auto-drills into the one server_agent app on a managed_runtime_only server', async () => {
