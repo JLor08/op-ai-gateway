@@ -345,3 +345,235 @@ func TestConformanceAIServerGPUVendorFields(t *testing.T) {
 		}
 	})
 }
+
+// backfillSeed is one server's legacy rows (empty vendor) in all four tables.
+type backfillSeed struct{ server, head, memberSpec string }
+
+// seedBackfillServer creates a server with a runtime spec (two empty-vendor GPU
+// rows and one explicit AMD row), an empty-vendor budget, a manual member spec
+// with one empty-vendor GPU, and a cluster member of a separate head running on
+// the server with one empty-vendor GPU row. It returns the row count the
+// backfill must rewrite (5).
+func seedBackfillServer(ctx context.Context, t *testing.T, s routing.Store, key string, now time.Time, port int) backfillSeed {
+	t.Helper()
+	head := seedRPCHeadSpec(ctx, t, s, key, now)
+	server := "srv_head_" + key
+	if err := s.SetRuntimeSpecGPUs(ctx, head, []routing.RuntimeSpecGPU{
+		{GPUIndex: 0, Position: 0, VRAMEstimateMB: 1000},
+		{GPUIndex: 1, Position: 1, VRAMEstimateMB: 1100},
+		{GPUVendor: routing.GPUVendorAMD, GPUIndex: 0, Position: 2, VRAMEstimateMB: 1200},
+	}); err != nil {
+		t.Fatalf("seed spec gpus: %v", err)
+	}
+	if err := s.SetServerGPUBudgets(ctx, server, []routing.ServerGPUBudget{
+		{GPUIndex: 0, BudgetMB: 5000, CreatedAt: now, UpdatedAt: now},
+	}); err != nil {
+		t.Fatalf("seed budgets: %v", err)
+	}
+	member := routing.RPCMemberSpec{
+		ID: "rpcm_" + key, ServerID: server, Enabled: true, DeviceBackend: "auto",
+		AllowedHeadGroups: "[]", CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.ReplaceRPCMemberSpec(ctx, member, []routing.RPCMemberSpecGPU{{GPUIndex: 0, VRAMEstimateMB: 700}}); err != nil {
+		t.Fatalf("seed member spec: %v", err)
+	}
+	other := seedRPCHeadSpec(ctx, t, s, key+"_other", now)
+	if err := s.SetClusterMembers(ctx, other,
+		[]routing.ClusterMember{{HeadSpecID: other, Position: 0, ServerID: server, DeviceBackend: "auto", Port: port}},
+		[]routing.ClusterMemberGPU{{HeadSpecID: other, MemberPosition: 0, ServerID: server, GPUIndex: 0, VRAMEstimateMB: 800}},
+	); err != nil {
+		t.Fatalf("seed cluster member: %v", err)
+	}
+	return backfillSeed{server: server, head: head, memberSpec: member.ID}
+}
+
+// backfillVendors lists every GPU vendor of the server's four row sets, in
+// read order, for compact assertions.
+func backfillVendors(ctx context.Context, t *testing.T, s routing.Store, seed backfillSeed, key string) (spec, budgets, member, cluster []string) {
+	t.Helper()
+	specRows, err := s.RuntimeSpecGPUs(ctx, seed.head)
+	if err != nil {
+		t.Fatalf("spec gpus: %v", err)
+	}
+	for _, r := range specRows {
+		spec = append(spec, r.Key().String())
+	}
+	budgetRows, err := s.ServerGPUBudgets(ctx, seed.server)
+	if err != nil {
+		t.Fatalf("budgets: %v", err)
+	}
+	for _, r := range budgetRows {
+		budgets = append(budgets, routing.GPUKey{Vendor: r.GPUVendor, Index: r.GPUIndex}.String())
+	}
+	memberRows, err := s.RPCMemberSpecGPUs(ctx, seed.memberSpec)
+	if err != nil {
+		t.Fatalf("member spec gpus: %v", err)
+	}
+	for _, r := range memberRows {
+		member = append(member, routing.GPUKey{Vendor: r.GPUVendor, Index: r.GPUIndex}.String())
+	}
+	_, clusterRows, err := s.ClusterMembers(ctx, "rspec_"+key+"_other")
+	if err != nil {
+		t.Fatalf("cluster members: %v", err)
+	}
+	for _, r := range clusterRows {
+		cluster = append(cluster, routing.GPUKey{Vendor: r.GPUVendor, Index: r.GPUIndex}.String())
+	}
+	return spec, budgets, member, cluster
+}
+
+// TestConformanceBackfillServerGPUVendor pins, on every routing store, the
+// one-time backfill of legacy empty GPU vendors (#434): only the named
+// server's rows are rewritten, an explicit row shadows its empty twin, the
+// legacy vendor is recorded on every call, the review note only on a mixed
+// first rewrite, a second call is a no-op, and clearing the note keeps the
+// legacy vendor.
+func TestConformanceBackfillServerGPUVendor(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		a := seedBackfillServer(ctx, t, s, "bfa", now, 47200)
+		b := seedBackfillServer(ctx, t, s, "bfb", now, 47201)
+
+		if _, err := s.BackfillServerGPUVendor(ctx, a.server, "", true); err == nil {
+			t.Fatal("an empty vendor must be refused")
+		}
+		if _, err := s.BackfillServerGPUVendor(ctx, a.server, "intel", true); err == nil {
+			t.Fatal("an unknown vendor must be refused")
+		}
+		if _, err := s.BackfillServerGPUVendor(ctx, "srv_nope", routing.GPUVendorNVIDIA, true); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unknown server: err=%v, want ErrNotFound", err)
+		}
+		if srv, _ := s.AIServerByID(ctx, a.server); srv.GPULegacyVendor != "" || srv.GPUVendorNote {
+			t.Fatalf("a refused backfill must write nothing: %+v", srv)
+		}
+
+		n, err := s.BackfillServerGPUVendor(ctx, a.server, routing.GPUVendorNVIDIA, true)
+		if err != nil || n != 5 {
+			t.Fatalf("backfill A: rewritten=%d err=%v, want 5", n, err)
+		}
+		spec, budgets, member, cluster := backfillVendors(ctx, t, s, a, "bfa")
+		if len(spec) != 3 || spec[0] != "NVIDIA 0" || spec[1] != "NVIDIA 1" || spec[2] != "AMD 0" ||
+			len(budgets) != 1 || budgets[0] != "NVIDIA 0" || len(member) != 1 || member[0] != "NVIDIA 0" ||
+			len(cluster) != 1 || cluster[0] != "NVIDIA 0" {
+			t.Fatalf("A's rows must carry the vendor: %v %v %v %v", spec, budgets, member, cluster)
+		}
+		spec, budgets, member, cluster = backfillVendors(ctx, t, s, b, "bfb")
+		if len(spec) != 3 || spec[0] == "NVIDIA 0" || spec[1] == "NVIDIA 1" || budgets[0] == "NVIDIA 0" ||
+			member[0] == "NVIDIA 0" || cluster[0] == "NVIDIA 0" {
+			t.Fatalf("B's rows must stay untouched: %v %v %v %v", spec, budgets, member, cluster)
+		}
+		srv, _ := s.AIServerByID(ctx, a.server)
+		if srv.GPULegacyVendor != routing.GPUVendorNVIDIA || !srv.GPUVendorNote {
+			t.Fatalf("A must record the legacy vendor and the note: %+v", srv)
+		}
+
+		// Idempotent; the note stays as it is.
+		if n, err := s.BackfillServerGPUVendor(ctx, a.server, routing.GPUVendorNVIDIA, true); err != nil || n != 0 {
+			t.Fatalf("second backfill: rewritten=%d err=%v, want 0", n, err)
+		}
+		if srv, _ = s.AIServerByID(ctx, a.server); !srv.GPUVendorNote {
+			t.Fatal("a second backfill must leave the note raised")
+		}
+
+		// No mixed report: the legacy vendor is recorded, the note is not.
+		if n, err := s.BackfillServerGPUVendor(ctx, b.server, routing.GPUVendorNVIDIA, false); err != nil || n != 5 {
+			t.Fatalf("backfill B: rewritten=%d err=%v, want 5", n, err)
+		}
+		if srv, _ = s.AIServerByID(ctx, b.server); srv.GPULegacyVendor != routing.GPUVendorNVIDIA || srv.GPUVendorNote {
+			t.Fatalf("B must record the legacy vendor without the note: %+v", srv)
+		}
+
+		// Clearing the note keeps the legacy vendor; a further backfill does
+		// not raise it again.
+		if err := s.ClearServerGPUVendorNote(ctx, a.server); err != nil {
+			t.Fatalf("clear note: %v", err)
+		}
+		if srv, _ = s.AIServerByID(ctx, a.server); srv.GPUVendorNote || srv.GPULegacyVendor != routing.GPUVendorNVIDIA {
+			t.Fatalf("clear must keep the legacy vendor: %+v", srv)
+		}
+		if n, err := s.BackfillServerGPUVendor(ctx, a.server, routing.GPUVendorNVIDIA, true); err != nil || n != 0 {
+			t.Fatalf("backfill after clear: rewritten=%d err=%v, want 0", n, err)
+		}
+		if srv, _ = s.AIServerByID(ctx, a.server); srv.GPUVendorNote {
+			t.Fatal("a no-op backfill must not raise the cleared note")
+		}
+		if err := s.ClearServerGPUVendorNote(ctx, "srv_nope"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("clear on an unknown server: err=%v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestConformanceBackfillExplicitRowWins pins, on every routing store, that
+// when an empty-vendor row and an explicit row share a key the empty row is
+// deleted and the explicit row keeps its values, in every table (the cluster
+// key includes the member position).
+func TestConformanceBackfillExplicitRowWins(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	forEachRoutingStore(t, func(t *testing.T, s routing.Store) {
+		ctx := context.Background()
+		head := seedRPCHeadSpec(ctx, t, s, "bfw", now)
+		server := "srv_head_bfw"
+		if err := s.SetRuntimeSpecGPUs(ctx, head, []routing.RuntimeSpecGPU{
+			{GPUIndex: 0, Position: 0, VRAMEstimateMB: 1000},
+			{GPUVendor: routing.GPUVendorNVIDIA, GPUIndex: 0, Position: 1, VRAMEstimateMB: 2000},
+		}); err != nil {
+			t.Fatalf("seed spec gpus: %v", err)
+		}
+		if err := s.SetServerGPUBudgets(ctx, server, []routing.ServerGPUBudget{
+			{GPUIndex: 0, BudgetMB: 1, CreatedAt: now, UpdatedAt: now},
+			{GPUVendor: routing.GPUVendorNVIDIA, GPUIndex: 0, BudgetMB: 2, CreatedAt: now, UpdatedAt: now},
+		}); err != nil {
+			t.Fatalf("seed budgets: %v", err)
+		}
+		member := routing.RPCMemberSpec{
+			ID: "rpcm_bfw", ServerID: server, Enabled: true, DeviceBackend: "auto",
+			AllowedHeadGroups: "[]", CreatedAt: now, UpdatedAt: now,
+		}
+		if err := s.ReplaceRPCMemberSpec(ctx, member, []routing.RPCMemberSpecGPU{
+			{GPUIndex: 0, VRAMEstimateMB: 10},
+			{GPUVendor: routing.GPUVendorNVIDIA, GPUIndex: 0, Position: 1, VRAMEstimateMB: 20},
+		}); err != nil {
+			t.Fatalf("seed member spec: %v", err)
+		}
+		other := seedRPCHeadSpec(ctx, t, s, "bfw_other", now)
+		// Position 0 holds both rows (explicit wins); position 1 only an
+		// empty row of the same index, which is rewritten, not dropped.
+		if err := s.SetClusterMembers(ctx, other,
+			[]routing.ClusterMember{
+				{HeadSpecID: other, Position: 0, ServerID: server, DeviceBackend: "auto", Port: 47300},
+				{HeadSpecID: other, Position: 1, ServerID: server, DeviceBackend: "auto", Port: 47301},
+			},
+			[]routing.ClusterMemberGPU{
+				{HeadSpecID: other, MemberPosition: 0, ServerID: server, GPUIndex: 0, VRAMEstimateMB: 100},
+				{HeadSpecID: other, MemberPosition: 0, ServerID: server, GPUVendor: routing.GPUVendorNVIDIA, GPUIndex: 0, Position: 1, VRAMEstimateMB: 200},
+				{HeadSpecID: other, MemberPosition: 1, ServerID: server, GPUIndex: 0, VRAMEstimateMB: 300},
+			},
+		); err != nil {
+			t.Fatalf("seed cluster members: %v", err)
+		}
+
+		n, err := s.BackfillServerGPUVendor(ctx, server, routing.GPUVendorNVIDIA, true)
+		if err != nil || n != 5 {
+			t.Fatalf("backfill: rewritten=%d err=%v, want 5 (rewritten or dropped rows)", n, err)
+		}
+		specRows, _ := s.RuntimeSpecGPUs(ctx, head)
+		if len(specRows) != 1 || specRows[0].GPUVendor != routing.GPUVendorNVIDIA || specRows[0].VRAMEstimateMB != 2000 {
+			t.Fatalf("spec gpus: explicit row must win: %+v", specRows)
+		}
+		budgetRows, _ := s.ServerGPUBudgets(ctx, server)
+		if len(budgetRows) != 1 || budgetRows[0].GPUVendor != routing.GPUVendorNVIDIA || budgetRows[0].BudgetMB != 2 {
+			t.Fatalf("budgets: explicit row must win: %+v", budgetRows)
+		}
+		memberRows, _ := s.RPCMemberSpecGPUs(ctx, member.ID)
+		if len(memberRows) != 1 || memberRows[0].GPUVendor != routing.GPUVendorNVIDIA || memberRows[0].VRAMEstimateMB != 20 {
+			t.Fatalf("member spec gpus: explicit row must win: %+v", memberRows)
+		}
+		_, clusterRows, _ := s.ClusterMembers(ctx, other)
+		if len(clusterRows) != 2 ||
+			clusterRows[0].MemberPosition != 0 || clusterRows[0].GPUVendor != routing.GPUVendorNVIDIA || clusterRows[0].VRAMEstimateMB != 200 ||
+			clusterRows[1].MemberPosition != 1 || clusterRows[1].GPUVendor != routing.GPUVendorNVIDIA || clusterRows[1].VRAMEstimateMB != 300 {
+			t.Fatalf("cluster gpus: per member, explicit wins, the lone empty row is rewritten: %+v", clusterRows)
+		}
+	})
+}

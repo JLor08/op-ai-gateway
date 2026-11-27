@@ -3578,6 +3578,24 @@ type RuntimeStore interface {
 	// ServerGPUBudgets lists serverID's per-GPU VRAM budgets, ordered by GPU
 	// vendor, then index. Always non-nil, empty when none.
 	ServerGPUBudgets(ctx context.Context, serverID string) ([]ServerGPUBudget, error)
+	// BackfillServerGPUVendor makes the legacy empty GPU vendor of serverID
+	// explicit, once: in one transaction it rewrites gpu_vendor "" to vendor in
+	// the GPU rows of the server's runtime specs (spec -> mapping ->
+	// application -> server), its GPU budgets, the GPU rows of the manual
+	// member specs on it and the cluster member GPU rows on it. Where a row
+	// with vendor already carries the same key the empty one is deleted
+	// instead (the explicit row wins and keeps its values). rewritten counts
+	// the rows rewritten or deleted.
+	//
+	// On every call it sets the server's GPULegacyVendor to vendor (also when
+	// rewritten is 0); when rewritten > 0 and noteMixed it also raises
+	// GPUVendorNote. vendor must be a non-empty valid vendor, else an error is
+	// returned and nothing is written; an unknown serverID is ErrNotFound. A
+	// second call rewrites 0 and leaves the note as it is.
+	BackfillServerGPUVendor(ctx context.Context, serverID, vendor string, noteMixed bool) (rewritten int, err error)
+	// ClearServerGPUVendorNote lowers GPUVendorNote and keeps
+	// GPULegacyVendor. An unknown serverID is ErrNotFound.
+	ClearServerGPUVendorNote(ctx context.Context, serverID string) error
 	// UpsertServerRuntimeReport stores the latest file-mode runtime report
 	// for its server (1:1, upsert-overwrite — mirrors UpsertServerHardware).
 	// An unknown ServerID is ErrNotFound (FK violation).

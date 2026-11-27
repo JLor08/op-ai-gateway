@@ -4307,3 +4307,110 @@ func (m *MemoryStore) RPCSessionsAt(_ context.Context, headSpecID string, instan
 	})
 	return out, nil
 }
+
+// --- RuntimeStore: one-time GPU vendor backfill (#434) -----------------------
+
+// BackfillServerGPUVendor mirrors the SQL transaction: everything runs under
+// one lock after the checks, so it is atomic here too.
+func (m *MemoryStore) BackfillServerGPUVendor(_ context.Context, serverID, vendor string, noteMixed bool) (int, error) {
+	if vendor == "" || !ValidGPUVendor(vendor) {
+		return 0, fmt.Errorf("backfill gpu vendor: invalid vendor %q", vendor)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	server, ok := m.servers[serverID]
+	if !ok {
+		return 0, storeerr.ErrNotFound
+	}
+	rewritten := 0
+	count := func(n int) { rewritten += n }
+
+	// Spec GPU rows: spec -> mapping -> application -> server.
+	for specID, spec := range m.runtimeSpecs {
+		mapping, ok := m.mappings[spec.MappingID]
+		if !ok {
+			continue
+		}
+		if app, ok := m.applications[mapping.ApplicationID]; !ok || app.ServerID != serverID {
+			continue
+		}
+		rows, n := backfillGPURows(m.runtimeSpecGPUs[specID], vendor,
+			func(g *RuntimeSpecGPU) bool { return true },
+			func(g *RuntimeSpecGPU) *string { return &g.GPUVendor },
+			func(g RuntimeSpecGPU) int { return g.GPUIndex })
+		m.runtimeSpecGPUs[specID] = rows
+		count(n)
+	}
+	rows, n := backfillGPURows(m.gpuBudgets[serverID], vendor,
+		func(b *ServerGPUBudget) bool { return true },
+		func(b *ServerGPUBudget) *string { return &b.GPUVendor },
+		func(b ServerGPUBudget) int { return b.GPUIndex })
+	m.gpuBudgets[serverID] = rows
+	count(n)
+	for specID, spec := range m.rpcMemberSpecs {
+		if spec.ServerID != serverID {
+			continue
+		}
+		rows, n := backfillGPURows(m.rpcMemberSpecGPUs[specID], vendor,
+			func(g *RPCMemberSpecGPU) bool { return true },
+			func(g *RPCMemberSpecGPU) *string { return &g.GPUVendor },
+			func(g RPCMemberSpecGPU) int { return g.GPUIndex })
+		m.rpcMemberSpecGPUs[specID] = rows
+		count(n)
+	}
+	type memberGPUKey struct{ position, index int }
+	for head, gpus := range m.clusterMemberGPUs {
+		rows, n := backfillGPURows(gpus, vendor,
+			func(g *ClusterMemberGPU) bool { return g.ServerID == serverID },
+			func(g *ClusterMemberGPU) *string { return &g.GPUVendor },
+			func(g ClusterMemberGPU) memberGPUKey { return memberGPUKey{g.MemberPosition, g.GPUIndex} })
+		m.clusterMemberGPUs[head] = rows
+		count(n)
+	}
+
+	server.GPULegacyVendor = vendor
+	if rewritten > 0 && noteMixed {
+		server.GPUVendorNote = true
+	}
+	m.servers[serverID] = server
+	return rewritten, nil
+}
+
+// backfillGPURows rewrites the empty vendor of the rows sel picks to vendor,
+// or drops such a row when a picked row of vendor already has its key (the
+// explicit row wins). It returns the new rows and how many it rewrote or
+// dropped. rows is never aliased: a fresh slice comes back.
+func backfillGPURows[T any, K comparable](rows []T, vendor string, sel func(*T) bool, vendorOf func(*T) *string, key func(T) K) ([]T, int) {
+	explicit := make(map[K]struct{})
+	for i := range rows {
+		if sel(&rows[i]) && *vendorOf(&rows[i]) == vendor {
+			explicit[key(rows[i])] = struct{}{}
+		}
+	}
+	out := make([]T, 0, len(rows))
+	n := 0
+	for _, r := range rows {
+		if sel(&r) && *vendorOf(&r) == "" {
+			n++
+			if _, dup := explicit[key(r)]; dup {
+				continue
+			}
+			*vendorOf(&r) = vendor
+		}
+		out = append(out, r)
+	}
+	return out, n
+}
+
+// ClearServerGPUVendorNote lowers the vendor note and keeps the legacy vendor.
+func (m *MemoryStore) ClearServerGPUVendorNote(_ context.Context, serverID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	server, ok := m.servers[serverID]
+	if !ok {
+		return storeerr.ErrNotFound
+	}
+	server.GPUVendorNote = false
+	m.servers[serverID] = server
+	return nil
+}

@@ -112,6 +112,18 @@ func (_d *RoutingStoreWithTracing) ApplicationsByServer(ctx context.Context, ser
 	return _d.Store.ApplicationsByServer(ctx, serverID)
 }
 
+func (_d *RoutingStoreWithTracing) BackfillServerGPUVendor(ctx context.Context, serverID string, vendor string, noteMixed bool) (rewritten int, err error) {
+	ctx, span := Start(ctx, "routing.Store.BackfillServerGPUVendor")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.BackfillServerGPUVendor(ctx, serverID, vendor, noteMixed)
+}
+
 func (_d *RoutingStoreWithTracing) BeginClusterMemberRun(ctx context.Context, headSpecID string, startedAt time.Time, headInstance int) (err error) {
 	ctx, span := Start(ctx, "routing.Store.BeginClusterMemberRun")
 	defer span.End()
@@ -182,6 +194,18 @@ func (_d *RoutingStoreWithTracing) ClearMappingAudioConcurrency(ctx context.Cont
 		}
 	}()
 	return _d.Store.ClearMappingAudioConcurrency(ctx, mappingID)
+}
+
+func (_d *RoutingStoreWithTracing) ClearServerGPUVendorNote(ctx context.Context, serverID string) (err error) {
+	ctx, span := Start(ctx, "routing.Store.ClearServerGPUVendorNote")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.ClearServerGPUVendorNote(ctx, serverID)
 }
 
 func (_d *RoutingStoreWithTracing) ClearServerNetbirdIP(ctx context.Context, id string) (err error) {
