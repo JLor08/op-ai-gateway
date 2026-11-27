@@ -266,7 +266,9 @@ func main() {
 	// not call a specific measurer's constructor from here; that routes around
 	// the split. Every answer carries its GPU's vendor, so a mixed host's
 	// NVIDIA 0 and AMD 0 never collide.
-	mgr.SetMeasurer(runtimeMeasurer(collector.NewVRAMMeasurer()))
+	vramMeasurer := collector.NewVRAMMeasurer()
+	mgr.SetMeasurer(runtimeMeasurer(vramMeasurer))
+	deps.VRAMMeasurable = vramMeasurer.Measurable
 	// Per-process host-RAM measurement is the same kind of hardware capability
 	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
 	// private working set on it, and returns nil on a host that cannot read

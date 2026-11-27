@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -5373,7 +5374,11 @@ func TestRunPushesDeviceTotalsBeforeTheBootRuntimeSync(t *testing.T) {
 		t.Fatal("no HostInfo had been pushed when the boot runtime sync began -- pinned/force_running specs would be admitted against no detected budgets")
 	}
 	want := runtimectl.HostInfo{GPUTotalsMB: map[runtimectl.GPUKey]int{{Index: 0}: 24000, {Index: 1}: 12288}, MemAvailableMB: 0}
-	if got := drv.pushed[0]; !reflect.DeepEqual(got, want) {
+	got := drv.pushed[0]
+	// The Vulkan map comes from whatever vulkaninfo this host has; it is pinned
+	// by TestSeedHostInfoCarriesVulkanMap, not here.
+	got.Vulkan = runtimectl.VulkanMap{}
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("first HostInfo push = %+v, want the boot seed %+v (device totals from the hardware inventory, RAM unknown)", got, want)
 	}
 }
@@ -5617,5 +5622,35 @@ func TestRuntimeGPUSamplesCarryVendor(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Runtimes[0].GPUs, want) {
 		t.Errorf("Runtimes[0].GPUs = %+v, want %+v", got.Runtimes[0].GPUs, want)
+	}
+}
+
+func TestHardwareOptionsUseConfigMeasurability(t *testing.T) {
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
+		VRAMMeasurable: func() map[string][]string { return map[string][]string{"amd": {"rocm"}} },
+	})
+	if got := a.hardwareOptions().VRAMMeasurable()["amd"]; !slices.Equal(got, []string{"rocm"}) {
+		t.Fatal(got)
+	}
+}
+
+func TestSeedHostInfoCarriesVulkanMap(t *testing.T) {
+	sink := &fakeHostInfoSink{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{HostInfo: sink})
+	zero, one := 0, 1
+	a.seedHostInfo(&sample.SystemReport{
+		VulkanDeviceCount: 3,
+		GPUs: []sample.GPUInfo{
+			{Index: 0, Vendor: "amd", VulkanOrdinal: &zero},
+			{Index: 1, Vendor: "amd", VulkanOrdinal: &one},
+			{Index: 0, Vendor: "nvidia"},
+		},
+	})
+	want := runtimectl.VulkanMap{
+		Ordinals:    map[runtimectl.GPUKey]int{{Vendor: runtimectl.ParseGPUVendor("amd"), Index: 0}: 0, {Vendor: runtimectl.ParseGPUVendor("amd"), Index: 1}: 1},
+		DeviceCount: 3,
+	}
+	if got := sink.last(t).Vulkan; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Vulkan = %+v, want %+v", got, want)
 	}
 }

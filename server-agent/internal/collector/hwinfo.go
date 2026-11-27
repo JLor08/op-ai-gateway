@@ -12,6 +12,7 @@ import (
 	"op-ai-server-agent/internal/sample"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,6 +31,12 @@ type HardwareOptions struct {
 	// HelperSocket is the privileged helper's Unix socket ("" = no helper). An
 	// unprivileged Linux agent reads its memory modules from there.
 	HelperSocket string
+	// VRAMMeasurable reports, per GPU vendor wire value, the sources that can
+	// measure per-process VRAM (cuda/rocm/vulkan). Nil = nothing measurable.
+	// Evaluated on every CollectHardware, after the GPU collectors ran.
+	VRAMMeasurable func() map[string][]string
+	// vulkan lists the Vulkan devices; nil = collectVulkan (test seam).
+	vulkan func(context.Context) ([]VulkanDevice, bool)
 }
 
 // HelperMemoryModulesNeeded reports whether r lacks the memory modules that
@@ -106,6 +113,33 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 				// intended degradation -- see sample.GPU.PCIBusID.
 				PCIBusID: gp.PCIBusID,
 			})
+		}
+	}
+
+	var measurable map[string][]string
+	if opts.VRAMMeasurable != nil {
+		measurable = opts.VRAMMeasurable()
+	}
+	vulkanFn := opts.vulkan
+	if vulkanFn == nil {
+		vulkanFn = collectVulkan
+	}
+	var ordinals map[pciAddr]int
+	if len(r.GPUs) > 0 {
+		if devs, ok := vulkanFn(ctx); ok {
+			r.VulkanDeviceCount = len(devs)
+			ordinals = vulkanOrdinalsByPCI(devs)
+		}
+	}
+	for i := range r.GPUs {
+		g := &r.GPUs[i]
+		if v := measurable[g.Vendor]; len(v) > 0 {
+			g.VRAMMeasurable = slices.Clone(v)
+		}
+		if addr, ok := parsePCIAddr(g.PCIBusID); ok {
+			if o, ok := ordinals[addr]; ok {
+				g.VulkanOrdinal = &o
+			}
 		}
 	}
 

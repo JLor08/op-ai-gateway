@@ -6,6 +6,7 @@ package collector
 import (
 	"context"
 	"op-ai-server-agent/internal/sample"
+	"slices"
 	"testing"
 )
 
@@ -83,5 +84,52 @@ func TestCollectHardwareCopiesVendor(t *testing.T) {
 	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", HardwareOptions{})
 	if len(r.GPUs) != 1 || r.GPUs[0].Vendor != VendorAMD || r.GPUs[0].PCIBusID != "0000:02:00.0" {
 		t.Fatalf("%+v", r.GPUs)
+	}
+}
+
+func vulkanFromFixture(t *testing.T, name string) func(context.Context) ([]VulkanDevice, bool) {
+	return func(context.Context) ([]VulkanDevice, bool) {
+		return parseVulkaninfo([]byte(readTestdata(t, name))), true
+	}
+}
+
+func TestCollectHardwareFillsMeasurabilityAndVulkanOrdinal(t *testing.T) {
+	opts := HardwareOptions{
+		VRAMMeasurable: func() map[string][]string { return map[string][]string{"amd": {"rocm", "vulkan"}} },
+		vulkan:         vulkanFromFixture(t, "vulkaninfo-amd-2gpu.txt"),
+	}
+	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
+	g := r.GPUs[0]
+	if g.VulkanOrdinal == nil || *g.VulkanOrdinal != 1 || !slices.Equal(g.VRAMMeasurable, []string{"rocm", "vulkan"}) || r.VulkanDeviceCount != 3 {
+		t.Fatalf("%+v count=%d", g, r.VulkanDeviceCount)
+	}
+}
+
+func TestCollectHardwareWithoutVulkaninfo(t *testing.T) {
+	opts := HardwareOptions{
+		vulkan: func(context.Context) ([]VulkanDevice, bool) { return nil, false },
+	}
+	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
+	if g := r.GPUs[0]; g.VulkanOrdinal != nil || g.VRAMMeasurable != nil || r.VulkanDeviceCount != 0 {
+		t.Fatalf("%+v count=%d", g, r.VulkanDeviceCount)
+	}
+}
+
+func TestCollectHardwareNVIDIAVulkanCount(t *testing.T) {
+	opts := HardwareOptions{vulkan: vulkanFromFixture(t, "vulkaninfo-nvidia-2gpu.txt")}
+	c := fixedGPUCollector{gpus: []sample.GPU{
+		{Index: 0, Vendor: VendorNVIDIA, PCIBusID: "0000:01:00.0"},
+		{Index: 1, Vendor: VendorNVIDIA, PCIBusID: "0000:02:00.0"},
+	}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
+	if r.VulkanDeviceCount != 2 {
+		t.Fatalf("count = %d", r.VulkanDeviceCount)
+	}
+	for i, g := range r.GPUs {
+		if g.VulkanOrdinal == nil || *g.VulkanOrdinal != i {
+			t.Fatalf("gpu %d: %+v", i, g)
+		}
 	}
 }

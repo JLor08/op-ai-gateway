@@ -127,8 +127,6 @@ func vulkanOrdinalsByPCI(devs []VulkanDevice) map[pciAddr]int {
 
 // collectVulkan runs vulkaninfo (5 s timeout). ok is false when the tool is
 // absent or fails.
-//
-//nolint:unused // consumed by the hardware-report wiring in a later task of #434
 func collectVulkan(ctx context.Context) (devs []VulkanDevice, ok bool) {
 	if _, err := exec.LookPath("vulkaninfo"); err != nil {
 		return nil, false
