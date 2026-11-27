@@ -762,3 +762,34 @@ func TestAgentFeaturesDeclaresRuntimeLogFiles(t *testing.T) {
 		t.Fatalf("Version = %q, want 0.27.0", Version)
 	}
 }
+
+// TestMixedVendorFeaturesAreDeclared pins the two mixed NVIDIA+AMD GPU flags
+// by exact wire NAME and the version they ship in. The gateway negotiates on
+// these literals before it saves vendor-aware specs or RPC cluster members
+// bound to loopback, and nothing in this module gates on them, so a rename
+// here would break that negotiation silently.
+func TestMixedVendorFeaturesAreDeclared(t *testing.T) {
+	for _, name := range []string{FeatureGPUVendorIdentity, FeatureRPCClusterSameHost} {
+		if !slices.Contains(FeatureNames(), name) {
+			t.Fatalf("FeatureNames() does not carry %q", name)
+		}
+		found := false
+		for _, f := range Features {
+			if f.Name == name {
+				found = true
+				if f.Since != "0.27.0" {
+					t.Fatalf("feature %q Since = %q, want 0.27.0 (the branch's single bump)", name, f.Since)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("Features does not declare %q", name)
+		}
+	}
+	if FeatureGPUVendorIdentity != "gpu_vendor_identity" {
+		t.Fatalf("FeatureGPUVendorIdentity = %q, want gpu_vendor_identity", FeatureGPUVendorIdentity)
+	}
+	if FeatureRPCClusterSameHost != "rpc_cluster_same_host" {
+		t.Fatalf("FeatureRPCClusterSameHost = %q, want rpc_cluster_same_host", FeatureRPCClusterSameHost)
+	}
+}
