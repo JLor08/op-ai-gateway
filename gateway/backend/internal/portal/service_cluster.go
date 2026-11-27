@@ -333,14 +333,19 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 //     member on the head's own server -- both allowed on a server whose
 //     agent declares rpc_cluster_same_host (agentRunsSameHostClusters). An
 //     entry without a server id keeps the stored member at its position (the
-//     read view hides members on servers the caller may not manage). When
-//     the membership, the member mode, the network, the transport and the
-//     head binary are all as stored, steps 4 to 8 are skipped: such a
-//     write changes no member server's document, so the head's own rights
-//     suffice and a member the caller cannot see does not lock it out of its
-//     head. The binary belongs to that list because it decides which member
-//     builds are compatible (step 6 and 7); a switch, even to the same build
-//     at another path, runs every member check.
+//     read view hides members on servers the caller may not manage). The
+//     flag is read from the agent's last declaration, so after a gateway
+//     restart a head with a member on its own server, or with two members
+//     on one server, is refused (cluster_member_on_head_server,
+//     cluster_member_server_twice) until that server's agent reconnects;
+//     that is no regression of the stored head. When the membership, the
+//     member mode, the network, the transport and the head binary are all
+//     as stored, steps 4 to 8 are skipped: such a write changes no member
+//     server's document, so the head's own rights suffice and a member the
+//     caller cannot see does not lock it out of its head. The binary
+//     belongs to that list because it decides which member builds are
+//     compatible (step 6 and 7); a switch, even to the same build at another
+//     path, runs every member check.
 //  4. rights: the caller manages every member server the write keeps or
 //     adds (a member it drops needs no rights: removal only frees the host),
 //     and every member consents to the head (its member spec's
@@ -1453,7 +1458,6 @@ type storedMembership struct {
 
 func indexStoredMembership(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) storedMembership {
 	out := storedMembership{
-		paired:   matchStoredRows(entries, prevMembers),
 		gpuOrder: map[int][]routing.GPUKey{},
 		gpuByKey: map[int]map[routing.GPUKey]routing.ClusterMemberGPU{},
 	}
@@ -1465,18 +1469,23 @@ func indexStoredMembership(entries []clusterEntry, prevMembers []routing.Cluster
 		}
 		out.gpuByKey[g.MemberPosition][key] = g
 	}
+	out.paired = matchStoredRows(entries, prevMembers, out.gpuOrder)
 	return out
 }
 
 // matchStoredRows pairs entries with the stored rows they continue, each row
-// with at most one entry, by entry position: first the row at the entry's
-// own position on the same server with the same member spec, then the first
-// unpaired row on the same server with the same spec (a reordered member),
-// then the first unpaired row on the same server (whose port the entry
-// keeps). A server carries several members only when its agent runs
-// same-host clusters; with one member per server this is the pairing by
-// server.
-func matchStoredRows(entries []clusterEntry, prevMembers []routing.ClusterMember) map[int]routing.ClusterMember {
+// with at most one entry, by entry position. An automatic member is first
+// paired by the GPUs it runs on: the row on the same server with the same
+// GPU selection (gpuOrder, by member position; sameGPUSelection under the
+// server's legacy vendor), the one at its own position first -- so when one
+// of two automatic members on a server is dropped, or the two are swapped,
+// each keeps its own port and measured values. Then every entry is paired
+// with the row at its own position on the same server with the same member
+// spec, then with the first unpaired row on the same server with the same
+// spec (a reordered member), then with the first unpaired row on the same
+// server (whose port the entry keeps). With one member per server this is
+// the pairing by server.
+func matchStoredRows(entries []clusterEntry, prevMembers []routing.ClusterMember, gpuOrder map[int][]routing.GPUKey) map[int]routing.ClusterMember {
 	out := make(map[int]routing.ClusterMember, len(entries))
 	taken := make([]bool, len(prevMembers))
 	pair := func(match func(e clusterEntry, m routing.ClusterMember) bool) {
@@ -1493,6 +1502,11 @@ func matchStoredRows(entries []clusterEntry, prevMembers []routing.ClusterMember
 		}
 	}
 	sameSpec := func(e clusterEntry, m routing.ClusterMember) bool { return m.MemberSpecID == e.specID() }
+	sameGPUs := func(e clusterEntry, m routing.ClusterMember) bool {
+		return !e.manual && m.MemberSpecID == "" && sameGPUSelection(gpuOrder[m.Position], e.gpus, e.server.GPULegacyVendor)
+	}
+	pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameGPUs(e, m) })
+	pair(sameGPUs)
 	pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameSpec(e, m) })
 	pair(sameSpec)
 	pair(func(clusterEntry, routing.ClusterMember) bool { return true })

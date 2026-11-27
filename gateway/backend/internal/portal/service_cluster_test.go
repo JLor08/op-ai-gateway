@@ -2489,3 +2489,88 @@ func TestClusterCandidatesListHeadServerWithFlag(t *testing.T) {
 		t.Fatalf("candidates with an unflagged head server = %v, want [A]", got)
 	}
 }
+
+// seedTwoMeasuredMembersOnOneServer saves a head with two automatic members
+// on a's server, on GPU 0 and GPU 1, and stores measured values for both:
+// RAM 1000 / VRAM 500 for the GPU-0 member, RAM 2000 / VRAM 700 for the
+// GPU-1 member. It returns the head id and the ports by GPU index.
+func seedTwoMeasuredMembersOnOneServer(t *testing.T, f *clusterFixture, serverID string) (string, map[int]int) {
+	t.Helper()
+	dto := f.mustPut(clusterHeadRequest(autoMember(serverID, 0), autoMember(serverID, 1)))
+	members, gpus, err := f.routes.ClusterMembers(f.ctx, dto.ID)
+	if err != nil || len(members) != 2 || len(gpus) != 2 {
+		t.Fatalf("members = %+v gpus = %+v err=%v", members, gpus, err)
+	}
+	ports := map[int]int{}
+	for i := range members {
+		members[i].RAMMeasuredMB, members[i].MeasuredAt = 1000*(i+1), clusterTestNow
+		gpus[i].VRAMMeasuredMB = 500 + 200*i
+		ports[gpus[i].GPUIndex] = members[i].Port
+	}
+	if err := f.routes.SetClusterMembers(f.ctx, dto.ID, members, gpus); err != nil {
+		t.Fatal(err)
+	}
+	return dto.ID, ports
+}
+
+// assertMemberFollowsGPU checks that the member at position carries the
+// stored values of the member that ran on gpuIndex: its port, RAM and VRAM.
+func assertMemberFollowsGPU(t *testing.T, f *clusterFixture, headID string, position, gpuIndex int, ports map[int]int) {
+	t.Helper()
+	members, gpus, err := f.routes.ClusterMembers(f.ctx, headID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := storedMemberAt(members, position)
+	if !ok {
+		t.Fatalf("no member at %d: %+v", position, members)
+	}
+	wantRAM, wantVRAM := 1000*(gpuIndex+1), 500+200*gpuIndex
+	if m.Port != ports[gpuIndex] || m.RAMMeasuredMB != wantRAM {
+		t.Fatalf("member %d = port %d ram %d, want the GPU-%d member's port %d ram %d", position, m.Port, m.RAMMeasuredMB, gpuIndex, ports[gpuIndex], wantRAM)
+	}
+	i := slices.IndexFunc(gpus, func(g routing.ClusterMemberGPU) bool { return g.MemberPosition == position })
+	if i < 0 || gpus[i].GPUIndex != gpuIndex || gpus[i].VRAMMeasuredMB != wantVRAM {
+		t.Fatalf("gpu rows = %+v, want GPU %d at member %d with VRAM %d", gpus, gpuIndex, position, wantVRAM)
+	}
+}
+
+// TestPlanTwoMembersOnOneServerFollowGPUs: dropping the first of two
+// automatic members on one server, or swapping them, keeps each member's
+// port and measured values with the GPUs it runs on, not with its position.
+func TestPlanTwoMembersOnOneServerFollowGPUs(t *testing.T) {
+	t.Run("drop the first", func(t *testing.T) {
+		f := newClusterFixture(t)
+		a := f.member("A")
+		f.sameHostAgent(a.ID)
+		head, ports := seedTwoMeasuredMembersOnOneServer(t, f, a.ID)
+		f.mustPut(clusterHeadRequest(autoMember(a.ID, 1)))
+		assertMemberFollowsGPU(t, f, head, 0, 1, ports)
+	})
+	t.Run("swap", func(t *testing.T) {
+		f := newClusterFixture(t)
+		a := f.member("A")
+		f.sameHostAgent(a.ID)
+		head, ports := seedTwoMeasuredMembersOnOneServer(t, f, a.ID)
+		f.mustPut(clusterHeadRequest(autoMember(a.ID, 1), autoMember(a.ID, 0)))
+		assertMemberFollowsGPU(t, f, head, 0, 1, ports)
+		assertMemberFollowsGPU(t, f, head, 1, 0, ports)
+	})
+}
+
+// TestReallocateAfterConflictTwoMembersOnOneServer: a port retry gives two
+// members on one server two distinct ports.
+func TestReallocateAfterConflictTwoMembersOnOneServer(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	plan := &clusterPlan{
+		members:   []routing.ClusterMember{{Position: 0, ServerID: a.ID, Port: rpcPortFirst}, {Position: 1, ServerID: a.ID, Port: rpcPortFirst}},
+		allocated: []int{0, 1},
+	}
+	if err := f.svc.reallocateAfterConflict(f.ctx, "rts_none", plan, false); err != nil {
+		t.Fatal(err)
+	}
+	if p0, p1 := plan.members[0].Port, plan.members[1].Port; p0 == 0 || p1 == 0 || p0 == p1 {
+		t.Fatalf("ports after the retry = %d, %d, want two distinct ports", p0, p1)
+	}
+}
