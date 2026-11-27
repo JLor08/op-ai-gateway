@@ -6,6 +6,7 @@ package runtime
 import (
 	"fmt"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"unicode"
 )
@@ -70,6 +71,15 @@ func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVend
 	return expandNonSecretText(content, surfaceConfigFileContent, spec, port, vendor, vendors, configFilesDir)
 }
 
+// contentPathsUseSlashes makes ${CONFIG_DIR} resolve with forward slashes in
+// config-file CONTENT. It is a seam: true on Windows, where the native
+// C:\... form is invalid inside a JSON string (\U, \s are not escapes) and
+// the Strata import writes "log": "${CONFIG_DIR}/engine.log" into strata.json
+// (design §4.1, #430). Only the content surface uses it: args, env and
+// log-file paths keep the native form (the path policy compares native
+// roots), and a WSL spec already resolves to a POSIX path.
+var contentPathsUseSlashes = goruntime.GOOS == "windows"
+
 // nonSecretSurface names the surface expandNonSecretText expands, which its
 // errors name and which picks the wording of a secret-token refusal.
 type nonSecretSurface int
@@ -116,6 +126,9 @@ func expandNonSecretText(text string, what nonSecretSurface, spec Spec, port int
 			return "", err
 		}
 		if handled {
+			if inner == "CONFIG_DIR" && what == surfaceConfigFileContent && contentPathsUseSlashes && !spec.IsWSL() {
+				v = strings.ReplaceAll(v, `\`, "/")
+			}
 			b.WriteString(v)
 			continue
 		}
