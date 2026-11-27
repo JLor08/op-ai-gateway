@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
-	"sync/atomic"
 )
 
 // This file is the gateway's half of live managed-process log streaming (T3):
@@ -159,6 +158,11 @@ type RuntimeLogEntryDTO struct {
 	ExitCode     int                   `json:"exit_code,omitempty"`
 	Command      *RuntimeLogCommandDTO `json:"command,omitempty"`
 	Instance     int                   `json:"instance,omitempty"`
+	// Stream names the declared log file an entry belongs to (#430). Empty is
+	// the process's own output, which is what an agent that predates log files
+	// sends. Allow-listed by shape on ingest (validLogStreamName); an entry
+	// whose stream fails it is dropped.
+	Stream string `json:"stream,omitempty"`
 }
 
 // RuntimeLogCommandDTO is the RESOLVED launch command of ONE generation: what
@@ -257,8 +261,7 @@ type RuntimeLogBatchDTO struct {
 // counters are separate from the queue on purpose -- a full queue must not need
 // a slot to record that it was full.
 type runtimeLogSub struct {
-	ch      chan RuntimeLogBatchDTO
-	dropped atomic.Int64
+	ch chan RuntimeLogBatchDTO
 
 	// resync is closed when this subscriber has fallen so far behind that the
 	// next thing lost would be a boundary marker. Ending the stream makes the
@@ -268,6 +271,10 @@ type runtimeLogSub struct {
 	resync chan struct{}
 
 	mu sync.Mutex
+	// dropped counts, per stream ("" is the process output), the text bytes
+	// lost because the queue was full. A gap is reported per stream so a file
+	// stream's loss is never blamed on the process output or vice versa.
+	dropped map[string]int64
 	// carry holds markers (and the commands riding them) taken out of batches
 	// that did not fit the queue, to be delivered in front of the next batch
 	// that does. queueLocked in the agent protects exactly this property one
@@ -318,11 +325,10 @@ func (s *runtimeLogSub) deliver(batch RuntimeLogBatchDTO) {
 	// Stamp at ENQUEUE time, not at read time: the rescued markers came from a
 	// batch published after everything already queued, so this is the one
 	// position where they are in order.
-	dropped := s.dropped.Load()
 	select {
-	case s.ch <- s.stampedLocked(batch, dropped):
+	case s.ch <- s.stampedLocked(batch):
 		s.carry = nil
-		s.dropped.Add(-dropped)
+		s.dropped = nil
 		if replay {
 			s.sbStarted = true
 			s.sbDone = !more
@@ -330,33 +336,64 @@ func (s *runtimeLogSub) deliver(batch RuntimeLogBatchDTO) {
 	default:
 		// Nothing was consumed: the batch that would have carried them did not
 		// fit either, so they stay owed.
-		s.dropped.Add(batchTextBytes(batch))
+		s.addDroppedLocked(batch)
 		s.carryLocked(batch.Entries)
 	}
 }
 
-// stampedLocked returns batch with the rescued markers in front of its entries
-// and dropped accounted on the first of them. It COPIES rather than mutating:
-// the batch value is shared by every subscriber of this spec (publish fans out
-// one snapshot) and each has its own losses, so mutating in place would give one
+// stampedLocked returns batch with one gap entry per lossy stream and the
+// rescued markers in front of its entries. It COPIES rather than mutating: the
+// batch value is shared by every subscriber of this spec (publish fans out one
+// snapshot) and each has its own losses, so mutating in place would give one
 // subscriber's gap to all of them. The per-entry Command pointers inside are
 // shared and need no deep copy -- once sanitizeRuntimeLogCommand has run on
 // ingest, nothing writes them again.
-func (s *runtimeLogSub) stampedLocked(batch RuntimeLogBatchDTO, dropped int64) RuntimeLogBatchDTO {
-	if dropped == 0 && len(s.carry) == 0 {
+func (s *runtimeLogSub) stampedLocked(batch RuntimeLogBatchDTO) RuntimeLogBatchDTO {
+	if len(s.dropped) == 0 && len(s.carry) == 0 {
 		return batch
 	}
-	entries := make([]RuntimeLogEntryDTO, 0, len(s.carry)+len(batch.Entries)+1)
+	gaps := droppedGapEntries(s.dropped)
+	entries := make([]RuntimeLogEntryDTO, 0, len(gaps)+len(s.carry)+len(batch.Entries))
+	entries = append(entries, gaps...)
 	entries = append(entries, s.carry...)
 	entries = append(entries, batch.Entries...)
-	if dropped > 0 {
-		if len(entries) == 0 {
-			entries = append(entries, RuntimeLogEntryDTO{})
-		}
-		entries[0].DroppedBytes += dropped
-	}
 	batch.Entries = entries
 	return batch
+}
+
+// addDroppedLocked accounts the text of a batch that did not fit the queue,
+// per stream.
+func (s *runtimeLogSub) addDroppedLocked(batch RuntimeLogBatchDTO) {
+	for _, e := range batch.Entries {
+		if len(e.Text) == 0 {
+			continue
+		}
+		if s.dropped == nil {
+			s.dropped = make(map[string]int64)
+		}
+		s.dropped[e.Stream] += int64(len(e.Text))
+	}
+}
+
+// droppedGapEntries turns per-stream drop counts into one gap entry per stream
+// with a non-zero count, process output ("") first and file streams by name, so
+// the order is stable.
+func droppedGapEntries(dropped map[string]int64) []RuntimeLogEntryDTO {
+	if len(dropped) == 0 {
+		return nil
+	}
+	streams := make([]string, 0, len(dropped))
+	for stream, n := range dropped {
+		if n > 0 {
+			streams = append(streams, stream)
+		}
+	}
+	sort.Strings(streams)
+	gaps := make([]RuntimeLogEntryDTO, 0, len(streams))
+	for _, stream := range streams {
+		gaps = append(gaps, RuntimeLogEntryDTO{Stream: stream, DroppedBytes: dropped[stream]})
+	}
+	return gaps
 }
 
 // carryLocked rescues the entries that must not be lost from a batch that was
@@ -404,8 +441,9 @@ func (s *runtimeLogSub) resyncLocked() {
 func (s *runtimeLogSub) take(batch RuntimeLogBatchDTO) RuntimeLogBatchDTO {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dropped := s.dropped.Swap(0)
-	if dropped == 0 {
+	gaps := droppedGapEntries(s.dropped)
+	s.dropped = nil
+	if len(gaps) == 0 {
 		return batch
 	}
 	// Copy before stamping: the batch value is shared by every subscriber of
@@ -413,12 +451,9 @@ func (s *runtimeLogSub) take(batch RuntimeLogBatchDTO) RuntimeLogBatchDTO {
 	// losses. The per-entry Command pointers inside are shared and need no deep
 	// copy -- once sanitizeRuntimeLogCommand has run on ingest, nothing writes
 	// them again.
-	entries := make([]RuntimeLogEntryDTO, len(batch.Entries))
-	copy(entries, batch.Entries)
-	if len(entries) == 0 {
-		entries = []RuntimeLogEntryDTO{{}}
-	}
-	entries[0].DroppedBytes += dropped
+	entries := make([]RuntimeLogEntryDTO, 0, len(gaps)+len(batch.Entries))
+	entries = append(entries, gaps...)
+	entries = append(entries, batch.Entries...)
 	batch.Entries = entries
 	return batch
 }
@@ -662,7 +697,9 @@ func (r *runtimeLogRegistry) publish(serverID string, batch RuntimeLogBatchDTO) 
 	}
 }
 
-// runtimeLogEvents is the ALLOW-LIST of boundary markers an agent may report.
+// runtimeLogEvents is the ALLOW-LIST of boundary markers an agent may report on
+// the process stream (an entry with no Stream); runtimeLogFileEvents is the
+// matching list for a declared log file stream, and the two are disjoint.
 // The portal renders each of these as its own localized sentence ("process
 // started, pid N" / "process exited, code N" / "process did not start"), which
 // is only safe as long as
@@ -672,6 +709,40 @@ func (r *runtimeLogRegistry) publish(serverID string, batch RuntimeLogBatchDTO) 
 // marker, which is safe and honest. Same technique, and the same reasoning, as
 // runtimeReportParseErrorCodes in agent_runtime.go.
 var runtimeLogEvents = map[string]bool{"started": true, "exited": true, "start_failed": true}
+
+// runtimeLogFileEvents is the closed set of markers a declared log FILE stream
+// may carry (#430): typed statuses, never text. Same technique and reasoning as
+// runtimeLogEvents. The two sets are disjoint on purpose: a process event on a
+// file stream, or a file event on the process stream, is not a marker the
+// portal could place honestly, so it degrades to a plain entry.
+var runtimeLogFileEvents = map[string]bool{
+	"file_opened":        true,
+	"file_rotated":       true,
+	"file_truncated":     true,
+	"file_line_cut":      true,
+	"file_stale":         true,
+	"file_waiting":       true,
+	"file_not_permitted": true,
+	"file_binary":        true,
+	"file_missing":       true,
+}
+
+// validLogStreamName reports the shape of a declared log file's name, the
+// same pattern the portal enforces on a spec (^[A-Za-z0-9._-]{1,32}$).
+func validLogStreamName(s string) bool {
+	if len(s) < 1 || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // runtimeLogOpeningEvents are the markers that OPEN a generation, and therefore
 // the only entries a resolved launch command may be attached to. A command on an
@@ -773,9 +844,22 @@ func (s *Server) ingestRuntimeLog(serverID string, raw json.RawMessage) {
 	if len(batch.Entries) > runtimeLogMaxEntries {
 		batch.Entries = batch.Entries[:runtimeLogMaxEntries]
 	}
+	// An entry naming an invalid stream is dropped whole: it cannot be
+	// attributed to anything, and the stream name keys a portal tab.
+	kept := batch.Entries[:0]
+	for _, e := range batch.Entries {
+		if e.Stream == "" || validLogStreamName(e.Stream) {
+			kept = append(kept, e)
+		}
+	}
+	batch.Entries = kept
 	for i := range batch.Entries {
 		batch.Entries[i].At = clampString(batch.Entries[i].At, runtimeLogMaxAtLen)
-		if !runtimeLogEvents[batch.Entries[i].Event] {
+		allowed := runtimeLogEvents
+		if batch.Entries[i].Stream != "" {
+			allowed = runtimeLogFileEvents
+		}
+		if !allowed[batch.Entries[i].Event] {
 			batch.Entries[i].Event = ""
 			batch.Entries[i].ExitCode = 0
 		}
@@ -804,16 +888,4 @@ func clampString(s string, n int) string {
 		return s[:n]
 	}
 	return s
-}
-
-// batchTextBytes is how much process output a dropped batch was carrying --
-// the number that becomes the reader's "N bytes missing" marker. Only text
-// counts: a lost boundary marker is not a byte the process printed, and
-// inflating the count with bookkeeping would misreport the gap.
-func batchTextBytes(batch RuntimeLogBatchDTO) int64 {
-	var n int64
-	for _, e := range batch.Entries {
-		n += int64(len(e.Text))
-	}
-	return n
 }

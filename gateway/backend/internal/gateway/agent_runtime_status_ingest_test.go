@@ -152,6 +152,45 @@ func TestIngestTelemetrySampleRuntimeClampsStderrTail(t *testing.T) {
 	}
 }
 
+// TestIngestTelemetrySampleRuntimeClampsLogFileTails proves the log_file_tails
+// on a runtime's last_error (#430) are bounded before they reach the volatile
+// registry: at most four entries, each tail at most maxRuntimeStderrTail bytes,
+// and an entry whose name is not a valid log file name is dropped.
+func TestIngestTelemetrySampleRuntimeClampsLogFileTails(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_tails")
+
+	big := strings.Repeat("y", 4096)
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_tails","state":"crashed",` +
+		`"last_error":{"message":"boom","exit_code":1,"failures":1,"log_file_tails":[` +
+		`{"name":"a/b","tail":"bad name"},` +
+		`{"name":"one","tail":"1"},{"name":"two","tail":"` + big + `"},{"name":"three","tail":"3"},` +
+		`{"name":"four","tail":"4"},{"name":"five","tail":"5"}]}}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 || snap[0].LastError == nil {
+		t.Fatalf("snapshot = %#v, want one entry with a last_error", snap)
+	}
+	tails := snap[0].LastError.LogFileTails
+	if len(tails) != 4 {
+		t.Fatalf("tails = %d entries, want 4 (invalid name dropped first, then the cap): %+v", len(tails), tails)
+	}
+	var names []string
+	for _, tl := range tails {
+		names = append(names, tl.Name)
+	}
+	if strings.Join(names, ",") != "one,two,three,four" {
+		t.Fatalf("names = %v, want [one two three four]", names)
+	}
+	if len(tails[1].Tail) != maxRuntimeStderrTail {
+		t.Fatalf("tail length = %d, want clamped to %d", len(tails[1].Tail), maxRuntimeStderrTail)
+	}
+}
+
 // TestIngestTelemetrySampleRuntimeVRAMWriteBack proves a sample's measured VRAM is
 // written back onto the spec's GPU row (VRAMMeasuredMB) without disturbing
 // the operator's own VRAMEstimateMB.

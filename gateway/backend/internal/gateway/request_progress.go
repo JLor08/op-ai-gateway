@@ -22,7 +22,7 @@ import (
 //
 // Same shape as the repo's two existing hot-path counters: chatRunRegistry holds
 // *ChatRun and mutates per delta through the run's OWN lock (chat_runs.go), and
-// runtimeLogSub.dropped is an atomic on a per-subscriber object (runtime_logs.go).
+// the per-subscriber state of runtimeLogSub (runtime_logs.go) sits behind its own lock.
 type requestProgress struct {
 	// outputTokens is the upstream's own cumulative count. 0 means the upstream
 	// reported none -- never a gateway guess.
