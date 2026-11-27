@@ -56,9 +56,11 @@ func (s *Service) RPCMemberDisplayNames(ctx context.Context, p auth.Token, serve
 	if err != nil {
 		return nil, err
 	}
+	// The server's membership rows hold every member of each of its heads
+	// on it, which is what an automatic member's number counts.
 	headOf := make(map[string]string, len(rows))
 	for _, m := range rows {
-		headOf[MemberAgentSpecID(m)] = m.HeadSpecID
+		headOf[MemberAgentSpecID(m, rows)] = m.HeadSpecID
 	}
 	r := memberNamer{s: s, p: p, serverID: serverID, headOf: headOf, heads: map[string]RPCMemberName{}}
 	out := make(map[string]RPCMemberName, len(specIDs))
@@ -93,9 +95,10 @@ func (r *memberNamer) name(ctx context.Context, id string) (RPCMemberName, bool,
 		name, err := r.headName(ctx, head)
 		return name, true, err
 	}
-	// An automatic member whose membership row is gone still names its head.
-	if rest, ok := strings.CutPrefix(id, automaticMemberSpecPrefix); ok {
-		if head, ok := strings.CutSuffix(rest, "_"+r.serverID); ok {
+	// An automatic member whose membership row is gone still names its head,
+	// a later member of the head on the server (an "_m<n>" id) too.
+	if strings.HasPrefix(id, automaticMemberSpecPrefix) {
+		if head, ok := AutomaticMemberHead(id, r.serverID); ok {
 			name, err := r.headName(ctx, head)
 			return name, true, err
 		}

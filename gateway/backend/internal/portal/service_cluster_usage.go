@@ -9,6 +9,8 @@ import (
 	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/routing"
 	"slices"
+	"strconv"
+	"strings"
 )
 
 // ErrClusterMemberNotFound (404): the server is no member of the head.
@@ -17,21 +19,63 @@ var ErrClusterMemberNotFound = errors.New("runtime_spec.cluster_member_not_found
 // automaticMemberSpecPrefix starts the agent spec id of an automatic member.
 const automaticMemberSpecPrefix = "rpca_"
 
-// automaticMemberAgentSpecID is the agent spec id of the automatic member of
-// headSpecID on serverID: derived from both, so a server serving two heads
-// runs two distinct members.
-func automaticMemberAgentSpecID(headSpecID, serverID string) string {
-	return automaticMemberSpecPrefix + headSpecID + "_" + serverID
+// automaticMemberAgentSpecID is the agent spec id of the nth automatic
+// member (1-based, in member order) of headSpecID on serverID: derived from
+// both, so a server serving two heads runs two distinct members. The first
+// keeps the id it had before a head could have several members on one
+// server, so an existing cluster's members never relaunch for it; a later
+// one gets an "_m<nth>" suffix (server ids are "srv_<hex>", so it cannot
+// collide with another server's id).
+func automaticMemberAgentSpecID(headSpecID, serverID string, nth int) string {
+	id := automaticMemberSpecPrefix + headSpecID + "_" + serverID
+	if nth <= 1 {
+		return id
+	}
+	return id + "_m" + strconv.Itoa(nth)
 }
 
 // MemberAgentSpecID is the agent spec id the runtime documents push for the
 // membership row m: the manual member spec's id, or the automatic member's
-// derived one. A member's telemetry names its process by this id.
-func MemberAgentSpecID(m routing.ClusterMember) string {
+// derived one. members are the rows m is read with -- the head's membership,
+// or every membership on m's server; an automatic member's number is 1 plus
+// the automatic members of its head on its server at a lower position. A
+// member's telemetry names its process by this id.
+func MemberAgentSpecID(m routing.ClusterMember, members []routing.ClusterMember) string {
 	if m.MemberSpecID != "" {
 		return m.MemberSpecID
 	}
-	return automaticMemberAgentSpecID(m.HeadSpecID, m.ServerID)
+	return automaticMemberAgentSpecID(m.HeadSpecID, m.ServerID, automaticMemberNth(m, members))
+}
+
+// AutomaticMemberHead is the head spec id an automatic member's agent spec id
+// on serverID names (automaticMemberAgentSpecID: "rpca_<head>_<server>",
+// with "_m<n>" after it for a later member of the head on the server); ok is
+// false for any other id.
+func AutomaticMemberHead(id, serverID string) (string, bool) {
+	rest, ok := strings.CutPrefix(id, automaticMemberSpecPrefix)
+	if !ok {
+		return "", false
+	}
+	if i := strings.LastIndex(rest, "_m"); i >= 0 && i+2 < len(rest) && strings.Trim(rest[i+2:], "0123456789") == "" {
+		rest = rest[:i]
+	}
+	head, ok := strings.CutSuffix(rest, "_"+serverID)
+	if !ok {
+		return "", false
+	}
+	return head, true
+}
+
+// automaticMemberNth is the automatic member m's 1-based number among the
+// automatic members of its head on its server, by position.
+func automaticMemberNth(m routing.ClusterMember, members []routing.ClusterMember) int {
+	nth := 1
+	for _, o := range members {
+		if o.HeadSpecID == m.HeadSpecID && o.ServerID == m.ServerID && o.MemberSpecID == "" && o.Position < m.Position {
+			nth++
+		}
+	}
+	return nth
 }
 
 // AuthorizeClusterMemberUsageReset authorizes a reset of the stored usage of

@@ -118,16 +118,17 @@ func DerivesIdleTimeout(spec routing.RuntimeSpec) bool {
 }
 
 // clusterDerivation is a head's cluster as the runtime documents carry it:
-// the head's cluster block and one rpc_server spec per member server, or the
-// reason none of it is pushed.
+// the head's cluster block and one rpc_server spec per member, or the reason
+// none of it is pushed.
 type clusterDerivation struct {
-	reason  string
-	head    *AgentClusterHeadDTO
-	members map[string]AgentRuntimeSpecDTO
-	// addresses is each member server's dial address (the host of its
-	// endpoint), headIdentity how the members know the head: its addresses,
-	// or the name they resolve. The plan carries both (ClusterPlan).
-	addresses    map[string]string
+	reason string
+	head   *AgentClusterHeadDTO
+	// members are the members in member order (index = position), so two
+	// members of the head on one server are two entries.
+	members []derivedMemberSpec
+	// headIdentity is how the members know the head: its addresses, or the
+	// name they resolve (loopback when every member runs on the head's
+	// server). The plan carries it (ClusterPlan).
 	headIdentity []string
 	// hold: the viewing server's own agent declaration is unknown, so its
 	// document is held rather than served without the cluster.
@@ -136,12 +137,33 @@ type clusterDerivation struct {
 
 func withheld(reason string) clusterDerivation { return clusterDerivation{reason: reason} }
 
-// derivedMember is one member with what its spec is built from.
+// derivedMemberSpec is one member of a derivable cluster: its server, its
+// rpc_server spec and its dial address (the host of its endpoint).
+type derivedMemberSpec struct {
+	serverID string
+	spec     AgentRuntimeSpecDTO
+	address  string
+}
+
+// derivedMember is one member with what its spec is built from. loopback: the
+// member runs on the head's server (sameHostMember).
 type derivedMember struct {
 	clusterMemberState
-	binary  routing.ServerBinary
-	address string
-	bindIP  string
+	binary   routing.ServerBinary
+	address  string
+	bindIP   string
+	loopback bool
+}
+
+// loopbackAddr is where a member on the head's own server is dialed and
+// bound, and how it knows its head: nothing of it leaves the host, so it
+// needs neither NetBird nor a LAN address and is outside both exposures.
+const loopbackAddr = "127.0.0.1"
+
+// sameHostMember reports whether m runs on the head's server headServerID,
+// where it is addressed on loopback.
+func sameHostMember(headServerID string, m routing.ClusterMember) bool {
+	return m.ServerID == headServerID
 }
 
 // clusterHeadBlock returns head's cluster block for headServer's document,
@@ -234,22 +256,39 @@ type derivedNetwork struct {
 // deriveClusterNetwork is the address and transport stages of deriveCluster:
 // the resolved network and transport, the head's identity, each member's
 // address and bind address (set on members), then the transport's
-// preconditions. A reason withholds the cluster.
+// preconditions. A reason withholds the cluster. A member on the head's
+// server is on loopback (sameHostMember): it has no network reason, and a
+// cluster whose members all are needs neither the head's identity nor the
+// transport's preconditions.
 func (s *Service) deriveClusterNetwork(ctx context.Context, head routing.RuntimeSpec, headServer routing.AIServer, members []derivedMember) (derivedNetwork, string, error) {
 	servers := []routing.AIServer{headServer}
-	for _, m := range members {
+	remote := false
+	for i, m := range members {
 		servers = append(servers, m.server)
+		members[i].loopback = sameHostMember(headServer.ID, m.row)
+		remote = remote || !members[i].loopback
 	}
 	var cn derivedNetwork
 	var err error
 	if cn.network, cn.transport, err = s.resolveClusterNetwork(ctx, head, servers); err != nil {
 		return cn, "", err
 	}
+	if !remote {
+		cn.headIPs = []string{loopbackAddr}
+		for i := range members {
+			members[i].bindIP, members[i].address = loopbackAddr, loopbackAddr
+		}
+		return cn, "", nil
+	}
 	var reason string
 	if cn.headIPs, cn.headDomain, reason = clusterHeadIdentity(headServer, cn.network); reason != "" {
 		return cn, reason, nil
 	}
 	for i := range members {
+		if members[i].loopback {
+			members[i].bindIP, members[i].address = loopbackAddr, loopbackAddr
+			continue
+		}
 		// The bind address first: a bind-only member's missing interface is
 		// the more specific reason when it also leaves no address to dial.
 		if members[i].bindIP, reason = memberBindIP(members[i].server, cn.network); reason != "" {
@@ -626,14 +665,17 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 	block := &AgentClusterHeadDTO{Endpoints: make([]AgentClusterEndpointDTO, 0, len(members)), Transport: transport, Network: network}
 	parts := make([]memberGenerationPart, 0, len(members))
 	out := clusterDerivation{
-		head: block, members: make(map[string]AgentRuntimeSpecDTO, len(members)),
-		addresses: make(map[string]string, len(members)), headIdentity: slices.Clone(headIPs),
+		head: block, members: make([]derivedMemberSpec, 0, len(members)), headIdentity: slices.Clone(headIPs),
 	}
 	if headDomain != "" {
 		out.headIdentity = append(out.headIdentity, headDomain)
 	}
+	rows := make([]routing.ClusterMember, len(members))
+	for i, m := range members {
+		rows[i] = m.row
+	}
 	for _, m := range members {
-		spec, err := s.memberAgentSpec(ctx, head.ID, m, transport, headIPs, headDomain)
+		spec, err := s.memberAgentSpec(ctx, head.ID, m, MemberAgentSpecID(m.row, rows), transport, headIPs, headDomain)
 		if errors.Is(err, ErrRuntimeSpecArgsInvalid) || errors.Is(err, ErrRuntimeSpecEnvInvalid) {
 			// One member's unreadable row withholds its cluster; it must not
 			// fail the documents (and the read view) the cluster is part of.
@@ -662,11 +704,10 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 			Kind: kind, ID: spec.ID, Server: m.server.ID, Binary: m.binary.Path, Args: spec.Args, Env: spec.Env,
 			CacheEnabled: spec.RPC.CacheEnabled, DeviceBackend: spec.DeviceBackend,
 			Version: m.binary.EffectiveVersion(),
-			Commit:  commit, Build: build, DeviceCount: devices, GPUs: indices, Transport: transport, Network: network,
+			Commit:  commit, Build: build, DeviceCount: devices, GPUs: indices, Transport: spec.RPC.Transport, Network: network,
 			Bind: m.bindIP, Port: m.row.Port,
 		})
-		out.members[m.server.ID] = spec
-		out.addresses[m.server.ID] = m.address
+		out.members = append(out.members, derivedMemberSpec{serverID: m.server.ID, spec: spec, address: m.address})
 	}
 	raw, err := json.Marshal(parts)
 	if err != nil {
@@ -677,12 +718,15 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 	return out, nil
 }
 
-// memberAgentSpec builds m's rpc_server spec. Its id is the manual spec's id,
-// or for an automatic member one derived from the head and the server, so a
-// server serving two heads runs two distinct members. The demand per GPU and
-// for RAM is max(stored usage, estimate), the stored usage held at the
-// memory ceiling while it is stale (memberDemand).
-func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m derivedMember, transport string, headIPs []string, headDomain string) (AgentRuntimeSpecDTO, error) {
+// memberAgentSpec builds m's rpc_server spec with the agent spec id id
+// (MemberAgentSpecID): the manual spec's id, or for an automatic member one
+// derived from the head, the server and its number there, so a server
+// serving two heads, or one head twice, runs distinct members. The demand per
+// GPU and for RAM is max(stored usage, estimate), the stored usage held at
+// the memory ceiling while it is stale (memberDemand). A member on the head's
+// server (loopback) runs direct and knows its head as loopback, whatever the
+// cluster's transport: no relay is needed where nothing leaves the host.
+func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m derivedMember, id, transport string, headIPs []string, headDomain string) (AgentRuntimeSpecDTO, error) {
 	var gpuCeiling map[routing.GPUKey]int
 	ramCeiling := 0
 	if m.row.Stale {
@@ -700,7 +744,7 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 		})
 	}
 	spec := AgentRuntimeSpecDTO{
-		ID:                    automaticMemberAgentSpecID(headSpecID, m.server.ID),
+		ID:                    id,
 		Kind:                  AgentSpecKindRPCServer,
 		Binary:                m.binary.Path,
 		Args:                  []string{},
@@ -720,13 +764,15 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 			HeadIPs: headIPs, HeadDomain: headDomain, CacheEnabled: m.row.CacheEnabled,
 		},
 	}
+	if m.loopback {
+		spec.RPC.Transport, spec.RPC.HeadIPs, spec.RPC.HeadDomain = rpcTransportDirect, []string{loopbackAddr}, ""
+	}
 	if m.row.MemberSpecID == "" {
 		if m.row.Threads > 0 {
 			spec.Args = []string{"-t", strconv.Itoa(m.row.Threads)}
 		}
 		return spec, nil
 	}
-	spec.ID = m.spec.ID
 	spec.DeviceBackend = normalizeDeviceBackend(m.spec.DeviceBackend)
 	spec.RPC.CacheEnabled = m.spec.CacheEnabled
 	if strings.TrimSpace(m.spec.Args) != "" {
@@ -807,9 +853,10 @@ func (s *Service) serverMemoryCeilings(ctx context.Context, serverID, legacy str
 }
 
 // memberSpecsForServer derives the rpc_server specs serverID runs for the
-// cluster heads it is a member of, in head spec id order. A head that is
-// disabled or withheld contributes nothing; hold reports that serverID's own
-// agent declaration is unknown while it is a member of an enabled head,
+// cluster heads it is a member of, in head spec id order and, within a head,
+// in member order (a head may have several members on serverID). A head that
+// is disabled or withheld contributes nothing; hold reports that serverID's
+// own agent declaration is unknown while it is a member of an enabled head,
 // which holds serverID's document.
 func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (specs []AgentRuntimeSpecDTO, hold bool, err error) {
 	memberships, err := s.routes.ClusterMembershipsByServer(ctx, serverID)
@@ -817,8 +864,12 @@ func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (sp
 		return nil, false, err
 	}
 	specs = []AgentRuntimeSpecDTO{}
+	var heads []string
 	for _, row := range memberships {
-		d, ok, err := s.deriveHeadOf(ctx, row.HeadSpecID, serverID)
+		heads = appendUnique(heads, row.HeadSpecID)
+	}
+	for _, headSpecID := range heads {
+		d, ok, err := s.deriveHeadOf(ctx, headSpecID, serverID)
 		if err != nil {
 			return nil, false, err
 		}
@@ -826,8 +877,13 @@ func (s *Service) memberSpecsForServer(ctx context.Context, serverID string) (sp
 			continue
 		}
 		hold = hold || d.hold
-		if spec, ok := d.members[serverID]; ok && d.reason == "" {
-			specs = append(specs, spec)
+		if d.reason != "" {
+			continue
+		}
+		for _, m := range d.members {
+			if m.serverID == serverID {
+				specs = append(specs, m.spec)
+			}
 		}
 	}
 	return specs, hold, nil
@@ -905,12 +961,21 @@ func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, row
 	if err != nil || !ok {
 		return "", err
 	}
+	legacy, err := s.serverLegacyGPUVendor(ctx, used.ServerID)
+	if err != nil {
+		return "", err
+	}
 	for range clusterRewriteAttempts {
 		read, readGPUs, err := s.routes.ClusterMembers(ctx, used.HeadSpecID)
 		if err != nil {
 			return "", err
 		}
-		members, gpus := resyncedManualMember(used, rows, read, readGPUs)
+		// The member as read now: its position is what its GPU rows hang on.
+		i := slices.IndexFunc(read, func(m routing.ClusterMember) bool { return m.MemberSpecID == specID })
+		if i < 0 {
+			return used.HeadSpecID, nil // no longer a member of the head
+		}
+		members, gpus := resyncedManualMember(read[i], rows, read, readGPUs, legacy)
 		applied, err := s.routes.SetClusterMembersIf(ctx, used.HeadSpecID, read, readGPUs, members, gpus)
 		if err != nil || applied {
 			return used.HeadSpecID, err
@@ -920,15 +985,18 @@ func (s *Service) resyncManualMemberGPUs(ctx context.Context, specID string, row
 }
 
 // resyncedManualMember is resyncManualMemberGPUs' rewrite of the membership
-// rows read: used's GPU rows follow the spec's rows, matched by GPU key
-// (vendor, index).
-func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSpecGPU, read []routing.ClusterMember, gpus []routing.ClusterMemberGPU) ([]routing.ClusterMember, []routing.ClusterMemberGPU) {
+// rows read: used's GPU rows (by its position, so another member of the head
+// on the same server keeps its own) follow the spec's rows, matched by GPU
+// key. An empty vendor and legacy -- the member server's legacy vendor --
+// name one card (lookupGPUKey, sameGPUSelection), so a backfill that wrote
+// the vendor onto one side only keeps the measured values and ends no run.
+func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSpecGPU, read []routing.ClusterMember, gpus []routing.ClusterMemberGPU, legacy string) ([]routing.ClusterMember, []routing.ClusterMemberGPU) {
 	members := slices.Clone(read)
 	prev := map[routing.GPUKey]routing.ClusterMemberGPU{}
 	var prevOrder []routing.GPUKey
 	next := make([]routing.ClusterMemberGPU, 0, len(gpus)+len(rows))
 	for _, g := range gpus {
-		if g.ServerID == used.ServerID {
+		if g.MemberPosition == used.Position {
 			key := routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}
 			prev[key] = g
 			prevOrder = append(prevOrder, key)
@@ -944,29 +1012,29 @@ func resyncedManualMember(used routing.ClusterMember, rows []routing.RPCMemberSp
 			GPUVendor: r.GPUVendor, GPUIndex: r.GPUIndex, Position: pos,
 		}
 		key := routing.GPUKey{Vendor: r.GPUVendor, Index: r.GPUIndex}
-		if p, ok := prev[key]; ok {
+		if p, ok := lookupGPUKey(prev, key, legacy); ok {
 			g.VRAMMeasuredMB, g.RunPeakVRAMMB = p.VRAMMeasuredMB, p.RunPeakVRAMMB
 			measured = measured || p.VRAMMeasuredMB > 0
 		}
 		nextOrder = append(nextOrder, key)
 		next = append(next, g)
 	}
-	if !slices.Equal(prevOrder, nextOrder) {
-		endClusterRuns(members, next, used.ServerID, measured)
+	if !sameGPUSelection(prevOrder, nextOrder, legacy) {
+		endClusterRuns(members, next, used.Position, measured)
 	}
 	return members, next
 }
 
 // endClusterRuns is a change of the distribution on a head's membership:
 // every member's run ends with its peaks, and the kept values of the member
-// on serverID (measured: a kept GPU value is known) become a stale floor.
-func endClusterRuns(members []routing.ClusterMember, gpus []routing.ClusterMemberGPU, serverID string, measured bool) {
+// at position (measured: a kept GPU value is known) become a stale floor.
+func endClusterRuns(members []routing.ClusterMember, gpus []routing.ClusterMemberGPU, position int, measured bool) {
 	for i := range gpus {
 		gpus[i].RunPeakVRAMMB = 0
 	}
 	for i := range members {
 		members[i].RunPeakRAMMB, members[i].RunHeadInstance, members[i].RunStartedAt = 0, 0, time.Time{}
-		if members[i].ServerID == serverID && (measured || members[i].RAMMeasuredMB > 0) {
+		if members[i].Position == position && (measured || members[i].RAMMeasuredMB > 0) {
 			members[i].Stale = true
 		}
 	}

@@ -1166,7 +1166,7 @@ func (w *clusterWatchdog) checkBlocked(serverID string, next []RuntimeStatusDTO)
 
 // memberHeadCandidates lists the heads the member spec on serverID may serve:
 // the head it reports holding it, the heads whose last plan lists it, and the
-// head an automatic member's id names (rpca_<head>_<server>). They are only
+// head an automatic member's id names (portal.AutomaticMemberHead). They are only
 // candidates: removeForBlockedStart keeps one only when its plan lists the
 // member on serverID.
 func (o *clusterOrchestrator) memberHeadCandidates(serverID, member string, next []RuntimeStatusDTO) []string {
@@ -1184,10 +1184,8 @@ func (o *clusterOrchestrator) memberHeadCandidates(serverID, member string, next
 			add(v.head)
 		}
 	}
-	if rest, ok := strings.CutPrefix(member, "rpca_"); ok {
-		if head, ok := strings.CutSuffix(rest, "_"+serverID); ok {
-			add(head)
-		}
+	if head, ok := portal.AutomaticMemberHead(member, serverID); ok {
+		add(head)
 	}
 	return heads
 }

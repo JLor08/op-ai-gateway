@@ -124,7 +124,8 @@ func (s *Service) resolveClusterNetwork(ctx context.Context, head routing.Runtim
 // unauthenticated RPC port to the whole mesh unless the catch-all policy is
 // off and the managed policies are the only grants. Every enabled head
 // counts, also one withheld right now: it is pushed again as soon as its
-// reason goes away.
+// reason goes away -- except one whose members all run on the head's server,
+// on loopback, which exposes no port to the mesh.
 func (s *Service) directMeshClusterExists(ctx context.Context) (bool, error) {
 	servers, err := s.routes.AIServers(ctx)
 	if err != nil {
@@ -135,14 +136,16 @@ func (s *Service) directMeshClusterExists(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return slices.ContainsFunc(clusters, func(c rpcCluster) bool {
-		return c.network == clusterNetworkMesh && c.transport == rpcTransportDirect
+		return c.network == clusterNetworkMesh && c.transport == rpcTransportDirect &&
+			slices.ContainsFunc(c.members, func(m routing.ClusterMember) bool { return !sameHostMember(c.headServer.ID, m) })
 	}), nil
 }
 
 // desiredRPCRules groups the grants every mesh cluster needs by member server.
 // Only a cluster the runtime documents carry gets grants: one withheld --
 // a member that withdrew its consent or turned RPC membership off, a missing
-// binary -- runs nowhere, and its member's port stays closed. A member needs
+// binary -- runs nowhere, and its member's port stays closed. A member on the
+// head's own server is dialed on loopback and gets none. A member needs
 // a tracking group on both ends and an allocated port; the grants are
 // deduplicated (several heads of one server may dial one port) and sorted so
 // the desired policy is stable.
@@ -153,6 +156,9 @@ func desiredRPCRules(clusters []rpcCluster) map[string][]rpcRule {
 			continue
 		}
 		for _, m := range c.members {
+			if sameHostMember(c.headServer.ID, m) {
+				continue // dialed on loopback, never through NetBird
+			}
 			member, ok := c.servers[m.ServerID]
 			if !ok || !serverHasGroup(member) || m.Port <= 0 || m.Port > 65535 {
 				continue

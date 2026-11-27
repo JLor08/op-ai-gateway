@@ -250,3 +250,68 @@ func TestManualMemberGPUChangeEndsTheRun(t *testing.T) {
 		t.Fatalf("member A = %+v %+v, want stale with its values kept and no run peak", rows[a.ID], gpus[a.ID])
 	}
 }
+
+// TestMemberAgentSpecIDStableForSingleMemberPerServer: the only member of a
+// head on a server keeps the id it had before several members per server
+// existed, whatever its position, so an existing cluster's members do not
+// relaunch.
+func TestMemberAgentSpecIDStableForSingleMemberPerServer(t *testing.T) {
+	m := routing.ClusterMember{HeadSpecID: "rts_h", ServerID: "srv_a", Position: 3}
+	if got := MemberAgentSpecID(m, []routing.ClusterMember{m}); got != "rpca_rts_h_srv_a" {
+		t.Fatalf("id = %q, want rpca_rts_h_srv_a", got)
+	}
+	// Members of the head on other servers, and of other heads on this
+	// server, do not count.
+	others := []routing.ClusterMember{
+		{HeadSpecID: "rts_h", ServerID: "srv_b", Position: 0},
+		{HeadSpecID: "rts_other", ServerID: "srv_a", Position: 0},
+		m,
+	}
+	if got := MemberAgentSpecID(m, others); got != "rpca_rts_h_srv_a" {
+		t.Fatalf("id among other members = %q, want rpca_rts_h_srv_a", got)
+	}
+}
+
+// TestMemberAgentSpecIDSecondMemberOnServer: the second automatic member of a
+// head on one server gets an _m2 suffix; a manual member there neither takes
+// a number nor shifts the automatic ones.
+func TestMemberAgentSpecIDSecondMemberOnServer(t *testing.T) {
+	first := routing.ClusterMember{HeadSpecID: "rts_h", ServerID: "srv_a", Position: 0}
+	manual := routing.ClusterMember{HeadSpecID: "rts_h", ServerID: "srv_a", Position: 1, MemberSpecID: "rpcm_x"}
+	second := routing.ClusterMember{HeadSpecID: "rts_h", ServerID: "srv_a", Position: 2}
+	members := []routing.ClusterMember{first, manual, second}
+	if got := MemberAgentSpecID(first, members); got != "rpca_rts_h_srv_a" {
+		t.Fatalf("first id = %q, want rpca_rts_h_srv_a", got)
+	}
+	if got := MemberAgentSpecID(second, members); got != "rpca_rts_h_srv_a_m2" {
+		t.Fatalf("second id = %q, want rpca_rts_h_srv_a_m2", got)
+	}
+	if got := MemberAgentSpecID(manual, members); got != "rpcm_x" {
+		t.Fatalf("manual id = %q, want rpcm_x", got)
+	}
+	if got := automaticMemberAgentSpecID("rts_h", "srv_a", 3); got != "rpca_rts_h_srv_a_m3" {
+		t.Fatalf("third id = %q, want rpca_rts_h_srv_a_m3", got)
+	}
+}
+
+// TestAutomaticMemberHead reads the head back from an automatic member's id,
+// numbered or not, and nothing from any other id.
+func TestAutomaticMemberHead(t *testing.T) {
+	for _, tc := range []struct {
+		id, head string
+		ok       bool
+	}{
+		{"rpca_rts_h_srv_a", "rts_h", true},
+		{"rpca_rts_h_srv_a_m2", "rts_h", true},
+		{"rpca_rts_h_srv_a_m12", "rts_h", true},
+		{"rpca_rts_h_srv_a_m", "", false},
+		{"rpca_rts_h_srv_a_mx", "", false},
+		{"rpca_rts_h_srv_b", "", false},
+		{"rpcm_x", "", false},
+	} {
+		head, ok := AutomaticMemberHead(tc.id, "srv_a")
+		if head != tc.head || ok != tc.ok {
+			t.Errorf("AutomaticMemberHead(%q) = %q, %v, want %q, %v", tc.id, head, ok, tc.head, tc.ok)
+		}
+	}
+}

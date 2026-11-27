@@ -205,7 +205,7 @@ func (u *clusterUsage) observe(ctx context.Context, serverID, legacyVendor strin
 	}
 	held := make(map[string]bool, len(memberships))
 	for _, m := range memberships {
-		row, ok := u.heldRow(ctx, serverID, m, byID)
+		row, ok := u.heldRow(ctx, serverID, m, memberships, byID)
 		held[m.HeadSpecID] = ok
 		if ok {
 			u.raise(ctx, m, row, legacyVendor)
@@ -235,13 +235,15 @@ func (u *clusterUsage) relevant(serverID string, rows []RuntimeStatusDTO) bool {
 }
 
 // heldRow returns m's row in the frame of serverID and whether it counts: the
-// row reports the hold of m's head, and serverID owns the member. An
+// row reports the hold of m's head, and serverID owns the member. m's agent
+// spec id is numbered among memberships, serverID's membership rows, which
+// hold every member of m's head on serverID (portal.MemberAgentSpecID). An
 // automatic member is serverID's by its membership row (the reverse index
 // read it for serverID) and its agent spec id, which names the server; a
 // manual member must also be a spec of serverID's own, since the membership
 // row only records where the spec was when it was chosen.
-func (u *clusterUsage) heldRow(ctx context.Context, serverID string, m routing.ClusterMember, rows map[string]RuntimeStatusDTO) (RuntimeStatusDTO, bool) {
-	row, ok := rows[portal.MemberAgentSpecID(m)]
+func (u *clusterUsage) heldRow(ctx context.Context, serverID string, m routing.ClusterMember, memberships []routing.ClusterMember, rows map[string]RuntimeStatusDTO) (RuntimeStatusDTO, bool) {
+	row, ok := rows[portal.MemberAgentSpecID(m, memberships)]
 	if !ok || row.RPC == nil || row.RPC.HeldBy != m.HeadSpecID {
 		return row, false
 	}

@@ -103,14 +103,16 @@ func (s *Service) ClusterPlan(ctx context.Context, headSpecID string) (ClusterPl
 }
 
 // clusterPlanMember is the plan entry of one membership row of a derivable
-// cluster d, or the reason it can no longer be planned: its member spec is
-// not in the derivation or its server is gone (member missing), or the
-// server lost its server_agent application (member unmanaged).
+// cluster d, or the reason it can no longer be planned: the derivation has
+// no member at its position on its server or its server is gone (member
+// missing), or the server lost its server_agent application (member
+// unmanaged).
 func (s *Service) clusterPlanMember(ctx context.Context, row routing.ClusterMember, d clusterDerivation) (ClusterPlanMember, string, error) {
-	spec, ok := d.members[row.ServerID]
-	if !ok {
+	if row.Position < 0 || row.Position >= len(d.members) || d.members[row.Position].serverID != row.ServerID {
 		return ClusterPlanMember{}, ClusterWithheldMemberMissing, nil
 	}
+	derived := d.members[row.Position]
+	spec := derived.spec
 	srv, err := s.routes.AIServerByID(ctx, row.ServerID)
 	if err != nil {
 		if ignoreNotFound(err) == nil {
@@ -127,7 +129,7 @@ func (s *Service) clusterPlanMember(ctx context.Context, row routing.ClusterMemb
 	}
 	return ClusterPlanMember{
 		Position: row.Position, Server: srv, Application: app,
-		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds, Address: d.addresses[row.ServerID],
+		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds, Address: derived.address,
 	}, "", nil
 }
 

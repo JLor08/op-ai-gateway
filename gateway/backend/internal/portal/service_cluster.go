@@ -490,8 +490,10 @@ func (s *Service) checkClusterMembershipOrKeep(ctx context.Context, w clusterHea
 		return s.checkClusterMembership(ctx, w, plan)
 	}
 	// The acknowledgement is the head's own setting: withdrawing it from a
-	// direct lan cluster is refused like a missing one.
-	if plan.transport == rpcTransportDirect && plan.network == clusterNetworkLAN && !w.req.LANExposureAck {
+	// direct lan cluster is refused like a missing one -- unless every member
+	// runs on the head's server, on loopback, which exposes nothing.
+	if plan.transport == rpcTransportDirect && plan.network == clusterNetworkLAN && !w.req.LANExposureAck &&
+		entriesHaveRemoteMember(w.headServer.ID, w.entries) {
 		return ErrClusterLANAckRequired
 	}
 	return nil
@@ -1058,7 +1060,10 @@ func (s *Service) defaultRPCTransport(ctx context.Context, network string) (stri
 }
 
 // checkClusterNetwork is step 8 of validateClusterHead; it returns the
-// network and transport the write stores, defaults resolved.
+// network and transport the write stores, defaults resolved. A member on the
+// head's server runs on loopback (sameHostMember): it needs nothing of the
+// network, and a cluster whose members all do needs nothing of the head's
+// network or of the transport either.
 func (s *Service) checkClusterNetwork(ctx context.Context, headServer routing.AIServer, entries []clusterEntry, network, transport string, lanAck bool) (string, string, error) {
 	servers := []routing.AIServer{headServer}
 	for _, e := range entries {
@@ -1067,7 +1072,11 @@ func (s *Service) checkClusterNetwork(ctx context.Context, headServer routing.AI
 	if network == "" {
 		network = defaultClusterNetwork(servers)
 	}
+	remote := entriesHaveRemoteMember(headServer.ID, entries)
 	for _, srv := range servers {
+		if srv.ID == headServer.ID && !remote {
+			continue
+		}
 		if err := checkServerInNetwork(srv, network); err != nil {
 			return "", "", err
 		}
@@ -1078,10 +1087,19 @@ func (s *Service) checkClusterNetwork(ctx context.Context, headServer routing.AI
 			return "", "", err
 		}
 	}
+	if !remote {
+		return network, transport, nil
+	}
 	if err := s.checkClusterTransport(ctx, network, transport, lanAck); err != nil {
 		return "", "", err
 	}
 	return network, transport, nil
+}
+
+// entriesHaveRemoteMember reports whether a member of entries runs on another
+// server than the head's headServerID, i.e. is reached over the network.
+func entriesHaveRemoteMember(headServerID string, entries []clusterEntry) bool {
+	return slices.ContainsFunc(entries, func(e clusterEntry) bool { return e.req.ServerID != headServerID })
 }
 
 // checkServerInNetwork requires what network needs of one server: NetBird
