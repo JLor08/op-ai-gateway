@@ -839,18 +839,7 @@ func (s *LogStore) enforceTotalLocked(keep string, r *streamRing) {
 // newest record (the marker enforceTotalLocked keeps) never.
 func (s *LogStore) trimOldestLocked(protect *streamRing) {
 	for s.used > s.total {
-		var victim *streamRing
-		var victimAt time.Time
-		for _, l := range s.logs {
-			for _, r := range l.streams {
-				if len(r.recs) == 0 || (r == protect && len(r.recs) == 1) {
-					continue
-				}
-				if victim == nil || r.recs[0].at.Before(victimAt) {
-					victim, victimAt = r, r.recs[0].at
-				}
-			}
-		}
+		victim := s.oldestRingLocked(protect)
 		if victim == nil {
 			return
 		}
@@ -865,6 +854,26 @@ func (s *LogStore) trimOldestLocked(protect *streamRing) {
 			return // cannot happen; a guard against looping forever
 		}
 	}
+}
+
+// oldestRingLocked is trimOldestLocked's victim search: the ring, store-wide,
+// whose oldest record is oldest, skipping empty rings and protect while its
+// only record is the one it protects; nil when no ring is left. The caller
+// holds s.mu.
+func (s *LogStore) oldestRingLocked(protect *streamRing) *streamRing {
+	var victim *streamRing
+	var victimAt time.Time
+	for _, l := range s.logs {
+		for _, r := range l.streams {
+			if len(r.recs) == 0 || (r == protect && len(r.recs) == 1) {
+				continue
+			}
+			if victim == nil || r.recs[0].at.Before(victimAt) {
+				victim, victimAt = r, r.recs[0].at
+			}
+		}
+	}
+	return victim
 }
 
 // evictLocked enforces the TOTAL ceiling by dropping whole spec histories --

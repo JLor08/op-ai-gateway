@@ -95,26 +95,8 @@ func (st *maskCarry) empty() bool { return len(st.pending) == 0 && !st.open }
 func newSecretMasker(ex expandedSpec) *secretMasker {
 	seen := make(map[string]bool)
 	var pairs []maskPair
-	collect := func(strs []string, spans [][]secretSpan) {
-		for i, ss := range spans {
-			if i >= len(strs) {
-				break
-			}
-			for _, sp := range ss {
-				if sp.start < 0 || sp.end > len(strs[i]) || sp.end-sp.start < minMaskedSecretLen {
-					continue
-				}
-				v := strs[i][sp.start:sp.end]
-				if seen[v] {
-					continue
-				}
-				seen[v] = true
-				pairs = append(pairs, maskPair{value: v, mask: sp.mask})
-			}
-		}
-	}
-	collect(ex.args, ex.argSpans)
-	collect(ex.env, ex.envSpans)
+	pairs = collectMaskPairs(pairs, seen, ex.args, ex.argSpans)
+	pairs = collectMaskPairs(pairs, seen, ex.env, ex.envSpans)
 	if len(pairs) == 0 {
 		return nil
 	}
@@ -124,6 +106,31 @@ func newSecretMasker(ex expandedSpec) *secretMasker {
 		m.first[p.value[0]] = true
 	}
 	return m
+}
+
+// collectMaskPairs is newSecretMasker's walk over one string list (args or
+// env) and its spans: it appends to pairs every span value of at least
+// minMaskedSecretLen bytes not yet in seen, in span order, and records it in
+// seen. Spans past the end of strs, and spans that do not fit their string,
+// are ignored rather than trusted.
+func collectMaskPairs(pairs []maskPair, seen map[string]bool, strs []string, spans [][]secretSpan) []maskPair {
+	for i, ss := range spans {
+		if i >= len(strs) {
+			break
+		}
+		for _, sp := range ss {
+			if sp.start < 0 || sp.end > len(strs[i]) || sp.end-sp.start < minMaskedSecretLen {
+				continue
+			}
+			v := strs[i][sp.start:sp.end]
+			if seen[v] {
+				continue
+			}
+			seen[v] = true
+			pairs = append(pairs, maskPair{value: v, mask: sp.mask})
+		}
+	}
+	return pairs
 }
 
 // mask returns st's pending bytes followed by b, with every secret value
@@ -160,62 +167,110 @@ func (m *secretMasker) mask(st *maskCarry, b []byte, final bool) string {
 	if m == nil {
 		return string(b)
 	}
-	joined := b
-	if len(st.pending) > 0 {
-		joined = make([]byte, 0, len(st.pending)+len(b))
-		joined = append(joined, st.pending...)
-		joined = append(joined, b...)
-	}
-	n := len(joined)
-	var sb strings.Builder
-	sb.Grow(n)
-	open, end := st.open, st.end
-	plain := 0 // the first byte not yet written; meaningful while no span is open
-	for i := 0; i < n; i++ {
-		if open && i > end {
-			open, plain = false, end
-		}
-		if !m.first[joined[i]] {
+	s := maskScan{joined: joinPending(st.pending, b), open: st.open, end: st.end}
+	s.sb.Grow(len(s.joined))
+	for i := 0; i < len(s.joined); i++ {
+		s.closeBefore(i)
+		if !m.first[s.joined[i]] {
 			continue
 		}
-		if !final && m.couldBegin(joined[i:]) {
-			if open {
-				*st = maskCarry{pending: bytes.Clone(joined[i:]), open: true, end: end - i}
-				return sb.String()
-			}
-			c := i
-			for c > plain && i-c < utf8.UTFMax-1 && !utf8.RuneStart(joined[c]) {
-				c--
-			}
-			sb.Write(joined[plain:c])
-			*st = maskCarry{pending: bytes.Clone(joined[c:])}
-			return sb.String()
+		if !final && m.couldBegin(s.joined[i:]) {
+			*st = s.holdBack(i)
+			return s.sb.String()
 		}
-		k := m.longestAt(joined[i:])
-		if k < 0 {
-			continue
-		}
-		if e := i + len(m.pairs[k].value); open {
-			end = max(end, e)
-		} else {
-			sb.Write(joined[plain:i])
-			sb.WriteString(m.pairs[k].mask)
-			open, end = true, e
+		if k := m.longestAt(s.joined[i:]); k >= 0 {
+			s.match(i, m.pairs[k])
 		}
 	}
-	if open && n > end {
-		open, plain = false, end
+	*st = s.finish(final)
+	return s.sb.String()
+}
+
+// joinPending returns pending followed by b: b itself when nothing is
+// pending, otherwise a new slice (never aliasing pending, which the caller
+// replaces).
+func joinPending(pending, b []byte) []byte {
+	if len(pending) == 0 {
+		return b
 	}
-	if !open {
-		sb.Write(joined[plain:])
+	joined := make([]byte, 0, len(pending)+len(b))
+	joined = append(joined, pending...)
+	return append(joined, b...)
+}
+
+// maskScan is the state of one mask call's scan over joined (st's pending
+// bytes followed by the new write). open and end describe the masked span the
+// scan is in: its placeholder is already in sb, and joined[:end] is inside it.
+// plain is the first byte not yet written to sb; it is meaningful only while
+// no span is open. A maskScan lives on mask's stack and touches nothing but
+// its own fields, so its methods need no lock; the maskCarry they return is
+// stored by mask, under the caller's lock.
+type maskScan struct {
+	joined []byte
+	sb     strings.Builder
+	open   bool
+	end    int
+	plain  int
+}
+
+// closeBefore closes the open span when position i lies past its end: the
+// bytes from its end onwards are plain again. At i == end the span stays
+// open, so a secret beginning right there still joins it.
+func (s *maskScan) closeBefore(i int) {
+	if s.open && i > s.end {
+		s.open, s.plain = false, s.end
 	}
-	*st = maskCarry{}
-	if open && !final {
+}
+
+// match takes the full match of p at position i: it extends the open span to
+// cover it, or writes the plain bytes before i and p's placeholder and opens a
+// span ending where p ends.
+func (s *maskScan) match(i int, p maskPair) {
+	e := i + len(p.value)
+	if s.open {
+		s.end = max(s.end, e)
+		return
+	}
+	s.sb.Write(s.joined[s.plain:i])
+	s.sb.WriteString(p.mask)
+	s.open, s.end = true, e
+}
+
+// holdBack ends a non-final scan at position i, where a secret could still
+// complete, and returns the carry for the next call. Inside an open span
+// nothing is written (the span's placeholder already was) and the carry keeps
+// the span open, with its end relative to the held bytes. Otherwise the plain
+// bytes before the hold-back are written, and a hold-back that would begin
+// inside a multi-byte UTF-8 character begins at that character instead (at
+// most utf8.UTFMax-1 bytes earlier, never before plain).
+func (s *maskScan) holdBack(i int) maskCarry {
+	if s.open {
+		return maskCarry{pending: bytes.Clone(s.joined[i:]), open: true, end: s.end - i}
+	}
+	c := i
+	for c > s.plain && i-c < utf8.UTFMax-1 && !utf8.RuneStart(s.joined[c]) {
+		c--
+	}
+	s.sb.Write(s.joined[s.plain:c])
+	return maskCarry{pending: bytes.Clone(s.joined[c:])}
+}
+
+// finish ends a scan that reached the end of joined and returns the carry for
+// the next call: the plain rest is written unless a span is still open. A span
+// open exactly to the end of the input stays open in the carry unless final:
+// a secret beginning with the next byte would still join it.
+func (s *maskScan) finish(final bool) maskCarry {
+	s.closeBefore(len(s.joined))
+	if !s.open {
+		s.sb.Write(s.joined[s.plain:])
+		return maskCarry{}
+	}
+	if !final {
 		// The input ended exactly at the open span's end: a secret beginning
 		// with the next byte would still join it.
-		*st = maskCarry{open: true}
+		return maskCarry{open: true}
 	}
-	return sb.String()
+	return maskCarry{}
 }
 
 // couldBegin reports whether rest is a proper prefix of some value longer

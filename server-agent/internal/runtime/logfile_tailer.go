@@ -285,16 +285,7 @@ func (t *fileTailer) run() {
 
 // poll is one step of the loop (see the file comment).
 func (t *fileTailer) poll() {
-	if t.stopping && !t.probesDone {
-		// EndGrace may have come before the Stop the loop saw first: the
-		// grace is then over before it began, and the post-Stop probe is
-		// not made (EndGrace's contract).
-		select {
-		case <-t.endGrace:
-			t.probesDone = true
-		default:
-		}
-	}
+	t.noteEndGraceBeforeProbe()
 	if t.probesDone {
 		t.drain()
 		return
@@ -318,26 +309,61 @@ func (t *fileTailer) poll() {
 	if t.f != nil {
 		t.read(&budget)
 	}
-	if t.ended || t.giveUp {
-		if nf != nil {
-			_ = nf.Close()
-		}
-		if !t.ended {
-			t.end(logEventFileNotPermitted)
-		}
+	if t.endAfterRead(nf) {
 		return
 	}
 	if nf == nil {
 		return
 	}
+	t.rotate(nf, &budget)
+}
+
+// noteEndGraceBeforeProbe is poll's first step: once stopping, and while the
+// post-Stop probe is still to be made, an EndGrace that has already come marks
+// the probes done without making it.
+func (t *fileTailer) noteEndGraceBeforeProbe() {
+	if t.stopping && !t.probesDone {
+		// EndGrace may have come before the Stop the loop saw first: the
+		// grace is then over before it began, and the post-Stop probe is
+		// not made (EndGrace's contract).
+		select {
+		case <-t.endGrace:
+			t.probesDone = true
+		default:
+		}
+	}
+}
+
+// endAfterRead is poll's step after the held handle was read: when the
+// tailer has ended or given up, the newly opened file nf (if any) is closed,
+// a give-up ends the tailer with file_not_permitted, and it reports true --
+// the poll is over. Otherwise it changes nothing and reports false.
+func (t *fileTailer) endAfterRead(nf *os.File) bool {
+	if !t.ended && !t.giveUp {
+		return false
+	}
+	if nf != nil {
+		_ = nf.Close()
+	}
+	if !t.ended {
+		t.end(logEventFileNotPermitted)
+	}
+	return true
+}
+
+// rotate is poll's last step: nf is a different file at the path than the
+// held one, which has been read up to this poll's budget. The held handle is
+// closed, file_rotated recorded, nf adopted from offset 0, and what is left
+// of *budget read from it.
+func (t *fileTailer) rotate(nf *os.File, budget *int) {
 	_ = t.f.Close()
 	t.f = nil
 	t.mark(logEventFileRotated)
 	if !t.adopt(nf, false) {
 		return
 	}
-	if budget > 0 {
-		t.read(&budget)
+	if *budget > 0 {
+		t.read(budget)
 	}
 }
 
@@ -501,55 +527,79 @@ func (t *fileTailer) feed(b []byte) {
 		return
 	}
 	for len(b) > 0 {
-		if t.resync {
-			i := indexNewline(b)
-			if i < 0 {
-				t.pendingGap += int64(len(b))
-				return
-			}
-			t.pendingGap += int64(i + 1)
-			b = b[i+1:]
-			t.resync = false
-			continue
+		switch {
+		case t.resync:
+			b = t.skipToNextLine(b)
+		case t.discarding:
+			b = t.discardRestOfLine(b)
+		default:
+			b = t.feedLine(b)
 		}
-		if t.discarding {
-			i := indexNewline(b)
-			if i < 0 {
-				return
-			}
-			b = b[i+1:]
-			t.discarding, t.lineLen = false, 0
-			continue
-		}
-		seg := b
-		nl := indexNewline(b)
-		if nl >= 0 {
-			seg = b[:nl+1]
-		}
-		content := len(seg)
-		if nl >= 0 {
-			content--
-		}
-		if t.lineLen+content > t.cfg.MaxLine {
-			keep := t.cfg.MaxLine - t.lineLen
-			t.sanitize(b[:keep])
-			t.writeOut()
-			// A cut the tailer makes: a secret straddling it must not be
-			// resolved in clear (file comment), so the carry is dropped.
-			t.pendingGap += int64(t.cfg.Log.DiscardCarry())
-			t.sanitize([]byte{'\n'}) // the inserted newline (file comment)
-			t.mark(logEventFileLineCut)
-			t.discarding = true
-			b = b[keep:]
-			continue
-		}
-		t.sanitize(seg)
-		t.lineLen += content
-		if nl >= 0 {
-			t.lineLen = 0
-		}
-		b = b[len(seg):]
 	}
+}
+
+// skipToNextLine is feed's step after a skip (t.resync): everything up to and
+// including the next \n is dropped and counted, and resync ends there. It
+// returns the rest of b; without a \n all of b is dropped and counted, and
+// resync continues into the next read.
+func (t *fileTailer) skipToNextLine(b []byte) []byte {
+	i := indexNewline(b)
+	if i < 0 {
+		t.pendingGap += int64(len(b))
+		return b[len(b):]
+	}
+	t.pendingGap += int64(i + 1)
+	t.resync = false
+	return b[i+1:]
+}
+
+// discardRestOfLine is feed's step after a line cut (t.discarding): the rest
+// of the cut line, up to and including its \n, is dropped (the line_cut
+// marker already told the reader), and the next line starts afresh. It
+// returns the rest of b; without a \n all of b is dropped and discarding
+// continues into the next read.
+func (t *fileTailer) discardRestOfLine(b []byte) []byte {
+	i := indexNewline(b)
+	if i < 0 {
+		return b[len(b):]
+	}
+	t.discarding, t.lineLen = false, 0
+	return b[i+1:]
+}
+
+// feedLine is feed's ordinary step: it sanitises b up to and including its
+// first \n (all of b without one) and returns the rest. A line whose content
+// would grow past cfg.MaxLine is cut there instead: its first part is
+// written, the masking carry dropped and counted, a newline inserted,
+// file_line_cut recorded, and the rest of the line discarded.
+func (t *fileTailer) feedLine(b []byte) []byte {
+	seg := b
+	nl := indexNewline(b)
+	if nl >= 0 {
+		seg = b[:nl+1]
+	}
+	content := len(seg)
+	if nl >= 0 {
+		content--
+	}
+	if t.lineLen+content > t.cfg.MaxLine {
+		keep := t.cfg.MaxLine - t.lineLen
+		t.sanitize(b[:keep])
+		t.writeOut()
+		// A cut the tailer makes: a secret straddling it must not be
+		// resolved in clear (file comment), so the carry is dropped.
+		t.pendingGap += int64(t.cfg.Log.DiscardCarry())
+		t.sanitize([]byte{'\n'}) // the inserted newline (file comment)
+		t.mark(logEventFileLineCut)
+		t.discarding = true
+		return b[keep:]
+	}
+	t.sanitize(seg)
+	t.lineLen += content
+	if nl >= 0 {
+		t.lineLen = 0
+	}
+	return b[len(seg):]
 }
 
 func indexNewline(b []byte) int {
@@ -628,11 +678,7 @@ func (t *fileTailer) sanitize(b []byte) {
 	for i := 0; i < len(data); {
 		c := data[i]
 		if c < utf8.RuneSelf {
-			if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7f {
-				t.out = append(t.out, '\\', 'x', hexDigits[c>>4], hexDigits[c&0xf])
-			} else {
-				t.out = append(t.out, c)
-			}
+			t.out = appendSafeASCII(t.out, c)
 			i++
 			continue
 		}
@@ -648,6 +694,16 @@ func (t *fileTailer) sanitize(b []byte) {
 		}
 		i += size
 	}
+}
+
+// appendSafeASCII appends the ASCII byte c to out as safe text: \t, \n, \r
+// and every printable byte as they are, any other C0 control byte and DEL as
+// a \xNN escape (lower-case hex).
+func appendSafeASCII(out []byte, c byte) []byte {
+	if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c == 0x7f {
+		return append(out, '\\', 'x', hexDigits[c>>4], hexDigits[c&0xf])
+	}
+	return append(out, c)
 }
 
 // writeOut writes the sanitised text gathered so far, after the dropped

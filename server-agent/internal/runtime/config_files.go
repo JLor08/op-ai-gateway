@@ -134,24 +134,37 @@ func expandNonSecretText(text string, what nonSecretSurface, spec Spec, port int
 			continue
 		}
 
-		// The two secret tokens. Exact-match ${API_TOKEN}; for the agent
-		// environment ANY ${AGENT_ENV...} spelling is refused (valid, empty-name
-		// or typo'd), because the only safe thing to do with a reference to a
-		// secret source here is not to guess what was meant.
-		if inner == "API_TOKEN" {
-			return "", fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, false))
-		}
-		upper := strings.ToUpper(inner)
-		if strings.HasPrefix(upper, "AGENT_ENV") {
-			return "", fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, true))
-		}
-		if strings.HasPrefix(upper, "PORT") {
-			return "", fmt.Errorf("malformed placeholder %s looks like a PORT reference but does not match the expected syntax", match)
+		if err := refuseUnresolvedToken(match, inner, what); err != nil {
+			return "", err
 		}
 		b.WriteString(match)
 	}
 	b.WriteString(text[copied:])
 	return b.String(), nil
+}
+
+// refuseUnresolvedToken is expandNonSecretText's verdict on a placeholder
+// (match, with inner its text between "${" and "}") that
+// resolveNonSecretToken did not handle: an error for a secret token or a
+// malformed ${PORT...}, nil for a "${...}" that passes through literally. The
+// checks run in this order: ${API_TOKEN}, every ${AGENT_ENV...} spelling,
+// then the PORT near miss.
+func refuseUnresolvedToken(match, inner string, what nonSecretSurface) error {
+	// The two secret tokens. Exact-match ${API_TOKEN}; for the agent
+	// environment ANY ${AGENT_ENV...} spelling is refused (valid, empty-name
+	// or typo'd), because the only safe thing to do with a reference to a
+	// secret source here is not to guess what was meant.
+	if inner == "API_TOKEN" {
+		return fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, false))
+	}
+	upper := strings.ToUpper(inner)
+	if strings.HasPrefix(upper, "AGENT_ENV") {
+		return fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, true))
+	}
+	if strings.HasPrefix(upper, "PORT") {
+		return fmt.Errorf("malformed placeholder %s looks like a PORT reference but does not match the expected syntax", match)
+	}
+	return nil
 }
 
 // secretTokenRefusalReason is the "why" of a secret-token refusal on surface

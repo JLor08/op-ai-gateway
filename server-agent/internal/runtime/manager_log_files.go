@@ -77,7 +77,21 @@ const logFileTailBytes = 2048
 // once the exec has succeeded (startLogFileTailers), so a start whose exec
 // fails records no file_not_permitted for them.
 func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (targets []logFileTarget, refused []string, stale map[string]bool) {
-	configDir := ""
+	targets, refused, configDir := resolveSpecLogFiles(spec, pol, port, vendor, vendors, configFilesDir)
+	if configDir != "" {
+		if err := ensureInstanceConfigDir(configDir); err != nil {
+			slog.Warn("runtime: cannot create the spec's config dir for its log file", "spec", spec.ID, "error", err)
+		}
+	}
+	return targets, refused, removeConfigDirLogFiles(spec, targets)
+}
+
+// resolveSpecLogFiles is prepareLogFiles' first pass, in declaration order:
+// each declaration the path policy accepts and that names none of the spec's
+// config_files becomes a target, every other name is refused. configDir is
+// the instance's ${CONFIG_DIR} when some target lies directly in it, else "".
+// It touches no file.
+func resolveSpecLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (targets []logFileTarget, refused []string, configDir string) {
 	for _, lf := range spec.LogFiles {
 		target, err := pol.resolveLogFile(spec, lf, port, vendor, vendors, configFilesDir)
 		if err != nil {
@@ -94,11 +108,14 @@ func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, ven
 			configDir = target.ConfigDir
 		}
 	}
-	if configDir != "" {
-		if err := ensureInstanceConfigDir(configDir); err != nil {
-			slog.Warn("runtime: cannot create the spec's config dir for its log file", "spec", spec.ID, "error", err)
-		}
-	}
+	return targets, refused, configDir
+}
+
+// removeConfigDirLogFiles is prepareLogFiles' last pass, after the instance
+// config dir was ensured: it removes the earlier file of every target directly
+// in ${CONFIG_DIR}, in target order, and returns the names whose removal
+// failed (nil when none did) -- their tailers start at the file's end.
+func removeConfigDirLogFiles(spec Spec, targets []logFileTarget) (stale map[string]bool) {
 	for _, target := range targets {
 		if !target.InConfigDir {
 			continue
@@ -111,7 +128,7 @@ func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, ven
 			stale[target.Name] = true
 		}
 	}
-	return targets, refused, stale
+	return stale
 }
 
 // endPredecessorGraces ends the grace of every earlier generation's tailer of
@@ -270,7 +287,11 @@ type cmdLogFileTails struct {
 	tails []LogFileTail
 }
 
-func (cmdLogFileTails) isCommand() {}
+// isCommand marks cmdLogFileTails as an owner command; the marker has no
+// body.
+func (cmdLogFileTails) isCommand() {
+	// Intentionally empty: it only places cmdLogFileTails in the command set.
+}
 
 // handleLogFileTails attaches the tails to the instance's last_error only if
 // it is still the very one the exit recorded (pointer identity): every later

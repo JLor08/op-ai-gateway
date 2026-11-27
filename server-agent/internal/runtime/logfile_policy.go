@@ -161,17 +161,7 @@ func (r logFileResolution) resolveNative(roots []string) (logFileTarget, error) 
 	if underPseudoFS(c) {
 		return logFileTarget{}, r.refuse("lies under a kernel pseudo filesystem (proc, sys or dev), which is never tailed")
 	}
-	matched := ""
-	if r.instOK && strictlyWithinDir(c, r.inst) {
-		matched = r.inst
-	} else {
-		for _, root := range roots {
-			if strictlyWithinDir(c, root) {
-				matched = root
-				break
-			}
-		}
-	}
+	matched := r.matchRoot(c, roots)
 	if matched == "" {
 		return logFileTarget{}, r.refuse(fmt.Sprintf("lies outside the spec's ${CONFIG_DIR} and every entry of %s; the list holds %d native entries", logFileSettingNames, r.nativeEntries))
 	}
@@ -190,6 +180,22 @@ func (r logFileResolution) resolveNative(roots []string) (logFileTarget, error) 
 	return r.target(c, matched, rel, r.withInst(roots)), nil
 }
 
+// matchRoot returns the allowed root the cleaned native path c lies strictly
+// inside: the instance config dir when there is one and c is in it, otherwise
+// the first of roots that contains c, in their configured order; "" when none
+// does.
+func (r logFileResolution) matchRoot(c string, roots []string) string {
+	if r.instOK && strictlyWithinDir(c, r.inst) {
+		return r.inst
+	}
+	for _, root := range roots {
+		if strictlyWithinDir(c, root) {
+			return root
+		}
+	}
+	return ""
+}
+
 func (r logFileResolution) resolveWSL(configFilesDir string, winRoots []string, distroEntries int) (logFileTarget, error) {
 	// A backslash or a colon means different things on the two sides of the
 	// boundary (wslPathToWindows' doc), so neither is mapped.
@@ -198,37 +204,66 @@ func (r logFileResolution) resolveWSL(configFilesDir string, winRoots []string, 
 	}
 	c := path.Clean(r.expanded)
 	all := r.withInst(winRoots)
-	if r.instOK {
-		if dir, err := windowsPathToWSL(configFilesDir); err == nil {
-			wslInst := path.Join(dir, r.spec.ID)
-			if rel, ok := strings.CutPrefix(c, wslInst+"/"); ok && wslInst != path.Clean(dir) {
-				// The file lives on the Windows side, so Windows naming rules
-				// apply on every GOOS.
-				if windowsNameRefused(rel) {
-					return logFileTarget{}, r.refuse(windowsNameReason)
-				}
-				open := filepath.Join(r.inst, filepath.FromSlash(rel))
-				// Re-asserted on the native path rather than assumed, as the last
-				// line of defence for the containment property.
-				if !strictlyWithinDir(open, r.inst) {
-					return logFileTarget{}, r.refuse(fmt.Sprintf("does not map into the spec's ${CONFIG_DIR}; %s does not apply to it", logFileSettingNames))
-				}
-				return r.target(open, r.inst, filepath.FromSlash(rel), all), nil
-			}
-		}
+	if t, ok, err := r.resolveWSLConfigDir(configFilesDir, c, all); ok {
+		return t, err
 	}
 	if win, ok := wslPathToWindows(c); ok {
-		for _, root := range winRoots {
-			if rel, ok := relWithinWindowsDir(win, root); ok {
-				if windowsNameRefused(rel) {
-					return logFileTarget{}, r.refuse(windowsNameReason)
-				}
-				return r.target(win, root, filepath.FromSlash(rel), all), nil
-			}
-		}
-		return logFileTarget{}, r.refuse(fmt.Sprintf("is a /mnt/<drive> path outside the spec's ${CONFIG_DIR} and every native entry of %s; the list holds %d native entries", logFileSettingNames, r.nativeEntries))
+		return r.resolveWSLDrive(win, winRoots, all)
 	}
 	return logFileTarget{}, r.refuse(fmt.Sprintf("is a path inside the wsl distro; only ${CONFIG_DIR} and /mnt/<drive> paths of a wsl spec are tailed in this version, even under a wsl:// entry of %s (%d wsl:// entries name this distro)", logFileSettingNames, distroEntries))
+}
+
+// resolveWSLConfigDir is resolveWSL's first branch: the cleaned distro path c
+// inside ${CONFIG_DIR} as the distro sees it (windowsPathToWSL of
+// configFilesDir, joined with spec.ID), mapped back to the native instance
+// directory. ok is false -- and nothing is decided or logged -- when the spec
+// has no instance config dir, configFilesDir has no distro form, the instance
+// dir would be the distro base itself, or c does not lie below it; resolveWSL
+// then tries its other branches. With ok true the result is final: the
+// accepted target, or a refusal (Windows naming rules, which apply on every
+// GOOS because the file lives on the Windows side, or the re-asserted native
+// containment).
+func (r logFileResolution) resolveWSLConfigDir(configFilesDir, c string, all []string) (t logFileTarget, ok bool, err error) {
+	if !r.instOK {
+		return logFileTarget{}, false, nil
+	}
+	dir, derr := windowsPathToWSL(configFilesDir)
+	if derr != nil {
+		return logFileTarget{}, false, nil
+	}
+	wslInst := path.Join(dir, r.spec.ID)
+	rel, below := strings.CutPrefix(c, wslInst+"/")
+	if !below || wslInst == path.Clean(dir) {
+		return logFileTarget{}, false, nil
+	}
+	// The file lives on the Windows side, so Windows naming rules
+	// apply on every GOOS.
+	if windowsNameRefused(rel) {
+		return logFileTarget{}, true, r.refuse(windowsNameReason)
+	}
+	open := filepath.Join(r.inst, filepath.FromSlash(rel))
+	// Re-asserted on the native path rather than assumed, as the last
+	// line of defence for the containment property.
+	if !strictlyWithinDir(open, r.inst) {
+		return logFileTarget{}, true, r.refuse(fmt.Sprintf("does not map into the spec's ${CONFIG_DIR}; %s does not apply to it", logFileSettingNames))
+	}
+	return r.target(open, r.inst, filepath.FromSlash(rel), all), true, nil
+}
+
+// resolveWSLDrive is resolveWSL's /mnt/<drive> branch: win is the Windows
+// path the distro path maps to, checked against the NATIVE entries (winRoots,
+// in their configured order), because the file lives there. Windows naming
+// rules apply below the matched root.
+func (r logFileResolution) resolveWSLDrive(win string, winRoots, all []string) (logFileTarget, error) {
+	for _, root := range winRoots {
+		if rel, ok := relWithinWindowsDir(win, root); ok {
+			if windowsNameRefused(rel) {
+				return logFileTarget{}, r.refuse(windowsNameReason)
+			}
+			return r.target(win, root, filepath.FromSlash(rel), all), nil
+		}
+	}
+	return logFileTarget{}, r.refuse(fmt.Sprintf("is a /mnt/<drive> path outside the spec's ${CONFIG_DIR} and every native entry of %s; the list holds %d native entries", logFileSettingNames, r.nativeEntries))
 }
 
 // target builds the accepted target for the agent-side path openPath, which
