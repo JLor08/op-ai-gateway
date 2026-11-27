@@ -163,14 +163,14 @@ func TestMemberCacheDirPerHead(t *testing.T) {
 
 func TestHeadGetsNoComm(t *testing.T) {
 	spec := clusterHeadSpec()
-	_, env, err := ExpandPlaceholders(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, "")
+	_, env, err := ExpandPlaceholders(spec, 1, GPUTopology{}, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(env, "GGML_RPC_NO_COMM=1") {
 		t.Fatalf("env = %v, want GGML_RPC_NO_COMM=1 on a head", env)
 	}
-	_, env, _ = ExpandPlaceholders(Spec{}, 1, GPUVendorNone, nil, func(string) string { return "" }, "")
+	_, env, _ = ExpandPlaceholders(Spec{}, 1, GPUTopology{}, func(string) string { return "" }, "")
 	if slices.Contains(env, "GGML_RPC_NO_COMM=1") {
 		t.Fatalf("env = %v, a plain model spec must not get GGML_RPC_NO_COMM", env)
 	}

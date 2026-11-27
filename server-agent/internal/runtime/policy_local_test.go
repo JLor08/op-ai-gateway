@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -468,7 +469,7 @@ func TestExpandPlaceholdersPort(t *testing.T) {
 	}
 	getenv := func(string) string { return "" }
 
-	args, _, err := ExpandPlaceholders(spec, 41123, GPUVendorNVIDIA, nil, getenv, "")
+	args, _, err := ExpandPlaceholders(spec, 41123, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -499,7 +500,7 @@ func TestExpandPlaceholdersConfigDir(t *testing.T) {
 		}
 		dir := filepath.Join(base, "spec-a")
 
-		args, env, err := ExpandPlaceholders(spec, 41123, GPUVendorNVIDIA, nil, getenv, base)
+		args, env, err := ExpandPlaceholders(spec, 41123, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, base)
 		if err != nil {
 			t.Fatalf("ExpandPlaceholders: %v", err)
 		}
@@ -516,7 +517,7 @@ func TestExpandPlaceholdersConfigDir(t *testing.T) {
 	t.Run("different spec IDs yield different directories", func(t *testing.T) {
 		resolve := func(id string) string {
 			t.Helper()
-			args, _, err := ExpandPlaceholders(Spec{ID: id, Args: []string{"${CONFIG_DIR}"}}, 8080, GPUVendorNone, nil, getenv, base)
+			args, _, err := ExpandPlaceholders(Spec{ID: id, Args: []string{"${CONFIG_DIR}"}}, 8080, GPUTopology{}, getenv, base)
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders(%q): %v", id, err)
 			}
@@ -535,7 +536,7 @@ func TestExpandPlaceholdersConfigDir(t *testing.T) {
 		// Exact match only, like ${MODEL}: these are plausible tokens a model
 		// server expands itself, and a typo must not start refusing specs.
 		in := []string{"${CONFIG_DIRS}", "${CONFIG_DIR_X}", "${config_dir}", "${CONFIG_DIR }"}
-		args, _, err := ExpandPlaceholders(Spec{ID: "spec-a", Args: in}, 8080, GPUVendorNone, nil, getenv, base)
+		args, _, err := ExpandPlaceholders(Spec{ID: "spec-a", Args: in}, 8080, GPUTopology{}, getenv, base)
 		if err != nil {
 			t.Fatalf("ExpandPlaceholders: %v", err)
 		}
@@ -552,7 +553,7 @@ func TestExpandPlaceholdersConfigDir(t *testing.T) {
 		}
 		dir := filepath.Join(base, "spec-a")
 
-		ex, err := expandSpec(spec, 8080, GPUVendorNone, nil, getenv, base)
+		ex, err := expandSpec(spec, 8080, GPUTopology{}, getenv, base)
 		if err != nil {
 			t.Fatalf("expandSpec: %v", err)
 		}
@@ -599,7 +600,7 @@ func TestExpandPlaceholdersModel(t *testing.T) {
 		Env: map[string]string{"MODEL_TAG": "${MODEL}", "MIXED": "${MODEL}:${PORT}"},
 	}
 
-	args, env, err := ExpandPlaceholders(spec, 41123, GPUVendorNVIDIA, nil, func(string) string { return "" }, "")
+	args, env, err := ExpandPlaceholders(spec, 41123, GPUTopology{Legacy: GPUVendorNVIDIA}, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -653,7 +654,7 @@ func TestExpandPlaceholdersModelVariantsPassThroughLiterally(t *testing.T) {
 				Args:          []string{text},
 				Env:           map[string]string{"X": text},
 			}
-			args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, func(string) string { return "" }, "")
+			args, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, func(string) string { return "" }, "")
 			if err != nil {
 				t.Fatalf("%s should pass through untouched, not error: %v", text, err)
 			}
@@ -678,7 +679,7 @@ func TestExpandPlaceholdersModelEmptyUpstreamErrors(t *testing.T) {
 		{Model: "gpt-4o-mini", Args: []string{"--alias", "${MODEL}"}},
 		{Model: "gpt-4o-mini", Env: map[string]string{"TAG": "${MODEL}"}},
 	} {
-		_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, func(string) string { return "" }, "")
+		_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, func(string) string { return "" }, "")
 		if err == nil {
 			t.Fatalf("ExpandPlaceholders(%+v) with an empty UpstreamModel should refuse, not substitute an empty string", spec)
 		}
@@ -693,7 +694,7 @@ func TestExpandPlaceholdersModelEmptyUpstreamErrors(t *testing.T) {
 	// The refusal is scoped to specs that actually USE the placeholder: an
 	// empty upstream_model is not by itself a launch failure.
 	unused := Spec{Args: []string{"--port", "${PORT}"}, Env: map[string]string{"MODE": "solo"}}
-	if _, _, err := ExpandPlaceholders(unused, 8080, GPUVendorNVIDIA, nil, func(string) string { return "" }, ""); err != nil {
+	if _, _, err := ExpandPlaceholders(unused, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, func(string) string { return "" }, ""); err != nil {
 		t.Errorf("a spec that never mentions ${MODEL} must not be refused for an empty upstream_model: %v", err)
 	}
 }
@@ -713,7 +714,7 @@ func TestExpandPlaceholdersAgentEnvResolves(t *testing.T) {
 		return ""
 	}
 
-	args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	args, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -741,7 +742,7 @@ func TestExpandPlaceholdersAgentEnvRefusesOwnNamespace(t *testing.T) {
 		return ""
 	}
 
-	_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err == nil {
 		t.Fatal("ExpandPlaceholders with ${AGENT_ENV:OP_AGENT_TOKEN} should refuse, not resolve the agent's own token")
 	}
@@ -769,7 +770,7 @@ func TestExpandPlaceholdersAgentEnvRefusesOwnNamespaceViaEnv(t *testing.T) {
 		return ""
 	}
 
-	_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err == nil {
 		t.Fatal("ExpandPlaceholders with spec.Env referencing ${AGENT_ENV:OP_AGENT_TOKEN} should refuse, not resolve the agent's own token")
 	}
@@ -793,7 +794,7 @@ func TestExpandPlaceholdersAgentEnvOrdinaryNameStillResolves(t *testing.T) {
 		return ""
 	}
 
-	args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -810,7 +811,7 @@ func TestExpandPlaceholdersMissingAgentEnvErrors(t *testing.T) {
 	spec := Spec{Args: []string{"--hf-token", "${AGENT_ENV:HF_TOKEN}"}}
 	getenv := func(string) string { return "" }
 
-	_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err == nil {
 		t.Fatal("ExpandPlaceholders with an unset AGENT_ENV var should error")
 	}
@@ -830,7 +831,7 @@ func TestExpandPlaceholdersMissingAgentEnvErrorHasNoDoubledPrefix(t *testing.T) 
 	spec := Spec{Args: []string{"${AGENT_ENV:HF_TOKEN}"}}
 	getenv := func(string) string { return "" }
 
-	_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err == nil {
 		t.Fatal("ExpandPlaceholders with an unset AGENT_ENV var should error")
 	}
@@ -845,7 +846,7 @@ func TestExpandPlaceholdersMissingAgentEnvInEnvValueErrors(t *testing.T) {
 	spec := Spec{Env: map[string]string{"HF_TOKEN": "${AGENT_ENV:HF_TOKEN}"}}
 	getenv := func(string) string { return "" }
 
-	_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err == nil {
 		t.Fatal("ExpandPlaceholders with an unset AGENT_ENV var in spec.Env should error")
 	}
@@ -885,7 +886,7 @@ func TestExpandPlaceholdersChildEnvExactSet(t *testing.T) {
 	}
 	getenv := func(k string) string { return agentEnv[k] }
 
-	_, env, err := ExpandPlaceholders(spec, 9090, GPUVendorNVIDIA, nil, getenv, "")
+	_, env, err := ExpandPlaceholders(spec, 9090, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -928,7 +929,7 @@ func TestExpandPlaceholdersSpecEnvCannotOverridePathOrHome(t *testing.T) {
 	for _, key := range []string{"PATH", "HOME"} {
 		t.Run(key, func(t *testing.T) {
 			spec := Spec{Env: map[string]string{key: "/attacker-controlled"}}
-			_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err == nil {
 				t.Fatalf("ExpandPlaceholders with spec.Env[%q] set should refuse, not override the agent-provided base", key)
 			}
@@ -948,7 +949,7 @@ func TestExpandPlaceholdersSpecEnvCannotOverridePathOrHomeEvenWhenBaseAbsent(t *
 	spec := Spec{Env: map[string]string{"PATH": "/attacker-controlled"}}
 	getenv := func(string) string { return "" }
 
-	_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err == nil {
 		t.Fatal("ExpandPlaceholders with spec.Env[PATH] set should refuse even when the agent has no PATH of its own")
 	}
@@ -961,7 +962,7 @@ func TestExpandPlaceholdersOmitsAbsentBase(t *testing.T) {
 	spec := Spec{Env: map[string]string{"MODE": "solo"}}
 	getenv := func(string) string { return "" } // no PATH, no HOME
 
-	_, env, err := ExpandPlaceholders(spec, 1234, GPUVendorNVIDIA, nil, getenv, "")
+	_, env, err := ExpandPlaceholders(spec, 1234, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -1022,7 +1023,7 @@ func TestExpandPlaceholdersWindowsBaseEnvironment(t *testing.T) {
 	})
 
 	spec := Spec{Env: map[string]string{"MODE": "production"}}
-	_, env, err := ExpandPlaceholders(spec, 9090, GPUVendorNVIDIA, nil, getenv, "")
+	_, env, err := ExpandPlaceholders(spec, 9090, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -1081,7 +1082,7 @@ func TestExpandPlaceholdersPosixBaseEnvironmentUnchanged(t *testing.T) {
 	getenv := func(k string) string { return agentEnv[k] } // case-SENSITIVE, as on unix
 
 	spec := Spec{Env: map[string]string{"MODE": "production"}}
-	_, env, err := ExpandPlaceholders(spec, 9090, GPUVendorNVIDIA, nil, getenv, "")
+	_, env, err := ExpandPlaceholders(spec, 9090, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -1110,7 +1111,7 @@ func TestExpandPlaceholdersOmitsAbsentWindowsBase(t *testing.T) {
 		"USERPROFILE": `C:\Users\agent`,
 	})
 
-	_, env, err := ExpandPlaceholders(Spec{}, 1234, GPUVendorNVIDIA, nil, getenv, "")
+	_, env, err := ExpandPlaceholders(Spec{}, 1234, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -1154,7 +1155,7 @@ func TestExpandPlaceholdersNearMissErrors(t *testing.T) {
 			spec := Spec{Args: []string{tc.value}}
 			getenv := func(string) string { return "" }
 
-			_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err == nil {
 				t.Fatalf("ExpandPlaceholders(%q) should error as a malformed near-miss placeholder", tc.value)
 			}
@@ -1185,7 +1186,7 @@ func TestExpandPlaceholdersUnrelatedPlaceholderPassesThrough(t *testing.T) {
 			spec := Spec{Args: []string{value}}
 			getenv := func(string) string { return "" }
 
-			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders(%s) should pass through untouched, got error: %v", value, err)
 			}
@@ -1223,7 +1224,7 @@ func TestExpandPlaceholdersNearMissScanIgnoresResolvedSecretValue(t *testing.T) 
 		return ""
 	}
 
-	args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders should not error just because a RESOLVED secret value contains near-miss-shaped text: %v", err)
 	}
@@ -1257,7 +1258,7 @@ func envContainsExactly(env []string, want map[string]string) bool {
 // non-nil, matching the module-wide rule that any collection a caller might
 // range over or re-marshal must never be nil.
 func TestExpandPlaceholdersArgsNeverNil(t *testing.T) {
-	args, _, err := ExpandPlaceholders(Spec{}, 80, GPUVendorNVIDIA, nil, func(string) string { return "" }, "")
+	args, _, err := ExpandPlaceholders(Spec{}, 80, GPUTopology{Legacy: GPUVendorNVIDIA}, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -1279,7 +1280,7 @@ func TestExpandPlaceholdersEnvSortedDeterministic(t *testing.T) {
 
 	want := []string{"AKEY=a", "MKEY=m", "ZKEY=z"}
 	for i := 0; i < 5; i++ {
-		_, env, err := ExpandPlaceholders(spec, 80, GPUVendorNVIDIA, nil, getenv, "")
+		_, env, err := ExpandPlaceholders(spec, 80, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 		if err != nil {
 			t.Fatalf("ExpandPlaceholders: %v", err)
 		}
@@ -1333,7 +1334,7 @@ func TestExpandPlaceholdersAgentEnvRefusalIsCaseInsensitive(t *testing.T) {
 				{Args: []string{"--api-key", "${AGENT_ENV:" + name + "}"}},
 				{Env: map[string]string{"TOKEN": "${AGENT_ENV:" + name + "}"}},
 			} {
-				args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+				args, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 				if err == nil {
 					t.Fatalf("${AGENT_ENV:%s} resolved instead of being refused: args=%v env=%v", name, args, env)
 				}
@@ -1386,7 +1387,7 @@ func TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive(t *testing.T) {
 	} {
 		t.Run(key, func(t *testing.T) {
 			spec := Spec{Env: map[string]string{key: `C:\attacker\bin`}}
-			_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			_, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err == nil {
 				t.Fatalf("a spec env key %q was accepted; the child environment would be %v", key, env)
 			}
@@ -1399,7 +1400,7 @@ func TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive(t *testing.T) {
 	// The reservation is scoped to those names, not to anything that merely
 	// resembles them: a spec may still set its own PATH-adjacent variables.
 	spec := Spec{Env: map[string]string{"LD_LIBRARY_PATH": "/opt/cuda/lib64", "HOMEBREW_PREFIX": "/opt/homebrew", "PATHOLOGY": "x", "USERPROFILE_BACKUP": "x", "SYSTEMROOTS": "x"}}
-	if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, ""); err != nil {
+	if _, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, ""); err != nil {
 		t.Fatalf("ExpandPlaceholders refused a legitimate env key: %v", err)
 	}
 
@@ -1420,7 +1421,7 @@ func TestExpandPlaceholdersReservedEnvKeysAreCaseInsensitive(t *testing.T) {
 		"LLAMA_CACHE":    `D:\models\llama.cpp`,
 		"XDG_CACHE_HOME": "/mnt/models/.cache",
 	}}
-	if _, _, err := ExpandPlaceholders(lever, 8080, GPUVendorNVIDIA, nil, getenv, ""); err != nil {
+	if _, _, err := ExpandPlaceholders(lever, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, ""); err != nil {
 		t.Fatalf("ExpandPlaceholders refused a cache/home redirection an operator legitimately needs: %v", err)
 	}
 }
@@ -1539,7 +1540,7 @@ func TestExpandPlaceholdersSetsVisibleDevicesPerVendor(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run("vendor="+string(tc.vendor), func(t *testing.T) {
-			_, env, err := ExpandPlaceholders(visibleDevicesSpec(), 8080, tc.vendor, nil, getenv, "")
+			_, env, err := ExpandPlaceholders(visibleDevicesSpec(), 8080, GPUTopology{Legacy: tc.vendor}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders: %v", err)
 			}
@@ -1582,7 +1583,7 @@ func TestExpandPlaceholdersVisibleDevicesEmptyGPUListRefused(t *testing.T) {
 			t.Run(fmt.Sprintf("vendor=%s/gpus=%v", vendor, gpus), func(t *testing.T) {
 				spec := visibleDevicesSpec()
 				spec.GPUs = gpus
-				_, env, err := ExpandPlaceholders(spec, 8080, vendor, nil, getenv, "")
+				_, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: vendor}, getenv, "")
 				if err == nil {
 					t.Fatalf("set_visible_devices with no gpus was accepted; the child environment would be %v", env)
 				}
@@ -1621,7 +1622,7 @@ func TestExpandPlaceholdersVisibleDevicesConflictRefused(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/vendor=%s", key, vendor), func(t *testing.T) {
 				spec := visibleDevicesSpec()
 				spec.Env = map[string]string{key: "0,1"}
-				_, env, err := ExpandPlaceholders(spec, 8080, vendor, nil, getenv, "")
+				_, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: vendor}, getenv, "")
 				if err == nil {
 					t.Fatalf("set_visible_devices alongside a hand-set %s was accepted; the child environment would be %v", key, env)
 				}
@@ -1640,7 +1641,7 @@ func TestExpandPlaceholdersVisibleDevicesConflictRefused(t *testing.T) {
 			spec := visibleDevicesSpec()
 			spec.SetVisibleDevices = false
 			spec.Env = map[string]string{key: "0,1"}
-			_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			_, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err != nil {
 				t.Fatalf("a hand-set %s with the option OFF must still be accepted: %v", key, err)
 			}
@@ -1657,7 +1658,7 @@ func TestExpandPlaceholdersVisibleDevicesConflictRefused(t *testing.T) {
 	t.Run("ONEAPI_DEVICE_SELECTOR composes with the option", func(t *testing.T) {
 		spec := visibleDevicesSpec()
 		spec.Env = map[string]string{"ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}"}
-		_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+		_, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 		if err != nil {
 			t.Fatalf("ONEAPI_DEVICE_SELECTOR must compose with set_visible_devices, got: %v", err)
 		}
@@ -1698,7 +1699,7 @@ func TestExpandPlaceholdersVisibleDevicesOffIsUnchanged(t *testing.T) {
 			spec.SetVisibleDevices = false
 			spec.Env = map[string]string{"LLAMA_CACHE": "/mnt/models", "NCCL_DEBUG": "INFO"}
 
-			args, env, err := ExpandPlaceholders(spec, 41123, vendor, nil, getenv, "")
+			args, env, err := ExpandPlaceholders(spec, 41123, GPUTopology{Legacy: vendor}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders: %v", err)
 			}
@@ -1731,7 +1732,7 @@ func TestHostGPUIDsPreservesOrderAndDedups(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := hostGPUIDs(Spec{GPUs: tc.gpus}); got != tc.want {
+			if got := hostGPUIDs(specGPUKeys(Spec{GPUs: tc.gpus})); got != tc.want {
 				t.Errorf("hostGPUIDs(%v) = %q, want %q", tc.gpus, got, tc.want)
 			}
 		})
@@ -1766,7 +1767,7 @@ func TestExpandPlaceholdersHostGPUIDs(t *testing.T) {
 				Env:  map[string]string{"ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}"},
 				GPUs: tc.gpus,
 			}
-			args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+			args, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders: %v", err)
 			}
@@ -1784,13 +1785,13 @@ func TestExpandPlaceholdersHostGPUIDs(t *testing.T) {
 	// empty upstream_model -- refuse where the placeholder is USED.
 	t.Run("no gpus is a hard error", func(t *testing.T) {
 		spec := Spec{Env: map[string]string{"ONEAPI_DEVICE_SELECTOR": "level_zero:${HOST_GPU_IDS}"}}
-		if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, ""); err == nil {
+		if _, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{}, getenv, ""); err == nil {
 			t.Fatal("${HOST_GPU_IDS} on a spec with no gpus should refuse, not substitute an empty string")
 		}
 	})
 	t.Run("unused on a spec with no gpus is fine", func(t *testing.T) {
 		spec := Spec{Args: []string{"--port", "${PORT}"}}
-		if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, ""); err != nil {
+		if _, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{}, getenv, ""); err != nil {
 			t.Fatalf("a spec that never mentions ${HOST_GPU_IDS} must be unaffected by having no gpus: %v", err)
 		}
 	})
@@ -1805,7 +1806,7 @@ func TestExpandPlaceholdersHostGPUIDs(t *testing.T) {
 	} {
 		t.Run("passes through literally: "+value, func(t *testing.T) {
 			spec := Spec{Args: []string{value}, GPUs: []SpecGPU{{Index: 1}}}
-			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders(%s) should pass through untouched, got error: %v", value, err)
 			}
@@ -1833,7 +1834,7 @@ func TestExpandPlaceholdersHostGPUIDsAreHostIndices(t *testing.T) {
 		GPUs:              []SpecGPU{{Index: 4}, {Index: 6}},
 		SetVisibleDevices: true,
 	}
-	args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+	args, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 	if err != nil {
 		t.Fatalf("ExpandPlaceholders: %v", err)
 	}
@@ -1870,7 +1871,7 @@ func TestExpandPlaceholdersDeviceLists(t *testing.T) {
 				Args: []string{"--device", tc.placeholder},
 				GPUs: []SpecGPU{{Index: 3}, {Index: 2}}, // non-ascending: proves order, not sort
 			}
-			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders: %v", err)
 			}
@@ -1880,7 +1881,7 @@ func TestExpandPlaceholdersDeviceLists(t *testing.T) {
 		})
 		t.Run(tc.placeholder+"/no gpus refused", func(t *testing.T) {
 			spec := Spec{Args: []string{"--device", tc.placeholder}}
-			if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, ""); err == nil {
+			if _, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, ""); err == nil {
 				t.Fatalf("%s on a spec with no gpus must refuse, not substitute an empty device list", tc.placeholder)
 			}
 		})
@@ -1888,7 +1889,7 @@ func TestExpandPlaceholdersDeviceLists(t *testing.T) {
 
 	t.Run("dedup keeps first-occurrence order", func(t *testing.T) {
 		spec := Spec{Args: []string{"${CUDA_DEVICES}"}, GPUs: []SpecGPU{{Index: 3}, {Index: 2}, {Index: 3}}}
-		args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+		args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 		if err != nil {
 			t.Fatalf("ExpandPlaceholders: %v", err)
 		}
@@ -1902,7 +1903,7 @@ func TestExpandPlaceholdersDeviceLists(t *testing.T) {
 	for _, value := range []string{"${CUDA_DEVICE}", "${cuda_devices}", "${METAL_DEVICES_JSON}"} {
 		t.Run("passes through literally: "+value, func(t *testing.T) {
 			spec := Spec{Args: []string{value}, GPUs: []SpecGPU{{Index: 1}}}
-			args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders(%s) should pass through untouched, got: %v", value, err)
 			}
@@ -1932,7 +1933,7 @@ func TestExpandPlaceholdersVisibleDevicesArgsModeSkipsEnvInjection(t *testing.T)
 	t.Run("args mode injects no visibility variable", func(t *testing.T) {
 		spec := base()
 		spec.VisibleDevicesMode = VisibleDevicesModeArgs
-		args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+		args, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 		if err != nil {
 			t.Fatalf("ExpandPlaceholders: %v", err)
 		}
@@ -1948,7 +1949,7 @@ func TestExpandPlaceholdersVisibleDevicesArgsModeSkipsEnvInjection(t *testing.T)
 		t.Run("mode="+mode+" injects the visibility variable in operator order", func(t *testing.T) {
 			spec := base()
 			spec.VisibleDevicesMode = mode
-			_, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, "")
+			_, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, "")
 			if err != nil {
 				t.Fatalf("ExpandPlaceholders: %v", err)
 			}
@@ -1975,7 +1976,7 @@ func TestExpandPlaceholdersVisibleDevicesConflictHoldsInBothModes(t *testing.T) 
 				SetVisibleDevices:  true,
 				VisibleDevicesMode: mode,
 			}
-			if _, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNVIDIA, nil, getenv, ""); err == nil {
+			if _, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA}, getenv, ""); err == nil {
 				t.Fatalf("a hand-set CUDA_VISIBLE_DEVICES must be refused in %q mode too", mode)
 			}
 		})
@@ -2013,7 +2014,7 @@ func TestExpandPlaceholdersHostGPUIDsMainLast(t *testing.T) {
 			Env:  map[string]string{"X_DEVICES": "d:${HOST_GPU_IDS_MAIN_LAST}"},
 			GPUs: gpus,
 		}
-		args, env, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+		args, env, err := ExpandPlaceholders(spec, 8080, GPUTopology{}, getenv, "")
 		if err != nil {
 			t.Fatalf("ExpandPlaceholders: %v", err)
 		}
@@ -2026,16 +2027,220 @@ func TestExpandPlaceholdersHostGPUIDsMainLast(t *testing.T) {
 	})
 	t.Run("no gpus is a hard error naming the token", func(t *testing.T) {
 		spec := Spec{Args: []string{"${HOST_GPU_IDS_MAIN_LAST}"}}
-		_, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+		_, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{}, getenv, "")
 		if err == nil || !strings.Contains(err.Error(), "HOST_GPU_IDS_MAIN_LAST") {
 			t.Fatalf("err = %v, want an error naming ${HOST_GPU_IDS_MAIN_LAST}", err)
 		}
 	})
 	t.Run("near miss passes through literally", func(t *testing.T) {
 		spec := Spec{Args: []string{"${HOST_GPU_IDS_MAIN_LAS}"}, GPUs: gpus}
-		args, _, err := ExpandPlaceholders(spec, 8080, GPUVendorNone, nil, getenv, "")
+		args, _, err := ExpandPlaceholders(spec, 8080, GPUTopology{}, getenv, "")
 		if err != nil || args[0] != "${HOST_GPU_IDS_MAIN_LAS}" {
 			t.Fatalf("args = %v, err = %v, want literal pass-through", args, err)
 		}
 	})
+}
+
+// TestExpandSingleVendorCUDASpecUnchanged is the golden regression of the
+// per-spec device plan (#434): on a single-vendor NVIDIA host every device
+// token and the injected visibility variable render byte-identically to what
+// they rendered before the plan existed, whether the spec's GPUs carry the
+// legacy empty vendor or an explicit nvidia one.
+func TestExpandSingleVendorCUDASpecUnchanged(t *testing.T) {
+	getenv := func(name string) string {
+		if name == "PATH" {
+			return "/usr/bin"
+		}
+		return ""
+	}
+	args := []string{
+		"--port", "${PORT}", "--device", "${DEVICES}", "--cuda", "${CUDA_DEVICES}",
+		"--ids", "${HOST_GPU_IDS}", "--last", "${HOST_GPU_IDS_MAIN_LAST}",
+		"-mmdev", "${FIRST_LOCAL_DEVICE}", "--first", "${CUDA_FIRST_DEVICE}",
+	}
+	cases := []struct {
+		name     string
+		vendor   GPUVendor
+		inject   bool
+		wantArgs []string
+		wantEnv  []string
+	}{
+		{
+			"legacy vendor, injected", GPUVendorNone, true,
+			[]string{"--port", "8080", "--device", "CUDA0,CUDA1", "--cuda", "CUDA5,CUDA2", "--ids", "5,2", "--last", "2,5", "-mmdev", "CUDA0", "--first", "CUDA5"},
+			[]string{"PATH=/usr/bin", "CUDA_VISIBLE_DEVICES=5,2", "LLAMA_CACHE=/mnt/models"},
+		},
+		{
+			"explicit vendor, injected", GPUVendorNVIDIA, true,
+			[]string{"--port", "8080", "--device", "CUDA0,CUDA1", "--cuda", "CUDA5,CUDA2", "--ids", "5,2", "--last", "2,5", "-mmdev", "CUDA0", "--first", "CUDA5"},
+			[]string{"PATH=/usr/bin", "CUDA_VISIBLE_DEVICES=5,2", "LLAMA_CACHE=/mnt/models"},
+		},
+		{
+			"legacy vendor, not injected", GPUVendorNone, false,
+			[]string{"--port", "8080", "--device", "CUDA5,CUDA2", "--cuda", "CUDA5,CUDA2", "--ids", "5,2", "--last", "2,5", "-mmdev", "CUDA5", "--first", "CUDA5"},
+			[]string{"PATH=/usr/bin", "LLAMA_CACHE=/mnt/models"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := visibleDevicesSpec()
+			spec.Args = args
+			spec.SetVisibleDevices = tc.inject
+			for i := range spec.GPUs {
+				spec.GPUs[i].Vendor = tc.vendor
+			}
+			gotArgs, gotEnv, err := ExpandPlaceholders(spec, 8080, GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, getenv, "")
+			if err != nil {
+				t.Fatalf("ExpandPlaceholders: %v", err)
+			}
+			if !reflect.DeepEqual(gotArgs, tc.wantArgs) {
+				t.Errorf("args = %q\nwant   %q", gotArgs, tc.wantArgs)
+			}
+			if !reflect.DeepEqual(gotEnv, tc.wantEnv) {
+				t.Errorf("env = %q\nwant  %q", gotEnv, tc.wantEnv)
+			}
+		})
+	}
+}
+
+// Host topologies of the per-spec device plan tests (#434). amd2Topo is a
+// single-vendor AMD host whose two cards' Vulkan ordinals are known; mixedTopo
+// a host with one NVIDIA and two AMD cards, all mapped.
+var (
+	amd2Topo = GPUTopology{Legacy: GPUVendorAMD, Vendors: GPUVendors{GPUVendorAMD}, Vulkan: VulkanMap{
+		Ordinals:    map[GPUKey]int{{GPUVendorAMD, 0}: 0, {GPUVendorAMD, 1}: 1},
+		DeviceCount: 2,
+	}}
+	mixedTopo = GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}, Vulkan: VulkanMap{
+		Ordinals:    map[GPUKey]int{{GPUVendorNVIDIA, 0}: 0, {GPUVendorAMD, 0}: 1, {GPUVendorAMD, 1}: 2},
+		DeviceCount: 3,
+	}}
+)
+
+// TestExpandInjectsGGMLVKVisibleDevicesOnVulkanSpec pins the deliberate design
+// §5.3 change: a vulkan spec with set_visible_devices in env mode gets
+// GGML_VK_VISIBLE_DEVICES (its cards' Vulkan ordinals, declared order) instead
+// of the vendor variable the Vulkan driver ignores, and its device tokens name
+// the renumbered Vulkan0.. devices.
+func TestExpandInjectsGGMLVKVisibleDevicesOnVulkanSpec(t *testing.T) {
+	spec := Spec{
+		GPUs:              []SpecGPU{{Index: 1, Vendor: GPUVendorAMD}, {Index: 0, Vendor: GPUVendorAMD}},
+		DeviceBackend:     "vulkan",
+		SetVisibleDevices: true,
+		Args:              []string{"--device", "${VULKAN_DEVICES}", "--all", "${DEVICES}", "-mmdev", "${VULKAN_FIRST_DEVICE}", "--one", "${FIRST_LOCAL_DEVICE}"},
+	}
+	args, env, err := ExpandPlaceholders(spec, 0, amd2Topo, func(string) string { return "" }, "")
+	if err != nil {
+		t.Fatalf("ExpandPlaceholders: %v", err)
+	}
+	if v, ok := envValue(env, "GGML_VK_VISIBLE_DEVICES"); !ok || v != "1,0" {
+		t.Errorf("env %v: want GGML_VK_VISIBLE_DEVICES=1,0", env)
+	}
+	for _, name := range []string{"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"} {
+		if _, ok := envValue(env, name); ok {
+			t.Errorf("env %v sets %s next to GGML_VK_VISIBLE_DEVICES", env, name)
+		}
+	}
+	want := []string{"--device", "Vulkan0,Vulkan1", "--all", "Vulkan0,Vulkan1", "-mmdev", "Vulkan0", "--one", "Vulkan0"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %q, want %q", args, want)
+	}
+}
+
+// TestExpandRefusesHandSetGGMLVKVisibleDevices: GGML_VK_VISIBLE_DEVICES joins
+// the variables set_visible_devices owns, on every host and case-folded.
+func TestExpandRefusesHandSetGGMLVKVisibleDevices(t *testing.T) {
+	for _, key := range []string{"GGML_VK_VISIBLE_DEVICES", "ggml_vk_visible_devices"} {
+		for _, topo := range []GPUTopology{{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, amd2Topo, {}} {
+			spec := visibleDevicesSpec()
+			spec.Env = map[string]string{key: "0"}
+			if _, env, err := ExpandPlaceholders(spec, 0, topo, func(string) string { return "" }, ""); err == nil {
+				t.Errorf("%s with set_visible_devices on %+v was accepted; env %v", key, topo, env)
+			} else if !strings.Contains(err.Error(), key) {
+				t.Errorf("error %q does not name %s", err, key)
+			}
+		}
+	}
+	if !slices.Contains(visibleDevicesOwnedVars, "GGML_VK_VISIBLE_DEVICES") {
+		t.Errorf("visibleDevicesOwnedVars = %v, want GGML_VK_VISIBLE_DEVICES in it", visibleDevicesOwnedVars)
+	}
+}
+
+// TestExpandRefusesHostGPUIDsOnVendorSpanningSpec: host indices and the
+// fixed-backend device tokens have no meaning for a spec whose GPUs span
+// NVIDIA and AMD (NVIDIA 0 and AMD 0 are both "0"); the Vulkan tokens, backed
+// by the injected ordinals, still resolve.
+func TestExpandRefusesHostGPUIDsOnVendorSpanningSpec(t *testing.T) {
+	spec := Spec{
+		GPUs:              []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}, {Index: 1, Vendor: GPUVendorAMD}},
+		DeviceBackend:     "vulkan",
+		SetVisibleDevices: true,
+	}
+	getenv := func(string) string { return "" }
+	for _, tok := range []string{"HOST_GPU_IDS", "HOST_GPU_IDS_MAIN_LAST", "CUDA_DEVICES", "CUDA_FIRST_DEVICE", "METAL_DEVICES", "METAL_FIRST_DEVICE"} {
+		s := spec
+		s.Args = []string{"${" + tok + "}"}
+		_, _, err := ExpandPlaceholders(s, 0, mixedTopo, getenv, "")
+		if err == nil {
+			t.Errorf("${%s} on a vendor-spanning spec was accepted", tok)
+			continue
+		}
+		if want := "${" + tok + "} has no meaning for a spec whose GPUs span NVIDIA and AMD"; !strings.Contains(err.Error(), want) {
+			t.Errorf("${%s}: error %q, want it to contain %q", tok, err, want)
+		}
+		if _, err := expandConfigFileContent("x=${"+tok+"}", s, 0, mixedTopo, getenv, ""); err == nil {
+			t.Errorf("${%s} in config file content of a vendor-spanning spec was accepted", tok)
+		}
+	}
+	s := spec
+	s.Args = []string{"${VULKAN_DEVICES}", "${DEVICES}"}
+	args, env, err := ExpandPlaceholders(s, 0, mixedTopo, getenv, "")
+	if err != nil {
+		t.Fatalf("vulkan tokens on a vendor-spanning spec: %v", err)
+	}
+	if want := []string{"Vulkan0,Vulkan1", "Vulkan0,Vulkan1"}; !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %q, want %q", args, want)
+	}
+	if v, ok := envValue(env, "GGML_VK_VISIBLE_DEVICES"); !ok || v != "0,2" {
+		t.Errorf("env %v: want GGML_VK_VISIBLE_DEVICES=0,2", env)
+	}
+}
+
+// TestExpandMixedHostGPUPlanRefusals: on a mixed host the plan's coded
+// refusals reach the caller as a *GPUPlanError wherever the plan is consumed
+// -- the injected variable or a device token -- so the start path can record
+// their stable code.
+func TestExpandMixedHostGPUPlanRefusals(t *testing.T) {
+	nvAMD := []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}, {Index: 0, Vendor: GPUVendorAMD}}
+	cases := []struct {
+		name     string
+		spec     Spec
+		topo     GPUTopology
+		wantCode string
+	}{
+		{"cuda on both vendors, injected", Spec{GPUs: nvAMD, DeviceBackend: "cuda", SetVisibleDevices: true}, mixedTopo, codeGPUVendorBackendMismatch},
+		{"cuda on both vendors, devices token", Spec{GPUs: nvAMD, DeviceBackend: "cuda", Args: []string{"${DEVICES}"}}, mixedTopo, codeGPUVendorBackendMismatch},
+		{"rocm on an nvidia card, single-vendor host", Spec{GPUs: []SpecGPU{{Index: 0}}, DeviceBackend: "rocm", SetVisibleDevices: true}, GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, codeGPUVendorBackendMismatch},
+		{"vulkan without injection", Spec{GPUs: nvAMD, DeviceBackend: "vulkan", Args: []string{"${VULKAN_DEVICES}"}}, mixedTopo, codeVulkanVisibleDevicesRequired},
+		{"vulkan unmapped", Spec{GPUs: nvAMD, DeviceBackend: "vulkan", SetVisibleDevices: true}, GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: mixedTopo.Vendors}, codeVulkanMappingUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := ExpandPlaceholders(tc.spec, 0, tc.topo, func(string) string { return "" }, "")
+			var pe *GPUPlanError
+			if !errors.As(err, &pe) || pe.Code != tc.wantCode {
+				t.Fatalf("err = %v, want a *GPUPlanError with code %s", err, tc.wantCode)
+			}
+		})
+	}
+	// A single-vendor spec on the mixed host gets its native backend and
+	// variable (design §5.3).
+	spec := Spec{GPUs: []SpecGPU{{Index: 1, Vendor: GPUVendorAMD}}, SetVisibleDevices: true, Args: []string{"${DEVICES}"}}
+	args, env, err := ExpandPlaceholders(spec, 0, mixedTopo, func(string) string { return "" }, "")
+	if err != nil {
+		t.Fatalf("single-vendor spec on a mixed host: %v", err)
+	}
+	if v, ok := envValue(env, "ROCR_VISIBLE_DEVICES"); !ok || v != "1" || args[0] != "ROCm0" {
+		t.Errorf("args %q env %v: want ROCm0 and ROCR_VISIBLE_DEVICES=1", args, env)
+	}
 }

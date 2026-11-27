@@ -3453,6 +3453,86 @@ func TestManagerVisibleDevicesRefusalIsNotPermitted(t *testing.T) {
 	}
 }
 
+// TestStartRefusalCarriesGPUPlanCode: a spec the per-spec device plan refuses
+// (#434) is not_permitted with the plan's stable code in last_error, so the
+// gateway can map it to its own message; a Vulkan spec on the same mixed host
+// starts once the hardware report has mapped its cards, and its child sees the
+// injected GGML_VK_VISIBLE_DEVICES (the owner's topology reads the pushed
+// HostInfo.Vulkan).
+func TestStartRefusalCarriesGPUPlanCode(t *testing.T) {
+	skipOnWindows(t)
+	nvAMD := []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA, VRAMMB: 1}, {Index: 0, Vendor: GPUVendorAMD, VRAMMB: 1}}
+	newMixed := func(t *testing.T) *Manager {
+		m := NewManager(ManagerOptions{
+			Policy:     allowlistPolicy(),
+			Getenv:     func(string) string { return "" },
+			GPUVendor:  GPUVendorNVIDIA,
+			GPUVendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD},
+		})
+		t.Cleanup(m.Close)
+		return m
+	}
+	cases := []struct {
+		name     string
+		backend  string
+		wantCode string
+	}{
+		{"cuda on both vendors", "cuda", codeGPUVendorBackendMismatch},
+		{"vulkan before the cards are mapped", "vulkan", codeVulkanMappingUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkTimings(t)
+			spec := baseSpec("spec-a", "model-a")
+			spec.GPUs = nvAMD
+			spec.DeviceBackend = tc.backend
+			spec.SetVisibleDevices = true
+			m := newMixed(t)
+			m.Apply(Config{Specs: []Spec{spec}})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, _, err := m.EnsureRunning(ctx, "model-a"); !errors.Is(err, ErrNotPermitted) {
+				t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted", err)
+			}
+			st := statusFor(m, "spec-a")
+			if st == nil || st.State != StateNotPermitted {
+				t.Fatalf("Status()[spec-a] = %+v, want not_permitted", st)
+			}
+			if st.LastError == nil || st.LastError.Code != tc.wantCode {
+				t.Errorf("LastError = %+v, want code %s", st.LastError, tc.wantCode)
+			}
+		})
+	}
+
+	t.Run("vulkan with mapped cards starts", func(t *testing.T) {
+		shrinkTimings(t)
+		envLog := filepath.Join(t.TempDir(), "env")
+		spec := baseSpec("spec-a", "model-a")
+		spec.Args = visibleDevicesStubArgs(envLog, "GGML_VK_VISIBLE_DEVICES")
+		spec.GPUs = nvAMD
+		spec.DeviceBackend = "vulkan"
+		spec.SetVisibleDevices = true
+		m := newMixed(t)
+		m.SetHostInfo(HostInfo{Vulkan: VulkanMap{
+			Ordinals:    map[GPUKey]int{{GPUVendorNVIDIA, 0}: 1, {GPUVendorAMD, 0}: 0},
+			DeviceCount: 2,
+		}})
+		m.Apply(Config{Specs: []Spec{spec}})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, "model-a")
+		if err != nil {
+			t.Fatalf("EnsureRunning: %v", err)
+		}
+		defer release()
+		if got, want := readEnvLog(t, envLog), "set:1,0"; got != want {
+			t.Errorf("child read GGML_VK_VISIBLE_DEVICES as %q, want %q", got, want)
+		}
+	})
+}
+
 // newSnapshotOwner assembles an owner just far enough to call buildSnapshot:
 // one spec, one live generation, no goroutine and no child process.
 // buildSnapshot reads only owner state (o.specs, o.cfg, o.allowedPairs) plus

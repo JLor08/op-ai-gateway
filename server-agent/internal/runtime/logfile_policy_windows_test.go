@@ -149,7 +149,7 @@ func TestResolveLogFileWindowsNames(t *testing.T) {
 	} {
 		t.Run(path, func(t *testing.T) {
 			p := LocalPolicy{}
-			got, err := p.resolveLogFile(nativeLogSpec("s1"), LogFile{Name: "e", Path: path}, 8080, GPUVendorNone, nil, cfgDir)
+			got, err := p.resolveLogFile(nativeLogSpec("s1"), LogFile{Name: "e", Path: path}, 8080, GPUTopology{}, cfgDir)
 			if err == nil {
 				t.Fatalf("resolveLogFile(%q) = %+v, want a refusal", path, got)
 			}

@@ -63,8 +63,8 @@ const logFileTailBytes = 2048
 // declarations in declaration order, refused the names the path policy
 // refused (it logs why) or that name one of the spec's config_files
 // (logFileShadowsConfigFile), stale the ${CONFIG_DIR} names whose earlier file
-// could not be removed. port, vendor, vendors and configFilesDir feed the
-// path's placeholder expansion exactly as for the launch itself.
+// could not be removed. port, topo and configFilesDir feed the path's
+// placeholder expansion exactly as for the launch itself.
 //
 // If any target lies directly in the instance's ${CONFIG_DIR}, that
 // directory is created (0755) when it is missing, as writeSpecConfigFiles
@@ -76,8 +76,8 @@ const logFileTailBytes = 2048
 // a model not to run. The refused names are marked file_not_permitted only
 // once the exec has succeeded (startLogFileTailers), so a start whose exec
 // fails records no file_not_permitted for them.
-func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (targets []logFileTarget, refused []string, stale map[string]bool) {
-	targets, refused, configDir := resolveSpecLogFiles(spec, pol, port, vendor, vendors, configFilesDir)
+func prepareLogFiles(spec Spec, pol LocalPolicy, port int, topo GPUTopology, configFilesDir string) (targets []logFileTarget, refused []string, stale map[string]bool) {
+	targets, refused, configDir := resolveSpecLogFiles(spec, pol, port, topo, configFilesDir)
 	if configDir != "" {
 		if err := ensureInstanceConfigDir(configDir); err != nil {
 			slog.Warn("runtime: cannot create the spec's config dir for its log file", "spec", spec.ID, "error", err)
@@ -91,9 +91,9 @@ func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, ven
 // config_files becomes a target, every other name is refused. configDir is
 // the instance's ${CONFIG_DIR} when some target lies directly in it, else "".
 // It touches no file.
-func resolveSpecLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (targets []logFileTarget, refused []string, configDir string) {
+func resolveSpecLogFiles(spec Spec, pol LocalPolicy, port int, topo GPUTopology, configFilesDir string) (targets []logFileTarget, refused []string, configDir string) {
 	for _, lf := range spec.LogFiles {
-		target, err := pol.resolveLogFile(spec, lf, port, vendor, vendors, configFilesDir)
+		target, err := pol.resolveLogFile(spec, lf, port, topo, configFilesDir)
 		if err != nil {
 			refused = append(refused, lf.Name)
 			continue

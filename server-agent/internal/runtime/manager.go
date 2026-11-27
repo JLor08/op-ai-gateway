@@ -254,10 +254,11 @@ type ManagerOptions struct {
 	Getenv func(string) string
 	// GPUVendor is the GPU stack this HOST actually has, discovered locally
 	// by main.go from collector.DetectGPUCollectors() -- never a
-	// gateway-supplied value. It selects the environment variable a
-	// SetVisibleDevices spec gets (VisibleDevicesVar); its zero value,
-	// GPUVendorNone, is the correct answer for a CPU-only host and makes
-	// that option a no-op rather than an error.
+	// gateway-supplied value. It is the legacy vendor: the one a spec GPU
+	// with an empty vendor stands for (resolveLegacyGPUVendors) and the one
+	// the per-spec device plan falls back to (GPUTopology.Legacy); its zero
+	// value, GPUVendorNone, is the correct answer for a CPU-only host and
+	// makes set_visible_devices a no-op rather than an error.
 	GPUVendor GPUVendor
 
 	// GPUVendors is the full detected vendor set (see GPUVendors). Optional;
@@ -975,6 +976,29 @@ func (m *Manager) SetHostInfo(hi HostInfo) {
 	}
 }
 
+// topology is the host's GPU topology for the per-spec device plan: the legacy
+// vendor, every detected vendor (the legacy one alone when only it was
+// given), and the Vulkan device mapping of the latest hardware report.
+func (o *owner) topology() GPUTopology {
+	vendors := o.gpuVendors
+	if len(vendors) == 0 && o.gpuVendor != GPUVendorNone {
+		vendors = GPUVendors{o.gpuVendor}
+	}
+	return GPUTopology{Legacy: o.gpuVendor, Vendors: vendors, Vulkan: o.hostInfo().Vulkan}
+}
+
+// refuseExpansion records a start that placeholder expansion (or the member
+// preparation after it) refused: not_permitted, carrying the stable code of a
+// per-spec device plan refusal (*GPUPlanError) when that is the cause.
+func (o *owner) refuseExpansion(st *specState, err error) {
+	var pe *GPUPlanError
+	if errors.As(err, &pe) {
+		o.setNotPermittedCode(st, err.Error(), pe.Code)
+		return
+	}
+	o.setNotPermitted(st, err.Error())
+}
+
 // hostInfo returns the latest pushed hardware figures, or the zero HostInfo
 // when nothing has been pushed yet: no detected GPU totals and MemAvailableMB
 // 0 (unknown). It is the ONE place the "no sample yet" case is interpreted, so
@@ -1657,8 +1681,9 @@ type owner struct {
 	// owner goroutine and never written after construction.
 	gpuVendor GPUVendor
 	// gpuVendors is every vendor the host's GPU detection found, in precedence
-	// order. Only the generic device tokens' "auto" backend reads it; the
-	// single gpuVendor above keeps driving visibility and budgets.
+	// order. With gpuVendor and the pushed Vulkan mapping it is the host's
+	// GPUTopology (topology), from which the per-spec device plan decides
+	// each spec's visibility variable and device names.
 	gpuVendors GPUVendors
 	// specsFromLocalFile is ManagerOptions.SpecsFromLocalFile -- fixed for
 	// the process lifetime, so a plain field like gpuVendor above. Its only
@@ -2444,8 +2469,9 @@ func sameLaunchShape(a, b Spec) bool {
 			rpc.HeadDomain = ""
 			s.RPC = &rpc
 		}
-		// GPUs' launch-relevant part is the ordered/deduped INDEX list
-		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
+		// GPUs' launch-relevant part is the ordered/deduped (vendor, index)
+		// KEY list (specDevices -> the device plan, hostGPUIDs/deviceList and
+		// the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy
 		// arithmetic and the measurement snapshot, never baked into the child.
 		// Zero it so a pure vram_mb edit is metadata (binds at the next start,
@@ -4784,8 +4810,13 @@ func (o *owner) startProcess(st *specState) {
 	// substitutes a decimal string for ${PORT}), so this dry run with a
 	// placeholder port is a faithful pre-check; the real port is
 	// substituted in the second call below once one is available.
-	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
-		o.setNotPermitted(st, err.Error())
+	// One topology for the whole launch, so the dry runs and the real
+	// expansion below decide the same device plan even if a hardware report
+	// lands in between. A plan refusal carries its stable code
+	// (refuseExpansion).
+	topo := o.topology()
+	if _, _, err := ExpandPlaceholders(spec, 0, topo, o.getenv, o.configFilesDir); err != nil {
+		o.refuseExpansion(st, err)
 		return
 	}
 	// The config_files half of the same dry run (#257): a secret or malformed
@@ -4795,8 +4826,8 @@ func (o *owner) startProcess(st *specState) {
 	// rate-limited -- and before a port is acquired or anything is written. The
 	// checks are port-independent for the same reason the one above is. Only the
 	// filesystem writes, further down, are start failures.
-	if _, err := planSpecConfigFiles(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
-		o.setNotPermitted(st, err.Error())
+	if _, err := planSpecConfigFiles(spec, 0, topo, o.getenv, o.configFilesDir); err != nil {
+		o.refuseExpansion(st, err)
 		return
 	}
 
@@ -4813,12 +4844,12 @@ func (o *owner) startProcess(st *specState) {
 		port = p
 	}
 
-	ex, err := expandSpec(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir)
+	ex, err := expandSpec(spec, port, topo, o.getenv, o.configFilesDir)
 	if err != nil {
 		// Already validated above (that dry run used port 0); reaching
 		// here would mean ExpandPlaceholders' result depends on the port
 		// value, which it does not. Defensive only.
-		o.setNotPermitted(st, err.Error())
+		o.refuseExpansion(st, err)
 		return
 	}
 
@@ -4829,7 +4860,7 @@ func (o *owner) startProcess(st *specState) {
 	// full disk, failed rename) -- a start failure that backs off and retries,
 	// the same shape as the ephemeral-port failure above, and NOT a
 	// not_permitted verdict, which would claim the config can never work.
-	if err := writeSpecConfigFiles(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
+	if err := writeSpecConfigFiles(spec, port, topo, o.getenv, o.configFilesDir); err != nil {
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, err.Error(), 0, "")
 		o.failPending(st, ErrStartFailed)
@@ -4844,7 +4875,7 @@ func (o *owner) startProcess(st *specState) {
 		// ex grows by those entries, so what is reported below is what runs.
 		var err error
 		if ex, port, err = o.prepareMember(spec, ex); err != nil {
-			o.setNotPermitted(st, err.Error())
+			o.refuseExpansion(st, err)
 			return
 		}
 	}
@@ -4881,7 +4912,7 @@ func (o *owner) startProcess(st *specState) {
 	// or a stale name) a few early bytes of this generation can still reach
 	// the predecessor's stream (see endPredecessorGraces). A log file never
 	// fails the start (see prepareLogFiles).
-	logTargets, logRefused, logStale := prepareLogFiles(spec, o.policy, port, o.gpuVendor, o.gpuVendors, o.configFilesDir)
+	logTargets, logRefused, logStale := prepareLogFiles(spec, o.policy, port, topo, o.configFilesDir)
 	endPredecessorGraces(st, logTargets)
 
 	// One writer for BOTH streams: the requirement is stdout AND stderr, and

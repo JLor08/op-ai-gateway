@@ -142,7 +142,7 @@ func TestResolvedCommandMasksSecretUnderWSLWrapper(t *testing.T) {
 	spec := wslSpec(wslBin, "/home/ai/vllm")
 	spec.Args = []string{"serve", "--api-key", "${API_TOKEN}"}
 	spec.APIToken = "tok-secret"
-	ex, err := expandSpec(spec, 41234, GPUVendorNone, nil, func(string) string { return "" }, "")
+	ex, err := expandSpec(spec, 41234, GPUTopology{}, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,14 +176,14 @@ func TestConfigDirPlaceholderIsLinuxPathForWSL(t *testing.T) {
 	spec := wslSpec(wslBin, "")
 	spec.ID = "spec-1"
 	spec.Args = []string{"${CONFIG_DIR}/m.ini"}
-	args, _, err := ExpandPlaceholders(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, `C:\agent\cfg`)
+	args, _, err := ExpandPlaceholders(spec, 1, GPUTopology{}, func(string) string { return "" }, `C:\agent\cfg`)
 	if err != nil || args[0] != "/mnt/c/agent/cfg/spec-1/m.ini" {
 		t.Errorf("args = %q, err = %v", args, err)
 	}
 	// The refusal travels upward (a not_permitted message, a last_error), so
 	// it names the setting, never the agent-local directory itself.
 	for _, dir := range []string{`\\fileserver\cfg`, `C:\agent\..\..\cfg`} {
-		_, _, err := ExpandPlaceholders(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, dir)
+		_, _, err := ExpandPlaceholders(spec, 1, GPUTopology{}, func(string) string { return "" }, dir)
 		if err == nil {
 			t.Errorf("config dir %q translated, want a refusal", dir)
 			continue
@@ -193,7 +193,7 @@ func TestConfigDirPlaceholderIsLinuxPathForWSL(t *testing.T) {
 		}
 	}
 	native := Spec{ID: "spec-1", Binary: "/b", Args: []string{"${CONFIG_DIR}"}}
-	args, _, err = ExpandPlaceholders(native, 1, GPUVendorNone, nil, func(string) string { return "" }, "/agent/cfg")
+	args, _, err = ExpandPlaceholders(native, 1, GPUTopology{}, func(string) string { return "" }, "/agent/cfg")
 	if err != nil || args[0] != "/agent/cfg/spec-1" {
 		t.Errorf("native args = %q, err = %v", args, err)
 	}

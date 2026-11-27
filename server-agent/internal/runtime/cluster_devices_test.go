@@ -26,65 +26,69 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 		name    string
 		spec    Spec
 		tok     string
-		vendor  GPUVendor
-		vendors GPUVendors
+		topo    GPUTopology
 		want    string
 		wantErr bool
 	}{
-		{"head servers", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${RPC_SERVERS}", GPUVendorNVIDIA, nil, "a,b", false},
-		{"head rpc devices", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${RPC_DEVICES}", GPUVendorNVIDIA, nil, "RPC0,RPC1,RPC2", false},
-		{"head devices", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${DEVICES}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "RPC0,RPC1,RPC2,CUDA3,CUDA2", false},
-		{"head first local", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${FIRST_LOCAL_DEVICE}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "CUDA3", false},
-		{"cuda first", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${CUDA_FIRST_DEVICE}", GPUVendorNVIDIA, nil, "CUDA3", false},
-		{"vulkan first", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${VULKAN_FIRST_DEVICE}", GPUVendorNVIDIA, nil, "Vulkan3", false},
-		{"metal first", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${METAL_FIRST_DEVICE}", GPUVendorNVIDIA, nil, "MTL3", false},
+		{"head servers", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${RPC_SERVERS}", GPUTopology{Legacy: GPUVendorNVIDIA}, "a,b", false},
+		{"head rpc devices", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${RPC_DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA}, "RPC0,RPC1,RPC2", false},
+		{"head devices", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, "RPC0,RPC1,RPC2,CUDA3,CUDA2", false},
+		{"head first local", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${FIRST_LOCAL_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, "CUDA3", false},
+		{"cuda first", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${CUDA_FIRST_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA}, "CUDA3", false},
+		{"vulkan first", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${VULKAN_FIRST_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA}, "Vulkan3", false},
+		{"metal first", func() Spec { s := clusterHeadSpec(); s.GPUs = gpus; return s }(), "${METAL_FIRST_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA}, "MTL3", false},
 		{"env renumbered", func() Spec {
 			s := clusterHeadSpec()
 			s.GPUs = gpus
 			s.SetVisibleDevices = true
 			s.VisibleDevicesMode = VisibleDevicesModeEnv
 			return s
-		}(), "${DEVICES}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "RPC0,RPC1,RPC2,CUDA0,CUDA1", false},
+		}(), "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, "RPC0,RPC1,RPC2,CUDA0,CUDA1", false},
 		{"args mode keeps host indices", func() Spec {
 			s := clusterHeadSpec()
 			s.GPUs = gpus
 			s.SetVisibleDevices = true
 			s.VisibleDevicesMode = VisibleDevicesModeArgs
 			return s
-		}(), "${DEVICES}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "RPC0,RPC1,RPC2,CUDA3,CUDA2", false},
+		}(), "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, "RPC0,RPC1,RPC2,CUDA3,CUDA2", false},
 		{"apple env: no variable, no renumbering", func() Spec {
 			s := clusterHeadSpec()
 			s.GPUs = gpus
 			s.SetVisibleDevices = true
 			s.VisibleDevicesMode = VisibleDevicesModeEnv
 			return s
-		}(), "${DEVICES}", GPUVendorApple, GPUVendors{GPUVendorApple}, "RPC0,RPC1,RPC2,MTL3,MTL2", false},
-		{"env first local renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${FIRST_LOCAL_DEVICE}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "CUDA0", false},
-		{"env explicit CUDA first never renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${CUDA_FIRST_DEVICE}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, "CUDA3", false},
-		{"env explicit Vulkan first never renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${VULKAN_FIRST_DEVICE}", GPUVendorNVIDIA, nil, "Vulkan3", false},
-		{"env amd renumbers ROCm", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUVendorAMD, GPUVendors{GPUVendorAMD}, "ROCm0,ROCm1", false},
-		{"env mixed host auto Vulkan not renumbered", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}, "Vulkan3,Vulkan2", false},
-		{"env explicit vulkan not renumbered", Spec{GPUs: gpus, DeviceBackend: "vulkan", SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUVendorNVIDIA, nil, "Vulkan3,Vulkan2", false},
-		{"env explicit sycl not renumbered", Spec{GPUs: gpus, DeviceBackend: "sycl", SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${FIRST_LOCAL_DEVICE}", GPUVendorNVIDIA, nil, "SYCL3", false},
-		{"zero-count endpoint adds no rpc devices", Spec{Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a", DeviceCount: 0}, {Address: "b", DeviceCount: 2}}}}, "${RPC_DEVICES}", GPUVendorNone, nil, "RPC0,RPC1", false},
-		{"all-zero endpoints rpc devices", Spec{Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a", DeviceCount: 0}}}}, "${RPC_DEVICES}", GPUVendorNone, nil, "", true},
-		{"head without gpus devices", clusterHeadSpec(), "${DEVICES}", GPUVendorNone, nil, "RPC0,RPC1,RPC2", false},
-		{"head without gpus first local", clusterHeadSpec(), "${FIRST_LOCAL_DEVICE}", GPUVendorNone, nil, "RPC0", false},
-		{"head without gpus cuda first", clusterHeadSpec(), "${CUDA_FIRST_DEVICE}", GPUVendorNVIDIA, nil, "", true},
-		{"non-head no gpus devices", Spec{}, "${DEVICES}", GPUVendorNVIDIA, nil, "", true},
-		{"non-head no gpus first local", Spec{}, "${FIRST_LOCAL_DEVICE}", GPUVendorNVIDIA, nil, "", true},
-		{"non-head rpc servers", Spec{GPUs: gpus}, "${RPC_SERVERS}", GPUVendorNVIDIA, nil, "", true},
-		{"non-head rpc devices", Spec{GPUs: gpus}, "${RPC_DEVICES}", GPUVendorNVIDIA, nil, "", true},
-		{"non-head devices", Spec{GPUs: gpus}, "${DEVICES}", GPUVendorAMD, GPUVendors{GPUVendorAMD}, "ROCm3,ROCm2", false},
-		{"mixed vendors", Spec{GPUs: gpus}, "${DEVICES}", GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}, "Vulkan3,Vulkan2", false},
-		{"explicit sycl", Spec{GPUs: gpus, DeviceBackend: "SYCL"}, "${DEVICES}", GPUVendorNVIDIA, nil, "SYCL3,SYCL2", false},
-		{"auto without vendors", Spec{GPUs: gpus, DeviceBackend: "auto"}, "${DEVICES}", GPUVendorNone, nil, "", true},
-		{"unknown backend", Spec{GPUs: gpus, DeviceBackend: "opencl"}, "${DEVICES}", GPUVendorNVIDIA, nil, "", true},
+		}(), "${DEVICES}", GPUTopology{Legacy: GPUVendorApple, Vendors: GPUVendors{GPUVendorApple}}, "RPC0,RPC1,RPC2,MTL3,MTL2", false},
+		{"env first local renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${FIRST_LOCAL_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, "CUDA0", false},
+		{"env explicit CUDA first never renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${CUDA_FIRST_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, "CUDA3", false},
+		{"env explicit Vulkan first never renumbers", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${VULKAN_FIRST_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA}, "Vulkan3", false},
+		{"env amd renumbers ROCm", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUTopology{Legacy: GPUVendorAMD, Vendors: GPUVendors{GPUVendorAMD}}, "ROCm0,ROCm1", false},
+		// Design §5.3: on a two-vendor host the vendor-less GPUs resolve to the legacy
+		// vendor (NVIDIA), so this single-vendor spec gets its native backend, renumbered
+		// by CUDA_VISIBLE_DEVICES (it was Vulkan3,Vulkan2 when the host vendor set decided).
+		{"env mixed host single-vendor spec gets its native backend", Spec{GPUs: gpus, SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}}, "CUDA0,CUDA1", false},
+		{"env explicit vulkan not renumbered", Spec{GPUs: gpus, DeviceBackend: "vulkan", SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA}, "Vulkan3,Vulkan2", false},
+		{"env explicit sycl not renumbered", Spec{GPUs: gpus, DeviceBackend: "sycl", SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeEnv}, "${FIRST_LOCAL_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA}, "SYCL3", false},
+		{"zero-count endpoint adds no rpc devices", Spec{Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a", DeviceCount: 0}, {Address: "b", DeviceCount: 2}}}}, "${RPC_DEVICES}", GPUTopology{}, "RPC0,RPC1", false},
+		{"all-zero endpoints rpc devices", Spec{Cluster: &ClusterHead{Endpoints: []ClusterEndpoint{{Address: "a", DeviceCount: 0}}}}, "${RPC_DEVICES}", GPUTopology{}, "", true},
+		{"head without gpus devices", clusterHeadSpec(), "${DEVICES}", GPUTopology{}, "RPC0,RPC1,RPC2", false},
+		{"head without gpus first local", clusterHeadSpec(), "${FIRST_LOCAL_DEVICE}", GPUTopology{}, "RPC0", false},
+		{"head without gpus cuda first", clusterHeadSpec(), "${CUDA_FIRST_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA}, "", true},
+		{"non-head no gpus devices", Spec{}, "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA}, "", true},
+		{"non-head no gpus first local", Spec{}, "${FIRST_LOCAL_DEVICE}", GPUTopology{Legacy: GPUVendorNVIDIA}, "", true},
+		{"non-head rpc servers", Spec{GPUs: gpus}, "${RPC_SERVERS}", GPUTopology{Legacy: GPUVendorNVIDIA}, "", true},
+		{"non-head rpc devices", Spec{GPUs: gpus}, "${RPC_DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA}, "", true},
+		{"non-head devices", Spec{GPUs: gpus}, "${DEVICES}", GPUTopology{Legacy: GPUVendorAMD, Vendors: GPUVendors{GPUVendorAMD}}, "ROCm3,ROCm2", false},
+		// Design §5.3: a single-vendor spec on a two-vendor host gets its native backend
+		// (it was Vulkan3,Vulkan2 when the host vendor set decided).
+		{"mixed host single-vendor spec gets its native backend", Spec{GPUs: gpus}, "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}}, "CUDA3,CUDA2", false},
+		{"explicit sycl", Spec{GPUs: gpus, DeviceBackend: "SYCL"}, "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA}, "SYCL3,SYCL2", false},
+		{"auto without vendors", Spec{GPUs: gpus, DeviceBackend: "auto"}, "${DEVICES}", GPUTopology{}, "", true},
+		{"unknown backend", Spec{GPUs: gpus, DeviceBackend: "opencl"}, "${DEVICES}", GPUTopology{Legacy: GPUVendorNVIDIA}, "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.spec.Args = []string{"--device=" + tc.tok}
-			args, _, err := ExpandPlaceholders(tc.spec, 8080, tc.vendor, tc.vendors, getenv, "")
+			args, _, err := ExpandPlaceholders(tc.spec, 8080, tc.topo, getenv, "")
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want error, got args %v", args)
@@ -103,7 +107,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 	t.Run("env value expands", func(t *testing.T) {
 		s := clusterHeadSpec()
 		s.Env = map[string]string{"LLAMA_ARG_RPC": "${RPC_SERVERS}"}
-		_, env, err := ExpandPlaceholders(s, 8080, GPUVendorNone, nil, getenv, "")
+		_, env, err := ExpandPlaceholders(s, 8080, GPUTopology{}, getenv, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,7 +119,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 	t.Run("config file content expands", func(t *testing.T) {
 		s := clusterHeadSpec()
 		s.GPUs = gpus
-		got, err := expandConfigFileContent("dev=${DEVICES}\nfirst=${FIRST_LOCAL_DEVICE}", s, 1, GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, getenv, "")
+		got, err := expandConfigFileContent("dev=${DEVICES}\nfirst=${FIRST_LOCAL_DEVICE}", s, 1, GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, getenv, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +129,7 @@ func TestExpandClusterPlaceholders(t *testing.T) {
 	})
 
 	t.Run("single vendor fallback when no set is given", func(t *testing.T) {
-		args, _, err := ExpandPlaceholders(Spec{GPUs: gpus, Args: []string{"${DEVICES}"}}, 1, GPUVendorAMD, nil, getenv, "")
+		args, _, err := ExpandPlaceholders(Spec{GPUs: gpus, Args: []string{"${DEVICES}"}}, 1, GPUTopology{Legacy: GPUVendorAMD}, getenv, "")
 		if err != nil || args[0] != "ROCm3,ROCm2" {
 			t.Errorf("args=%v err=%v", args, err)
 		}
@@ -169,7 +173,7 @@ func TestVisibleDevicesArgsModeAcceptsDevicesToken(t *testing.T) {
 		SetVisibleDevices:  true,
 		VisibleDevicesMode: VisibleDevicesModeArgs,
 	}
-	args, env, err := ExpandPlaceholders(spec, 1, GPUVendorNVIDIA, GPUVendors{GPUVendorNVIDIA}, func(string) string { return "" }, "")
+	args, env, err := ExpandPlaceholders(spec, 1, GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatal(err)
 	}

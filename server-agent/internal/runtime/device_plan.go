@@ -146,7 +146,7 @@ func planDevices(spec Spec, topo GPUTopology) (devicePlan, error) {
 		hostIdx = append(hostIdx, k.Index)
 	}
 	hostIdx = dedupInts(hostIdx)
-	inject := spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs
+	inject := injectsVisibleDevices(spec)
 
 	renumbered := func(n int) []string {
 		names := make([]string, n)

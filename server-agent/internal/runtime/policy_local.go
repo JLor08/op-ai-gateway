@@ -189,7 +189,10 @@ func ParseGPUVendor(name string) GPUVendor {
 
 // VisibleDevicesVar returns the environment variable that restricts a child
 // to a chosen set of cards on vendor's stack, or "" when this agent has
-// nothing to set.
+// nothing to set. It is decided per spec, from the vendor of the spec's own
+// GPUs (planDevices, #434), not once for the host; a Vulkan spec whose cards'
+// Vulkan ordinals are known gets GGML_VK_VISIBLE_DEVICES instead, which this
+// function does not name.
 //
 // NVIDIA -> CUDA_VISIBLE_DEVICES. The universal one; every CUDA runtime, and
 // therefore llama.cpp/vLLM/ollama on NVIDIA, honours it.
@@ -224,24 +227,23 @@ func VisibleDevicesVar(vendor GPUVendor) string {
 	}
 }
 
-// injectedVisibleDevicesVar is the single rule for whether the agent puts a
-// visibility variable into the child's environment, and which one: only for a
-// SetVisibleDevices spec in env mode on a vendor that has such a variable.
-// Empty means nothing is injected and the child sees the declared host indices.
-func injectedVisibleDevicesVar(spec Spec, vendor GPUVendor) string {
-	if !spec.SetVisibleDevices || spec.VisibleDevicesMode == VisibleDevicesModeArgs {
-		return ""
-	}
-	return VisibleDevicesVar(vendor)
+// injectsVisibleDevices is the single rule for whether the agent may put a
+// visibility variable into the child's environment at all: only for a
+// SetVisibleDevices spec in env mode. Which variable, if any, is the per-spec
+// device plan's decision (planDevices).
+func injectsVisibleDevices(spec Spec) bool {
+	return spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs
 }
 
 // visibleDevicesOwnedVars is the set of environment variables the
 // SetVisibleDevices option OWNS: a spec may not hand-set any of them while the
 // option is on (ExpandPlaceholders refuses the pair outright -- trap 3).
 //
-// It is deliberately VENDOR-INDEPENDENT, i.e. the same three names are refused
-// on every host, even though only one of them would ever be SET on any given
-// one. Two reasons, and the second is the load-bearing one:
+// It is deliberately VENDOR-INDEPENDENT, i.e. the same four names are refused
+// on every host, even though only one of them would ever be SET for any given
+// spec. GGML_VK_VISIBLE_DEVICES is the Vulkan backend's filter, which the agent
+// sets for a Vulkan spec whose cards' Vulkan ordinals it knows (#434). Two
+// reasons, and the second is the load-bearing one:
 //
 //  1. The portal enforces the identical rule at save time and cannot know the
 //     agent's vendor (the gateway is OS- and hardware-agnostic; the config
@@ -268,6 +270,7 @@ var visibleDevicesOwnedVars = []string{
 	"CUDA_VISIBLE_DEVICES",
 	"ROCR_VISIBLE_DEVICES",
 	"HIP_VISIBLE_DEVICES",
+	vulkanVisibleDevicesVar,
 }
 
 // gpuIndices returns spec.GPUs' host indices in the operator's DECLARED array
@@ -275,6 +278,11 @@ var visibleDevicesOwnedVars = []string{
 // index list every visibility rendering is built from -- hostGPUIDs and
 // deviceList differ only in how they format it. Empty when the spec declares
 // no GPUs; every caller treats that as a refusal, not a value (trap 1).
+//
+// A shim for the RPC member path (rpc_member.go, rpc_classify.go) until #434
+// Task C3 moves it onto the per-spec device plan: a bare index is ambiguous on
+// a host with NVIDIA and AMD cards, so the spec's own expansion reads its GPU
+// keys (specDevices) instead.
 func gpuIndices(spec Spec) []int {
 	indices := make([]int, 0, len(spec.GPUs))
 	seen := make(map[int]bool, len(spec.GPUs))
@@ -288,9 +296,10 @@ func gpuIndices(spec Spec) []int {
 	return indices
 }
 
-// hostGPUIDs renders the ordered/deduped host indices as a comma-separated
-// decimal list ("5,2"): the value both SetVisibleDevices (env mode) and
-// ${HOST_GPU_IDS} emit. Empty string when the spec declares no GPUs.
+// hostGPUIDs renders the host indices of keys -- a spec's GPU keys, ordered
+// and deduplicated (specGPUKeys, planKeys) -- as a comma-separated decimal list
+// ("5,2"): the value ${HOST_GPU_IDS} emits, and the value a CUDA or ROCm
+// visibility variable carries. Empty string when the spec declares no GPUs.
 //
 // DECLARED ORDER, not sorted. The gateway persists an explicit position column
 // (agent_runtime_spec_gpus.position) and reads the rows back ORDER BY position,
@@ -309,11 +318,14 @@ func gpuIndices(spec Spec) []int {
 // CUDA_VISIBLE_DEVICES=1,1,2 silently yields ONE visible device, not three.
 // The gateway already refuses a duplicate index at save time; a file-mode
 // document is hand-written and has no such gate.
-func hostGPUIDs(spec Spec) string {
-	indices := gpuIndices(spec)
-	parts := make([]string, len(indices))
-	for i, idx := range indices {
-		parts[i] = strconv.Itoa(idx)
+//
+// The keys of one vendor never repeat an index, so this is a list of distinct
+// indices; a spec whose GPUs span NVIDIA and AMD has no host-index list at all
+// (specDevices.refuseSpanning).
+func hostGPUIDs(keys []GPUKey) string {
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = strconv.Itoa(k.Index)
 	}
 	return strings.Join(parts, ",")
 }
@@ -345,22 +357,25 @@ func hostGPUIDsMainLast(gpus []int) string {
 	return strings.Join(parts, ",")
 }
 
-// deviceList renders the ordered/deduped host indices (gpuIndices) as
+// deviceList renders the host indices of keys (as hostGPUIDs takes them) as
 // backend-prefixed llama.cpp --device names -- "CUDA3,CUDA2" for prefix
 // "CUDA", "Vulkan3,Vulkan2" for "Vulkan", "MTL3,MTL2" for "MTL". It is the
-// value the ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholders
-// emit; the order and dedup are identical to hostGPUIDs, only the formatting
+// value the ${CUDA_DEVICES}/${METAL_DEVICES} placeholders emit, and
+// ${VULKAN_DEVICES} where the agent did not inject GGML_VK_VISIBLE_DEVICES;
+// the order and dedup are identical to hostGPUIDs, only the formatting
 // differs. Empty string when the spec declares no GPUs.
 //
 // CAVEAT (documented, not enforced): a backend enumerates its own devices
 // independently of the host's GPU index, so Vulkan2/MTL2 are not guaranteed to
 // be the same physical card as host index 2; the operator verifies with
 // --list-devices. CUDA with CUDA_VISIBLE_DEVICES unset matches the host order.
-func deviceList(spec Spec, prefix string) string {
-	indices := gpuIndices(spec)
-	parts := make([]string, len(indices))
-	for i, idx := range indices {
-		parts[i] = prefix + strconv.Itoa(idx)
+// The caveat does not apply where the mapping exists: a Vulkan spec whose cards'
+// Vulkan ordinals the agent knows gets GGML_VK_VISIBLE_DEVICES and renders
+// Vulkan0.. in declared order instead (specDevices.vulkanNames).
+func deviceList(keys []GPUKey, prefix string) string {
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = prefix + strconv.Itoa(k.Index)
 	}
 	return strings.Join(parts, ",")
 }
@@ -898,8 +913,11 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // ${MODEL} (${GPU_IDS_FILE}, ${HOST_GPU_IDS_JSON} and friends are plausible
 // pass-through tokens, and an over-eager prefix rule breaks working specs
 // while a literal pass-through breaks only a spec that was already wrong). It
-// resolves to hostGPUIDs(spec) -- the spec's own declared GPU indices as the
-// HOST sees them, ascending, comma-separated, e.g. "2,3".
+// resolves to hostGPUIDs of the spec's GPU keys -- the spec's own declared GPU
+// indices as the HOST sees them, in declared order, comma-separated, e.g.
+// "2,3". Host indices are vendor-local, so the token is refused for a spec
+// whose GPUs span NVIDIA and AMD (#434), as are ${HOST_GPU_IDS_MAIN_LAST} and
+// the fixed-backend ${CUDA_*}/${METAL_*} device tokens.
 //
 // It exists as the manual escape hatch beside spec.SetVisibleDevices: an
 // operator on a runtime this agent has no vendor mapping for writes
@@ -924,14 +942,25 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // # SetVisibleDevices: making the GPU list an enforcement, not a declaration
 //
 // When spec.SetVisibleDevices is set in the default env mode, this function
-// adds ONE agent-owned variable to the child's environment:
-// VisibleDevicesVar(vendor) = hostGPUIDs(spec). vendor is the agent's own
-// locally-detected hardware, never anything the gateway said. On Apple or an
-// unrecognised stack the variable name is "" and nothing is added at all -- a
-// successful no-op, not an error. In args mode (VisibleDevicesMode == "args")
-// it adds NO variable: the operator enforces visibility through a
+// adds ONE agent-owned variable to the child's environment, which the per-spec
+// device plan decides from the vendor of the spec's own GPUs and the backend
+// they resolve to (planDevices, #434; topo is the agent's own locally-detected
+// hardware, never anything the gateway said): CUDA_VISIBLE_DEVICES or
+// ROCR_VISIBLE_DEVICES with the host indices for a CUDA or ROCm spec, and
+// GGML_VK_VISIBLE_DEVICES with the cards' Vulkan ordinals for a Vulkan spec
+// whose cards the hardware report mapped (on a single-vendor host without that
+// mapping a Vulkan spec keeps the vendor variable it always got). On Apple or
+// an unrecognised stack the variable name is "" and nothing is added at all --
+// a successful no-op, not an error. In args mode (VisibleDevicesMode ==
+// "args") it adds NO variable: the operator enforces visibility through a
 // ${CUDA_DEVICES}/${VULKAN_DEVICES}/${METAL_DEVICES} placeholder in args
 // instead, so the vendor env var is deliberately left unset.
+//
+// A spec the plan refuses -- a device_backend that cannot drive one of its
+// GPUs, a Vulkan spec on a host with NVIDIA and AMD GPUs whose cards are not
+// mapped or that runs without the variable -- fails with a *GPUPlanError where
+// the plan is consumed (the variable, ${DEVICES}, the Vulkan tokens); its
+// stable code reaches last_error.
 //
 // The four traps this option has to defuse, and where each is handled:
 //
@@ -974,9 +1003,9 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 //     resolves environment names case-insensitively and os/exec deduplicates
 //     them that way.
 //
-//  4. HOST INDICES, NOT CHILD INDICES. The emitted value is hostGPUIDs(spec)
-//     -- the spec's declared indices as the host sees them -- and so is
-//     ${HOST_GPU_IDS}. Pinned in that token's name, in hostGPUIDs's doc, and
+//  4. HOST INDICES, NOT CHILD INDICES. The emitted CUDA/ROCm value is the
+//     spec's declared indices as the host sees them (hostGPUIDs), and so is
+//     ${HOST_GPU_IDS}; GGML_VK_VISIBLE_DEVICES carries Vulkan ordinals. Pinned in that token's name, in hostGPUIDs's doc, and
 //     by TestExpandPlaceholdersHostGPUIDsAreHostIndices.
 //
 // ISOLATION IS STRUCTURAL, NOT ADDED. Every value above is computed from the
@@ -1014,8 +1043,8 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 // that performed the substitution. command.go turns that into the masked,
 // reportable ResolvedCommand; see its doc for why span-level provenance is
 // the only honest basis for masking a resolved command.
-func ExpandPlaceholders(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
-	ex, err := expandSpec(spec, port, vendor, vendors, getenv, configFilesDir)
+func ExpandPlaceholders(spec Spec, port int, topo GPUTopology, getenv func(string) string, configFilesDir string) (args []string, env []string, err error) {
+	ex, err := expandSpec(spec, port, topo, getenv, configFilesDir)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1077,9 +1106,9 @@ type expandedSpec struct {
 // the three exact-match siblings (${CUDA_DEVICES}/${VULKAN_DEVICES}/
 // ${METAL_DEVICES}) in a single branch with one shared empty-list guard.
 var deviceBackendByToken = map[string]string{
-	"CUDA_DEVICES":   "CUDA",
-	"VULKAN_DEVICES": "Vulkan",
-	"METAL_DEVICES":  "MTL",
+	"CUDA_DEVICES":   backendCUDA,
+	"VULKAN_DEVICES": backendVulkan,
+	"METAL_DEVICES":  backendMetal,
 }
 
 // resolveNonSecretToken resolves inner -- the text between "${" and "}" -- when
@@ -1087,7 +1116,7 @@ var deviceBackendByToken = map[string]string{
 // ${HOST_GPU_IDS}, ${HOST_GPU_IDS_MAIN_LAST}, ${CUDA_DEVICES},
 // ${VULKAN_DEVICES}, ${METAL_DEVICES} and ${CONFIG_DIR}. handled reports whether inner was one of them; err is non-nil
 // only when handled (the token exists but cannot be resolved for this spec).
-// gpuIDs is hostGPUIDs(spec), hoisted by the caller so it is computed once per
+// dev is the spec's device view (newSpecDevices), built by the caller once per
 // expansion rather than once per match.
 //
 // This is the ONE copy of that resolution. expandSpec (Args/Env) and
@@ -1096,7 +1125,7 @@ var deviceBackendByToken = map[string]string{
 // ${CONFIG_DIR} means. The secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are
 // deliberately NOT here: expandSpec resolves and masks them,
 // expandNonSecretText refuses them.
-func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string, dev deviceContext) (value string, handled bool, err error) {
+func resolveNonSecretToken(inner string, spec Spec, port int, configFilesDir string, dev specDevices) (value string, handled bool, err error) {
 	if v, ok, derr := resolveClusterDeviceToken(inner, spec, dev); ok {
 		return v, true, derr
 	}
@@ -1117,19 +1146,25 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 	// EXACT match only, same reasoning as ${MODEL} above. HOST, not
 	// child, indices -- the name says so because the digits do not.
 	if inner == "HOST_GPU_IDS" {
-		if gpuIDs == "" {
+		if len(dev.keys) == 0 {
 			return "", true, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
 		}
-		return gpuIDs, true, nil
+		if err := dev.refuseSpanning(inner); err != nil {
+			return "", true, err
+		}
+		return hostGPUIDs(dev.keys), true, nil
 	}
 
 	// EXACT match only, sibling of ${HOST_GPU_IDS}: the same host indices with
 	// the first declared (main) GPU moved last. Same empty-list refusal.
 	if inner == "HOST_GPU_IDS_MAIN_LAST" {
-		if gpuIDs == "" {
+		if len(dev.keys) == 0 {
 			return "", true, fmt.Errorf("${HOST_GPU_IDS_MAIN_LAST} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
 		}
-		return hostGPUIDsMainLast(gpuIndices(spec)), true, nil
+		if err := dev.refuseSpanning(inner); err != nil {
+			return "", true, err
+		}
+		return hostGPUIDsMainLast(dev.hostIndices()), true, nil
 	}
 
 	// The three llama.cpp --device placeholders, exact-match siblings of
@@ -1137,11 +1172,23 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 	// Same empty-list refusal, on the same reasoning (an empty --device
 	// list selects NO device, not every device). One table-driven branch
 	// for the three, so the shared guard and message live once.
+	// ${VULKAN_DEVICES} names the renumbered Vulkan0.. devices where the
+	// agent injected GGML_VK_VISIBLE_DEVICES (specDevices.vulkanNames).
 	if backend, ok := deviceBackendByToken[inner]; ok {
-		if gpuIDs == "" {
+		if len(dev.keys) == 0 {
 			return "", true, fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device", inner)
 		}
-		return deviceList(spec, backend), true, nil
+		if backend == backendVulkan {
+			names, verr := dev.vulkanNames(inner)
+			if verr != nil {
+				return "", true, verr
+			}
+			return strings.Join(names, ","), true, nil
+		}
+		if err := dev.refuseSpanning(inner); err != nil {
+			return "", true, err
+		}
+		return deviceList(dev.keys, backend), true, nil
 	}
 
 	// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and
@@ -1179,15 +1226,14 @@ func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFile
 }
 
 // placeholderExpander resolves the placeholders of one spec's args and env
-// values (expandSpec): the spec, its port and GPU list, the agent's
-// environment and config-files base, and the device context the generic
-// device tokens resolve against.
+// values (expandSpec): the spec, its port, the agent's environment and
+// config-files base, and the spec's device view every device token resolves
+// against.
 type placeholderExpander struct {
 	spec           Spec
 	port           int
-	gpuIDs         string
 	configFilesDir string
-	dev            deviceContext
+	dev            specDevices
 	getenv         func(string) string
 }
 
@@ -1222,7 +1268,7 @@ func (e placeholderExpander) expand(s string) (string, []secretSpan, error) {
 // the PORT/AGENT_ENV near-miss refusal, and finally pass-through as literal
 // text.
 func (e placeholderExpander) writeToken(b *strings.Builder, spans *[]secretSpan, match, inner string) error {
-	if v, handled, resolveErr := resolveNonSecretToken(inner, e.spec, e.port, e.gpuIDs, e.configFilesDir, e.dev); handled {
+	if v, handled, resolveErr := resolveNonSecretToken(inner, e.spec, e.port, e.configFilesDir, e.dev); handled {
 		if resolveErr != nil {
 			return resolveErr
 		}
@@ -1390,20 +1436,22 @@ func checkSpecEnv(spec Spec, envKeys []string, gpuIDs string) error {
 // because that is what it is -- a value this agent computed from local
 // hardware. It cannot collide with a spec key: checkSpecEnv's conflict
 // refusal is what guarantees that, exactly as the baseEnvNames reservation
-// guarantees it for PATH. A "" name means Apple or an unrecognised stack:
-// nothing is added and the child's environment is byte-identical to the
-// SetVisibleDevices-off one. Last, a cluster head runs with the RPC backend's
-// collective communication off: it is unsupported across rpc-server members,
-// and agent-owned like the visibility variable.
-func agentBaseEnv(spec Spec, vendor GPUVendor, gpuIDs string, getenv func(string) string) []string {
+// guarantees it for PATH. visVar and visValue are the per-spec plan's
+// variable (specDevices.visibility); a "" name means none (Apple, an
+// unrecognised stack, or no injection): nothing is added and the child's
+// environment is byte-identical to the SetVisibleDevices-off one. Last, a
+// cluster head runs with the RPC backend's collective communication off: it is
+// unsupported across rpc-server members, and agent-owned like the visibility
+// variable.
+func agentBaseEnv(spec Spec, visVar, visValue string, getenv func(string) string) []string {
 	env := make([]string, 0, len(baseEnvNames)+2)
 	for _, name := range baseEnvNames {
 		if v := getenv(name); v != "" {
 			env = append(env, name+"="+v)
 		}
 	}
-	if name := injectedVisibleDevicesVar(spec, vendor); name != "" {
-		env = append(env, name+"="+gpuIDs)
+	if visVar != "" {
+		env = append(env, visVar+"="+visValue)
 	}
 	if spec.IsClusterHead() {
 		env = append(env, "GGML_RPC_NO_COMM=1")
@@ -1422,14 +1470,12 @@ func agentBaseEnv(spec Spec, vendor GPUVendor, gpuIDs string, getenv func(string
 // observable; it changes no classification and no error. A failing match
 // returns immediately rather than setting a first-error and walking on, which
 // yields the identical error because the walk was, and is, left to right.
-// vendors is the host's detected vendor set, which only the generic device
-// tokens (${DEVICES}, ${FIRST_LOCAL_DEVICE}) consult to resolve an "auto"
-// device backend; nil falls back to the single vendor.
-func expandSpec(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
-	gpuIDs := hostGPUIDs(spec)
-	dev := newDeviceContext(spec, vendor, vendors)
+// topo is the host's GPU topology (owner.topology), from which the per-spec
+// device plan decides the visibility variable and the device tokens.
+func expandSpec(spec Spec, port int, topo GPUTopology, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
+	dev := newSpecDevices(spec, topo)
 
-	expand := placeholderExpander{spec: spec, port: port, gpuIDs: gpuIDs, configFilesDir: configFilesDir, dev: dev, getenv: getenv}.expand
+	expand := placeholderExpander{spec: spec, port: port, configFilesDir: configFilesDir, dev: dev, getenv: getenv}.expand
 
 	expandedArgs := make([]string, len(spec.Args))
 	argSpans := make([][]secretSpan, len(spec.Args))
@@ -1448,13 +1494,17 @@ func expandSpec(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, geten
 	}
 	sort.Strings(envKeys)
 
-	if err := checkSpecEnv(spec, envKeys, gpuIDs); err != nil {
+	if err := checkSpecEnv(spec, envKeys, hostGPUIDs(dev.keys)); err != nil {
+		return expandedSpec{}, err
+	}
+	visVar, visValue, err := dev.visibility(spec)
+	if err != nil {
 		return expandedSpec{}, err
 	}
 
 	// Minimal base: the agent-provided block (agentBaseEnv), then the spec's
 	// own entries.
-	base := agentBaseEnv(spec, vendor, gpuIDs, getenv)
+	base := agentBaseEnv(spec, visVar, visValue, getenv)
 	resultEnv := make([]string, 0, len(envKeys)+len(base))
 	// Index-aligned with resultEnv throughout: every append below appends to
 	// all three, so a later reader can never be off by one between a value

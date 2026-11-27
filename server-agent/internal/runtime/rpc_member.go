@@ -265,7 +265,7 @@ func (o *owner) memberDevicePrefix(spec Spec) (string, error) {
 	if len(gpuIndices(spec)) == 0 {
 		return "", nil
 	}
-	vendors := newDeviceContext(spec, o.gpuVendor, o.gpuVendors).vendors
+	vendors := newDeviceContext(o.gpuVendor, o.gpuVendors).vendors
 	prefix, err := ResolveDeviceBackend(spec, vendors)
 	if err != nil {
 		return "", fmt.Errorf("runtime: %w", err)
