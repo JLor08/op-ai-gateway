@@ -3749,6 +3749,29 @@ with `?position=`. A same-host cluster whose member server's agent is known to
 lack the flag (downgraded since the save) is withheld
 (`runtime.cluster_agent_too_old`).
 
+**Upgrading a host that already reports both vendors.** "No upgrade order is
+needed" ([§7.1](#71-agent-versioning)) holds for the legacy vendor and the GPU rows; it does not mean that
+every spec on a host whose agent already detected an NVIDIA **and** a
+ROCm-visible AMD card keeps running unchanged, because on such a host the
+refusals of this section apply eagerly from the 0.27.0 agent's first start:
+- an explicit `vulkan` spec with GPUs but **without** `set_visible_devices` in
+  `env` mode goes `not_permitted` (`runtime.vulkan_visible_devices_required`),
+  and one with it whose cards have no Vulkan ordinal (no `vulkaninfo` on the host,
+  a card missing from its output or listed twice) goes `not_permitted`
+  (`runtime.vulkan_mapping_unavailable`); the operator enables env-mode
+  visibility, or installs `vulkaninfo`;
+- an `auto` spec whose GPUs are all of one vendor switches from Vulkan to that
+  vendor's native backend (`cuda`/`rocm`) at its next start, so its child gets
+  `CUDA_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES` and native device names;
+- a hand-set `GGML_VK_VISIBLE_DEVICES` in the env of a spec with
+  `set_visible_devices` is refused when the agent starts the spec, not only when
+  the spec is next saved in the portal;
+- a literal `--device VulkanN` in a spec's args (numbered against the unfiltered
+  enumeration) must be rewritten to `${VULKAN_DEVICES}`/`${DEVICES}` or to
+  `Vulkan0..k-1` in declared order, on every host (§3.3).
+Check such hosts' specs before upgrading their agent; the portal's save-time
+codes name the same conditions.
+
 **What is verified and what is not.** The measurers, the Vulkan mapping and
 `GGML_VK_VISIBLE_DEVICES` (including `1,0` keeping the listed order) were checked
 on two single-vendor test VMs, the AMD test VM and the NVIDIA test VM (§5.3). **No
@@ -7175,7 +7198,9 @@ its old document (no vendors, only the rows it reads correctly). Two behaviour
 changes are deliberate on every host: `auto` is decided per spec (identical on a
 single-vendor host), and a `vulkan` spec with `set_visible_devices` in `env` mode
 gets `GGML_VK_VISIBLE_DEVICES` (§3.3), so a literal `--device VulkanN` in its args
-must be adapted.
+must be adapted. A host that already reports both vendors has further
+consequences at the upgrade (refused Vulkan specs, `auto` switching to the
+native backend, see [§3.10](#310-mixed-vendor-gpu-hosts)).
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/

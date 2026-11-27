@@ -14394,6 +14394,17 @@ members exist only for an agent with the second.
   gets `GGML_VK_VISIBLE_DEVICES`, so a spec with a literal `--device VulkanN` must be
   adapted. A hand-set `GGML_VK_VISIBLE_DEVICES` beside the option, accepted before, is
   refused. On a mixed host a Vulkan member runs with the injected variable too.
+- Hosts that **already** report both vendors are not covered by "no relaunch":
+  after the agent upgrade an explicit `vulkan` spec with GPUs but without env-mode
+  `set_visible_devices` goes `not_permitted`
+  (`runtime.vulkan_visible_devices_required`), as does one whose cards have no
+  Vulkan ordinal (no `vulkaninfo`: `runtime.vulkan_mapping_unavailable`); an
+  `auto` spec over one vendor's cards switches from Vulkan to the native backend
+  at its next start; a hand-set `GGML_VK_VISIBLE_DEVICES` beside
+  `set_visible_devices` is refused at agent start, not only on re-save; and a
+  literal `--device VulkanN` must be adapted. Decision 4 makes these refusals
+  deliberate (refuse rather than guess); the operator checks such hosts' specs before
+  the upgrade ([Agent-Managed Model Runtime §3.10](cross-cutting/agent-runtime-manager.md#310-mixed-vendor-gpu-hosts)).
 - Existing single-vendor hosts and configurations keep working with old and new
   agents: no relaunch on upgrade (the backfilled vendor equals the resolved one), no
   renumbering of AMD cards where KFD rank and rocm-smi card agreed (the AMD test VM),
