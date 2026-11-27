@@ -76,8 +76,10 @@
 # gateway/backend/internal/gateway holds 465 files, and it has no property that
 # bounds that. The JVM's own default, a quarter of the memory, is about 3 GB
 # inside a 12 GB docker VM: too little. Docker mode's -Xmx5g needs a docker VM
-# of at least about 8 GB. SONAR_SCANNER_EXTRA_ARGS adds arguments (such as
-# -Dsonar.javascript.node.maxspace=4608) to the scanner's command line, in both
+# of at least about 8 GB; with the JS/TS bridge's 4608 MB
+# (sonar.javascript.node.maxspace in sonar-project.properties) and the server,
+# roughly 12 GB. SONAR_SCANNER_EXTRA_ARGS adds arguments (such as
+# -Dsonar.go.duration.statistics=true) to the scanner's command line, in both
 # modes; it is split on whitespace.
 #
 # Credentials (admin password + API token) live in the gitignored
