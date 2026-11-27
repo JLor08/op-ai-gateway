@@ -1254,3 +1254,83 @@ func TestSameHostClusterWithheldForDowngradedAgent(t *testing.T) {
 		}
 	})
 }
+
+// crossVendorMemberFixture is a flagged, mixed NVIDIA+AMD member server whose
+// legacy vendor is nvidia.
+func crossVendorMemberFixture(t *testing.T) (*clusterFixture, ServerDTO) {
+	t.Helper()
+	f := newClusterFixture(t)
+	a := f.member("A")
+	features := f.clusterAgents(a.ID)
+	features[a.ID] = append(features[a.ID], AgentFeatureGPUVendorIdentity)
+	f.hostOS(a.ID, "linux")
+	f.hardware(a.ID, mixedHostReport(`["rocm","vulkan"]`))
+	if _, err := f.routes.BackfillServerGPUVendor(f.ctx, a.ID, routing.GPUVendorNVIDIA, false); err != nil {
+		t.Fatal(err)
+	}
+	return f, a
+}
+
+func vulkanMember(serverID string, gpus ...routing.GPUKey) ClusterMemberDTO {
+	m := ClusterMemberDTO{ServerID: serverID, DeviceBackend: "vulkan", GPUs: []ClusterMemberGPUDTO{}}
+	for _, g := range gpus {
+		m.GPUs = append(m.GPUs, ClusterMemberGPUDTO{Vendor: g.Vendor, Index: g.Index, VRAMEstimateMB: 8000})
+	}
+	return m
+}
+
+// A Vulkan member over NVIDIA 0 and AMD 0 exposes two devices: the head's
+// endpoint counts distinct GPU keys, not distinct indices.
+func TestClusterEndpointCountsGPUKeysAcrossVendors(t *testing.T) {
+	f, a := crossVendorMemberFixture(t)
+	head := f.mustPut(clusterHeadRequest(vulkanMember(a.ID,
+		routing.GPUKey{Vendor: routing.GPUVendorNVIDIA, Index: 0}, routing.GPUKey{Vendor: routing.GPUVendorAMD, Index: 0})))
+	hs, ok := specByID(f.config(f.head.ID), head.ID)
+	if !ok || hs.Cluster == nil {
+		t.Fatalf("head withheld: %q", f.withheldReason())
+	}
+	if got := hs.Cluster.Endpoints[0].DeviceCount; got != 2 {
+		t.Fatalf("device count = %d, want 2 (NVIDIA 0 and AMD 0)", got)
+	}
+}
+
+// Moving a member from NVIDIA 0 to AMD 0 changes the head's generation.
+func TestClusterGenerationFollowsMemberGPUVendor(t *testing.T) {
+	f, a := crossVendorMemberFixture(t)
+	generation := func(key routing.GPUKey) string {
+		t.Helper()
+		head := f.mustPut(clusterHeadRequest(vulkanMember(a.ID, key)))
+		hs, ok := specByID(f.config(f.head.ID), head.ID)
+		if !ok || hs.Cluster == nil {
+			t.Fatalf("head withheld: %q", f.withheldReason())
+		}
+		return hs.Cluster.Generation
+	}
+	nvidia := generation(routing.GPUKey{Vendor: routing.GPUVendorNVIDIA, Index: 0})
+	if amd := generation(routing.GPUKey{Vendor: routing.GPUVendorAMD, Index: 0}); amd == nvidia {
+		t.Fatal("generation unchanged by moving the member from NVIDIA 0 to AMD 0")
+	}
+}
+
+// A member whose GPUs are all of its server's legacy vendor keeps the
+// generation part it had before vendors existed, byte for byte, so an
+// existing cluster's head does not relaunch on the upgrade.
+func TestMemberGenerationPartWithoutCrossVendorKeysIsUnchanged(t *testing.T) {
+	part := memberGenerationPart{
+		Kind: memberModeAutomatic, ID: "m", Server: "s", Binary: "/rpc", Args: []string{"-t", "4"}, Env: map[string]string{},
+		DeviceBackend: "cuda", Version: "1", Commit: "c", Build: "b", DeviceCount: 2, GPUs: []int{0, 1},
+		Transport: "direct", Network: "lan", Bind: "0.0.0.0", Port: 50052,
+		GPUKeys: crossVendorGPUKeys([]AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Index: 1}}, "nvidia"),
+	}
+	raw, err := json.Marshal(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"kind":"automatic","id":"m","server":"s","binary":"/rpc","args":["-t","4"],"env":{},"cache_enabled":false,"device_backend":"cuda","version":"1","commit":"c","build":"b","device_count":2,"gpus":[0,1],"transport":"direct","network":"lan","bind":"0.0.0.0","port":50052}`
+	if string(raw) != want {
+		t.Fatalf("generation part = %s\nwant %s", raw, want)
+	}
+	if got := crossVendorGPUKeys([]AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Vendor: "amd", Index: 0}}, "nvidia"); !slices.Equal(got, []string{"amd:0"}) {
+		t.Fatalf("cross-vendor keys = %v, want [amd:0]", got)
+	}
+}

@@ -2658,13 +2658,20 @@ manual member GPU resync rewrites the membership the same way.
 **Derivation.** Each server's runtime document is derived on every read from the
 stored **configuration**, never from whether a member is up. For a head the
 document carries the `cluster` block: one endpoint per member in member order
-(`<address>:<port>`, and the member's device count: its deduplicated GPU rows,
-or 1 for a CPU member, which exposes its CPU device), the transport, the
+(`<address>:<port>`, and the member's device count: its distinct GPU keys, an
+empty vendor read as the member server's legacy vendor, so a Vulkan member over
+NVIDIA 0 and AMD 0 counts two; or 1 for a CPU member, which exposes its CPU
+device), the transport, the
 network, and `generation`, a digest of every member launch input the
 endpoints do not show (binaries and versions, args, env, the cache switch,
 device backends, GPU selections, bind addresses and ports; not the RPC
 protocol, which a probe can learn or lose without the binary changing): whatever relaunches
 a member relaunches the head, which would otherwise lose the member mid-request.
+The GPU selection enters it as the indices plus `gpu_keys`, the keys of the
+member's GPUs whose vendor is not its server's legacy vendor, omitted when there
+are none: moving a member from NVIDIA 0 to AMD 0 changes the generation, while a
+member with only legacy-vendor GPUs (every member before #434) hashes exactly as
+before, so no existing head relaunches for the upgrade.
 For a member server it carries one `rpc_server` spec per membership: the manual
 spec's id, or `rpca_<head spec id>_<server id>` for an automatic member, with
 `_m<n>` appended for the n-th automatic member of that head on that server by

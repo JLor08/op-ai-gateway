@@ -685,6 +685,36 @@ type memberGenerationPart struct {
 	Network       string            `json:"network"`
 	Bind          string            `json:"bind"`
 	Port          int               `json:"port"`
+	// GPUKeys lists the member's GPU keys ("vendor:index") whose vendor is
+	// not its server's legacy vendor (crossVendorGPUKeys): GPUs alone cannot
+	// tell NVIDIA 0 from AMD 0. Omitted when empty, so a member with only
+	// legacy-vendor GPUs (every member before vendors) hashes as before.
+	GPUKeys []string `json:"gpu_keys,omitempty"`
+}
+
+// memberDeviceCount is how many devices a member with gpus exposes to its
+// head: its distinct GPU keys, an empty vendor read as legacy, or 1 for a
+// CPU member (its CPU device). NVIDIA 0 and AMD 0 are two devices.
+func memberDeviceCount(gpus []AgentRuntimeSpecGPUDTO, legacy string) int {
+	keys := make(map[routing.GPUKey]struct{}, len(gpus))
+	for _, g := range gpus {
+		keys[resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy)] = struct{}{}
+	}
+	return max(len(keys), 1)
+}
+
+// crossVendorGPUKeys lists, in declared order, the keys ("vendor:index") of
+// gpus whose vendor, an empty one read as legacy, is not legacy; nil when
+// there are none.
+func crossVendorGPUKeys(gpus []AgentRuntimeSpecGPUDTO, legacy string) []string {
+	var out []string
+	for _, g := range gpus {
+		key := resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy)
+		if key.Vendor != legacy {
+			out = append(out, key.Vendor+":"+strconv.Itoa(key.Index))
+		}
+	}
+	return out
 }
 
 // buildCluster assembles a derivable cluster: the head's block and each
@@ -716,10 +746,7 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 		for _, g := range spec.GPUs {
 			indices = append(indices, g.Index)
 		}
-		devices := len(slices.Compact(slices.Sorted(slices.Values(indices))))
-		if devices == 0 {
-			devices = 1 // a CPU member exposes its CPU device
-		}
+		devices := memberDeviceCount(spec.GPUs, m.server.GPULegacyVendor)
 		block.Endpoints = append(block.Endpoints, AgentClusterEndpointDTO{
 			Address: net.JoinHostPort(m.address, strconv.Itoa(m.row.Port)), DeviceCount: devices,
 		})
@@ -733,7 +760,7 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 			CacheEnabled: spec.RPC.CacheEnabled, DeviceBackend: spec.DeviceBackend,
 			Version: m.binary.EffectiveVersion(),
 			Commit:  commit, Build: build, DeviceCount: devices, GPUs: indices, Transport: spec.RPC.Transport, Network: network,
-			Bind: m.bindIP, Port: m.row.Port,
+			Bind: m.bindIP, Port: m.row.Port, GPUKeys: crossVendorGPUKeys(spec.GPUs, m.server.GPULegacyVendor),
 		})
 		out.members = append(out.members, derivedMemberSpec{serverID: m.server.ID, spec: spec, address: m.address})
 	}
