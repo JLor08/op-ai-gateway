@@ -141,8 +141,11 @@ type agentTelemetryRequest struct {
 // only place a reader can learn HOW OLD a measurement is, since the stored
 // row carries no timestamp (see RuntimeStatusDTO.GPUs/MeasuredAt).
 type agentRuntimeGPUSample struct {
-	Index          int `json:"index"`
-	VRAMMeasuredMB int `json:"vram_measured_mb"`
+	Index int `json:"index"`
+	// Vendor names the GPU's vendor ("nvidia", "amd", "apple"); empty from an
+	// agent without gpu_vendor_identity. Sanitized on ingest.
+	Vendor         string `json:"vendor,omitempty"`
+	VRAMMeasuredMB int    `json:"vram_measured_mb"`
 }
 
 // agentRuntimeError is one managed process's last failure, as reported inside
@@ -694,7 +697,11 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 			if gpu.VRAMMeasuredMB <= 0 {
 				continue
 			}
-			dto.GPUs = append(dto.GPUs, RuntimeGPUStatusDTO(gpu))
+			dto.GPUs = append(dto.GPUs, RuntimeGPUStatusDTO{
+				Index:          gpu.Index,
+				Vendor:         sanitizeGPUVendor(gpu.Vendor),
+				VRAMMeasuredMB: gpu.VRAMMeasuredMB,
+			})
 		}
 		if len(dto.GPUs) > 0 {
 			dto.MeasuredAt = receivedAt
@@ -1992,7 +1999,11 @@ type agentNetReport struct {
 }
 
 type agentGPUReport struct {
-	Index         int     `json:"index"`
+	Index int `json:"index"`
+	// Vendor and PCIBusID are additive: an agent without gpu_vendor_identity
+	// omits them and they decode empty.
+	Vendor        string  `json:"vendor"`
+	PCIBusID      string  `json:"pci_bus_id"`
 	Name          string  `json:"name"`
 	UUID          string  `json:"uuid"`
 	UtilPct       float64 `json:"util_pct"`
@@ -2019,6 +2030,9 @@ type agentSystemReport struct {
 	Mainboard    agentMainboard  `json:"mainboard"`
 	BIOS         agentBIOS       `json:"bios"`
 	GPUs         []agentGPUInfo  `json:"gpus"`
+	// VulkanDeviceCount is how many Vulkan devices the agent's probe saw; 0
+	// when unknown or not probed.
+	VulkanDeviceCount int `json:"vulkan_device_count,omitempty"`
 }
 
 type agentCPUInfo struct {
@@ -2066,6 +2080,14 @@ type agentGPUInfo struct {
 	// the agent's sample.GPU.PCIBusID). The only logic reading it is the
 	// portal's gpuLooksNVIDIA, as an NVIDIA fallback behind an AMD name check.
 	PCIBusID string `json:"pci_bus_id,omitempty"`
+	// Vendor is "nvidia", "amd" or "apple"; empty when the agent does not
+	// report it (or reports something else).
+	Vendor string `json:"vendor,omitempty"`
+	// VRAMMeasurable lists the runtime backends ("cuda", "rocm", "vulkan")
+	// that can measure this GPU's VRAM.
+	VRAMMeasurable []string `json:"vram_measurable,omitempty"`
+	// VulkanOrdinal is the GPU's Vulkan device ordinal; nil when unknown.
+	VulkanOrdinal *int `json:"vulkan_ordinal,omitempty"`
 }
 
 // errAgentSystemReportInvalid: the system-report payload failed to parse (POST ->
@@ -2519,6 +2541,33 @@ func nonNegI64(v int64) int64 {
 	return v
 }
 
+// sanitizeGPUVendor lower-cases and trims an agent-reported GPU vendor and
+// keeps it only when it is one of the known wire values; anything else is the
+// legacy empty vendor.
+func sanitizeGPUVendor(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" || !routing.ValidGPUVendor(v) {
+		return ""
+	}
+	return v
+}
+
+// sanitizeVRAMMeasurable keeps only the known backend names, de-duplicated
+// and sorted; nil when none survive.
+func sanitizeVRAMMeasurable(in []string) []string {
+	var out []string
+	for _, b := range in {
+		switch b {
+		case "cuda", "rocm", "vulkan":
+			if !slices.Contains(out, b) {
+				out = append(out, b)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // sanitizeSystemReport clamps negatives, caps slice sizes + string lengths, forces a
 // non-nil GPUs slice, and re-marshals to a canonical JSON blob (stable Go field
 // order). It returns the canonical bytes + the effective collected_at (the report's
@@ -2567,9 +2616,16 @@ func sanitizeSystemReport(r *agentSystemReport, now time.Time) ([]byte, time.Tim
 		r.GPUs[i].UUID = clampHardwareString(r.GPUs[i].UUID)
 		r.GPUs[i].DriverVersion = clampHardwareString(r.GPUs[i].DriverVersion)
 		r.GPUs[i].PCIBusID = clampHardwareString(r.GPUs[i].PCIBusID)
+		r.GPUs[i].Vendor = sanitizeGPUVendor(r.GPUs[i].Vendor)
+		r.GPUs[i].VRAMMeasurable = sanitizeVRAMMeasurable(r.GPUs[i].VRAMMeasurable)
+		if o := r.GPUs[i].VulkanOrdinal; o != nil && *o < 0 {
+			r.GPUs[i].VulkanOrdinal = nil
+		}
 		r.GPUs[i].Index = nonNegI(r.GPUs[i].Index)
 		r.GPUs[i].MemoryTotalBytes = nonNegI64(r.GPUs[i].MemoryTotalBytes)
 	}
+
+	r.VulkanDeviceCount = nonNegI(r.VulkanDeviceCount)
 
 	collectedAt := r.CollectedAt
 	if collectedAt.IsZero() {
@@ -2772,7 +2828,9 @@ func telemetrySampleFromRequest(req agentTelemetryRequest, now time.Time) (routi
 			return routing.TelemetrySample{}, fmt.Errorf("gpu memory counters must be non-negative")
 		}
 		sample.GPUs = append(sample.GPUs, routing.GPUSample{
+			Vendor:        sanitizeGPUVendor(g.Vendor),
 			Index:         g.Index,
+			PCIBusID:      clampHardwareString(g.PCIBusID),
 			Name:          strings.TrimSpace(g.Name),
 			UUID:          strings.TrimSpace(g.UUID),
 			UtilPct:       g.UtilPct,
