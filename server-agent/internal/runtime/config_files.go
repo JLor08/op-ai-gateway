@@ -67,9 +67,28 @@ type plannedConfigFile struct {
 // ${AGENT_ENV:NAME} is refused without looking the variable up. An error names
 // the offending token's text, never any value.
 func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, _ func(string) string, configFilesDir string) (string, error) {
-	matches := placeholderPattern.FindAllStringIndex(content, -1)
+	return expandNonSecretText(content, whatConfigFileContent, spec, port, vendor, vendors, configFilesDir)
+}
+
+// The surfaces expandNonSecretText expands, as they appear in its errors.
+const (
+	whatConfigFileContent = "config file content"
+	whatLogFilePath       = "log file path"
+)
+
+// expandNonSecretText is the one expansion loop behind every surface that
+// resolves only the NON-SECRET placeholders: config file content (#257) and a
+// declared log file's path (#430). The rules are expandConfigFileContent's (see
+// its doc): resolveNonSecretToken for the non-secret tokens, ${API_TOKEN} and
+// every ${AGENT_ENV...} spelling a hard error, a malformed ${PORT...} a hard
+// error, every other "${...}" and all plain text passed through literally.
+// what names the surface in the errors (whatConfigFileContent or
+// whatLogFilePath), so a refusal says where the token was found. The agent
+// environment is never read.
+func expandNonSecretText(text, what string, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (string, error) {
+	matches := placeholderPattern.FindAllStringIndex(text, -1)
 	if len(matches) == 0 {
-		return content, nil
+		return text, nil
 	}
 	gpuIDs := hostGPUIDs(spec)
 	dev := newDeviceContext(spec, vendor, vendors)
@@ -77,9 +96,9 @@ func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVend
 	var b strings.Builder
 	copied := 0
 	for _, m := range matches {
-		b.WriteString(content[copied:m[0]])
+		b.WriteString(text[copied:m[0]])
 		copied = m[1]
-		match := content[m[0]:m[1]]
+		match := text[m[0]:m[1]]
 		inner := match[2 : len(match)-1] // strip "${" and "}"
 
 		v, handled, err := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir, dev)
@@ -94,21 +113,36 @@ func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVend
 		// The two secret tokens. Exact-match ${API_TOKEN}; for the agent
 		// environment ANY ${AGENT_ENV...} spelling is refused (valid, empty-name
 		// or typo'd), because the only safe thing to do with a reference to a
-		// secret source in a file is not to guess what was meant.
+		// secret source here is not to guess what was meant.
 		if inner == "API_TOKEN" {
-			return "", fmt.Errorf("%s may not appear in config file content: a written file never carries a secret (pass it through args or env instead)", match)
+			return "", fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, false))
 		}
 		upper := strings.ToUpper(inner)
 		if strings.HasPrefix(upper, "AGENT_ENV") {
-			return "", fmt.Errorf("%s may not appear in config file content: a written file never carries a secret read from the agent environment (pass it through env instead)", match)
+			return "", fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, true))
 		}
 		if strings.HasPrefix(upper, "PORT") {
 			return "", fmt.Errorf("malformed placeholder %s looks like a PORT reference but does not match the expected syntax", match)
 		}
 		b.WriteString(match)
 	}
-	b.WriteString(content[copied:])
+	b.WriteString(text[copied:])
 	return b.String(), nil
+}
+
+// secretTokenRefusalReason is the "why" of a secret-token refusal on surface
+// what. The config-file wording is the long-standing one, kept verbatim.
+func secretTokenRefusalReason(what string, agentEnv bool) string {
+	switch {
+	case what == whatConfigFileContent && agentEnv:
+		return "a written file never carries a secret read from the agent environment (pass it through env instead)"
+	case what == whatConfigFileContent:
+		return "a written file never carries a secret (pass it through args or env instead)"
+	case agentEnv:
+		return "a path the agent reads is never built from a secret read from the agent environment"
+	default:
+		return "a path the agent reads is never built from a secret"
+	}
 }
 
 // planSpecConfigFiles validates and expands every one of spec's config files

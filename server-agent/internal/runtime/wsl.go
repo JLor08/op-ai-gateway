@@ -239,6 +239,37 @@ func windowsPathToWSL(p string) (string, error) {
 	return "", fmt.Errorf("runtime: %q is not a drive path that maps into a WSL distro (UNC and relative paths cannot)", p)
 }
 
+// wslPathToWindows is the inverse of windowsPathToWSL for the drive mounts: a
+// distro path /mnt/<drive>[/rest] maps to <DRIVE>:\rest, the Windows path of
+// the same file, so the log-file policy (#430, design §5.4) can check it
+// against the agent's native allowlist entries. It reports false for every
+// other path -- distro-internal ones, /mnt itself, a mount that is not a single
+// lower-case letter (WSL mounts drives lower-case; /mnt/C is not the C: drive)
+// -- and for any path it cannot map without guessing:
+//
+//   - two leading separators, which POSIX leaves implementation-defined;
+//   - a backslash or a colon anywhere: both are ordinary name characters in
+//     the distro, but on Windows a backslash is a separator (so `a\..\..` would
+//     climb) and a colon names an alternate data stream;
+//   - a ".." that leaves the drive's mount. path.Clean runs first, the same
+//     lexical reading the distro gives the path, so /mnt/c/a/../b is C:\b
+//     and /mnt/c/.. is /mnt, which maps to nothing.
+//
+// Symlinks inside the drive are not resolved here; the opened file's final
+// path is what the policy checks last.
+func wslPathToWindows(p string) (string, bool) {
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || strings.ContainsAny(p, `\:`) {
+		return "", false
+	}
+	c := path.Clean(p)
+	rest, ok := strings.CutPrefix(c, "/mnt/")
+	if !ok || rest == "" || rest[0] < 'a' || rest[0] > 'z' || len(rest) > 1 && rest[1] != '/' {
+		return "", false
+	}
+	drive := strings.ToUpper(rest[:1])
+	return drive + `:\` + strings.ReplaceAll(strings.TrimPrefix(rest[1:], "/"), "/", `\`), true
+}
+
 func isWindowsSep(c byte) bool { return c == '/' || c == '\\' }
 
 // climbsAboveRoot reports whether the slash-separated path p, read from a

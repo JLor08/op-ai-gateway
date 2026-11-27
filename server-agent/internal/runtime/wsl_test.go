@@ -198,3 +198,41 @@ func TestConfigDirPlaceholderIsLinuxPathForWSL(t *testing.T) {
 		t.Errorf("native args = %q, err = %v", args, err)
 	}
 }
+
+// TestWSLPathToWindows pins the inverse of windowsPathToWSL for the log-file
+// policy (#430, design §5.4): only a lower-case single-letter /mnt/<drive>
+// mount maps back, and anything whose meaning differs on the two sides of the
+// boundary (a backslash or a colon in a POSIX name) is refused, not guessed.
+func TestWSLPathToWindows(t *testing.T) {
+	for in, want := range map[string]string{
+		"/mnt/c/a/b":     `C:\a\b`,
+		"/mnt/c":         `C:\`,
+		"/mnt/c/":        `C:\`,
+		"/mnt/d/x/":      `D:\x`,
+		"/mnt/c/a/./b":   `C:\a\b`,
+		"/mnt/c/a/../b":  `C:\b`,
+		"/mnt/z/logs/x":  `Z:\logs\x`,
+		"/mnt/c/a b/c.d": `C:\a b\c.d`,
+	} {
+		got, ok := wslPathToWindows(in)
+		if !ok || got != want {
+			t.Errorf("wslPathToWindows(%q) = %q, %v; want %q, true", in, got, ok, want)
+		}
+	}
+	for _, in := range []string{
+		"/home/x", "/mnt/cc/x", "/mnt", "/mnt/", "/mnt/1/x", "", "mnt/c/x", "relative",
+		// Not a drive mount WSL creates (drives mount lower-case).
+		"/mnt/C/x",
+		// A .. that leaves the drive's mount names no drive path.
+		"/mnt/c/..", "/mnt/c/../../etc",
+		// A backslash is a name character in the distro but a separator on
+		// Windows; a colon names an alternate data stream there.
+		`/mnt/c/a\..\..\x`, "/mnt/c/x.log:stream",
+		// Two leading separators.
+		"//mnt/c/x",
+	} {
+		if got, ok := wslPathToWindows(in); ok {
+			t.Errorf("wslPathToWindows(%q) = %q, true; want false", in, got)
+		}
+	}
+}

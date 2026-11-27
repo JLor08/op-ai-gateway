@@ -1091,10 +1091,11 @@ var deviceBackendByToken = map[string]string{
 // expansion rather than once per match.
 //
 // This is the ONE copy of that resolution. expandSpec (Args/Env) and
-// expandConfigFileContent (config_files content, #257) both call it, so the two
-// surfaces cannot drift apart on what ${MODEL} or ${CONFIG_DIR} means. The
-// secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are deliberately NOT here:
-// expandSpec resolves and masks them, expandConfigFileContent refuses them.
+// expandNonSecretText (config_files content, #257, and log_files paths, #430)
+// both call it, so the surfaces cannot drift apart on what ${MODEL} or
+// ${CONFIG_DIR} means. The secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are
+// deliberately NOT here: expandSpec resolves and masks them,
+// expandNonSecretText refuses them.
 func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string, dev deviceContext) (value string, handled bool, err error) {
 	if v, ok, derr := resolveClusterDeviceToken(inner, spec, dev); ok {
 		return v, true, derr
