@@ -293,6 +293,7 @@ const logFileIssueLabel: Record<LogFileIssue, MessageKey> = {
   path_control: 'runtimeSpecLogFilePathControl',
   path_secret: 'runtimeSpecLogFilePathSecret',
   path_not_absolute: 'runtimeSpecLogFilePathNotAbsolute',
+  path_is_config_file: 'runtimeSpecLogFilePathIsConfigFile',
 };
 
 // The warning codes RuntimeWarnings emits today (see
@@ -3383,7 +3384,10 @@ export function RuntimeAdminSection({
   // same lists with a 400, and on a CREATE the mapping is written before its
   // spec. Names the offending row, never its path.
   function logFilesError(): string | undefined {
-    const issues = logFileIssues(logFiles);
+    const issues = logFileIssues(
+      logFiles,
+      configFiles.map((r) => r.name),
+    );
     const idx = issues.findIndex((issue) => issue !== null);
     if (idx < 0) return undefined;
     const issue = issues[idx]!;
@@ -5204,7 +5208,10 @@ export function RuntimeAdminSection({
     // Same advisory shape for log files (#430): an agent without
     // runtime_log_files ignores the list, but the gateway stores it, so saving
     // stays possible.
-    const logFileRowIssues = logFileIssues(logFiles);
+    const logFileRowIssues = logFileIssues(
+      logFiles,
+      configFiles.map((r) => r.name),
+    );
     const showAgentNoLogFiles =
       logFiles.length > 0 && reportReady && !agentFeatures.includes('runtime_log_files');
     // ${HOST_GPU_IDS_MAIN_LAST} (#424) is expanded by the agent only when it
@@ -5753,7 +5760,8 @@ export function RuntimeAdminSection({
                   issue === 'path_too_long' ||
                   issue === 'path_control' ||
                   issue === 'path_secret' ||
-                  issue === 'path_not_absolute'
+                  issue === 'path_not_absolute' ||
+                  issue === 'path_is_config_file'
                     ? issue
                     : null;
                 return (

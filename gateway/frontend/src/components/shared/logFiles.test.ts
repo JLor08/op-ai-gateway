@@ -7,7 +7,7 @@ import { LOG_FILES_MAX, logFileIssues } from './logFiles';
 const ok = { name: 'app', path: '${CONFIG_DIR}/app.log' };
 
 function issue(file: { name: string; path: string }) {
-  return logFileIssues([file])[0];
+  return logFileIssues([file], [])[0];
 }
 
 describe('logFileIssues', () => {
@@ -52,11 +52,14 @@ describe('logFileIssues', () => {
   });
 
   it('flags the later of two names that collide case-insensitively', () => {
-    expect(logFileIssues([ok, { name: 'APP', path: '/x/y' }])).toEqual([null, 'name_duplicate']);
+    expect(logFileIssues([ok, { name: 'APP', path: '/x/y' }], [])).toEqual([
+      null,
+      'name_duplicate',
+    ]);
   });
 
   it('does not let an invalid row claim its name', () => {
-    expect(logFileIssues([{ name: 'a b', path: ok.path }, ok])).toEqual(['name_invalid', null]);
+    expect(logFileIssues([{ name: 'a b', path: ok.path }, ok], [])).toEqual(['name_invalid', null]);
   });
 
   it('flags a blank path', () => {
@@ -100,13 +103,35 @@ describe('logFileIssues', () => {
     expect(issue({ name: 'app', path })).toBe('path_not_absolute');
   });
 
+  // logFilePathIsConfigFile: the agent removes a ${CONFIG_DIR} log file before
+  // exec, so one named like a config file would delete it.
+  it.each([
+    ['${CONFIG_DIR}/run.json'],
+    ['${CONFIG_DIR}\\run.json'],
+    ['${CONFIG_DIR}/RUN.JSON'],
+    ['${CONFIG_DIR}/server.toml'],
+  ])('flags the config-file path %j', (path) => {
+    expect(logFileIssues([{ name: 'app', path }], ['run.json', 'Server.Toml'])[0]).toBe(
+      'path_is_config_file',
+    );
+  });
+
+  it.each([
+    ['${CONFIG_DIR}/engine.log'],
+    ['${CONFIG_DIR}/logs/run.json'],
+    ['${CONFIG_DIR}/run.json.log'],
+    ['/var/log/run.json'],
+  ])('accepts %j beside a config file run.json', (path) => {
+    expect(logFileIssues([{ name: 'app', path }], ['run.json'])[0]).toBeNull();
+  });
+
   it('reports the first problem in the gateway order: name, reserved, duplicate, path', () => {
     expect(issue({ name: 'process', path: '' })).toBe('name_reserved');
     expect(issue({ name: 'app', path: '${API_TOKEN}' })).toBe('path_secret');
   });
 
   it('is index-aligned', () => {
-    expect(logFileIssues([ok, { name: 'b', path: 'rel' }, ok])).toEqual([
+    expect(logFileIssues([ok, { name: 'b', path: 'rel' }, ok], [])).toEqual([
       null,
       'path_not_absolute',
       'name_duplicate',

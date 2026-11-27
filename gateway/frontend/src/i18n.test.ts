@@ -4905,6 +4905,7 @@ describe('runtime log files i18n keys (#430)', () => {
       'runtimeSpecLogFilePathControl',
       'runtimeSpecLogFilePathSecret',
       'runtimeSpecLogFilePathNotAbsolute',
+      'runtimeSpecLogFilePathIsConfigFile',
       'runtimeSpecAgentNoLogFiles',
       'runtimeParseErrorInvalidLogFiles',
     ] as const;

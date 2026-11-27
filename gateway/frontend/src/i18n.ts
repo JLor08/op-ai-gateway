@@ -1672,6 +1672,8 @@ const de = {
     'Der Pfad darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten – er wird unverschlüsselt übertragen und angezeigt.',
   runtimeSpecLogFilePathNotAbsolute:
     'Der Pfad muss absolut sein oder mit ${CONFIG_DIR} und einem Pfadtrenner beginnen.',
+  runtimeSpecLogFilePathIsConfigFile:
+    'Der Pfad ist eine der Konfigurationsdateien dieser Spezifikation in ${CONFIG_DIR}: Der Agent entfernt eine Log-Datei dort vor dem Start und würde die Konfigurationsdatei löschen. Wählen Sie einen anderen Dateinamen.',
   runtimeSpecAgentNoLogFiles:
     'Der verbundene Agent meldet „runtime_log_files“ nicht (benötigt Version 0.26.0 oder neuer): Er liest diese Log-Dateien nicht mit. Speichern ist trotzdem möglich.',
   runtimeSpecArgsHint:
@@ -5950,6 +5952,8 @@ const en: PortalMessages = {
     'The path must not contain ${API_TOKEN} or ${AGENT_ENV:…} — it is sent and shown unencrypted.',
   runtimeSpecLogFilePathNotAbsolute:
     'The path must be absolute or start with ${CONFIG_DIR} followed by a path separator.',
+  runtimeSpecLogFilePathIsConfigFile:
+    "The path is one of this spec's config files in ${CONFIG_DIR}: the agent removes a log file there before the start and would delete the config file. Choose another file name.",
   runtimeSpecAgentNoLogFiles:
     'The connected agent does not report "runtime_log_files" (needs version 0.26.0 or newer): it does not tail these log files. Saving still works.',
   runtimeSpecArgsHint:

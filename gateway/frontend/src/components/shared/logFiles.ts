@@ -36,7 +36,8 @@ export type LogFileIssue =
   | 'path_too_long'
   | 'path_control'
   | 'path_secret'
-  | 'path_not_absolute';
+  | 'path_not_absolute'
+  | 'path_is_config_file';
 
 const utf8 = new TextEncoder();
 
@@ -55,6 +56,18 @@ function hasConfigDirRoot(path: string): boolean {
   if (!path.startsWith(CONFIG_DIR)) return false;
   const rest = path.slice(CONFIG_DIR.length);
   return rest === '' || rest[0] === '/' || rest[0] === '\\';
+}
+
+// logFilePathIsConfigFile: exactly ${CONFIG_DIR}/<name> or ${CONFIG_DIR}\<name>
+// for a config file's name, compared case-insensitively. The agent removes a
+// log file directly in ${CONFIG_DIR} before exec, which would delete the config
+// file it has just written.
+function isConfigFilePath(path: string, configFileNames: readonly string[]): boolean {
+  if (!hasConfigDirRoot(path)) return false;
+  const leaf = path.slice(CONFIG_DIR.length + 1);
+  if (leaf === '') return false;
+  const key = leaf.toLowerCase();
+  return configFileNames.some((name) => name.toLowerCase() === key);
 }
 
 // The absolute-path helpers below transcribe isAbsPOSIXBinaryPath /
@@ -138,12 +151,17 @@ function isAbsWindowsPath(path: string): boolean {
 /**
  * The first problem of each row, in the gateway's own order per file (name,
  * reserved, repeat, path blank, length, control character, secret placeholder,
- * root), or null for a clean row. Index-aligned with `files`. A repeat is
- * flagged on the LATER row only, names compared case-insensitively; a row whose
- * own name is refused is not counted as having claimed it. The entry COUNT is
- * the add button's business (LOG_FILES_MAX), not a row's.
+ * root, a config file's own path), or null for a clean row. Index-aligned with
+ * `files`. A repeat is flagged on the LATER row only, names compared
+ * case-insensitively; a row whose own name is refused is not counted as having
+ * claimed it. `configFileNames` are the spec's config_files names: a path that
+ * is exactly one of them in ${CONFIG_DIR} is `path_is_config_file`. The entry
+ * COUNT is the add button's business (LOG_FILES_MAX), not a row's.
  */
-export function logFileIssues(files: readonly LogFile[]): (LogFileIssue | null)[] {
+export function logFileIssues(
+  files: readonly LogFile[],
+  configFileNames: readonly string[],
+): (LogFileIssue | null)[] {
   const seen = new Set<string>();
   return files.map((file) => {
     if (file.name.trim() === '') return 'name_blank';
@@ -165,6 +183,7 @@ export function logFileIssues(files: readonly LogFile[]): (LogFileIssue | null)[
     ) {
       return 'path_not_absolute';
     }
+    if (isConfigFilePath(file.path, configFileNames)) return 'path_is_config_file';
     return null;
   });
 }

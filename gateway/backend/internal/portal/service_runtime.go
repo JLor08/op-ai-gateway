@@ -1562,7 +1562,7 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	}
 	// log_files (#430) is the newest request validation, so it runs last: it
 	// cannot rewrite the answer to a body already invalid for a shipped reason.
-	if f.logFiles, err = validateRuntimeSpecLogFiles(req.LogFiles); err != nil {
+	if f.logFiles, err = validateRuntimeSpecLogFiles(req.LogFiles, req.ConfigFiles); err != nil {
 		return runtimeSpecFields{}, err
 	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
@@ -2358,12 +2358,15 @@ func validateRuntimeSpecConfigFiles(files []ConfigFileDTO) (string, error) {
 //     and never "process" (case-insensitive), the process stream's own key;
 //   - a non-empty path of at most runtimeSpecLogFilePathMaxBytes bytes that
 //     starts with ${CONFIG_DIR} (then a separator or the end) or is absolute on either platform, and carries
-//     no secret placeholder or control character (the path travels in the clear and is reported).
+//     no secret placeholder or control character (the path travels in the clear and is reported);
+//   - a path that is not exactly ${CONFIG_DIR}/<name> or ${CONFIG_DIR}\<name> for
+//     a <name> of configFiles, the spec's own config files, compared
+//     case-insensitively (logFilePathIsConfigFile).
 //
 // Every refusal wraps ErrRuntimeSpecLogFilesInvalid and names the entry by
 // index or name, never quoting the path. The agent re-checks and applies its own
 // allowlist; this is the early-feedback layer.
-func validateRuntimeSpecLogFiles(files []LogFileDTO) (string, error) {
+func validateRuntimeSpecLogFiles(files []LogFileDTO, configFiles []ConfigFileDTO) (string, error) {
 	if len(files) == 0 {
 		return "", nil
 	}
@@ -2408,12 +2411,37 @@ func validateRuntimeSpecLogFiles(files []LogFileDTO) (string, error) {
 			return "", fmt.Errorf("%w: the path of log file %q must be absolute or start with %s, which must be followed by a path separator",
 				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
 		}
+		if logFilePathIsConfigFile(f.Path, configFiles) {
+			return "", fmt.Errorf("%w: log file %q names one of the spec's config files in %s, which the agent would remove before the start",
+				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
+		}
 	}
 	encoded, err := json.Marshal(files)
 	if err != nil {
 		return "", fmt.Errorf("%w: %w", ErrRuntimeSpecLogFilesInvalid, err)
 	}
 	return string(encoded), nil
+}
+
+// logFilePathIsConfigFile reports whether p is exactly ${CONFIG_DIR}/<name> or
+// ${CONFIG_DIR}\<name>, where <name> equals one of configFiles' names
+// case-insensitively. The agent removes a log file directly in ${CONFIG_DIR}
+// before exec so each generation's file is its own; at a config file's name
+// that would delete the file the agent has just written. Case-insensitive
+// because the agent may run on Windows; the agent refuses the overlap at start
+// time too (file_not_permitted), and its parse stays permissive.
+func logFilePathIsConfigFile(p string, configFiles []ConfigFileDTO) bool {
+	rest, ok := strings.CutPrefix(p, runtimeSpecLogFileConfigDir)
+	if !ok || rest == "" || (rest[0] != '/' && rest[0] != '\\') {
+		return false
+	}
+	leaf := rest[1:]
+	for _, cf := range configFiles {
+		if strings.EqualFold(cf.Name, leaf) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasLogFileConfigDirRoot reports whether p is rooted at ${CONFIG_DIR}: the

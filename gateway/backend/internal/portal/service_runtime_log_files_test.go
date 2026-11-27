@@ -70,7 +70,7 @@ func TestValidateRuntimeSpecLogFiles(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := validateRuntimeSpecLogFiles(tc.files)
+			got, err := validateRuntimeSpecLogFiles(tc.files, nil)
 			if tc.wantInvalid {
 				if !errors.Is(err, ErrRuntimeSpecLogFilesInvalid) {
 					t.Fatalf("err = %v, want ErrRuntimeSpecLogFilesInvalid", err)
@@ -97,6 +97,54 @@ func TestValidateRuntimeSpecLogFiles(t *testing.T) {
 				t.Fatalf("serialized = %q, want %q", got, tc.wantJSON)
 			}
 		})
+	}
+}
+
+// TestValidateRuntimeSpecLogFilesRefusesAConfigFileName pins that a log file
+// declared at exactly ${CONFIG_DIR}/<name> (either separator), where <name> is
+// one of the spec's config_files compared case-insensitively, is refused: the
+// agent removes a ${CONFIG_DIR} log file before exec and would delete the
+// config file it has just written. The refusal names the log file, never the
+// path; a deeper path, another name or an absolute path stays valid.
+func TestValidateRuntimeSpecLogFilesRefusesAConfigFileName(t *testing.T) {
+	configFiles := []ConfigFileDTO{{Name: "run.json", Content: "{}"}, {Name: "Server.Toml", Content: ""}}
+	for _, tc := range []struct {
+		name, path  string
+		wantInvalid bool
+	}{
+		{"slash", "${CONFIG_DIR}/run.json", true},
+		{"backslash", `${CONFIG_DIR}\run.json`, true},
+		{"case-insensitive", "${CONFIG_DIR}/RUN.JSON", true},
+		{"second config file", "${CONFIG_DIR}/server.toml", true},
+		{"other name", "${CONFIG_DIR}/engine.log", false},
+		{"subdirectory", "${CONFIG_DIR}/logs/run.json", false},
+		{"prefix only", "${CONFIG_DIR}/run.json.log", false},
+		{"absolute", "/var/log/run.json", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateRuntimeSpecLogFiles([]LogFileDTO{{Name: "engine", Path: tc.path}}, configFiles)
+			if !tc.wantInvalid {
+				if err != nil {
+					t.Fatalf("err = %v, want valid", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrRuntimeSpecLogFilesInvalid) {
+				t.Fatalf("err = %v, want ErrRuntimeSpecLogFilesInvalid", err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, `"engine"`) || strings.Contains(msg, tc.path) || strings.Contains(strings.ToLower(msg), "run.json") {
+				t.Fatalf("err = %q, want it to name the log file and not the path", msg)
+			}
+		})
+	}
+	// Through the request validator: the spec's own config_files count.
+	req := PutRuntimeSpecRequest{
+		Binary:      "/usr/local/bin/llama-server",
+		ConfigFiles: []ConfigFileDTO{{Name: "run.json", Content: "{}"}},
+		LogFiles:    []LogFileDTO{{Name: "x", Path: "${CONFIG_DIR}/run.json"}},
+	}
+	if _, err := validateRuntimeSpecRequest(req); !errors.Is(err, ErrRuntimeSpecLogFilesInvalid) {
+		t.Fatalf("request err = %v, want ErrRuntimeSpecLogFilesInvalid", err)
 	}
 }
 

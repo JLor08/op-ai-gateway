@@ -11303,6 +11303,22 @@ describe('RuntimeAdminSection log files editor (#430)', () => {
     expect(await screen.findByText(t.runtimeSpecLogFilePathNotAbsolute)).toBeInTheDocument();
   });
 
+  it("refuses a log file at the path of one of the spec's config files", async () => {
+    const { putSpecs } = await openEditFor({
+      config_files: [{ name: 'run.json', content: '{}' }],
+      log_files: [{ name: 'x', path: '${CONFIG_DIR}/RUN.json' }],
+    });
+    expect(await screen.findByText(t.runtimeSpecLogFilePathIsConfigFile)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(
+      await screen.findByText(
+        `${t.runtimeSpecLogFiles} (x): ${t.runtimeSpecLogFilePathIsConfigFile}`,
+      ),
+    ).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
   describe('agent feature warning (runtime_log_files)', () => {
     const withFiles = { log_files: [filesOnTheServer[0]] };
 

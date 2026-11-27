@@ -111,7 +111,7 @@ describe('importStrataRunConfig', () => {
 
   it('produces names and paths the log-file validation accepts', () => {
     const r = ok(run((o) => (o.replicas = 6)));
-    expect(logFileIssues(r.logFiles)).toEqual(r.logFiles.map(() => null));
+    expect(logFileIssues(r.logFiles, ['strata.json'])).toEqual(r.logFiles.map(() => null));
   });
 
   it('sets model_name to ${MODEL}, gpu_order to as_given, and pretty-prints', () => {
