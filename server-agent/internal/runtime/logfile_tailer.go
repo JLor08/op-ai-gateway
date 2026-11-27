@@ -83,10 +83,10 @@ import (
 // start until the next bytes decide it. At a NATURAL boundary -- a rotation,
 // a truncation, the end -- the tailer resolves that carry (procLog.Flush)
 // before the marker: the stream really ends there. At a cut the tailer makes
-// ITSELF in the middle of the text -- a line cut, a skip past the rate cap --
-// the bytes after the cut are not the continuation, and resolving the carry
-// would write the first part of a secret straddling the cut in clear; there
-// the carry is DISCARDED (procLog.DiscardCarry) and counted as dropped. After
+// ITSELF in the middle of the text -- a line cut, a skip past the rate cap,
+// the stop at a binary blob -- the bytes after the cut are not the
+// continuation, and resolving the carry would write the first part of a
+// secret straddling the cut in clear; there the carry is DISCARDED (procLog.DiscardCarry) and counted as dropped. After
 // a skip, reading resumes at the next line start (the bytes up to and
 // including the next \n are dropped and counted too), so the end of a secret
 // the skip cut through is never written either.
@@ -285,6 +285,16 @@ func (t *fileTailer) run() {
 
 // poll is one step of the loop (see the file comment).
 func (t *fileTailer) poll() {
+	if t.stopping && !t.probesDone {
+		// EndGrace may have come before the Stop the loop saw first: the
+		// grace is then over before it began, and the post-Stop probe is
+		// not made (EndGrace's contract).
+		select {
+		case <-t.endGrace:
+			t.probesDone = true
+		default:
+		}
+	}
 	if t.probesDone {
 		t.drain()
 		return
@@ -483,6 +493,10 @@ func (t *fileTailer) atLineStart() bool {
 // feed runs one read through the binary check and the line cut, into t.out.
 func (t *fileTailer) feed(b []byte) {
 	if t.looksBinary(b) {
+		// A cut the tailer makes: the blob is not the continuation of a
+		// possible secret start held in the carry, so the carry is dropped
+		// and counted (file comment), never flushed by the end's boundary.
+		t.cut(0)
 		t.end(logEventFileBinary)
 		return
 	}
@@ -683,8 +697,8 @@ func (t *fileTailer) end(ev string) {
 }
 
 // finish ends the tailer: the last text is written and flushed, a file that
-// never appeared (and was not refused) is file_missing, and the handle is
-// closed.
+// never appeared (and was not refused) is file_missing, the handle is
+// closed and the read buffer released.
 func (t *fileTailer) finish() {
 	if !t.opened && !t.ended {
 		t.mark(logEventFileMissing)
@@ -694,4 +708,7 @@ func (t *fileTailer) finish() {
 		_ = t.f.Close()
 		t.f = nil
 	}
+	// A finished tailer can stay parked on specState.graceTailers until the
+	// next generation starts; it must not pin its read buffer meanwhile.
+	t.buf = nil
 }

@@ -5,6 +5,9 @@ package runtime
 
 import (
 	"log/slog"
+	"path/filepath"
+	goruntime "runtime"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -17,7 +20,10 @@ import (
 //
 //   - Before exec (startProcess): every declaration is resolved by the path
 //     policy (prepareLogFiles). A refused one is only marked file_not_permitted
-//     -- a log file never fails a start. A ${CONFIG_DIR} file is removed, so
+//     -- a log file never fails a start. So is a ${CONFIG_DIR} file named
+//     like one of the spec's config_files (logFileShadowsConfigFile):
+//     removing it would delete the config file just written for N. Any other
+//     ${CONFIG_DIR} file is removed, so
 //     N's file is N's alone and is tailed from offset 0; if the removal fails,
 //     the name is stale and its tailer starts at the end of what is there,
 //     after a file_stale marker. The tailers of N-1 for the same names are told
@@ -55,7 +61,8 @@ const logFileTailBytes = 2048
 // prepareLogFiles resolves spec's declared log files for one launch and makes
 // the generation's ${CONFIG_DIR} files its own. targets are the accepted
 // declarations in declaration order, refused the names the path policy
-// refused (it logs why), stale the ${CONFIG_DIR} names whose earlier file
+// refused (it logs why) or that name one of the spec's config_files
+// (logFileShadowsConfigFile), stale the ${CONFIG_DIR} names whose earlier file
 // could not be removed. port, vendor, vendors and configFilesDir feed the
 // path's placeholder expansion exactly as for the launch itself.
 //
@@ -74,6 +81,11 @@ func prepareLogFiles(spec Spec, pol LocalPolicy, port int, vendor GPUVendor, ven
 	for _, lf := range spec.LogFiles {
 		target, err := pol.resolveLogFile(spec, lf, port, vendor, vendors, configFilesDir)
 		if err != nil {
+			refused = append(refused, lf.Name)
+			continue
+		}
+		if logFileShadowsConfigFile(spec, target) {
+			slog.Warn("runtime: log file refused: it names one of the spec's config_files in ${CONFIG_DIR}", "spec", spec.ID, "log_file", lf.Name)
 			refused = append(refused, lf.Name)
 			continue
 		}
@@ -276,4 +288,29 @@ func (o *owner) handleLogFileTails(c cmdLogFileTails) {
 	le.LogFileTails = c.tails
 	st.lastError = &le
 	o.signalTransition()
+}
+
+// logFileNamesFoldCase makes logFileShadowsConfigFile compare names without
+// regard to case. A seam, true on Windows, whose filesystems name one file
+// "run.json" and "RUN.json"; a test sets it to pin both comparisons.
+var logFileNamesFoldCase = goruntime.GOOS == "windows"
+
+// logFileShadowsConfigFile reports that target is a file directly in the
+// instance's ${CONFIG_DIR} whose leaf name is one of spec's config_files.
+// writeSpecConfigFiles has just written that file for the child to read, and
+// prepareLogFiles would remove it as an earlier run's log, so such a
+// declaration is refused instead. The agent's parse stays permissive (a
+// file-mode document with the overlap is still valid); the gateway refuses
+// the overlap at submit time.
+func logFileShadowsConfigFile(spec Spec, target logFileTarget) bool {
+	if !target.InConfigDir {
+		return false
+	}
+	leaf := filepath.Base(filepath.Clean(target.OpenPath))
+	for _, cf := range spec.ConfigFiles {
+		if cf.Name == leaf || (logFileNamesFoldCase && strings.EqualFold(cf.Name, leaf)) {
+			return true
+		}
+	}
+	return false
 }

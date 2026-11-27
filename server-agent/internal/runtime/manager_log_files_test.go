@@ -685,3 +685,63 @@ func TestManagerStaleConfigDirLogTailsFromEOF(t *testing.T) {
 		t.Errorf("engine events = %v, want %s then %s", events, logEventFileStale, logEventFileOpened)
 	}
 }
+
+// TestManagerLogFileNamedLikeConfigFileIsRefused: a ${CONFIG_DIR} log file
+// declared at the very name of one of the spec's config_files is refused, not
+// removed -- the agent writes the config file before exec, and removing the
+// "earlier run's log" would delete the file the child is about to read. The
+// child starts with its config file and the log stream shows
+// file_not_permitted.
+func TestManagerLogFileNamedLikeConfigFileIsRefused(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	base := t.TempDir()
+	readLog := filepath.Join(t.TempDir(), "read")
+	m := newLogFileManager(t, allowlistPolicy(), base)
+
+	spec := baseSpec("spec-overlap", "overlap-model")
+	spec.Pinned = true
+	spec.ConfigFiles = []ConfigFile{{Name: "run.json", Content: `{"ok":true}`}}
+	spec.Args = configFileStubArgs("run.json", readLog)
+	spec.LogFiles = []LogFile{{Name: "x", Path: "${CONFIG_DIR}/run.json"}}
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	if got := readFileLog(t, readLog); got != `content:{"ok":true}` {
+		t.Errorf("the child found %q at ${CONFIG_DIR}/run.json, want the config file it was given", got)
+	}
+	waitForStreamEvent(t, m, "spec-overlap", "x", logEventFileNotPermitted)
+	waitForState(t, m, "spec-overlap", StateRunning)
+	if got, err := os.ReadFile(filepath.Join(base, "spec-overlap", "run.json")); err != nil || string(got) != `{"ok":true}` {
+		t.Errorf("run.json after the start = %q (err %v), want it to survive", got, err)
+	}
+}
+
+// TestLogFileShadowsConfigFile pins the name comparison behind the refusal:
+// exact on a case-sensitive agent, case-insensitive on Windows, and only for
+// a file directly in ${CONFIG_DIR}.
+func TestLogFileShadowsConfigFile(t *testing.T) {
+	spec := Spec{ConfigFiles: []ConfigFile{{Name: "run.json"}}}
+	inDir := func(leaf string) logFileTarget {
+		return logFileTarget{Name: "x", OpenPath: filepath.Join("/cfg", "s", leaf), ConfigDir: filepath.Join("/cfg", "s"), InConfigDir: true}
+	}
+	sub := logFileTarget{Name: "x", OpenPath: filepath.Join("/cfg", "s", "sub", "run.json"), ConfigDir: filepath.Join("/cfg", "s")}
+
+	orig := logFileNamesFoldCase
+	t.Cleanup(func() { logFileNamesFoldCase = orig })
+	for _, tc := range []struct {
+		fold   bool
+		target logFileTarget
+		want   bool
+	}{
+		{false, inDir("run.json"), true},
+		{false, inDir("RUN.json"), false},
+		{true, inDir("RUN.json"), true},
+		{true, inDir("engine.log"), false},
+		{true, sub, false},
+	} {
+		logFileNamesFoldCase = tc.fold
+		if got := logFileShadowsConfigFile(spec, tc.target); got != tc.want {
+			t.Errorf("fold=%v %s: shadows = %v, want %v", tc.fold, tc.target.OpenPath, got, tc.want)
+		}
+	}
+}

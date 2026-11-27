@@ -129,8 +129,10 @@ const (
 	// fleet cannot monopolize the single agent->gateway WebSocket writer that
 	// telemetry also uses. At the agent's 250 ms flush cadence this is
 	// ~512 KiB/s of log traffic, fleet-wide, and only while someone is
-	// actually watching. (spec, stream) units are visited round-robin so the
-	// budget cannot starve whichever unit happens to sort last.
+	// actually watching. (spec, stream) units are visited process units first,
+	// then file units, each group round-robin among itself, so files never
+	// defer a process stream and the budget cannot starve whichever unit of a
+	// group happens to sort last (see Drain).
 	//
 	// It is deliberately LARGER than logPendingBytes, and that relationship is
 	// load-bearing rather than a taste: Drain defers a unit whose whole queue

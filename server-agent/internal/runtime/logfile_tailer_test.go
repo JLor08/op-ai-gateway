@@ -961,3 +961,80 @@ func TestTailerLeavesNoGoroutine(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestTailerBinaryStopDiscardsAHeldBackSecretStart: the binary stop is a cut
+// the tailer makes itself -- what follows the held-back bytes is a blob, not
+// their continuation -- so a possible secret start held in the masking carry
+// is discarded and counted as dropped, never resolved in clear.
+func TestTailerBinaryStopDiscardsAHeldBackSecretStart(t *testing.T) {
+	target, path, _ := newTailerTarget(t, "engine.log")
+	mustWrite(t, path, "key="+longSecret[:20])
+	h := maskedTailer(t, target, nil)
+	h.waitText("key=")
+	blob := make([]byte, 64<<10)
+	for i := range blob {
+		blob[i] = byte(i * 7)
+	}
+	appendFile(t, path, string(blob))
+	h.waitDone()
+	assertNoSecretFragment(t, h)
+	if got, want := h.flat(), "["+logEventFileOpened+"]key=["+logEventFileBinary+"]"; got != want {
+		t.Fatalf("stream = %q, want %q", got, want)
+	}
+	if got := h.dropped(); got != 20 {
+		t.Fatalf("dropped = %d, want the 20 held-back bytes", got)
+	}
+}
+
+// TestTailerEndGraceBeforeStopNeverProbes: once EndGrace was called, a Stop
+// that the loop happens to see first does not buy the post-Stop probe of the
+// path -- the grace is over before it began. Both channels are closed while
+// the loop is held inside a poll, so its next select finds both ready and
+// picks one at random; repeated, the probe would show up.
+func TestTailerEndGraceBeforeStopNeverProbes(t *testing.T) {
+	for i := range 32 {
+		target, path, _ := newTailerTarget(t, "engine.log")
+		mustWrite(t, path, "x\n")
+		var opens atomic.Int64
+		hold, held := make(chan struct{}), make(chan struct{})
+		h := startHarness(t, target, func(c *tailerConfig) {
+			c.Interval = time.Hour
+			c.Grace = time.Hour
+			c.Open = func(tg logFileTarget) (*os.File, error) {
+				// The first open is startFileTailer's, the second the loop's
+				// first poll: that one waits until both channels are closed.
+				if opens.Add(1) == 2 {
+					close(held)
+					<-hold
+				}
+				return openLogFile(tg)
+			}
+		})
+		<-held
+		h.tailer.EndGrace()
+		done := h.tailer.Stop()
+		close(hold)
+		select {
+		case <-done:
+		case <-time.After(tailerWait):
+			t.Fatal("tailer did not finish")
+		}
+		if n := opens.Load(); n != 2 {
+			t.Fatalf("run %d: Open called %d times, want 2 (no probe after EndGrace)", i, n)
+		}
+	}
+}
+
+// TestTailerFinishReleasesItsBuffer: a finished tailer can stay parked on
+// specState.graceTailers until the next generation starts, so it must not
+// keep its read buffer.
+func TestTailerFinishReleasesItsBuffer(t *testing.T) {
+	target, path, _ := newTailerTarget(t, "engine.log")
+	mustWrite(t, path, "x\n")
+	h := startHarness(t, target, nil)
+	h.waitText("x\n")
+	h.stop()
+	if h.tailer.buf != nil { // done is closed: finish has happened before
+		t.Fatalf("finished tailer still holds a %d-byte read buffer", len(h.tailer.buf))
+	}
+}

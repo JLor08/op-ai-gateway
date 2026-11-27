@@ -2384,9 +2384,10 @@ func sameLaunchShape(a, b Spec) bool {
 		// the spec may run and when they start -- the scaler's input, read live --
 		// never what a process IS, so editing them must not bounce a healthy
 		// child.
-		// LogFiles (#430) is the tailer's input, read live from the stored spec
-		// (design §4); the child neither sees nor needs it, so a declaration
-		// change must not bounce a healthy process.
+		// LogFiles (#430) is the tailers' input, applied at the next
+		// generation start (agent-runtime-manager.md §5.6), not to a running
+		// one; the child neither sees nor needs it, so a declaration change
+		// must not bounce a healthy process.
 		s.LogFiles = nil
 		s.Replicable = false
 		s.MinInstances = 0

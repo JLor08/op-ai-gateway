@@ -554,8 +554,9 @@ func underPseudoFS(p string) bool {
 // calls on one handle on Windows), so a name can change between them, and a
 // directory the walk already holds can be renamed away from below the root
 // without the walk noticing (os.Root tracks directories by handle). Exploiting
-// either needs a name of the outside file the server can remove or relink,
-// which a server that could do so does not need the agent for.
+// either needs a server that can create and remove a hard link to an outside
+// file it could not read itself: possible on macOS, and on Linux without
+// fs.protected_hardlinks, not where that protection is on.
 //
 // Classification: a name that is missing in the root, or that names another
 // file, or that now leads out of the root, AFTER the open succeeded, is
