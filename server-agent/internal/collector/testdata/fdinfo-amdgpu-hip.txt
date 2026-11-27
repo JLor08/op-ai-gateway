@@ -1,0 +1,42 @@
+== /dev/dri/renderD128
+pos:	0
+flags:	02100002
+mnt_id:	26
+ino:	875
+drm-driver:	amdgpu
+drm-client-id:	28662
+drm-pdev:	0000:01:00.0
+pasid:	28662
+drm-memory-vram:	32 KiB
+drm-memory-gtt: 	44 KiB
+drm-memory-cpu: 	4 KiB
+amd-memory-visible-vram:	0 KiB
+amd-evicted-vram:	0 KiB
+amd-evicted-visible-vram:	0 KiB
+amd-requested-vram:	32 KiB
+amd-requested-visible-vram:	0 KiB
+amd-requested-gtt:	48 KiB
+drm-shared-vram:	0 KiB
+drm-shared-gtt:	0 KiB
+drm-shared-cpu:	0 KiB
+== /dev/dri/renderD129
+pos:	0
+flags:	02100002
+mnt_id:	26
+ino:	890
+drm-driver:	amdgpu
+drm-client-id:	28663
+drm-pdev:	0000:02:00.0
+pasid:	28662
+drm-memory-vram:	3544696 KiB
+drm-memory-gtt: 	18532 KiB
+drm-memory-cpu: 	91108 KiB
+amd-memory-visible-vram:	0 KiB
+amd-evicted-vram:	0 KiB
+amd-evicted-visible-vram:	0 KiB
+amd-requested-vram:	3544696 KiB
+amd-requested-visible-vram:	0 KiB
+amd-requested-gtt:	18544 KiB
+drm-shared-vram:	0 KiB
+drm-shared-gtt:	0 KiB
+drm-shared-cpu:	0 KiB
