@@ -665,8 +665,10 @@ func (d *Driver) stopAll() {
 	d.applied = false
 	d.appliedSpecCount = 0
 	// The empty document withholds nothing; the next active Sync's apply
-	// starts the withheld-instances and withheld-log-files bookkeeping over.
+	// starts the withheld-instances, withheld-cluster-specs and
+	// withheld-log-files bookkeeping over.
 	d.instancesWithheld = false
+	d.rpcWithheld = false
 	d.logFilesWithheld = false
 	if err := d.StartRouter(0); err != nil {
 		slog.Debug("runtime: router stop failed", "error", err)
