@@ -31,11 +31,10 @@ const (
 // vendor selects its native backend (nvidia CUDA, amd ROCm, apple MTL), several
 // select Vulkan, none is an error.
 //
-// This host-level "auto" rule applies only to a spec without GPUs (and to the
-// RPC member path until #434 Task C3). A spec that declares GPUs resolves
-// "auto" from the vendors of its own GPUs (resolveDevicePrefix): each GPU
-// carries its vendor, so a single-vendor spec on a mixed host gets its native
-// backend.
+// This host-level "auto" rule applies only to a spec without GPUs. A spec that
+// declares GPUs, an RPC member included, resolves "auto" from the vendors of
+// its own GPUs (resolveDevicePrefix): each GPU carries its vendor, so a
+// single-vendor spec on a mixed host gets its native backend.
 func ResolveDeviceBackend(spec Spec, vendors GPUVendors) (string, error) {
 	switch v := strings.ToLower(strings.TrimSpace(spec.DeviceBackend)); v {
 	case "cuda":
@@ -97,37 +96,6 @@ func rpcDeviceNames(spec Spec) []string {
 		}
 	}
 	return names
-}
-
-// localDeviceNames lists the spec's local GPUs in declared order with prefix.
-// With renumbered the child sees its visible devices numbered from 0, so the
-// names are prefix0..prefix(k-1); otherwise the declared host indices. A shim
-// for the RPC member path (rpc_member.go) until #434 Task C3 moves it onto the
-// per-spec device plan; the spec's own expansion uses specDevices.
-func localDeviceNames(spec Spec, prefix string, renumbered bool) []string {
-	indices := gpuIndices(spec)
-	names := make([]string, len(indices))
-	for i, idx := range indices {
-		if renumbered {
-			idx = i
-		}
-		names[i] = prefix + strconv.Itoa(idx)
-	}
-	return names
-}
-
-// deviceContext carries the host's detected vendors for the RPC member's
-// device prefix (rpc_member.go). It is a shim: the member path moves onto the
-// per-spec device plan in #434 Task C3, which removes it.
-type deviceContext struct {
-	vendors GPUVendors
-}
-
-func newDeviceContext(vendor GPUVendor, vendors GPUVendors) deviceContext {
-	if len(vendors) == 0 && vendor != GPUVendorNone {
-		vendors = GPUVendors{vendor}
-	}
-	return deviceContext{vendors: vendors}
 }
 
 // specDevices is one expansion's view of a spec's devices (#434): its GPU keys

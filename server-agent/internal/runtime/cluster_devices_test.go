@@ -196,16 +196,3 @@ func TestRPCDeviceNames(t *testing.T) {
 		t.Errorf("got %v, want %s", got, want)
 	}
 }
-
-func TestLocalDeviceNames(t *testing.T) {
-	spec := Spec{GPUs: []SpecGPU{{Index: 3}, {Index: 2}, {Index: 3}}}
-	if got := strings.Join(localDeviceNames(spec, "CUDA", false), ","); got != "CUDA3,CUDA2" {
-		t.Errorf("declared = %s", got)
-	}
-	if got := strings.Join(localDeviceNames(spec, "CUDA", true), ","); got != "CUDA0,CUDA1" {
-		t.Errorf("renumbered = %s", got)
-	}
-	if got := localDeviceNames(Spec{}, "CUDA", false); len(got) != 0 {
-		t.Errorf("no gpus = %v", got)
-	}
-}

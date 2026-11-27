@@ -166,9 +166,10 @@ func parseMemberBanner(lines []string) (memberBanner, bool) {
 }
 
 // expectedMemberDevices is how many devices a member's banner must list: one
-// per distinct GPU row, or the single CPU device of a member without GPUs.
+// per distinct GPU (vendor and index: NVIDIA 0 and AMD 0 are two cards), or the
+// single CPU device of a member without GPUs.
 func expectedMemberDevices(spec Spec) int {
-	if n := len(gpuIndices(spec)); n > 0 {
+	if n := len(specGPUKeys(spec)); n > 0 {
 		return n
 	}
 	return 1

@@ -273,29 +273,6 @@ var visibleDevicesOwnedVars = []string{
 	vulkanVisibleDevicesVar,
 }
 
-// gpuIndices returns spec.GPUs' host indices in the operator's DECLARED array
-// order, deduplicated (first occurrence wins). It is the single ordered/deduped
-// index list every visibility rendering is built from -- hostGPUIDs and
-// deviceList differ only in how they format it. Empty when the spec declares
-// no GPUs; every caller treats that as a refusal, not a value (trap 1).
-//
-// A shim for the RPC member path (rpc_member.go, rpc_classify.go) until #434
-// Task C3 moves it onto the per-spec device plan: a bare index is ambiguous on
-// a host with NVIDIA and AMD cards, so the spec's own expansion reads its GPU
-// keys (specDevices) instead.
-func gpuIndices(spec Spec) []int {
-	indices := make([]int, 0, len(spec.GPUs))
-	seen := make(map[int]bool, len(spec.GPUs))
-	for _, g := range spec.GPUs {
-		if seen[g.Index] {
-			continue
-		}
-		seen[g.Index] = true
-		indices = append(indices, g.Index)
-	}
-	return indices
-}
-
 // hostGPUIDs renders the host indices of keys -- a spec's GPU keys, ordered
 // and deduplicated (specGPUKeys, planKeys) -- as a comma-separated decimal list
 // ("5,2"): the value ${HOST_GPU_IDS} emits, and the value a CUDA or ROCm
@@ -331,12 +308,12 @@ func hostGPUIDs(keys []GPUKey) string {
 }
 
 // hostGPUIDsMainLast renders gpus (already ordered and deduplicated, as
-// gpuIndices returns them) as a comma-separated list with the FIRST declared
-// index moved to the END: [2,0,1] -> "0,1,2". The first declared GPU is the
-// operator's main card; tools that treat the last listed device as the main one
-// (Strata) need it there while the rest keep their declared order. Empty string
-// for an empty list. Defensive dedup (first wins) keeps it safe for a caller
-// that passes a raw list.
+// specDevices.hostIndices returns them) as a comma-separated list with the
+// FIRST declared index moved to the END: [2,0,1] -> "0,1,2". The first declared
+// GPU is the operator's main card; tools that treat the last listed device as
+// the main one (Strata) need it there while the rest keep their declared order.
+// Empty string for an empty list. Defensive dedup (first wins) keeps it safe
+// for a caller that passes a raw list.
 func hostGPUIDsMainLast(gpus []int) string {
 	seen := make(map[int]bool, len(gpus))
 	uniq := make([]int, 0, len(gpus))
