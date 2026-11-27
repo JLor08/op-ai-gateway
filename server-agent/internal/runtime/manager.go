@@ -4796,7 +4796,15 @@ func (o *owner) startProcess(st *specState) {
 	// already retired too, and a further instance's lines carry "[#k] " so the
 	// instances can be told apart there. Instance 0 writes exactly as a spec
 	// that never replicates always has.
-	plog := o.logs.newInstanceProc(specBase(spec), st.instance)
+	//
+	// Masked (#430 §8): the values this launch substituted for ${API_TOKEN}
+	// and ${AGENT_ENV:NAME} are replaced by their placeholders before any byte
+	// of this generation's output -- or, through its ForStream siblings, of its
+	// log files -- is retained. The masker is built from ex because the
+	// plaintext exists nowhere else; ex is final here (prepareMember's
+	// agent-owned arguments carry no secret, and withWrapper below shifts
+	// spans but not values).
+	plog := o.logs.newInstanceProcMasked(specBase(spec), st.instance, newSecretMasker(ex))
 	var cmd *exec.Cmd
 	var wslUnit string
 	execPath := spec.Binary
@@ -5312,7 +5320,11 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// EVERY kind of exit -- crash, drain, idle unload, force_stopped,
 	// shutdown. cmd.Wait (waitForExit) has already waited for os/exec's two
 	// copy goroutines, so every byte the process ever wrote is in the buffer
-	// before this marker lands after it.
+	// before this marker lands after it -- the masker's held-back tail too,
+	// flushed here (#430 §8) so it precedes the marker and is in the tail the
+	// crash report below reads. (Exited flushes as well, as the backstop for
+	// any other caller.)
+	proc.log.Flush()
 	proc.log.Exited(extractExitCode(exitErr))
 
 	// A spec deleted from the config is dropped on this exit however the

@@ -99,11 +99,18 @@ import (
 //     plaintext, and in file mode an argument is in the report. This is not the
 //     exposure; it is a second view of one that already exists. Operator
 //     guidance is unchanged: ${AGENT_ENV:NAME}, never a literal.
-//   - The CHILD's own output. A model server that prints its command line at
-//     startup prints the real values, and that text reaches the same operator
-//     through the very stream this rides on (and through LastError.StderrTail).
-//     Nothing here can mask a value the child chose to print, and claiming
-//     otherwise would be the dangerous kind of comment.
+//   - The CHILD's own output, beyond one narrow rule (#430 §8, secret_mask.go):
+//     literal occurrences of the agent's own resolved secrets -- the values
+//     THIS generation substituted for ${API_TOKEN} and ${AGENT_ENV:NAME}, at
+//     least 8 bytes long -- are replaced by their placeholder in the process
+//     output and the generation's log files before anything is retained, so a
+//     model server that echoes its argv at startup shows the placeholder there
+//     and in LastError.StderrTail. Nothing else is masked. An encoded form
+//     (URL- or JSON-escaped, base64), a value the child splits across lines or
+//     interleaves with other text, a value shorter than 8 bytes, a literal
+//     secret typed into the spec (above), and any secret the child obtained
+//     some other way all reach the operator unchanged. Claiming more would be
+//     the dangerous kind of comment.
 //
 // COPY AFFORDANCE, decided deliberately in the negative: there is none, and
 // the portal must not add one. Even a completely unmasked rendering of this

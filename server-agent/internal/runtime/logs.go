@@ -4,7 +4,6 @@
 package runtime
 
 import (
-	"bytes"
 	"op-ai-server-agent/internal/gwapi"
 	"sort"
 	"strconv"
@@ -564,6 +563,15 @@ func (s *LogStore) newProc(specID string) *procLog {
 // (LogEntry.Instance), so a reader can tell the instances apart without parsing
 // the prefix back out of the text.
 func (s *LogStore) newInstanceProc(specID string, k int) *procLog {
+	return s.newInstanceProcMasked(specID, k, nil)
+}
+
+// newInstanceProcMasked is newInstanceProc for a generation whose launch
+// substituted secrets (#430 §8): every stream of the generation masks m's
+// values before they are recorded (see LogStore.write). startProcess builds m
+// from the generation's expandedSpec, the one place the plaintext exists; a
+// nil m masks nothing.
+func (s *LogStore) newInstanceProcMasked(specID string, k int, m *secretMasker) *procLog {
 	if s == nil {
 		return &procLog{}
 	}
@@ -571,7 +579,7 @@ func (s *LogStore) newInstanceProc(specID string, k int) *procLog {
 	s.nextGen++
 	gen := s.nextGen
 	s.mu.Unlock()
-	return &procLog{store: s, specID: specID, gen: gen, instance: k, prefix: instanceLinePrefix(k)}
+	return &procLog{store: s, specID: specID, gen: gen, instance: k, prefix: instanceLinePrefix(k), masker: m}
 }
 
 // instanceLinePrefix is the text that opens every line instance k of a spec
@@ -589,16 +597,58 @@ func instanceLinePrefix(k int) string {
 // fails: there is no failure mode for a bounded in-memory append, and a log
 // write must never be able to stall the process it is reading from.
 //
-// A further instance's text is prefixed line by line here (prefixLinesLocked),
-// under the same lock as the append, so the prefix state of a generation and
-// the order its chunks land in can never disagree.
+// The order is: mask the generation's own resolved secrets (#430 §8), then
+// prefix a further instance's lines (prefixLinesLocked), then append and
+// queue -- all under the one lock, so the carry, the prefix state and the
+// order the chunks land in can never disagree. Masking comes first so no byte
+// of a secret ever reaches the ring, the live queue, Tail (and so
+// LastError.StderrTail) or anything built from them; the placeholder it
+// leaves contains no newline, so the prefix step sees the same lines.
+//
+// The masker holds back up to its longest value minus one byte (p.carry) in
+// case a secret is split across two writes; those bytes land with the next
+// write or at flushLocked. A write that only grows the carry records nothing.
+//
+// Concurrency: the carry is a single byte sequence in the order writes take
+// the lock. os/exec hands a writer that is both Stdout and Stderr to a single
+// copying goroutine over one pipe, so for the process stream the order is the
+// child's own; were two goroutines ever to write, each write would still join
+// the carry whole and in lock order -- no byte lost or duplicated -- and a
+// secret split by the other writer's bytes would simply not be contiguous,
+// and so not masked (best effort, like every other non-literal form).
 func (s *LogStore) write(p *procLog, b []byte) {
 	if s == nil || p.specID == "" || len(b) == 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec := logRecord{gen: p.gen, pid: int(p.pid.Load()), at: s.now(), text: p.prefixLinesLocked(b), instance: p.instance, stream: p.stream}
+	if p.masker == nil {
+		s.recordLocked(p, string(b))
+		return
+	}
+	var text string
+	text, p.carry = p.masker.mask(p.carry, b, false)
+	s.recordLocked(p, text)
+}
+
+// flushLocked records whatever p's masker still holds back (the end of a
+// stream: nothing can complete a split value any more). The caller holds mu.
+func (s *LogStore) flushLocked(p *procLog) {
+	if len(p.carry) == 0 {
+		return
+	}
+	text, _ := p.masker.mask(p.carry, nil, true)
+	p.carry = nil
+	s.recordLocked(p, text)
+}
+
+// recordLocked prefixes already-masked text and appends and queues it as one
+// text record of p's stream. The caller holds mu.
+func (s *LogStore) recordLocked(p *procLog, text string) {
+	if text == "" {
+		return
+	}
+	rec := logRecord{gen: p.gen, pid: int(p.pid.Load()), at: s.now(), text: p.prefixLinesLocked(text), instance: p.instance, stream: p.stream}
 	s.appendLocked(p.specID, rec)
 	s.queueLocked(streamKey{p.specID, p.stream}, rec)
 }
@@ -1634,6 +1684,12 @@ func (s *LogStore) tailStream(specID, stream string, gen uint64, n int) string {
 // ForStream. Each sibling is its own procLog, so it has its own line state
 // (midLine), and everything it writes goes through the same LogStore.write as
 // the process output.
+//
+// masker is the generation's secret masker (#430 §8; nil when its launch
+// substituted no maskable secret), shared by every sibling; carry is THIS
+// stream's held-back tail (see LogStore.write), guarded by the store's mutex
+// like midLine, because a split secret can only be completed by the same
+// stream's next bytes.
 type procLog struct {
 	store    *LogStore
 	specID   string
@@ -1643,17 +1699,20 @@ type procLog struct {
 	prefix   string
 	midLine  bool
 	stream   string
+	masker   *secretMasker
+	carry    []byte
 }
 
 // ForStream returns a sibling of p that records on the stream name: the same
 // store, spec, generation, instance and line prefix, so a file's text is
 // attributed exactly like the process output of the same generation, but with
-// its own line state, its own ring, its own live queue and its own gap count. It carries no
+// its own line state, its own ring, its own live queue and its own gap count.
+// It shares p's secret masker, with a carry of its own. It carries no
 // pid -- a file is not the process's pipe -- so its text and markers have pid
 // 0. The log-file tailer of one generation and declared file writes through
 // it.
 func (p *procLog) ForStream(name string) *procLog {
-	return &procLog{store: p.store, specID: p.specID, gen: p.gen, instance: p.instance, prefix: p.prefix, stream: name}
+	return &procLog{store: p.store, specID: p.specID, gen: p.gen, instance: p.instance, prefix: p.prefix, stream: name, masker: p.masker}
 }
 
 // Mark records the typed event (one of the logEventFile* constants) on p's
@@ -1675,6 +1734,21 @@ func (p *procLog) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// Flush records the bytes p's secret masker still holds back, masked as the
+// end of the stream (see LogStore.write). Call it where p's stream ends: the
+// process's exit (Exited does it first, so its marker follows every byte), a
+// log-file tailer's stop, and before a discontinuity in a file (rotation,
+// truncation, a counted gap), where the bytes before and after can no longer
+// form one value. A no-op without a masker or carry.
+func (p *procLog) Flush() {
+	if p.store == nil || p.specID == "" {
+		return
+	}
+	p.store.mu.Lock()
+	defer p.store.mu.Unlock()
+	p.store.flushLocked(p)
+}
+
 // prefixLinesLocked returns b as the text to record: b itself for instance 0,
 // and for a further instance b with p.prefix opening every line that starts in
 // it. A line starts at the generation's first byte and after every '\n'; the
@@ -1682,23 +1756,23 @@ func (p *procLog) Write(b []byte) (int, error) {
 // before it does, so output that ends with a newline leaves no dangling prefix
 // and a line split across two writes is prefixed once. The caller holds the
 // store's mutex.
-func (p *procLog) prefixLinesLocked(b []byte) string {
+func (p *procLog) prefixLinesLocked(b string) string {
 	if p.prefix == "" {
-		return string(b)
+		return b
 	}
 	var out strings.Builder
-	out.Grow(len(b) + len(p.prefix)*(1+bytes.Count(b, []byte{'\n'})))
-	for len(b) > 0 {
+	out.Grow(len(b) + len(p.prefix)*(1+strings.Count(b, "\n")))
+	for b != "" {
 		if !p.midLine {
 			out.WriteString(p.prefix)
 		}
-		i := bytes.IndexByte(b, '\n')
+		i := strings.IndexByte(b, '\n')
 		if i < 0 {
-			out.Write(b)
+			out.WriteString(b)
 			p.midLine = true
 			break
 		}
-		out.Write(b[:i+1])
+		out.WriteString(b[:i+1])
 		b = b[i+1:]
 		p.midLine = false
 	}
@@ -1731,8 +1805,12 @@ func (p *procLog) StartFailed(cmd ResolvedCommand) {
 // Exited records the generation boundary that closes it. Together with
 // Started these are what makes a crash loop READABLE: the appended history of
 // several attempts, with the exit code of each one in its right place.
+//
+// It flushes the masker's carry first (Flush), so the marker lands after every
+// byte the generation wrote, whichever caller closes it.
 func (p *procLog) Exited(exitCode int) {
 	if p.store != nil {
+		p.Flush()
 		p.store.mark(p, int(p.pid.Load()), logEventExited, exitCode, nil)
 	}
 }

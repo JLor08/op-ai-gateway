@@ -1294,7 +1294,10 @@ func (e placeholderExpander) writeAgentEnv(b *strings.Builder, spans *[]secretSp
 	// network egress from the child, because a model server that
 	// echoes its argv (vLLM and llama.cpp both do) and then
 	// exits non-zero has that line captured into
-	// LastError.StderrTail and reported upward.
+	// LastError.StderrTail and reported upward. (Since #430
+	// a LITERAL echo of a resolved secret is masked in the
+	// child's output -- secret_mask.go -- but any encoded or
+	// reshaped form is not, so this refusal stays the guard.)
 	//
 	// Deliberately folded on unix too, where a variable named
 	// "op_agent_token" IS distinct from "OP_AGENT_TOKEN":

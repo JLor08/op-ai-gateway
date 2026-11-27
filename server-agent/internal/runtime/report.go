@@ -29,7 +29,10 @@
 // ("secrets go in env, never in args") is in server-agent/README.md and in
 // the risk register. Nor is this the only upward channel: LastError's stderr
 // tail carries the child's own output, and a model server that prints its
-// command line at startup puts the resolved values there. "No env value ever
+// command line at startup puts the resolved values there -- since #430 with
+// the agent's own resolved ${API_TOKEN}/${AGENT_ENV:NAME} values masked when
+// they appear literally (secret_mask.go), but a literal secret typed into an
+// argument, or any encoded form, unchanged. "No env value ever
 // reaches the wire in a report" is true; "no secret ever reaches the wire" is
 // not, and a comment here claiming the latter would make the gap invisible
 // to exactly the reader best placed to close it.
