@@ -2672,7 +2672,8 @@ protocol, which a probe can learn or lose without the binary changing): whatever
 a member relaunches the head, which would otherwise lose the member mid-request.
 The GPU selection enters it as the indices plus `gpu_keys`, the keys of the
 member's GPUs whose vendor is not its server's legacy vendor, omitted when there
-are none: moving a member from NVIDIA 0 to AMD 0 changes the generation, while a
+are none or while the server has no legacy vendor yet (before its first
+backfill, which would otherwise change the generation once for nothing): moving a member from NVIDIA 0 to AMD 0 changes the generation, while a
 member with only legacy-vendor GPUs (every member before #434) hashes exactly as
 before, so no existing head relaunches for the upgrade.
 For a member server it carries one `rpc_server` spec per membership: the manual
@@ -3652,14 +3653,17 @@ hardware report's `gpu_legacy_vendor` (`runtimeGPUVendor`, the same startup
 detection the runtime resolves with), because the report's GPU list can be
 partial: `CollectHardware` drops a GPU collector that errors (2 s budget), so a
 cold `nvidia-smi` on an NVIDIA+AMD host yields an AMD-only list while the runtime
-still means NVIDIA by an empty vendor. The gateway makes the vendor explicit once
-per server, from the **first vendor-reporting hardware report**:
+still means NVIDIA by an empty vendor. The gateway makes the vendor explicit
+per server, from the **first vendor-reporting hardware report** on:
 `BackfillServerGPUVendor` stores the agent's `gpu_legacy_vendor` as is in
 `ai_servers.gpu_legacy_vendor` on every such report (never derived from the GPU
 list when present), and rewrites that server's empty-vendor rows (its specs' GPU rows, its budgets, its
 manual member specs' GPU rows, its cluster member GPU rows) to it in one
 transaction; an empty row whose owner already has an explicit row of that vendor
-at the same index is deleted instead (the explicit one wins). A report that lists
+at the same index is deleted instead (the explicit one wins). Every such report
+runs the rewrite: the first one converts the legacy rows, a later one only a row
+saved with an empty vendor since (e.g. while the agent's feature declaration was
+unknown), so a repeated report normally rewrites nothing and pushes nothing. A report that lists
 vendors but carries no `gpu_legacy_vendor` (no 0.27.0 agent sends one) falls back
 to the list's first of NVIDIA, AMD, Apple, but never moves the stored vendor down
 that order, so a partial report cannot turn a stored `nvidia` into `amd`. The legacy vendor is

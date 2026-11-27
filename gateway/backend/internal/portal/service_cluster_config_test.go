@@ -1333,4 +1333,11 @@ func TestMemberGenerationPartWithoutCrossVendorKeysIsUnchanged(t *testing.T) {
 	if got := crossVendorGPUKeys([]AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Vendor: "amd", Index: 0}}, "nvidia"); !slices.Equal(got, []string{"amd:0"}) {
 		t.Fatalf("cross-vendor keys = %v, want [amd:0]", got)
 	}
+	// Before the server's first backfill (legacy vendor unknown) no key is
+	// cross-vendor: otherwise the generation would change once at the
+	// backfill, which makes the explicit vendor equal to the legacy one, and
+	// relaunch the head for nothing.
+	if got := crossVendorGPUKeys([]AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Index: 1}}, ""); got != nil {
+		t.Fatalf("cross-vendor keys without a legacy vendor = %v, want nil", got)
+	}
 }

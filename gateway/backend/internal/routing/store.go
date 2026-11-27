@@ -3579,7 +3579,7 @@ type RuntimeStore interface {
 	// vendor, then index. Always non-nil, empty when none.
 	ServerGPUBudgets(ctx context.Context, serverID string) ([]ServerGPUBudget, error)
 	// BackfillServerGPUVendor makes the legacy empty GPU vendor of serverID
-	// explicit, once: in one transaction it rewrites gpu_vendor "" to vendor in
+	// explicit: in one transaction it rewrites gpu_vendor "" to vendor in
 	// the GPU rows of the server's runtime specs (spec -> mapping ->
 	// application -> server), its GPU budgets, the GPU rows of the manual
 	// member specs on it and the cluster member GPU rows on it. Where a row
@@ -3590,8 +3590,9 @@ type RuntimeStore interface {
 	// On every call it sets the server's GPULegacyVendor to vendor (also when
 	// rewritten is 0); when rewritten > 0 and noteMixed it also raises
 	// GPUVendorNote. vendor must be a non-empty valid vendor, else an error is
-	// returned and nothing is written; an unknown serverID is ErrNotFound. A
-	// second call rewrites 0 and leaves the note as it is.
+	// returned and nothing is written; an unknown serverID is ErrNotFound. Every
+	// call rewrites the empty rows present at that moment; once none is left it
+	// rewrites 0 and leaves the note as it is.
 	BackfillServerGPUVendor(ctx context.Context, serverID, vendor string, noteMixed bool) (rewritten int, err error)
 	// ClearServerGPUVendorNote lowers GPUVendorNote and keeps
 	// GPULegacyVendor. An unknown serverID is ErrNotFound.

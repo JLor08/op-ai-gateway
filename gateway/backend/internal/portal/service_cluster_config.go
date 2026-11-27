@@ -705,8 +705,14 @@ func memberDeviceCount(gpus []AgentRuntimeSpecGPUDTO, legacy string) int {
 
 // crossVendorGPUKeys lists, in declared order, the keys ("vendor:index") of
 // gpus whose vendor, an empty one read as legacy, is not legacy; nil when
-// there are none.
+// there are none, and always nil while legacy is "" (the server not yet
+// backfilled): the backfill makes the vendors explicit as the legacy one, so
+// listing them before it would change the generation, and relaunch the head,
+// once for nothing.
 func crossVendorGPUKeys(gpus []AgentRuntimeSpecGPUDTO, legacy string) []string {
+	if legacy == "" {
+		return nil
+	}
 	var out []string
 	for _, g := range gpus {
 		key := resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy)

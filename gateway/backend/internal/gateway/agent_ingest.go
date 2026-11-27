@@ -2769,8 +2769,11 @@ func reportGPUVendors(gpus []agentGPUInfo) []string {
 // explicit as legacy (legacyVendorFromReport), and a report whose GPUs carry
 // more than one vendor raises the review note. legacy "" (an agent without
 // gpu_vendor_identity) calls nothing and never clears what is stored. The
-// store persists the legacy vendor on every call and rewrites rows only the
-// first time, so a repeated report costs one transaction and no push.
+// store persists the legacy vendor on every call and rewrites whatever
+// empty-vendor rows the server has at that moment: the first report rewrites
+// the legacy rows, a later one only a row saved empty since (say, while the
+// agent's feature declaration was unknown), so a repeated report usually
+// costs one transaction and no push.
 // Best-effort: a failure is logged, never fails the report it rode in on.
 //
 // When rows were rewritten the server's runtime document changes (its specs
