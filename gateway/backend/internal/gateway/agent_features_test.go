@@ -156,6 +156,32 @@ func TestAgentFeaturesDeclaresRuntimeInstances(t *testing.T) {
 	}
 }
 
+// TestAgentFeaturesDeclaresRuntimeLogFiles pins the name an agent's declared
+// log-file tailing hangs on (#430): the agent tails a spec's log_files only
+// when this endpoint lists "runtime_log_files". Compared as the literal the
+// agent matches, read off the served body.
+func TestAgentFeaturesDeclaresRuntimeLogFiles(t *testing.T) {
+	if runtimeLogFilesFeature != "runtime_log_files" {
+		t.Fatalf("runtimeLogFilesFeature = %q, want the wire literal runtime_log_files", runtimeLogFilesFeature)
+	}
+	srv := NewTestServer()
+	seedTestAgentToken(t, srv, "agt_features", "mock-host-qwen", "features-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, agentFeaturesRequest("features-secret", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var got agentFeaturesDTO
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body %s: %v", rec.Body.String(), err)
+	}
+	for _, name := range []string{"runtime_log_files", "runtime_manager", "runtime_instances"} {
+		if !slices.Contains(got.Features, name) {
+			t.Fatalf("features = %v, want %s declared", got.Features, name)
+		}
+	}
+}
+
 // TestAgentFeaturesEndpointAuthAndMethod pins the shared agent-endpoint
 // skeleton: Cache-Control:no-store even on a failure, 401 with no bearer
 // (never reaching the feature list), and 405 on a non-GET.

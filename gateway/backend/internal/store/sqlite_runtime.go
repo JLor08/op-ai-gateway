@@ -42,7 +42,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 	}
 	_, err = s.exec(ctx, `
 		insert into agent_runtime_specs (
-			id, mapping_id, enabled, binary_path, args, env, config_files, work_dir, listen_port,
+			id, mapping_id, enabled, binary_path, args, env, config_files, log_files, work_dir, listen_port,
 			health_path, health_timeout_seconds, startup_timeout_seconds,
 			idle_timeout_seconds, admission_wait_timeout_seconds, pinned,
 			admin_state, set_visible_devices, api_flavors, responses_mode, messages_mode, decisions_mode, systemone_mode,
@@ -53,11 +53,11 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			cluster_enabled, member_mode, cluster_network, rpc_transport, lan_exposure_ack, device_backend,
 			execution_mode, wsl_distro, process_tree,
 			created_at, updated_at
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		on conflict(mapping_id) do update set
 			enabled = excluded.enabled, binary_path = excluded.binary_path,
 			args = excluded.args, env = excluded.env,
-			config_files = excluded.config_files, work_dir = excluded.work_dir,
+			config_files = excluded.config_files, log_files = excluded.log_files, work_dir = excluded.work_dir,
 			listen_port = excluded.listen_port, health_path = excluded.health_path,
 			health_timeout_seconds = excluded.health_timeout_seconds,
 			startup_timeout_seconds = excluded.startup_timeout_seconds,
@@ -91,7 +91,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 			process_tree = excluded.process_tree,
 			updated_at = excluded.updated_at`,
 		spec.ID, spec.MappingID, spec.Enabled, spec.Binary, spec.Args, spec.Env,
-		spec.ConfigFiles, spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
+		spec.ConfigFiles, spec.LogFiles, spec.WorkDir, spec.ListenPort, spec.HealthPath, spec.HealthTimeoutSeconds,
 		spec.StartupTimeoutSeconds, spec.IdleTimeoutSeconds,
 		spec.AdmissionWaitTimeoutSeconds, spec.Pinned, spec.AdminState,
 		spec.SetVisibleDevices, apiFlavors, string(spec.ResponsesMode), string(spec.MessagesMode),
@@ -118,7 +118,7 @@ func (s *SQLiteStore) UpsertRuntimeSpec(ctx context.Context, spec routing.Runtim
 	return nil
 }
 
-const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config_files, work_dir,
+const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config_files, log_files, work_dir,
 	listen_port, health_path, health_timeout_seconds, startup_timeout_seconds,
 	idle_timeout_seconds, admission_wait_timeout_seconds, pinned, admin_state,
 	set_visible_devices, api_flavors, responses_mode, messages_mode, decisions_mode, systemone_mode,
@@ -134,7 +134,7 @@ const runtimeSpecCols = `id, mapping_id, enabled, binary_path, args, env, config
 // the RuntimeSpecsByApplication join below where an unqualified column list
 // would be ambiguous against the joined model_mappings table (mirrors
 // projectColsPrefixed in sqlite_projects.go).
-const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s.args, s.env, s.config_files, s.work_dir,
+const runtimeSpecColsPrefixed = `s.id, s.mapping_id, s.enabled, s.binary_path, s.args, s.env, s.config_files, s.log_files, s.work_dir,
 	s.listen_port, s.health_path, s.health_timeout_seconds, s.startup_timeout_seconds,
 	s.idle_timeout_seconds, s.admission_wait_timeout_seconds, s.pinned, s.admin_state,
 	s.set_visible_devices, s.api_flavors, s.responses_mode, s.messages_mode, s.decisions_mode, s.systemone_mode,
@@ -492,7 +492,7 @@ func scanRuntimeSpec(row rowScanner) (routing.RuntimeSpec, error) {
 	var enabled, pinned, setVisibleDevices, liveTimings, replicable, clusterEnabled, lanExposureAck int64
 	var apiFlavors string
 	err := row.Scan(&spec.ID, &spec.MappingID, &enabled, &spec.Binary, &spec.Args,
-		&spec.Env, &spec.ConfigFiles, &spec.WorkDir, &spec.ListenPort, &spec.HealthPath,
+		&spec.Env, &spec.ConfigFiles, &spec.LogFiles, &spec.WorkDir, &spec.ListenPort, &spec.HealthPath,
 		&spec.HealthTimeoutSeconds, &spec.StartupTimeoutSeconds,
 		&spec.IdleTimeoutSeconds, &spec.AdmissionWaitTimeoutSeconds, &pinned,
 		&spec.AdminState, &setVisibleDevices,

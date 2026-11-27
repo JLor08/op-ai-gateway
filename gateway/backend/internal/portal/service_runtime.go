@@ -176,6 +176,12 @@ var (
 	// names the offending file and rule -- never its content, which can hold
 	// the very secret that tripped the check.
 	ErrRuntimeSpecConfigFilesInvalid = errors.New("runtime_spec.config_files_invalid")
+	// ErrRuntimeSpecLogFilesInvalid rejects a log_files list that breaks any of
+	// validateRuntimeSpecLogFiles' rules: more than runtimeSpecLogFilesMax
+	// entries, a bad, reserved or repeated name, or an empty, oversized,
+	// non-absolute or secret-carrying path. HTTP 400; the message names the
+	// entry (index or name) and the rule, never the path.
+	ErrRuntimeSpecLogFilesInvalid = errors.New("runtime_spec.log_files_invalid")
 	// ErrRuntimeSpecInstancesInvalid rejects a min_instances above
 	// max_instances when both are set (> 0): a floor of warm instances the cap
 	// never allows; and either count above maxRuntimeSpecInstances, more
@@ -304,7 +310,21 @@ const (
 	// server config.
 	runtimeSpecConfigFilesMax     = 16
 	runtimeSpecConfigFileMaxBytes = 64 << 10
+
+	// runtimeSpecLogFilesMax and runtimeSpecLogFilePathMaxBytes bound a spec's
+	// declared log files (#430): at most four tailed files per spec, each path
+	// at most 1024 bytes.
+	runtimeSpecLogFilesMax         = 4
+	runtimeSpecLogFilePathMaxBytes = 1024
+	// runtimeSpecLogFileConfigDir is the placeholder the agent resolves to its
+	// per-spec config directory, the one non-absolute path root allowed.
+	runtimeSpecLogFileConfigDir = "${CONFIG_DIR}"
 )
+
+// runtimeSpecLogFileNamePattern is the name rule of a declared log file: 1 to
+// 32 characters of letters, digits, dot, underscore and hyphen. The name is a
+// stream key on the agent and in the portal's log tabs.
+var runtimeSpecLogFileNamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,32}$`)
 
 // runtimeSpecConfigFileSecretPlaceholders are the two placeholders that
 // resolve to a secret at launch time: the per-spec API token and an agent
@@ -614,6 +634,11 @@ type RuntimeSpecDTO struct {
 	// admin-state write is a full-document upsert and would otherwise clear the
 	// operator's files.
 	ConfigFiles []ConfigFileDTO `json:"config_files"`
+	// LogFiles are the stored log files (#430), always non-nil on the wire ([]
+	// when there are none). Carried on the read-back for the same reason as
+	// ConfigFiles: a benchmark write spreads the document back through
+	// PutRuntimeSpec and would otherwise clear them.
+	LogFiles []LogFileDTO `json:"log_files"`
 	// EffectiveType / ResolvedMetricsPath / ResolvedContextProbePath are
 	// READ-ONLY echoes of routing.EffectiveRuntimeSpecType +
 	// routing.DeriveProbePaths -- what the agent will actually use once Type/
@@ -697,6 +722,15 @@ type RuntimeSpecDTO struct {
 type ConfigFileDTO struct {
 	Name    string `json:"name"`
 	Content string `json:"content"`
+}
+
+// LogFileDTO is one log file a runtime spec's server writes besides its
+// stdout/stderr (#430): a stream name and the path the agent tails. The path is
+// absolute on the agent's host or rooted at ${CONFIG_DIR}; the agent's own
+// allowlist decides whether it may read it. Never a secret.
+type LogFileDTO struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
 }
 
 // PutRuntimeSpecRequest is a full-document upsert (no pointer-patch): every
@@ -791,6 +825,10 @@ type PutRuntimeSpecRequest struct {
 	// means none: a PUT that omits them clears the stored set. Validated by
 	// validateRuntimeSpecConfigFiles.
 	ConfigFiles []ConfigFileDTO `json:"config_files,omitempty"`
+	// LogFiles are the log files the agent tails (#430). Absent means none: a
+	// PUT that omits them clears the stored set. Validated by
+	// validateRuntimeSpecLogFiles.
+	LogFiles []LogFileDTO `json:"log_files,omitempty"`
 	// DeviceBackend: see RuntimeSpecDTO; "" stores "auto".
 	DeviceBackend string `json:"device_backend"`
 	// ExecutionMode: see RuntimeSpecDTO; "" stores "native". WSLDistro is
@@ -855,6 +893,7 @@ func (s *Service) GetRuntimeSpec(ctx context.Context, principal auth.Token, mapp
 			Env:                      map[string]string{},
 			GPUs:                     []RuntimeSpecGPUDTO{},
 			ConfigFiles:              []ConfigFileDTO{},
+			LogFiles:                 []LogFileDTO{},
 			APIFlavors:               []string{},
 			VisibleDevicesMode:       string(routing.VisibleDevicesModeEnv),
 			APITokenMode:             string(routing.RuntimeAPITokenModeApp),
@@ -1339,6 +1378,7 @@ type runtimeSpecFields struct {
 	args               string // JSON
 	env                string // JSON
 	configFiles        string // JSON array of ConfigFileDTO; "" when there are none
+	logFiles           string // JSON array of LogFileDTO; "" when there are none
 	healthPath         string
 	healthTimeout      int
 	startupTimeout     int
@@ -1519,6 +1559,11 @@ func validateRuntimeSpecRequest(req PutRuntimeSpecRequest) (runtimeSpecFields, e
 	var ok bool
 	if f.processTree, ok = routing.NormalizeProcessTree(req.ProcessTree); !ok {
 		return runtimeSpecFields{}, ErrRuntimeSpecProcessTreeInvalid
+	}
+	// log_files (#430) is the newest request validation, so it runs last: it
+	// cannot rewrite the answer to a body already invalid for a shipped reason.
+	if f.logFiles, err = validateRuntimeSpecLogFiles(req.LogFiles); err != nil {
+		return runtimeSpecFields{}, err
 	}
 	f.healthPath = strings.TrimSpace(req.HealthPath)
 	if f.healthPath == "" {
@@ -1830,6 +1875,7 @@ func (s *Service) runtimeSpecRow(mappingID string, req PutRuntimeSpecRequest, f 
 		Args:                        f.args,
 		Env:                         f.env,
 		ConfigFiles:                 f.configFiles,
+		LogFiles:                    f.logFiles,
 		WorkDir:                     strings.TrimSpace(req.WorkDir),
 		ListenPort:                  req.ListenPort,
 		HealthPath:                  f.healthPath,
@@ -2305,6 +2351,85 @@ func validateRuntimeSpecConfigFiles(files []ConfigFileDTO) (string, error) {
 	return string(encoded), nil
 }
 
+// validateRuntimeSpecLogFiles validates a spec's declared log files (#430) and
+// returns the canonical column value, "" for none. Rules, in request order:
+//   - at most runtimeSpecLogFilesMax entries;
+//   - a name matching runtimeSpecLogFileNamePattern, unique case-insensitively
+//     and never "process" (case-insensitive), the process stream's own key;
+//   - a non-empty path of at most runtimeSpecLogFilePathMaxBytes bytes that
+//     starts with ${CONFIG_DIR} or is absolute on either platform, and carries
+//     no secret placeholder (the path travels in the clear and is reported).
+//
+// Every refusal wraps ErrRuntimeSpecLogFilesInvalid and names the entry by
+// index or name, never quoting the path. The agent re-checks and applies its own
+// allowlist; this is the early-feedback layer.
+func validateRuntimeSpecLogFiles(files []LogFileDTO) (string, error) {
+	if len(files) == 0 {
+		return "", nil
+	}
+	if len(files) > runtimeSpecLogFilesMax {
+		return "", fmt.Errorf("%w: at most %d log files are allowed, got %d",
+			ErrRuntimeSpecLogFilesInvalid, runtimeSpecLogFilesMax, len(files))
+	}
+	seen := make(map[string]struct{}, len(files))
+	for i, f := range files {
+		if !runtimeSpecLogFileNamePattern.MatchString(f.Name) {
+			return "", fmt.Errorf("%w: log file %d has an invalid name (1-32 characters of letters, digits, '.', '_' or '-')",
+				ErrRuntimeSpecLogFilesInvalid, i+1)
+		}
+		key := strings.ToLower(f.Name)
+		if key == "process" {
+			return "", fmt.Errorf("%w: log file name %q is reserved for the process output",
+				ErrRuntimeSpecLogFilesInvalid, f.Name)
+		}
+		if _, dup := seen[key]; dup {
+			return "", fmt.Errorf("%w: duplicate log file name %q (names are compared case-insensitively)",
+				ErrRuntimeSpecLogFilesInvalid, f.Name)
+		}
+		seen[key] = struct{}{}
+		if f.Path == "" {
+			return "", fmt.Errorf("%w: log file %q has an empty path", ErrRuntimeSpecLogFilesInvalid, f.Name)
+		}
+		if len(f.Path) > runtimeSpecLogFilePathMaxBytes {
+			return "", fmt.Errorf("%w: the path of log file %q is longer than %d bytes",
+				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFilePathMaxBytes)
+		}
+		for _, placeholder := range runtimeSpecConfigFileSecretPlaceholders {
+			if strings.Contains(f.Path, placeholder) {
+				return "", fmt.Errorf("%w: the path of log file %q must not contain the secret placeholder %s",
+					ErrRuntimeSpecLogFilesInvalid, f.Name, placeholder)
+			}
+		}
+		if !strings.HasPrefix(f.Path, runtimeSpecLogFileConfigDir) && !isAbsPOSIXBinaryPath(f.Path) && !isAbsWindowsBinaryPath(f.Path) {
+			return "", fmt.Errorf("%w: the path of log file %q must be absolute or start with %s",
+				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
+		}
+	}
+	encoded, err := json.Marshal(files)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrRuntimeSpecLogFilesInvalid, err)
+	}
+	return string(encoded), nil
+}
+
+// decodeRuntimeSpecLogFiles is the inverse of validateRuntimeSpecLogFiles'
+// encoding: the stored column back to a list, always non-nil. "" (every row
+// written before #430) is "none", not an error; anything else unparseable is a
+// corrupt stored row and surfaces as the domain sentinel.
+func decodeRuntimeSpecLogFiles(stored string) ([]LogFileDTO, error) {
+	files := []LogFileDTO{}
+	if stored == "" {
+		return files, nil
+	}
+	if err := json.Unmarshal([]byte(stored), &files); err != nil {
+		return nil, ErrRuntimeSpecLogFilesInvalid
+	}
+	if files == nil {
+		files = []LogFileDTO{}
+	}
+	return files, nil
+}
+
 // configFileNameIsSingleSegment reports whether name is one plain file name the
 // agent can safely join under its config directory: non-blank, no path
 // separator of either OS, not "." or "..", no volume or alternate-data-stream
@@ -2404,6 +2529,10 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 	if err != nil {
 		return RuntimeSpecDTO{}, err
 	}
+	logFiles, err := decodeRuntimeSpecLogFiles(spec.LogFiles)
+	if err != nil {
+		return RuntimeSpecDTO{}, err
+	}
 	gpuDTOs := make([]RuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
 		gpuDTOs = append(gpuDTOs, RuntimeSpecGPUDTO{
@@ -2459,6 +2588,7 @@ func runtimeSpecDTO(spec routing.RuntimeSpec, gpus []routing.RuntimeSpecGPU, app
 		MetricsPath:                 spec.MetricsPath,
 		ContextProbePath:            spec.ContextProbePath,
 		ConfigFiles:                 configFiles,
+		LogFiles:                    logFiles,
 		EffectiveType:               string(effectiveType),
 		ResolvedMetricsPath:         resolvedMetrics,
 		ResolvedContextProbePath:    resolvedContext,
@@ -3429,6 +3559,11 @@ type AgentRuntimeSpecDTO struct {
 	// ${PORT}/${MODEL}-style placeholders the agent resolves locally --
 	// passed through here untouched.
 	ConfigFiles []ConfigFileDTO `json:"config_files"`
+	// LogFiles are the log files the agent tails besides the process output
+	// (#430; the agent-side runtime.Spec pairs this exact json tag). omitempty,
+	// so a spec without any ships a document that hashes exactly as it did
+	// before the field existed.
+	LogFiles []LogFileDTO `json:"log_files,omitempty"`
 	// Replicable / MinInstances / MaxInstances are the spec's instance
 	// settings (#340; the agent-side runtime.Spec pairs these exact json
 	// tags): whether the agent may run several instances of the spec, how
@@ -3937,6 +4072,10 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 	if err != nil {
 		return AgentRuntimeSpecDTO{}, err
 	}
+	logFiles, err := decodeRuntimeSpecLogFiles(spec.LogFiles)
+	if err != nil {
+		return AgentRuntimeSpecDTO{}, err
+	}
 	gpuDTOs := make([]AgentRuntimeSpecGPUDTO, 0, len(gpus))
 	for _, g := range gpus {
 		// max(measured, estimate): the estimate is the floor, a larger
@@ -3972,6 +4111,7 @@ func agentRuntimeSpecDTO(spec routing.RuntimeSpec, mapping routing.ModelMapping,
 		VisibleDevicesMode:          string(spec.VisibleDevicesMode),
 		AdminState:                  spec.AdminState,
 		ConfigFiles:                 configFiles,
+		LogFiles:                    logFiles,
 	}
 	// Counts stored on a spec that is not replicable mean nothing and are not
 	// pushed: its document stays byte-for-byte the pre-instances one, ETag

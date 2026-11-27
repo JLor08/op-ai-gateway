@@ -324,6 +324,29 @@ func TestHandlePortalMappingRuntimeSpecPutBadConfigFilesReturns400(t *testing.T)
 	}
 }
 
+// TestHandlePortalMappingRuntimeSpecPutBadLogFilesReturns400 pins the WIRE
+// contract of portal.ErrRuntimeSpecLogFilesInvalid (#430): 400 with its own
+// code, a message naming the entry and rule, and no echo of the path.
+func TestHandlePortalMappingRuntimeSpecPutBadLogFilesReturns400(t *testing.T) {
+	srv := NewTestServer()
+	mappingID := seedRuntimeSpecMapping(t, srv)
+	body := `{"binary":"/usr/local/bin/llama-server","log_files":[{"name":"engine","path":"relative/secret-layout.log"}]}`
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, newJSONRequest(http.MethodPut, "/api/portal/mappings/"+mappingID+"/runtime-spec", body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if code := errorBodyOf(t, rec); code != "runtime_spec.log_files_invalid" {
+		t.Fatalf("error code = %q, want runtime_spec.log_files_invalid", code)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "engine") || !strings.Contains(got, "absolute") {
+		t.Fatalf("body = %s, want a message naming the entry and the absolute-path rule", got)
+	}
+	if strings.Contains(rec.Body.String(), "secret-layout") {
+		t.Fatalf("body = %s echoes the path", rec.Body.String())
+	}
+}
+
 // TestHandlePortalMappingRuntimeSpecPutInstanceRefusalsReturn400 pins the wire
 // contract of the instance settings' refusals (#340) from a raw body, so the
 // request's JSON names are pinned with them: a floor above the cap is 400

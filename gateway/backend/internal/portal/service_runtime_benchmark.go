@@ -68,6 +68,7 @@ func putRequestFromDTO(dto RuntimeSpecDTO) PutRuntimeSpecRequest {
 		MaxInstances:                dto.MaxInstances,
 		InstanceParallelism:         dto.InstanceParallelism,
 		ConfigFiles:                 dto.ConfigFiles,
+		LogFiles:                    dto.LogFiles,
 		APIFlavors:                  dto.APIFlavors,
 		ResponsesMode:               dto.ResponsesMode,
 		MessagesMode:                dto.MessagesMode,
