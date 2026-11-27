@@ -2376,44 +2376,11 @@ func validateRuntimeSpecLogFiles(files []LogFileDTO, configFiles []ConfigFileDTO
 	}
 	seen := make(map[string]struct{}, len(files))
 	for i, f := range files {
-		if !runtimeSpecLogFileNamePattern.MatchString(f.Name) {
-			return "", fmt.Errorf("%w: log file %d has an invalid name (1-32 characters of letters, digits, '.', '_' or '-')",
-				ErrRuntimeSpecLogFilesInvalid, i+1)
+		if err := validateRuntimeSpecLogFileName(i, f, seen); err != nil {
+			return "", err
 		}
-		key := strings.ToLower(f.Name)
-		if key == "process" {
-			return "", fmt.Errorf("%w: log file name %q is reserved for the process output",
-				ErrRuntimeSpecLogFilesInvalid, f.Name)
-		}
-		if _, dup := seen[key]; dup {
-			return "", fmt.Errorf("%w: duplicate log file name %q (names are compared case-insensitively)",
-				ErrRuntimeSpecLogFilesInvalid, f.Name)
-		}
-		seen[key] = struct{}{}
-		if f.Path == "" {
-			return "", fmt.Errorf("%w: log file %q has an empty path", ErrRuntimeSpecLogFilesInvalid, f.Name)
-		}
-		if len(f.Path) > runtimeSpecLogFilePathMaxBytes {
-			return "", fmt.Errorf("%w: the path of log file %q is longer than %d bytes",
-				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFilePathMaxBytes)
-		}
-		if strings.IndexFunc(f.Path, unicode.IsControl) >= 0 {
-			return "", fmt.Errorf("%w: the path of log file %q must not contain control characters",
-				ErrRuntimeSpecLogFilesInvalid, f.Name)
-		}
-		for _, placeholder := range runtimeSpecConfigFileSecretPlaceholders {
-			if strings.Contains(f.Path, placeholder) {
-				return "", fmt.Errorf("%w: the path of log file %q must not contain the secret placeholder %s",
-					ErrRuntimeSpecLogFilesInvalid, f.Name, placeholder)
-			}
-		}
-		if !hasLogFileConfigDirRoot(f.Path) && !isAbsPOSIXBinaryPath(f.Path) && !isAbsWindowsBinaryPath(f.Path) {
-			return "", fmt.Errorf("%w: the path of log file %q must be absolute or start with %s, which must be followed by a path separator",
-				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
-		}
-		if logFilePathIsConfigFile(f.Path, configFiles) {
-			return "", fmt.Errorf("%w: log file %q names one of the spec's config files in %s, which the agent would remove before the start",
-				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
+		if err := validateRuntimeSpecLogFilePath(f, configFiles); err != nil {
+			return "", err
 		}
 	}
 	encoded, err := json.Marshal(files)
@@ -2421,6 +2388,64 @@ func validateRuntimeSpecLogFiles(files []LogFileDTO, configFiles []ConfigFileDTO
 		return "", fmt.Errorf("%w: %w", ErrRuntimeSpecLogFilesInvalid, err)
 	}
 	return string(encoded), nil
+}
+
+// validateRuntimeSpecLogFileName is validateRuntimeSpecLogFiles' name rules
+// for entry i (0-based) of the request, in this order: the name pattern, the
+// reserved "process", then uniqueness against seen (lower-cased keys), to
+// which the name is added once it passes. A refusal names the entry by its
+// 1-based index until the name is known to be valid.
+func validateRuntimeSpecLogFileName(i int, f LogFileDTO, seen map[string]struct{}) error {
+	if !runtimeSpecLogFileNamePattern.MatchString(f.Name) {
+		return fmt.Errorf("%w: log file %d has an invalid name (1-32 characters of letters, digits, '.', '_' or '-')",
+			ErrRuntimeSpecLogFilesInvalid, i+1)
+	}
+	key := strings.ToLower(f.Name)
+	if key == "process" {
+		return fmt.Errorf("%w: log file name %q is reserved for the process output",
+			ErrRuntimeSpecLogFilesInvalid, f.Name)
+	}
+	if _, dup := seen[key]; dup {
+		return fmt.Errorf("%w: duplicate log file name %q (names are compared case-insensitively)",
+			ErrRuntimeSpecLogFilesInvalid, f.Name)
+	}
+	seen[key] = struct{}{}
+	return nil
+}
+
+// validateRuntimeSpecLogFilePath is validateRuntimeSpecLogFiles' path rules
+// for f, whose name already passed, in this order: non-empty, the length cap,
+// no control character, no secret placeholder (in
+// runtimeSpecConfigFileSecretPlaceholders order), rooted at ${CONFIG_DIR} or
+// absolute on either platform, and not one of configFiles in ${CONFIG_DIR}.
+// A refusal names the entry, never the path.
+func validateRuntimeSpecLogFilePath(f LogFileDTO, configFiles []ConfigFileDTO) error {
+	if f.Path == "" {
+		return fmt.Errorf("%w: log file %q has an empty path", ErrRuntimeSpecLogFilesInvalid, f.Name)
+	}
+	if len(f.Path) > runtimeSpecLogFilePathMaxBytes {
+		return fmt.Errorf("%w: the path of log file %q is longer than %d bytes",
+			ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFilePathMaxBytes)
+	}
+	if strings.IndexFunc(f.Path, unicode.IsControl) >= 0 {
+		return fmt.Errorf("%w: the path of log file %q must not contain control characters",
+			ErrRuntimeSpecLogFilesInvalid, f.Name)
+	}
+	for _, placeholder := range runtimeSpecConfigFileSecretPlaceholders {
+		if strings.Contains(f.Path, placeholder) {
+			return fmt.Errorf("%w: the path of log file %q must not contain the secret placeholder %s",
+				ErrRuntimeSpecLogFilesInvalid, f.Name, placeholder)
+		}
+	}
+	if !hasLogFileConfigDirRoot(f.Path) && !isAbsPOSIXBinaryPath(f.Path) && !isAbsWindowsBinaryPath(f.Path) {
+		return fmt.Errorf("%w: the path of log file %q must be absolute or start with %s, which must be followed by a path separator",
+			ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
+	}
+	if logFilePathIsConfigFile(f.Path, configFiles) {
+		return fmt.Errorf("%w: log file %q names one of the spec's config files in %s, which the agent would remove before the start",
+			ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
+	}
+	return nil
 }
 
 // logFilePathIsConfigFile reports whether p is exactly ${CONFIG_DIR}/<name> or
