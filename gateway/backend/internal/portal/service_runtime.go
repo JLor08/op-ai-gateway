@@ -4458,6 +4458,17 @@ const AgentFeatureGPUVendorIdentity = "gpu_vendor_identity"
 // spelling of the name.
 const AgentFeatureRPCClusterSameHost = "rpc_cluster_same_host"
 
+// agentRunsSameHostClusters reports whether serverID's agent is known and
+// declares AgentFeatureRPCClusterSameHost: only then may a cluster put a
+// member on its head's server, or two members on that server. An agent not
+// heard from yet, and every agent of a service without a reader, does not.
+func (s *Service) agentRunsSameHostClusters(serverID string) bool {
+	if s.agentFeatures == nil || !s.agentFeatures.Known(serverID) {
+		return false
+	}
+	return s.agentFeatures.Has(serverID, AgentFeatureRPCClusterSameHost)
+}
+
 // agentRunsWSL reports whether serverID's agent declares
 // AgentFeatureRuntimeExecWSL, and whether this gateway knows its declaration.
 // A nil reader reports (true, true): a service built without one has no

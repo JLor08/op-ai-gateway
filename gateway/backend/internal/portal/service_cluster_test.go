@@ -2268,3 +2268,224 @@ func TestClusterMemberSaveRefusesVendorBackendMismatch(t *testing.T) {
 		t.Fatalf("move back into the mismatch: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
 	}
 }
+
+// sameHostAgent makes serverID's agent declare rpc_cluster,
+// gpu_vendor_identity and rpc_cluster_same_host, and makes the server ready
+// to be an automatic member (RPC membership, consent for the head's admin
+// group, a matching ggml-rpc-server).
+func (f *clusterFixture) sameHostAgent(serverID string) {
+	f.t.Helper()
+	features := f.clusterAgents(serverID)
+	features[serverID] = append(features[serverID], AgentFeatureGPUVendorIdentity, AgentFeatureRPCClusterSameHost)
+	f.updateServer(serverID, func(s *routing.AIServer) {
+		s.RPCMemberEnabled = true
+		s.RPCAllowedHeadGroups = encodeRPCHeadGroups([]string{testAdminGroupID})
+	})
+	f.binary(serverID, clusterRPCBinary, BinaryKindRPCServer, clusterCommit)
+}
+
+func TestClusterEntriesAllowHeadServerWithFlag(t *testing.T) {
+	flagged := func(id string) bool { return id == "srv_a" }
+	entries, err := clusterEntries([]ClusterMemberDTO{autoMember("srv_b"), autoMember("srv_a")}, memberModeAutomatic, "srv_a", flagged, nil, nil)
+	if err != nil {
+		t.Fatalf("member on the flagged head server: %v", err)
+	}
+	if len(entries) != 2 || entries[1].req.ServerID != "srv_a" || entries[0].position != 0 || entries[1].position != 1 {
+		t.Fatalf("entries = %+v", entries)
+	}
+	unflagged := func(string) bool { return false }
+	if _, err := clusterEntries([]ClusterMemberDTO{autoMember("srv_a")}, memberModeAutomatic, "srv_a", unflagged, nil, nil); !errors.Is(err, ErrClusterMemberOnHeadServer) {
+		t.Fatalf("member on an unflagged head server: err = %v, want ErrClusterMemberOnHeadServer", err)
+	}
+	// The head server's own agent decides, not another member's.
+	onlyB := func(id string) bool { return id == "srv_b" }
+	if _, err := clusterEntries([]ClusterMemberDTO{autoMember("srv_b"), autoMember("srv_a")}, memberModeAutomatic, "srv_a", onlyB, nil, nil); !errors.Is(err, ErrClusterMemberOnHeadServer) {
+		t.Fatalf("member on the head server, another server flagged: err = %v, want ErrClusterMemberOnHeadServer", err)
+	}
+}
+
+func TestClusterEntriesAllowServerTwiceWithFlag(t *testing.T) {
+	flagged := func(id string) bool { return id == "srv_a" }
+	members := []ClusterMemberDTO{autoMember("srv_a", 0), autoMember("srv_a", 1)}
+	entries, err := clusterEntries(members, memberModeAutomatic, "srv_h", flagged, nil, nil)
+	if err != nil {
+		t.Fatalf("two members on a flagged server: %v", err)
+	}
+	if len(entries) != 2 || entries[0].position != 0 || entries[1].position != 1 ||
+		!slices.Equal(entries[0].gpus, []routing.GPUKey{{Index: 0}}) || !slices.Equal(entries[1].gpus, []routing.GPUKey{{Index: 1}}) {
+		t.Fatalf("entries = %+v", entries)
+	}
+	if _, err := clusterEntries(members, memberModeAutomatic, "srv_h", func(string) bool { return false }, nil, nil); !errors.Is(err, ErrClusterMemberServerTwice) {
+		t.Fatalf("two members on an unflagged server: err = %v, want ErrClusterMemberServerTwice", err)
+	}
+	// An entry without a server id keeps the stored member at its position,
+	// with that member's own GPUs, not those of the other member on its
+	// server.
+	prevMembers := []routing.ClusterMember{
+		{Position: 0, ServerID: "srv_a", DeviceBackend: "auto"},
+		{Position: 1, ServerID: "srv_a", DeviceBackend: "auto", Threads: 4},
+	}
+	prevGPUs := []routing.ClusterMemberGPU{
+		{MemberPosition: 0, ServerID: "srv_a", GPUVendor: "nvidia", GPUIndex: 0, VRAMEstimateMB: 1000},
+		{MemberPosition: 1, ServerID: "srv_a", GPUVendor: "amd", GPUIndex: 0, VRAMEstimateMB: 2000},
+	}
+	entries, err = clusterEntries([]ClusterMemberDTO{autoMember("srv_a", 0), {}}, memberModeAutomatic, "srv_h", flagged, prevMembers, prevGPUs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := entries[1]; e.req.ServerID != "srv_a" || e.req.Threads != 4 || !slices.Equal(e.gpus, []routing.GPUKey{{Vendor: "amd", Index: 0}}) || e.estimate[routing.GPUKey{Vendor: "amd", Index: 0}] != 2000 {
+		t.Fatalf("kept stored member = %+v", e)
+	}
+}
+
+// TestMembershipUnchangedComparesNormalizedKeys: a re-sent member GPU whose
+// vendor differs from the stored one only in case, or that names the
+// server's legacy vendor where the stored row has none (a backfill), is no
+// membership change; another vendor at the same index is one.
+func TestMembershipUnchangedComparesNormalizedKeys(t *testing.T) {
+	prevMembers := []routing.ClusterMember{{Position: 0, ServerID: "srv_a", DeviceBackend: "auto"}}
+	entriesFor := func(vendor string) []clusterEntry {
+		e, err := clusterEntries([]ClusterMemberDTO{{ServerID: "srv_a", GPUs: []ClusterMemberGPUDTO{{Vendor: vendor, Index: 0, VRAMEstimateMB: 1000}}}},
+			memberModeAutomatic, "srv_h", func(string) bool { return false }, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	stored := func(vendor string) []routing.ClusterMemberGPU {
+		return []routing.ClusterMemberGPU{{MemberPosition: 0, ServerID: "srv_a", GPUVendor: vendor, GPUIndex: 0, VRAMEstimateMB: 1000}}
+	}
+	legacy := map[string]string{"srv_a": "nvidia"}
+	if !membershipUnchanged(entriesFor("NVIDIA"), prevMembers, stored("nvidia"), legacy) {
+		t.Error(`"NVIDIA" against a stored "nvidia" reads as a change`)
+	}
+	if !membershipUnchanged(entriesFor("nvidia"), prevMembers, stored(""), legacy) {
+		t.Error(`"nvidia" against a stored "" on a legacy-nvidia server reads as a change`)
+	}
+	if !membershipUnchanged(entriesFor(""), prevMembers, stored("nvidia"), legacy) {
+		t.Error(`"" against a backfilled "nvidia" reads as a change`)
+	}
+	if membershipUnchanged(entriesFor("amd"), prevMembers, stored("nvidia"), legacy) {
+		t.Error(`"amd" against a stored "nvidia" reads as unchanged`)
+	}
+	if membershipUnchanged(entriesFor("nvidia"), prevMembers, stored(""), map[string]string{}) {
+		t.Error(`"nvidia" against a stored "" without a legacy vendor reads as unchanged`)
+	}
+}
+
+// TestClusterOverlapWarningOnSameHostSharedCard: a member on the head's own
+// server that uses the head's card saves with the overlap warning.
+func TestClusterOverlapWarningOnSameHostSharedCard(t *testing.T) {
+	f := newClusterFixture(t)
+	f.sameHostAgent(f.head.ID)
+	f.hostOS(f.head.ID, "linux")
+	f.hardware(f.head.ID, mixedHostReport(`["rocm","vulkan"]`))
+	member := autoMember(f.head.ID, 0)
+	member.GPUs[0].Vendor = "nvidia"
+	req := clusterHeadRequest(member)
+	req.GPUs = []RuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}}
+	dto := f.mustPut(req)
+	if !slices.Contains(dto.ClusterWarnings, ClusterWarnGPUOverlap) {
+		t.Fatalf("warnings = %v, want %s", dto.ClusterWarnings, ClusterWarnGPUOverlap)
+	}
+	members, _, err := f.routes.ClusterMembers(f.ctx, dto.ID)
+	if err != nil || len(members) != 1 || members[0].ServerID != f.head.ID {
+		t.Fatalf("members = %+v err=%v", members, err)
+	}
+	// Without the flag the head's server is no member.
+	f.svc.agentFeatures.(fakeAgentFeatures)[f.head.ID] = []string{"runtime_manager", AgentFeatureRPCCluster, AgentFeatureGPUVendorIdentity}
+	if _, err := f.put(ownerToken(), clusterHeadRequest(autoMember(f.head.ID))); !errors.Is(err, ErrClusterMemberOnHeadServer) {
+		t.Fatalf("member on an unflagged head server: err = %v, want ErrClusterMemberOnHeadServer", err)
+	}
+}
+
+// TestClusterOverlapIgnoresOtherVendorSameIndex: the head on NVIDIA 0 and a
+// member on AMD 0 of the same server use two cards, so no overlap warning.
+func TestClusterOverlapIgnoresOtherVendorSameIndex(t *testing.T) {
+	f := newClusterFixture(t)
+	f.sameHostAgent(f.head.ID)
+	f.hostOS(f.head.ID, "linux")
+	f.hardware(f.head.ID, mixedHostReport(`["rocm","vulkan"]`))
+	member := autoMember(f.head.ID, 0)
+	member.GPUs[0].Vendor = "amd"
+	member.DeviceBackend = "rocm"
+	req := clusterHeadRequest(member)
+	req.Args = append(req.Args, "--tensor-split", "1,1")
+	req.GPUs = []RuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}}
+	dto := f.mustPut(req)
+	if slices.Contains(dto.ClusterWarnings, ClusterWarnGPUOverlap) {
+		t.Fatalf("warnings = %v: NVIDIA 0 and AMD 0 are two cards", dto.ClusterWarnings)
+	}
+}
+
+// TestPutClusterTwoMembersOnOneServer: two automatic members on one flagged
+// server save with distinct ports, each with its own GPU rows, read back by
+// position; a re-save keeps both rows' ports; two members on one card warn.
+func TestPutClusterTwoMembersOnOneServer(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.sameHostAgent(a.ID)
+	dto := f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(a.ID, 1)))
+	members, gpus, err := f.routes.ClusterMembers(f.ctx, dto.ID)
+	if err != nil || len(members) != 2 || members[0].ServerID != a.ID || members[1].ServerID != a.ID {
+		t.Fatalf("members = %+v err=%v", members, err)
+	}
+	if members[0].Port == 0 || members[0].Port == members[1].Port {
+		t.Fatalf("ports = %d, %d, want two distinct ports", members[0].Port, members[1].Port)
+	}
+	if len(gpus) != 2 || gpus[0].MemberPosition != 0 || gpus[0].GPUIndex != 0 || gpus[1].MemberPosition != 1 || gpus[1].GPUIndex != 1 {
+		t.Fatalf("gpu rows = %+v", gpus)
+	}
+	if len(dto.ClusterMembers) != 2 || len(dto.ClusterMembers[0].GPUs) != 1 || dto.ClusterMembers[0].GPUs[0].Index != 0 ||
+		len(dto.ClusterMembers[1].GPUs) != 1 || dto.ClusterMembers[1].GPUs[0].Index != 1 {
+		t.Fatalf("dto members = %+v", dto.ClusterMembers)
+	}
+	if slices.Contains(dto.ClusterWarnings, ClusterWarnGPUOverlap) {
+		t.Fatalf("warnings = %v: GPU 0 and GPU 1 are two cards", dto.ClusterWarnings)
+	}
+	resave := putRequestFromDTO(dto)
+	resave.IdleTimeoutSeconds = 900
+	f.mustPut(resave)
+	again, _, err := f.routes.ClusterMembers(f.ctx, dto.ID)
+	if err != nil || len(again) != 2 || again[0].Port != members[0].Port || again[1].Port != members[1].Port {
+		t.Fatalf("members after re-save = %+v err=%v, want ports %d, %d", again, err, members[0].Port, members[1].Port)
+	}
+	// A third member on the same server gets a port of its own.
+	third := f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(a.ID, 1), autoMember(a.ID)))
+	rows, _, err := f.routes.ClusterMembers(f.ctx, third.ID)
+	if err != nil || len(rows) != 3 || rows[2].Port == rows[0].Port || rows[2].Port == rows[1].Port || rows[0].Port != members[0].Port {
+		t.Fatalf("members with a third = %+v err=%v", rows, err)
+	}
+	shared := f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(a.ID, 0)))
+	if !slices.Contains(shared.ClusterWarnings, ClusterWarnGPUOverlap) {
+		t.Fatalf("warnings = %v, want %s for two members on one card", shared.ClusterWarnings, ClusterWarnGPUOverlap)
+	}
+}
+
+// TestClusterCandidatesListHeadServerWithFlag: the head's own server is a
+// candidate only when its agent declares rpc_cluster_same_host.
+func TestClusterCandidatesListHeadServerWithFlag(t *testing.T) {
+	f := newClusterFixture(t)
+	f.mustPut(PutRuntimeSpecRequest{Enabled: true, Binary: clusterHeadBinary, Args: []string{"-m", "/m.gguf"}})
+	f.member("A")
+	f.sameHostAgent(f.head.ID)
+	names := func() []string {
+		t.Helper()
+		list, err := f.svc.ClusterCandidates(f.ctx, ownerToken(), f.mappingID, "automatic", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := []string{}
+		for _, c := range list.Candidates {
+			out = append(out, c.ServerName)
+		}
+		return out
+	}
+	if got := names(); !slices.Equal(got, []string{"A", "Head"}) {
+		t.Fatalf("candidates with a flagged head server = %v, want [A Head]", got)
+	}
+	f.svc.agentFeatures.(fakeAgentFeatures)[f.head.ID] = []string{"runtime_manager", AgentFeatureRPCCluster}
+	if got := names(); !slices.Equal(got, []string{"A"}) {
+		t.Fatalf("candidates with an unflagged head server = %v, want [A]", got)
+	}
+}
