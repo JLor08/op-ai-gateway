@@ -3876,8 +3876,11 @@ func (m *MemoryStore) RPCMemberSpecGPUs(_ context.Context, specID string) ([]RPC
 	return out, nil
 }
 
-// clusterPortTakenLocked reports whether another head's member on serverID
-// uses port (the partial unique index on (server_id, port) of migration 106).
+// clusterPortTakenLocked reports whether a stored member of another head on
+// serverID uses port (the partial unique index on (server_id, port) of
+// migration 106). The rows of headSpecID itself are skipped because the call
+// replaces them; a repeat within the incoming members is caught by
+// checkClusterMembersLocked.
 func (m *MemoryStore) clusterPortTakenLocked(headSpecID, serverID string, port int) bool {
 	for head, others := range m.clusterMembers {
 		if head == headSpecID {
@@ -3978,11 +3981,13 @@ func (m *MemoryStore) setClusterMembersLocked(headSpecID string, members []Clust
 
 // checkClusterMembersLocked enforces on members what the tables enforce,
 // member by member: the server exists, (head, position) is unique, a
-// non-zero port is free on its server, and a manual member spec is used once
-// across all heads. It returns each member's server by position. The caller
+// non-zero port is used once per server (within the call, since one server
+// may hold several members of the head, and across the other heads), and a
+// manual member spec is used once across all heads. It returns each member's server by position. The caller
 // holds m.mu.
 func (m *MemoryStore) checkClusterMembersLocked(headSpecID string, members []ClusterMember) (map[int]string, error) {
 	serverAt := make(map[int]string, len(members))
+	ports := make(map[serverPort]struct{}, len(members))
 	specs := make(map[string]struct{}, len(members))
 	for _, mem := range members {
 		if _, ok := m.servers[mem.ServerID]; !ok {
@@ -3992,7 +3997,8 @@ func (m *MemoryStore) checkClusterMembersLocked(headSpecID string, members []Clu
 			return nil, storeerr.ErrConflict
 		}
 		serverAt[mem.Position] = mem.ServerID
-		if mem.Port != 0 && m.clusterPortTakenLocked(headSpecID, mem.ServerID, mem.Port) {
+		if mem.Port != 0 && (!addOnce(ports, serverPort{mem.ServerID, mem.Port}) ||
+			m.clusterPortTakenLocked(headSpecID, mem.ServerID, mem.Port)) {
 			return nil, storeerr.ErrConflict
 		}
 		if mem.MemberSpecID == "" {
@@ -4003,6 +4009,13 @@ func (m *MemoryStore) checkClusterMembersLocked(headSpecID string, members []Clu
 		}
 	}
 	return serverAt, nil
+}
+
+// serverPort is a member's (server, port), unique across all heads for a
+// non-zero port.
+type serverPort struct {
+	serverID string
+	port     int
 }
 
 // addOnce adds k to set and reports whether it was not there yet.

@@ -287,6 +287,19 @@ func TestConformanceTwoMembersOnOneServer(t *testing.T) {
 			t.Fatalf("a failed set must keep the membership: %+v %+v", after, afterG)
 		}
 
+		// Two members on one server still need two ports (the (server, port)
+		// uniqueness holds within one head too).
+		samePort := []routing.ClusterMember{
+			{HeadSpecID: head, Position: 0, ServerID: "srv_two_a", DeviceBackend: "cuda", Port: 47100},
+			{HeadSpecID: head, Position: 1, ServerID: "srv_two_a", DeviceBackend: "rocm", Port: 47100},
+		}
+		if err := s.SetClusterMembers(ctx, head, samePort, nil); !errors.Is(err, ErrConflict) {
+			t.Fatalf("one port twice on one server: err=%v, want ErrConflict", err)
+		}
+		if after, afterG, _ := s.ClusterMembers(ctx, head); len(after) != 2 || after[1].Port != 47101 || len(afterG) != len(beforeG) {
+			t.Fatalf("a refused same-port set must keep the membership: %+v %+v", after, afterG)
+		}
+
 		// The same (vendor, index) on two members of one server is two rows.
 		sameKey := []routing.ClusterMemberGPU{
 			{HeadSpecID: head, MemberPosition: 0, ServerID: "srv_two_a", GPUVendor: routing.GPUVendorNVIDIA, GPUIndex: 0},

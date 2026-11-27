@@ -38,7 +38,7 @@ const aiServerParityRows = 4
 // table cannot silently degrade:
 //
 //   - every PAIR of rows differs in at least one column, so a swap of any two
-//     of the six bool columns changes an observable value in at least one
+//     of the nine bool columns changes an observable value in at least one
 //     seeded server;
 //   - every row is true in at least one column, so a column dropped from a
 //     reader's select list (coming back as the false zero value) still shows
@@ -121,9 +121,9 @@ var aiServerParityBoolNames = []string{
 //
 // So: the fields that CAN hold a distinct value per row (strings, ints,
 // floats, times) do, and each is varied per row as well, so a reader that
-// returns the wrong ROW is caught too. The six bools and three override
+// returns the wrong ROW is caught too. The nine bools and three override
 // strings carry the bit-pattern tables above, sized so that every pair of
-// same-typed columns differs in at least one of the three seeded servers.
+// same-typed columns differs in at least one of the seeded servers.
 // Together that makes a swapped pair in any one reader's list observable
 // wherever the two columns are same-typed — which is the only case that does
 // not already fail loudly at Scan.
