@@ -110,9 +110,21 @@ Vulkan device numbering:
   is **not** guaranteed in general (the loader and Mesa's device-select layer
   may reorder), which is why the mapping goes through the PCI address.
 
+`GGML_VK_VISIBLE_DEVICES`, verified on the AMD test VM against the pinned
+llama.cpp source (`ggml-vulkan.cpp`, device selection):
+
+- Its indices address the raw `vkEnumeratePhysicalDevices` order (the list
+  `vulkaninfo` prints, CPU devices such as llvmpipe included in the count),
+  and the **listed order is preserved**: `1,0` makes `Vulkan0` the card at
+  enumeration index 1.
+- An index ≥ the device count makes ggml throw ("Invalid Vulkan device
+  index"); the child fails to start.
+- Set to an **empty** string it selects **no** device.
+- Unset, ggml uses its own filtered list (supported discrete/integrated GPUs,
+  de-duplicated by UUID across drivers), not the loader order.
+
 Not measured (no mixed host exists yet): Vulkan enumeration order on a mixed
-host, and whether `GGML_VK_VISIBLE_DEVICES` preserves the listed order. See
-§9.
+host. See §9.
 
 ## 4. GPU identity
 
@@ -248,16 +260,17 @@ and merges their results (keys never collide because they carry the vendor):
   A spec with a literal `--device VulkanN` in its args must be adapted; the
   architecture docs and the PR description say so. Without
   `set_visible_devices` (or in args mode) a single-vendor host keeps today's
-  behaviour (host index = Vulkan index, documented caveat, unless the mapping
-  of §5.4 is available); a mixed host refuses it (§5.4).
+  behaviour (host index = Vulkan index, documented caveat); a mixed host
+  refuses it (§5.4). Loader ordinals are never emitted without injection,
+  because ggml then numbers its own filtered list (§3).
 - `GGML_VK_VISIBLE_DEVICES` joins the vendor-independent set of variables a
   `set_visible_devices` spec may not hand-set (`visibleDevicesOwnedVars`); the
   portal enforces the same rule.
 - `${VULKAN_DEVICES}`, `${VULKAN_FIRST_DEVICE}`, `${DEVICES}` and
-  `${FIRST_LOCAL_DEVICE}` emit real Vulkan ordinals (renumbered from 0 when the
-  agent injected `GGML_VK_VISIBLE_DEVICES`, the raw ordinals otherwise). The
-  documented caveat "Vulkan2 is not necessarily host GPU 2" disappears for
-  hosts where the mapping is available. `${HOST_GPU_IDS}` keeps emitting
+  `${FIRST_LOCAL_DEVICE}` emit `Vulkan0..k-1` in declared order when the agent
+  injected `GGML_VK_VISIBLE_DEVICES`; without injection they keep today's host
+  indices and the documented caveat "Vulkan2 is not necessarily host GPU 2"
+  stays for that path only. `${HOST_GPU_IDS}` keeps emitting
   vendor-local indices and is refused for a spec spanning both vendors
   (it has no meaning there).
 
