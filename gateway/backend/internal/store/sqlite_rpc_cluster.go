@@ -177,8 +177,10 @@ func (s *SQLiteStore) RPCMemberSpecGPUs(ctx context.Context, specID string) ([]r
 
 // SetClusterMembers atomically replaces headSpecID's membership and GPU rows.
 // A failed insert rolls the whole replace back. An unknown head or member
-// server is ErrNotFound (foreign key); a duplicate position, server, or a
-// manual member spec already used elsewhere is ErrConflict (unique).
+// server, or a GPU row on a server no member runs on, is ErrNotFound (foreign
+// key); a duplicate position or a manual member spec already used elsewhere
+// is ErrConflict (unique), and so is a second member on one server (see
+// setClusterMembersOn).
 func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -201,6 +203,16 @@ func (s *SQLiteStore) SetClusterMembers(ctx context.Context, headSpecID string, 
 // setClusterMembersOn replaces headSpecID's membership and GPU rows inside
 // tx; the caller has checked that the head exists.
 func (s *SQLiteStore) setClusterMembersOn(ctx context.Context, tx *sql.Tx, headSpecID string, members []routing.ClusterMember, gpus []routing.ClusterMemberGPU) error {
+	// A GPU row references its member by (head, member position); the
+	// position is that of the member on the row's server, which is unique
+	// per head in this API, so a second member on one server is a conflict.
+	positionOf := make(map[string]int, len(members))
+	for _, m := range members {
+		if _, dup := positionOf[m.ServerID]; dup {
+			return ErrConflict
+		}
+		positionOf[m.ServerID] = m.Position
+	}
 	// The GPU rows cascade from their membership row.
 	if _, err := s.execOn(ctx, tx, `delete from rpc_cluster_members where head_spec_id = ?`, headSpecID); err != nil {
 		return fmt.Errorf("clear cluster members: %w", err)
@@ -218,11 +230,15 @@ func (s *SQLiteStore) setClusterMembersOn(ctx context.Context, tx *sql.Tx, headS
 		}
 	}
 	for _, g := range gpus {
+		memberPosition, ok := positionOf[g.ServerID]
+		if !ok {
+			return ErrNotFound // no member on the row's server: the foreign key's verdict
+		}
 		if _, err := s.execOn(ctx, tx, `
-			insert into rpc_cluster_member_gpus (head_spec_id, server_id, gpu_index, position, vram_estimate_mb,
-				vram_measured_mb, run_peak_vram_mb)
-			values (?, ?, ?, ?, ?, ?, ?)`,
-			headSpecID, g.ServerID, g.GPUIndex, g.Position, g.VRAMEstimateMB, g.VRAMMeasuredMB, g.RunPeakVRAMMB); err != nil {
+			insert into rpc_cluster_member_gpus (head_spec_id, member_position, server_id, gpu_index, position,
+				vram_estimate_mb, vram_measured_mb, run_peak_vram_mb)
+			values (?, ?, ?, ?, ?, ?, ?, ?)`,
+			headSpecID, memberPosition, g.ServerID, g.GPUIndex, g.Position, g.VRAMEstimateMB, g.VRAMMeasuredMB, g.RunPeakVRAMMB); err != nil {
 			return s.classifyRPCWrite(err, "insert cluster member gpu")
 		}
 	}

@@ -69,12 +69,14 @@ func assertMigration104Tables(ctx context.Context, t *testing.T, s *SQLStore) {
 // TestMigration104AddsRPCClusterTables pins migration 104 on a fresh install
 // and on an upgrade of a genuine version-103 database that already holds a
 // server: the five tables exist with their columns, the store can write and
-// read them, and a replay disturbs nothing.
+// read them, and a replay disturbs nothing. The exact column sets are those
+// of version 104, so both legs stop the ledger there before asserting them
+// (migration 119 adds GPU vendor and member position columns).
 func TestMigration104AddsRPCClusterTables(t *testing.T) {
 	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 
 	t.Run("fresh", func(t *testing.T) {
-		forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		forEachDialectMigratedTo(t, 104, func(t *testing.T, s *SQLStore) {
 			assertMigration104Tables(context.Background(), t, s)
 		})
 	})
@@ -89,10 +91,13 @@ func TestMigration104AddsRPCClusterTables(t *testing.T) {
 				}
 			}
 			seedMigration103Server(ctx, t, s, now)
+			if err := s.migrateTo(ctx, 104); err != nil {
+				t.Fatalf("migrate to 104: %v", err)
+			}
+			assertMigration104Tables(ctx, t, s)
 			if err := s.Migrate(ctx); err != nil {
 				t.Fatalf("migrate to head: %v", err)
 			}
-			assertMigration104Tables(ctx, t, s)
 
 			spec := rpcSpecFixture("rpcm_up", "srv_m103", now)
 			if err := s.UpsertRPCMemberSpec(ctx, spec); err != nil {

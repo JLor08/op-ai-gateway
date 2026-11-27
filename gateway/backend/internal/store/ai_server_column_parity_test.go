@@ -337,7 +337,10 @@ func TestAIServersSchemaColumnsAllCovered(t *testing.T) {
 				"price_unit", "provider", "pue", "rpc_allowed_head_groups", "runtime_max_processes", "server_path_suffix",
 				"status", "system_group_id", "updated_at",
 			},
-			ignored: map[string]string{},
+			ignored: map[string]string{
+				"gpu_legacy_vendor": "struct fields land in E2: migration 119 adds the column before routing.AIServer has a field for it",
+				"gpu_vendor_note":   "struct fields land in E2: migration 119 adds the column before routing.AIServer has a field for it",
+			},
 		})
 	})
 }
