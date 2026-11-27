@@ -60,13 +60,22 @@ are unchanged.
 ### 8.2.2 GPU metrics
 
 `DetectGPUCollectors` (`collector.go`) probes, in order, `NewNvidia`, `NewAMD`,
-`NewApple` and keeps every one whose `Available()` is true (a host can have more
-than one GPU vendor active, e.g. none in practice, but the composition allows it):
+`NewApple` and keeps every one whose `Available()` is true. A host can have more
+than one GPU vendor active (a mixed NVIDIA + AMD host, [ADR-122](../09-architecture-decisions.md#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members)),
+so every GPU carries **`vendor`** (`nvidia`, `amd`, `apple`; the collector that
+found it) beside its vendor-local `index`: the two together are the GPU's
+identity, because both vendors number their cards from 0. `vendor` is
+`omitempty` and absent from an older agent's sample, whose GPUs are the
+server's legacy vendor's ([Agent-Managed Model Runtime §3.10](agent-runtime-manager.md#310-mixed-vendor-gpu-hosts)).
+The gateway sanitizes it on ingest (lower-cased, anything but the three values
+dropped to empty) and stores it, with **`pci_bus_id`**, in the sample's
+`gpus_json`; the portal's performance series shows the vendor, and the runtime
+status rows' `gpus[]` carry it too:
 
 | Vendor | File | Tool | Notes |
 |---|---|---|---|
 | NVIDIA | `nvidia.go` | `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` | Index, name, UUID, util%, mem used/total (MiB→bytes), temp, power draw, fan%, driver version, PCI bus id; `[N/A]`-style sentinels map to 0 |
-| AMD | `amd.go` | `rocm-smi --json` (`--showid --showproductname --showuse --showmeminfo vram --showtemp --showpower --showdriverversion --showbus --showuniqueid`) | Parses the `cardN`-keyed JSON object, in both the pre-4.0 (3.x) key spelling and rocm-smi 4.x's. Name: `Device Name`, else `Card Series`/`Card series`, else `Card Model`/`Card model`. `Unique ID` is the UUID and `PCI Bus` the `pci_bus_id`; VRAM total/used come from `--showmeminfo vram`. `N/A`-style sentinels mean "not reported". A `"system"` entry supplies the driver version for every card |
+| AMD | `amd.go` | `rocm-smi --json` (`--showid --showproductname --showuse --showmeminfo vram --showtemp --showpower --showdriverversion --showbus --showuniqueid`) | Parses the `cardN`-keyed JSON object, in both the pre-4.0 (3.x) key spelling and rocm-smi 4.x's. Name: `Device Name`, else `Card Series`/`Card series`, else `Card Model`/`Card model`. `Unique ID` is the UUID and `PCI Bus` the `pci_bus_id`; VRAM total/used come from `--showmeminfo vram`. `N/A`-style sentinels mean "not reported". A `"system"` entry supplies the driver version for every card. The `index` is the **KFD topology GPU rank** (the ROCr ordinal `ROCR_VISIBLE_DEVICES` addresses), joined to each rocm-smi card **by PCI address** (a KFD node's `domain` and `location_id` = bus<<8 \| device<<3 \| function): the rocm-smi `cardN` key is only assumed to equal that rank. The join is all-or-nothing; when the topology is unreadable or a card does not join, the cards keep their `cardN` index and the join is not published, so the AMD VRAM measurers measure nothing ([Agent-Managed Model Runtime §5.3](agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)) |
 | Apple | `apple.go` | `ioreg -r -c IOAccelerator -d 1` | Regex-scrapes the integrated-GPU text dump; always exactly one GPU (`Index 0`); memory is in-use/allocated **system** memory (Apple unified memory has no separate VRAM total) |
 
 The per-GPU `MemTotalBytes` these collectors report is also what the runtime manager's
@@ -131,25 +140,54 @@ from `host.InfoWithContext`, and per-OS mainboard/BIOS/DIMM detail via
 
 Per GPU the report carries `index`, `name`, `uuid`, `driver_version`,
 `memory_total_bytes` and `pci_bus_id` — the last three `omitempty`, so a
-consumer can tell "not reported" from "reported blank".
+consumer can tell "not reported" from "reported blank" — and, from an agent
+that declares `gpu_vendor_identity` (#434), three more, each `omitempty`:
 
-**`pci_bus_id` is a display and disambiguation aid, and deliberately not an
-identity.** It comes from `nvidia-smi --query-gpu=pci.bus_id` on NVIDIA and
-from rocm-smi's `PCI Bus` on AMD. `ioreg` reports nothing of this form, so
-Apple leaves it empty rather than inventing an equivalent, as does an AMD host
-whose rocm-smi omits it (pre-4.0); every consumer must render without it. It
-exists because 4×/8× identical cards is the normal AI-server build, and of the
-handles telemetry actually offers — an `index` that can renumber across reboots
-(which is exactly what the GPU-budget rows' `expected_uuid`/`expected_name`
-drift detection exists to catch), an opaque `uuid`, and live utilisation, which
-is not identity at all — the bus id is the only one that maps to a physical slot
-and survives renumbering. Nothing keys on it: spec GPU rows, budgets and the
-whole admission arithmetic key on `index`, and making the bus id a second
-identity would be a separate design, not a field addition. Its one logical
-reader is the portal's vendor guess for the NVIDIA-only RPC-member exemptions
-(`gpuLooksNVIDIA`): a name marking the card as AMD (`amd`, `radeon`, `instinct`)
-means not NVIDIA first, and only then does a non-empty bus id count as NVIDIA,
-as a fallback for NVIDIA names without a vendor keyword.
+- **`vendor`** (`nvidia`, `amd`, `apple`), as on the telemetry GPU (§8.2.2).
+- **`vram_measurable`**: the backends whose per-process VRAM the agent can
+  measure on this card, an array of `cuda`, `rocm`, `vulkan`. NVIDIA's
+  compute-apps (and Windows PDH) measurer sees CUDA and Vulkan processes, so
+  `["cuda","vulkan"]`; AMD with the DRM fdinfo measurer `["rocm","vulkan"]`, AMD
+  on the KFD fallback `["rocm"]`; absent when nothing measures the card (Apple,
+  an AMD card whose PCI join failed). It is evaluated on every report, after the
+  collectors ran, because the AMD part depends on the collector's PCI join.
+  The portal decides its RPC-member estimate and `--tensor-split` exemptions
+  from it when present ([Agent-Managed Model Runtime §5.3](agent-runtime-manager.md#53-unknown-vram-resolves-itself-by-measurement)).
+- **`vulkan_ordinal`**: the card's position in the Vulkan loader's device
+  enumeration (the index `GGML_VK_VISIBLE_DEVICES` addresses), absent when
+  unknown. The agent runs `vulkaninfo` (5 s timeout) with each hardware report
+  on a host with GPUs and maps each Vulkan device's PCI address to its
+  ordinal; a card listed twice (two Vulkan drivers for one card) gets none.
+
+The report itself gains **`vulkan_device_count`**: how many Vulkan devices the
+probe saw, CPU devices such as llvmpipe included (they occupy ordinals); `0`
+or absent when unknown or not probed. The gateway sanitizes all four on ingest
+(unknown `vram_measurable` entries dropped, the list de-duplicated and sorted,
+a negative ordinal or count dropped) and stores them in `report_json`; the
+portal's hardware table shows the vendor, the Vulkan ordinal and the
+measurable backends.
+
+**`pci_bus_id` is the cross-API anchor, but not itself the identity.** It
+comes from `nvidia-smi --query-gpu=pci.bus_id` on NVIDIA and from rocm-smi's
+`PCI Bus` on AMD. `ioreg` reports nothing of this form, so Apple leaves it empty
+rather than inventing an equivalent, as does an AMD host whose rocm-smi omits it
+(pre-4.0); every consumer must render without it. The GPU's identity is
+(`vendor`, `index`) ([ADR-122](../09-architecture-decisions.md#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members));
+the bus address is what the other APIs speak, so the agent resolves through it:
+the AMD collector joins rocm-smi's cards to the KFD ranks on it, the DRM fdinfo
+measurer maps a client's `drm-pdev` to the AMD index through that join, and the
+Vulkan mapping ties a Vulkan ordinal to a card by it. It is also the one handle
+that maps to a physical slot and survives renumbering on the 4×/8×
+identical-card hosts that are the normal AI-server build (an `index` can
+renumber across reboots, which is what the GPU-budget rows'
+`expected_uuid`/`expected_name` drift detection exists to catch). Spec GPU rows,
+budgets and the admission arithmetic key on (`vendor`, `index`), never on the
+bus id. In the gateway its one logical reader is the portal's vendor guess for a
+report **without** `vendor` (an older agent's) in the NVIDIA-only RPC-member
+exemptions (`gpuLooksNVIDIA`): a name marking the card as AMD (`amd`, `radeon`,
+`instinct`) means not NVIDIA first, and only then does a non-empty bus id count
+as NVIDIA, as a fallback for NVIDIA names without a vendor keyword. A report with
+`vendor` is read by its vendor.
 
 Privacy is a schema-level guarantee, documented on `sample.SystemReport`
 (`server-agent/internal/sample/system_report.go`): the struct has **no** serial,
@@ -1817,7 +1855,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-118-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-119-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -2321,7 +2359,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-118-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-119-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open

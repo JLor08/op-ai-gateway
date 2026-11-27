@@ -649,7 +649,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -698,6 +698,10 @@ the wrong cards — never a blocked Save. A backend's local device index is its
 **own** independent enumeration, unrelated to the host/PCI GPU index an
 operator's other tooling reports, so `Vulkan0`/`MTL0` need not be host GPU 0;
 an operator verifies the mapping with llama.cpp's own `--list-devices`.
+(*Superseded in part by [ADR-122](#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members) (3, 4):* the env-mode
+variable is chosen per spec from its GPUs' vendors and backend; a `vulkan` spec gets
+`GGML_VK_VISIBLE_DEVICES` and `${VULKAN_DEVICES}` renders `Vulkan0..k-1` where the agent
+knows the cards' Vulkan ordinals.)
 `${METAL_DEVICES}` additionally does nothing useful except against a macOS
 host running a llama.cpp build compiled with multi-device Metal support,
 which the portal also flags when the placeholder is used against a
@@ -705,7 +709,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -874,7 +878,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1086,7 +1090,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1301,7 +1305,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-118-migrations),
+[§4](reference/data-model.md#4-migration-history-119-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1527,7 +1531,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-118-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-119-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1674,7 +1678,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-118-migrations),
+[§4](reference/data-model.md#4-migration-history-119-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3645,7 +3649,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-118-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-119-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3875,7 +3879,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-118-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-119-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4907,7 +4911,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5033,7 +5037,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5179,7 +5183,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-118-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-119-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7693,7 +7697,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-118-migrations),
+[Data Model](reference/data-model.md#4-migration-history-119-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7916,7 +7920,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-118-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-119-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8057,7 +8061,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-118-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-119-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8321,7 +8325,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-118-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-119-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -11737,7 +11741,9 @@ unknown` count as no identity, and a server without a compatible binary is liste
 - **(a) The gateway configures, orders, holds, accounts and secures; it is never on the RPC data path.** A head is an
   ordinary `llama_cpp` spec with `cluster_enabled`; its members are `rpc_server` processes on **other** servers (a
   member on the head's own server is refused), each serving exactly one head, and a server is a member of a given head
-  at most once. A head is never replicable and needs an explicit `startup_timeout_seconds`. The RPC protocol itself
+  at most once. (*Superseded in part by [ADR-122](#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members) (5):* for an agent that declares
+  `rpc_cluster_same_host` a member may run on the head's own server, on loopback, and one server may serve a head
+  several times; members are keyed by position.) A head is never replicable and needs an explicit `startup_timeout_seconds`. The RPC protocol itself
   stays unauthenticated and unencrypted: securing it upstream is not this project's job, so the design narrows who can
   reach a member instead (b, i).
 - **(b) Transport × network is chosen per cluster.** The **network** is `mesh` (NetBird on the head and every member)
@@ -11888,7 +11894,9 @@ unknown` count as no identity, and a server without a compatible binary is liste
   `nvidia-smi` only with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, and Vulkan and mixed-vendor hosts enumerate independently.
   `auto` on a mixed host is the host's vendor set, not the vendor of the spec's GPUs (each collector numbers its cards
   from 0, so the agent cannot map an index to a vendor). The operator verifies with `--list-devices`
-  ([§11 risks](11-risks-and-technical-debt.md#111-operational-risks)).
+  ([§11 risks](11-risks-and-technical-debt.md#111-operational-risks)). (*Superseded in part by
+  [ADR-122](#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members) (3, 4):* `auto` follows the spec's own GPUs' vendors, Vulkan is mapped
+  through the PCI address with `GGML_VK_VISIBLE_DEVICES`, and a mixed host refuses an unmapped Vulkan path.)
 - **A `lan` cluster in direct transport exposes each member's port unauthenticated**, and a `lan` relay trusts DNS when
   the head is named by `Domain`; both are accepted per cluster and recorded as risks.
 - **No upgrade order.** Each side gates on the other's declaration, so a mixed fleet runs no cluster rather than a
@@ -12189,7 +12197,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-118-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-119-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -13604,6 +13612,12 @@ inventing usage figures and hammering a vendor's rate-limited usage endpoint, an
 
 ## ADR-113 — Per-process VRAM on AMD Linux: KFD sysfs, not start-delta attribution or amd-smi
 
+(**Superseded in part by [ADR-122](#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members)**: AMD indices are the KFD rank
+joined to rocm-smi by PCI address, not the assumed rank = card index; DRM fdinfo is
+the primary AMD measurer with KFD as its fallback, and it runs beside NVIDIA's on a
+mixed host instead of NVIDIA winning; member measurability comes from the report's
+`vram_measurable`.)
+
 **Context.** On AMD Linux hosts the runtime manager never measured a spec's VRAM, so an unfilled `vram_estimate_mb` waited forever and the
 benchmark reported only the per-GPU delta (#432). Two causes stacked: the agent's `rocm-smi` collector asked for flags and read keys of the pre-4.0
 (3.x) output, while rocm-smi 4.x spells them differently, so on such a host the device name, total VRAM, UUID and PCI bus all read empty or 0; and no
@@ -13630,10 +13644,10 @@ rank equalled the rocm-smi card order.
 
 **Consequences.**
 - The ordinal is an assumption, not a contract: KFD node rank is taken to equal the rocm-smi card index. Verified on the test host, recorded as a
-  risk in [§11.1](11-risks-and-technical-debt.md#111-operational-risks).
+  risk in [§11.1](11-risks-and-technical-debt.md#111-operational-risks). (Superseded by ADR-122: the collector joins the two by PCI address.)
 - Visibility is ROCm/HIP only; a Vulkan engine on AMD still reads as absent and falls back to the estimate.
 - With `nvidia-smi` on the `PATH` NVIDIA has priority and the KFD measurer is not installed, which is what a mixed NVIDIA and AMD Linux host
-  looks like to the agent.
+  looks like to the agent. (Superseded by ADR-122: a composite measurer runs both vendors' measurers.)
 - The portal's cluster save checks exempt such members (a host whose telemetry OS is `linux` and whose hardware report lists only AMD GPUs,
   `device_backend` `rocm` or `auto`) from the VRAM estimate and the head's `--tensor-split`: the agent launches the member with ROCm device
   names, so a non-HIP binary fails with `runtime.device_backend_mismatch`, and every live process, `rpc_server` members included, is a
@@ -13653,7 +13667,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 
 **Decision.**
 
-- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-118-migrations))
+- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-119-migrations))
   holds the same JSON as `api_tokens.vendor_provider_access` and goes through the same codec, validated like a token policy against the user's own
   reach. `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}` (`store.ChatSessionVendorAccess`), so every existing user keeps
   today's behavior with no backfill. An explicit save whose encoding would be `''` is stored as `{"all":false}`, so "no providers" never collapses into
@@ -13702,7 +13716,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 - → [External Vendor Accounts §11.4](cross-cutting/external-vendor-accounts.md#114-who-is-restricted-api-tokens-and-the-owners-chat-session-policy),
   [Security, Auth & RBAC §5](cross-cutting/security-auth-rbac.md),
   [HTTP API surface](reference/api-surface.md),
-  [Data model](reference/data-model.md#4-migration-history-118-migrations).
+  [Data model](reference/data-model.md#4-migration-history-119-migrations).
 
 ## ADR-115 — VM CPU power via a host-attributed synthetic RAPL tree over virtiofs
 
@@ -14266,3 +14280,138 @@ layout either.
   every ring instead of a count of buffers.
 - → [Agent-Managed Model Runtime §3.1.3, §3.2, §3.5, §3.8, §14.9](cross-cutting/agent-runtime-manager.md#149-log-files),
   [HTTP API Surface](reference/api-surface.md), [Risks](11-risks-and-technical-debt.md).
+
+## ADR-122 — Mixed-vendor GPU hosts: (vendor, index) identity, DRM-fdinfo measurement, per-spec visibility, Vulkan ordinal mapping, same-host RPC members
+
+**Context.** An operator plans one inference host with NVIDIA **and** AMD GPUs and
+wants to use it two ways: one model per vendor side by side, and one model across
+both, as a single Vulkan `llama-server` or as an RPC cluster on that host (a CUDA head
+and a ROCm `rpc-server` member) (#434). The agent and the gateway modelled a host as
+having GPUs of one vendor: indices collided across vendors (`nvidia 0` and `amd 0`
+were both "GPU 0"), the detected totals of the two card 0s overwrote each other, only
+one vendor was measured ([ADR-113](#adr-113--per-process-vram-on-amd-linux-kfd-sysfs-not-start-delta-attribution-or-amd-smi):
+NVIDIA won), only one vendor's visibility variable was set, `device_backend: auto`
+followed the host's vendor set rather than the spec's GPUs, and an RPC cluster refused
+a second member on one host. Facts measured on two single-vendor test VMs (the AMD
+test VM, two Radeon RX 6800 with ROCm and Mesa RADV, kernel 6.8; the NVIDIA test VM,
+two RTX 2080 Ti, proprietary driver, kernel 6.12), llama.cpp from one commit:
+
+- amdgpu DRM fdinfo (`/proc/<pid>/fdinfo/<fd>`) carries `drm-driver`, `drm-pdev` (the
+  PCI address), `drm-client-id` and `drm-memory-vram` and covers ROCm **and** Vulkan
+  allocations (HIP 3462 MiB, Vulkan 3323 MiB on one card); KFD covers ROCm only
+  (3593 MiB for the HIP run, nothing for Vulkan). A Vulkan process held two fds per
+  render node with one client id, and both runs opened the other card with ≤ 32 KiB
+  of VRAM.
+- On NVIDIA, `nvidia-smi --query-compute-apps` already lists a Vulkan process with its
+  real usage; the proprietary driver exposes no fdinfo memory keys.
+- `vulkaninfo` reports each device's PCI address on both vendors; llvmpipe appears
+  as a device there but not in llama.cpp's `--list-devices`.
+- `GGML_VK_VISIBLE_DEVICES`, checked against the pinned llama.cpp source and on both
+  VMs: (V1) it renumbers like `CUDA_VISIBLE_DEVICES` and keeps the listed order
+  (`1,0` makes `Vulkan0` the card at ordinal 1); (V2) its indices address the raw
+  `vkEnumeratePhysicalDevices` order, CPU devices included; (V3) an index past the
+  device count fails the child and an empty value selects no device; (V4) unset,
+  ggml numbers its own filtered list (supported GPUs, de-duplicated across drivers),
+  not the loader order.
+- On both VMs the Vulkan order followed the PCI bus order, which the loader and
+  Mesa's device-select layer do not guarantee in general. No mixed host exists yet.
+
+**Decision.**
+
+1. **Identity is (vendor, vendor-local index).** `vendor` ∈ `nvidia`, `amd`, `apple`;
+   the index is what each stack already uses (the nvidia-smi index; for AMD the KFD
+   topology rank, the ROCr ordinal, now joined to rocm-smi's cards **by PCI address**
+   instead of assuming rocm-smi's `cardN` equals it; Apple's 0). The PCI bus address
+   is the cross-API anchor, never the key. Every GPU-keyed map in the agent and every
+   GPU row in the gateway carries the vendor (`gpu_vendor` in four primary keys,
+   migration 119). An empty vendor keeps its old meaning, *the host's only vendor*,
+   resolved to the **legacy vendor** (the first of NVIDIA, AMD, Apple the host has):
+   the agent resolves it before comparing a document, and the gateway rewrites a
+   server's empty-vendor rows to it once, from the first vendor-reporting hardware
+   report, persisting it (`ai_servers.gpu_legacy_vendor`) and raising a review note
+   (`gpu_vendor_note`) when that report shows several vendors.
+2. **Per-process VRAM is measured for both vendors at once.** On Linux a composite
+   measurer merges NVIDIA compute-apps and one AMD measurer; for AMD a **DRM fdinfo
+   measurer** is primary (chosen by a self-probe of the agent's own fdinfo), with
+   clients de-duplicated by (`drm-pdev`, `drm-client-id`) over the whole process
+   group, an 8 MiB per-card noise floor, and PCI addresses mapped only through the
+   collector's published join; KFD stays the fallback and is never added to fdinfo.
+   What the agent can measure is **reported**, per GPU (`vram_measurable`), not
+   assumed by the gateway.
+3. **Device backend and visibility are decided per spec**, from the vendors of the
+   spec's own GPUs: `auto` is `cuda` (NVIDIA only), `rocm` (AMD only), `metal`
+   (Apple only) or `vulkan` (NVIDIA and AMD); a native backend that cannot drive one
+   of the GPUs is refused. A `vulkan` spec with `set_visible_devices` in `env` mode
+   gets `GGML_VK_VISIBLE_DEVICES` with its cards' Vulkan ordinals and `Vulkan0..k-1`
+   in declared order, **on every host**; `GGML_VK_VISIBLE_DEVICES` joins the variables
+   such a spec may not hand-set.
+4. **Vulkan ordinals are mapped through the PCI address** from `vulkaninfo`, CPU
+   devices counted but not mapped, a card listed twice left unmapped. On a host with
+   NVIDIA and AMD GPUs **every guess is refused**: a Vulkan spec without the injection
+   (`runtime.vulkan_visible_devices_required`) and one whose cards have no ordinal
+   (`runtime.vulkan_mapping_unavailable`), eagerly at start; a single-vendor host keeps
+   its old fallback (host index = Vulkan index) on those paths. Three agent codes
+   (with `runtime.gpu_vendor_backend_mismatch`) and five portal codes
+   (`runtime_spec.gpu_vendor_invalid`, `.gpu_vendor_unsupported`,
+   `.gpu_vendor_backend_mismatch`, `.vulkan_visible_devices_required`,
+   `.cluster_member_ambiguous`) make the refusals stable.
+5. **RPC members may share a host with their head and with each other**: a member
+   on the head's server is dialled and bound on loopback, `direct`, outside the
+   cluster's mesh/LAN network; one server may carry several members of a head;
+   members are keyed by **position** (`rpc_cluster_members` key `(head_spec_id,
+   position)`), automatic member ids gain `_m<n>` from the second member on a server,
+   and usage, peaks and resets address a member by position. The agent tells a
+   loopback head from its own readiness probe by a two-poll debounce.
+
+Two agent-only feature flags, `gpu_vendor_identity` and `rpc_cluster_same_host`
+(agent 0.27.0, one MINOR bump), gate the gateway's side by name: an agent without
+the first gets its old document (no vendors, only the rows it reads correctly, a
+spec left without GPUs withheld) and a save it could not deliver is refused; same-host
+members exist only for an agent with the second.
+
+**Alternatives rejected.**
+- *The PCI bus address as the GPU key*: it is what fdinfo and Vulkan speak, but the
+  visibility variables, budgets, specs and the operator all speak vendor-local
+  indices, and Apple has none; the key stays (vendor, index) and the address resolves
+  to it.
+- *Refusing an empty vendor on a mixed host*: it would take a host that already
+  reports two vendors offline on upgrade; the legacy vendor keeps its meaning.
+- *Extending Windows PDH to AMD*: pointless without a Windows AMD collector; a mixed
+  Windows host stays out of scope.
+- *KFD plus fdinfo summed, or KFD primary*: both read the same ROCm allocations
+  (double count), and KFD cannot see Vulkan; the ~130 MiB fdinfo under-read is the
+  price of the one source that covers both.
+- *Raw loader ordinals as Vulkan device names without injection*: ggml numbers its
+  own filtered list then (V4), so the name would point at another card.
+- *Picking a driver when a card appears twice in `vulkaninfo`* (AMDVLK and RADV):
+  either choice is a guess; the card is left unmapped.
+
+**Consequences.**
+- Deliberate behaviour changes: `auto` is decided per spec (identical on a
+  single-vendor host; on a mixed host a single-vendor spec gets its native backend
+  instead of Vulkan), and a `vulkan` spec with `set_visible_devices` in `env` mode now
+  gets `GGML_VK_VISIBLE_DEVICES`, so a spec with a literal `--device VulkanN` must be
+  adapted. A hand-set `GGML_VK_VISIBLE_DEVICES` beside the option, accepted before, is
+  refused. On a mixed host a Vulkan member runs with the injected variable too.
+- Existing single-vendor hosts and configurations keep working with old and new
+  agents: no relaunch on upgrade (the backfilled vendor equals the resolved one), no
+  renumbering of AMD cards where KFD rank and rocm-smi card agreed (the AMD test VM),
+  and the refusals stay lazy there.
+- A save leaves an unchanged stored object alone (`refusalUnlessUnchanged`), so the
+  portal's overrides keep working on specs stored before the rules or before a host
+  turned mixed; the agent applies its rule at launch.
+- The second flag exists because a member bound to loopback cannot tell its head
+  from its own probe without the debounce; an agent downgraded below it withholds
+  its same-host clusters.
+- Not verified until a mixed host exists: a real CUDA + ROCm + Vulkan run, the Vulkan
+  enumeration order there, a same-host cluster on hardware, and fdinfo readability
+  under the privileged helper (#438), where the agent runs unprivileged (the agents on
+  the test hosts run as root).
+- ADR-113's "NVIDIA wins on a mixed host" and "KFD rank equals the rocm-smi card
+  index" are superseded by decisions 1 and 2.
+- → [Agent-Managed Model Runtime §3.3, §3.6, §3.7, §3.10, §5.1, §5.3](cross-cutting/agent-runtime-manager.md#310-mixed-vendor-gpu-hosts),
+  [Telemetry §8.2.2, §8.2.5](cross-cutting/telemetry-usage-observability.md#825-static-hardware-inventory),
+  [Data Model](reference/data-model.md#4-migration-history-119-migrations) (migration 119),
+  [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
+  [HTTP API Surface](reference/api-surface.md#gpu-vendors-on-gpu-rows),
+  [Risks](11-risks-and-technical-debt.md#111-operational-risks).

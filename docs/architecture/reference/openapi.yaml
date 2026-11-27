@@ -2850,7 +2850,11 @@ paths:
     description: >
       Per-server management surface. Sub-paths (see api-surface.md):
       energy, admin-groups, applications, agent-token, resource-groups,
-      models, certificate, https-switch-override, ping.
+      models, certificate, https-switch-override, ping, gpu-budgets,
+      gpu-vendor-note/dismiss. The server DTO carries gpu_legacy_vendor (the
+      vendor an empty GPU vendor stands for on this server, omitted when none
+      is stored) and gpu_vendor_note (true while the legacy-vendor review note
+      is raised, omitted otherwise).
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
@@ -2914,7 +2918,13 @@ paths:
   /api/portal/mappings/{id}/runtime-spec:
     description: >
       Agent-managed model runtime: the launch specification for one mapping.
-      PUT is a full-document replace, never a delta.
+      PUT is a full-document replace, never a delta. Each gpus[] row and each
+      automatic cluster member's gpus[] row carries vendor (nvidia, amd, apple,
+      or empty for the server's legacy vendor); the GPU vendor refusals are 400
+      runtime_spec.gpu_vendor_invalid, runtime_spec.gpu_vendor_unsupported,
+      runtime_spec.gpu_vendor_backend_mismatch and
+      runtime_spec.vulkan_visible_devices_required (see api-surface.md, GPU
+      vendors on GPU rows).
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
@@ -3127,10 +3137,20 @@ paths:
       the member's GPU budget or host memory (cluster_status.peaks_above_budget),
       which its next start would be refused for. The member server's runtime
       document is pushed. Authorized on the head (through its mapping) and on
-      the member's server.
+      the member's server. Usage is kept per member position: position names
+      the member when the head has several on the server (a same-host
+      cluster); without it the server's one member is meant.
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
       - { name: serverID, in: path, required: true, schema: { type: string } }
+      - name: position
+        in: query
+        required: false
+        description: >
+          The member's position in the head's member list. Anything but a
+          non-negative integer, or a position with no member on serverID, is
+          404 runtime_spec.cluster_member_not_found.
+        schema: { type: string }
     post:
       tags: [portal]
       summary: Reset a cluster member's stored usage
@@ -3143,11 +3163,19 @@ paths:
             no-leak collapse), `runtime_spec.not_found` (the mapping has no
             spec), `server.not_found` (a member server the caller may not
             manage, or none) or `runtime_spec.cluster_member_not_found` (the
-            server is no member of the head).
+            server is no member of the head, position names no member on it,
+            or position is malformed).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '405': { description: 'Any method other than POST (Allow: POST).' }
+        '409':
+          description: >
+            The Error envelope with `runtime_spec.cluster_member_ambiguous`: the
+            head has several members on the server and no position names one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '500':
           description: The Error envelope with `runtime_spec.request_failed` (a store read or write failed).
           content:
@@ -3237,7 +3265,7 @@ paths:
       - { name: id, in: path, required: true, schema: { type: string } }
     get:
       tags: [portal]
-      summary: Per-GPU VRAM budgets ({"budgets":[...]})
+      summary: Per-GPU VRAM budgets ({"budgets":[{vendor,index,budget_mb,expected_uuid,expected_name}]})
       security: [{ bearerAuth: [] }, { sessionCookie: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
@@ -3245,13 +3273,35 @@ paths:
       tags: [portal]
       summary: Replace the server's complete per-GPU budget list
       description: >
-        expected_uuid/expected_name are never client-writable; the server
-        snapshots them once per GPU index and preserves them afterwards.
+        One row per GPU key (vendor, index); vendor is nvidia, amd, apple or
+        empty (the server's legacy vendor). expected_uuid/expected_name are
+        never client-writable; the server snapshots them once per GPU (from the
+        newest telemetry sample's card of the same key) and preserves them
+        afterwards. 400 server.gpu_budget_invalid (negative index or budget_mb,
+        a key named twice), runtime_spec.gpu_vendor_invalid,
+        runtime_spec.gpu_vendor_unsupported (a vendor other than the server's
+        legacy vendor for an agent known to lack gpu_vendor_identity, unless the
+        row is already stored).
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
         '400': { $ref: '#/components/responses/BadRequest' }
+  /api/portal/servers/{id}/gpu-vendor-note/dismiss:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [portal]
+      summary: Dismiss the server's legacy GPU vendor review note
+      description: >
+        Lowers gpu_vendor_note, which the gateway raises when its one-time
+        legacy-vendor backfill rewrote GPU rows from a hardware report listing
+        more than one GPU vendor; gpu_legacy_vendor stays. Authorized like
+        every server write (no rights: 404 server.not_found, nothing leaks).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '204': { description: Dismissed (empty body) }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/portal/servers/{id}/rpc-members:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -3267,9 +3317,15 @@ paths:
       description: >
         400 runtime_spec.member_flag_reserved (-H/-p/-d/-c belong to the agent),
         runtime_spec.device_backend_invalid, runtime_spec.member_vram_estimate_required
-        (a non-NVIDIA GPU without an estimate, except AMD on a host whose telemetry OS is
-        linux and whose hardware report lists only AMD GPUs, with the rocm or auto
-        backend, which the agent measures).
+        (a non-NVIDIA GPU without an estimate, except one whose hardware report
+        lists the member's resolved backend in vram_measurable, or, for a report
+        without that list, AMD on a host whose telemetry OS is linux and whose
+        hardware report lists only AMD GPUs, with the rocm or auto backend, which
+        the agent measures), runtime_spec.gpu_vendor_invalid,
+        runtime_spec.gpu_vendor_unsupported, runtime_spec.gpu_vendor_backend_mismatch
+        (the backend cannot drive one of the GPUs; spared when backend and GPUs
+        are unchanged), runtime_spec.visible_devices_conflict (a hand-set
+        GGML_VK_VISIBLE_DEVICES among others). Each gpus[] row carries vendor.
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       requestBody: { $ref: '#/components/requestBodies/OpaqueJSON' }
       responses:
@@ -6264,6 +6320,13 @@ components:
                 items:
                   type: object
                   properties:
+                    vendor:
+                      type: string
+                      enum: [nvidia, amd, apple]
+                      description: >
+                        The GPU's vendor (agent feature gpu_vendor_identity);
+                        absent from an older agent, whose GPU is the server's
+                        legacy vendor's.
                     index: { type: integer }
                     vram_measured_mb: { type: integer }
               last_error:

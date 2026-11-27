@@ -702,7 +702,7 @@ semantics.
 | `/api/portal/mappings/{id}/runtime-spec` | GET/PUT/DELETE | mapping | The launch specification for one mapping, including where the agent runs it: `execution_mode` (`native` \| `wsl`) and `wsl_distro` (validation below) |
 | `/api/portal/mappings/{id}/runtime/start` | POST | mapping | **Transient manual start** (the live-status Play): starts one more instance of the mapping's managed model and writes nothing, so it then follows the normal idle, eviction and burst rules. No body. Refused while a benchmark run holds the server (`409 runtime_spec.server_benchmarking`, as the spec PUT). `200 {"instance":k,"state":"running"}` when the agent reports it running within 5 s, the agent's refusal when it answers within 5 s, otherwise `202 {"instance":k,"state":"starting"}` while the start completes in the background. See the start and stop conventions below |
 | `/api/portal/mappings/{id}/runtime/stop` | POST | mapping | **Transient manual stop** (the live-status Stop): `{"instance":k}` (required, 0–63) drains that one instance now and writes nothing, so demand can start it again. Needs the agent feature `runtime_stop` (agent 0.17.0). `200 {"instance":k,"state":"stopping"\|"stopped"}`, the agent's answer passed through. Refused while a benchmark run holds the server, like the start |
-| `/api/portal/mappings/{id}/runtime/cluster-members/{serverID}/reset-usage` | POST | mapping + member server | **Reset a cluster member's stored usage**: clears the stored VRAM per GPU and RAM of the member on `{serverID}` of the llama.cpp RPC cluster head on the mapping, their stale mark and the current run's peaks, and pushes the member server's runtime document (its demand is `max(stored usage, estimate)`). The way out of a stored peak above the member's budget (`cluster_status.peaks_above_budget`). No body. `200` the head's runtime spec; `404 server.not_found` for a member server the caller may not manage, `404 runtime_spec.cluster_member_not_found` for a server that is no member of the head |
+| `/api/portal/mappings/{id}/runtime/cluster-members/{serverID}/reset-usage[?position=N]` | POST | mapping + member server | **Reset a cluster member's stored usage**: clears the stored VRAM per GPU and RAM of the member on `{serverID}` of the llama.cpp RPC cluster head on the mapping (usage is kept per member **position**, so with `?position=N` the member at that position on that server, without it the server's one member), their stale mark and the current run's peaks, and pushes the member server's runtime document (its demand is `max(stored usage, estimate)`). The way out of a stored peak above the member's budget (`cluster_status.peaks_above_budget`). No body. `200` the head's runtime spec; `404 server.not_found` for a member server the caller may not manage, `404 runtime_spec.cluster_member_not_found` for a server that is no member of the head, for a `position` that names no member on that server, and for a malformed `position` (anything but a non-negative integer); `409 runtime_spec.cluster_member_ambiguous` when the head has several members on the server and no `position` names one (same-host clusters, [RPC clusters](#rpc-clusters)) |
 | `/api/portal/mappings/{id}/runtime/cluster-candidates?mode=automatic\|manual&binary=<path>` | GET | mapping | `{"data":[…],"head_binary_known":bool,"head_rpc_protocol":"X.Y.Z"}`: the servers the cluster head on the mapping may add as members, sorted by name: servers other than the head's that the caller manages and whose consent admits the head (system scope included). `binary` (optional) is the head binary the operator's form has; its version is read from the head server's inventory exactly as the save check reads it, and without it the stored spec's binary is used (a mapping without a stored spec then has no known version). `head_binary_known` says whether that version is known: a commit or build (`build 0` and `commit unknown` count as none) or a probed RPC protocol; `head_rpc_protocol` is the head binary's RPC protocol, omitted when unknown. `automatic` (the default) lists the servers that offer RPC membership; `compatible` is true when the server has a native, allowed `ggml-rpc-server` the head binary can drive (`rpc_binary`, `rpc_binary_version`, `rpc_binary_protocol`): when both report an RPC protocol, the same protocol (all of `X.Y.Z`), else the same commit, else build; an identical build wins over a protocol match, then the first by path. A server without one is listed with `compatible: false` and `incompatible_reason`: `no_rpc_binary` (no eligible `ggml-rpc-server`), `protocol_mismatch` (with `member_rpc_protocol`, the first mismatching binary's protocol by path), `build_mismatch`, `version_unknown`, or `head_version_unknown`. `manual` lists servers with enabled member specs that serve no other head (`member_specs`); `incompatible_member_specs` names the ones whose binary has a known protocol or build mismatch with the head binary, and `compatible` is true while at least one is not among them. A member the save would refuse for its binary is the one this listing marks incompatible, since both decide with the same matching. Refusals as the spec PUT's ([RPC clusters](#rpc-clusters)) |
 | `/api/portal/servers/{id}/rpc-members`, `/rpc-members/{specID}` | GET/POST, PUT/DELETE | server | The server's **manual** cluster member specs (`rpc_server` processes an operator defines; [RPC clusters](#rpc-clusters)). POST creates (`201`), PUT replaces the full document (`binary`, `args`, `env`, `gpus` in device order with `vram_estimate_mb`, `ram_estimate_mb`, `cache_enabled`, `device_backend`, `enabled` default true, `allowed_head_groups`: omitted keeps the stored list on update and defaults to the server's own admin groups on create), DELETE answers `204`. `used_by_head_spec_id` is set only when the caller may see the head's server. `400 runtime_spec.member_flag_reserved` for `-H`/`-p`/`-d`/`-c` in any spelling (the agent owns them), `runtime_spec.device_backend_invalid`, `runtime_spec.member_vram_estimate_required` (a GPU known to be non-NVIDIA without an estimate, except AMD on a host whose telemetry OS is `linux` and whose hardware report lists only AMD GPUs, with `device_backend` `rocm` or `auto`, which the agent measures), `404 rpc_member_spec.not_found`; disabling or deleting a spec a head uses is `409 runtime.cluster_member_in_use` |
 | `/api/portal/servers/{id}/binaries` | GET/POST/PUT/DELETE | server | The server's **binary inventory**: `{"data":[…]}` of `path`, `kind` (`llama_server`, `rpc_server`, `vllm`, `other`), `execution` (`native` or `wsl`), `distro` (the WSL distro, empty for native) and `exec_path` (the Linux path for a WSL row, `path` for a native one) derived from `path` (a `wsl://<distro>/<linux path>` path is a WSL row), the agent-detected `version`/`build`/`commit` with `version_source`, the operator's `version_override`, `effective_version` (the override when set, else the detected one: what version matching uses), `rpc_protocol` (the agent-probed RPC protocol `X.Y.Z`: an `rpc_server`'s own, a `llama_server`'s from the `rpc_server` in its directory; empty when unknown and on every manual row; an override does not change it), `source` (`agent` or `manual`), `allowed` and `reported_at`. POST adds a manual row (`201`), PUT edits a manual row or sets the version override of either kind (the path travels in the body, never in the URL), DELETE `?path=` removes a manual row (`204`). An agent row is read-only except its override: `409 binary.agent_owned`; `400 binary.path_invalid` (not absolute, a malformed `wsl://` path, over 4096 characters), `binary.kind_invalid`, `binary.version_invalid` (over 256 characters), `404 binary.not_found` |
@@ -710,7 +710,8 @@ semantics.
 | `/api/portal/applications/{id}/runtime/coresidency` | GET/PUT | application | The application's co-residency document, `{"mode":"opt_out"\|"opt_in","pairs":[{"a","b","verdict":"allow"\|"forbid"}]}`: its per-server **mode** (what a pair with no entry means, default `opt_out`) and the complete set of its **explicit** pair verdicts, each canonical (`a < b`). `pairs` is always a non-nil array; the effective allowed-pair list the agent receives is derived from both and is not part of this document ([ADR-087](../09-architecture-decisions.md#adr-087--co-residency-is-a-per-server-mode-plus-a-tri-state-pair-verdict-opt-out-by-default-existing-servers-stay-opt-in)). The PUT is a full replace of the explicit pairs; an empty or absent `mode` leaves the stored mode unchanged, an empty `verdict` is an `allow`, and `400` `runtime_coresidency.mode_invalid` / `runtime_coresidency.pair_invalid` reject an unknown mode / a bad pair or verdict |
 | `/api/portal/applications/{id}/runtime/cluster-candidates?mode=automatic\|manual&binary=<path>` | GET | application | The mapping-scoped listing above for a cluster head that is not stored yet: a new runtime spec on the application, whose first write stores the spec and its members together. Same answer and refusals (an application the caller may not manage is `404 application.not_found`); the head server is the application's, the head binary is `binary` alone (no stored spec), and a member spec any head uses is not offered |
 | `/api/portal/applications/{id}/runtime/warnings` | GET | application | `{"warnings":[…]}` — opaque codes; today `timeout_ms_below_startup_timeout`, `binary_path_os_mismatch`, `api_flavors_not_on_application`, `api_flavors_text_on_stable_diffusion`, `api_flavors_text_on_vllm_sr`, `api_flavors_no_audio_on_sglang_omni`, `process_tree_agent_unknown` and `process_tree_agent_unsupported` ([Agent-Managed Model Runtime §11.5](../cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows)) |
-| `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
+| `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[{vendor, index, budget_mb, expected_uuid, expected_name}]}` on both GET and PUT — the server's complete per-GPU budget list, one row per GPU key (vendor, index); `400 server.gpu_budget_invalid` for a negative `index`/`budget_mb` or a key named twice (an empty vendor and the server's legacy vendor at one index count as one card), and the vendor rules of every GPU row ([GPU vendors](#gpu-vendors-on-gpu-rows)) |
+| `/api/portal/servers/{id}/gpu-vendor-note/dismiss` | POST | server | Lowers the server's **legacy GPU vendor review note** (`gpu_vendor_note` on the server DTO), which the gateway raises when its one-time legacy-vendor backfill rewrote GPU rows from a hardware report listing more than one vendor ([Agent-Managed Model Runtime §3.10](../cross-cutting/agent-runtime-manager.md#310-mixed-vendor-gpu-hosts)); the stored `gpu_legacy_vendor` stays. No body, `204`; authorized like every server write (`404 server.not_found` without rights, nothing leaks) |
 | `/api/portal/servers/{id}/runtime/report` | GET | server | The file-mode agent's reported effective configuration |
 | `/api/portal/servers/{id}/runtime/events` | GET (SSE) | server | Live per-spec runtime status (`GetServer` ownership check runs **before the first stream byte**). An RPC cluster member's row (`kind: "rpc_server"`) carries `display_name`, resolved for the reader from the stored membership: `RPC (<head's gateway model name>)(<head server's name>)`. The member's own server is the one being viewed, so the name says which head it serves. A head the reader may not see (its mapping is beyond the reader's rights) and a head whose spec or mapping is gone show as `RPC (—)`, naming neither model nor server, and a manual member spec no head uses shows as `RPC (<binary's file name>)`. The row also carries the name's parts, `head_model` and `head_server`, so a client can sort and filter by them; both are absent whenever the name names no head. `spec_id` stays the member's identity. Each stream looks the names up when its set of members changes and on the first frame 15 s or more after the last lookup, so a renamed model or head server shows on that frame. A failed lookup is retried after 5 s; until then the names already known stay, but never longer than 15 s after the last successful lookup, and a refusal of the server (the reader lost its rights) drops them at once |
 | `/api/portal/servers/{id}/runtime/logs?spec_id=…` | GET (SSE) | server | Live stdout+stderr of ONE managed process. Each generation's **opening marker entry** additionally carries the **resolved launch command** (`command`: binary, argv, work_dir and the complete effective environment, with every `${AGENT_ENV:NAME}`-derived value masked agent-side as its own placeholder). One subscription carries every stream of the spec: the process output (no `stream`) and, from agent 0.26.0, each declared log file (`stream` set to its name) with its typed file events ([Agent-Managed Model Runtime §14.9](../cross-cutting/agent-runtime-manager.md#149-log-files)); there is no per-stream endpoint. Same ownership check, before the first stream byte — argv is closer to user data than status, and the boundary is the same one, not a laxer one. `spec_id` is validated as well as authorized, because it is also shipped to the agent inside the watch command: `400 runtime_logs.spec_required` without it, `400 runtime_logs.spec_invalid` when it is over-long (rejected, never clamped), and `503 runtime_logs.too_many_specs` when the server already has the maximum number of distinct specs under view. Subscribing is what makes the agent stream, and unsubscribing is what stops it. |
@@ -810,7 +811,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
 - **`expected_uuid` / `expected_name` on a budget row are never
   client-writable** — a request's values are ignored, on first creation and on
   every later PUT. The server snapshots them from the latest telemetry sample for
-  a brand-new GPU index (left empty when no sample exists) and preserves the
+  a brand-new GPU (the sample's card of the same vendor and index; left empty when no sample exists) and preserves the
   stored values verbatim afterwards, because drift detection is only meaningful
   against the *original* snapshot. So on real hardware a created row comes back
   carrying the actual GPU identity, and an assertion must match only the subset
@@ -919,7 +920,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   | `benchmark.vram_no_gpu_samples` | The server's latest telemetry carries no GPU sample, so there is nothing to difference and no per-process measurer either |
   | `benchmark.vram_isolation_blocked` | A spec already carries an operator override (the target's own included), or a spec *other than the target* is pinned. The message names the spec |
   | `benchmark.agent_ensure_unsupported` | The target is images-only and its agent has not declared `runtime_ensure`, so the run could load it only by generating, which its upstream cannot serve. It is the Load's code; with the name declared, the run loads through the router's ensure route instead, and its report carries the warning `first_generation_not_measured` |
-  | `benchmark.vram_declared_gpu_missing` | The target's launch spec declares a GPU index the host does not report. A card the run cannot see never holds still, so every stability window would burn its bound and the run could reach no number. The message names the index |
+  | `benchmark.vram_declared_gpu_missing` | The target's launch spec declares a GPU (vendor and index; a row without a vendor is the server's legacy vendor's) the host does not report. A card the run cannot see never holds still, so every stability window would burn its bound and the run could reach no number. The message names the index |
   | `benchmark.vram_cluster_member_held` | A llama.cpp RPC cluster holds, or has reserved, a member on the server. The drain force-stops only the server's launch specs and a member is removed only through its head, so the run would measure beside a process it cannot stop; it is refused rather than stopping a cluster the operator did not name |
 
   The result rides `BenchmarkStatus.results[].vram`, and `vram` **absent** means
@@ -1078,6 +1079,8 @@ sentinel is a breaking API change that must be applied in both places):
 | `runtime_spec.process_tree_invalid`, `runtime_spec.process_tree_unsupported` | 400 — the process-tree mode (#424): a `process_tree` other than `direct`/`job` (`""` stores `direct`); a write that moves a spec into `job` (a new spec, or one not stored as `job`) for a server whose reported OS is not `windows` or whose agent declared its features without `runtime_process_tree_job` (operator path only, checked last; a re-save of a spec already stored as `job` is not refused) |
 | `runtime_spec.instances_invalid`, `runtime_spec.instances_need_ephemeral_port` | 400 — the instance settings (#340): `min_instances` or `max_instances` above 64 (`MaxInstanceIndex` + 1; `instance_parallelism` has no upper bound), or `min_instances` above a set `max_instances`; `replicable` with a fixed `listen_port`. A negative `min_instances`, `max_instances` or `instance_parallelism` is `runtime_spec.tuning_invalid` |
 | `runtime_coresidency.pair_invalid`, `runtime_coresidency.mode_invalid`, `server.gpu_budget_invalid`, `server.runtime_limit_invalid` | 400 |
+| `runtime_spec.gpu_vendor_invalid`, `.gpu_vendor_unsupported`, `.gpu_vendor_backend_mismatch`, `.vulkan_visible_devices_required` | 400 — the GPU vendor rules ([GPU vendors](#gpu-vendors-on-gpu-rows)): all four on the spec PUT, the first two on the budget PUT, the first three on the RPC member spec writes and in the cluster save's member checks. The device-plan pair mirrors the agent's `runtime.gpu_vendor_backend_mismatch` and `runtime.vulkan_visible_devices_required`; the agent's third code, `runtime.vulkan_mapping_unavailable`, has no save-time mirror (only the agent knows the Vulkan device mapping at launch) |
+| `runtime_spec.cluster_member_ambiguous` | **409** — a cluster member usage reset without `position` on a server that serves the head more than once |
 | `application.managed_runtime_only`, `application.server_agent_exists` | **409** — the request shape is valid, it conflicts with the server's existing configuration |
 | `application.api_token_key_required` | 400 — the application-surface twin of `runtime_spec.api_token_key_required` above: `capture.SealSecret` returned `capture.ErrKeyRequired` sealing a non-empty `api_token` on a disk-backed store with no encryption key. Mapped from the shared `capture.ErrKeyRequired`; before #85 it had no row here (nor in `sharedErrorMap`) and fell through to the 500 `application.request_failed` fallback below |
 | `application.proxy_listen_port_invalid` | 400 |
@@ -1593,6 +1596,54 @@ streamed, and every other token's relay is byte for byte as before; a translated
 `/v1/decisions` request is always read whole, whatever the token ([Compatibility & Inference
 §3.10](../cross-cutting/compatibility-and-inference.md#310-openai-decisions) item 8).
 
+#### GPU vendors on GPU rows
+
+See [ADR-122](../09-architecture-decisions.md#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members)
+and [Agent-Managed Model Runtime §3.10](../cross-cutting/agent-runtime-manager.md#310-mixed-vendor-gpu-hosts) (#434).
+Every GPU row of the portal's runtime surface carries `vendor` beside
+`index`: a spec's `gpus[]` (`RuntimeSpecGPUDTO`), a budget (`GPUBudgetDTO`),
+a manual RPC member spec's `gpus[]`, an automatic cluster member's `gpus[]`
+(`ClusterMemberGPUDTO`), the live runtime status's `gpus[]`
+(`RuntimeGPUStatusDTO`), the VRAM benchmark's per-GPU items
+(`VRAMGPUItemDTO`), the server performance series' GPUs, and a cluster
+peak above its budget (`cluster_status.peaks_above_budget[].gpu_vendor`). The
+wire values are exactly `nvidia`, `amd`, `apple`, and `""`, the legacy *the
+host's only vendor*. A save lower-cases the vendor and then applies, per
+row: a value outside those four is `400 runtime_spec.gpu_vendor_invalid`;
+for a server whose agent is **known** not to declare `gpu_vendor_identity`, a
+non-empty vendor other than the server's stored legacy vendor (any non-empty
+vendor when none is stored) is `400 runtime_spec.gpu_vendor_unsupported`,
+**except** a (vendor, index) the saved object already has stored (a spec, the
+budget list, a member spec, a cluster member): the portal's overrides re-send
+stored rows whole, and they must keep working on an agent downgraded since. An
+agent whose declaration is not known yet is not refused (its document is held
+instead). For a flagged agent an empty vendor is stored as the server's legacy
+vendor. One card named twice (an empty vendor and the legacy vendor at one
+index included) is `runtime_spec.gpu_invalid` (`server.gpu_budget_invalid`
+for budgets). A spec or member whose `device_backend` cannot drive one of its
+GPUs (`cuda`, `rocm`, `metal` with another vendor's GPU, `sycl` across
+vendors) is `400 runtime_spec.gpu_vendor_backend_mismatch`, and a spec with
+GPUs that resolves to Vulkan on a server whose hardware report lists NVIDIA
+and AMD GPUs without `set_visible_devices` in `env` mode is `400
+runtime_spec.vulkan_visible_devices_required` (RPC members are exempt: the
+agent pins them itself). Both device-plan refusals spare a write that leaves
+the stored object's backend, GPU set and injection unchanged, so an override
+of a spec stored before the rule (or before its host turned mixed) still
+saves; the agent applies its own rule at launch. The server DTO carries
+`gpu_legacy_vendor` and `gpu_vendor_note` (each omitted when empty / false).
+The server hardware response's `report` (`GET /api/portal/servers/{id}/hardware`)
+carries, per GPU, `vendor`, `pci_bus_id`, `vram_measurable` (the backends the agent
+measures on the card: `cuda`, `rocm`, `vulkan`) and `vulkan_ordinal`, and at the top
+`vulkan_device_count`, each omitted when unknown, as the agent's system report
+sends them ([Telemetry §8.2.5](../cross-cutting/telemetry-usage-observability.md#825-static-hardware-inventory));
+the agent's telemetry adds `vendor` to each GPU and to each runtime row's `gpus[]`.
+
+`GGML_VK_VISIBLE_DEVICES` joined the visibility variables a
+`set_visible_devices` spec may not hand-set in `env`
+(`runtime_spec.visible_devices_conflict`, also checked on an RPC member's env),
+so a spec that set it by hand beside the option, accepted before, is refused on
+its next save.
+
 #### RPC clusters
 
 A llama.cpp RPC cluster head is a launch spec with `cluster_enabled`
@@ -1641,13 +1692,13 @@ which is part of the API (`validateClusterHead`, `internal/portal/service_cluste
 |---|---|---|
 | 1 | Cluster off: no `${RPC_SERVERS}` / `${RPC_DEVICES}` in args, env or a config file's content. Dropping the membership needs the head's rights only, as deleting the head does | `400 runtime_spec.cluster_rpc_placeholder_without_cluster` |
 | 2 | The head's document: effective type `llama_cpp`; no `=` form of `--rpc`, `--device`/`-dev`, `--tensor-split`/`-ts`, `--mmproj-device`/`-mmdev` (llama-server refuses it); `${RPC_SERVERS}` as the value of `--rpc` or `LLAMA_ARG_RPC`; exactly once through one of the two; a device list that names `${DEVICES}` or `${RPC_DEVICES}`; a device list parsed after the RPC servers (argv `--device` after `--rpc`, or RPC through env); at least one member; not replicable; an explicit `startup_timeout_seconds` | `400 runtime_spec.cluster_type_invalid`, `.cluster_flag_equals_form`, `.cluster_rpc_placeholder_missing`, `.cluster_rpc_twice`, `.cluster_device_list_missing_rpc`, `.cluster_device_order`, `.cluster_members_required`, `.cluster_head_replicable`, `.cluster_startup_timeout_required` |
-| 3 | The member list: one entry per server, none on the head's server | `400 runtime_spec.cluster_member_server_twice`, `.cluster_member_on_head_server` |
+| 3 | The member list: one entry per server and none on the head's server, unless that server's agent is known to declare `rpc_cluster_same_host`: then a member may run on the head's own server (addressed on loopback) and the server may carry several members of the head | `400 runtime_spec.cluster_member_server_twice`, `.cluster_member_on_head_server` |
 | 4 | Rights on every member server the write keeps or adds (a member it drops needs none: removal only frees the host); in manual mode the named spec exists on that server; every member's consent (system scope included). Skipped with 5–8 when the membership, member mode, network, transport and head binary are all as stored and every manual member's spec still exists; the head's own acknowledgement is still required then, so a direct `lan` head saved without `lan_exposure_ack` is refused `runtime.cluster_lan_ack_required` | `404 server.not_found` (rights and consent alike, so nothing leaks), `404 rpc_member_spec.not_found` |
 | 5 | Manual specs: enabled, serving no other head | `400 runtime_spec.cluster_member_spec_disabled`, `409 runtime_spec.cluster_member_spec_taken` |
 | 6 | Automatic members: RPC membership on, a native `ggml-rpc-server` the head binary can drive: the same RPC protocol when both report one, else the same commit, else build (an unknown head version is refused last, row 12) | `400 runtime_spec.cluster_member_rpc_disabled`, `.cluster_member_no_matching_binary` |
 | 7 | Manual members: a binary with a known RPC protocol mismatch (the message names both protocols) or, without a protocol pair, a known build mismatch with the head's (unknown only warns) | `400 runtime_spec.cluster_version_mismatch` |
-| 8 | Network (mesh: NetBird with a tracking group and mesh IP on every server; lan: an effective LAN address everywhere, a manual `lan_address` or a reported LAN interface on NetBird-enabled servers), then transport (direct mesh: the NetBird policy preconditions; direct lan: the acknowledgement) | `400 runtime_spec.cluster_mesh_unavailable`, `.cluster_lan_address_required`, `.cluster_direct_unavailable`, `runtime.cluster_lan_ack_required` |
-| 9 | Member GPUs (also for a member the caller cannot see): a GPU budget for an Apple GPU, an estimate for a known non-NVIDIA GPU of an automatic member, `--tensor-split` on the head for any member with known non-NVIDIA GPUs; a GPU on a host whose telemetry OS is `linux` and whose hardware report lists only AMD GPUs, with `device_backend` `rocm` or `auto`, needs neither (measured from the KFD) | `400 runtime_spec.cluster_member_budget_required`, `runtime_spec.member_vram_estimate_required`, `runtime_spec.cluster_tensor_split_required` |
+| 8 | Network (mesh: NetBird with a tracking group and mesh IP on every server; lan: an effective LAN address everywhere, a manual `lan_address` or a reported LAN interface on NetBird-enabled servers), then transport (direct mesh: the NetBird policy preconditions; direct lan: the acknowledgement). A member on the head's own server is addressed on loopback and needs nothing of the network; a cluster whose members all run there needs neither the network nor the transport preconditions, nor the acknowledgement | `400 runtime_spec.cluster_mesh_unavailable`, `.cluster_lan_address_required`, `.cluster_direct_unavailable`, `runtime.cluster_lan_ack_required` |
+| 9 | Member GPUs. First the vendors of every automatic member's GPUs are normalized under the member server's rules (a member the caller cannot see is kept as stored) and an automatic member whose backend cannot drive its GPUs is refused unless it is unchanged ([GPU vendors](#gpu-vendors-on-gpu-rows)). Then (also for a member the caller cannot see): a GPU budget for an Apple GPU, an estimate for a known non-NVIDIA GPU of an automatic member, `--tensor-split` on the head for any member with known non-NVIDIA GPUs. A GPU the agent measures for the member's resolved backend needs neither: its report's `vram_measurable` lists that backend, or, for a report without the list (an agent without `gpu_vendor_identity`), the host's telemetry OS is `linux`, its report lists only AMD GPUs and the backend is `rocm` or `auto` (the KFD rule) | `400 runtime_spec.gpu_vendor_invalid`, `.gpu_vendor_unsupported`, `.gpu_invalid`, `.gpu_vendor_backend_mismatch`, `runtime_spec.cluster_member_budget_required`, `runtime_spec.member_vram_estimate_required`, `runtime_spec.cluster_tensor_split_required` |
 | 10 | A port in 26000–26999 on each new member's server (below every default ephemeral range, so no model child holds it) | `409 runtime_spec.cluster_port_exhausted` |
 | 11 | A new or changed fixed `listen_port` equal to a cluster member's port on the server | `409 runtime_spec.port_conflicts_rpc_member` |
 | 12 | Automatic members need the head binary's version known: a commit, a build or a probed RPC protocol (add it in the Binaries tab); the newest save code, so the last refusal of the write | `400 runtime_spec.cluster_head_binary_version_unknown` |
@@ -2020,7 +2071,7 @@ Session-or-bearer, scope **`system`** (role `system_admin` + step-up elevation) 
 |---|---|---|
 | `/api/agent/v1/telemetry` | POST | Ingest one telemetry sample (POST transport) |
 | `/api/agent/v1/stream` | GET (WebSocket upgrade) | Persistent telemetry stream (WebSocket transport) + server-pushed doorbells (e.g. certificate updates) |
-| `/api/agent/v1/system-report` | POST | Ingest the static hardware inventory report |
+| `/api/agent/v1/system-report` | POST | Ingest the static hardware inventory report (per GPU `vendor`, `vram_measurable`, `vulkan_ordinal`, and `vulkan_device_count`, from an agent with `gpu_vendor_identity`; a report that carries vendors also drives the one-time legacy-vendor backfill, [GPU vendors](#gpu-vendors-on-gpu-rows)) |
 | `/api/agent/v1/certificate` | GET | Fetch the agent's current mesh leaf certificate (cert modes `files`/`proxy`) |
 | `/api/agent/v1/ca` | GET | Fetch the internal CA bundle |
 | `/api/agent/v1/proxy-routes` | GET | Fetch the gateway-provided TLS proxy route topology (cert mode `proxy`) |
@@ -2089,13 +2140,13 @@ feature set.
 token**; the server id is never taken from a parameter. Shape rules that two
 independent implementations must agree on:
 
-- top-level `router_listen`, `max_processes`, `gpu_budgets[{index, budget_mb}]`,
+- top-level `router_listen`, `max_processes`, `gpu_budgets[{vendor, index, budget_mb}]`,
   `specs[]`, `coresident[[specIdA, specIdB]]`, `etag`;
 - each spec carries `id`, `model`, `upstream_model`, `binary`, `args[]`, `env{}`,
   `config_files[{name, content}]` (always an array, `[]` for none, never `null`;
   `content` still carries any `${PORT}`/`${MODEL}`/`${CONFIG_DIR}`-style
   placeholder, which the agent resolves locally — [§3.5](../cross-cutting/agent-runtime-manager.md#35-config-files-the-agent-writes-before-it-launches-the-child)),
-  `work_dir`, `gpus[{index, vram_mb}]`, `ram_mb`, `listen_port`, `health_path`,
+  `work_dir`, `gpus[{vendor, index, vram_mb}]`, `ram_mb`, `listen_port`, `health_path`,
   `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
   `admission_wait_timeout_seconds`, `pinned`, `set_visible_devices`,
   `visible_devices_mode`, `admin_state`, `type`, `role`, `metrics_path`,
@@ -2157,7 +2208,22 @@ independent implementations must agree on:
   `runtime_exec_wsl` (an older agent would ignore the `execution` block and run the
   Linux path as a native binary), and a spec withheld for that reason is also left
   out of every `coresident` pair;
-- `specs`, `gpu_budgets` and `coresident` are always present arrays.
+- `specs`, `gpu_budgets` and `coresident` are always present arrays;
+- **`vendor` on `gpus[]` and `gpu_budgets[]` goes only to an agent that declares
+  `gpu_vendor_identity`** (#434; an agent-only name, sent in its sample, never on
+  the gateway's `/features` list). An agent without it gets the document it got
+  before vendors existed: each row without `vendor`, and only the rows it reads
+  correctly, those with an empty vendor or the server's stored legacy vendor
+  (only empty-vendor rows when none is stored), each index once. A spec (model
+  or `rpc_server` member) whose GPU rows are **all** dropped that way is
+  withheld (an empty list would run it with no VRAM reservation, invisible to
+  admission), and a withheld model spec leaves every `coresident` pair. While
+  that agent's declaration is not yet known, a document that would lose a row
+  this way is held like the replicable case below, since served to a flagged
+  agent it would take a GPU away from a running model. A same-host cluster
+  ([RPC clusters](#rpc-clusters)) whose member server's agent is known to lack
+  `rpc_cluster_same_host` (downgraded since the save) is withheld
+  (`runtime.cluster_agent_too_old`).
 
 **A document the gateway cannot yet build for this agent is held, not served.**
 While the gateway has not heard the agent's features since it started (until its
@@ -2169,7 +2235,8 @@ ingest pushes the document as soon as the declaration arrives. Serving the
 instance-less document instead would drain the protected instances of an agent
 that does run them. An enabled `wsl` spec holds the document the same way, since
 whether it may be sent depends on the agent's `runtime_exec_wsl`, and a sample that
-changes that declaration pushes the document again. A deployment that splits one store across several gateway
+changes that declaration pushes the document again; so does a sample that changes
+its `gpu_vendor_identity`. A deployment that splits one store across several gateway
 processes, one of which never ingests that agent's telemetry, answers it this 503
 for as long as the spec is replicable.
 

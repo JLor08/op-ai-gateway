@@ -327,7 +327,7 @@ Additions worth knowing when looking for code on this side:
 | Package | Responsibility |
 |---|---|
 | `agent` | The agent run loop, version, and orchestration of collection + reporting. |
-| `collector` | Host (gopsutil, including available memory), GPU (nvidia-smi/rocm-smi/ioreg), the per-process VRAM measurers (NVIDIA compute-apps, Windows PDH, AMD-on-Linux KFD sysfs) and the host-RAM measurer (build-tag split per platform), power, CPU-temperature, and hardware-inventory collectors; optional inference `/metrics` scraper and loaded-model lister. |
+| `collector` | Host (gopsutil, including available memory), GPU (nvidia-smi/rocm-smi/ioreg), the per-process VRAM measurers (NVIDIA compute-apps, Windows PDH, and on Linux beside NVIDIA's an AMD measurer, DRM fdinfo with KFD sysfs as its fallback, all keyed by (vendor, index)) and the host-RAM measurer (build-tag split per platform), power, CPU-temperature, and hardware-inventory collectors (the latter with the `vulkaninfo` Vulkan ordinal mapping); optional inference `/metrics` scraper and loaded-model lister. |
 | `client` | HTTP and WebSocket senders that push telemetry to the gateway. |
 | `sample` | Telemetry sample shaping. |
 | `trust` | Gateway trust store (CA handling) for outbound TLS. |

@@ -390,7 +390,9 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   operator set in the portal, and that order is what reaches this list.
   Deduplicated (first occurrence wins) because CUDA stops parsing the list at
   the first repeated entry, so `1,1,2` would silently yield one visible device
-  rather than three.
+  rather than three. Host indices are vendor-local (NVIDIA 0 and AMD 0 are both
+  `0`), so the token, and `${HOST_GPU_IDS_MAIN_LAST}` below, is refused for a
+  spec whose GPUs span NVIDIA and AMD ([§3.10](#310-mixed-vendor-gpu-hosts)).
 - `${HOST_GPU_IDS_MAIN_LAST}` — an exact-match sibling of `${HOST_GPU_IDS}`: the
   same declared, deduplicated host index list with the **first** entry (the main
   card) moved to the **end** (`2,0,1` declared → `"0,1,2"`; one GPU renders
@@ -412,9 +414,19 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   "${CUDA_DEVICES}"]` on a spec declaring GPUs `[3, 2]` yields
   `--device CUDA3,CUDA2` — the operator's order, not ascending. Same empty-set
   refusal as `${HOST_GPU_IDS}`, on the same reasoning: a spec declaring no GPUs
-  is a hard error rather than an empty `--device` value. **The local index is
-  the vendor backend's own enumeration, not the host/PCI GPU index**: Vulkan
-  and Metal enumerate their devices independently of the host, so `Vulkan0` or
+  is a hard error rather than an empty `--device` value. `${CUDA_DEVICES}` and
+  `${METAL_DEVICES}` are refused for a spec whose GPUs span NVIDIA and AMD, like
+  `${HOST_GPU_IDS}`. **`${VULKAN_DEVICES}` names the renumbered `Vulkan0..k-1`
+  in declared order whenever the agent injected `GGML_VK_VISIBLE_DEVICES`** (a
+  `vulkan` spec with `set_visible_devices` in `env` mode whose cards' Vulkan
+  ordinals the agent knows, [§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)):
+  then the child's `Vulkan0` is exactly the first declared card. Without that
+  injection it renders the declared host indices, and on a host with NVIDIA and
+  AMD GPUs it is refused instead (`runtime.vulkan_visible_devices_required`,
+  [§3.10](#310-mixed-vendor-gpu-hosts)), because there a host index names no
+  reliable Vulkan device. **On the paths that render host indices the number is
+  still the backend's own enumeration, not the host/PCI GPU index**: Vulkan and
+  Metal enumerate their devices independently of the host, so `Vulkan0` or
   `MTL0` is not guaranteed to be the same physical card as host GPU 0 — an
   operator relying on these placeholders verifies the mapping with llama.cpp's
   own `--list-devices` output. (CUDA without `CUDA_VISIBLE_DEVICES` set
@@ -439,7 +451,12 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
 - `${DEVICES}` — an exact match, any spec: on a head the RPC devices first,
   then the spec's local GPUs in declared order (`RPC0,RPC1,CUDA3,CUDA2`); on any
   other spec the local GPUs only. The prefix is the spec's `device_backend`
-  (`auto` by default, resolved from the host's detected vendors, §3.6). A head
+  (`auto` by default, resolved per spec from the vendors of its own GPUs, §3.3),
+  and the local names are the spec's device plan's: renumbered from 0 when the
+  agent injected the visibility variable that governs that backend
+  (`CUDA_VISIBLE_DEVICES` for CUDA, `ROCR_VISIBLE_DEVICES` for ROCm,
+  `GGML_VK_VISIBLE_DEVICES` for Vulkan), else the declared host indices. A
+  plan the agent refuses (§3.3) refuses the token with the plan's code. A head
   without GPUs renders only its RPC devices; a non-head without GPUs is a hard
   error, on the same reasoning as `${CUDA_DEVICES}`. RPC devices come first
   because llama.cpp puts the output layer on the **last** device and `--fit`
@@ -452,8 +469,9 @@ spec's config-file content ([§3.5](#35-config-files-the-agent-writes-before-it-
   it is a hard error.
 - `${CUDA_FIRST_DEVICE}` / `${VULKAN_FIRST_DEVICE}` / `${METAL_FIRST_DEVICE}` —
   the first GPU in declared order, rendered like the matching `${…_DEVICES}`
-  sibling with an **explicit** prefix (`CUDA3` for GPUs `[3, 2]`). Without GPU
-  rows it is a hard error.
+  sibling with an **explicit** prefix (`CUDA3` for GPUs `[3, 2]`; `Vulkan0`
+  under an injected `GGML_VK_VISIBLE_DEVICES`), with the same refusals. Without
+  GPU rows it is a hard error.
 - `${CONFIG_DIR}` — an exact match substitutes the **absolute per-instance
   directory the agent writes the spec's config files into**,
   `<config_files_dir>/<spec-id>` for instance 0 and
@@ -875,23 +893,69 @@ route, and it is OS-independent for the same reason: the environment is built
 programmatically.
 
 **`set_visible_devices` (per spec, default off)** asks the agent to set the
-visibility variable **its own detected hardware** uses, to **this spec's own
-GPU indices**:
+visibility variable that **this spec's device backend** honours, to **this
+spec's own GPUs**. The agent decides it **per spec** (`planDevices`,
+`device_plan.go`, #434), from the vendors of the spec's own GPU rows (an empty
+vendor read as the host's legacy vendor, [§3.10](#310-mixed-vendor-gpu-hosts))
+and the backend they resolve to, against the hardware it detected itself:
 
-| Detected stack | Variable set |
-|---|---|
-| NVIDIA (`nvidia-smi` present) | `CUDA_VISIBLE_DEVICES` |
-| AMD (`rocm-smi` present) | `ROCR_VISIBLE_DEVICES` — **and nothing else** |
-| Apple, or no recognised stack | *nothing*, and that is a success, not an error |
+| Spec's GPUs | `device_backend` | Variable set (`env` mode) | Device names the tokens render |
+|---|---|---|---|
+| NVIDIA only | `auto` or `cuda` | `CUDA_VISIBLE_DEVICES` = the host indices | `CUDA0..k-1` |
+| AMD only | `auto` or `rocm` | `ROCR_VISIBLE_DEVICES` = the host indices — **and nothing else** | `ROCm0..k-1` |
+| any vendors | `vulkan`, or `auto` with NVIDIA and AMD | `GGML_VK_VISIBLE_DEVICES` = the cards' **Vulkan ordinals**, declared order | `Vulkan0..k-1` |
+| Apple only | `auto` or `metal` | *nothing*, and that is a success, not an error | `MTL` + host index |
+| one vendor | `sycl` (or `metal` on NVIDIA/AMD: refused, below) | that vendor's variable above = the host indices | `SYCL` + host index |
+| no recognised vendor (a host where detection found none) | an explicit backend | *nothing*, a success as before | prefix + host index |
+| both NVIDIA and AMD | `cuda`, `rocm`, `metal` or `sycl` | refused: `runtime.gpu_vendor_backend_mismatch` | — |
+| one vendor | another vendor's native backend (`rocm` for NVIDIA GPUs, …) | refused: same code | — |
 
-That table describes `visible_devices_mode = "env"` (the default, and the
+`auto` follows the spec's **own** GPUs: NVIDIA only → `cuda`, AMD only →
+`rocm`, Apple only → `metal`, NVIDIA and AMD → `vulkan`. A spec without GPUs
+keeps the host-level rule (the host's one detected vendor's backend, `vulkan`
+for several, a hard error for none). On a single-vendor host this is exactly
+the result the host-level rule gave before; on a mixed host a single-vendor
+spec now gets its native backend instead of Vulkan, deliberately.
+
+The Vulkan row needs the card-to-ordinal mapping of the hardware report
+([§3.10](#310-mixed-vendor-gpu-hosts)). Where a declared card has no known
+ordinal (no `vulkaninfo`, a card missing from its output or listed twice, or a
+spec started before the first hardware report reached the runtime), a
+single-vendor host falls back to exactly the pre-#434 behaviour, the host
+vendor's variable with the host indices and host-index device names, and a host
+with NVIDIA and AMD GPUs refuses the spec (`runtime.vulkan_mapping_unavailable`).
+
+> **Operator-visible change for `vulkan` specs, on every host.** Before #434 a
+> `vulkan` spec with `set_visible_devices` in `env` mode got
+> `CUDA_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES`, which the Vulkan driver
+> ignores, so its pinning did nothing and its devices kept their unfiltered
+> numbers. Now it gets `GGML_VK_VISIBLE_DEVICES` and its devices are
+> `Vulkan0..k-1` in declared order, so a spec that names a literal
+> `--device VulkanN` in its `args` (computed against the old, unfiltered
+> numbering) **must be adapted**: write `${VULKAN_DEVICES}` or `${DEVICES}`, or
+> `Vulkan0..k-1` in declared order. Without `set_visible_devices` (or in `args`
+> mode) a single-vendor host keeps the old behaviour, host index = Vulkan
+> index with the caveat of §3.2; a mixed host refuses that spec
+> (`runtime.vulkan_visible_devices_required`).
+
+`GGML_VK_VISIBLE_DEVICES` is ggml-vulkan's own filter, verified against the
+pinned llama.cpp source and on the two single-vendor test VMs: its indices
+address the raw `vkEnumeratePhysicalDevices` order (CPU devices such as
+llvmpipe included in the count), the listed order is kept (`1,0` makes
+`Vulkan0` the card at ordinal 1), an index at or past the device count makes
+the child fail to start, and an empty value selects no device. Unset, ggml
+numbers its **own filtered** list (supported GPUs, de-duplicated across
+drivers) rather than the loader's order, which is why the agent never renders
+a loader ordinal as a device name without injecting the variable.
+
+The per-spec table above describes `visible_devices_mode = "env"` (the default, and the
 whole of pre-existing behaviour). **`visible_devices_mode` (per spec, default
 `env`)** chooses *how* `set_visible_devices` enforces, and only matters when
 the option is on:
 
 | Mode | Behavior |
 |---|---|
-| `env` (default) | The agent injects the vendor variable from the table above, exactly as before this field existed. |
+| `env` (default) | The agent injects the variable from the table above (before this field existed, `env` was the only behaviour). |
 | `args` | The agent injects **no** visibility variable at all. The spec itself carries the restriction: the operator places one of the `${CUDA_DEVICES}`/`${VULKAN_DEVICES}`/`${METAL_DEVICES}` placeholders, the generic `${DEVICES}`, or one of the host-numbered card lists `${HOST_GPU_IDS}`/`${HOST_GPU_IDS_MAIN_LAST}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) in the spec's own `args` **or in a config file's content** — `["--device", "${CUDA_DEVICES}"]` for llama.cpp, `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` in Strata's `strata.json`. The portal labels this mode "Via args or config file"; the stored value stays `args`. |
 
 `args` mode exists because a visibility variable hides every other card from
@@ -931,15 +995,33 @@ conflict trap (trap 3 below) holds in both modes**: a hand-set
 `CUDA_VISIBLE_DEVICES`/`ROCR_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` in `env`
 is refused whenever `set_visible_devices` is on, regardless of
 `visible_devices_mode` — the mode changes what the agent injects, never
-whether a hand-set entry may coexist with the option.
+whether a hand-set entry may coexist with the option. `GGML_VK_VISIBLE_DEVICES`
+joined the owned set with #434, so a spec that hand-set it beside the option is
+now refused, by the agent at start and by the portal on its next save.
 
-The vendor comes from the **same** detection the telemetry collectors use
+The vendors come from the **same** detection the telemetry collectors use
 (`collector.DetectGPUCollectors`, which probes nvidia → amd → apple in that
-fixed order and keeps whichever reports `Available()`). It is a hardware
-capability discovered locally, never a gateway-supplied value — the same posture
-as the VRAM measurer ([§5.1](#51-the-per-gpu-data-model)). The
-gateway carries the boolean and nothing about the variable name, because it
-cannot know what is in the machine.
+fixed order and keeps whichever reports `Available()`), and the Vulkan mapping
+from the agent's own hardware report. Both are hardware capabilities discovered
+locally, never gateway-supplied values — the same posture as the VRAM measurer
+([§5.1](#51-the-per-gpu-data-model)). The gateway carries the boolean, the
+backend and each GPU's vendor and index, and nothing about the variable name,
+because it cannot know what is in the machine.
+
+**When a plan refusal bites.** The plan is made for every launch from one
+snapshot of the host's topology, so the dry runs and the real expansion agree
+even if a hardware report lands in between. A refused plan carries its stable
+code to `last_error.code` (`not_permitted`). On a host with NVIDIA and AMD GPUs
+a model spec whose plan is refused is refused at start **whether or not**
+anything consumes the plan, and a plan that fails for another reason (an
+unknown `device_backend`, say) refuses the injection there too. On every other
+host the refusal stays where the plan is consumed (the injected variable,
+`${DEVICES}`, `${FIRST_LOCAL_DEVICE}`, the Vulkan tokens), and an injection
+whose plan fails for an uncoded reason falls back to the legacy vendor's
+variable with the host indices, so a spec that worked before the plan existed
+starts as it did. A `not_permitted` spec is evaluated again on its next ensure
+or document apply at least 5 s later (`notPermittedRetryInterval`); a hardware
+report alone does not wake it.
 
 > **AMD sets the ROCR level only, and adding `HIP_VISIBLE_DEVICES` is the
 > mistake to expect.** The two are not synonyms, they are *stacked* filters.
@@ -990,7 +1072,8 @@ cannot know what is in the machine.
    invisible ambiguity into a message
    (`runtime_spec.visible_devices_conflict`, HTTP 400; `not_permitted`
    agent-side). The owned set is `CUDA_VISIBLE_DEVICES`,
-   `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, compared case-insensitively,
+   `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES` and (since #434)
+   `GGML_VK_VISIBLE_DEVICES`, compared case-insensitively,
    and it is **vendor-independent on both sides** — the gateway cannot know the
    target host's hardware, and a portal rule that could not mirror the agent's
    would reintroduce, in the validator, the very "two states that look identical
@@ -1000,10 +1083,12 @@ cannot know what is in the machine.
    `GPU_DEVICE_ORDINAL` are deliberately **not** owned: composing one of those
    with the option is the documented escape hatch (`${HOST_GPU_IDS}`), not a
    contradiction.
-4. **Host indices, not child indices.** The emitted value is the spec's declared
-   indices as the **host** sees them — the same numbers `nvidia-smi`/`rocm-smi`
-   report and the same ones the per-GPU budgets and measurement rows are keyed
-   by. `${HOST_GPU_IDS}` carries host indices too, which is why it is named that
+4. **Host indices, not child indices.** The emitted CUDA or ROCm value is the
+   spec's declared indices as the **host** sees them — the same numbers
+   `nvidia-smi` and the KFD topology report, and the same ones the per-GPU
+   budgets and measurement rows are keyed by (with the vendor). The Vulkan value
+   is the cards' Vulkan ordinals instead, which is what that filter
+   addresses. `${HOST_GPU_IDS}` carries host indices too, which is why it is named that
    and not `${GPU_IDS}` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)).
    **In the operator's declared order, not sorted** — the store persists that
    order explicitly (`agent_runtime_spec_gpus.position`, migration 73) and
@@ -1957,12 +2042,27 @@ owns the bind and device flags:
   any of them (including the `--host`/`--port`/`--device`/`--cache` spellings
   and the `flag=value` form) is refused (`runtime.not_permitted`). Operator
   `args` carry `-t` and whatever upstream adds later.
-- `-d` is the spec's GPUs as device names with the member's `device_backend`
-  prefix, in the declared order and with the declared host indices (a member
-  never runs in visibility-variable mode: without `-d` a multi-backend build
-  exposes each card twice and shifts every `RPC<n>`), or `CPU` for a member
-  with no GPUs. A declared-GPU member whose backend cannot be resolved is a
-  hard error.
+- `-d` is the member's **device plan** (`memberDevicePlan`, the per-spec plan
+  of §3.3) joined: the spec's GPUs as device names with the backend its own
+  GPUs resolve to, in the declared order and with the declared host indices,
+  or `CPU` for a member with no GPUs. A member never runs in
+  visibility-variable mode on its own (`set_visible_devices` in `env` mode is
+  refused on an `rpc_server` spec): without `-d` a multi-backend build exposes
+  each card twice and shifts every `RPC<n>`. **One exception**, decided by the
+  agent alone: a Vulkan member on a host with NVIDIA and AMD GPUs is planned as
+  if `set_visible_devices` were on in `env` mode, so the agent injects
+  `GGML_VK_VISIBLE_DEVICES` with the cards' Vulkan ordinals and `-d` names the
+  renumbered `Vulkan0..k-1` of that filtered list (without it ggml numbers its
+  own filtered list, not the loader's order). Such a member whose cards have no
+  known ordinal is refused (`runtime.vulkan_mapping_unavailable`); a member
+  whose backend cannot drive one of its GPUs is refused
+  (`runtime.gpu_vendor_backend_mismatch`), each code on `last_error.code`. A
+  member env entry that hand-sets the variable its plan injects is refused
+  (`runtime.not_permitted`, with no code of its own): the agent's device list is
+  numbered against its own value. A declared-GPU member whose backend cannot be
+  resolved is a hard error. The banner's device count is checked against one
+  device per distinct GPU key (vendor and index: NVIDIA 0 and AMD 0 are two
+  cards).
 - `-H`/`-p` follow the transport. `direct` binds `rpc.bind_ip` and `rpc.port`
   exactly (a mesh address, `0.0.0.0` on a LAN, or the server's LAN address).
   `relay` binds the child to `127.0.0.1` on an ephemeral port and listens on
@@ -2040,23 +2140,29 @@ owns the bind and device flags:
 **Device backend and the device tokens.** `device_backend` (`""`/`auto`,
 `cuda`, `rocm`, `vulkan`, `metal`, `sycl`; case-insensitive) names the prefix
 the generic device tokens render: `CUDA`, `ROCm`, `Vulkan`, `MTL`, `SYCL`. An
-explicit value maps directly. `auto` is resolved **on the agent** from the
-host's detected GPU vendor set (`collector.DetectGPUCollectors`): exactly one
-vendor selects its native backend (NVIDIA `cuda`, AMD `rocm`, Apple `metal`),
-several vendors select `vulkan`, and none is a hard error for any token that
-needs a GPU prefix. This is an approximation by design: each collector numbers
-its devices from 0, so on a mixed host the agent cannot map a declared GPU
-index to a vendor, and "the vendor of the spec's GPUs" becomes "the vendors of
-the host". An unknown value is refused.
+explicit value maps directly. `auto` is resolved **on the agent, per spec**,
+from the vendors of the spec's own GPU rows ([§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement)):
+NVIDIA only `cuda`, AMD only `rocm`, Apple only `metal`, NVIDIA and AMD
+`vulkan`. Since every GPU row names its vendor (#434), the agent no longer has
+to approximate "the vendor of the spec's GPUs" by "the vendors of the host";
+only a spec without GPUs still uses the host's detected vendor set
+(`collector.DetectGPUCollectors`: one vendor its native backend, several
+`vulkan`, none a hard error for any token that needs a GPU prefix). A backend
+that cannot drive one of the spec's GPUs is refused
+(`runtime.gpu_vendor_backend_mismatch`), and so is `sycl` across vendors. An
+unknown value is refused.
 
-**Known limitation, documented follow-up: backend enumeration order.** The
-number in a backend device name is the backend's own enumeration, not the host
-GPU index. CUDA matches `nvidia-smi` only with `CUDA_DEVICE_ORDER=PCI_BUS_ID`,
-which the agent does not set (it would renumber existing specs); Vulkan, and
-above all mixed-vendor hosts, enumerate independently of the host indices. The
-operator verifies the mapping with the binary's `--list-devices` output. A later
-change may match that output to the host's GPUs; the placeholders already
-render exactly what the spec declares, so nothing here has to change for it.
+**Known limitation: backend enumeration order.** Where the agent renders a host
+index under a backend prefix, the number is the backend's own enumeration, not
+the host GPU index. CUDA matches `nvidia-smi` only with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, which the agent does not set (it would renumber
+existing specs), except for a `wsl` spec (§3.8). For **Vulkan the mapping
+exists**: the agent ties each card to its Vulkan ordinal through the PCI address
+and, with `GGML_VK_VISIBLE_DEVICES` injected, names the devices `Vulkan0..k-1` in
+declared order. Only the paths without that injection keep the caveat, on a
+single-vendor host; a host with NVIDIA and AMD GPUs refuses them rather than
+guess. Otherwise the operator verifies the mapping with the binary's
+`--list-devices` output.
 
 **Telemetry.** A cluster row reports, beside the ordinary fields
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), `kind`,
@@ -2257,7 +2363,14 @@ member process's established connections on its bind port, polled every 2 s on
 a goroutine per member (listing connections can be slow, so it never runs on the
 collect loop and a poll still running is not overlapped). A connection from an
 allowed head address is the hold. A connection from this host's own addresses
-(the readiness probe, a local tool) is ignored. Any **other** remote address is
+(the readiness probe, a local tool) is ignored. **A member on its head's own
+server** (every head address loopback, `127.0.0.1`) cannot tell its head from the
+agent's readiness probe by address, since both connect from loopback; there a
+head connection counts only once **two consecutive polls** list the same
+connection (`debounceLoopback`, agent feature `rpc_cluster_same_host`). The
+probe is short-lived and never survives two polls, the head's connection is
+long-lived; only the latest poll's connections are remembered, so the state stays
+bounded. The hold therefore appears up to one poll later for such a member. Any **other** remote address is
 a breach and never a holder, even when it is the only connection: llama.cpp
 blocks a second head in the handshake and lets it take over when the first
 disconnects, so a foreign peer must be reported, not mistaken for the head.
@@ -2277,7 +2390,9 @@ the address the gateway configured: a **direct-mode member's rpc-server** binds
 address), and a **relay's listener** binds `rpc.bind_ip:rpc.port` while its
 child stays on `127.0.0.1`. A relay refuses a target that is not loopback and a
 bind that is not a literal IPv4 address. A head, like any model server, binds
-loopback and is reached through the router.
+loopback and is reached through the router. A member on the head's own server
+needs neither exception: the gateway gives it `rpc.bind_ip` `127.0.0.1`,
+`direct` transport and the head address `127.0.0.1` (§3.7).
 
 #### Binary inventory
 
@@ -2422,25 +2537,34 @@ document (type `llama_cpp`, no `--flag=value` form of the scanned options,
 `${RPC_SERVERS}` exactly once as the value of `--rpc` or `LLAMA_ARG_RPC`, a
 device list that names the RPC devices and is parsed after them, at least one
 member, not replicable, an explicit startup timeout); the member list (one entry
-per server, none on the head's server); then rights and consent, member specs,
-member binaries, network and transport, and the member GPUs (an Apple GPU needs
-a GPU budget; a known non-NVIDIA GPU needs an estimate on an automatic member,
-and `--tensor-split` on the head, unless the agent measures it per process. It
-does so only for a member whose host's telemetry OS is `linux` (the
-`runtime.GOOS` of its last sample; the hardware report's own `os` is a platform
-string such as `ubuntu 24.04` and names no family) and whose hardware report
-lists only AMD GPUs and whose `device_backend` is `rocm` or `auto`: the agent
-launches that member with ROCm device names, so it runs only as a ROCm/HIP
-process, which the KFD measurer sees. A Windows host, a host without telemetry,
-a mixed host, a GPU the report does not name as AMD and a Vulkan `rpc-server`
-are not measured and still need both. The check reads the report, not the
-agent's measurer: the agent chooses its GPU vendors and measurer from the tools
-on its `PATH` (`nvidia-smi` present selects the NVIDIA vendor and the
+per server, none on the head's server, unless that server's agent is known to
+declare `rpc_cluster_same_host`: then a member may run on the head's own server
+and one server may carry several members of the head,
+[§3.10](#310-mixed-vendor-gpu-hosts)); then rights and consent, member specs, member binaries, network and
+transport, and the member GPUs. Those start with the GPU vendors: every GPU of
+an automatic member is normalized under its member server's vendor rules
+([§3.10](#310-mixed-vendor-gpu-hosts)), and an automatic member whose backend
+cannot drive one of its GPUs is refused unless it is unchanged. Then an Apple
+GPU needs a GPU budget, and a known non-NVIDIA GPU needs an estimate on an
+automatic member, and `--tensor-split` on the head, unless the agent measures it
+per process. **Measurability is read from the report**: a hardware report that
+carries `vram_measurable` for the card ([Telemetry
+§8.2.5](telemetry-usage-observability.md#825-static-hardware-inventory)) exempts
+the member exactly when the list names the member's resolved backend (`rocm`
+or `vulkan` on an AMD card the DRM fdinfo measurer covers, `rocm` alone on the
+KFD fallback). A report without the list (an agent without
+`gpu_vendor_identity`) keeps the earlier rule: a host whose telemetry OS is
+`linux` (the `runtime.GOOS` of its last sample; the report's own `os` is a
+platform string such as `ubuntu 24.04` and names no family), whose report lists
+only AMD GPUs and whose member `device_backend` is `rocm` or `auto`, which the
+KFD measurer sees. Everything else, a Windows host and a host without telemetry
+included, is not measured and still needs both. On such an older report the
+check reads the report, not the agent's measurer: the older agent chose its
+measurer from the tools on its `PATH` (`nvidia-smi` present selected the
 compute-apps measurer ahead of the KFD), while the report lists only GPUs whose
-collector succeeded. On a Linux AMD host with a leftover `nvidia-smi` that finds
-no GPU the member is exempt, yet `auto` resolves to Vulkan and an explicit
-`rocm` member is not measured, so it stays unknown-demand until the operator
-gives an estimate. A manual member spec write re-checks only its own estimate
+collector succeeded, so on a Linux AMD host with a leftover `nvidia-smi` that
+finds no GPU the member is exempt yet not measured, and stays unknown-demand
+until the operator gives an estimate. A manual member spec write re-checks only its own estimate
 rule, not the `--tensor-split` rule of a head that already uses it: switching a
 used spec's `device_backend` from `rocm` to `vulkan` leaves a stored head
 without `--tensor-split` that a fresh save would refuse, as a later change of
@@ -2542,7 +2666,11 @@ device backends, GPU selections, bind addresses and ports; not the RPC
 protocol, which a probe can learn or lose without the binary changing): whatever relaunches
 a member relaunches the head, which would otherwise lose the member mid-request.
 For a member server it carries one `rpc_server` spec per membership: the manual
-spec's id, or `rpca_<head spec id>_<server id>`; the binary (an automatic
+spec's id, or `rpca_<head spec id>_<server id>` for an automatic member, with
+`_m<n>` appended for the n-th automatic member of that head on that server by
+position (n ≥ 2), so the first keeps the id it had before a server could serve
+a head twice and an existing cluster's members never relaunch for the upgrade;
+the binary (an automatic
 member's `ggml-rpc-server` the head binary can drive (Matching member binaries
 above), read on every derivation, so an inventory change moves it); `-t <threads>` for an automatic
 member, the manual spec's own args and env otherwise; the GPUs with their demand
@@ -2555,7 +2683,16 @@ addresses follow the network: a mesh member is dialled and bound at its mesh
 IPv4; a LAN member is dialled at its effective LAN address (its manual
 `lan_address`, its chosen or most likely agent-reported interface, else the
 `Domain` of a non-NetBird server; [Networking §12](networking-mesh.md#12-rpc-cluster-policies-op-gw-rpc)),
-and binds `0.0.0.0`, or that address alone with `lan_bind_only`. A LAN head is
+and binds `0.0.0.0`, or that address alone with `lan_bind_only`. A member on
+the head's own server is dialled and bound on `127.0.0.1` whatever the
+cluster's network, runs `direct` even in a relay cluster (nothing leaves the
+host, so there is nothing to relay), and knows its head as `127.0.0.1`; the
+cluster plan carries each member's own transport, so the orchestration's
+stale-hold stop and the watchdog's hold handling treat such a member as direct
+inside a relay cluster too. A cluster whose members all run on the head's server
+needs neither the head's network identity nor the transport preconditions,
+publishes no NetBird policy for those members and needs no LAN
+acknowledgement. A LAN head is
 recognised by its manual `lan_address`, by every IPv4 it reports when its
 source is an interface or `auto` (unless it resolves to its `Domain`), or by
 its `Domain`. A head's own idle timeout is derived from its
@@ -2576,7 +2713,12 @@ stage that finds a reason stops it:
    the agent version of its last telemetry: 0.18.0 or newer declares
    `rpc_cluster`, an older one is too old, and only a host without a parseable
    version stays pending. So the host that reports first after a gateway restart
-   keeps its cluster instead of draining it.
+   keeps its cluster instead of draining it. Then the same-host re-check: a
+   server that carries a member on the head's server, or several members of the
+   head, and whose agent is **known** to lack `rpc_cluster_same_host` (downgraded
+   since the save) withholds the cluster as `.cluster_agent_too_old`; it would
+   read the head's loopback connection as its own probe, or the second member as
+   the first. An unknown declaration is left to the `rpc_cluster` check above.
 3. **Each member, in member order**: `.cluster_member_missing` (its server, its
    manual spec or its position is gone), `.cluster_member_disabled` (a disabled
    manual spec, or RPC membership turned off on an automatic member's server),
@@ -2628,7 +2770,8 @@ keeps its last one) rather than withholding the cluster.
 every former and new member server; a manual member spec write notifies its
 server and every server of the cluster that uses it (a change of its GPU rows
 also re-syncs the head's membership GPU rows, keeping the measured values by GPU
-index); a write to a server's row, admin groups, NetBird state or binary
+key, an empty vendor and the server's legacy vendor at one index being one
+card); a write to a server's row, admin groups, NetBird state or binary
 inventory, or a change of what its agent declares, notifies every server that
 shares a cluster with it; a system settings save or a group delete re-derives
 every cluster; and so does every change of the NetBird `Default` policy state a
@@ -2680,7 +2823,10 @@ and a stop releases.
 **Member usage.** A member's agent measures its `ggml-rpc-server` like any child
 while the head holds it, and the gateway keeps the values on the membership row
 (`rpc_cluster_members.ram_measured_mb`,
-`rpc_cluster_member_gpus.vram_measured_mb`), not on any spec, by a rule per
+`rpc_cluster_member_gpus.vram_measured_mb`), not on any spec, keyed by the
+member's **position** in the head's member list and its GPUs by (vendor, index)
+(a server may serve one head twice, so the server no longer identifies a
+member; a sample's spec id names the member it measures), by a rule per
 **run** (one head process from its cluster start until it stops; its start
 instant, `run_started_at`, is stamped on every membership row of the head and
 every usage write names the run it read):
@@ -2705,7 +2851,11 @@ every usage write names the run it read):
   when a formed run measured every part that holds a value.
 - A stored peak above what the host admits makes the member's next start a
   terminal `not_permitted`; the head's `cluster_status.peaks_above_budget` names
-  it, and `POST …/cluster-members/{serverID}/reset-usage` clears it.
+  it (with the GPU's `gpu_vendor`), and `POST
+  …/cluster-members/{serverID}/reset-usage` clears it, `?position=N` naming the
+  member when the head has several on that server (without it such a reset is
+  `409 runtime_spec.cluster_member_ambiguous`; [HTTP API
+  Surface](../reference/api-surface.md#agent-managed-model-runtime)).
 
 The same samples keep the session records (`rpc_sessions`): a hold opens one,
 its end closes it, a restarted gateway adopts the sessions still held and closes
@@ -3344,7 +3494,7 @@ object** ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-str
 **Verified on hardware (2026-11-23):** the job-mode start (suspended start, job, resume) works with `strata.cmd` as the binary; `${HOST_GPU_IDS_MAIN_LAST}` resolved to `0,1,2` for GPUs declared `2,0,1` and Strata logged a layer split across GPUs `[0, 1, 2]` (main card last); ready in 38 s; the live log shows the server's output including its JSONL `starting`/`ready` events; the agent's authenticated metrics and context probes both succeeded (context 262144); per-GPU VRAM is attributed over the whole tree (the engine is a grandchild, so per-root attribution would read about 0); a chat completion through the gateway answered. **Stop verified on hardware (2026-11-23, agent 0.21.0, 3 GPUs):** the portal's stop delivered Ctrl-Break and Strata logged `stopping` (`reason: "sigbreak"`), `draining` (0 pending, 3 s deadline) and `stopped` (`drained: true`, `cancelled_requests: 0`, `exit_code: 0`) about 2.7 s after the stop, inside the 5 s kill grace; cmd.exe then printed its localized "Terminate batch job (Y/N)?" prompt to the live log and the root exited about 0.1 s later with exit code -1, and the spec state became `stopped` (intentional stop, restarts 0). The prompt does not block the stop; its only side effects are a cosmetic log line and a root exit code of -1 instead of 0. VRAM was freed on all three GPUs within about 2 s (host totals 24.5/32.9/33.3 GB to 0.3/0.0/0.0 GB) and host RAM in use fell from 22.1 to 10.6 GB, so the engine and vision processes ended; leftover non-GPU processes (cmd.exe, python.exe) were not inspected in Task Manager. `strata.cmd` stays the documented binary and the `python.exe` fallback is not needed. **Known RAM under-count:** the spec's measured RAM (private working set summed over the job) read 7.7 GB while host RAM in use fell by about 11.5 GB at stop; pages that are not private working set (locked or mapped model pages, the file cache, driver allocations) are not counted. **Still pending:** the RAM figure against Task Manager beyond the above, Claude Code and Codex round trips, the Windows-tagged unit tests and the console-less (service) agent path. Everything else below is compiled and vetted for Windows (`GOOS=windows go vet`, `golangci-lint`); the Windows-tagged tests (`proc_job_windows_test.go`) are ones CI cannot run (§13).
 
 **The field.** `process_tree` is `direct` (the default, today's behaviour) or `job`
-(migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-118-migrations)).
+(migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-119-migrations)).
 The gateway refuses any other value (400 `runtime_spec.process_tree_invalid`) and
 pushes `"process_tree": "job"` only for a job spec, omitting it for `direct`, so every
 existing document and its ETag are byte-identical. The agent reads an absent or empty
@@ -3430,6 +3580,159 @@ process-group grouping (§5.3).
 
 **Error text.** A failed job step reads `runtime: exec <bin>: runtime: process_tree
 job: <step>: <err>` in `last_error`.
+
+### 3.10 Mixed-vendor GPU hosts
+
+One host may carry NVIDIA **and** AMD GPUs (#434,
+[ADR-122](../09-architecture-decisions.md#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members)), used two
+ways: one model per vendor side by side (a CUDA model on the NVIDIA cards, a ROCm
+model on the AMD cards), or one model across both, as a single Vulkan
+`llama-server` or as an RPC cluster on that one host (a CUDA head and a ROCm
+`rpc-server` member, each on its native backend). The agent calls a host **mixed**
+when its detection found both an NVIDIA and an AMD GPU (`GPUTopology.Mixed`), the
+one combination whose per-vendor numbering collides; the portal calls it mixed when
+the stored hardware report lists both vendors. A mixed **Windows** host is out of
+scope: the agent has no Windows AMD collector.
+
+**Identity.** Every GPU is a GPU key, (vendor, vendor-local index) (§5.1;
+*GPU key* in the [Glossary](../12-glossary.md)). The NVIDIA index is the nvidia-smi index; the AMD
+index is the **KFD topology rank**, joined to rocm-smi's cards by PCI address
+([Telemetry §8.2.2](telemetry-usage-observability.md#822-gpu-metrics)): rocm-smi's
+`cardN` key is no longer trusted to equal it. On the AMD test VM the two agree
+(rocm-smi `card0`/`card1` = KFD ranks 0/1 = PCI buses 1/2, while the DRM `card0`
+there is the virtual VGA), so existing hosts are not renumbered. The PCI bus
+address is the anchor the other APIs speak: DRM fdinfo, the Vulkan mapping and
+Windows PDH resolve through it to the key.
+
+**The Vulkan mapping.** With each hardware report on a host with GPUs the agent runs
+`vulkaninfo` (when on `PATH`, 5 s timeout), reads every `GPU<n>:` device's PCI
+address (`VK_EXT_pci_bus_info`) and type, and maps each card's PCI address to its
+Vulkan enumeration ordinal. CPU devices (llvmpipe) are left out of the map but
+keep their ordinal, since `GGML_VK_VISIBLE_DEVICES` addresses the loader's
+enumeration order; a PCI address listed twice (two Vulkan drivers for one card,
+AMDVLK and RADV) makes that card's mapping unavailable rather than picking a
+driver. The report carries the result (`vulkan_ordinal`, `vulkan_device_count`,
+[Telemetry §8.2.5](telemetry-usage-observability.md#825-static-hardware-inventory)),
+and the agent hands it to the runtime with the detected totals; `Run` seeds both
+from the hardware inventory before the first runtime reconciliation. On both
+single-vendor test VMs the Vulkan order followed the PCI bus order, which is not
+guaranteed in general (the loader and Mesa's device-select layer may reorder),
+hence the PCI join.
+
+**The legacy vendor.** An empty vendor means *the host's only vendor*: what an
+older agent reports, what an older gateway sends and what every GPU row held after
+migration 119. The **legacy vendor** of a host is the first of NVIDIA, AMD, Apple
+that it has, the vendor the agent treated as "the" vendor before #434, so a host
+that already had an NVIDIA and a ROCm-visible AMD card keeps exactly its meaning
+(empty = NVIDIA). The agent resolves an empty vendor in a pushed document to its
+legacy vendor **before** comparing or storing the document
+(`resolveLegacyGPUVendors`), so an upgraded gateway that makes the same vendor
+explicit pushes a spec equal to the resolved one and nothing relaunches; no model
+goes offline on the upgrade. The gateway makes it explicit once per server, from
+the **first vendor-reporting hardware report**: `BackfillServerGPUVendor` stores the
+report's legacy vendor in `ai_servers.gpu_legacy_vendor` on every such report, and
+rewrites that server's empty-vendor rows (its specs' GPU rows, its budgets, its
+manual member specs' GPU rows, its cluster member GPU rows) to it in one
+transaction; an empty row whose owner already has an explicit row of that vendor
+at the same index is deleted instead (the explicit one wins). A vendor-less report
+(an older agent) calls nothing and never clears what is stored, and the stored
+legacy vendor is deliberately not re-derived from later reports, so a downgraded
+agent keeps being sent the rows it got. When the backfill rewrote rows and the
+report lists more than one vendor, it raises `ai_servers.gpu_vendor_note`: the
+portal shows an informational note on the server that legacy GPU assignments were
+mapped to the legacy vendor and should be reviewed, until an operator dismisses it
+(`POST /api/portal/servers/{id}/gpu-vendor-note/dismiss`); it never blocks a save.
+A rewrite pushes the server's document and every server sharing a cluster with
+it. A GPU in a vendor-less telemetry frame resolves to the stored legacy vendor,
+and a measurement of the legacy vendor also lands on a row still saved with the
+empty vendor; a measurement for a key the spec has no row for is skipped.
+
+**Saving GPU rows.** Every GPU row a save stores carries a vendor, normalized per
+row ([HTTP API Surface](../reference/api-surface.md#gpu-vendors-on-gpu-rows)):
+lower-cased; anything but `nvidia`, `amd`, `apple` or empty is
+`runtime_spec.gpu_vendor_invalid`; for a server whose agent is **known** to lack
+`gpu_vendor_identity` a non-empty vendor other than the stored legacy vendor is
+`runtime_spec.gpu_vendor_unsupported`, except a (vendor, index) the saved object
+already has stored (a re-save or override after a downgrade must keep working),
+and the legacy vendor itself is accepted and stored as sent; an agent whose
+declaration is not yet known is not refused. For a flagged agent an empty vendor
+is stored as the legacy vendor. Two device-plan refusals mirror the agent's codes
+at save time: `runtime_spec.gpu_vendor_backend_mismatch` (a spec, a manual member
+spec or an automatic cluster member whose backend cannot drive one of its GPUs)
+and `runtime_spec.vulkan_visible_devices_required` (a spec, not a member, with GPUs
+that resolves to Vulkan without `set_visible_devices` in `env` mode, on a server
+whose stored report lists NVIDIA and AMD GPUs). Both spare a write whose backend,
+GPU set (empty and legacy vendor read as one) and injection equal the stored
+object's (`refusalUnlessUnchanged`): the portal's Stop/Start/Pin overrides re-send
+the whole stored spec, so a spec stored before the rule, or before its host turned
+mixed, keeps saving and meets the agent's rule at launch. The agent's third code,
+`runtime.vulkan_mapping_unavailable`, has no save-time mirror. The portal's
+pickers list GPUs as `NVIDIA 0 · <name>` and store (vendor, index), show what
+`auto` resolves to for the chosen GPUs and mark the mismatch combinations; the
+hardware table shows each GPU's vendor, Vulkan ordinal and measurable backends.
+
+**The document for an agent without the flag.** An agent that does not declare
+`gpu_vendor_identity` gets the document it got before vendors existed: its GPU
+rows and budgets carry no `vendor`, a row is kept only when it has an empty vendor
+or the stored legacy vendor (only empty-vendor rows when none is stored), and each
+index at most once, so its bare index always names the card the row means. A spec
+or member whose GPU rows are all dropped is **withheld** (an empty GPU list would
+run it without a VRAM reservation, invisible to admission) and leaves every
+co-residency pair. While the agent's declaration is unknown, a document that
+would drop a row is held, since served to a flagged agent it would take a GPU away
+from a running model; a sample that changes the declaration pushes the document
+again ([HTTP API Surface §5.1](../reference/api-surface.md#51-the-two-managed-runtime-gets)).
+
+**On the agent, mixed hosts refuse instead of guessing.** The per-spec plan of
+§3.3 has three stable codes, each on `last_error.code` of a `not_permitted` start
+(§4.3): `runtime.gpu_vendor_backend_mismatch` (a native backend, or `sycl` across
+vendors, that cannot drive one of the spec's GPUs), `runtime.vulkan_mapping_unavailable`
+(a Vulkan spec whose cards have no known ordinal) and
+`runtime.vulkan_visible_devices_required` (a Vulkan spec with GPUs without
+`set_visible_devices` in `env` mode). On a mixed host a model spec with a refused
+plan is refused **eagerly**, at start, whatever consumes the plan; on a
+single-vendor host the refusal stays **lazy** (only where the plan is consumed),
+which keeps every spec that worked before #434 working. On a mixed host
+`${VULKAN_DEVICES}`, `${VULKAN_FIRST_DEVICE}`, and `${DEVICES}` /
+`${FIRST_LOCAL_DEVICE}` where they would render Vulkan names, are refused without
+the injected `GGML_VK_VISIBLE_DEVICES` (`runtime.vulkan_visible_devices_required`),
+so a host index is never rendered as a Vulkan name there; `${HOST_GPU_IDS}`,
+`${HOST_GPU_IDS_MAIN_LAST}`, `${CUDA_DEVICES}` and `${METAL_DEVICES}` (and their
+`_FIRST_DEVICE` forms) are refused for a spec whose GPUs span both vendors.
+**The window before the first hardware report:** the Vulkan mapping reaches the
+runtime with the hardware report, which `Run` seeds before the boot runtime sync,
+so the window is short. A single-vendor Vulkan spec launched inside it still gets
+the legacy vendor's variable and host-index names (its pre-#434 behaviour); on a
+mixed host it is `not_permitted` (`runtime.vulkan_mapping_unavailable`) and is
+evaluated again on its next ensure or document apply 5 s or more later. An RPC
+member runs the same plan: a Vulkan member on a mixed host gets the injected
+variable (§3.6).
+
+**Same-host RPC clusters.** A head's member may run on the head's own server, and
+one server may carry several members of a head (an NVIDIA and an AMD member, say),
+only for a server whose agent is known to declare `rpc_cluster_same_host`
+(`runtime_spec.cluster_member_on_head_server` / `.cluster_member_server_twice`
+otherwise). Such a member is dialled and bound on `127.0.0.1`, independent of the
+cluster's `mesh`/`lan` network, runs `direct` even in a relay cluster, needs no
+NetBird or LAN readiness, and gets no NetBird policy; members on other servers keep
+today's addressing (§3.7). Its agent tells its head from the readiness probe by the
+two-poll debounce (§3.6). Several members on one server get distinct ports (the
+`(server_id, port)` uniqueness), and an automatic member's agent spec id gains
+`_m<n>` from the second member of the head on that server, so existing clusters
+keep their ids. Head and member (or two members) sharing one card stays the
+advisory `cluster_member_gpu_overlap` warning, not a refusal. Usage, peaks and the
+budget checks key a member by its **position** (migration 119 keys
+`rpc_cluster_members` by `(head_spec_id, position)`), and a usage reset names it
+with `?position=`. A same-host cluster whose member server's agent is known to
+lack the flag (downgraded since the save) is withheld
+(`runtime.cluster_agent_too_old`).
+
+**What is verified and what is not.** The measurers, the Vulkan mapping and
+`GGML_VK_VISIBLE_DEVICES` (including `1,0` keeping the listed order) were checked
+on two single-vendor test VMs, the AMD test VM and the NVIDIA test VM (§5.3). **No
+mixed host has been verified yet**: a real CUDA + ROCm + Vulkan run, the Vulkan
+enumeration order on such a host and a same-host cluster on real hardware are
+outstanding ([§11.1](../11-risks-and-technical-debt.md#111-operational-risks)).
 
 ## 4. One router port per AI server
 
@@ -3747,7 +4050,14 @@ because the ensure that hits a failed cluster process answers the ordinary
 `runtime.device_backend_mismatch`, `runtime.rpc_device_count_mismatch`,
 `runtime.rpc_unsupported_build`, `runtime.cluster_version_mismatch` (all terminal,
 [§3.6](#exit-classification-and-sticky-verdicts)) and `runtime.bind_mismatch` (not
-terminal, §3.6).
+terminal, §3.6). Three more ride `last_error.code` of a `not_permitted` start the
+per-spec device plan refused ([§3.3](#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
+[§3.10](#310-mixed-vendor-gpu-hosts)): `runtime.gpu_vendor_backend_mismatch` (the
+`device_backend` cannot drive one of the spec's GPUs), `runtime.vulkan_mapping_unavailable`
+(a Vulkan spec or member on a host with NVIDIA and AMD GPUs whose cards have no
+known Vulkan ordinal) and `runtime.vulkan_visible_devices_required` (a Vulkan spec,
+or a Vulkan device token, on such a host without the injected
+`GGML_VK_VISIBLE_DEVICES`).
 
 Collapsing or renaming any of these destroys the distinction between a
 misconfiguration, a slow load and a crash. The fallthrough to
@@ -4156,12 +4466,24 @@ is in [Data Model](../reference/data-model.md); the semantics that matter here:
 
 | Field | Owner | Meaning |
 |---|---|---|
-| `agent_runtime_spec_gpus.vram_estimate_mb` | Operator (portal) | Declared demand for this spec on this GPU index. A **floor** (see below). |
-| `agent_runtime_spec_gpus.vram_measured_mb` | Agent | Measured actual usage, written back through telemetry. **Always ignored on a portal write** — `PutRuntimeSpec` copies each index's stored measured value forward. |
+| `agent_runtime_spec_gpus.vram_estimate_mb` | Operator (portal) | Declared demand for this spec on this GPU (its GPU key, below). A **floor** (see below). |
+| `agent_runtime_spec_gpus.vram_measured_mb` | Agent | Measured actual usage, written back through telemetry. **Always ignored on a portal write** — `PutRuntimeSpec` copies each GPU's stored measured value forward. |
 | `agent_runtime_specs.ram_estimate_mb` | Operator (portal) | Declared host-RAM demand of the whole spec: one number, not per GPU. A **floor**; `0` = unknown. |
 | `agent_runtime_specs.ram_measured_mb` | Agent | The managed child's measured resident RAM (RSS; the private working set on Windows, summed over the job's processes for a `process_tree: job` spec, §3.9), written back through telemetry. **Never clobbered by an operator upsert** — the store's update list does not touch it, and the portal's own response keeps the stored value. |
-| `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU index on that server. **`0` means "no budget set" and is unconstrained**, identical to an absent row — see §5.2 — **except that the agent fills in a budget the operator did not set from the GPU's detected total memory** (below). |
+| `ai_server_gpu_budgets.budget_mb` | Operator | The ceiling for that GPU on that server. **`0` means "no budget set" and is unconstrained**, identical to an absent row — see §5.2 — **except that the agent fills in a budget the operator did not set from the GPU's detected total memory** (below). |
 | `ai_servers.runtime_max_processes` | Operator | Concurrent managed processes; `0` = unlimited. |
+
+**Every per-GPU figure is keyed by the GPU key, (vendor, vendor-local index)**,
+not by the index alone (#434, [§3.10](#310-mixed-vendor-gpu-hosts)): NVIDIA 0
+and AMD 0 are two cards. The vendor is `nvidia`, `amd` or `apple`; the index is
+the nvidia-smi index (the CUDA ordinal), the AMD KFD topology rank (the ROCr
+ordinal `ROCR_VISIBLE_DEVICES` addresses) or Apple's 0. The agent keys every
+map on it (`runtime.GPUKey`: spec GPUs, budgets, detected totals, measurements,
+the admission sums), the gateway too (`routing.GPUKey`, the `gpu_vendor`
+columns), and humans read it as `NVIDIA 0`, `AMD 1`, `Apple 0`. An empty vendor
+is the legacy *the host's only vendor* and resolves to the host's legacy vendor
+on both sides. Keying the detected totals by it also ended a latent bug: two
+vendors' card 0 overwrote each other's total, and with it the detected budget.
 
 The split of ownership is the load-bearing rule of the whole budget feature: a
 future PUT handler that starts trusting `vram_measured_mb` (or a RAM measurement)
@@ -4193,8 +4515,10 @@ total memory (`sample.GPU.MemTotalBytes`, converted to MB), minus the optional
 verbatim** (no headroom, no clamp to the hardware), a row of `0` or less counts
 as "none set" and is replaced, and a GPU the agent cannot read keeps the old
 unconstrained behaviour. The `<= 0` interpretation itself still lives only in
-`Admit` (§5.2). Unified-memory GPUs are skipped (an Apple GPU's reported "total"
-is the memory it has allocated at that instant, not a ceiling), and the same
+`Admit` (§5.2). Unified-memory GPUs are skipped, per GPU by its key's vendor so a
+card of another vendor on the same host keeps its detected budget (an Apple GPU's
+reported "total" is the memory it has allocated at that instant, not a ceiling),
+and the same
 risk applies to an AMD APU, whose reported VRAM may be a BIOS carve-out; a
 positive operator budget is the escape hatch for both
 ([ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)).
@@ -4592,25 +4916,76 @@ has finished mapping its weights, so the first number is already the
 meaningful one.
 
 **VRAM measurement exists for NVIDIA and for AMD on Linux (host RAM is measured on
-every platform, §5.1), and which measurer runs is decided per platform.** `main.go`
-installs exactly one measurer, `collector.NewVRAMMeasurer()` — a build-tag split
-(`measurer_other.go` / `measurer_fallback_linux.go` / `measurer_fallback_other.go` /
-`measurer_windows.go`), not a `runtime.GOOS` branch — which yields, on **Linux**, the
-NVIDIA compute-apps measurer when `nvidia-smi` is on PATH, else the **KFD** measurer
-when `/sys/class/kfd/kfd/proc` exists, else nil; on other non-Windows hosts the
-compute-apps measurer or nil; and on Windows the PDH measurer or nil. The **KFD
-measurer** (`kfd_measurer.go`) reads the amdgpu compute driver's per-process counter
-`/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes) — a world-readable sysfs file,
-no subprocess — maps each `gpu_id` to its rank among the KFD topology's GPU nodes in
-numeric node order (the CPU node, `gpu_id 0`, is skipped; that rank is taken as the
-rocm-smi card index the manager's GPU indices use), attributes through the
-process-group leader exactly as the NVIDIA path does, sums the figures and floors to
-MiB, and returns nil on any failure so the manager falls back to the estimate. NVIDIA
-wins on a mixed host. The KFD sees only ROCm/HIP compute allocations: a Vulkan build
-of an engine allocates through the graphics stack and reads as absent. An Apple
-unified-memory host, a host with no GPU, AMD on Windows and an AMD runtime that is
-not ROCm/HIP install **no** measurer (or measure nothing) and never write a
-measurement back. On those hosts the operator's
+every platform, §5.1), and which measurers run is decided per platform.** The
+measurer answers `pid → GPU key → MiB` (§5.1). `main.go` installs
+`collector.NewVRAMMeasurer()` — a build-tag split (`measurer_other.go` /
+`measurer_fallback_linux.go` / `measurer_fallback_other.go` / `measurer_windows.go`),
+not a `runtime.GOOS` branch — which yields, on **Linux**, a **composite**: the NVIDIA
+compute-apps measurer when `nvidia-smi` is on PATH **and**, beside it, one AMD
+measurer, and merges their answers per pid ([ADR-122](../09-architecture-decisions.md#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members)).
+The keys carry the vendor, so they never collide: a mixed NVIDIA + AMD host measures
+both vendors at once, and one vendor answering nothing (an `nvidia-smi` timeout)
+costs the other nothing. On other non-Windows hosts it is the compute-apps measurer
+or nil, and on Windows the PDH measurer or nil (NVIDIA only; the agent has no
+Windows AMD collector).
+
+The **AMD measurer** is chosen once at start by a **self-probe**: the agent opens the
+first amdgpu render node it may open (`/dev/dri/renderD*` whose
+`/sys/class/drm/<node>/device/driver` is `amdgpu`), reads its own
+`/proc/self/fdinfo/<fd>` and checks for a parseable `drm-memory-vram`. Present, it
+installs the **DRM fdinfo measurer** (`drm_fdinfo.go`, `drm_fdinfo_linux.go`), else
+the **KFD measurer**, else none. The fdinfo measurer scans `/proc` for every pid
+whose process group a managed process leads (the same group boundary as the
+NVIDIA and KFD attribution), reads the `fdinfo` of only those fds whose link target
+lies under `/dev/dri/`, keeps the `drm-driver: amdgpu` clients with a parseable
+`drm-pdev` and `drm-client-id`, **de-duplicates them by (`drm-pdev`,
+`drm-client-id`) across every fd and pid of the group** (a Vulkan process holds
+several fds on one render node with one client id, and a forked worker inherits
+its leader's fds; summing per fd would double count), sums `drm-memory-vram` per
+`drm-pdev`, truncates KiB to MiB, and maps each PCI address to the AMD index
+through the AMD collector's published PCI join (Telemetry §8.2.2). A card below
+the **8 MiB noise floor** is dropped (a Vulkan or HIP runtime opens every render
+node, and the stray entries on a card a process merely opened carry a few KiB of
+VRAM); dropped means *not measured*, so the estimate stays, never a measured 0. A
+PCI address the join does not cover is dropped too, never guessed, and a pid whose
+fds cannot be read contributes nothing. DRM fdinfo covers **ROCm/HIP and Vulkan**
+allocations alike. The **KFD measurer** (`kfd_measurer.go`) is the fallback for a
+kernel whose amdgpu fdinfo lacks `drm-memory-vram`: it reads the amdgpu compute
+driver's per-process counter `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (bytes) —
+a world-readable sysfs file, no subprocess — maps each `gpu_id` to its rank among
+the KFD topology's GPU nodes in numeric node order (the CPU node, `gpu_id 0`, is
+skipped), attributes through the process-group leader, sums and floors to MiB, and
+sees ROCm/HIP allocations only. The two read the same allocations, so a KFD figure
+is never added to an fdinfo one. **Both AMD measurers answer only while the AMD
+collector's PCI join is published** (read at every call): the AMD index is the KFD
+rank joined to the rocm-smi card by PCI address, and without a complete join an
+AMD index would be a guess, so nothing is measured on AMD and nothing is reported
+measurable. KFD reads about 130 MiB more than fdinfo for one ROCm process (3593
+against 3462 MiB on the AMD test VM); the under-read is accepted, since fdinfo is the
+one source that also covers Vulkan, and §5.1's `max(measured, estimate)` and the
+run-peak history absorb it.
+
+**Measurability is reported, not assumed.** The measurer also answers, per vendor,
+which backends it sees (`cuda` and `vulkan` for NVIDIA's compute-apps and PDH,
+which list a Vulkan process too; `rocm` and `vulkan` for fdinfo; `rocm` for KFD),
+and the hardware report carries that per GPU as `vram_measurable`
+([Telemetry §8.2.5](telemetry-usage-observability.md#825-static-hardware-inventory)),
+evaluated on every report because the AMD part follows the PCI join. The portal
+reads it for its RPC-member estimate and `--tensor-split` exemptions (§3.7).
+
+Verified on two single-vendor test VMs (2026-11-27): on the AMD test VM (two
+Radeon RX 6800, kernel 6.8, Mesa RADV) a HIP llama-server measured 3461 MiB and a
+Vulkan one 3323 MiB on the card it used, with no double count and the other card
+absent below the noise floor; on the NVIDIA test VM (two RTX 2080 Ti, proprietary
+driver, which exposes no fdinfo memory keys) a CUDA run measured 8052 MiB
+(`nvidia-smi`: 8056). A Vulkan run there **without** `GGML_VK_VISIBLE_DEVICES`
+measured 7874 MiB on its card plus a stray 8 MiB context on the other one, which
+compute-apps reports (it has no noise floor; behaviour that predates #434); with
+the variable injected that context does not occur.
+
+An Apple unified-memory host, a host with no GPU, AMD on Windows and an AMD card
+outside the PCI join install **no** measurer for it (or measure nothing) and never
+write a measurement back. On those hosts the operator's
 `vram_estimate_mb` is the only number there will ever be. The rule above still applies — a spec left at the default `0` waits
 while a pinned or busy spec holds one of its GPUs — but nothing resolves it
 except the other spec becoming evictable or the operator filling the estimate
@@ -4667,7 +5042,7 @@ host class as self-resolving when nothing on it ever resolved.
 
 **And the failure was worse than a missing number.** `naInt("[N/A]")` is `0`, so
 the compute-apps measurer returned a **non-nil** `map[pid]map[gpuIndex]0`, and
-`buildSnapshot` reads `if v, ok := byGPU[g.Index]; ok` — a present key is
+`buildSnapshot` reads `if v, ok := byGPU[g.Key()]; ok` — a present key is
 authoritative. Every managed process on every Windows host was therefore charged
 **0 MB**, each GPU's budget read as entirely free however much was resident, and
 co-residency admission lost exactly the OOM protection it exists for. The
@@ -6089,6 +6464,26 @@ so instead of staying blank (§14.9). `TestAgentFeaturesDeclaresRuntimeLogFiles`
 pins the name, its `Since` and the version;
 `TestDriverWithoutRuntimeLogFilesTailsNothing` pins the agent's gate.
 
+`gpu_vendor_identity` and `rpc_cluster_same_host` (#434, [§3.10](#310-mixed-vendor-gpu-hosts),
+[ADR-122](../09-architecture-decisions.md#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members))
+are on the agent's list alone (`FeatureGPUVendorIdentity`, `FeatureRPCClusterSameHost`,
+both `Since: "0.27.0"`), and the gateway gates real behaviour on both by their
+literal names, never on the agent's version. `gpu_vendor_identity` says the agent
+reports `vendor` on every GPU (telemetry, hardware report, runtime samples),
+reports `vram_measurable` and the Vulkan mapping, accepts `vendor` on spec GPUs and
+budgets (empty = the host's legacy vendor), measures per vendor and decides backend
+and visibility per spec. The gateway puts a GPU row's `vendor` into the document,
+and a foreign vendor's row at all, only for an agent that declares it, refuses a
+save it could not deliver (`runtime_spec.gpu_vendor_unsupported`) for one known to
+lack it, holds the document of one whose declaration is unknown when the document
+would lose a row, and pushes the document again when a sample changes the
+declaration. `rpc_cluster_same_host` says the agent tells a loopback member's own
+readiness probe apart from a same-host head (the two-poll debounce of §3.6); the
+gateway accepts a member on the head's server, or several members of a head on one
+server, only for an agent known to declare it, and withholds such a cluster from
+one known to lack it. `TestMixedVendorFeaturesAreDeclared` pins both names and
+their `Since`.
+
 `runtime_exec_wsl` (#381, [§3.8](#38-execution-modes-wsl2),
 [ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged))
 is on the agent's list alone, and **the gateway gates real behaviour on it,
@@ -6739,6 +7134,25 @@ gateway does not declare `runtime_log_files`, so the agent treats the declaratio
 as absent and tails nothing (§7). A current gateway behind an older agent receives exactly what it did;
 behind a 0.26.0 agent it receives masked process output where it received the
 value before.
+
+**`0.26.0` → `0.27.0` (mixed NVIDIA + AMD hosts, #434) is MINOR, and one bump for the
+whole branch.** `agent.Features` gained `gpu_vendor_identity` and
+`rpc_cluster_same_host` (§7); the wire gained `vendor` on every GPU the agent
+describes and on spec GPUs and budgets, and the hardware report's
+`vram_measurable`, `vulkan_ordinal` and `vulkan_device_count`; the agent gained the
+GPU key, the composite measurer with DRM fdinfo, the KFD/PCI join for AMD indices,
+the Vulkan ordinal mapping, the per-spec device plan with `GGML_VK_VISIBLE_DEVICES`
+and three stable codes, vendor-aware RPC members and the loopback member debounce
+([§3.10](#310-mixed-vendor-gpu-hosts)). **No upgrade order is needed for existing
+configurations**: an empty vendor keeps its meaning on the agent (the legacy
+vendor), so an older gateway's document keeps working, and the gateway's
+backfill makes that same vendor explicit, so the upgraded document is equal to
+the resolved one and nothing relaunches. An older agent behind a new gateway gets
+its old document (no vendors, only the rows it reads correctly). Two behaviour
+changes are deliberate on every host: `auto` is decided per spec (identical on a
+single-vendor host), and a `vulkan` spec with `set_visible_devices` in `env` mode
+gets `GGML_VK_VISIBLE_DEVICES` (§3.3), so a literal `--device VulkanN` in its args
+must be adapted.
 
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
@@ -9250,7 +9664,7 @@ nothing:
 | The server's latest telemetry carries no GPU sample | `benchmark.vram_no_gpu_samples` |
 | A spec already carries an operator override, or a spec *other than the target* is pinned (the message names it) | `benchmark.vram_isolation_blocked` |
 | The target is images-only ([§11.9](#119-manual-runs-on-an-images-only-mapping)) and its agent has not declared `runtime_ensure`, so the run could load it only by generating, which its upstream cannot serve | `benchmark.agent_ensure_unsupported` |
-| The target's launch spec declares a GPU index this host does not report (the message names it) | `benchmark.vram_declared_gpu_missing` |
+| The target's launch spec declares a GPU (vendor and index) this host does not report (the message names it) | `benchmark.vram_declared_gpu_missing` |
 
 The override refusal is what makes the restore unambiguous: the run only ever
 restores to exactly `""`, so it never has to reconstruct what an operator's
@@ -9660,6 +10074,12 @@ the stability gate, and shared/host-spillover memory is out of scope — the
 Windows `Shared Usage` and `Non Local Usage` counters were measured reading
 *identically* on all three GPUs of a 3-GPU host, so they are not per-adapter
 figures and this feature claims nothing about spillover.
+
+**Cards are read by GPU key.** A run watches and reports cards by (vendor, index)
+(§5.1): a mixed host's NVIDIA 0 and AMD 0 are two items, each item carries its
+`vendor`, and the portal labels and keys the rows by both. A vendor-less sample or
+spec row (an agent without `gpu_vendor_identity`, a row saved before vendors) is
+read as the server's stored legacy vendor's card ([§3.10](#310-mixed-vendor-gpu-hosts)).
 
 **The card fingerprint degrades, and says how far.** A stored VRAM number
 attributed to index 1 after the cards were renumbered is worse than no number,
@@ -11066,15 +11486,17 @@ operator meets first:
   (`loopbackPrincipal`, shared by every internal route) does not check a user's
   status, so a disabled user's loopback session is admitted and ended only at the
   first re-check, within one re-check interval.
-- **Device names follow the backend's enumeration, not the host index**
-  (§3.2, §3.6). A `${DEVICES}`-style token renders the declared GPU indices under
-  the backend prefix, but the number the backend gives a card is its own:
-  CUDA matches `nvidia-smi` only with `CUDA_DEVICE_ORDER=PCI_BUS_ID` (which the
-  agent sets only for a `wsl` spec, [§3.8](#38-execution-modes-wsl2)), and Vulkan
-  and mixed-vendor hosts enumerate
-  independently. `device_backend: auto` on a mixed host is the host's vendor set,
-  not the vendor of the spec's GPUs. The operator verifies with `--list-devices`;
-  matching that output to the host's GPUs is an open follow-up.
+- **Device names follow the backend's enumeration where the agent renders a host
+  index** (§3.2, §3.6). A `${DEVICES}`-style token without an injected
+  visibility variable renders the declared GPU indices under the backend prefix,
+  but the number the backend gives a card is its own: CUDA matches `nvidia-smi`
+  only with `CUDA_DEVICE_ORDER=PCI_BUS_ID` (which the agent sets only for a `wsl`
+  spec, [§3.8](#38-execution-modes-wsl2)), and Vulkan enumerates independently.
+  Vulkan is mapped where the agent knows the cards' ordinals: with
+  `GGML_VK_VISIBLE_DEVICES` injected the names are `Vulkan0..k-1` in declared
+  order, and a host with NVIDIA and AMD GPUs refuses every Vulkan path without
+  that injection instead of guessing (§3.10). On the remaining paths the operator
+  verifies with `--list-devices`.
 - **A direct-mode cluster member cannot defend itself.** The connection observer
   reports an unexpected peer but cannot stop it, and a second head blocks and then
   takes the member over when the first leaves; only the member's bind address,
@@ -11082,9 +11504,10 @@ operator meets first:
   whose address is only a name is allowed by the IPv4 addresses that name
   resolves to, so DNS is in the trust path and an IPv6-only head is never
   allowed.
-- **VRAM measurement covers NVIDIA and AMD on Linux only** (§5.3; ROCm/HIP
-  allocations, not Vulkan). On Apple unified memory, GPU-less hosts, AMD on Windows
-  and non-ROCm AMD runtimes the agent installs no measurer, so `vram_estimate_mb` is
+- **VRAM measurement covers NVIDIA, and AMD on Linux only** (§5.3; on AMD ROCm/HIP
+  and Vulkan through DRM fdinfo, ROCm/HIP alone on the KFD fallback, and nothing
+  without the collector's PCI join). On Apple unified memory, GPU-less hosts, AMD on
+  Windows and AMD cards the agent cannot join, the agent measures nothing, so `vram_estimate_mb` is
   authoritative for good and an unfilled estimate is not something waiting for
   the agent to resolve. Host RAM does not share the limit: it is measured on every
   platform whose OS exposes per-process memory to the agent (a container without
