@@ -683,7 +683,7 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 // for RAM is max(stored usage, estimate), the stored usage held at the
 // memory ceiling while it is stale (memberDemand).
 func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m derivedMember, transport string, headIPs []string, headDomain string) (AgentRuntimeSpecDTO, error) {
-	var gpuCeiling map[int]int
+	var gpuCeiling map[routing.GPUKey]int
 	ramCeiling := 0
 	if m.row.Stale {
 		var err error
@@ -695,7 +695,8 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 	gpus := make([]AgentRuntimeSpecGPUDTO, 0, len(parts))
 	for _, g := range parts {
 		gpus = append(gpus, AgentRuntimeSpecGPUDTO{
-			Vendor: g.Vendor, Index: g.Index, VRAMMB: memberDemand(g.VRAMMeasuredMB, g.VRAMEstimateMB, m.row.Stale, gpuCeiling[g.Index]),
+			Vendor: g.Vendor, Index: g.Index,
+			VRAMMB: memberDemand(g.VRAMMeasuredMB, g.VRAMEstimateMB, m.row.Stale, gpuCeiling[resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, m.server.GPULegacyVendor)]),
 		})
 	}
 	spec := AgentRuntimeSpecDTO{
@@ -762,16 +763,23 @@ func memberDemand(stored, estimate int, stale bool, ceiling int) int {
 // serverMemoryCeilings reads what a stale member value is held at on
 // serverID: per GPU the operator's budget, else the card's memory from the
 // hardware report; for RAM the host's memory. A figure that is not known is
-// absent (0).
-func (s *Service) serverMemoryCeilings(ctx context.Context, serverID string) (map[int]int, int, error) {
-	gpus := map[int]int{}
+// absent (0). GPUs are keyed by (vendor, index) with an empty vendor read as
+// the server's legacy vendor (resolveLegacyGPUKey), on the report's and the
+// budgets' side alike, so a caller looks a member GPU up by its resolved
+// key and gets its own card's ceiling, never another vendor's at that index.
+func (s *Service) serverMemoryCeilings(ctx context.Context, serverID string) (map[routing.GPUKey]int, int, error) {
+	gpus := map[routing.GPUKey]int{}
+	legacy, err := s.serverLegacyGPUVendor(ctx, serverID)
+	if err != nil {
+		return nil, 0, err
+	}
 	hosts, err := s.serverHostGPUs(ctx, serverID)
 	if err != nil {
 		return nil, 0, err
 	}
-	for idx, g := range hosts {
+	for key, g := range hosts {
 		if g.totalMB > 0 {
-			gpus[idx] = g.totalMB
+			gpus[resolveLegacyGPUKey(key, legacy)] = g.totalMB
 		}
 	}
 	budgets, err := s.routes.ServerGPUBudgets(ctx, serverID)
@@ -780,7 +788,7 @@ func (s *Service) serverMemoryCeilings(ctx context.Context, serverID string) (ma
 	}
 	for _, b := range budgets {
 		if b.BudgetMB > 0 {
-			gpus[b.GPUIndex] = b.BudgetMB
+			gpus[resolveLegacyGPUKey(routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}, legacy)] = b.BudgetMB
 		}
 	}
 	ram := 0

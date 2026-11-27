@@ -233,6 +233,20 @@ var (
 	// the row would name whichever card its bare index is there. The legacy
 	// vendor itself is accepted (normalizeGPUVendor). HTTP 400.
 	ErrRuntimeSpecGPUVendorUnsupported = errors.New("runtime_spec.gpu_vendor_unsupported")
+	// ErrRuntimeSpecGPUVendorBackendMismatch refuses a runtime spec, an RPC
+	// member spec or an automatic cluster member whose device backend cannot
+	// drive one of its GPUs: cuda, rocm or metal with another vendor's GPU,
+	// or sycl across several vendors (resolveSpecBackend, the mirror of the
+	// agent's runtime.gpu_vendor_backend_mismatch). HTTP 400.
+	ErrRuntimeSpecGPUVendorBackendMismatch = errors.New("runtime_spec.gpu_vendor_backend_mismatch")
+	// ErrRuntimeSpecVulkanVisibleDevicesRequired refuses a runtime spec with
+	// GPUs that resolves to Vulkan on a server whose hardware report lists
+	// both NVIDIA and AMD GPUs without set_visible_devices in env mode: the
+	// Vulkan loader's device order there is not the declared order, so only
+	// the agent's GGML_VK_VISIBLE_DEVICES selects the declared cards (the
+	// mirror of the agent's runtime.vulkan_visible_devices_required). RPC
+	// members are exempt; the agent pins them itself. HTTP 400.
+	ErrRuntimeSpecVulkanVisibleDevicesRequired = errors.New("runtime_spec.vulkan_visible_devices_required")
 )
 
 // Task 6 sentinels: the co-residency matrix, per-GPU VRAM budgets, the
@@ -1238,10 +1252,11 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 
 // operatorClusterPlan runs the store-reading checks of an operator's write,
 // the newest refusals of the write, in order: the cluster checks
-// (validateClusterHead), the listen-port check, and the unknown head binary
-// version, the newest save code, appended last so a body that is also
-// invalid for an older reason keeps that answer. It runs with the cluster
-// write lock held (writeRuntimeSpecAs).
+// (validateClusterHead), the listen-port check, the unknown head binary
+// version, the process-tree check and the device-plan refusals
+// (checkSpecDevicePlan), each newer save code appended last so a body that
+// is also invalid for an older reason keeps that answer. It runs with the
+// cluster write lock held (writeRuntimeSpecAs).
 func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app routing.Application, req PutRuntimeSpecRequest, fields runtimeSpecFields, prior runtimeSpecPrior) (clusterPlan, error) {
 	plan, err := s.validateClusterHead(ctx, p, app, req, fields, prior)
 	if err != nil {
@@ -1254,8 +1269,7 @@ func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app rou
 		return clusterPlan{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
 			ErrClusterHeadBinaryVersionUnknown, fields.binary)
 	}
-	// The process-tree check is the newest refusal and so runs last. It
-	// refuses only a write that moves the spec into job: a re-save of a spec
+	// The process-tree check runs after those. It refuses only a write that moves the spec into job: a re-save of a spec
 	// stored as job (the portal's Stop/Start/Pin/Clear overrides re-send the
 	// whole spec) succeeds, and RuntimeWarnings reports the agent's lack of
 	// support (runtimeProcessTreeAgentUnsupportedWarning).
@@ -1264,6 +1278,12 @@ func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app rou
 		if err := s.checkProcessTreeSupported(ctx, app.ServerID); err != nil {
 			return clusterPlan{}, err
 		}
+	}
+	// The device-plan refusals (the agent's, mirrored; req.GPUs carry their
+	// normalized vendors) are newer still. A benchmark writer, which
+	// re-saves the stored spec, never gets here.
+	if err := s.checkSpecDevicePlan(ctx, app.ServerID, req, fields, prior); err != nil {
+		return clusterPlan{}, err
 	}
 	return plan, nil
 }

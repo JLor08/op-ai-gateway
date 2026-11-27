@@ -457,6 +457,8 @@ var portalServerErrRows = []errRow{
 	// spec save, with the runtime spec's codes.
 	{err: portal.ErrRuntimeSpecGPUVendorInvalid, status: http.StatusBadRequest, code: "runtime_spec.gpu_vendor_invalid", msg: "unknown GPU vendor"},
 	{err: portal.ErrRuntimeSpecGPUVendorUnsupported, status: http.StatusBadRequest, code: "runtime_spec.gpu_vendor_unsupported", msg: "this server's agent does not support vendor-qualified GPUs yet"},
+	{err: portal.ErrRuntimeSpecGPUVendorBackendMismatch, status: http.StatusBadRequest, code: "runtime_spec.gpu_vendor_backend_mismatch", msg: "the device backend cannot drive one of the selected GPUs"},
+	{err: portal.ErrRuntimeSpecVulkanVisibleDevicesRequired, status: http.StatusBadRequest, code: "runtime_spec.vulkan_visible_devices_required", msg: "a Vulkan spec on a host with NVIDIA and AMD GPUs needs set_visible_devices in env mode"},
 	{err: portal.ErrServerEnergyConfigInvalid, status: http.StatusBadRequest, code: "server.energy_config_invalid", msg: "estimated_watts, idle_watts, price_per_kwh and pue must be >= 0"},
 	{err: portal.ErrServerLANAddressInvalid, status: http.StatusBadRequest, code: "server.lan_address_invalid", msg: "lan_address must be empty or an IPv4 address"},
 	{err: portal.ErrServerLANSourceInvalid, status: http.StatusBadRequest, code: "server.lan_source_invalid", msg: "lan_source must be auto, interface or manual"},

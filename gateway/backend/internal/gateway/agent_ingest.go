@@ -2132,7 +2132,8 @@ type agentGPUInfo struct {
 	// empty. Display and disambiguation, not identity -- the portal shows it
 	// to tell 4x/8x identical cards apart, and GPU identity is the index (see
 	// the agent's sample.GPU.PCIBusID). The only logic reading it is the
-	// portal's gpuLooksNVIDIA, as an NVIDIA fallback behind an AMD name check.
+	// portal's gpuLooksNVIDIA for a report without Vendor, as an NVIDIA
+	// fallback behind an AMD name check.
 	PCIBusID string `json:"pci_bus_id,omitempty"`
 	// Vendor is "nvidia", "amd" or "apple"; empty when the agent does not
 	// report it (or reports something else).

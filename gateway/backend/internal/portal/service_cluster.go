@@ -81,6 +81,11 @@ const (
 	rpcTransportDirect  = "direct"
 	rpcTransportRelay   = "relay"
 	deviceBackendAuto   = "auto"
+	deviceBackendCUDA   = "cuda"
+	deviceBackendROCm   = "rocm"
+	deviceBackendVulkan = "vulkan"
+	deviceBackendMetal  = "metal"
+	deviceBackendSYCL   = "sycl"
 )
 
 // RPC port range a member server's member processes are allocated from. It
@@ -402,6 +407,9 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 		return clusterPlan{}, err
 	}
 	if err := s.normalizeClusterMemberGPUVendors(entries, prevGPUs); err != nil {
+		return clusterPlan{}, err
+	}
+	if err := checkClusterMemberBackends(entries, prevMembers, prevGPUs); err != nil {
 		return clusterPlan{}, err
 	}
 	if err := s.checkClusterMemberGPUs(ctx, entries, scan); err != nil {
@@ -1051,32 +1059,49 @@ func (s *Service) checkClusterTransport(ctx context.Context, network, transport 
 
 // hostGPU is what a server's hardware report says about one GPU.
 type hostGPU struct {
+	// vendor is the report's vendor ("nvidia", "amd", "apple"); "" in the
+	// report of an agent without gpu_vendor_identity, whose card nvidia and
+	// apple then read from its name.
+	vendor string
 	nvidia bool
 	apple  bool
 	// kfdHost: a Linux host on which every listed GPU is AMD, so the agent's
-	// KFD measurer is the one installed (ADR-113).
+	// KFD measurer is the one installed (ADR-113). Only read for a card
+	// without hasMeasurable.
 	kfdHost bool
 	totalMB int
+	// measurable lists the backends whose per-process VRAM the agent measures
+	// on this card (the report's vram_measurable); hasMeasurable: the report
+	// states it, which every report that names the card's vendor does -- the
+	// list is omitted on the wire when empty, which there means none.
+	measurable    []string
+	hasMeasurable bool
 }
 
-// serverHostGPUs reads serverID's hardware report by GPU index. A server
-// without a (readable) report answers an empty map: its vendors are unknown,
-// and no vendor-dependent rule applies to it. The host's OS family is the
-// runtime.GOOS in its last telemetry sample: the report's own os field is the
-// platform string ("ubuntu 24.04"), which names no family. Without telemetry
-// the family is unknown, so no Linux-only exemption applies.
-func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]hostGPU, error) {
-	out := map[int]hostGPU{}
+// serverHostGPUs reads serverID's hardware report by GPU key (the report's
+// vendor, index); a vendor-less report of an older agent keys ("", index)
+// and keeps the name heuristic for its vendors. A server without a
+// (readable) report answers an empty map: its vendors are unknown, and no
+// vendor-dependent rule applies to it. A caller looks a stored GPU key up
+// with lookupGPUKey under the server's legacy vendor, so the empty vendor
+// and the legacy vendor name one card. The host's OS family is the
+// runtime.GOOS in its last telemetry sample: the report's own os field is
+// the platform string ("ubuntu 24.04"), which names no family. Without
+// telemetry the family is unknown, so no Linux-only exemption applies.
+func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[routing.GPUKey]hostGPU, error) {
+	out := map[routing.GPUKey]hostGPU{}
 	hw, ok, err := s.routes.ServerHardwareByServer(ctx, serverID)
 	if err != nil || !ok {
 		return out, err
 	}
 	var report struct {
 		GPUs []struct {
-			Index            int    `json:"index"`
-			Name             string `json:"name"`
-			PCIBusID         string `json:"pci_bus_id"`
-			MemoryTotalBytes int64  `json:"memory_total_bytes"`
+			Index            int      `json:"index"`
+			Name             string   `json:"name"`
+			PCIBusID         string   `json:"pci_bus_id"`
+			Vendor           string   `json:"vendor"`
+			MemoryTotalBytes int64    `json:"memory_total_bytes"`
+			VRAMMeasurable   []string `json:"vram_measurable"`
 		} `json:"gpus"`
 	}
 	if json.Unmarshal([]byte(hw.ReportJSON), &report) != nil {
@@ -1090,20 +1115,43 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 	if hasTelemetry {
 		goos = telemetry.OS
 	}
-	kfdHost := goos == "linux" && len(report.GPUs) > 0
-	for _, g := range report.GPUs {
-		kfdHost = kfdHost && gpuLooksAMD(g.Name)
+	vendors := make([]string, len(report.GPUs))
+	for i, g := range report.GPUs {
+		if v := strings.ToLower(strings.TrimSpace(g.Vendor)); routing.ValidGPUVendor(v) {
+			vendors[i] = v
+		}
 	}
-	for _, g := range report.GPUs {
-		apple := goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")
-		out[g.Index] = hostGPU{
-			nvidia:  !apple && gpuLooksNVIDIA(g.Name, g.PCIBusID),
-			apple:   apple,
-			kfdHost: kfdHost,
-			totalMB: int(g.MemoryTotalBytes / (1024 * 1024)),
+	kfdHost := goos == "linux" && len(report.GPUs) > 0
+	for i, g := range report.GPUs {
+		kfdHost = kfdHost && gpuLooksAMD(vendors[i], g.Name)
+	}
+	for i, g := range report.GPUs {
+		vendor := vendors[i]
+		apple := vendor == routing.GPUVendorApple ||
+			(vendor == "" && (goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")))
+		out[routing.GPUKey{Vendor: vendor, Index: g.Index}] = hostGPU{
+			vendor:        vendor,
+			nvidia:        !apple && gpuLooksNVIDIA(vendor, g.Name, g.PCIBusID),
+			apple:         apple,
+			kfdHost:       kfdHost,
+			totalMB:       int(g.MemoryTotalBytes / (1024 * 1024)),
+			measurable:    g.VRAMMeasurable,
+			hasMeasurable: vendor != "" || len(g.VRAMMeasurable) > 0,
 		}
 	}
 	return out, nil
+}
+
+// hostIsMixed reports whether host (serverHostGPUs) lists both NVIDIA and
+// AMD GPUs by their reported vendor: the host on which the Vulkan loader's
+// device order is not the declared one (the agent's GPUTopology.Mixed).
+func hostIsMixed(host map[routing.GPUKey]hostGPU) bool {
+	var nvidia, amd bool
+	for k := range host {
+		nvidia = nvidia || k.Vendor == routing.GPUVendorNVIDIA
+		amd = amd || k.Vendor == routing.GPUVendorAMD
+	}
+	return nvidia && amd
 }
 
 // normalizeClusterMemberGPUVendors normalizes the vendor of every GPU an
@@ -1153,16 +1201,53 @@ func (s *Service) normalizeClusterMemberGPUVendors(entries []clusterEntry, prevG
 	return nil
 }
 
+// checkClusterMemberBackends refuses an automatic member whose device
+// backend cannot drive one of its GPUs (specDeviceRefusal, without the
+// Vulkan visibility rule: the agent pins a member's devices itself), right
+// after the vendors are normalized. A manual member's backend and GPUs were
+// checked when its spec was saved, and an entry the caller cannot see is
+// kept as it is. Only a member moved into the mismatch is refused
+// (movesIntoDeviceRefusal): the stored member on the same server, with its
+// stored backend and GPUs, is not mismatched the same way.
+func checkClusterMemberBackends(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) error {
+	for _, e := range entries {
+		if e.manual || !e.visible {
+			continue
+		}
+		legacy := e.server.GPULegacyVendor
+		refusal := specDeviceRefusal(e.req.DeviceBackend, e.gpus, legacy, false, false)
+		if refusal == nil {
+			continue
+		}
+		var prior error
+		if i := slices.IndexFunc(prevMembers, func(m routing.ClusterMember) bool {
+			return m.ServerID == e.server.ID && m.MemberSpecID == ""
+		}); i >= 0 {
+			var stored []routing.GPUKey
+			for _, g := range prevGPUs {
+				if g.ServerID == e.server.ID {
+					stored = append(stored, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
+				}
+			}
+			prior = specDeviceRefusal(prevMembers[i].DeviceBackend, stored, legacy, false, false)
+		}
+		if err := movesIntoDeviceRefusal(refusal, prior); err != nil {
+			return e.refusal(err, "the device backend of the member on server %q cannot drive its GPUs", e.server.Name)
+		}
+	}
+	return nil
+}
+
 // checkClusterMemberGPUs is step 9 of validateClusterHead. An Apple GPU gets
 // no auto-detected budget on its agent, so a member on one needs the
-// operator's. A known non-NVIDIA GPU is not measured per process, so an
-// automatic member needs the operator's estimate for it and the head needs
-// --tensor-split, since the member's real share may stay invisible to its
-// agent. The exception is a measurable GPU (memberGPUMeasurable: AMD on
-// Linux under the ROCm or auto backend, read from KFD, ADR-113), which needs
-// neither.
+// operator's. A known non-NVIDIA GPU whose VRAM the agent cannot measure for
+// the member's resolved backend (gpuMeasurable) is not measured per process,
+// so an automatic member needs the operator's estimate for it and the head
+// needs --tensor-split, since the member's real share may stay invisible to
+// its agent. Each GPU key is looked up on its own server's report, the empty
+// vendor read as that server's legacy vendor.
 func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterEntry, scan clusterArgScan) error {
-	hosts := make([]map[int]hostGPU, len(entries))
+	hosts := make([]map[routing.GPUKey]hostGPU, len(entries))
 	for i, e := range entries {
 		var err error
 		if hosts[i], err = s.serverHostGPUs(ctx, e.server.ID); err != nil {
@@ -1174,13 +1259,20 @@ func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterE
 			return err
 		}
 	}
+	unmeasured := func(i int, e clusterEntry) func(routing.GPUKey) bool {
+		backend := entryResolvedBackend(e)
+		return func(k routing.GPUKey) bool {
+			return unmeasuredNonNVIDIA(hosts[i], k, e.server.GPULegacyVendor, backend)
+		}
+	}
 	for i, e := range entries {
-		if !e.manual && slices.ContainsFunc(e.gpus, func(k routing.GPUKey) bool { return unmeasuredNonNVIDIA(hosts[i], k.Index, e) && e.estimate[k] == 0 }) {
+		isUnmeasured := unmeasured(i, e)
+		if !e.manual && slices.ContainsFunc(e.gpus, func(k routing.GPUKey) bool { return isUnmeasured(k) && e.estimate[k] == 0 }) {
 			return ErrRPCMemberVRAMEstimateRequired
 		}
 	}
 	for i, e := range entries {
-		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, func(k routing.GPUKey) bool { return unmeasuredNonNVIDIA(hosts[i], k.Index, e) }) {
+		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, unmeasured(i, e)) {
 			return e.refusal(ErrClusterTensorSplitRequired, "server %q has GPUs whose VRAM the agent cannot measure", e.server.Name)
 		}
 	}
@@ -1196,40 +1288,53 @@ func entryDeviceBackend(e clusterEntry) string {
 	return e.req.DeviceBackend
 }
 
-// unmeasuredNonNVIDIA reports whether the report lists GPU idx of entry e as
-// a non-NVIDIA card whose VRAM the agent cannot measure.
-func unmeasuredNonNVIDIA(host map[int]hostGPU, idx int, e clusterEntry) bool {
-	return knownNonNVIDIA(host, idx) && !memberGPUMeasurable(host[idx], entryDeviceBackend(e))
+// entryResolvedBackend is entryDeviceBackend resolved for the vendors of the
+// entry's GPUs (resolveSpecBackend), what the agent runs the member with.
+func entryResolvedBackend(e clusterEntry) string {
+	backend, _ := resolveSpecBackend(entryDeviceBackend(e), specGPUVendors(e.gpus, e.server.GPULegacyVendor))
+	return backend
 }
 
-// memberGPUMeasurable reports whether the agent measures g's per-process VRAM
-// for a member with the given device backend: g sits on a Linux host with only
-// AMD GPUs (kfdHost) and the backend is rocm, or auto/"" (which the agent
-// resolves to ROCm on such a host). A member that runs with the ROCm device
-// prefix is a HIP process, which the KFD measurer sees; a non-HIP binary fails
-// with device_backend_mismatch instead.
-func memberGPUMeasurable(g hostGPU, backend string) bool {
+// unmeasuredNonNVIDIA reports whether host's report lists the card key names
+// (lookupGPUKey under legacy) as a non-NVIDIA card whose VRAM the agent
+// cannot measure for a member with resolved backend backend.
+func unmeasuredNonNVIDIA(host map[routing.GPUKey]hostGPU, key routing.GPUKey, legacy, backend string) bool {
+	g, known := lookupGPUKey(host, key, legacy)
+	return known && !g.nvidia && !gpuMeasurable(g, backend)
+}
+
+// gpuMeasurable reports whether the agent measures g's per-process VRAM for
+// a member whose device backend resolves to backend (resolveSpecBackend).
+// A report that states the card's measurable backends decides by that list.
+// One that does not (an older agent's) keeps the KFD rule: g sits on a Linux
+// host with only AMD GPUs (kfdHost) and the backend is rocm, or auto (which
+// the agent resolves to ROCm on such a host). A member that runs with the
+// ROCm device prefix is a HIP process, which the KFD measurer sees; a
+// non-HIP binary fails with device_backend_mismatch instead.
+func gpuMeasurable(g hostGPU, backend string) bool {
+	if g.hasMeasurable {
+		return slices.Contains(g.measurable, backend)
+	}
 	if !g.kfdHost {
 		return false
 	}
-	switch normalizeDeviceBackend(backend) {
-	case "rocm", deviceBackendAuto:
+	switch backend {
+	case deviceBackendROCm, deviceBackendAuto:
 		return true
 	}
 	return false
 }
 
-// knownNonNVIDIA reports whether the hardware report lists GPU idx and it is
-// not an NVIDIA card.
-func knownNonNVIDIA(host map[int]hostGPU, idx int) bool {
-	g, known := host[idx]
-	return known && !g.nvidia
-}
-
 // checkAppleMemberBudgets requires an operator GPU budget for every Apple GPU
-// an entry selects.
-func (s *Service) checkAppleMemberBudgets(ctx context.Context, e clusterEntry, host map[int]hostGPU) error {
-	if !slices.ContainsFunc(e.gpus, func(k routing.GPUKey) bool { return host[k.Index].apple }) {
+// an entry selects: a budget of the same card, the empty vendor read as the
+// server's legacy vendor on both sides.
+func (s *Service) checkAppleMemberBudgets(ctx context.Context, e clusterEntry, host map[routing.GPUKey]hostGPU) error {
+	legacy := e.server.GPULegacyVendor
+	isApple := func(k routing.GPUKey) bool {
+		g, _ := lookupGPUKey(host, k, legacy)
+		return g.apple
+	}
+	if !slices.ContainsFunc(e.gpus, isApple) {
 		return nil
 	}
 	budgets, err := s.routes.ServerGPUBudgets(ctx, e.server.ID)
@@ -1237,9 +1342,11 @@ func (s *Service) checkAppleMemberBudgets(ctx context.Context, e clusterEntry, h
 		return err
 	}
 	for _, k := range e.gpus {
-		idx := k.Index
-		if host[idx].apple && !slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool { return b.GPUIndex == idx && b.BudgetMB > 0 }) {
-			return e.refusal(ErrClusterMemberBudgetRequired, "GPU %d of server %q needs a GPU budget", idx, e.server.Name)
+		card := resolveLegacyGPUKey(k, legacy)
+		if isApple(k) && !slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool {
+			return resolveLegacyGPUKey(routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}, legacy) == card && b.BudgetMB > 0
+		}) {
+			return e.refusal(ErrClusterMemberBudgetRequired, "GPU %d of server %q needs a GPU budget", k.Index, e.server.Name)
 		}
 	}
 	return nil
@@ -1931,7 +2038,7 @@ func (s *Service) peaksAboveBudget(ctx context.Context, members []clusterMemberS
 // memberPeaksAboveBudget names one member's stored peaks above its host's
 // ceilings, RAM first, then its GPUs in device order; a member the reader
 // may not see keeps only its position.
-func memberPeaksAboveBudget(m clusterMemberState, parts []ClusterMemberGPUDTO, gpuCeilings map[int]int, ramCeiling int) []ClusterPeakAboveBudgetDTO {
+func memberPeaksAboveBudget(m clusterMemberState, parts []ClusterMemberGPUDTO, gpuCeilings map[routing.GPUKey]int, ramCeiling int) []ClusterPeakAboveBudgetDTO {
 	var found []ClusterPeakAboveBudgetDTO
 	if ramCeiling > 0 && m.row.RAMMeasuredMB > ramCeiling {
 		found = append(found, ClusterPeakAboveBudgetDTO{
@@ -1939,7 +2046,7 @@ func memberPeaksAboveBudget(m clusterMemberState, parts []ClusterMemberGPUDTO, g
 		})
 	}
 	for _, g := range parts {
-		if c := gpuCeilings[g.Index]; c > 0 && g.VRAMMeasuredMB > c {
+		if c := gpuCeilings[resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, m.server.GPULegacyVendor)]; c > 0 && g.VRAMMeasuredMB > c {
 			index := g.Index
 			found = append(found, ClusterPeakAboveBudgetDTO{
 				Position: m.row.Position, Resource: ClusterPeakResourceVRAM, GPUIndex: &index, StoredMB: g.VRAMMeasuredMB, CeilingMB: c,
@@ -2062,7 +2169,7 @@ func (s *Service) memberWarnings(ctx context.Context, headSpecID string, m clust
 	if scan.tensorSplit || len(parts) == 0 {
 		return nil
 	}
-	below, err := s.budgetBelowDevice(ctx, m.server.ID, parts)
+	below, err := s.budgetBelowDevice(ctx, m.server.ID, m.server.GPULegacyVendor, parts)
 	if err != nil {
 		return err
 	}
@@ -2082,8 +2189,10 @@ func memberEstimateMissing(m clusterMemberState, parts []ClusterMemberGPUDTO) bo
 }
 
 // budgetBelowDevice reports whether an operator GPU budget on serverID is
-// below the total memory of one of the member's GPUs.
-func (s *Service) budgetBelowDevice(ctx context.Context, serverID string, parts []ClusterMemberGPUDTO) (bool, error) {
+// below the total memory of one of the member's GPUs: the budget and the
+// card of the member GPU's own (vendor, index), the empty vendor read as
+// the server's legacy vendor legacy on every side.
+func (s *Service) budgetBelowDevice(ctx context.Context, serverID, legacy string, parts []ClusterMemberGPUDTO) (bool, error) {
 	budgets, err := s.routes.ServerGPUBudgets(ctx, serverID)
 	if err != nil {
 		return false, err
@@ -2093,8 +2202,14 @@ func (s *Service) budgetBelowDevice(ctx context.Context, serverID string, parts 
 		return false, err
 	}
 	for _, g := range parts {
+		card := resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy)
+		device, known := lookupGPUKey(hosts, card, legacy)
+		if !known {
+			continue
+		}
 		if slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool {
-			return b.GPUIndex == g.Index && b.BudgetMB > 0 && hosts[g.Index].totalMB > b.BudgetMB
+			return resolveLegacyGPUKey(routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}, legacy) == card &&
+				b.BudgetMB > 0 && device.totalMB > b.BudgetMB
 		}) {
 			return true, nil
 		}

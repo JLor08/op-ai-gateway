@@ -2101,3 +2101,158 @@ func TestClusterCandidateReadsTheInventoryOnce(t *testing.T) {
 		t.Fatalf("inventory reads = %d, want 1", swap.reads)
 	}
 }
+
+// mixedHostReport is a hardware report of a host with NVIDIA 0 (11264 MB)
+// and AMD 0 (16384 MB), the AMD card measurable as amdMeasurable lists
+// (a JSON array).
+func mixedHostReport(amdMeasurable string) string {
+	return `{"gpus":[` +
+		`{"index":0,"name":"NVIDIA GeForce RTX 3080 Ti","vendor":"nvidia","pci_bus_id":"00000000:01:00.0","memory_total_bytes":11811160064,"vram_measurable":["cuda","vulkan"],"vulkan_ordinal":1},` +
+		`{"index":0,"name":"AMD Radeon RX 7900 XT","vendor":"amd","pci_bus_id":"0000:03:00.0","memory_total_bytes":17179869184,"vram_measurable":` + amdMeasurable + `,"vulkan_ordinal":0}]}`
+}
+
+func TestServerHostGPUsKeysByVendor(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.hostOS(a.ID, "linux")
+	f.hardware(a.ID, mixedHostReport(`["rocm"]`))
+	hosts, err := f.svc.serverHostGPUs(f.ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hosts) != 2 {
+		t.Fatalf("hosts = %+v, want two cards", hosts)
+	}
+	nv, amd := hosts[routing.GPUKey{Vendor: "nvidia", Index: 0}], hosts[routing.GPUKey{Vendor: "amd", Index: 0}]
+	if !nv.nvidia || nv.vendor != "nvidia" || nv.totalMB != 11264 || nv.kfdHost {
+		t.Fatalf("nvidia 0 = %+v", nv)
+	}
+	if amd.nvidia || amd.apple || amd.vendor != "amd" || amd.totalMB != 16384 || amd.kfdHost ||
+		!amd.hasMeasurable || !slices.Equal(amd.measurable, []string{"rocm"}) {
+		t.Fatalf("amd 0 = %+v", amd)
+	}
+
+	// A vendor-less report of an older agent keeps the name heuristic and
+	// keys ("", index).
+	f.hardware(a.ID, `{"gpus":[{"index":0,"name":"AMD Radeon RX 7900 XT","pci_bus_id":"0000:03:00.0"},{"index":1,"name":"NVIDIA GeForce RTX 4090","pci_bus_id":"00000000:01:00.0"}]}`)
+	if hosts, err = f.svc.serverHostGPUs(f.ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if g := hosts[routing.GPUKey{Index: 0}]; g.nvidia || g.hasMeasurable || g.vendor != "" {
+		t.Fatalf("legacy amd 0 = %+v", g)
+	}
+	if g := hosts[routing.GPUKey{Index: 1}]; !g.nvidia {
+		t.Fatalf("legacy nvidia 1 = %+v", g)
+	}
+}
+
+// TestCheckClusterMemberGPUsLooksUpByKey: on a host with NVIDIA 0 and AMD 0
+// whose AMD card is not measurable under Vulkan, a Vulkan member on the AMD
+// card needs an estimate and one on the NVIDIA card does not; a vendor-less
+// entry is the server's legacy vendor's card.
+func TestCheckClusterMemberGPUsLooksUpByKey(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.hostOS(a.ID, "linux")
+	f.hardware(a.ID, mixedHostReport(`["rocm"]`))
+	entry := func(keys ...routing.GPUKey) []clusterEntry {
+		server, err := f.routes.AIServerByID(f.ctx, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []clusterEntry{{visible: true, server: server, req: ClusterMemberDTO{DeviceBackend: "vulkan"}, gpus: keys, estimate: map[routing.GPUKey]int{}}}
+	}
+	split := clusterArgScan{tensorSplit: true}
+	if err := f.svc.checkClusterMemberGPUs(f.ctx, entry(routing.GPUKey{Vendor: "amd", Index: 0}), split); !errors.Is(err, ErrRPCMemberVRAMEstimateRequired) {
+		t.Fatalf("amd 0 vulkan: err = %v, want ErrRPCMemberVRAMEstimateRequired", err)
+	}
+	if err := f.svc.checkClusterMemberGPUs(f.ctx, entry(routing.GPUKey{Vendor: "nvidia", Index: 0}), split); err != nil {
+		t.Fatalf("nvidia 0 vulkan: %v", err)
+	}
+	if err := f.svc.checkClusterMemberGPUs(f.ctx, entry(routing.GPUKey{Index: 0}), split); err != nil {
+		t.Fatalf("vendor-less 0 without a legacy vendor: %v", err)
+	}
+	if _, err := f.routes.BackfillServerGPUVendor(f.ctx, a.ID, "amd", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.svc.checkClusterMemberGPUs(f.ctx, entry(routing.GPUKey{Index: 0}), split); !errors.Is(err, ErrRPCMemberVRAMEstimateRequired) {
+		t.Fatalf("vendor-less 0, legacy amd: err = %v, want ErrRPCMemberVRAMEstimateRequired", err)
+	}
+	// Measurable under Vulkan: no estimate needed.
+	f.hardware(a.ID, mixedHostReport(`["rocm","vulkan"]`))
+	if err := f.svc.checkClusterMemberGPUs(f.ctx, entry(routing.GPUKey{Vendor: "amd", Index: 0}), split); err != nil {
+		t.Fatalf("amd 0 measurable under vulkan: %v", err)
+	}
+}
+
+// TestBudgetBelowDeviceComparesSameVendorCard: a budget below a card's
+// memory flags a member GPU only when budget and card are the member GPU's
+// own (vendor, index).
+func TestBudgetBelowDeviceComparesSameVendorCard(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.hardware(a.ID, mixedHostReport(`["rocm"]`))
+	parts := []ClusterMemberGPUDTO{{Vendor: "amd", Index: 0, VRAMEstimateMB: 12000}}
+	setBudget := func(vendor string) {
+		t.Helper()
+		if err := f.routes.SetServerGPUBudgets(f.ctx, a.ID, []routing.ServerGPUBudget{{ServerID: a.ID, GPUVendor: vendor, GPUIndex: 0, BudgetMB: 8000, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setBudget("nvidia")
+	if below, err := f.svc.budgetBelowDevice(f.ctx, a.ID, "", parts); err != nil || below {
+		t.Fatalf("budget on nvidia 0: below = %v err = %v, want false", below, err)
+	}
+	setBudget("amd")
+	if below, err := f.svc.budgetBelowDevice(f.ctx, a.ID, "", parts); err != nil || !below {
+		t.Fatalf("budget on amd 0: below = %v err = %v, want true", below, err)
+	}
+	// A vendor-less budget and member GPU are the legacy vendor's card.
+	setBudget("")
+	legacyParts := []ClusterMemberGPUDTO{{Index: 0}}
+	if below, err := f.svc.budgetBelowDevice(f.ctx, a.ID, "amd", legacyParts); err != nil || !below {
+		t.Fatalf("vendor-less budget, legacy amd: below = %v err = %v, want true", below, err)
+	}
+}
+
+// TestClusterMemberSaveRefusesVendorBackendMismatch: an automatic member
+// whose device backend cannot drive one of its GPUs is refused with the
+// stable code; Vulkan across both vendors is accepted (members are exempt
+// from the visible-devices rule, the agent pins them itself). A head
+// re-save that keeps a member stored in that state saves.
+func TestClusterMemberSaveRefusesVendorBackendMismatch(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	features := f.clusterAgents(a.ID)
+	features[a.ID] = append(features[a.ID], AgentFeatureGPUVendorIdentity)
+	f.hostOS(a.ID, "linux")
+	f.hardware(a.ID, mixedHostReport(`["rocm","vulkan"]`))
+	member := autoMember(a.ID, 0, 0)
+	member.GPUs[0].Vendor, member.GPUs[1].Vendor = "nvidia", "amd"
+	member.DeviceBackend = "cuda"
+	if _, err := f.put(ownerToken(), clusterHeadRequest(member)); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("cuda member over nvidia+amd: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+	member.DeviceBackend = "vulkan"
+	if _, err := f.put(ownerToken(), clusterHeadRequest(member)); err != nil {
+		t.Fatalf("vulkan member over nvidia+amd: %v", err)
+	}
+
+	// Stored before the backfill named its vendor-less GPU AMD.
+	legacyMember := autoMember(a.ID, 0)
+	legacyMember.DeviceBackend = "cuda"
+	f.hardware(a.ID, `{"gpus":[]}`)
+	f.mustPut(clusterHeadRequest(legacyMember))
+	if _, err := f.routes.BackfillServerGPUVendor(f.ctx, a.ID, "amd", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.put(ownerToken(), clusterHeadRequest(legacyMember)); err != nil {
+		t.Fatalf("re-save of a stored mismatched member: %v", err)
+	}
+	moved := autoMember(a.ID, 0)
+	moved.DeviceBackend = "rocm"
+	f.mustPut(clusterHeadRequest(moved))
+	if _, err := f.put(ownerToken(), clusterHeadRequest(legacyMember)); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("move back into the mismatch: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+}

@@ -6,7 +6,9 @@ package portal
 import (
 	"context"
 	"errors"
+	"maps"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strings"
 )
 
@@ -241,4 +243,126 @@ func lookupGPUKey[T any](m map[routing.GPUKey]T, key routing.GPUKey, legacy stri
 	}
 	v, ok := m[key]
 	return v, ok
+}
+
+// resolveSpecBackend is the portal's mirror of the agent's per-spec backend
+// rule (server-agent internal/runtime/device_plan.go, resolveDevicePrefix):
+// the device backend a spec with GPUs of vendors runs with, and whether that
+// backend cannot drive one of them. vendors are the spec's GPU vendors with
+// an empty vendor read as the server's legacy vendor (resolveLegacyGPUKey);
+// an empty one left is a GPU of a host without a detected vendor, which
+// takes part in neither decision. auto (or "") resolves by the spec's own
+// vendors: NVIDIA only cuda, AMD only rocm, Apple only metal, several vendors
+// vulkan, none auto. cuda, rocm and metal cannot drive another vendor's GPU,
+// and sycl cannot span several vendors: each is a mismatch. vulkan drives
+// every vendor. An unknown backend is returned lower-cased with no mismatch;
+// the request validation refuses it.
+func resolveSpecBackend(backend string, vendors []string) (resolved string, mismatch bool) {
+	distinct := make([]string, 0, len(vendors))
+	for _, v := range vendors {
+		if v != "" && !slices.Contains(distinct, v) {
+			distinct = append(distinct, v)
+		}
+	}
+	b := normalizeDeviceBackend(strings.ToLower(strings.TrimSpace(backend)))
+	native := map[string]string{
+		routing.GPUVendorNVIDIA: deviceBackendCUDA,
+		routing.GPUVendorAMD:    deviceBackendROCm,
+		routing.GPUVendorApple:  deviceBackendMetal,
+	}
+	switch b {
+	case deviceBackendAuto:
+		switch len(distinct) {
+		case 0:
+			return deviceBackendAuto, false
+		case 1:
+			return native[distinct[0]], false
+		default:
+			return deviceBackendVulkan, false
+		}
+	case deviceBackendCUDA, deviceBackendROCm, deviceBackendMetal:
+		for _, v := range distinct {
+			if native[v] != b {
+				return b, true
+			}
+		}
+		return b, false
+	case deviceBackendSYCL:
+		return b, len(distinct) > 1
+	default:
+		return b, false
+	}
+}
+
+// specGPUVendors are the vendors of keys with an empty vendor read as
+// legacy, resolveSpecBackend's input.
+func specGPUVendors(keys []routing.GPUKey, legacy string) []string {
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = resolveLegacyGPUKey(k, legacy).Vendor
+	}
+	return out
+}
+
+// specDeviceRefusal is the save-time mirror of the agent's device-plan
+// refusals (planDevices) for one spec with device backend backend and GPU
+// keys on a server whose legacy vendor is legacy:
+// ErrRuntimeSpecGPUVendorBackendMismatch when the backend cannot drive one
+// of the GPUs (resolveSpecBackend); with vulkanRule (the server's stored
+// hardware report lists both NVIDIA and AMD GPUs, and the spec is not an RPC
+// member, which the agent pins itself), ErrRuntimeSpecVulkanVisibleDevicesRequired
+// when the spec resolves to Vulkan, has GPUs and does not let the agent
+// inject the visibility variable (injects: set_visible_devices in env mode):
+// the Vulkan loader's device order on such a host is not the declared order.
+func specDeviceRefusal(backend string, keys []routing.GPUKey, legacy string, injects, vulkanRule bool) error {
+	resolved, mismatch := resolveSpecBackend(backend, specGPUVendors(keys, legacy))
+	if mismatch {
+		return ErrRuntimeSpecGPUVendorBackendMismatch
+	}
+	if vulkanRule && resolved == deviceBackendVulkan && len(keys) > 0 && !injects {
+		return ErrRuntimeSpecVulkanVisibleDevicesRequired
+	}
+	return nil
+}
+
+// movesIntoDeviceRefusal is specDeviceRefusal's answer for a write, unless
+// the stored object the write replaces is refused the same way (prior; nil
+// for a new object or none): like the process-tree rule, only a write that
+// moves an object into the refusal is refused, so the portal's overrides,
+// which re-send the whole stored object, keep working on one stored before
+// the rule applied (or before its host turned mixed). The agent refuses
+// such an object at launch with the same code.
+func movesIntoDeviceRefusal(refusal, prior error) error {
+	if refusal != nil && errors.Is(prior, refusal) {
+		return nil
+	}
+	return refusal
+}
+
+// checkSpecDevicePlan is specDeviceRefusal for an operator's runtime-spec
+// write on serverID, after its GPU vendors are normalized: the Vulkan
+// visibility rule applies when the server's stored hardware report lists
+// both NVIDIA and AMD GPUs (read only when the spec could need it), and the
+// agent injects the visibility variable for set_visible_devices in env mode
+// (the default). Only a write that moves the spec into a refusal is refused
+// (movesIntoDeviceRefusal against the stored spec and its stored GPU rows).
+func (s *Service) checkSpecDevicePlan(ctx context.Context, serverID string, req PutRuntimeSpecRequest, f runtimeSpecFields, prior runtimeSpecPrior) error {
+	legacy := prior.legacyVendor
+	keys := specGPUKeys(req.GPUs)
+	injects := req.SetVisibleDevices && f.visibleMode != routing.VisibleDevicesModeArgs
+	mixed := false
+	if resolved, _ := resolveSpecBackend(f.deviceBackend, specGPUVendors(keys, legacy)); resolved == deviceBackendVulkan && len(keys) > 0 && !injects {
+		host, err := s.serverHostGPUs(ctx, serverID)
+		if err != nil {
+			return err
+		}
+		mixed = hostIsMixed(host)
+	}
+	refusal := specDeviceRefusal(f.deviceBackend, keys, legacy, injects, mixed)
+	if refusal == nil || !prior.ok {
+		return refusal
+	}
+	priorInjects := prior.spec.SetVisibleDevices && prior.spec.VisibleDevicesMode != routing.VisibleDevicesModeArgs
+	priorKeys := slices.Collect(maps.Keys(prior.measuredByKey))
+	return movesIntoDeviceRefusal(refusal, specDeviceRefusal(prior.spec.DeviceBackend, priorKeys, legacy, priorInjects, mixed))
 }

@@ -1279,9 +1279,10 @@ func TestHandlePortalMappingRuntimeSpecPutBothDecisionModesInvalid(t *testing.T)
 }
 
 // TestVendorErrorsAreMappedInEveryTable: each save that normalizes GPU
-// vendors (the runtime spec, the GPU budgets through the server mapper, the
-// RPC member spec through its concatenated table) answers both vendor
-// refusals with their 400 and code, never the 500 fallback.
+// vendors (the runtime spec and its cluster members, the GPU budgets through
+// the server mapper, the RPC member spec through its concatenated table)
+// answers the vendor and device-plan refusals with their 400 and code,
+// never the 500 fallback.
 func TestVendorErrorsAreMappedInEveryTable(t *testing.T) {
 	tables := map[string][]errRow{
 		"runtime spec": portalRuntimeSpecErrors,
@@ -1291,6 +1292,9 @@ func TestVendorErrorsAreMappedInEveryTable(t *testing.T) {
 	codes := map[error]string{
 		portal.ErrRuntimeSpecGPUVendorInvalid:     "runtime_spec.gpu_vendor_invalid",
 		portal.ErrRuntimeSpecGPUVendorUnsupported: "runtime_spec.gpu_vendor_unsupported",
+		// The device-plan refusals (#434 F5) of the same saves.
+		portal.ErrRuntimeSpecGPUVendorBackendMismatch:     "runtime_spec.gpu_vendor_backend_mismatch",
+		portal.ErrRuntimeSpecVulkanVisibleDevicesRequired: "runtime_spec.vulkan_visible_devices_required",
 	}
 	for name, tbl := range tables {
 		for err, code := range codes {

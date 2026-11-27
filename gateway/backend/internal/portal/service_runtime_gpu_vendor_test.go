@@ -749,3 +749,93 @@ func TestClusterHeadOverrideKeepsStoredMemberVendor(t *testing.T) {
 		t.Fatalf("new amd 1 member gpu: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
 	}
 }
+
+func (f *gpuVendorFixture) hardware(report string) {
+	f.t.Helper()
+	if err := f.routes.UpsertServerHardware(f.ctx, routing.ServerHardware{ServerID: f.serverID, CollectedAt: gpuVendorTestNow, UpdatedAt: gpuVendorTestNow, ReportJSON: report}); err != nil {
+		f.t.Fatalf("UpsertServerHardware: %v", err)
+	}
+}
+
+// putSpec saves the fixture's spec as the operator, with req's device and
+// visibility fields over a valid base.
+func (f *gpuVendorFixture) putSpec(backend string, setVisible bool, mode string, env map[string]string, gpus ...RuntimeSpecGPUDTO) error {
+	_, err := f.svc.PutRuntimeSpec(f.ctx, ownerToken(), f.mappingID, PutRuntimeSpecRequest{
+		Enabled: true, Binary: "/usr/local/bin/llama-server", GPUs: gpus, DeviceBackend: backend,
+		SetVisibleDevices: setVisible, VisibleDevicesMode: mode, Env: env,
+		Args: []string{"--device", "${VULKAN_DEVICES}"},
+	})
+	return err
+}
+
+var (
+	specNVIDIA0 = RuntimeSpecGPUDTO{Vendor: "nvidia", Index: 0}
+	specAMD0    = RuntimeSpecGPUDTO{Vendor: "amd", Index: 0}
+)
+
+func TestSaveSpecRefusesVendorBackendMismatch(t *testing.T) {
+	f := newGPUVendorFixture(t)
+	f.hardware(mixedHostReport(`["rocm","vulkan"]`))
+	for _, tc := range []struct {
+		backend string
+		gpus    []RuntimeSpecGPUDTO
+		want    error
+	}{
+		{"cuda", []RuntimeSpecGPUDTO{specNVIDIA0, specAMD0}, ErrRuntimeSpecGPUVendorBackendMismatch},
+		{"rocm", []RuntimeSpecGPUDTO{specNVIDIA0}, ErrRuntimeSpecGPUVendorBackendMismatch},
+		{"metal", []RuntimeSpecGPUDTO{specAMD0}, ErrRuntimeSpecGPUVendorBackendMismatch},
+		{"sycl", []RuntimeSpecGPUDTO{specNVIDIA0, specAMD0}, ErrRuntimeSpecGPUVendorBackendMismatch},
+		{"cuda", []RuntimeSpecGPUDTO{specNVIDIA0}, nil},
+		{"auto", []RuntimeSpecGPUDTO{specAMD0}, nil},
+	} {
+		if err := f.putSpec(tc.backend, true, "env", nil, tc.gpus...); !errors.Is(err, tc.want) || (tc.want == nil && err != nil) {
+			t.Errorf("%s %v: err = %v, want %v", tc.backend, tc.gpus, err, tc.want)
+		}
+	}
+}
+
+func TestSaveSpecRefusesVulkanWithoutEnvVisibilityOnMixedHost(t *testing.T) {
+	f := newGPUVendorFixture(t)
+	f.hardware(mixedHostReport(`["rocm","vulkan"]`))
+	both := []RuntimeSpecGPUDTO{specNVIDIA0, specAMD0}
+	for _, tc := range []struct {
+		name, backend string
+		setVisible    bool
+		mode          string
+		gpus          []RuntimeSpecGPUDTO
+		want          error
+	}{
+		{"vulkan without visibility", "vulkan", false, "", both, ErrRuntimeSpecVulkanVisibleDevicesRequired},
+		{"auto over both vendors without visibility", "auto", false, "", both, ErrRuntimeSpecVulkanVisibleDevicesRequired},
+		{"vulkan on one card without visibility", "vulkan", false, "", []RuntimeSpecGPUDTO{specAMD0}, ErrRuntimeSpecVulkanVisibleDevicesRequired},
+		{"vulkan in args mode", "vulkan", true, "args", both, ErrRuntimeSpecVulkanVisibleDevicesRequired},
+		{"vulkan in env mode", "vulkan", true, "env", both, nil},
+		{"vulkan in default mode", "vulkan", true, "", both, nil},
+		{"vulkan without gpus", "vulkan", false, "", nil, nil},
+		{"rocm on the amd card without visibility", "rocm", false, "", []RuntimeSpecGPUDTO{specAMD0}, nil},
+	} {
+		if err := f.putSpec(tc.backend, tc.setVisible, tc.mode, nil, tc.gpus...); !errors.Is(err, tc.want) || (tc.want == nil && err != nil) {
+			t.Errorf("%s: err = %v, want %v", tc.name, err, tc.want)
+		}
+	}
+
+	// A single-vendor host has no loader-order ambiguity.
+	f.hardware(`{"gpus":[{"index":0,"name":"AMD Radeon RX 7900 XT","vendor":"amd"},{"index":1,"name":"AMD Radeon RX 7900 XT","vendor":"amd"}]}`)
+	if err := f.putSpec("vulkan", false, "", nil, specAMD0, RuntimeSpecGPUDTO{Vendor: "amd", Index: 1}); err != nil {
+		t.Fatalf("single-vendor host: %v", err)
+	}
+	// The host turns mixed: a re-save of the stored spec (an override)
+	// still saves; the agent reports the refusal at launch.
+	f.hardware(mixedHostReport(`["rocm","vulkan"]`))
+	if err := f.putSpec("vulkan", false, "", nil, specAMD0, RuntimeSpecGPUDTO{Vendor: "amd", Index: 1}); err != nil {
+		t.Fatalf("re-save of a stored spec on a host turned mixed: %v", err)
+	}
+}
+
+func TestSaveSpecRefusesHandSetGGMLVKVisibleDevices(t *testing.T) {
+	f := newGPUVendorFixture(t)
+	err := f.putSpec("vulkan", true, "env", map[string]string{"GGML_VK_VISIBLE_DEVICES": "0"}, specAMD0)
+	if !errors.Is(err, ErrRuntimeSpecVisibleDevicesConflict) {
+		t.Fatalf("err = %v, want ErrRuntimeSpecVisibleDevicesConflict", err)
+	}
+}

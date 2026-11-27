@@ -962,3 +962,35 @@ func TestAgentRuntimeConfigDerivesProtocolOnlyMember(t *testing.T) {
 		t.Fatalf("member spec = %+v ok=%v, want binary %s", ms, ok, tarballRPC)
 	}
 }
+
+// TestServerMemoryCeilingsKeyedByVendor: each card's ceiling is its own
+// budget, else its own memory, by (vendor, index); a vendor-less budget is
+// the legacy vendor's card.
+func TestServerMemoryCeilingsKeyedByVendor(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.hardware(a.ID, mixedHostReport(`["rocm"]`))
+	if err := f.routes.SetServerGPUBudgets(f.ctx, a.ID, []routing.ServerGPUBudget{{ServerID: a.ID, GPUVendor: "nvidia", GPUIndex: 0, BudgetMB: 10000, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := f.svc.serverMemoryCeilings(f.ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[routing.GPUKey{Vendor: "nvidia", Index: 0}] != 10000 || got[routing.GPUKey{Vendor: "amd", Index: 0}] != 16384 || len(got) != 2 {
+		t.Fatalf("ceilings = %v, want nvidia 0: 10000, amd 0: 16384", got)
+	}
+
+	if _, err := f.routes.BackfillServerGPUVendor(f.ctx, a.ID, "amd", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.routes.SetServerGPUBudgets(f.ctx, a.ID, []routing.ServerGPUBudget{{ServerID: a.ID, GPUIndex: 0, BudgetMB: 9000, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err = f.svc.serverMemoryCeilings(f.ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got[routing.GPUKey{Vendor: "amd", Index: 0}] != 9000 || got[routing.GPUKey{Vendor: "nvidia", Index: 0}] != 11264 || len(got) != 2 {
+		t.Fatalf("ceilings with a vendor-less budget, legacy amd = %v", got)
+	}
+}
