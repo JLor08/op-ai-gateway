@@ -920,8 +920,10 @@ spec now gets its native backend instead of Vulkan, deliberately.
 The Vulkan row needs the card-to-ordinal mapping of the hardware report
 ([§3.10](#310-mixed-vendor-gpu-hosts)). Where a declared card has no known
 ordinal (no `vulkaninfo`, a card missing from its output or listed twice, or a
-spec started before the first hardware report reached the runtime), a
-single-vendor host falls back to exactly the pre-#434 behaviour, the host
+spec started before the first hardware report reached the runtime), and for
+every WSL spec (§3.9: its child enumerates Vulkan inside the distro, never in the
+Windows host's `vulkaninfo` order the map was read from, so WSL keeps its pre-#434
+behaviour), a single-vendor host falls back to exactly the pre-#434 behaviour, the host
 vendor's variable with the host indices and host-index device names, and a host
 with NVIDIA and AMD GPUs refuses the spec (`runtime.vulkan_mapping_unavailable`).
 
@@ -7156,7 +7158,7 @@ value before.
 whole branch.** `agent.Features` gained `gpu_vendor_identity` and
 `rpc_cluster_same_host` (§7); the wire gained `vendor` on every GPU the agent
 describes and on spec GPUs and budgets, and the hardware report's
-`vram_measurable`, `vulkan_ordinal` and `vulkan_device_count`; the agent gained the
+`vram_measurable`, `vulkan_ordinal`, `vulkan_device_count` and `gpu_legacy_vendor`; the agent gained the
 GPU key, the composite measurer with DRM fdinfo, the KFD/PCI join for AMD indices,
 the Vulkan ordinal mapping, the per-spec device plan with `GGML_VK_VISIBLE_DEVICES`
 and three stable codes, vendor-aware RPC members and the loopback member debounce

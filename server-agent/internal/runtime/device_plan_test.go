@@ -189,3 +189,28 @@ func TestResolveDevicePrefix(t *testing.T) {
 		t.Fatalf("cuda err = %v, want %s", err, codeGPUVendorBackendMismatch)
 	}
 }
+
+// A WSL spec's child enumerates Vulkan inside the distro, not in the Windows
+// host's vulkaninfo order, so the host's ordinals never apply to it: it keeps
+// the single-vendor fallback (host indices in the legacy vendor's variable).
+func TestPlanDevicesWSLIgnoresVulkanMapping(t *testing.T) {
+	nvMapped := GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}, Vulkan: VulkanMap{
+		Ordinals:    map[GPUKey]int{{GPUVendorNVIDIA, 0}: 1, {GPUVendorNVIDIA, 1}: 0},
+		DeviceCount: 2,
+	}}
+	spec := Spec{
+		GPUs: []SpecGPU{{Vendor: GPUVendorNVIDIA, Index: 1}}, DeviceBackend: "vulkan", SetVisibleDevices: true,
+		Execution: &Execution{Mode: ExecutionModeWSL, WSL: &WSLExecution{Distro: "Ubuntu"}},
+	}
+	got, err := planDevices(spec, nvMapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := devicePlan{
+		Prefix: "Vulkan", VisVar: "CUDA_VISIBLE_DEVICES", VisValue: "1", Names: []string{"Vulkan1"},
+		Keys: []GPUKey{{GPUVendorNVIDIA, 1}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("planDevices = %+v, want %+v", got, want)
+	}
+}

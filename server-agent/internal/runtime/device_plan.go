@@ -187,13 +187,13 @@ func planDevices(spec Spec, topo GPUTopology) (devicePlan, error) {
 		plan.VisVar, plan.VisValue, plan.Names = "CUDA_VISIBLE_DEVICES", joinInts(hostIdx), renumbered(len(hostIdx))
 	case backendVulkan:
 		ords := make([]int, 0, len(keys))
-		mapped := true
-		for _, k := range keys {
-			o, ok := topo.Vulkan.Ordinals[k]
-			if !ok || o < 0 || o >= topo.Vulkan.DeviceCount {
-				mapped = false
-				break
-			}
+		// A WSL child enumerates Vulkan inside the distro, never in the
+		// Windows host's vulkaninfo order the map was read from, so a WSL
+		// spec has no Vulkan mapping and keeps the fallback below.
+		mapped := !spec.IsWSL()
+		for i := 0; mapped && i < len(keys); i++ {
+			o, ok := topo.Vulkan.Ordinals[keys[i]]
+			mapped = ok && o >= 0 && o < topo.Vulkan.DeviceCount
 			ords = append(ords, o)
 		}
 		switch {
