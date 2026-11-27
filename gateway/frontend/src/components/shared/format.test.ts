@@ -1240,6 +1240,15 @@ const clusterWireCodes = [
   'runtime_spec.cluster_member_not_found',
   // Agent lifecycle codes (runtime status last_error.code).
   'runtime.device_backend_mismatch',
+  // Mixed-vendor GPU codes: the agent's (runtime.*) and the portal's (runtime_spec.*).
+  'runtime.gpu_vendor_backend_mismatch',
+  'runtime.vulkan_mapping_unavailable',
+  'runtime.vulkan_visible_devices_required',
+  'runtime_spec.gpu_vendor_backend_mismatch',
+  'runtime_spec.vulkan_visible_devices_required',
+  'runtime_spec.gpu_vendor_invalid',
+  'runtime_spec.gpu_vendor_unsupported',
+  'runtime_spec.cluster_member_ambiguous',
   'runtime.rpc_device_count_mismatch',
   'runtime.rpc_unsupported_build',
   'runtime.cluster_version_mismatch',

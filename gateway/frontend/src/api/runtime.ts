@@ -12,6 +12,7 @@
 
 import { type Fetcher, buildQueryString, request, subscribeSSE } from './transport';
 import type { DecisionsMode, EndpointMode, SystemOneMode } from './models';
+import type { GpuVendor } from './gpus';
 import type { RPCMemberSpec } from './rpcMembers';
 
 // One per-GPU VRAM demand row on a runtime spec. vram_estimate_mb is
@@ -21,6 +22,8 @@ import type { RPCMemberSpec } from './rpcMembers';
 // ignored server-side (see PutRuntimeSpecRequest below).
 export interface RuntimeSpecGPU {
   index: number;
+  // Optional until the editors write it (a legacy row carries ''/absent).
+  vendor?: GpuVendor;
   vram_estimate_mb: number;
   vram_measured_mb: number;
 }
@@ -34,6 +37,7 @@ export type RpcTransport = 'direct' | 'relay';
 // operator's VRAM estimate (written) and the measured VRAM (read-only).
 export interface ClusterMemberGPU {
   index: number;
+  vendor?: GpuVendor;
   vram_estimate_mb: number;
   vram_measured_mb: number;
 }
@@ -106,6 +110,7 @@ export interface ClusterBreach {
 export interface ClusterPeakAboveBudget {
   position: number;
   resource?: 'vram' | 'ram';
+  gpu_vendor?: GpuVendor;
   gpu_index?: number;
   stored_mb?: number;
   ceiling_mb?: number;
@@ -560,6 +565,7 @@ export interface CoResidency {
 // telemetry -- never client-writable, on create or on later PUTs.
 export interface GPUBudget {
   index: number;
+  vendor?: GpuVendor;
   budget_mb: number;
   expected_uuid: string;
   expected_name: string;
@@ -612,6 +618,7 @@ export interface RuntimeClusterStatus {
 // unknown throughout the runtime feature and is dropped on ingest.
 export interface RuntimeGPUStatus {
   index: number;
+  vendor?: GpuVendor;
   vram_measured_mb: number;
 }
 
