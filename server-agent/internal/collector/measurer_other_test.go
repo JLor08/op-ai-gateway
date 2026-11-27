@@ -10,9 +10,9 @@ import "testing"
 // TestNewVRAMMeasurerMatchesComputeAppsOffWindows is the runtime half of the
 // selection test for every host that is neither Windows nor Linux: there the
 // selector must resolve to EXACTLY the compute-apps measurer. Linux is
-// excluded because it adds the KFD fallback, so on an AMD Linux host the
-// selector is non-nil while compute-apps is nil; TestPickLinuxVRAMMeasurer
-// pins the Linux priority with fakes instead. Nil-ness is the whole observable
+// excluded because it adds an AMD measurer, so on an AMD Linux host the
+// selector is non-nil while compute-apps is nil; the linuxVRAMMeasurer tests
+// pin the Linux assembly with fakes instead. Nil-ness is the whole observable
 // difference (function values are not comparable), and it is the one that
 // matters: nil means "estimates only", non-nil means "measure".
 //
@@ -22,8 +22,8 @@ import "testing"
 // trivial reason.
 // TestNonWindowsMeasurerArmKeepsComputeApps is the one that bites everywhere.
 func TestNewVRAMMeasurerMatchesComputeAppsOffWindows(t *testing.T) {
-	if (NewVRAMMeasurer() == nil) != (NewNvidiaComputeApps() == nil) {
-		t.Fatalf("NewVRAMMeasurer() nil = %v, NewNvidiaComputeApps() nil = %v -- off Windows and Linux the selector must resolve to compute-apps unchanged",
-			NewVRAMMeasurer() == nil, NewNvidiaComputeApps() == nil)
+	if (NewVRAMMeasurer().Measure == nil) != (NewNvidiaComputeApps() == nil) {
+		t.Fatalf("NewVRAMMeasurer().Measure nil = %v, NewNvidiaComputeApps() nil = %v -- off Windows and Linux the selector must resolve to compute-apps unchanged",
+			NewVRAMMeasurer().Measure == nil, NewNvidiaComputeApps() == nil)
 	}
 }

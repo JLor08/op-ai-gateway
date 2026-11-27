@@ -4479,6 +4479,61 @@ func TestManagerEnforcesAutoDetectedBudget(t *testing.T) {
 	})
 }
 
+// TestManagerBindsProductionGPUKeys drives the key shape main.go installs
+// end to end: an NVIDIA host (ManagerOptions.GPUVendor), a vendor-less spec
+// (legacy wire data), hardware totals keyed {nvidia, 0} and a measurer that
+// answers {nvidia, 0}. Both must land on the spec's GPU: the detected total
+// refuses a spec above it, and a live measurement above the spec's estimate is
+// what admission charges. A spec GPU that resolved to a different key ({"",
+// 0}) would leave the GPU unconstrained and the measurement unread, and both
+// halves below would pass the wrong way.
+func TestManagerBindsProductionGPUKeys(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	nvidia0 := GPUKey{Vendor: GPUVendorNVIDIA, Index: 0}
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: func(string) string { return "" }, GPUVendor: GPUVendorNVIDIA})
+	t.Cleanup(m.Close)
+	m.SetHostInfo(HostInfo{GPUTotalsMB: map[GPUKey]int{nvidia0: 8000}})
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
+		for _, p := range pids {
+			out[p] = map[GPUKey]int{nvidia0: 7000}
+		}
+		return out
+	})
+
+	big := baseSpec("spec-big", "model-big")
+	big.GPUs = []SpecGPU{{Index: 0, VRAMMB: 12000}}
+	resident := baseSpec("spec-a", "model-a")
+	resident.Pinned = true
+	resident.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}} // measured at 7000
+	candidate := baseSpec("spec-b", "model-b")
+	candidate.GPUs = []SpecGPU{{Index: 0, VRAMMB: 2000}} // fits next to the estimate, not the measurement
+	candidate.AdmissionWaitTimeoutSeconds = 1
+	m.Apply(Config{Specs: []Spec{big, resident, candidate}, Coresident: [][2]string{{"spec-a", "spec-b"}}})
+
+	ensure := func(model string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, model)
+		if err == nil {
+			release()
+		}
+		return err
+	}
+	if err := ensure("model-big"); !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("EnsureRunning(12000 MB on an {nvidia,0} total of 8000) = %v, want ErrNotPermitted -- the detected total did not bind to the vendor-less spec", err)
+	}
+
+	waitUntil(t, 5*time.Second, "spec-a carries its {nvidia,0} measurement", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning && st.MeasuredVRAM[nvidia0] == 7000
+	})
+	if err := ensure("model-b"); err == nil {
+		t.Fatal("EnsureRunning(2000 MB next to a pinned spec measured at 7000 on 8000) = nil -- the {nvidia,0} measurement was not charged, admission used the 1000 MB estimate")
+	}
+}
+
 // snapshotHostRAMBudget builds a snapshot on an owner holding hi as its latest
 // hardware sample (nil = none pushed yet) and reserveMB as its host-RAM
 // reserve, and returns the HostRAMBudgetMB Admit will decide on. The owner's one

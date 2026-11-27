@@ -252,23 +252,21 @@ func main() {
 	defer mgr.Close()
 	logBufferPerSpec, logBufferTotal := mgr.Logs().Capacity()
 	// Per-process VRAM measurement is a HARDWARE capability, not a negotiated
-	// feature (design spec §5): NewVRAMMeasurer returns nil on hosts that
-	// cannot measure (Apple unified memory, no GPU at all, neither nvidia-smi
-	// nor AMD's KFD sysfs), and SetMeasurer(nil) is exactly NewManager's own
-	// default -- operator VRAM estimates stand.
+	// feature (design spec §5): NewVRAMMeasurer has a nil Measure on hosts
+	// that cannot measure (Apple unified memory, no GPU at all, neither
+	// nvidia-smi nor an AMD source), and SetMeasurer(nil) is exactly
+	// NewManager's own default -- operator VRAM estimates stand.
 	//
 	// The measurer is chosen per PLATFORM, inside the collector package: every
 	// non-Windows host gets the nvidia-smi compute-apps measurer when nvidia-smi
-	// exists, AMD Linux hosts fall back to KFD sysfs, while Windows gets the
-	// PDH one or none, never compute-apps -- which under WDDM reports `[N/A]`
-	// per process, parses to 0, and would override every operator estimate
-	// with a measured zero. Do not call a specific measurer's constructor from
-	// here; that routes around the split.
-	//
-	// The collector measurer still answers by bare GPU index; runtimeMeasurer
-	// keys its answer by the legacy vendor until the measurers report their
-	// own vendor (#434).
-	mgr.SetMeasurer(runtimeMeasurer(collector.NewVRAMMeasurer(), runtimeGPUVendor(gpus)))
+	// exists, Linux hosts additionally an AMD one (DRM fdinfo, else KFD sysfs)
+	// side by side with it, while Windows gets the PDH one or none, never
+	// compute-apps -- which under WDDM reports `[N/A]` per process, parses to
+	// 0, and would override every operator estimate with a measured zero. Do
+	// not call a specific measurer's constructor from here; that routes around
+	// the split. Every answer carries its GPU's vendor, so a mixed host's
+	// NVIDIA 0 and AMD 0 never collide.
+	mgr.SetMeasurer(runtimeMeasurer(collector.NewVRAMMeasurer()))
 	// Per-process host-RAM measurement is the same kind of hardware capability
 	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
 	// private working set on it, and returns nil on a host that cannot read
@@ -499,30 +497,29 @@ func runtimeGPUVendor(gpus []collector.GPUCollector) runtimectl.GPUVendor {
 	return runtimectl.GPUVendorNone
 }
 
-// runtimeMeasurer adapts a collector VRAM measurer, which answers
-// pid -> GPU index -> MB, to the runtime manager's pid -> GPU key -> MB by
-// keying every index with vendor, the host's legacy vendor (runtimeGPUVendor):
-// the vendor whose measurer the collector package picks on a host with more
-// than one. A nil measurer stays nil, which is SetMeasurer's "no measurement".
-// Temporary: it goes once the collector measurers return keys themselves.
-func runtimeMeasurer(f func(pids []int) map[int]map[int]int, vendor runtimectl.GPUVendor) func(pids []int) map[int]map[runtimectl.GPUKey]int {
-	if f == nil {
+// runtimeMeasurer adapts the collector's VRAM measurer, which answers
+// pid -> collector.GPUKey -> MiB, to the runtime manager's pid ->
+// runtimectl.GPUKey -> MB. The vendor strings are the same wire values on both
+// sides (ParseGPUVendor). A nil Measure stays nil, which is SetMeasurer's "no
+// measurement".
+func runtimeMeasurer(m collector.VRAMMeasurer) func(pids []int) map[int]map[runtimectl.GPUKey]int {
+	if m.Measure == nil {
 		return nil
 	}
 	return func(pids []int) map[int]map[runtimectl.GPUKey]int {
-		byPID := f(pids)
+		byPID := m.Measure(pids)
 		if byPID == nil {
 			return nil
 		}
 		out := make(map[int]map[runtimectl.GPUKey]int, len(byPID))
-		for pid, byIndex := range byPID {
-			if byIndex == nil {
+		for pid, byGPU := range byPID {
+			if byGPU == nil {
 				out[pid] = nil
 				continue
 			}
-			keyed := make(map[runtimectl.GPUKey]int, len(byIndex))
-			for idx, mb := range byIndex {
-				keyed[runtimectl.GPUKey{Vendor: vendor, Index: idx}] = mb
+			keyed := make(map[runtimectl.GPUKey]int, len(byGPU))
+			for k, mb := range byGPU {
+				keyed[runtimectl.GPUKey{Vendor: runtimectl.ParseGPUVendor(k.Vendor), Index: k.Index}] = mb
 			}
 			out[pid] = keyed
 		}

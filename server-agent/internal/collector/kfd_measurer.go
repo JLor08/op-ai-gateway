@@ -11,10 +11,16 @@ import (
 	"strings"
 )
 
-// Per-process VRAM on AMD Linux comes from the kernel's KFD (the amdgpu
-// compute driver) sysfs: /sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id> holds the
-// bytes of VRAM that process has allocated on that GPU, mode 0444, so the
-// agent needs no privileges. It is the same source `rocm-smi --showpids`
+// KFD is the FALLBACK per-process VRAM source on AMD Linux: the primary one is
+// DRM fdinfo (drm_fdinfo.go, drm_fdinfo_linux.go), which covers Vulkan too,
+// and KFD is used only on a kernel whose amdgpu fdinfo lacks drm-memory-vram.
+// The two read the same allocations, so a KFD figure is never added to an
+// fdinfo one.
+//
+// In the kernel's KFD (the amdgpu compute driver) sysfs,
+// /sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id> holds the bytes of VRAM that
+// process has allocated on that GPU, mode 0444, so the agent needs no
+// privileges. It is the same source `rocm-smi --showpids`
 // reads, without spawning a Python tool on the manager's owner goroutine.
 //
 // gpu_id is KFD's opaque per-GPU identifier, not an index. The ordinal is the
