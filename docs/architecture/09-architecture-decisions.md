@@ -14431,6 +14431,10 @@ members exist only for an agent with the second.
 - The second flag exists because a member bound to loopback cannot tell its head
   from its own probe without the debounce; an agent downgraded below it withholds
   its same-host clusters.
+- **Out of scope**: a mixed Windows host (the agent has no Windows AMD collector; Windows NVIDIA
+  keeps its PDH measurer), mixed-vendor execution under WSL (WSL specs keep their behaviour),
+  Apple (one integrated GPU, vendor `apple`, unchanged), and Intel/SYCL cards as a third measured
+  vendor.
 - Not verified until a mixed host exists: a real CUDA + ROCm + Vulkan run, the Vulkan
   enumeration order there, a same-host cluster on hardware, and fdinfo readability
   under the privileged helper (#438), where the agent runs unprivileged (the agents on
