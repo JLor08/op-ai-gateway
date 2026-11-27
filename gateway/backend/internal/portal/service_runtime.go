@@ -226,10 +226,12 @@ var (
 	// of nvidia, amd, apple or empty, in any letter case (normalizeGPUVendor).
 	// HTTP 400.
 	ErrRuntimeSpecGPUVendorInvalid = errors.New("runtime_spec.gpu_vendor_invalid")
-	// ErrRuntimeSpecGPUVendorUnsupported refuses a GPU row with a vendor for
-	// a server whose agent is known not to declare
+	// ErrRuntimeSpecGPUVendorUnsupported refuses a GPU row with a vendor
+	// other than the server's stored legacy vendor (any vendor when none is
+	// stored) for a server whose agent is known not to declare
 	// AgentFeatureGPUVendorIdentity: the agent never receives the vendor, so
-	// the row would name whichever card its bare index is there. HTTP 400.
+	// the row would name whichever card its bare index is there. The legacy
+	// vendor itself is accepted (normalizeGPUVendor). HTTP 400.
 	ErrRuntimeSpecGPUVendorUnsupported = errors.New("runtime_spec.gpu_vendor_unsupported")
 )
 
@@ -4395,8 +4397,8 @@ const AgentFeatureRuntimeProcessTreeJob = "runtime_process_tree_job"
 // rows and budgets (#434): one index exists once per vendor on a mixed NVIDIA
 // + AMD host. Agent-only: the gateway never declares it. The document carries
 // a GPU's vendor only for an agent that declares it (pushedGPUVendor), and a
-// save refuses a vendor for an agent known to lack it
-// (ErrRuntimeSpecGPUVendorUnsupported). The module's one spelling of the name.
+// save refuses a vendor other than the server's legacy vendor for an agent
+// known to lack it (ErrRuntimeSpecGPUVendorUnsupported). The module's one spelling of the name.
 const AgentFeatureGPUVendorIdentity = "gpu_vendor_identity"
 
 // AgentFeatureRPCClusterSameHost is the feature an agent declares when it can

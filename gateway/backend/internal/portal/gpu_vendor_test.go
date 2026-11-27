@@ -25,6 +25,8 @@ func TestNormalizeGPUVendor(t *testing.T) {
 		{name: "unknown vendor", vendor: "intel", flagged: true, known: true, wantErr: ErrRuntimeSpecGPUVendorInvalid},
 		{name: "unknown vendor before the flag check", vendor: "intel", known: true, wantErr: ErrRuntimeSpecGPUVendorInvalid},
 		{name: "vendor for an unflagged agent", vendor: "amd", known: true, wantErr: ErrRuntimeSpecGPUVendorUnsupported},
+		{name: "foreign vendor for an unflagged agent", vendor: "amd", known: true, legacy: "nvidia", wantErr: ErrRuntimeSpecGPUVendorUnsupported},
+		{name: "legacy vendor for an unflagged agent is kept", vendor: "NVIDIA", known: true, legacy: "nvidia", want: "nvidia"},
 		{name: "vendor for an agent not heard from", vendor: "amd", want: "amd"},
 		{name: "empty for an unflagged agent stays empty", vendor: "", known: true, legacy: "nvidia", want: ""},
 		{name: "empty for a flagged agent is the legacy vendor", vendor: "", flagged: true, known: true, legacy: "nvidia", want: "nvidia"},

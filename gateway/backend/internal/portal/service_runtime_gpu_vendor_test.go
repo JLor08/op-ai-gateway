@@ -334,7 +334,16 @@ func TestSaveRuntimeSpecVendorRules(t *testing.T) {
 
 		f.unflag()
 		if _, err := f.put(RuntimeSpecGPUDTO{Vendor: "amd", Index: 0}); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
-			t.Fatalf("amd on unflagged: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+			t.Fatalf("amd on unflagged with legacy nvidia: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+		}
+		// The stored legacy vendor is what the portal echoes back on every
+		// re-save after a backfill; an unflagged agent gets the row without
+		// it (pushedGPUVendor), so it is accepted and stored as sent.
+		if _, err := f.put(RuntimeSpecGPUDTO{Vendor: "nvidia", Index: 0}); err != nil {
+			t.Fatalf("legacy vendor nvidia on unflagged: %v", err)
+		}
+		if got := f.storedVendors(); !slices.Equal(got, []routing.GPUKey{{Vendor: "nvidia", Index: 0}}) {
+			t.Fatalf("stored = %v, want nvidia 0 as sent", got)
 		}
 		if _, err := f.put(RuntimeSpecGPUDTO{Index: 0}); err != nil {
 			t.Fatalf("empty on unflagged: %v", err)
@@ -346,6 +355,14 @@ func TestSaveRuntimeSpecVendorRules(t *testing.T) {
 		f.forget()
 		if _, err := f.put(RuntimeSpecGPUDTO{Vendor: "amd", Index: 0}); err != nil {
 			t.Fatalf("amd for an agent not heard from: %v", err)
+		}
+	})
+
+	t.Run("spec, unflagged agent without a stored legacy vendor", func(t *testing.T) {
+		f := newGPUVendorFixture(t)
+		f.unflag()
+		if _, err := f.put(RuntimeSpecGPUDTO{Vendor: "nvidia", Index: 0}); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
+			t.Fatalf("nvidia without a legacy vendor: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
 		}
 	})
 
@@ -532,5 +549,43 @@ func TestClusterHiddenMemberKeptDespiteVendorUnsupported(t *testing.T) {
 	resave.ClusterMembers[0].GPUs[0].Vendor = "nvidia"
 	if _, err := f.put(ownerToken(), resave); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
 		t.Fatalf("visible member vendor on an unflagged agent: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+	}
+}
+
+// TestOverridesWorkForUnflaggedAgentAfterBackfill: after a backfill gave a
+// spec's GPU rows the legacy vendor and the agent was downgraded (no
+// gpu_vendor_identity), the portal's Stop, Start and Pin overrides -- each
+// re-sends the whole stored spec, vendors included -- still save, and the
+// agent's document carries the rows without their vendor.
+func TestOverridesWorkForUnflaggedAgentAfterBackfill(t *testing.T) {
+	f := newGPUVendorFixture(t)
+	if _, err := f.put(RuntimeSpecGPUDTO{Index: 0, VRAMEstimateMB: 1000}); err != nil {
+		t.Fatalf("PutRuntimeSpec: %v", err)
+	}
+	f.legacy("nvidia")
+	f.unflag()
+	for _, override := range []struct {
+		name  string
+		apply func(*PutRuntimeSpecRequest)
+	}{
+		{"stop", func(r *PutRuntimeSpecRequest) { r.AdminState = "force_stopped" }},
+		{"start", func(r *PutRuntimeSpecRequest) { r.AdminState = "force_running" }},
+		{"pin", func(r *PutRuntimeSpecRequest) { r.AdminState, r.Pinned = "", true }},
+	} {
+		stored, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+		if err != nil {
+			t.Fatalf("GetRuntimeSpec: %v", err)
+		}
+		if len(stored.GPUs) != 1 || stored.GPUs[0].Vendor != "nvidia" {
+			t.Fatalf("stored gpus = %+v, want the backfilled nvidia 0", stored.GPUs)
+		}
+		req := putRequestFromDTO(stored)
+		override.apply(&req)
+		if _, err := f.svc.PutRuntimeSpec(f.ctx, ownerToken(), f.mappingID, req); err != nil {
+			t.Fatalf("%s override: %v", override.name, err)
+		}
+	}
+	if want := []AgentRuntimeSpecGPUDTO{{Index: 0, VRAMMB: 1000}}; !slices.Equal(f.config().Specs[0].GPUs, want) {
+		t.Fatalf("gpus = %+v, want %+v", f.config().Specs[0].GPUs, want)
 	}
 }

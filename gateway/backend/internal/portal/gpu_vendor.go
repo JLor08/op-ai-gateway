@@ -47,20 +47,25 @@ func (s *Service) serverLegacyGPUVendor(ctx context.Context, serverID string) (s
 }
 
 // normalizeGPUVendor is the vendor a save stores for one GPU row: vendor
-// lower-cased; not a valid vendor is ErrRuntimeSpecGPUVendorInvalid; a
-// non-empty vendor for an agent known to lack gpu_vendor_identity is
-// ErrRuntimeSpecGPUVendorUnsupported (it would never receive the row with its
-// vendor, and could not tell two rows of one index apart); and an empty
-// vendor for a flagged agent is the server's stored legacy vendor, so a row
-// saved without a vendor names the same card as one the backfill rewrote. An
-// agent the gateway has not heard from yet is not refused: the document is
-// held for it until its declaration is known (AgentRuntimeConfig).
+// lower-cased; not a valid vendor is ErrRuntimeSpecGPUVendorInvalid; for an
+// agent known to lack gpu_vendor_identity, a non-empty vendor other than the
+// server's stored legacy vendor (any non-empty vendor when none is stored) is
+// ErrRuntimeSpecGPUVendorUnsupported -- the agent never receives the row with
+// its vendor, so it would read the bare index as the legacy vendor's card.
+// The legacy vendor itself is accepted and stored as sent: it names exactly
+// that card, the unflagged document drops it to "" (pushedGPUVendor), and the
+// portal echoes it back on every re-save and override of rows a backfill
+// rewrote. An empty vendor for a flagged agent is the server's stored legacy
+// vendor, so a row saved without a vendor names the same card as one the
+// backfill rewrote. An agent the gateway has not heard from yet is not
+// refused: the document is held for it until its declaration is known
+// (AgentRuntimeConfig).
 func normalizeGPUVendor(vendor string, flagged, known bool, legacy string) (string, error) {
 	v := strings.ToLower(strings.TrimSpace(vendor))
 	if !routing.ValidGPUVendor(v) {
 		return "", ErrRuntimeSpecGPUVendorInvalid
 	}
-	if v != "" && known && !flagged {
+	if v != "" && v != legacy && known && !flagged {
 		return "", ErrRuntimeSpecGPUVendorUnsupported
 	}
 	if v == "" && flagged && legacy != "" {
