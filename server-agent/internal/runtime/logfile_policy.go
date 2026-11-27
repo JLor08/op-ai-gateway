@@ -504,23 +504,26 @@ func underPseudoFS(p string) bool {
 // refuses anything but a regular file. Then, in this order, because the
 // server can change the file's names while the agent looks:
 //
-//  1. the descriptor's link count must be 1 (checkLinkCount): a hard link
-//     inside an allowed directory to a file outside it has an inside final
-//     path, so no path check can see it;
-//  2. the final path (openedFinalPath) must still name THIS file: not a
-//     " (deleted)" readlink, and os.Lstat of it a regular file that
-//     os.SameFile matches with the descriptor. Without this, a server that
-//     unlinks the inside name right after the open leaves the agent with an
-//     outside file and an inside path;
-//  3. the link count is read again and must still be 1, so a name added or
-//     removed while 2 ran cannot slip through;
-//  4. the final path must lie strictly inside one of target.Roots, each
+//  1. the descriptor's link count must be 1 (checkLinkCount), an early
+//     refusal of an in-tree hard link to an outside file, whose final path
+//     would be inside;
+//  2. the final path is computed (openedFinalPath);
+//  3. the BINDING (bindFinalPath): the final path must still name THIS file
+//     and that file must have exactly one name, both read from ONE stat of
+//     the final path (statFinalBinding: os.Lstat on POSIX, one
+//     GetFileInformationByHandle on Windows). One observation that shows the
+//     inside name is this file and has a single link proves no other name
+//     existed at that instant. Separate syscalls would not: a server toggling
+//     an inside hard link could show "one link" to one call and "this file"
+//     to the next. This step is the guarantee; 1 and 4 are extra layers;
+//  4. the descriptor's link count is read again and must still be 1;
+//  5. the final path must lie strictly inside one of target.Roots, each
 //     resolved the same way, and outside the pseudo filesystems.
 //
 // On a refusal the file is closed and the error wraps errLogFileNotPermitted.
-// A file whose last name went away during these steps (link count 0) is
-// fs.ErrNotExist, like a file not created yet: the tailer retries it. Any
-// other error carries the OS cause without the path.
+// A file whose last name went away during these steps (descriptor link count
+// 0) is errLogFileVanished, an fs.ErrNotExist like a file not created yet: the
+// tailer retries it. Any other error carries the OS cause without the path.
 func openLogFile(target logFileTarget) (*os.File, error) {
 	f, err := openLogFileHandle(target)
 	if err != nil {
@@ -533,31 +536,51 @@ func openLogFile(target logFileTarget) (*os.File, error) {
 	return f, nil
 }
 
-// afterLogFileFinalPath, when set, runs right after openLogFile has computed
-// the opened file's final path. It is a TEST SEAM only: the tests use it to
-// change the file's names at the one moment the race checks guard.
-var afterLogFileFinalPath func()
+// logFileOpenStage names the moments of checkOpenedLogFile the test seam can
+// interpose at.
+type logFileOpenStage int
+
+const (
+	stageBeforeLinkCount logFileOpenStage = iota // before step 1
+	stageAfterLinkCount                          // between steps 1 and 2
+	stageAfterFinalPath                          // between steps 2 and 3
+	stageAfterBinding                            // between steps 3 and 4
+)
+
+// logFileOpenSeam, when set, runs at each stage of checkOpenedLogFile. It is a
+// TEST SEAM only: the tests use it to change the file's names at exactly the
+// moments the race checks guard.
+var logFileOpenSeam func(logFileOpenStage)
+
+func runLogFileOpenSeam(stage logFileOpenStage) {
+	if logFileOpenSeam != nil {
+		logFileOpenSeam(stage)
+	}
+}
 
 // errLogFileVanished is the fs.ErrNotExist of a file whose last name was
 // removed while openLogFile looked at it.
 var errLogFileVanished = fmt.Errorf("runtime: open log file: the file was removed while it was opened: %w", fs.ErrNotExist)
 
-// checkOpenedLogFile runs steps 1-4 of openLogFile on the opened f and returns
+// checkOpenedLogFile runs steps 1-5 of openLogFile on the opened f and returns
 // the final path, or the refusal (or errLogFileVanished).
 func checkOpenedLogFile(f *os.File, target logFileTarget) (string, error) {
+	runLogFileOpenSeam(stageBeforeLinkCount)
 	if err := checkLinkCount(f, target, ""); err != nil {
 		return "", err
 	}
+	runLogFileOpenSeam(stageAfterLinkCount)
 	final, err := openedFinalPath(f, target.OpenPath)
 	if err != nil {
-		return "", logOpenRefusal(target, "", "has a final path that cannot be determined")
+		// Off Linux, openedFinalPath resolves the path by name, so a rotation
+		// or delete in this window lands here.
+		return "", vanishedOrRefusal(f, target, "", "has a final path that cannot be determined")
 	}
-	if afterLogFileFinalPath != nil {
-		afterLogFileFinalPath()
-	}
+	runLogFileOpenSeam(stageAfterFinalPath)
 	if err := bindFinalPath(f, target, final); err != nil {
 		return "", err
 	}
+	runLogFileOpenSeam(stageAfterBinding)
 	if err := checkLinkCount(f, target, final); err != nil {
 		return "", err
 	}
@@ -600,30 +623,43 @@ func checkLinkCount(f *os.File, target logFileTarget, final string) error {
 	return nil
 }
 
-// bindFinalPath requires final to still name the file f is open on. When it
-// does not, a link count of 0 means the file is simply gone (rotated or
-// deleted: errLogFileVanished); anything else is a refusal, because the file
-// the agent holds is no longer the one the path check would vouch for.
+// vanishedOrRefusal is errLogFileVanished when the descriptor's file has no
+// name left (it was rotated away or deleted: the tailer retries), else the
+// refusal for reason.
+func vanishedOrRefusal(f *os.File, target logFileTarget, final, reason string) error {
+	if n, err := openedLinkCount(f); err == nil && n == 0 {
+		return errLogFileVanished
+	}
+	return logOpenRefusal(target, final, reason)
+}
+
+// finalBinding is what ONE stat of the final path says about it, compared
+// with the opened file: whether it is a plain regular file (no link, no
+// directory), whether it is the same file as the descriptor, and how many
+// names that file has. The three come from the same observation by
+// construction (statFinalBinding), which is what makes the binding race-free.
+type finalBinding struct {
+	regular bool
+	same    bool
+	nlink   uint64
+}
+
+// bindFinalPath is step 3 of openLogFile: final must still name the file f is
+// open on, and that file must have exactly one name, in one observation.
 func bindFinalPath(f *os.File, target logFileTarget, final string) error {
-	refuse := func(reason string) error {
-		if n, err := openedLinkCount(f); err == nil && n == 0 {
-			return errLogFileVanished
-		}
-		return logOpenRefusal(target, final, reason)
-	}
 	if strings.HasSuffix(final, " (deleted)") {
-		return refuse("lost its name while it was opened")
+		return vanishedOrRefusal(f, target, final, "lost its name while it was opened")
 	}
-	lfi, err := os.Lstat(final)
-	if err != nil {
-		return refuse("lost its name while it was opened")
-	}
-	if !lfi.Mode().IsRegular() {
-		return refuse("has a final path that is not a regular file")
-	}
-	ofi, err := f.Stat()
-	if err != nil || !os.SameFile(ofi, lfi) {
-		return refuse("has a final path that names another file")
+	b, err := statFinalBinding(f, final)
+	switch {
+	case err != nil:
+		return vanishedOrRefusal(f, target, final, "lost its name while it was opened")
+	case !b.regular:
+		return logOpenRefusal(target, final, "has a final path that is not a regular file")
+	case !b.same:
+		return vanishedOrRefusal(f, target, final, "has a final path that names another file")
+	case b.nlink != 1:
+		return logOpenRefusal(target, final, "has more than one hard link")
 	}
 	return nil
 }

@@ -127,3 +127,26 @@ func openedLinkCount(f *os.File) (uint64, error) {
 
 // isReparsePoint is a Windows notion; elsewhere a link is ModeSymlink.
 func isReparsePoint(os.FileInfo) bool { return false }
+
+// statFinalBinding observes final with ONE os.Lstat: its type, its identity
+// (compared with the descriptor's, which cannot change) and its link count
+// all come from that single stat (bindFinalPath's doc says why).
+func statFinalBinding(f *os.File, final string) (finalBinding, error) {
+	ofi, err := f.Stat()
+	if err != nil {
+		return finalBinding{}, err
+	}
+	lfi, err := os.Lstat(final)
+	if err != nil {
+		return finalBinding{}, err
+	}
+	st, ok := lfi.Sys().(*syscall.Stat_t)
+	if !ok || st == nil {
+		return finalBinding{}, os.ErrInvalid
+	}
+	return finalBinding{
+		regular: lfi.Mode().IsRegular(),
+		same:    os.SameFile(ofi, lfi),
+		nlink:   uint64(st.Nlink), //nolint:unconvert // Nlink is narrower than uint64 on some GOOS
+	}, nil
+}

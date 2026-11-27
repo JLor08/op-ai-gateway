@@ -112,3 +112,35 @@ func isReparsePoint(fi os.FileInfo) bool {
 	d, ok := fi.Sys().(*syscall.Win32FileAttributeData)
 	return ok && d != nil && d.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
+
+// statFinalBinding observes final through ONE GetFileInformationByHandle on a
+// handle to the name itself (FILE_FLAG_OPEN_REPARSE_POINT, so a link is seen
+// as a link, not followed): attributes, volume serial, file index and link
+// count all come from that single call, and the identity is compared with the
+// opened handle's, which cannot change (bindFinalPath's doc says why).
+func statFinalBinding(f *os.File, final string) (finalBinding, error) {
+	var opened windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &opened); err != nil {
+		return finalBinding{}, err
+	}
+	p16, err := windows.UTF16PtrFromString(final)
+	if err != nil {
+		return finalBinding{}, err
+	}
+	h, err := windows.CreateFile(p16, windows.FILE_READ_ATTRIBUTES, logFileShareMode, nil, windows.OPEN_EXISTING,
+		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return finalBinding{}, err
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
+		return finalBinding{}, err
+	}
+	return finalBinding{
+		regular: info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+		same: info.VolumeSerialNumber == opened.VolumeSerialNumber &&
+			info.FileIndexHigh == opened.FileIndexHigh && info.FileIndexLow == opened.FileIndexLow,
+		nlink: uint64(info.NumberOfLinks),
+	}, nil
+}
