@@ -1179,19 +1179,6 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	if err != nil {
 		return runtimeSpecWrite{}, err
 	}
-	// The GPU vendors are normalized after every request validation, the
-	// newest of them. A benchmark writer re-saves the stored rows as they
-	// are, so it is not refused for an agent that lacks the flag since.
-	vendors, err := s.gpuVendorRulesFor(ctx, app.ServerID)
-	if err != nil {
-		return runtimeSpecWrite{}, err
-	}
-	if principal == nil {
-		vendors.known = false
-	}
-	if req.GPUs, err = vendors.normalizeSpecGPUVendors(req.GPUs); err != nil {
-		return runtimeSpecWrite{}, err
-	}
 	if principal != nil {
 		// Port allocation and the one-head-per-manual-member rule are
 		// check-then-act across specs; serializing the operator writes keeps
@@ -1201,6 +1188,22 @@ func (s *Service) writeRuntimeSpecAs(ctx context.Context, mapping routing.ModelM
 	}
 	prior, err := s.priorRuntimeSpec(ctx, mapping.ID, expectSpecID)
 	if err != nil {
+		return runtimeSpecWrite{}, err
+	}
+	// The GPU vendors are normalized after every request validation, the
+	// newest of them, against the stored rows: a (vendor, index) the spec
+	// already has is re-saved as it is. A benchmark writer re-saves the
+	// stored rows as they are, so it is not refused for an agent that lacks
+	// the flag since.
+	vendors, err := s.gpuVendorRulesFor(ctx, app.ServerID)
+	if err != nil {
+		return runtimeSpecWrite{}, err
+	}
+	if principal == nil {
+		vendors.known = false
+	}
+	vendors = vendors.withStored(slices.Collect(maps.Keys(prior.measuredByKey)))
+	if req.GPUs, err = vendors.normalizeSpecGPUVendors(req.GPUs); err != nil {
 		return runtimeSpecWrite{}, err
 	}
 	prior.legacyVendor = vendors.legacy
@@ -2984,19 +2987,6 @@ func (s *Service) SetServerGPUBudgets(ctx context.Context, principal auth.Token,
 		}
 		seenKey[key] = true
 	}
-	vendors := s.gpuVendorRulesWith(server.ID, server.GPULegacyVendor)
-	budgets := slices.Clone(req.Budgets)
-	clear(seenKey)
-	for i := range budgets {
-		if budgets[i].Vendor, err = vendors.normalize(budgets[i].Vendor); err != nil {
-			return nil, err
-		}
-		key := vendors.resolve(routing.GPUKey{Vendor: budgets[i].Vendor, Index: budgets[i].Index})
-		if seenKey[key] {
-			return nil, ErrGPUBudgetInvalid
-		}
-		seenKey[key] = true
-	}
 	existing, err := s.routes.ServerGPUBudgets(ctx, server.ID)
 	if err != nil {
 		return nil, err
@@ -3004,6 +2994,21 @@ func (s *Service) SetServerGPUBudgets(ctx context.Context, principal auth.Token,
 	existingByKey := make(map[routing.GPUKey]routing.ServerGPUBudget, len(existing))
 	for _, b := range existing {
 		existingByKey[routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}] = b
+	}
+	// A budget the list already has stored is re-saved as it is
+	// (gpuVendorRules.normalizeAt).
+	vendors := s.gpuVendorRulesWith(server.ID, server.GPULegacyVendor).withStored(slices.Collect(maps.Keys(existingByKey)))
+	budgets := slices.Clone(req.Budgets)
+	clear(seenKey)
+	for i := range budgets {
+		if budgets[i].Vendor, err = vendors.normalizeAt(budgets[i].Vendor, budgets[i].Index); err != nil {
+			return nil, err
+		}
+		key := vendors.resolve(routing.GPUKey{Vendor: budgets[i].Vendor, Index: budgets[i].Index})
+		if seenKey[key] {
+			return nil, ErrGPUBudgetInvalid
+		}
+		seenKey[key] = true
 	}
 	now := s.clock().UTC()
 	rows := make([]routing.ServerGPUBudget, 0, len(budgets))
@@ -3971,12 +3976,17 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	// correctly, each index once (gpuVendorRules.pushedSpecGPUs). While the
 	// declaration is unknown, a document that would lose a row that way is
 	// held: served to a flagged agent, it would take a GPU away from a
-	// running model.
+	// running model. A spec with GPU rows of which the agent gets none is
+	// withheld (withhold): an empty GPU list would run it with no VRAM
+	// reservation, invisible to admission. Withholding only ever applies to
+	// a document that is served -- for an unknown declaration the same drop
+	// holds the whole document -- so a spec is never served and then
+	// withdrawn for want of the declaration.
 	vendors := s.gpuVendorRulesWith(serverID, server.GPULegacyVendor)
-	pushGPUs := func(gpus []AgentRuntimeSpecGPUDTO) []AgentRuntimeSpecGPUDTO {
+	pushGPUs := func(gpus []AgentRuntimeSpecGPUDTO) (out []AgentRuntimeSpecGPUDTO, withhold bool) {
 		out, dropped := vendors.pushedSpecGPUs(gpus)
 		awaitsFeatures = awaitsFeatures || (dropped && !vendors.known)
-		return out
+		return out, len(gpus) > 0 && len(out) == 0
 	}
 	for _, spec := range specs {
 		if !spec.Enabled {
@@ -4031,7 +4041,12 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 		if err != nil {
 			return AgentRuntimeConfigDTO{}, err
 		}
-		specDTO.GPUs = pushGPUs(specDTO.GPUs)
+		var withhold bool
+		if specDTO.GPUs, withhold = pushGPUs(specDTO.GPUs); withhold {
+			// Absent from specIDByMapping, so it drops out of every
+			// co-residency pair, like a withheld wsl spec.
+			continue
+		}
 		// The ONLY place the gateway decrypts the per-mapping token, and it does
 		// so fail-closed (see resolvePushToken). agentApp is guaranteed non-nil
 		// here -- the builder returns the empty document above when it is nil.
@@ -4077,10 +4092,12 @@ func (s *Service) AgentRuntimeConfig(ctx context.Context, serverID string) (Agen
 	if err != nil {
 		return AgentRuntimeConfigDTO{}, err
 	}
-	for i := range members {
-		members[i].GPUs = pushGPUs(members[i].GPUs)
+	for _, m := range members {
+		var withhold bool
+		if m.GPUs, withhold = pushGPUs(m.GPUs); !withhold {
+			specDTOs = append(specDTOs, m)
+		}
 	}
-	specDTOs = append(specDTOs, members...)
 	awaitsFeatures = awaitsFeatures || membersHold
 	coresident := effectiveAllowedPairs(mode, specIDByMapping, rules)
 	budgets, budgetsDropped := vendors.pushedBudgets(budgets)

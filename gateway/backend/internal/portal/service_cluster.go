@@ -401,7 +401,7 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	if err := s.checkClusterMembershipOrKeep(ctx, w, prevMembers, prevGPUs, &plan); err != nil {
 		return clusterPlan{}, err
 	}
-	if err := s.normalizeClusterMemberGPUVendors(entries); err != nil {
+	if err := s.normalizeClusterMemberGPUVendors(entries, prevGPUs); err != nil {
 		return clusterPlan{}, err
 	}
 	if err := s.checkClusterMemberGPUs(ctx, entries, scan); err != nil {
@@ -1113,14 +1113,22 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]
 // entry's GPUs are its spec's rows, normalized when the spec was saved. An
 // entry the caller cannot see is the stored member kept as it is, so it is
 // not refused for an agent that lacks gpu_vendor_identity since: the caller
-// could neither see nor change why.
-func (s *Service) normalizeClusterMemberGPUVendors(entries []clusterEntry) error {
+// could neither see nor change why. A visible member's GPU that the head
+// already has stored for that member server (prevGPUs) is re-saved as it is
+// (gpuVendorRules.normalizeAt), so a head override after a downgrade saves.
+func (s *Service) normalizeClusterMemberGPUVendors(entries []clusterEntry, prevGPUs []routing.ClusterMemberGPU) error {
 	for i := range entries {
 		e := &entries[i]
 		if e.manual {
 			continue
 		}
-		rules := s.gpuVendorRulesWith(e.server.ID, e.server.GPULegacyVendor)
+		var storedKeys []routing.GPUKey
+		for _, g := range prevGPUs {
+			if g.ServerID == e.server.ID {
+				storedKeys = append(storedKeys, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
+			}
+		}
+		rules := s.gpuVendorRulesWith(e.server.ID, e.server.GPULegacyVendor).withStored(storedKeys)
 		if !e.visible {
 			rules.known = false
 		}
@@ -1128,7 +1136,7 @@ func (s *Service) normalizeClusterMemberGPUVendors(entries []clusterEntry) error
 		estimate := make(map[routing.GPUKey]int, len(e.gpus))
 		seen := make(map[routing.GPUKey]struct{}, len(e.gpus))
 		for _, k := range e.gpus {
-			vendor, err := rules.normalize(k.Vendor)
+			vendor, err := rules.normalizeAt(k.Vendor, k.Index)
 			if err != nil {
 				return err
 			}

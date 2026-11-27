@@ -148,8 +148,20 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 		return "", false, err
 	}
 	// The GPU vendors are normalized after the request checks, the newest
-	// refusals of the request.
-	if req.GPUs, err = s.gpuVendorRulesWith(server.ID, server.GPULegacyVendor).normalizeSpecGPUVendors(req.GPUs); err != nil {
+	// refusals of the request; a (vendor, index) the stored spec already has
+	// is re-saved as it is (gpuVendorRules.normalizeAt).
+	var storedKeys []routing.GPUKey
+	if prior.ID != "" {
+		rows, err := s.routes.RPCMemberSpecGPUs(ctx, prior.ID)
+		if err != nil {
+			return "", false, err
+		}
+		for _, r := range rows {
+			storedKeys = append(storedKeys, routing.GPUKey{Vendor: r.GPUVendor, Index: r.GPUIndex})
+		}
+	}
+	vendors := s.gpuVendorRulesWith(server.ID, server.GPULegacyVendor).withStored(storedKeys)
+	if req.GPUs, err = vendors.normalizeSpecGPUVendors(req.GPUs); err != nil {
 		return "", false, err
 	}
 	groups, err := s.rpcMemberHeadGroups(ctx, server.ID, req.AllowedHeadGroups, prior)

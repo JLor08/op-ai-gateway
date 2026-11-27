@@ -5,6 +5,7 @@ package portal
 
 import (
 	"context"
+	"errors"
 	"op-ai-gateway/internal/routing"
 	"strings"
 )
@@ -89,11 +90,14 @@ func pushedGPUVendor(vendor string, flagged bool, legacy string) (out string, ke
 
 // gpuVendorRules is what a save or a document needs to know about one
 // server's GPU vendors: whether its agent declares gpu_vendor_identity,
-// whether that declaration is known, and the stored legacy vendor.
+// whether that declaration is known, and the stored legacy vendor. stored,
+// for a save, holds the GPU keys the saved object (a spec, the budget list,
+// a member spec, a cluster member) already has stored (normalizeAt).
 type gpuVendorRules struct {
 	flagged bool
 	known   bool
 	legacy  string
+	stored  map[routing.GPUKey]struct{}
 }
 
 // gpuVendorRulesFor reads serverID's gpuVendorRules.
@@ -112,9 +116,29 @@ func (s *Service) gpuVendorRulesWith(serverID, legacy string) gpuVendorRules {
 	return gpuVendorRules{flagged: flagged, known: known, legacy: legacy}
 }
 
-// normalize is normalizeGPUVendor under r.
-func (r gpuVendorRules) normalize(vendor string) (string, error) {
-	return normalizeGPUVendor(vendor, r.flagged, r.known, r.legacy)
+// normalizeAt is normalizeGPUVendor under r for the GPU at index, except
+// that a row whose (vendor, index) the saved object already has stored is
+// not refused as unsupported: an agent downgraded after a flagged save gets
+// such a row's spec re-sent whole by every override and re-save. A new
+// foreign-vendor row is still refused.
+func (r gpuVendorRules) normalizeAt(vendor string, index int) (string, error) {
+	v, err := normalizeGPUVendor(vendor, r.flagged, r.known, r.legacy)
+	if errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
+		lowered := strings.ToLower(strings.TrimSpace(vendor))
+		if _, ok := r.stored[routing.GPUKey{Vendor: lowered, Index: index}]; ok {
+			return lowered, nil
+		}
+	}
+	return v, err
+}
+
+// withStored is r for a save of an object whose stored GPU keys are keys.
+func (r gpuVendorRules) withStored(keys []routing.GPUKey) gpuVendorRules {
+	r.stored = make(map[routing.GPUKey]struct{}, len(keys))
+	for _, k := range keys {
+		r.stored[k] = struct{}{}
+	}
+	return r
 }
 
 // resolve is the card key names on this server: an empty vendor is the
@@ -142,7 +166,7 @@ func (r gpuVendorRules) normalizeSpecGPUVendors(gpus []RuntimeSpecGPUDTO) ([]Run
 	out := make([]RuntimeSpecGPUDTO, len(gpus))
 	seen := make(map[routing.GPUKey]struct{}, len(gpus))
 	for i, g := range gpus {
-		vendor, err := r.normalize(g.Vendor)
+		vendor, err := r.normalizeAt(g.Vendor, g.Index)
 		if err != nil {
 			return nil, err
 		}

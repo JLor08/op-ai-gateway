@@ -589,3 +589,163 @@ func TestOverridesWorkForUnflaggedAgentAfterBackfill(t *testing.T) {
 		t.Fatalf("gpus = %+v, want %+v", f.config().Specs[0].GPUs, want)
 	}
 }
+
+// TestUnflaggedAgentResavesStoredForeignVendorRows: a flagged agent saved
+// AMD rows and was then downgraded. The portal's overrides re-send the
+// whole stored spec, and a budget or member-spec re-save re-sends the
+// stored rows: a (vendor, index) already stored on that spec, budget list
+// or member spec is accepted. A new foreign-vendor row is still refused.
+func TestUnflaggedAgentResavesStoredForeignVendorRows(t *testing.T) {
+	f := newGPUVendorFixture(t)
+	f.legacy("nvidia")
+	if _, err := f.put(RuntimeSpecGPUDTO{Vendor: "nvidia", Index: 0, VRAMEstimateMB: 1000}, RuntimeSpecGPUDTO{Vendor: "amd", Index: 0, VRAMEstimateMB: 2000}); err != nil {
+		t.Fatalf("flagged save: %v", err)
+	}
+	budgets, err := f.svc.SetServerGPUBudgets(f.ctx, ownerToken(), f.serverID, SetGPUBudgetsRequest{Budgets: []GPUBudgetDTO{{Vendor: "amd", Index: 0, BudgetMB: 1}}})
+	if err != nil {
+		t.Fatalf("flagged budgets: %v", err)
+	}
+	memberReq := validRPCMemberRequest()
+	memberReq.GPUs = []RuntimeSpecGPUDTO{{Vendor: "amd", Index: 0, VRAMEstimateMB: 1}}
+	member, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), f.serverID, "", memberReq)
+	if err != nil {
+		t.Fatalf("flagged member spec: %v", err)
+	}
+	f.unflag()
+
+	for _, override := range []struct {
+		name  string
+		apply func(*PutRuntimeSpecRequest)
+	}{
+		{"stop", func(r *PutRuntimeSpecRequest) { r.AdminState = "force_stopped" }},
+		{"start", func(r *PutRuntimeSpecRequest) { r.AdminState = "force_running" }},
+		{"pin", func(r *PutRuntimeSpecRequest) { r.AdminState, r.Pinned = "", true }},
+	} {
+		stored, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+		if err != nil {
+			t.Fatalf("GetRuntimeSpec: %v", err)
+		}
+		req := putRequestFromDTO(stored)
+		override.apply(&req)
+		if _, err := f.svc.PutRuntimeSpec(f.ctx, ownerToken(), f.mappingID, req); err != nil {
+			t.Fatalf("%s override with a stored amd row: %v", override.name, err)
+		}
+	}
+	if got := f.storedVendors(); !slices.Equal(got, []routing.GPUKey{{Vendor: "nvidia", Index: 0}, {Vendor: "amd", Index: 0}}) {
+		t.Fatalf("stored = %v, want the rows kept", got)
+	}
+	if _, err := f.put(RuntimeSpecGPUDTO{Vendor: "nvidia", Index: 0}, RuntimeSpecGPUDTO{Vendor: "amd", Index: 1}); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
+		t.Fatalf("new amd 1 row: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+	}
+
+	if _, err := f.svc.SetServerGPUBudgets(f.ctx, ownerToken(), f.serverID, SetGPUBudgetsRequest{Budgets: []GPUBudgetDTO{{Vendor: budgets[0].Vendor, Index: 0, BudgetMB: 2}}}); err != nil {
+		t.Fatalf("budget re-save with the stored amd row: %v", err)
+	}
+	if _, err := f.svc.SetServerGPUBudgets(f.ctx, ownerToken(), f.serverID, SetGPUBudgetsRequest{Budgets: []GPUBudgetDTO{{Vendor: "amd", Index: 1, BudgetMB: 2}}}); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
+		t.Fatalf("new amd 1 budget: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+	}
+
+	memberReq.GPUs = member.GPUs
+	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), f.serverID, member.ID, memberReq); err != nil {
+		t.Fatalf("member spec re-save with the stored amd row: %v", err)
+	}
+	memberReq.GPUs = []RuntimeSpecGPUDTO{{Vendor: "amd", Index: 1, VRAMEstimateMB: 1}}
+	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), f.serverID, member.ID, memberReq); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
+		t.Fatalf("new amd 1 member gpu: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+	}
+	// A new member spec has nothing stored.
+	memberReq.GPUs = []RuntimeSpecGPUDTO{{Vendor: "amd", Index: 0, VRAMEstimateMB: 1}}
+	if _, err := f.svc.PutRPCMemberSpec(f.ctx, ownerToken(), f.serverID, "", memberReq); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
+		t.Fatalf("amd 0 on a new member spec: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+	}
+}
+
+// TestAgentRuntimeConfigWithholdsSpecWithAllGPUsDropped: a spec with GPU
+// rows of which an unflagged agent gets none is withheld from its document
+// -- an empty GPU list would run it with no VRAM reservation, invisible to
+// admission. A spec that keeps at least one row is pushed with it. While the
+// agent's declaration is unknown the document is held instead, so the spec
+// is never served and then withdrawn.
+func TestAgentRuntimeConfigWithholdsSpecWithAllGPUsDropped(t *testing.T) {
+	f := newGPUVendorFixture(t)
+	f.legacy("nvidia")
+	f.specGPUs(routing.RuntimeSpecGPU{GPUVendor: "amd", GPUIndex: 0, VRAMEstimateMB: 2000})
+	f.unflag()
+	doc, err := f.svc.AgentRuntimeConfig(f.ctx, f.serverID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Specs) != 0 || doc.AwaitsAgentFeatures {
+		t.Fatalf("specs = %+v held=%v, want the amd-only spec withheld and the document served", doc.Specs, doc.AwaitsAgentFeatures)
+	}
+
+	f.forget()
+	if doc, err = f.svc.AgentRuntimeConfig(f.ctx, f.serverID); err != nil || !doc.AwaitsAgentFeatures {
+		t.Fatalf("unknown declaration: held=%v err=%v, want the document held", doc.AwaitsAgentFeatures, err)
+	}
+
+	f.unflag()
+	f.specGPUs(
+		routing.RuntimeSpecGPU{GPUVendor: "nvidia", GPUIndex: 0, VRAMEstimateMB: 1000},
+		routing.RuntimeSpecGPU{GPUVendor: "amd", GPUIndex: 0, VRAMEstimateMB: 2000},
+	)
+	if want := []AgentRuntimeSpecGPUDTO{{Index: 0, VRAMMB: 1000}}; !slices.Equal(f.config().Specs[0].GPUs, want) {
+		t.Fatalf("gpus = %+v, want %+v", f.config().Specs[0].GPUs, want)
+	}
+
+	f.flag()
+	if want := []AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0, VRAMMB: 1000}, {Vendor: "amd", Index: 0, VRAMMB: 2000}}; !slices.Equal(f.config().Specs[0].GPUs, want) {
+		t.Fatalf("flagged gpus = %+v, want %+v", f.config().Specs[0].GPUs, want)
+	}
+}
+
+// TestAgentRuntimeConfigWithholdsMemberWithAllGPUsDropped: the same for an
+// RPC member spec in a member server's document.
+func TestAgentRuntimeConfigWithholdsMemberWithAllGPUsDropped(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	features := f.clusterAgents(a.ID)
+	features[a.ID] = append(features[a.ID], AgentFeatureGPUVendorIdentity)
+	member := autoMember(a.ID, 0)
+	member.GPUs[0].Vendor = "amd"
+	head := f.mustPut(clusterHeadRequest(member))
+	if _, ok := specByID(f.config(a.ID), automaticMemberSpecID(head.ID, a.ID)); !ok {
+		t.Fatal("flagged member spec not derived")
+	}
+	features[a.ID] = []string{"runtime_manager", AgentFeatureRPCCluster}
+	if _, err := f.routes.BackfillServerGPUVendor(f.ctx, a.ID, "nvidia", false); err != nil {
+		t.Fatal(err)
+	}
+	if ms, ok := specByID(f.config(a.ID), automaticMemberSpecID(head.ID, a.ID)); ok {
+		t.Fatalf("member spec %+v pushed with every GPU dropped, want it withheld", ms)
+	}
+}
+
+// TestClusterHeadOverrideKeepsStoredMemberVendor: a visible automatic
+// member whose stored GPU carries a vendor its agent no longer reads is kept
+// on a head override (the whole head is re-sent); a new foreign-vendor GPU
+// on it is refused.
+func TestClusterHeadOverrideKeepsStoredMemberVendor(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	features := f.clusterAgents(a.ID)
+	features[a.ID] = append(features[a.ID], AgentFeatureGPUVendorIdentity)
+	member := autoMember(a.ID, 0)
+	member.GPUs[0].Vendor = "amd"
+	f.mustPut(clusterHeadRequest(member))
+	features[a.ID] = []string{"runtime_manager", AgentFeatureRPCCluster}
+
+	got, err := f.svc.GetRuntimeSpec(f.ctx, ownerToken(), f.mappingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := putRequestFromDTO(got)
+	req.AdminState = "force_stopped"
+	if _, err := f.put(ownerToken(), req); err != nil {
+		t.Fatalf("stop override with a stored amd member gpu: %v", err)
+	}
+	req.ClusterMembers[0].GPUs = append(req.ClusterMembers[0].GPUs, ClusterMemberGPUDTO{Vendor: "amd", Index: 1, VRAMEstimateMB: 8000})
+	if _, err := f.put(ownerToken(), req); !errors.Is(err, ErrRuntimeSpecGPUVendorUnsupported) {
+		t.Fatalf("new amd 1 member gpu: err = %v, want ErrRuntimeSpecGPUVendorUnsupported", err)
+	}
+}
