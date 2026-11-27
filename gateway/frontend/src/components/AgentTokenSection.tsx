@@ -249,6 +249,18 @@ export function buildServerAgentConfig(
   // work_dir containment on (then only well-formed entries permit one).
   "runtime_allowed_dirs": [],
 
+  // Directories, besides a runtime spec's own \${CONFIG_DIR}, from which the
+  // agent may tail the log files that spec declares (log_files) for the
+  // portal's runtime log dialog. Empty (the default) means ONLY the spec's own
+  // \${CONFIG_DIR} -- fail closed, deliberately the inverse of
+  // runtime_allowed_dirs above (empty there means ANY work_dir), which is why
+  // that list is not reused. Comes ONLY from this local file (or
+  // OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS); the gateway can never widen it. A bare
+  // entry, or a trailing "/*" ("/var/log/models" and "/var/log/models/*" are
+  // the same), permits that directory and its whole subtree; it is not a
+  // glob. wsl://<distro>/<absolute Linux path> entries name a WSL distro.
+  "runtime_allowed_log_dirs": [],
+
   // When true, each runtime_allowed_binaries entry's PARENT directory is
   // treated as an allowed work_dir prefix WITHOUT listing it in
   // runtime_allowed_dirs above -- convenient when a model's work_dir sits

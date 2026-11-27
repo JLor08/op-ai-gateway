@@ -239,6 +239,16 @@ type Config struct {
 	// wsl://<distro>/<path> entries bound the work_dir of WSL specs in that
 	// distro only.
 	RuntimeAllowedDirs []string
+	// RuntimeAllowedLogDirs lists the directories, besides a spec's own
+	// ${CONFIG_DIR}, from which the agent may tail the log_files a runtime
+	// spec declares. EMPTY (the default) means ONLY the spec's own
+	// ${CONFIG_DIR} -- fail closed. RuntimeAllowedDirs is deliberately not
+	// reused: there an empty list means "any work_dir", the opposite of what a
+	// file-read allowlist needs. Same operator-only provenance as the other
+	// allowlists: it comes ONLY from this local file/env, never from the
+	// gateway. Same entry syntax as RuntimeAllowedDirs (a trailing \* or /*
+	// is a subtree synonym; wsl://<distro>/<path> entries name a WSL distro).
+	RuntimeAllowedLogDirs []string
 	// RuntimeAllowBinaryDirs, when true, treats each RuntimeAllowedBinaries
 	// entry's PARENT directory as an allowed work_dir prefix WITHOUT the
 	// operator listing it in RuntimeAllowedDirs (see
@@ -493,6 +503,7 @@ type fileConfig struct {
 	RuntimeConfigPath      string   `json:"runtime_config"`
 	RuntimeAllowedBinaries []string `json:"runtime_allowed_binaries"`
 	RuntimeAllowedDirs     []string `json:"runtime_allowed_dirs"`
+	RuntimeAllowedLogDirs  []string `json:"runtime_allowed_log_dirs"`
 	// RuntimeAllowBinaryDirs is a pointer bool (matching TLSInsecure/Verbose)
 	// so an absent key is distinguishable from an explicit false -- required by
 	// the reflection parity test and resolveBool's env>file precedence.
@@ -634,6 +645,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeConfigPath:      strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
 		RuntimeAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
 		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
+		RuntimeAllowedLogDirs:  resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS"), file.RuntimeAllowedLogDirs),
 		RuntimeAllowBinaryDirs: resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
 		RuntimeWSLExe:          resolveWSLExe(getenv("OP_AGENT_RUNTIME_WSL_EXE"), file.RuntimeWSLExe),
 		AgentKey:               resolveTrimmed(getenv("OP_AGENT_AGENT_KEY"), file.AgentKey),
@@ -795,7 +807,7 @@ func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(
 	for _, list := range []struct {
 		name    string
 		entries []string
-	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}} {
+	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}, {"runtime_allowed_log_dirs", cfg.RuntimeAllowedLogDirs}} {
 		for i, e := range list.entries {
 			if msg := allowlistEntryWarning(list.name, i, e); msg != "" {
 				w = append(w, msg)
@@ -820,7 +832,7 @@ func removedWSLSettingWarnings(fileKeys map[string]bool, getenv func(string) str
 // allowlistEntryWarning returns the warning for entry e at index i of the named
 // allowlist, or "" when the entry is fine.
 func allowlistEntryWarning(listName string, i int, e string) string {
-	isDirs := listName == "runtime_allowed_dirs"
+	isDirs := listName == "runtime_allowed_dirs" || listName == "runtime_allowed_log_dirs"
 	if wslentry.Is(e) {
 		if _, _, ok := wslentry.Parse(e); ok {
 			return ""

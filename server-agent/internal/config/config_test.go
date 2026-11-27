@@ -2334,3 +2334,59 @@ func TestHostpowerTLSFingerprintWarningCombinations(t *testing.T) {
 		t.Errorf("invalid pin + https URL = %v, want only the invalid-format warning", w)
 	}
 }
+
+// TestLoadRuntimeAllowedLogDirs proves the log-file allowlist follows the
+// env > file precedence and the comma-separated env form of
+// runtime_allowed_dirs.
+func TestLoadRuntimeAllowedLogDirs(t *testing.T) {
+	path := writeConfig(t, `{"gateway_url":"https://gw.example","token":"x",
+		"runtime_allowed_log_dirs":["/var/log/models"]}`)
+	cfg, err := Load([]string{"-config", path}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"/var/log/models"}; !reflect.DeepEqual(cfg.RuntimeAllowedLogDirs, want) {
+		t.Errorf("file: RuntimeAllowedLogDirs = %#v, want %#v", cfg.RuntimeAllowedLogDirs, want)
+	}
+
+	env := func(k string) string {
+		if k == "OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS" {
+			return "/a, /b"
+		}
+		return ""
+	}
+	cfg, err = Load([]string{"-config", path}, env)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := []string{"/a", "/b"}; !reflect.DeepEqual(cfg.RuntimeAllowedLogDirs, want) {
+		t.Errorf("env: RuntimeAllowedLogDirs = %#v, want %#v", cfg.RuntimeAllowedLogDirs, want)
+	}
+
+	cfg, err = Load([]string{"-gateway-url=https://gw.example", "-token=x"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.RuntimeAllowedLogDirs != nil {
+		t.Errorf("absent: RuntimeAllowedLogDirs = %#v, want nil", cfg.RuntimeAllowedLogDirs)
+	}
+}
+
+// TestRuntimeAllowedLogDirsWarnings proves malformed and look-alike wsl:
+// entries of the new list warn, naming runtime_allowed_log_dirs, with the dir
+// wording of runtime_allowed_dirs.
+func TestRuntimeAllowedLogDirsWarnings(t *testing.T) {
+	cfg := Config{RuntimeAllowedLogDirs: []string{`wsl://Ubuntu-24.04\srv`, "WSL://Ubuntu-24.04/srv", "wsl://Ubuntu-24.04/srv/logs", "/var/log"}}
+	w := runtimeAllowlistWarnings(cfg, nil, func(string) string { return "" })
+	if len(w) != 2 {
+		t.Fatalf("Warnings = %v, want 2", w)
+	}
+	for _, m := range w {
+		if !strings.Contains(m, "runtime_allowed_log_dirs[") {
+			t.Errorf("warning %q does not name runtime_allowed_log_dirs", m)
+		}
+		if !strings.Contains(m, "WSL work_dir containment stays on") {
+			t.Errorf("warning %q lacks the dir semantics", m)
+		}
+	}
+}

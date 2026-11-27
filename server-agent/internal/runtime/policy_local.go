@@ -385,6 +385,13 @@ type LocalPolicy struct {
 	// spec: no wsl:// entry of its distro) -- unlike AllowedBinaries, an operator who does
 	// not care about work_dir containment is not forced to enumerate one.
 	AllowedDirs []string
+	// AllowedLogDirs lists the directories, besides a spec's own
+	// ${CONFIG_DIR}, from which a spec's declared log_files may be tailed.
+	// EMPTY means ONLY the spec's own ${CONFIG_DIR} (fail closed) -- unlike
+	// AllowedDirs, where empty means any work_dir. Same entry syntax as
+	// AllowedDirs, same operator-only provenance (local config, never the
+	// gateway).
+	AllowedLogDirs []string
 	// AllowBinaryDirs (R3), when true, treats each allowed binary's PARENT
 	// directory as an allowed dir WITHOUT the operator listing it in
 	// AllowedDirs -- so a spec whose work_dir sits under any allowlisted
