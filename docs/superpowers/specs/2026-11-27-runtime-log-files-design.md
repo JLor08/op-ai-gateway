@@ -188,9 +188,10 @@ outside `${CONFIG_DIR}` is **never** removed or truncated by the agent.
   becomes a byte-based accounting over all streams. If one spec's streams alone
   would exceed the total (possible with a raised `perSpec`), the process ring
   keeps its full `perSpec` and the **file rings are clamped** equally to the
-  remainder, with the 64 KiB floor; if even that does not fit, the agent's
-  config validation refuses the setting combination at startup with a message
-  naming both settings. The clamp is reported once in the agent log.
+  remainder, with the 64 KiB floor. If even that does not fit, `NewLogStore`
+  raises the total to `perSpec + 4 × 64 KiB`, just as it already raises a
+  total below `perSpec` today, and the agent logs the effective capacity. It
+  does not refuse to start.
 - Instances of a replicable spec share each stream's ring, as today (records
   carry the instance; process lines keep the `[#k] ` prefix). File lines of
   instance k are prefixed the same way.
@@ -248,10 +249,12 @@ outside `${CONFIG_DIR}` is **never** removed or truncated by the agent.
 - **Masking** (§8) is applied before any byte enters the ring.
 
 ### Closed event / status set (new members)
-Markers: `file_opened`, `rotated`, `truncated`, `line_cut`, `stale_file`.
-Statuses: `waiting`, `not_permitted`, `binary`, `missing` (the generation ended
-and the file never appeared), `unsupported` (portal-side: the agent lacks the
-feature flag). The gateway allow-lists them. The portal owns their wording.
+Markers: `file_opened`, `file_rotated`, `file_truncated`, `file_line_cut`,
+`file_stale`. Statuses (also carried as typed events on the stream):
+`file_waiting`, `file_not_permitted`, `file_binary`, `file_missing` (the
+generation ended and the file never appeared). The agent-lacks-the-flag case is
+portal-side only. File events are valid only on an entry with a `stream`.
+(Elsewhere in this document the short names `rotated`, `waiting`, … mean these.) The gateway allow-lists them. The portal owns their wording.
 
 ## 8. Secret masking (applies to process output too)
 
@@ -285,8 +288,8 @@ feature flag). The gateway allow-lists them. The portal owns their wording.
 - New `log_file_tails: [{name, tail}]` on `LastError` and
   `sample.RuntimeErrorSample`: the end of each declared file for the failed
   generation, at most 2 KiB each, at most 4 entries. The gateway clamps each
-  tail to 2048 bytes, drops entries whose name is not declared in the spec, and
-  keeps them in RAM only, like `stderr_tail` (`agent_ingest.go:587-598`,
+  tail to 2048 bytes, keeps at most 4 entries, drops entries whose name fails
+  the §4 name pattern, and keeps them in RAM only, like `stderr_tail` (`agent_ingest.go:587-598`,
   `runtime_registry.go:26`).
 - **Timing:** `last_error` is recorded at exit. The file tails are added once
   the tailer has finished its post-exit grace. Briefly there is a `last_error`
@@ -308,9 +311,13 @@ feature flag). The gateway allow-lists them. The portal owns their wording.
   the runtime document regardless.
 - **`LogEntry` / `RuntimeLogEntryDTO`** gain `stream` (omitted = process output,
   which is what every current agent sends). Otherwise it is a declared `name`.
-  The gateway clamps `stream` on ingest (≤ 32 bytes, must be a name the spec
-  declares, else the entry is dropped) in addition to the existing clamps
-  (`runtime_logs.go:54-87`, `683-703`).
+  The gateway clamps `stream` on ingest (it must match the §4 name pattern,
+  else the entry is dropped) in addition to the existing clamps
+  (`runtime_logs.go:54-87`, `683-703`). **[builder call, settled]** The gateway
+  does **not** check the name against the spec's declaration: neither the
+  ingest path nor the registry knows the runtime document (a DB read per frame
+  otherwise). The portal only shows tabs for declared names, so an undeclared
+  stream is never rendered.
 - The same `runtime_log_config` watch, epochs, scrollback replay and chunking
   cover every stream of a spec: one SSE connection, one watch entry, the
   64-spec bound unchanged. Scrollback replays all streams of the spec (order
@@ -322,8 +329,8 @@ feature flag). The gateway allow-lists them. The portal owns their wording.
 ## 11. Portal
 
 ### 11.1 Live-log dialog (variant B)
-- **Top row: instance** (`Gesamt` / `#0` / `#1` …), shown exactly when it is
-  shown today (replicable specs).
+- **Top row: instance** (`Gesamt` / `Instanz 0` / `Instanz 1` …, the labels
+  as today), shown exactly when it is shown today (replicable specs).
 - **Second row: source** (`Prozess` / `Process` and one tab per declared file).
   It is shown **only when the spec declares `log_files`**. Without log files
   only process output exists, it is selected implicitly and the dialog looks
