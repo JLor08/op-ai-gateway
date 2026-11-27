@@ -62,6 +62,18 @@ import (
 // travels with the boundary that already carries the pid and needs no
 // attribution rule of its own -- see ResolvedCommand for why that placement,
 // and what it costs when a marker is evicted.
+//
+// AND STREAMS (#430). A spec may declare log files its server writes, and the
+// agent tails them into the same store. Each spec therefore holds one RING per
+// STREAM: stream "" is the process output this file always held, and every
+// declared file is a stream named after it. A ring is trimmed against its OWN
+// cap, so a file that floods can never push the process output -- or another
+// file -- out of the history, and each ring counts its own gap. Everything
+// downstream follows the same split: records, entries and the live queue carry
+// the stream, a live queue exists per (spec, stream) unit, and the replay walks
+// every stream of the spec in one chunk sequence. What does NOT split is the
+// total ceiling: it is one byte bound over every ring of every spec (see
+// LogStore's doc).
 
 const (
 	// DefaultLogBufferBytes is the per-spec retention default: 1 MiB.
@@ -105,26 +117,29 @@ const (
 	// the allocator's rounding.
 	logRecordOverhead = 64
 
-	// logPendingBytes bounds ONE watched spec's live queue -- what has
-	// accumulated since the last Drain (250 ms). Deliberately independent of
-	// the retention capacity: this is a rate bound, not a history bound, and
-	// 64 KiB per flush window (256 KiB/s for one spec) is already far more
-	// than any real model server sustains. Past it, bytes are dropped and
+	// logPendingBytes bounds ONE watched (spec, stream) unit's live queue --
+	// what has accumulated on one stream of one spec since the last Drain
+	// (250 ms). Deliberately independent of the retention capacity: this is a
+	// rate bound, not a history bound, and 64 KiB per flush window (256 KiB/s
+	// for one stream) is already far more than any real model server
+	// sustains, and exactly a log-file tailer's read-rate cap. Past it, bytes are dropped and
 	// COUNTED, and the count travels in the very next entry -- see Drain.
 	logPendingBytes = 64 << 10
 	// logDrainBudget bounds one Drain across ALL watched specs, so a chatty
 	// fleet cannot monopolize the single agent->gateway WebSocket writer that
 	// telemetry also uses. At the agent's 250 ms flush cadence this is
 	// ~512 KiB/s of log traffic, fleet-wide, and only while someone is
-	// actually watching. Specs are visited round-robin so the budget cannot
-	// starve whichever spec happens to sort last.
+	// actually watching. (spec, stream) units are visited round-robin so the
+	// budget cannot starve whichever unit happens to sort last.
 	//
 	// It is deliberately LARGER than logPendingBytes, and that relationship is
-	// load-bearing rather than a taste: Drain defers a spec whose whole queue
-	// does not fit rather than tearing its batch, so a per-spec queue that
+	// load-bearing rather than a taste: Drain defers a unit whose whole queue
+	// does not fit rather than tearing its batch, so a per-unit queue that
 	// could exceed the whole budget would be a queue that never drains at all
 	// -- output accumulating, overflowing, and reporting a growing gap while
-	// the operator's window stays empty.
+	// the operator's window stays empty. Because the queue is per UNIT, a
+	// spec with log files does not change the relation: each of its streams
+	// is a queue of its own, each one fitting a fresh budget whole.
 	logDrainBudget = 128 << 10
 
 	// maxLogBatchBytes bounds ONE marshaled LogBatch, and it is the bound that
@@ -142,7 +157,7 @@ const (
 	//
 	// This existed as a defect precisely because the two constants were equal
 	// and unrelated: DefaultLogBufferBytes (1 MiB) and the gateway's read limit
-	// (1 MiB). trimLocked holds a busy spec at exactly the retention cap, so its
+	// (1 MiB). trimRing holds a busy ring at exactly the retention cap, so its
 	// scrollback was STRUCTURALLY over the wire cap -- measured at 1,059,609 B
 	// for ordinary 86-column loader lines, 1,200,128 B with ANSI colour and
 	// 1,873,702 B for a chat template containing `<|im_start|>`. Deriving this
@@ -195,6 +210,21 @@ const (
 	// pid 0 was the alternative and it would have been a lie -- that marker
 	// means "output begins here, from this pid".
 	logEventStartFailed = "start_failed"
+
+	// File-stream events (#430): the closed set a log-file tailer records on
+	// its own stream. Like the generation markers they carry no text -- the
+	// portal owns the wording -- and they are valid only on an entry that names
+	// a stream. The first five are markers inside a file's history, the last
+	// four are statuses (why the tab has nothing, or nothing more, to show).
+	logEventFileOpened       = "file_opened"
+	logEventFileRotated      = "file_rotated"
+	logEventFileTruncated    = "file_truncated"
+	logEventFileLineCut      = "file_line_cut"
+	logEventFileStale        = "file_stale"
+	logEventFileWaiting      = "file_waiting"
+	logEventFileNotPermitted = "file_not_permitted"
+	logEventFileBinary       = "file_binary"
+	logEventFileMissing      = "file_missing"
 )
 
 // logRecord is one retained unit of a spec's output history. Text-carrying
@@ -218,6 +248,19 @@ type logRecord struct {
 	// marker opens. Attaching it here rather than keeping it per spec is what
 	// makes attribution structural -- see ResolvedCommand's doc.
 	command *ResolvedCommand
+	// stream names the ring this record belongs to: "" for process output, a
+	// declared log file's name otherwise. Every record of one ring carries the
+	// ring's own name, so an entry built from it can always say where it came
+	// from.
+	stream string
+	// dropped is a gap: the number of bytes of this stream that are missing
+	// IMMEDIATELY BEFORE this record's text. It is set by LogStore.gap at the
+	// position the bytes were skipped (the record then has no text until the
+	// next write of its generation coalesces into it), and on the first record
+	// of a replay snapshot, where it carries the ring's eviction count. It is
+	// never set on a live-queue record: the live path counts gaps per unit in
+	// pendingDropped instead.
+	dropped int64
 }
 
 // size is the record's weight against a buffer capacity: its text, any command
@@ -231,12 +274,13 @@ func (r logRecord) size() int { return len(r.text) + r.command.bytes() + logReco
 //
 // DroppedBytes is the overflow marker, and it means exactly one thing
 // everywhere it appears: "N bytes the process printed are missing
-// immediately before this entry's text". It is produced by all three places
-// output can be lost -- eviction from the retention buffer before a
-// scrollback snapshot, the per-spec live queue overflowing between two
-// flushes, and the gateway's per-subscriber queue overflowing -- and the
-// three are deliberately indistinguishable to the reader, because the reader
-// only needs the one fact. A gap that renders as silence would be a lie
+// immediately before this entry's text" -- on this entry's stream. It is
+// produced by every place output can be lost -- eviction from a retention
+// ring before a scrollback snapshot, a (spec, stream) live queue overflowing
+// between two flushes, a log-file tailer skipping bytes past its read-rate
+// cap (LogStore.gap), and the gateway's per-subscriber queue overflowing --
+// and they are deliberately indistinguishable to the reader, because the
+// reader only needs the one fact. A gap that renders as silence would be a lie
 // about what the process printed, and silence is exactly what an operator is
 // trying to interpret.
 // Command is present only on an opening marker ("started"/"start_failed") and
@@ -254,6 +298,12 @@ func (r logRecord) size() int { return len(r.text) + r.command.bytes() + logReco
 // to an instance, because the bytes lost may have come from any of them:
 // withDropped stamps it onto the first entry after it, which keeps naming the
 // instance of its own text, and an entry made for a gap alone names none.
+//
+// Stream names the stream the entry belongs to (#430): omitted for process
+// output -- which is also everything an agent from before log files sends --
+// and a declared log file's name otherwise. Every entry carries it, a gap entry
+// included: a gap is counted per stream, so the bytes it announces are missing
+// from exactly that stream.
 type LogEntry struct {
 	PID          int              `json:"pid,omitempty"`
 	At           time.Time        `json:"at"`
@@ -263,11 +313,14 @@ type LogEntry struct {
 	ExitCode     int              `json:"exit_code,omitempty"`
 	Command      *ResolvedCommand `json:"command,omitempty"`
 	Instance     int              `json:"instance,omitempty"`
+	Stream       string           `json:"stream,omitempty"`
 }
 
 // LogBatch is the payload of one agent->gateway runtime_log frame: the
-// entries accumulated for ONE spec since the previous flush, or one CHUNK of
-// that spec's history replay.
+// entries accumulated for ONE stream of ONE spec since the previous flush, or
+// one CHUNK of that spec's history replay -- which covers every stream of the
+// spec in one sequence, so a chunk may hold entries of several streams, each
+// naming its own (LogEntry.Stream).
 //
 // Scrollback marks a batch as part of the one-shot history replay a subscribe
 // produces, and it is load-bearing rather than cosmetic: it is what tells a
@@ -304,15 +357,27 @@ type LogBatch struct {
 	Entries    []LogEntry `json:"entries"`
 }
 
-// specLog is one spec's retained history: a byte-bounded record ring that
-// spans every generation of that spec's process, opening markers and their
-// resolved commands included.
+// specLog is one spec's retained history: one byte-bounded ring per stream,
+// each spanning every generation of that spec, opening markers and their
+// resolved commands included (those live in the process stream).
 type specLog struct {
-	recs      []logRecord
-	bytes     int   // sum of every record's size(), i.e. text and commands PLUS overhead
-	dropped   int64 // text bytes evicted from the front since this log began
-	lastWrite time.Time
+	streams   map[string]*streamRing
+	lastWrite time.Time // the newest write on ANY stream; the eviction order
 }
+
+// streamRing is one stream's retained records. cap is fixed when the ring is
+// created: the per-spec setting for the process stream, LogStore.fileCap for a
+// log file (see NewLogStore).
+type streamRing struct {
+	recs    []logRecord
+	bytes   int   // sum of every record's size(), i.e. text and commands PLUS overhead
+	dropped int64 // bytes missing from the front: text evicted, plus gaps evicted with their record
+	cap     int
+}
+
+// streamKey names one live-queue unit: a stream of a spec. Drain visits these
+// round-robin, at most one batch each.
+type streamKey struct{ spec, stream string }
 
 // LogStore is the agent's per-spec managed-process output: unconditional,
 // in-memory, never-persisted retention, plus the on-demand live fan-out the
@@ -325,20 +390,31 @@ type specLog struct {
 // Drain returns nothing, until the gateway names a spec in SetWatch, so a
 // fleet nobody is looking at generates no log traffic at all.
 //
-// THE MEMORY BOUND, exactly. Retention is capped at totalBytes: at most
-// totalBytes/perSpec spec buffers are kept (the least-recently-written
-// unwatched one is evicted to make room), and each is capped at perSpec
-// bytes INCLUDING per-record overhead. On top of that, each WATCHED spec can
-// hold a live queue of at most logPendingBytes (64 KiB), plus -- while a
-// history replay is in flight for it -- a scrollback snapshot, which is a
-// shallow copy that shares its strings with the retention buffer and so adds
-// only record headers unless the buffer churns underneath it. A generation's
-// opening marker also carries its masked launch command, capped at
-// maxResolvedCommandBytes (16 KiB) and charged against the same per-spec
-// capacity as the text (logRecord.size), so it widens no bound. With the
+// THE MEMORY BOUND, exactly. Retention is a hard BYTE bound: used, the sum of
+// every ring of every spec INCLUDING per-record overhead, never exceeds total
+// after any write. Each ring is first trimmed to its own cap (perSpec for the
+// process stream, fileCap for a log file); then, while used is over total,
+// whole UNWATCHED specs -- every stream together -- are dropped,
+// least-recently-written first, never the spec just written and never a
+// watched one. If that is not enough (every other spec is watched), the ring
+// just written gives up its own oldest bytes, counted as its gap like any
+// eviction -- so the bound holds whatever the watch set is. A spec with four
+// log files holds up to perSpec + 4*fileCap, i.e. up to five times the
+// per-spec size at the default, so fewer specs fit under the same total.
+// NewLogStore guarantees one such spec always fits (see there).
+//
+// On top of retention, each WATCHED (spec, stream) unit can hold a live queue
+// of at most logPendingBytes (64 KiB) -- five units for a spec with four
+// files -- plus, while a history replay is in flight for a spec, a scrollback
+// snapshot, which is a shallow copy that shares its strings with the retention
+// rings and so adds only record headers unless the rings churn underneath it.
+// A generation's opening marker also carries its masked launch command, capped
+// at maxResolvedCommandBytes (16 KiB) and charged against the process ring's
+// capacity like the text (logRecord.size), so it widens no bound. With the
 // defaults (1 MiB / 16 MiB) and the one or two specs an operator actually
 // watches at a time, that is 16 MiB steady-state and under 17 MiB while
-// watching.
+// watching a spec without log files (each watched file adds at most 64 KiB of
+// live queue).
 //
 // Every method is safe for concurrent use. Write in particular is called
 // from os/exec's two copying goroutines per process, for every process at
@@ -349,8 +425,14 @@ type specLog struct {
 type LogStore struct {
 	mu sync.Mutex
 
-	perSpec  int
-	maxSpecs int
+	perSpec int
+	// fileCap is the ring cap of every log-file stream (NewLogStore).
+	fileCap int
+	// total is the hard byte ceiling over every ring of every spec, and used
+	// is what they hold right now: the sum of every ring's bytes, kept
+	// incrementally by every append, trim and forget.
+	total int
+	used  int
 
 	logs map[string]*specLog
 
@@ -364,9 +446,11 @@ type LogStore struct {
 	// trigger a replay.
 	watchEpoch map[string]uint64
 
-	pending        map[string][]logRecord
-	pendingBytes   map[string]int
-	pendingDropped map[string]int64
+	// The live queue, per (spec, stream) unit: a file at its read-rate cap
+	// overflows its own queue, never the process output's.
+	pending        map[streamKey][]logRecord
+	pendingBytes   map[streamKey]int
+	pendingDropped map[streamKey]int64
 
 	// scrollbackDue marks a spec whose history has been ASKED for but not yet
 	// snapshotted; the value says whether the spec was ALREADY being watched
@@ -378,23 +462,37 @@ type LogStore struct {
 	scrollbackDue map[string]bool
 	// scrollback holds what is LEFT of an in-flight history replay, and
 	// scrollbackReady records that one is in flight -- separately, because an
-	// EMPTY history is a meaningful answer that still has to be delivered.
-	scrollback        map[string][]logRecord
-	scrollbackDropped map[string]int64
-	scrollbackReady   map[string]bool
+	// EMPTY history is a meaningful answer that still has to be delivered. A
+	// replay is per SPEC: one record sequence covering every stream, each
+	// stream's eviction gap carried on its own first record (snapshotLocked).
+	scrollback      map[string][]logRecord
+	scrollbackReady map[string]bool
 
 	nextGen uint64
-	// rr rotates Drain's starting point so the per-drain byte budget cannot
-	// systematically starve whichever spec sorts last.
+	// rr rotates Drain's starting point over the (spec, stream) units so the
+	// per-drain byte budget cannot systematically starve whichever sorts last.
 	rr int
 
 	now func() time.Time
 }
 
+// maxLogFileStreams is how many log-file rings NewLogStore sizes the total
+// for: the spec field's own limit (log_files holds at most four entries).
+const maxLogFileStreams = 4
+
 // NewLogStore builds a store with an operator-chosen per-spec capacity and
 // total ceiling. Both are clamped into a sane range rather than rejected: a
 // misconfigured buffer size must never stop an agent from supervising model
 // processes, which is its actual job.
+//
+// The process ring of every spec gets the full per-spec capacity. A log-file
+// ring gets the same, unless one spec's five rings would not fit the total:
+// then the file rings are clamped equally to what the total leaves after the
+// process ring, min(perSpec, max(64 KiB, (total-perSpec)/4)). The total itself
+// is raised to at least perSpec + 4*64 KiB -- just as it was always raised to
+// at least one buffer -- so the 64 KiB floor holds and one spec with all its
+// rings full always fits: perSpec + 4*fileCap <= total by construction.
+// Capacity reports the effective numbers for the startup log line.
 func NewLogStore(perSpecBytes, totalBytes int) *LogStore {
 	if perSpecBytes <= 0 {
 		perSpecBytes = DefaultLogBufferBytes
@@ -405,38 +503,35 @@ func NewLogStore(perSpecBytes, totalBytes int) *LogStore {
 	if totalBytes <= 0 {
 		totalBytes = DefaultLogBufferTotalBytes
 	}
-	if totalBytes < perSpecBytes {
-		totalBytes = perSpecBytes
+	if floor := perSpecBytes + maxLogFileStreams*minLogBufferBytes; totalBytes < floor {
+		totalBytes = floor
 	}
-	maxSpecs := totalBytes / perSpecBytes
-	if maxSpecs < 1 {
-		maxSpecs = 1
-	}
+	fileCap := min(perSpecBytes, max(minLogBufferBytes, (totalBytes-perSpecBytes)/maxLogFileStreams))
 	return &LogStore{
-		perSpec:           perSpecBytes,
-		maxSpecs:          maxSpecs,
-		logs:              make(map[string]*specLog),
-		watching:          make(map[string]bool),
-		watchEpoch:        make(map[string]uint64),
-		pending:           make(map[string][]logRecord),
-		pendingBytes:      make(map[string]int),
-		pendingDropped:    make(map[string]int64),
-		scrollbackDue:     make(map[string]bool),
-		scrollback:        make(map[string][]logRecord),
-		scrollbackDropped: make(map[string]int64),
-		scrollbackReady:   make(map[string]bool),
-		now:               time.Now,
+		perSpec:         perSpecBytes,
+		fileCap:         fileCap,
+		total:           totalBytes,
+		logs:            make(map[string]*specLog),
+		watching:        make(map[string]bool),
+		watchEpoch:      make(map[string]uint64),
+		pending:         make(map[streamKey][]logRecord),
+		pendingBytes:    make(map[streamKey]int),
+		pendingDropped:  make(map[streamKey]int64),
+		scrollbackDue:   make(map[string]bool),
+		scrollback:      make(map[string][]logRecord),
+		scrollbackReady: make(map[string]bool),
+		now:             time.Now,
 	}
 }
 
-// Capacity reports the resolved per-spec and total byte ceilings (after
-// clamping), for the one startup log line that tells an operator what their
-// setting actually became.
+// Capacity reports the resolved per-spec ring and total byte ceilings (after
+// clamping and raising), for the one startup log line that tells an operator
+// what their setting actually became.
 func (s *LogStore) Capacity() (perSpec, total int) {
 	if s == nil {
 		return 0, 0
 	}
-	return s.perSpec, s.perSpec * s.maxSpecs
+	return s.perSpec, s.total
 }
 
 // newProc opens a fresh generation for specID and returns the io.Writer that
@@ -486,10 +581,10 @@ func instanceLinePrefix(k int) string {
 	return "[#" + strconv.Itoa(k) + "] "
 }
 
-// write records b as p's generation's output and, when the spec is watched,
-// queues it for the next Drain. Never blocks on a reader and never fails:
-// there is no failure mode for a bounded in-memory append, and a log write
-// must never be able to stall the process it is reading from.
+// write records b as p's generation's output on p's stream and, when the spec
+// is watched, queues it for the next Drain. Never blocks on a reader and never
+// fails: there is no failure mode for a bounded in-memory append, and a log
+// write must never be able to stall the process it is reading from.
 //
 // A further instance's text is prefixed line by line here (prefixLinesLocked),
 // under the same lock as the append, so the prefix state of a generation and
@@ -500,14 +595,14 @@ func (s *LogStore) write(p *procLog, b []byte) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec := logRecord{gen: p.gen, pid: int(p.pid.Load()), at: s.now(), text: p.prefixLinesLocked(b), instance: p.instance}
+	rec := logRecord{gen: p.gen, pid: int(p.pid.Load()), at: s.now(), text: p.prefixLinesLocked(b), instance: p.instance, stream: p.stream}
 	s.appendLocked(p.specID, rec)
-	s.queueLocked(p.specID, rec)
+	s.queueLocked(streamKey{p.specID, p.stream}, rec)
 }
 
-// mark records a lifecycle marker (a generation boundary) in the same
-// history and live queue the output flows through, so its position relative
-// to the surrounding output is exact.
+// mark records a lifecycle marker (a generation boundary, or a file event) in
+// the same history and live queue the output of p's stream flows through, so
+// its position relative to the surrounding output is exact.
 //
 // cmd is non-nil only for an OPENING marker, and it is the masked launch
 // command of the generation that marker opens (see ResolvedCommand). It is
@@ -519,52 +614,111 @@ func (s *LogStore) mark(p *procLog, pid int, event string, exitCode int, cmd *Re
 		return
 	}
 	specID := p.specID
-	rec := logRecord{gen: p.gen, pid: pid, at: s.now(), event: event, exitCode: exitCode, command: cmd, instance: p.instance}
+	rec := logRecord{gen: p.gen, pid: pid, at: s.now(), event: event, exitCode: exitCode, command: cmd, instance: p.instance, stream: p.stream}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.appendLocked(specID, rec)
-	s.queueLocked(specID, rec)
+	s.queueLocked(streamKey{specID, p.stream}, rec)
 }
 
-// logForLocked returns specID's buffer, creating it (and enforcing the total
-// ceiling) on first use.
+// gap counts n bytes of p's stream that were skipped rather than recorded --
+// a log-file tailer's read-rate cap -- so the reader sees a counted gap, not
+// silence. In the retained history the gap is a record at the position the
+// bytes were skipped (the next text of the generation coalesces into it, so it
+// is reported as "missing immediately before" that text, exactly where it
+// happened); in a watched spec's live queue it is counted in that unit's
+// pendingDropped, like a queue overflow.
+func (s *LogStore) gap(p *procLog, n int64) {
+	if s == nil || p.specID == "" || n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// No instance on the gap record: a gap names none (LogEntry's doc). The
+	// generation's next text coalesces into it and brings its own.
+	s.appendLocked(p.specID, logRecord{gen: p.gen, at: s.now(), stream: p.stream, dropped: n})
+	if s.watching[p.specID] {
+		s.pendingDropped[streamKey{p.specID, p.stream}] += n
+	}
+}
+
+// logForLocked returns specID's history, creating it on first use. The total
+// ceiling is enforced by appendLocked, after the bytes it is about land.
 func (s *LogStore) logForLocked(specID string) *specLog {
 	l := s.logs[specID]
 	if l == nil {
-		l = &specLog{}
+		l = &specLog{streams: make(map[string]*streamRing)}
 		s.logs[specID] = l
-		s.evictLocked(specID)
 	}
 	return l
 }
 
-// appendLocked adds rec to specID's retained history, coalescing consecutive
-// same-generation output and evicting from the front to stay within the
-// per-spec capacity.
+// ringCap is the cap a new ring of stream gets.
+func (s *LogStore) ringCap(stream string) int {
+	if stream == "" {
+		return s.perSpec
+	}
+	return s.fileCap
+}
+
+// appendLocked adds rec to its stream's ring of specID's history, coalescing
+// consecutive same-generation output of that stream, evicting from the ring's
+// front to stay within its cap, and then restoring the total ceiling.
 func (s *LogStore) appendLocked(specID string, rec logRecord) {
 	l := s.logForLocked(specID)
 	l.lastWrite = rec.at
-	if rec.event == "" && len(l.recs) > 0 {
-		last := &l.recs[len(l.recs)-1]
-		if last.event == "" && last.gen == rec.gen && len(last.text) < logCoalesceTarget {
-			last.text += rec.text
-			l.bytes += len(rec.text)
-			s.trimLocked(l)
-			return
-		}
+	r := l.streams[rec.stream]
+	if r == nil {
+		r = &streamRing{cap: s.ringCap(rec.stream)}
+		l.streams[rec.stream] = r
 	}
-	l.recs = append(l.recs, rec)
-	l.bytes += rec.size()
-	s.trimLocked(l)
+	before := r.bytes
+	if !coalesceInto(r, rec) {
+		r.recs = append(r.recs, rec)
+		r.bytes += rec.size()
+	}
+	trimRing(r, r.cap)
+	s.used += r.bytes - before
+	s.enforceTotalLocked(specID, r)
 }
 
-// trimLocked drops the oldest bytes until l is back within the per-spec
-// capacity, counting exactly how much text it discarded so a later
-// scrollback can report it instead of showing a silent gap.
-func (s *LogStore) trimLocked(l *specLog) {
-	for l.bytes > s.perSpec && len(l.recs) > 0 {
-		excess := l.bytes - s.perSpec
-		head := &l.recs[0]
+// coalesceInto joins rec onto the ring's last record when both are plain output
+// of the same stream and generation, and reports whether it did. A gap joins a
+// gap-only record (the two are one longer gap); text joins anything that is not
+// a marker, a gap record included -- which is what puts a gap immediately
+// before the text that follows it.
+func coalesceInto(r *streamRing, rec logRecord) bool {
+	if rec.event != "" || len(r.recs) == 0 {
+		return false
+	}
+	last := &r.recs[len(r.recs)-1]
+	if last.event != "" || last.gen != rec.gen || last.stream != rec.stream || len(last.text) >= logCoalesceTarget {
+		return false
+	}
+	if rec.dropped > 0 {
+		if last.text != "" {
+			return false
+		}
+		last.dropped += rec.dropped
+		return true
+	}
+	if last.text == "" {
+		// A gap-only record taking its first text: the entry is that text,
+		// with the gap in front of it, so it takes the text's identity.
+		last.pid, last.at, last.instance = rec.pid, rec.at, rec.instance
+	}
+	last.text += rec.text
+	r.bytes += len(rec.text)
+	return true
+}
+
+// trimRing drops a ring's oldest bytes until it is back within limit, counting
+// exactly how much it discarded -- text, and any gap that went with its record
+// -- so a later scrollback can report it instead of showing a silent gap.
+func trimRing(r *streamRing, limit int) {
+	for r.bytes > limit && len(r.recs) > 0 {
+		excess := r.bytes - limit
+		head := &r.recs[0]
 		if len(head.text) > excess {
 			// strings.Clone, not a bare reslice: a Go string slice keeps the
 			// WHOLE backing array alive, which would leave the discarded
@@ -572,38 +726,54 @@ func (s *LogStore) trimLocked(l *specLog) {
 			// as the remainder lives. Same reasoning the predecessor of this
 			// file recorded for its own reallocate-on-overflow.
 			head.text = strings.Clone(head.text[excess:])
-			l.bytes -= excess
-			l.dropped += int64(excess)
+			r.bytes -= excess
+			// The head's own gap was in front of the text just cut, so it is
+			// now part of what is missing from the ring's front.
+			r.dropped += int64(excess) + head.dropped
+			head.dropped = 0
 			return
 		}
-		l.dropped += int64(len(head.text))
-		l.bytes -= head.size()
-		l.recs[0] = logRecord{} // release the string before dropping the slot
-		l.recs = l.recs[1:]
+		r.dropped += int64(len(head.text)) + head.dropped
+		r.bytes -= head.size()
+		r.recs[0] = logRecord{} // release the string before dropping the slot
+		r.recs = r.recs[1:]
 	}
 }
 
-// evictLocked enforces the TOTAL ceiling by dropping whole spec buffers,
-// least-recently-written first and preferring an unwatched one, until the
-// store holds at most maxSpecs of them. keep is the spec that just arrived
-// and is never the victim.
+// enforceTotalLocked restores used <= total after a write to ring r of spec
+// keep. First by dropping whole UNWATCHED specs other than keep, least-
+// recently-written first (evictLocked); if every remaining spec is keep or
+// watched, by trimming r -- the ring that just grew -- by the excess. That
+// always suffices: used was within total before the write, so the excess is
+// at most what r just gained.
+func (s *LogStore) enforceTotalLocked(keep string, r *streamRing) {
+	if s.used <= s.total {
+		return
+	}
+	s.evictLocked(keep)
+	if s.used <= s.total {
+		return
+	}
+	before := r.bytes
+	trimRing(r, max(0, r.bytes-(s.used-s.total)))
+	s.used += r.bytes - before
+}
+
+// evictLocked enforces the TOTAL ceiling by dropping whole spec histories --
+// every stream together -- least-recently-written first, until used is back
+// within total or no candidate is left. keep (the spec just written) and every
+// watched spec are never the victim: a watched spec's history is what an
+// operator is reading right now.
 func (s *LogStore) evictLocked(keep string) {
-	for len(s.logs) > s.maxSpecs {
+	for s.used > s.total {
 		victim := ""
 		var victimAt time.Time
-		victimWatched := true
 		for id, l := range s.logs {
-			if id == keep {
+			if id == keep || s.watching[id] {
 				continue
 			}
-			watched := s.watching[id]
-			// An unwatched buffer always outranks a watched one as a victim;
-			// among equals, the least recently written goes first.
-			better := victim == "" ||
-				(victimWatched && !watched) ||
-				(victimWatched == watched && l.lastWrite.Before(victimAt))
-			if better {
-				victim, victimAt, victimWatched = id, l.lastWrite, watched
+			if victim == "" || l.lastWrite.Before(victimAt) {
+				victim, victimAt = id, l.lastWrite
 			}
 		}
 		if victim == "" {
@@ -613,52 +783,80 @@ func (s *LogStore) evictLocked(keep string) {
 	}
 }
 
-// forgetLocked removes every trace of specID from the store.
+// forgetLocked removes every trace of specID from the store, every stream's
+// ring included, and returns their bytes to the total.
 func (s *LogStore) forgetLocked(specID string) {
+	if l := s.logs[specID]; l != nil {
+		for _, r := range l.streams {
+			s.used -= r.bytes
+		}
+	}
 	delete(s.logs, specID)
 	s.forgetStreamLocked(specID)
 }
 
 // forgetStreamLocked drops everything the STREAMING half holds for specID --
-// its live queue, any due or in-flight history replay, and the epoch that
-// replay was taken for -- leaving the retention buffer alone. It is what a spec
-// leaving the watch set gets: there is no one left to deliver to, and holding
-// any of it would be memory kept for nobody.
+// the live queue of every one of its streams, any due or in-flight history
+// replay, and the epoch that replay was taken for -- leaving the retention
+// rings alone. It is what a spec leaving the watch set gets: there is no one
+// left to deliver to, and holding any of it would be memory kept for nobody.
 func (s *LogStore) forgetStreamLocked(specID string) {
 	delete(s.watchEpoch, specID)
-	delete(s.pending, specID)
-	delete(s.pendingBytes, specID)
-	delete(s.pendingDropped, specID)
+	for _, k := range s.unitsOfLocked(specID) {
+		delete(s.pending, k)
+		delete(s.pendingBytes, k)
+		delete(s.pendingDropped, k)
+	}
 	delete(s.scrollbackDue, specID)
 	delete(s.scrollback, specID)
-	delete(s.scrollbackDropped, specID)
 	delete(s.scrollbackReady, specID)
 }
 
-// queueLocked adds rec to specID's live queue, but only while the spec is
+// unitsOfLocked returns specID's live-queue units that hold anything (records
+// or a counted drop), sorted by stream name -- the process stream first.
+func (s *LogStore) unitsOfLocked(specID string) []streamKey {
+	seen := map[streamKey]bool{}
+	var out []streamKey
+	add := func(k streamKey) {
+		if k.spec == specID && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for k := range s.pending {
+		add(k)
+	}
+	for k := range s.pendingDropped {
+		add(k)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].stream < out[j].stream })
+	return out
+}
+
+// queueLocked adds rec to unit k's live queue, but only while k's spec is
 // watched -- this is the "no traffic on an unwatched fleet" half of the
 // design. Past logPendingBytes the text is dropped and its length counted;
 // a MARKER is never dropped, because losing "the process exited, code 1" is
 // losing the very fact the operator is reading the stream to find.
-func (s *LogStore) queueLocked(specID string, rec logRecord) {
-	if !s.watching[specID] {
+func (s *LogStore) queueLocked(k streamKey, rec logRecord) {
+	if !s.watching[k.spec] {
 		return
 	}
-	if rec.event == "" && s.pendingBytes[specID]+rec.size() > logPendingBytes {
-		s.pendingDropped[specID] += int64(len(rec.text))
+	if rec.event == "" && s.pendingBytes[k]+rec.size() > logPendingBytes {
+		s.pendingDropped[k] += int64(len(rec.text))
 		return
 	}
-	q := s.pending[specID]
+	q := s.pending[k]
 	if rec.event == "" && len(q) > 0 {
 		last := &q[len(q)-1]
-		if last.event == "" && last.gen == rec.gen && len(last.text) < logCoalesceTarget {
+		if last.event == "" && last.gen == rec.gen && last.stream == rec.stream && len(last.text) < logCoalesceTarget {
 			last.text += rec.text
-			s.pendingBytes[specID] += len(rec.text)
+			s.pendingBytes[k] += len(rec.text)
 			return
 		}
 	}
-	s.pending[specID] = append(q, rec)
-	s.pendingBytes[specID] += rec.size()
+	s.pending[k] = append(q, rec)
+	s.pendingBytes[k] += rec.size()
 }
 
 // SetWatch replaces the set of specs whose output is streamed upward, and
@@ -724,7 +922,6 @@ func (s *LogStore) SetWatch(specIDs []string, epochs map[string]uint64) {
 		// one this epoch asks for, and half of it followed by half of a fresher
 		// one is the torn history the flags exist to prevent.
 		delete(s.scrollback, id)
-		delete(s.scrollbackDropped, id)
 		delete(s.scrollbackReady, id)
 		s.scrollbackDue[id] = s.watching[id]
 	}
@@ -773,20 +970,30 @@ func (s *LogStore) Retain(specIDs []string) {
 }
 
 // Drain takes what is queued for the watched specs, oldest first, and returns
-// it as at most one batch per spec. It is called on a fixed flush cadence by
-// the agent's run loop -- the SINGLE goroutine that writes to the gateway
-// WebSocket -- so the batching here is also the rate limit. Exactly what it
-// bounds, since the previous statement of it was false in two ways:
+// it as at most one batch per (spec, stream) unit. It is called on a fixed
+// flush cadence by the agent's run loop -- the SINGLE goroutine that writes to
+// the gateway WebSocket -- so the batching here is also the rate limit.
+// Exactly what it bounds, since the previous statement of it was false in two
+// ways:
 //
-//   - at most ONE batch per spec per interval, replay chunks included;
+//   - at most ONE batch per (spec, stream) unit per interval; a spec's history
+//     replay is ONE chunk per interval for the whole spec, every stream of it;
 //   - at most logDrainBudget bytes per interval of LIVE output across all
-//     specs, visited round-robin;
+//     units, visited round-robin;
 //   - plus at most maxLogBatchBytes of HISTORY REPLAY per interval, fleet-wide,
 //     in chunks of at most maxLogBatchBytes each. A replay is one-shot and only
 //     ever follows a viewer arriving, so it has its own budget rather than
 //     competing with live output for one -- but it is no longer unbounded,
 //     which is what made a full retention buffer produce a single frame the
 //     gateway could not read at all.
+//
+// THE UNIT IS (spec, stream), not spec (#430). Each unit has its own live
+// queue of at most logPendingBytes, so the load-bearing relation
+// logDrainBudget > logPendingBytes holds per unit exactly as it held per spec:
+// a unit's whole queue always fits a fresh drain's budget, so deferring rather
+// than tearing a batch can never strand one. A file at its read-rate cap fills
+// its own unit, and the process unit beside it is served from the same budget
+// in the same interval.
 //
 // THE SNAPSHOT IS TAKEN HERE, and the reason is the interaction between a
 // re-snapshot and the live queue. Everything queued for a spec at the instant
@@ -798,12 +1005,14 @@ func (s *LogStore) Retain(specIDs []string) {
 // goes out as an ordinary live batch (the watching viewer's stream is not
 // interrupted), the replay carries the same records as history for the arriving
 // one, and the gateway's per-subscriber routing keeps each from seeing the
-// other's copy. Nothing can land between the two.
+// other's copy. Nothing can land between the two. The cut covers every stream
+// of the spec, one live batch per unit that held anything.
 //
-// While a replay is in flight for a spec, that spec's live output WAITS behind
-// it -- torn history is a worse outcome than a delayed tail, and the wait is
-// bounded (the default 1 MiB buffer replays in about two flush intervals) and
-// honest (past the per-spec queue cap, bytes are dropped and counted).
+// While a replay is in flight for a spec, the live output of every one of its
+// streams WAITS behind it -- torn history is a worse outcome than a delayed
+// tail, and the wait is bounded (the default 1 MiB buffer replays in about two
+// flush intervals per full ring) and honest (past the per-unit queue cap,
+// bytes are dropped and counted).
 //
 // Returns nil when there is nothing to send, which on an unwatched fleet is
 // always.
@@ -814,34 +1023,39 @@ func (s *LogStore) Drain() []LogBatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ids := make([]string, 0, len(s.watching))
-	for id := range s.watching {
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
+	units := s.watchedUnitsLocked()
+	if len(units) == 0 {
 		return nil
 	}
-	sort.Strings(ids)
-	if s.rr >= len(ids) {
+	if s.rr >= len(units) {
 		s.rr = 0
 	}
-	ordered := append(append([]string(nil), ids[s.rr:]...), ids[:s.rr]...)
+	ordered := append(append([]streamKey(nil), units[s.rr:]...), units[:s.rr]...)
 	s.rr++
 
 	budget := logDrainBudget
 	replayBudget := maxLogBatchBytes
+	// replayed marks a spec whose replay (or the cut that precedes it) has had
+	// its turn this interval: its other units wait behind it.
+	replayed := map[string]bool{}
 	var out []LogBatch
-	for _, id := range ordered {
+	for _, k := range ordered {
+		id := k.spec
+		if replayed[id] {
+			continue
+		}
 		if hadViewer, due := s.scrollbackDue[id]; due {
-			if b, ok := s.startReplayLocked(id, hadViewer); ok {
-				// The queue held output an EXISTING viewer is still owed. It
-				// goes out as a live batch first; the replay begins next
+			if cut := s.startReplayLocked(id, hadViewer); len(cut) > 0 {
+				// The queues held output an EXISTING viewer is still owed. It
+				// goes out as live batches first; the replay begins next
 				// interval.
-				out = append(out, b)
+				out = append(out, cut...)
+				replayed[id] = true
 				continue
 			}
 		}
 		if s.scrollbackReady[id] {
+			replayed[id] = true
 			if replayBudget <= 0 {
 				// Another spec's replay has taken this interval's share. The
 				// rotation above brings this one round soon, and its snapshot
@@ -853,32 +1067,32 @@ func (s *LogStore) Drain() []LogBatch {
 			out = append(out, b)
 			continue
 		}
-		q := s.pending[id]
-		dropped := s.pendingDropped[id]
+		q := s.pending[k]
+		dropped := s.pendingDropped[k]
 		if len(q) == 0 && dropped == 0 {
 			continue
 		}
-		if s.pendingBytes[id] > budget && budget < logDrainBudget {
+		if s.pendingBytes[k] > budget && budget < logDrainBudget {
 			// Leave it queued for the next drain rather than tearing the
-			// batch: the rotation above guarantees this spec goes first soon,
-			// and the per-spec queue cap keeps the wait bounded (past it,
+			// batch: the rotation above guarantees this unit goes first soon,
+			// and the per-unit queue cap keeps the wait bounded (past it,
 			// bytes are dropped and counted, never silently lost).
 			//
 			// The `budget < logDrainBudget` half is what makes that promise
 			// unconditional: it means "something has already been taken this
-			// round". The FIRST spec of a round is served whatever its size,
+			// round". The FIRST unit of a round is served whatever its size,
 			// so a queue that somehow exceeded the full budget (marker records
-			// are admitted past the per-spec cap, by design, so that a
+			// are admitted past the per-unit cap, by design, so that a
 			// process-exit boundary can never be the thing that gets dropped)
 			// is drained rather than stuck forever.
 			continue
 		}
-		entries, rest, _ := takeChunk(id, q, dropped, maxLogBatchBytes)
-		budget -= s.pendingBytes[id]
-		delete(s.pendingDropped, id)
+		entries, rest, _ := takeStreamChunk(id, k.stream, q, dropped, maxLogBatchBytes)
+		budget -= s.pendingBytes[k]
+		delete(s.pendingDropped, k)
 		if rest == nil {
-			delete(s.pending, id)
-			delete(s.pendingBytes, id)
+			delete(s.pending, k)
+			delete(s.pendingBytes, k)
 		} else {
 			// A live queue over the frame cap is unreachable at the sizes
 			// queueLocked admits, but it is bounded by CONSTRUCTION rather than
@@ -889,73 +1103,144 @@ func (s *LogStore) Drain() []LogBatch {
 				kept += r.size()
 			}
 			budget += kept
-			s.pending[id] = rest
-			s.pendingBytes[id] = kept
+			s.pending[k] = rest
+			s.pendingBytes[k] = kept
 		}
 		out = append(out, LogBatch{SpecID: id, Entries: entries})
 	}
 	return out
 }
 
-// startReplayLocked snapshots specID's retained history and cuts its live queue
-// in one step -- see Drain for why those two must not be separable.
+// watchedUnitsLocked lists the (spec, stream) units Drain visits, sorted: the
+// process unit of every watched spec -- always, because that is where a due or
+// in-flight replay is found even when nothing is queued -- plus every unit of a
+// watched spec whose live queue holds anything.
+func (s *LogStore) watchedUnitsLocked() []streamKey {
+	seen := make(map[streamKey]bool, len(s.watching))
+	out := make([]streamKey, 0, len(s.watching))
+	add := func(k streamKey) {
+		if s.watching[k.spec] && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	for id := range s.watching {
+		add(streamKey{spec: id})
+	}
+	for k := range s.pending {
+		add(k)
+	}
+	for k := range s.pendingDropped {
+		add(k)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].spec != out[j].spec {
+			return out[i].spec < out[j].spec
+		}
+		return out[i].stream < out[j].stream
+	})
+	return out
+}
+
+// startReplayLocked snapshots specID's retained history and cuts the live queue
+// of every one of its streams in one step -- see Drain for why those two must
+// not be separable.
 //
 // What becomes of the cut depends on whether anyone was ALREADY watching this
-// spec. Everything the queue holds is also in the snapshot just taken (write
+// spec. Everything the queues hold is also in the snapshot just taken (write
 // appends to both, under this lock), so:
 //
 //   - a FIRST subscribe discards it: there is no viewer it belongs to, and the
 //     replay carries every one of those bytes as history;
-//   - a RE-snapshot, for a second viewer arriving, emits it as an ordinary live
-//     batch, returned here so the caller sends it before the replay begins.
-//     That is output the viewer already watching is still owed, and it must
-//     neither be dropped (a silent gap for them) nor left queued behind the
-//     replay (a duplicate of the replay's tail for the viewer arriving).
-func (s *LogStore) startReplayLocked(specID string, hadViewer bool) (LogBatch, bool) {
+//   - a RE-snapshot, for a second viewer arriving, emits it as ordinary live
+//     batches, one per unit that held anything, returned here so the caller
+//     sends them before the replay begins. That is output the viewer already
+//     watching is still owed, and it must neither be dropped (a silent gap for
+//     them) nor left queued behind the replay (a duplicate of the replay's
+//     tail for the viewer arriving).
+func (s *LogStore) startReplayLocked(specID string, hadViewer bool) []LogBatch {
 	delete(s.scrollbackDue, specID)
 	if l := s.logs[specID]; l != nil {
-		// A shallow copy: strings are immutable and trimLocked replaces rather
-		// than mutates them, so this shares the text with the retention buffer
-		// instead of duplicating a megabyte.
-		s.scrollback[specID] = append([]logRecord(nil), l.recs...)
-		s.scrollbackDropped[specID] = l.dropped
+		s.scrollback[specID] = l.snapshot()
 	}
 	s.scrollbackReady[specID] = true
 
-	q := s.pending[specID]
-	dropped := s.pendingDropped[specID]
-	delete(s.pending, specID)
-	delete(s.pendingBytes, specID)
-	delete(s.pendingDropped, specID)
-	if !hadViewer || (len(q) == 0 && dropped == 0) {
-		return LogBatch{}, false
-	}
-	// Chunked like any other batch; a remainder is dropped rather than requeued
-	// because the snapshot just taken contains every one of these records
-	// already, so the arriving viewer loses nothing and the watching one sees
-	// the same gap it would have seen from a full queue -- counted, not silent.
-	entries, rest, _ := takeChunk(specID, q, dropped, maxLogBatchBytes)
-	if len(rest) > 0 {
-		lost := int64(0)
-		for _, r := range rest {
-			lost += int64(len(r.text))
+	var out []LogBatch
+	for _, k := range s.unitsOfLocked(specID) {
+		q := s.pending[k]
+		dropped := s.pendingDropped[k]
+		delete(s.pending, k)
+		delete(s.pendingBytes, k)
+		delete(s.pendingDropped, k)
+		if !hadViewer || (len(q) == 0 && dropped == 0) {
+			continue
 		}
-		s.pendingDropped[specID] = lost
+		// Chunked like any other batch; a remainder is dropped rather than
+		// requeued because the snapshot just taken contains every one of these
+		// records already, so the arriving viewer loses nothing and the
+		// watching one sees the same gap it would have seen from a full queue
+		// -- counted, not silent.
+		entries, rest, _ := takeStreamChunk(specID, k.stream, q, dropped, maxLogBatchBytes)
+		if len(rest) > 0 {
+			lost := int64(0)
+			for _, r := range rest {
+				lost += int64(len(r.text))
+			}
+			s.pendingDropped[k] = lost
+		}
+		out = append(out, LogBatch{SpecID: specID, Entries: entries})
 	}
-	return LogBatch{SpecID: specID, Entries: entries}, true
+	return out
+}
+
+// snapshot is the record sequence a replay of l delivers: the process stream
+// first, then every file stream by name, each in its own order. It is a
+// shallow copy: strings are immutable and trimRing replaces rather than
+// mutates them, so this shares the text with the retention rings instead of
+// duplicating megabytes.
+//
+// Each ring's eviction count is stamped onto that ring's FIRST record -- it
+// means "bytes of this stream missing immediately before this entry", and only
+// the head of a stream has its evicted bytes in front of it -- or, for a ring
+// left with no records at all, onto a gap-only record of its own. Either way
+// it appears exactly once in the sequence and names its stream, which is what
+// keeps a replay's gaps on the first chunk that reaches each stream and never
+// repeated.
+func (l *specLog) snapshot() []logRecord {
+	names := make([]string, 0, len(l.streams))
+	n := 0
+	for name, r := range l.streams {
+		names = append(names, name)
+		n += len(r.recs) + 1
+	}
+	sort.Strings(names) // "" -- the process stream -- sorts first
+	out := make([]logRecord, 0, n)
+	for _, name := range names {
+		r := l.streams[name]
+		start := len(out)
+		out = append(out, r.recs...)
+		if r.dropped <= 0 {
+			continue
+		}
+		if len(out) > start {
+			out[start].dropped += r.dropped
+		} else {
+			out = append(out, logRecord{stream: name, dropped: r.dropped})
+		}
+	}
+	return out
 }
 
 // replayChunkLocked emits the next chunk of specID's in-flight history replay,
 // flagging More while any of it is left, and reports the wire bytes it used
 // against the caller's fleet-wide replay budget. Every chunk carries Scrollback:
 // it is the gateway's routing key for "this is history, for whoever asked for
-// it".
+// it". The chunk may span streams; every entry names its own.
 func (s *LogStore) replayChunkLocked(specID string) (LogBatch, int) {
-	entries, rest, used := takeChunk(specID, s.scrollback[specID], s.scrollbackDropped[specID], maxLogBatchBytes)
-	// The eviction count belongs to the FIRST chunk only: it means "bytes
-	// missing immediately before this entry", and only the head of the history
-	// has anything missing in front of it.
-	delete(s.scrollbackDropped, specID)
+	// No batch-level drop: each stream's eviction count rides on that
+	// stream's first record (snapshot), so it belongs to whichever chunk
+	// carries that record -- once, and never a later chunk.
+	entries, rest, used := takeStreamChunk(specID, "", s.scrollback[specID], 0, maxLogBatchBytes)
 	if rest == nil {
 		delete(s.scrollback, specID)
 		delete(s.scrollbackReady, specID)
@@ -971,21 +1256,25 @@ func (s *LogStore) replayChunkLocked(specID string) (LogBatch, int) {
 // written again, exactly like the immutable strings beside it, so the same
 // reasoning that makes the shallow scrollback snapshot safe applies here.
 func entryOf(r logRecord) LogEntry {
-	return LogEntry{PID: r.pid, At: r.at, Text: r.text, Event: r.event, ExitCode: r.exitCode, Command: r.command, Instance: r.instance}
+	return LogEntry{
+		PID: r.pid, At: r.at, Text: r.text, DroppedBytes: r.dropped, Event: r.event,
+		ExitCode: r.exitCode, Command: r.command, Instance: r.instance, Stream: r.stream,
+	}
 }
 
-// withDropped attaches dropped (bytes lost immediately BEFORE the first entry)
-// to that first entry. A non-zero drop with no entries still produces one: the
-// loss is the whole message, and swallowing it would turn a gap back into
-// silence.
-func withDropped(out []LogEntry, dropped int64) []LogEntry {
+// withDropped attaches dropped (bytes of stream lost immediately BEFORE the
+// first entry) to that first entry, which in a live batch is always of the same
+// stream. A non-zero drop with no entries still produces one, naming the
+// stream: the loss is the whole message, and swallowing it would turn a gap
+// back into silence.
+func withDropped(out []LogEntry, stream string, dropped int64) []LogEntry {
 	if dropped <= 0 {
 		return out
 	}
 	if len(out) == 0 {
-		return []LogEntry{{DroppedBytes: dropped}}
+		return []LogEntry{{DroppedBytes: dropped, Stream: stream}}
 	}
-	out[0].DroppedBytes = dropped
+	out[0].DroppedBytes += dropped
 	return out
 }
 
@@ -1007,11 +1296,19 @@ func withDropped(out []LogEntry, dropped int64) []LogEntry {
 // because its size is bounded by maxResolvedCommandBytes (16 KiB) plus its
 // envelope, two orders below the limit.
 func takeChunk(specID string, recs []logRecord, dropped int64, limit int) (entries []LogEntry, rest []logRecord, used int) {
+	return takeStreamChunk(specID, "", recs, dropped, limit)
+}
+
+// takeStreamChunk is takeChunk for a batch whose leading drop (if any) belongs
+// to stream: the gap-only entry it may synthesize names that stream. The
+// records themselves may be of any stream (a replay spans them all); each
+// entry names its own.
+func takeStreamChunk(specID, stream string, recs []logRecord, dropped int64, limit int) (entries []LogEntry, rest []logRecord, used int) {
 	fixed := logBatchWireOverhead + jsonStringMaxBytes(specID)
 	if dropped > 0 {
 		// withDropped synthesizes an entry when there is nothing to stamp the
 		// loss onto, so the room for one has to be reserved before the loop.
-		fixed += logEntryWireOverhead
+		fixed += logEntryWireOverhead + streamWireMax(stream)
 	}
 	budget := limit - fixed
 	taken := 0
@@ -1048,7 +1345,7 @@ func takeChunk(specID string, recs []logRecord, dropped int64, limit int) (entri
 	}
 	// budget started at limit-fixed and lost one entry's cost at a time, so
 	// what is left says exactly how much wire this chunk came to.
-	return withDropped(entries, dropped), rest, limit - budget
+	return withDropped(entries, stream, dropped), rest, limit - budget
 }
 
 // splitRecord cuts as much of r's text as fits budget off the front, returning
@@ -1081,6 +1378,9 @@ func splitRecord(r logRecord, budget int) (head, tail logRecord, ok bool) {
 	}
 	head, tail = r, r
 	head.text, tail.text = r.text[:n], r.text[n:]
+	// A gap is in front of the record's text, i.e. in front of the head; the
+	// tail continues the text directly and has nothing missing before it.
+	tail.dropped = 0
 	return head, tail, true
 }
 
@@ -1118,7 +1418,19 @@ func entryWireMax(r logRecord) int {
 	if r.event != "" {
 		n += jsonStringMaxBytes(r.event)
 	}
-	return n + commandWireMax(r.command)
+	return n + streamWireMax(r.stream) + commandWireMax(r.command)
+}
+
+// streamWireMax is an upper bound on what an entry's "stream" field costs:
+// nothing when it is the process stream (omitted), else the key, its
+// punctuation and the measured name. Measured rather than folded into
+// logEntryWireOverhead, so the bound does not depend on the name-length rule
+// being enforced somewhere else.
+func streamWireMax(stream string) int {
+	if stream == "" {
+		return 0
+	}
+	return len(`,"stream":`) + jsonStringMaxBytes(stream)
 }
 
 // commandWireMax is an upper bound on the bytes a ResolvedCommand costs as an
@@ -1169,22 +1481,30 @@ func jsonByteMaxBytes(c byte) int {
 	}
 }
 
-// tail returns the last n bytes of text written by generation gen, ignoring
-// markers and every other generation -- the exact semantics
-// LastError.StderrTail had when the buffer still belonged to one process, now
-// that the buffer spans all of them.
+// tail returns the last n bytes of PROCESS OUTPUT written by generation gen,
+// ignoring markers, every other generation and every log-file stream -- the
+// exact semantics LastError.StderrTail had when the buffer still belonged to
+// one process. The process stream is named explicitly: file text of the same
+// generation must never leak into stderr_tail.
 func (s *LogStore) tail(specID string, gen uint64, n int) string {
+	return s.tailStream(specID, "", gen, n)
+}
+
+// tailStream returns the last n bytes of text generation gen wrote on stream
+// of specID, ignoring markers and every other generation: tail for any
+// stream, which is what a log file's entry in last_error is cut from.
+func (s *LogStore) tailStream(specID, stream string, gen uint64, n int) string {
 	if s == nil || n <= 0 {
 		return ""
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	l := s.logs[specID]
-	if l == nil {
+	if l == nil || l.streams[stream] == nil {
 		return ""
 	}
 	var b strings.Builder
-	for _, r := range l.recs {
+	for _, r := range l.streams[stream].recs {
 		if r.gen == gen && r.event == "" {
 			b.WriteString(r.text)
 		}
@@ -1214,6 +1534,12 @@ func (s *LogStore) tail(specID string, gen uint64, n int) string {
 // midLine is whether the generation's last write ended inside a line, so the
 // next byte continues that line rather than opening a new one; it is guarded
 // by the store's mutex like everything else a write touches.
+//
+// stream is the stream this writer records on (#430): "" for the process
+// output exec.Cmd is handed, a declared log file's name for a sibling made by
+// ForStream. Each sibling is its own procLog, so it has its own line state
+// (midLine), and everything it writes goes through the same LogStore.write as
+// the process output.
 type procLog struct {
 	store    *LogStore
 	specID   string
@@ -1222,6 +1548,27 @@ type procLog struct {
 	instance int
 	prefix   string
 	midLine  bool
+	stream   string
+}
+
+// ForStream returns a sibling of p that records on the stream name: the same
+// store, spec, generation, instance and line prefix, so a file's text is
+// attributed exactly like the process output of the same generation, but its
+// own line state and its own ring, live queue and gap count. It carries no
+// pid -- a file is not the process's pipe -- so its text and markers have pid
+// 0. The log-file tailer of one generation and declared file writes through
+// it.
+func (p *procLog) ForStream(name string) *procLog {
+	return &procLog{store: p.store, specID: p.specID, gen: p.gen, instance: p.instance, prefix: p.prefix, stream: name}
+}
+
+// Mark records the typed event (one of the logEventFile* constants) on p's
+// stream, at its exact position among that stream's text: no pid, no command,
+// no exit code. The portal owns the wording.
+func (p *procLog) Mark(event string) {
+	if p.store != nil {
+		p.store.mark(p, 0, event, 0, nil)
+	}
 }
 
 // Write implements io.Writer. It never returns an error: there is no failure
@@ -1296,13 +1643,14 @@ func (p *procLog) Exited(exitCode int) {
 	}
 }
 
-// Tail returns the last n bytes THIS generation wrote (see LogStore.tail) --
-// the bounded snapshot that becomes LastError.StderrTail. Its output must
-// not be persisted anywhere durable; the gateway keeps it in volatile memory
-// only, exactly like the rest of this path.
+// Tail returns the last n bytes THIS generation wrote on p's stream (see
+// LogStore.tailStream) -- for the process writer, the bounded snapshot that
+// becomes LastError.StderrTail. Its output must not be persisted anywhere
+// durable; the gateway keeps it in volatile memory only, exactly like the rest
+// of this path.
 func (p *procLog) Tail(n int) string {
 	if p.store == nil {
 		return ""
 	}
-	return p.store.tail(p.specID, p.gen, n)
+	return p.store.tailStream(p.specID, p.stream, p.gen, n)
 }

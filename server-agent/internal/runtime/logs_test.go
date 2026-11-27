@@ -61,7 +61,9 @@ func TestLogCapacityClamping(t *testing.T) {
 	}{
 		{"zero means default", 0, 0, DefaultLogBufferBytes, DefaultLogBufferTotalBytes},
 		{"too small per-spec is raised", 1024, 0, minLogBufferBytes, DefaultLogBufferTotalBytes / minLogBufferBytes * minLogBufferBytes},
-		{"total below per-spec keeps one buffer", 1 << 20, 4096, 1 << 20, 1 << 20},
+		// The total is raised to fit one spec's process ring plus four log-file
+		// rings at the 64 KiB floor (#430), no longer to just one buffer.
+		{"total below per-spec keeps one buffer", 1 << 20, 4096, 1 << 20, 1<<20 + 4*minLogBufferBytes},
 		{"negative means default", -5, -5, DefaultLogBufferBytes, DefaultLogBufferTotalBytes},
 	}
 	for _, c := range cases {
@@ -347,19 +349,30 @@ func TestLogPendingOverflowReportsDroppedBytes(t *testing.T) {
 // for: the per-spec capacity is not the memory number, the TOTAL is, and it is
 // enforced by dropping whole spec buffers -- least-recently-written first, and
 // never one someone is watching while an unwatched one is available.
+//
+// The total is a BYTE bound since #430, not a count of buffers, so each spec
+// fills its buffer for the ceiling to bite, and per is 4*64 KiB so that per*2
+// is not raised by the rule that fits four log-file rings (per + 4*64 KiB).
 func TestLogTotalCeilingEvictsSpecBuffers(t *testing.T) {
-	const per = minLogBufferBytes
+	const per = 4 * minLogBufferBytes
 	s := newTestLogStore(t, per, per*2) // room for exactly two spec buffers
+	fill := strings.Repeat("f", 4096)
+	write := func(p *procLog, id string) {
+		for range per / len(fill) {
+			p.Write([]byte(fill))
+		}
+		p.Write([]byte(id + "-output"))
+	}
 
 	for _, id := range []string{"old", "mid"} {
 		p := s.newProc(id)
 		p.Started(1, ResolvedCommand{})
-		p.Write([]byte(id + "-output"))
+		write(p, id)
 	}
 	// A third spec must push the least-recently-written one out.
 	third := s.newProc("new")
 	third.Started(1, ResolvedCommand{})
-	third.Write([]byte("new-output"))
+	write(third, "new")
 
 	s.SetWatch([]string{"old", "mid", "new"}, nil)
 	batches := s.Drain()
@@ -814,7 +827,7 @@ func TestLogCommandIsChargedAgainstTheBufferCapacity(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	got := s.logs["spec-a"].bytes
+	got := s.logs["spec-a"].streams[""].bytes // the markers live in the process stream (#430)
 	s.mu.Unlock()
 	if got > s.perSpec {
 		t.Fatalf("retained bytes = %d, want at most the per-spec capacity %d -- a command must be charged like text", got, s.perSpec)
