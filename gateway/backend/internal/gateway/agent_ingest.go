@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // agentIngestPortal is the narrow slice of portal.API this file's handlers
@@ -157,6 +158,10 @@ type agentRuntimeError struct {
 	Failures   int       `json:"failures"`
 	StderrTail string    `json:"stderr_tail,omitempty"`
 	Code       string    `json:"code,omitempty"`
+	// LogFileTails mirrors the agent's last_error.log_file_tails (#430): the
+	// tail of each declared log file at the failure. Same RAM-only rule as
+	// StderrTail; clamped by clampRuntimeLogFileTails.
+	LogFileTails []RuntimeLogFileTailDTO `json:"log_file_tails,omitempty"`
 }
 
 // agentRuntimeCapabilityVerdict is one capability's answer inside an
@@ -600,6 +605,50 @@ func clampRuntimeStderrTail(s string) string {
 	return s
 }
 
+// maxRuntimeLogFileTails bounds the number of log file tails on one last_error:
+// the most log files a spec may declare.
+const maxRuntimeLogFileTails = 4
+
+// clampRuntimeLogFileTails bounds an agent-reported log_file_tails list: entries
+// whose name is not a valid log file name, is the reserved "process", or repeats
+// an earlier name (case-insensitively) are dropped, at most
+// maxRuntimeLogFileTails are kept, and each tail is cut to its LAST
+// maxRuntimeStderrTail bytes on a rune boundary -- the end of a log is what
+// explains a crash. It returns a fresh slice (nil for none), so the decoded
+// input is never shared.
+func clampRuntimeLogFileTails(in []RuntimeLogFileTailDTO) []RuntimeLogFileTailDTO {
+	var out []RuntimeLogFileTailDTO
+	seen := make(map[string]struct{}, maxRuntimeLogFileTails)
+	for _, t := range in {
+		if len(out) == maxRuntimeLogFileTails {
+			break
+		}
+		key := strings.ToLower(t.Name)
+		if !validLogStreamName(t.Name) || key == "process" {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, RuntimeLogFileTailDTO{Name: t.Name, Tail: tailBytesOnRuneBoundary(t.Tail, maxRuntimeStderrTail)})
+	}
+	return out
+}
+
+// tailBytesOnRuneBoundary returns the last at most n bytes of s, starting on a
+// rune boundary (so it may be a few bytes shorter than n).
+func tailBytesOnRuneBoundary(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[len(s)-n:]
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
+	}
+	return s
+}
+
 // runtimeStatusDTOsFromSamples maps the wire-decoded runtime samples to the
 // registry's RuntimeStatusDTO, clamping each LastError's stderr tail and
 // always returning a non-nil slice (a nil req.Runtimes -- a legacy agent, or
@@ -663,12 +712,13 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 		}
 		if rt.LastError != nil {
 			dto.LastError = &RuntimeErrorDTO{
-				Message:    rt.LastError.Message,
-				At:         rt.LastError.At,
-				ExitCode:   rt.LastError.ExitCode,
-				Failures:   rt.LastError.Failures,
-				StderrTail: clampRuntimeStderrTail(rt.LastError.StderrTail),
-				Code:       rt.LastError.Code,
+				Message:      rt.LastError.Message,
+				At:           rt.LastError.At,
+				ExitCode:     rt.LastError.ExitCode,
+				Failures:     rt.LastError.Failures,
+				StderrTail:   clampRuntimeStderrTail(rt.LastError.StderrTail),
+				Code:         rt.LastError.Code,
+				LogFileTails: clampRuntimeLogFileTails(rt.LastError.LogFileTails),
 			}
 		}
 		out = append(out, dto)

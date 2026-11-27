@@ -2834,6 +2834,23 @@ describe('resolved-command masking strings state their own scope', () => {
     }
   });
 
+  it('states the output masking of agents from 0.26.0 with its limits, never as a blanket claim', () => {
+    // #430 §8 (secret_mask.go): an agent >= 0.26.0 replaces literal occurrences
+    // of its own resolved secrets of at least 8 bytes in process output and log
+    // files. The sentence must neither deny that (the old "nothing the agent
+    // does can mask" wording) nor overclaim it: encoded forms and older agents
+    // stay unmasked, and both locales have to say so.
+    for (const m of [messages.en, messages.de]) {
+      expect(m.runtimeCommandMasked).toContain('0.26.0');
+      expect(m.runtimeCommandMasked).toMatch(/8 Bytes/i);
+      expect(m.runtimeCommandMasked).toMatch(/base64/i);
+    }
+    expect(messages.en.runtimeCommandMasked).not.toMatch(/nothing the agent does can mask/i);
+    expect(messages.de.runtimeCommandMasked).not.toMatch(/kann der Agent nicht maskieren/i);
+    expect(messages.en.runtimeCommandMasked).toMatch(/older agent/i);
+    expect(messages.de.runtimeCommandMasked).toMatch(/älterer Agent/i);
+  });
+
   it('gives the file-mode env redaction a sentence of its own, in both locales', () => {
     // A different reason for withholding -- the agent's specs come from a local
     // document the gateway does not own -- and a different mask. Selecting the
@@ -4863,6 +4880,54 @@ describe('realtime capability i18n keys', () => {
       expect(note).toContain('--enable-realtime');
       expect(note).toContain('/v1/realtime');
       expect(note).toContain('realtime');
+    }
+  });
+});
+
+describe('runtime log files i18n keys (#430)', () => {
+  it('defines all log-files keys in de and en', () => {
+    const keys = [
+      'runtimeSpecLogFiles',
+      'runtimeSpecLogFilesHint',
+      'runtimeSpecLogFileName',
+      'runtimeSpecLogFileNamePlaceholder',
+      'runtimeSpecLogFilePath',
+      'runtimeSpecLogFilePathPlaceholder',
+      'runtimeSpecLogFileAdd',
+      'runtimeSpecLogFileRemove',
+      // One per LogFileIssue.
+      'runtimeSpecLogFileNameBlank',
+      'runtimeSpecLogFileNameInvalid',
+      'runtimeSpecLogFileNameReserved',
+      'runtimeSpecLogFileNameDuplicate',
+      'runtimeSpecLogFilePathBlank',
+      'runtimeSpecLogFilePathTooLong',
+      'runtimeSpecLogFilePathControl',
+      'runtimeSpecLogFilePathSecret',
+      'runtimeSpecLogFilePathNotAbsolute',
+      'runtimeSpecLogFilePathIsConfigFile',
+      'runtimeSpecAgentNoLogFiles',
+      'runtimeParseErrorInvalidLogFiles',
+      'strataImportWarnEngineLogNeedsAgent',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.en.runtimeSpecAgentNoLogFiles).toContain('0.26.0');
+    expect(messages.de.runtimeSpecAgentNoLogFiles).toContain('runtime_log_files');
+  });
+
+  it('suggests a log path directly in ${CONFIG_DIR}', () => {
+    // The agent removes and tails from offset 0 only a file directly in the
+    // instance's ${CONFIG_DIR}, and it creates no subdirectory there: a file
+    // in a subdirectory would be read from its end and never removed.
+    for (const locale of ['de', 'en'] as const) {
+      const placeholder = messages[locale].runtimeSpecLogFilePathPlaceholder;
+      expect(placeholder).toContain('${CONFIG_DIR}/server.log');
+      expect(placeholder).not.toContain('/logs/');
     }
   });
 });

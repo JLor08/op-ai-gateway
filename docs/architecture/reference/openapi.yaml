@@ -6274,6 +6274,18 @@ components:
                   exit_code: { type: integer }
                   failures: { type: integer }
                   stderr_tail: { type: string }
+                  code: { type: string }
+                  log_file_tails:
+                    type: array
+                    description: >
+                      The end of each declared log file of the failed generation
+                      (#430, agent 0.26.0): at most four entries, each tail at most
+                      2048 bytes. Volatile, never persisted.
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        tail: { type: string }
     ModelImageOptions:
       type: object
       description: >

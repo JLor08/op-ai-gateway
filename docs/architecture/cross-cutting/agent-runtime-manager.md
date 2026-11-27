@@ -238,6 +238,100 @@ work-dir containment stays defence in depth.
 restrictive (the binary subtrees, plus R2's empty case) — the same flip adding
 the first `runtime_allowed_dirs` entry causes.
 
+#### 3.1.3 `runtime_allowed_log_dirs`: which files the agent may read
+
+A spec may name log files for the agent to tail (`log_files`,
+[§14.9](#149-log-files)). That is the first time the agent **reads a file the
+gateway chose**, so the path policy for it is a security boundary, not the
+defence in depth that `work_dir` containment is
+([ADR-121](../09-architecture-decisions.md#adr-121--the-agent-may-read-files-the-gateway-names-under-these-rules)).
+The gateway names a path; the agent alone decides whether it may open it
+(`server-agent/internal/runtime/logfile_policy.go`).
+
+**The allowed roots.** A declared file is tailable only strictly below one of
+these (`strictlyWithinDir`: a root itself is never a file):
+
+- the instance's own `${CONFIG_DIR}`, `<config_files_dir>/<spec-id>` or
+  `…/<spec-id>#<k>` (`instanceConfigDir`), always;
+- an entry of `runtime_allowed_log_dirs` / `OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS`
+  (`config.Config.RuntimeAllowedLogDirs`, handed to `LocalPolicy.AllowedLogDirs`).
+  It is agent-local like the other allowlists: file or environment, **no flag
+  form**, never gateway-supplied. Its entry syntax is `runtime_allowed_dirs`'s
+  (a bare entry or a trailing `/*` / `\*` is the subtree, `allowedDirBase`);
+  `nativeLogRoots` drops a relative entry, the empty base of a bare `*` and a UNC
+  base, and the agent logs a startup warning for a relative entry
+  (`allowlistEntryWarning`, `isAbsoluteLogDirEntry`). `wsl://` entries are
+  split off for `wsl` specs (§3.8).
+
+**Empty means `${CONFIG_DIR}` only.** `runtime_allowed_dirs` is deliberately not
+reused: empty there means *any* `work_dir`, which here would mean *any file*,
+and a work dir is only defence in depth behind an allowlisted binary, while
+this list is the boundary itself.
+
+**The lexical half** (`LocalPolicy.resolveLogFile`) expands the path with the
+non-secret placeholders only (`expandNonSecretText`, surface
+`surfaceLogFilePath`; `${API_TOKEN}` and every `${AGENT_ENV…}` spelling are
+errors, and `${CONFIG_DIR}` keeps its native separators), then refuses: a UNC
+or device path in either spelling (`hasTwoLeadingSeparators`), a path that is
+not absolute, anything under `/proc`, `/sys` or `/dev` (`underPseudoFS`), a path
+outside every root, and, for a Windows path, a reserved device name, an
+alternate data stream, or a name ending in a dot or space below the root
+(`windowsNameRefused`). The part below the matched root must be
+`filepath.IsLocal`, so a `..` cannot climb out.
+
+**The anchored half** (`openLogFile`) is what makes containment hold against a
+server that controls the files. The open goes through an `os.Root` at the root
+the path matched (`openLogRoot`), and the relative rest is opened **inside** it
+(`openInRoot`). `os.Root` walks one component at a time from the root's handle:
+it follows a symlink only while the link stays below the root, refuses an
+absolute link (even one that points inside the root), a junction (its target is
+absolute), and a `..` that climbs out, so a parent directory swapped for a link
+mid-walk cannot lead outside. Only the matched root is open, so a link from one
+allowed root into another is refused too (fail closed). The instance's
+`${CONFIG_DIR}` counts as a root only while it is a **real directory chain**
+below `config_files_dir`: `openInstanceRoot` opens the base and walks down on
+directory handles, refusing a symlink, junction or other reparse point
+(`openRealSubdir`, `isRealDir`), so a server that replaces its own instance
+directory with a link to `/etc` gets a refusal, not a new root. The platform
+open never blocks (`O_NONBLOCK|O_NOCTTY` on Unix, cleared once the descriptor
+is a regular file) and accepts only a regular file (a pre-open `Root.Stat` and
+the descriptor's `fstat` on Unix; `GetFileType` `FILE_TYPE_DISK` plus the stat
+on Windows). On Windows `Root.OpenFile` opens with
+`FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE`, so the tail never stops
+the server from writing, renaming or deleting its log.
+
+**Hard links.** An inside name of an outside file passes every walk, so after
+the open `bindOpenedLogFile` requires the descriptor's link count to be exactly
+1 (`openedLinkCount`: `Nlink` on Unix, `NumberOfLinks` on Windows) and then
+observes the name **once more** through the same root (`statLogFileName`): it
+must be the same file as the descriptor (`os.SameFile`; volume serial and file
+index on Windows), a regular file, with one link. A file with more than one
+link is refused. The residual window is stated in `openLogFile`'s doc: the
+lookup of the last component and the read of its link count are separate steps
+(inside the kernel on Unix, two calls on one handle on Windows), so a name can
+change between them. Exploiting it needs a server that can create and remove a
+hard link to an outside file it could not read itself (macOS, or Linux without
+`fs.protected_hardlinks`).
+
+**Outcomes.** A name that is missing, or that is removed, rotated or replaced
+between the open and the binding, is `errLogFileVanished`, an
+`fs.ErrNotExist` that the tailer retries like a file not created yet. An escape,
+a second link or a file that is not regular wraps `errLogFileNotPermitted`.
+Every refusal that leaves the agent names the setting
+(`logFileSettingNames`) and a count of roots, **never a path**; the paths go to
+the agent's own log (`slog.Warn`), the rule of every policy refusal (§3.1). The
+policy runs on **every** open, including the probe of every poll and the reopen
+after a rotation (§14.9), because the file behind the name can change.
+
+**What was not run.** The Windows half (`logfile_open_windows.go`, and the tests
+in `logfile_policy_windows_test.go`, which build only on Windows) compiles and
+passes `GOOS=windows go vet`, but CI has no Windows job and none of it has run on
+a Windows host yet: the share mode, the junction and reparse-point refusals,
+`NumberOfLinks` and `FILE_TYPE_DISK` are proven only by reading the Go standard
+library's `os.Root` implementation and the Win32 documentation. The lexical
+Windows rules (`windowsNameRefused`, `windowsDirKey`, `relWithinWindowsDir`) are
+pure string logic and are tested on Linux.
+
 ### 3.2 Placeholders, and why no secret enters the gateway
 
 A spec's `env` values are **referential placeholders** resolved on the AI
@@ -249,7 +343,11 @@ cannot set it. Two channels can still carry a **resolved** value upward, both
 arising on the agent side and both stated in §8.3: a **literal** secret written
 into `args` rather than referenced as `${AGENT_ENV:NAME}`, and a child that
 prints its own argv or environment into the output that
-`last_error.stderr_tail` samples. The third place a resolved value could have
+`last_error.stderr_tail` samples. Since agent 0.26.0 the second is narrowed, not
+closed: literal occurrences of the generation's own resolved secrets are masked
+in the output before it is retained
+([below](#resolved-secrets-are-masked-in-the-output-too-agent-0260)). The third
+place a resolved value could have
 travelled — the launch command the log stream reports — masks every
 placeholder-derived value by recorded provenance instead
 ([§14.7](#147-the-resolved-command-what-actually-ran)).
@@ -683,8 +781,11 @@ via an environment variable, so Args exists only for a backend that takes it
 exclusively as a flag. A value there is readable by any co-tenant process on
 the agent host via the process listing, and a model server that echoes its
 own argv at startup can put it in the very output the agent's `stderr_tail`
-capture samples (§8.3) — the agent's masking of the *reported command*
-cannot reach either channel. The portal surfaces this as a loud, non-blocking
+capture samples (§8.3). The agent's masking of the *reported command* cannot
+reach either channel; its output masking (agent 0.26.0, below) catches a
+literal startup echo of the resolved token, but not the process listing and not
+an encoded echo. The
+portal surfaces this as a loud, non-blocking
 warning rather than a refusal, on the same reasoning `${AGENT_ENV:NAME}`'s
 own Args exception already accepts (ADR-027): the operator keeps the
 fallback, informed of its cost.
@@ -709,6 +810,50 @@ replaced an earlier, unworkable design that keyed the warning off
 
 Capability flag `runtime_api_token` (`Since: "0.5.0"`) marks an agent that
 understands `${API_TOKEN}` at all; see [§7](#7-feature-negotiation).
+
+#### Resolved secrets are masked in the output too (agent 0.26.0)
+
+A model server that prints its own argv or environment at startup used to put
+every value the agent resolved into the output that the log view and
+`last_error.stderr_tail` carry. Since agent 0.26.0 the agent masks **literal
+occurrences of the secrets it resolved itself**, in process output and in the
+text of every declared log file alike (#430, `server-agent/internal/runtime/secret_mask.go`):
+
+- **What.** Exactly the values this generation substituted for `${API_TOKEN}`
+  and `${AGENT_ENV:NAME}`, taken from the launch's recorded secret spans
+  (`newSecretMasker` over the `expandedSpec`'s `argSpans` and `envSpans`), each
+  replaced by the placeholder that produced it, the same text the resolved
+  command shows (§14.7). Plain `env` and argument values and the agent-computed
+  placeholders (`${PORT}`, `${MODEL}`, …) are not masked: `CUDA_VISIBLE_DEVICES=0`
+  would otherwise mask every `0`. Values shorter than **8 bytes**
+  (`minMaskedSecretLen`) are skipped, because they would shred the output.
+  Overlapping and adjacent matches merge into one masked span, rendered as one
+  placeholder, so no byte of any matched value stays in clear.
+- **Where.** In `LogStore.write`, before the ring, under the store's lock
+  (`secretMasker.mask`). The ring, the live stream, `stderr_tail` and
+  `log_file_tails` therefore only ever hold masked text — the same
+  "what is retained is already masked" rule as the resolved command. The gateway
+  does not re-mask, for the reason §14.7 gives.
+- **Split across reads.** Each stream keeps a carry (`maskCarry`) of only the
+  longest suffix that could still begin a secret, never splitting a UTF-8
+  character, so the result is the same however the output is chunked, and live
+  delivery lags by at most those bytes. The carry is resolved at the end of a
+  stream (`procLog.Flush`: process exit, a tailer's stop, a rotation or
+  truncation). At a cut the log-file tailer makes itself (a line cut, a skip past
+  its read-rate cap, §14.9) the carry is **discarded** and counted as dropped
+  (`procLog.DiscardCarry`), because resolving it there would write the first
+  part of a secret that straddles the cut in clear.
+- **What it does not catch**, stated in the code as well: an encoded form (URL- or
+  JSON-escaped, base64, hex), a value the child splits across lines or
+  interleaves with other text, a value shorter than 8 bytes, a literal secret
+  typed into the spec (it was never resolved), any secret the child obtained in
+  another way, and everything an agent older than 0.26.0 sends. It is a guard
+  against the common case, a server echoing its own argv or environment, not a
+  data-loss filter. Operator guidance is unchanged: a secret goes into `env` as
+  `${AGENT_ENV:NAME}`.
+
+The masking is agent-local and needs no feature flag: a current gateway simply
+receives masked text where it received the value before.
 
 ### 3.3 `set_visible_devices`: turning the GPU list into an enforcement
 
@@ -1631,7 +1776,14 @@ a small expander over the **same resolver** the `args`/`env` pass uses
 (`resolveNonSecretToken`), restricted to the **non-secret** tokens: `${PORT}`,
 `${MODEL}`, `${HOST_GPU_IDS}`, `${HOST_GPU_IDS_MAIN_LAST}`, `${CUDA_DEVICES}`, `${VULKAN_DEVICES}`,
 `${METAL_DEVICES}` and `${CONFIG_DIR}`, each meaning exactly what it means on the
-command line. `${API_TOKEN}` and any `${AGENT_ENV…}` spelling are **hard
+command line — with one difference in spelling: on a **Windows** agent,
+`${CONFIG_DIR}` in **content** resolves with forward slashes (`C:/…/<spec-id>`),
+because the native `C:\…` form is invalid inside a JSON string (`\U` and `\s` are
+not JSON escapes) and Win32 file APIs, Python and the common config formats
+accept forward slashes (`contentPathsUseSlashes`, applied in
+`expandNonSecretText` to the `surfaceConfigFileContent` surface only). In `args`,
+`env` and a declared log file's path it keeps the native form, and a `wsl` spec
+resolves to a POSIX path either way. `${API_TOKEN}` and any `${AGENT_ENV…}` spelling are **hard
 errors** in content, as is a `PORT`-prefixed near-miss; every other `${…}`
 passes through literally, so a server's own templating survives. The expander is
 deliberately not `expandSpec`: that function *resolves* the two secret
@@ -1656,13 +1808,19 @@ Shortened, with the paths redacted, the stored content looks like this:
   "layer_split": "auto",
   "vram_reserve_mib": 700,
   "engine_ready_s": 1845,
+  "log": "${CONFIG_DIR}/engine.log",
   "model_name": "${MODEL}",
   "gpu_order": "as_given"
 }
 ```
 
 `model_name` is `${MODEL}`, so the id Strata lists can never drift from the mapping's
-upstream model, and the card order is the file's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` (`strata serve` has no `--gpu` flag): the import drops the source's `gpu`,
+upstream model, and, when the server's agent declares `runtime_log_files`, the import
+rewrites the source's `log` to `${CONFIG_DIR}/engine.log` and declares that file as the
+spec's log file `engine` (below and §14.9); on a Windows agent the forward-slash
+`${CONFIG_DIR}` above is what keeps this JSON valid. An older agent writes the native
+`C:\…` form there, which is invalid JSON, so for it the import keeps `log` as written
+(§7.1). The card order is the file's `"gpu": "${HOST_GPU_IDS_MAIN_LAST}"` (`strata serve` has no `--gpu` flag): the import drops the source's `gpu`,
 `gpu_roles`, `gpu_cards` and `gpu_order`, writes that `gpu` (none when the source named no cards) and sets `"gpu_order": "as_given"`. The key is
 never in the file; it travels as `STRATA_API_KEY=${API_TOKEN}` in `env`, and every key named
 `api_key` (any case, at any depth, e.g. inside `vision`, whatever its value) in the pasted
@@ -1707,6 +1865,53 @@ step that can fail for an environmental reason (an unwritable directory, a full
 disk, a failed rename), and that is `start_failed` with crash backoff, with a
 message naming the file or directory — never `not_permitted`, which would claim
 the configuration can never work (§6).
+
+**A server's log file belongs in `${CONFIG_DIR}` (#430).** The recommended way to
+make a server's own log visible in the portal is to point the server at
+`${CONFIG_DIR}/<file>` (a `--log-file` argument, or a key in a config file) and to
+declare the same path in the spec's `log_files` ([§14.9](#149-log-files)). The
+Strata import does both (`importStrataRunConfig`, `strataRunConfig.ts`): `log`
+becomes `${CONFIG_DIR}/engine.log`, declared as `engine`; a run config with
+`replicas` gets one declaration per replica instead (`engine-r<i>` at
+`${CONFIG_DIR}/engine.r<i>.log`, the names Strata derives itself, at most four, the
+editor warning beyond that), and the Strata template's default declares `engine`
+too. A re-import replaces exactly the rows it declares (`engine`, `engine-r<i>`) and
+keeps the operator's others. All of this happens only while the server's agent
+declares `runtime_log_files` (`StrataImportOptions.declareEngineLog`; a report that
+has not settled counts as not declared): otherwise the import keeps the source's
+`log`, declares no log file and warns that the engine log can be shown once the
+agent is 0.26.0 or newer, and the template declares none (§7.1). A `${CONFIG_DIR}`
+file is the one log file the agent treats as the generation's own, and it gets
+three things an external path does not (`prepareLogFiles`,
+`manager_log_files.go`):
+
+- **The directory exists before exec.** If any declared file lies directly in the
+  instance's `${CONFIG_DIR}`, the agent creates that directory (`0755`,
+  `ensureInstanceConfigDir`) even when the spec has no `config_files`, because the
+  server cannot create its log in a directory that does not exist. A failure is
+  logged and the start goes ahead; the tab then reports `file_waiting`.
+- **It is removed before exec**, so the file of a generation is that generation's
+  alone and is tailed from offset 0 (`removeConfigDirLogFile`). Only a file whose
+  **parent is the instance directory itself** (`logFileTarget.InConfigDir`) is
+  removed: the removal runs on a directory handle from `openInstanceRoot`, does
+  not follow the leaf (a symlink is removed as a link), and refuses a leaf that
+  is a directory. A file in a **subdirectory** of `${CONFIG_DIR}` is tailed like
+  an external path (from its end as of the start) and never removed, because the
+  subdirectory could be a link the server planted. A file outside `${CONFIG_DIR}`
+  is never removed or truncated by the agent. A file directly in `${CONFIG_DIR}`
+  whose name is one of the spec's `config_files` (compared case-insensitively on
+  Windows, exactly elsewhere; `logFileShadowsConfigFile`) is neither removed nor
+  tailed: the agent has just written that config file for the child, so the
+  declaration is refused and its tab shows `file_not_permitted`. The gateway and
+  the portal refuse the overlap at submit time (§14.9); `ParseConfig` stays
+  permissive, so a file-mode document with it remains valid.
+- **A failed removal does not fail the start.** If the old file cannot be removed
+  (a lingering process holds it without delete sharing, say), the name is stale:
+  its tab gets a `file_stale` marker and the tail starts at the current end, so
+  the previous run's lines are not shown as this run's.
+
+A log file never fails a start and never relaunches a child: `log_files` is not
+launch-affecting ([§5.6](#56-what-a-pushed-config-applies-and-what-it-does-not)).
 
 **Negotiation and visibility.** Writing the file is an observable agent
 behavior, so the agent declares `runtime_config_files` (`Since: "0.10.0"`, [§7](#7-feature-negotiation)).
@@ -3068,6 +3273,37 @@ column right after the path ("Native", or "WSL2" with the distro as caption) and
 the manual-add kind select offers `vllm`. The WSL hint under the editor points at
 `wsl://<Distro>/<path>` in `runtime_allowed_binaries`.
 
+#### Log files of a `wsl` spec
+
+A `wsl` spec's `log_files` ([§14.9](#149-log-files)) are paths as the **distro**
+sees them, but the tailer runs in the Windows agent and opens Windows files. The
+lexical half of the log-file policy (§3.1.3, `logFileResolution.resolveWSL`)
+therefore maps each path back to the agent's side before anything is opened, and
+in this version accepts exactly two kinds:
+
+- **Inside `${CONFIG_DIR}`** (the normal case). For a `wsl` spec `${CONFIG_DIR}` is
+  the agent's `config_files_dir` seen through `/mnt/<drive>` (`windowsPathToWSL`).
+  A path below it is mapped back to the native instance directory and tailed with
+  the native open and every native check; Windows naming rules apply to the part
+  below it (`windowsNameRefused`).
+- **A `/mnt/<drive>/…` path** is mapped to `<DRIVE>:\…` (`wslPathToWindows`) and
+  checked against the **native** Windows entries of `runtime_allowed_log_dirs`
+  (`windowsLogRoots`; a bare drive root permits nothing), because the file lives
+  there.
+
+The path must be an absolute POSIX path without a backslash or a colon (they mean
+different things on the two sides). **Every other distro path is refused**
+(`file_not_permitted`), even under a matching `wsl://<distro>/…` entry of
+`runtime_allowed_log_dirs`: reading a file inside the distro's ext4 filesystem
+from Windows would go through `\\wsl.localhost\<distro>\…`, and whether link
+resolution through that share is reliable enough for the anchored open has not
+been checked on a real host. Until it is, such a path fails closed rather than
+skipping the check, so a `wsl://` entry in `runtime_allowed_log_dirs` currently
+permits nothing; the refusal counts the `wsl://` entries naming the distro. Like
+everything in this section, the mapping is lexical and unit-tested on Linux; the
+tail of a `wsl` spec's log through a real `/mnt/<drive>` mount has not been run
+on a Windows host.
+
 #### What the host needs
 
 Installing and configuring WSL, the distro and the engines stays the operator's
@@ -3108,7 +3344,7 @@ object** ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-str
 **Verified on hardware (2026-11-23):** the job-mode start (suspended start, job, resume) works with `strata.cmd` as the binary; `${HOST_GPU_IDS_MAIN_LAST}` resolved to `0,1,2` for GPUs declared `2,0,1` and Strata logged a layer split across GPUs `[0, 1, 2]` (main card last); ready in 38 s; the live log shows the server's output including its JSONL `starting`/`ready` events; the agent's authenticated metrics and context probes both succeeded (context 262144); per-GPU VRAM is attributed over the whole tree (the engine is a grandchild, so per-root attribution would read about 0); a chat completion through the gateway answered. **Stop verified on hardware (2026-11-23, agent 0.21.0, 3 GPUs):** the portal's stop delivered Ctrl-Break and Strata logged `stopping` (`reason: "sigbreak"`), `draining` (0 pending, 3 s deadline) and `stopped` (`drained: true`, `cancelled_requests: 0`, `exit_code: 0`) about 2.7 s after the stop, inside the 5 s kill grace; cmd.exe then printed its localized "Terminate batch job (Y/N)?" prompt to the live log and the root exited about 0.1 s later with exit code -1, and the spec state became `stopped` (intentional stop, restarts 0). The prompt does not block the stop; its only side effects are a cosmetic log line and a root exit code of -1 instead of 0. VRAM was freed on all three GPUs within about 2 s (host totals 24.5/32.9/33.3 GB to 0.3/0.0/0.0 GB) and host RAM in use fell from 22.1 to 10.6 GB, so the engine and vision processes ended; leftover non-GPU processes (cmd.exe, python.exe) were not inspected in Task Manager. `strata.cmd` stays the documented binary and the `python.exe` fallback is not needed. **Known RAM under-count:** the spec's measured RAM (private working set summed over the job) read 7.7 GB while host RAM in use fell by about 11.5 GB at stop; pages that are not private working set (locked or mapped model pages, the file cache, driver allocations) are not counted. **Still pending:** the RAM figure against Task Manager beyond the above, Claude Code and Codex round trips, the Windows-tagged unit tests and the console-less (service) agent path. Everything else below is compiled and vetted for Windows (`GOOS=windows go vet`, `golangci-lint`); the Windows-tagged tests (`proc_job_windows_test.go`) are ones CI cannot run (§13).
 
 **The field.** `process_tree` is `direct` (the default, today's behaviour) or `job`
-(migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-117-migrations)).
+(migration 113, [Data Model §4](../reference/data-model.md#4-migration-history-118-migrations)).
 The gateway refuses any other value (400 `runtime_spec.process_tree_invalid`) and
 pushes `"process_tree": "job"` only for a job spec, omitting it for `direct`, so every
 existing document and its ETag are byte-identical. The agent reads an absent or empty
@@ -5038,6 +5274,7 @@ up. So:
 | `admin_state` set to `force_stopped` | **Applied immediately** — a running child drains. |
 | A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `config_files` — the files the agent writes before the exec and the child reads at startup, so a content edit relaunches — `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, `process_tree` (`direct` and an absent value are the same launch, [§3.9](#39-the-windows-process-tree-process_tree)), the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
 | A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, `api_token_header` (read only by the agent's own child probes, §3.2), startup/health timeouts, the reported runtime `type`, the client-facing model name, **the spec's `role`, or a GPU row's `vram_mb` or the spec's `ram_mb`** — admission inputs (the role orders eviction), not launch inputs; the gateway pushes each demand as `max(measured, estimate)`, so a fresh measurement alone changes the document without relaunching a healthy child, and a verdict change that moves the derived role does the same) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` or `ram_mb` binds at the next start, per the not-retroactive rule below). |
+| A spec's `log_files` change (#430, [§14.9](#149-log-files)), or a change of the gateway's `runtime_log_files` declaration, which gates them (§7) | **Applied at the next generation start** — no relaunch (`sameLaunchShape` strips `LogFiles`): the child neither sees nor needs the list, which only says what the agent tails. The tailers of a running generation are not re-armed; the next start resolves the new list (`prepareLogFiles`). |
 | Lowered per-GPU VRAM budget | **Not retroactive.** Binds at the next start. |
 | Removed or newly forbidden co-residency pair (an explicit `forbid`, or a mode switch that closes pairs) | **Not retroactive.** Binds at the next start. |
 | Lowered `runtime_max_processes` | **Not retroactive.** Binds at the next start. |
@@ -5402,7 +5639,9 @@ instance 0 last (§6.1).
 stderr are captured into one in-memory record buffer per **spec** — not per
 process — mutex-guarded because `os/exec` writes from two goroutines. Its tail
 is what populates `last_error.stderr_tail`, and a portal log view is what makes
-the agent stream it upward. Every instance of a replicable spec writes into its
+the agent stream it upward. Declared log files get rings of their own beside it
+([§14.9](#149-log-files)), and a generation's secret values are masked before
+anything is retained (§3.2). Every instance of a replicable spec writes into its
 spec's one buffer, lines of instance k ≥ 1 prefixed `[#k] ` and every entry
 naming its instance (§6.1). Capacity is an operator setting
 (`runtime_log_buffer_bytes`, default 1 MiB; `runtime_log_buffer_total_bytes`,
@@ -5565,8 +5804,9 @@ agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_role_eviction`, `runtime_stop`, `runtime_exec_wsl`, `realtime_proxy`,
 `runtime_gpu_main_last`, `runtime_process_tree_job`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
-only and read by the agent (below); and two, `runtime_instances` and `rpc_cluster`, are on **both** lists
-with a different fact behind each declaration, each side reading the other's (below).
+only and read by the agent (below); and three, `runtime_instances`, `rpc_cluster` and
+`runtime_log_files`, are on **both** lists with a different fact behind each
+declaration, each side reading the other's (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
 | Direction | Channel |
@@ -5609,13 +5849,14 @@ ignored on both sides. One flag per **shipped** capability, not per plan: today
 `runtime_exec_wsl` ([§3.8](#38-execution-modes-wsl2)), `Since: "0.19.0"`, and
 `realtime_proxy` ([§4.5](#45-one-protocol-upgrade-the-realtime-websocket--and-what-the-rest-costs)), `Since: "0.20.0"`, and
 `runtime_gpu_main_last` ([§3.2](#32-placeholders-and-why-no-secret-enters-the-gateway)) and
-`runtime_process_tree_job` ([§3.9](#39-the-windows-process-tree-process_tree)), both `Since: "0.21.0"`
+`runtime_process_tree_job` ([§3.9](#39-the-windows-process-tree-process_tree)), both `Since: "0.21.0"`, and
+`runtime_log_files` ([§14.9](#149-log-files)), `Since: "0.26.0"`
 — and, on the gateway's list alone, `capability_source_sdcpp` and
 `capability_source_audiocpp`
 ([§10](#10-runtime-status-volatile-and-a-full-snapshot-every-time)), which have no
 `Since` because the agent's registry does not carry them. The gateway's own list is
 `runtime_manager`, `runtime_logs`, `runtime_config_ack`, `capability_source_sdcpp`,
-`capability_source_audiocpp`, `runtime_instances` and `rpc_cluster`
+`capability_source_audiocpp`, `runtime_instances`, `rpc_cluster` and `runtime_log_files`
 (`gatewayAgentFeatures`, `internal/gateway/agent_features.go`).
 
 `realtime_proxy` ([ADR-104](../09-architecture-decisions.md#adr-104--v1realtime-a-websocket-relayed-through-a-new-agent-realtimemodel-route-that-holds-the-spec-admitted-for-the-session-meters-one-usage-row-and-is-served-only-by-an-agent-that-declared-realtime_proxy)) is, like `fullduplex_proxy`, on the **agent's list
@@ -5821,6 +6062,32 @@ and the child fails visibly). `runtime_process_tree_job` says the agent honours
 gateway reads it together with the reported OS and refuses a `job` save, fail-closed, only
 on evidence (§3.9). `TestFeaturesDeclareStrataFlags` pins both names and their `Since`, and
 `TestStrataFeatureNames` pins the gateway's copies of the strings.
+
+`runtime_log_files` (#430, [§14.9](#149-log-files),
+[ADR-121](../09-architecture-decisions.md#adr-121--the-agent-may-read-files-the-gateway-names-under-these-rules))
+says the agent tails a spec's declared `log_files` into streams of their own,
+sends their file events and adds `log_file_tails` to a failed generation's
+`last_error` (`FeatureRuntimeLogFiles`, `Since: "0.26.0"`). **The gateway's
+declaration** of the same string (`runtimeLogFilesFeature`) says it understands the
+`stream` a `runtime_log` entry carries, the file events and `log_file_tails`, and
+the agent reads it fail-closed, in file mode too, like `rpc_cluster`: while it is
+absent `Driver.Sync` clears every spec's `log_files` (`withoutLogFiles`), so the
+agent starts no tailer, removes no file before exec and sends no file stream and
+no `log_file_tails`, and an older gateway, which would relay a file's text as
+process output, never receives one. The declaration is not launch-affecting: a
+change of it, like an edit of `log_files`, applies at each spec's next start, and
+it bypasses the ETag short-circuit like `runtime_instances`
+(`sameLogFileDeclarations`); the Warn is logged once per transition. So a gateway
+that stops declaring the name does not stop a running generation's tailers (that
+applies at its next start), and the file history the agent already retains stays
+replayable. The gateway
+keeps `log_files` in the runtime document whatever the agent declares, an agent
+without the name ignores the field, and the portal reads the agent's declaration
+only to explain itself: the spec editor warns, without blocking the save, that the
+connected agent would not tail the files, and a file tab of such an agent says
+so instead of staying blank (§14.9). `TestAgentFeaturesDeclaresRuntimeLogFiles`
+pins the name, its `Since` and the version;
+`TestDriverWithoutRuntimeLogFilesTailsNothing` pins the agent's gate.
 
 `runtime_exec_wsl` (#381, [§3.8](#38-execution-modes-wsl2),
 [ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged))
@@ -6448,6 +6715,31 @@ saved only once the agent has declared `runtime_process_tree_job`, and an older 
 sends either field, and the new probe credential is additive
 ([ADR-111](../09-architecture-decisions.md#adr-111--strata-one-type-string-for-an-application-and-a-runtime-spec-a-main-last-gpu-placeholder-and-an-opt-in-windows-job-object-process-tree)).
 
+**`0.25.2` → `0.26.0` (runtime log files, #430) is MINOR, and one bump for the whole
+branch.** `agent.Features` gained `runtime_log_files` (§7), the spec gained
+`log_files`, the agent gained the agent-local `runtime_allowed_log_dirs` setting
+(§3.1.3), the log-file tailer, per-stream retention and `last_error.log_file_tails`
+(§14.9), masking of the generation's own resolved secrets in every stream, process
+output included (§3.2), the forward-slash `${CONFIG_DIR}` in config-file content on
+Windows (§3.5), and the file-mode parse-error code `invalid_log_files` (§8.3).
+`TestAgentFeaturesDeclaresRuntimeLogFiles` pins the name, its `Since` and the
+version. In gateway mode there is **no upgrade order** for the field itself: an older agent
+ignores `log_files` and sends no `stream`, no file event and no `log_file_tails`, so it
+behaves as before (the portal explains its empty file tabs), and an older gateway never
+sends `log_files`. **The one exception is the Strata run-config import** (§3.5): it
+points the config file's `log` at `${CONFIG_DIR}/engine.log`, and an agent older than
+0.26.0 expands `${CONFIG_DIR}` in config-file content in its native form, which on
+Windows puts `C:\…` into a JSON string and makes `strata.json` invalid. The portal
+therefore rewrites `log` and declares the engine log only while the server's agent
+declares `runtime_log_files` (an unsettled report counts as not declared); for an
+older agent it keeps `log` as written and warns, and the Strata template declares no
+log file either. A 0.26.0 agent in file mode whose local document declares `log_files`,
+behind a gateway older than the feature, does not mix the streams either: that
+gateway does not declare `runtime_log_files`, so the agent treats the declaration
+as absent and tails nothing (§7). A current gateway behind an older agent receives exactly what it did;
+behind a 0.26.0 agent it receives masked process output where it received the
+value before.
+
 **Not every gateway-side feature touching a runtime spec needs a bump.** The
 per-spec endpoint-mode trio — `RuntimeSpec.APIFlavors`/`ResponsesMode`/
 `MessagesMode` (§11.5; [Compatibility & Inference
@@ -6814,8 +7106,14 @@ mask is what keeps that from being the only protection.
 > [Telemetry & Observability](telemetry-usage-observability.md)) — but the scope
 > of the redaction claim is `env` values **in the report** plus every
 > placeholder-derived value **in the reported command**, not "no secret ever
-> reaches the wire". Nothing agent-side can mask a value the child chose to
-> print.
+> reaches the wire". Since agent 0.26.0 the tail is narrowed, not closed: the
+> agent replaces literal occurrences of the values it resolved for this
+> generation (at least 8 bytes) by their placeholder before the output is
+> retained, so a plain startup echo arrives masked
+> ([§3.2](#resolved-secrets-are-masked-in-the-output-too-agent-0260)). An
+> encoded or line-split echo, a shorter value, a literal secret typed into the
+> spec, and whatever an older agent sends still arrive as the child printed
+> them.
 
 `parse_error` is a first-class case, not an edge case: the agent may
 legitimately report an empty `config` alongside a non-empty `parse_error` — a
@@ -6837,6 +7135,7 @@ agent-chosen prose can never be allowed through (see
 | `json_syntax` | The file is not valid JSON, in any of the ways `encoding/json` reports. |
 | `duplicate_spec_id` | Two entries in the file share a spec id — a structural failure, not a syntax error. |
 | `invalid_config_file_name` | A spec's `config_files` carries a name that is not one plain file name (path separator, `.`/`..`, drive or stream marker, control character, blank), or repeats another name in the same spec, compared case-insensitively ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). Structural and fatal to the whole document, like a duplicate spec id. |
+| `invalid_log_files` | A spec's `log_files` breaks the declaration rules: more than four entries, a name that does not match `^[A-Za-z0-9._-]{1,32}$` or is `process` or repeats another case-insensitively, an empty path or one over 1024 bytes, or a path naming `${API_TOKEN}` or `${AGENT_ENV:…}` (`checkLogFiles`, [§14.9](#149-log-files)). Structural and fatal to the whole document, like an invalid config file name; the gateway refuses every such list at submit time, so only a hand-written file-mode `runtime.json` reaches it (agent 0.26.0). |
 | `file_missing` | Nothing exists at the configured path. |
 | `read_failed` | Something is there, but the agent could not stat or read it — permissions, a non-directory path component, an I/O error. |
 | *(empty)* | **No failure.** The field is `omitempty`, so a healthy agent sends nothing here. |
@@ -6865,7 +7164,7 @@ failure therefore discards the agent's mtime memory, so the next successful
 stat cannot take the unchanged shortcut past the re-parse that clears the code.
 
 The agent additionally owns an `unclassified` floor which nothing currently
-produces; it is a defensive value, not a sixth meaning, and the gateway
+produces; it is a defensive value, not a seventh meaning, and the gateway
 degrades it like any other unknown code.
 
 It is a **three-sided contract with no compiler on any seam**, so adding a code
@@ -10814,11 +11113,20 @@ operator meets first:
 - **A *literal* secret written into a spec reaches the gateway unmasked** — in
   `args` in either mode, or in an `env` value of a gateway-authored spec, where
   the gateway holds the plaintext document anyway. A resolved secret of either
-  kind can also reach it inside `last_error.stderr_tail`, which no masking can
-  reach (§8.3). Reference secrets as `${AGENT_ENV:NAME}` and keep them in `env`:
+  kind can also reach it inside `last_error.stderr_tail` and the log stream: since
+  agent 0.26.0 a literal echo of a resolved value of at least 8 bytes is masked
+  there, but an encoded or line-split echo, a shorter value and an older agent's
+  output are not (§3.2, §8.3). Reference secrets as `${AGENT_ENV:NAME}` and keep them in `env`:
   a placeholder-derived value is masked in the report's `env` and in the reported
   launch command's `args` and `env` alike
   ([§14.7](#147-the-resolved-command-what-actually-ran)).
+- **Log files have limits of their own** ([§14.9](#149-log-files)): a `wsl` spec
+  tails only `${CONFIG_DIR}` and `/mnt/<drive>` paths (a distro-internal path is
+  refused until the `\\wsl.localhost` check is done, §3.8); a hard link swapped in
+  between two steps of the anchored open is a narrow residual (§3.1.3); a few early
+  bytes of the next generation can reach the previous one's stream on an external
+  or stale path; and the Windows open path has compiled but not run on a Windows
+  host.
 - **The router authenticates nothing and its shipped default binds all
   interfaces** (§4.6).
 - **A pairwise list plus per-GPU arithmetic cannot express every co-residency
@@ -11011,6 +11319,11 @@ per running process. It exists for one job — an operator looking at a row that
 says `crashed`, or at a model that will not finish loading, has to be able to
 see what the process is actually printing.
 
+Since agent 0.26.0 a spec can also declare **log files** its server writes; the
+agent tails each into a stream of its own beside the process output, under the
+same rules (in memory, bounded, on demand), and the portal shows each as a
+source tab ([§14.9](#149-log-files)).
+
 ### 14.1 Collection is unconditional; streaming is on demand
 
 These are two different mechanisms and conflating them is the mistake to avoid.
@@ -11114,32 +11427,57 @@ able to make that host spend more of it.
 
 | Setting | Default | Governs |
 |---|---|---|
-| `runtime_log_buffer_bytes` | 1 MiB | Retention per spec. Values below 64 KiB are raised to it. |
-| `runtime_log_buffer_total_bytes` | 16 MiB | The ceiling across **all** specs. |
+| `runtime_log_buffer_bytes` | 1 MiB | The ring of each spec's **process output**, and the upper limit of each of its log-file rings. Values below 64 KiB are raised to it. |
+| `runtime_log_buffer_total_bytes` | 16 MiB | A hard byte ceiling over **every ring of every spec**, log files included. Raised to at least the per-spec size plus 4 × 64 KiB. |
 
 1 MiB per spec is sized against what has to fit: the predecessor's 64 KiB was
 chosen for "the one `CUDA error: out of memory` line and its neighbours" and is
 often less than a single vLLM or llama.cpp startup, so the interesting part had
 already scrolled out by the time the failure line appeared.
 
-The **total** is the number to reason about, because the per-spec figure alone
-is not a bound — twenty specs would be twenty times it. The agent keeps at most
-`total / per-spec` buffers and evicts the least-recently-written one nobody is
-watching. Worst case, precisely: the total ceiling, plus at most 64 KiB of live
-queue per **watched** spec (`logPendingBytes`), plus — while a history replay is
-in flight for it — a scrollback snapshot that shares its strings with the
-retention buffer. A replay is chunked, so that snapshot lives for as long as the
-replay does rather than for a single 250 ms flush window: roughly two windows at
-the 1 MiB default, and longer at a raised buffer. With the defaults and the one
-or two specs an operator watches at a time, that is 16 MiB steady-state and
-under 17 MiB while watching.
+**One ring per stream** (`LogStore`, `logs.go`; #430). A spec holds one ring for
+its process output (the stream `""`) and one per declared log file
+([§14.9](#149-log-files)). The process ring's cap is the per-spec size; a file
+ring's cap is `fileCap = min(perSpec, max(64 KiB, (total − perSpec) / 4))`
+(`NewLogStore`), so at the defaults every ring holds 1 MiB, and the file rings
+shrink only when one spec's five rings would not fit the total. A ring is
+trimmed against its own cap (`trimRing`), so a log file that floods can never
+push the process output, or another file, out of the history, and each ring
+counts its own gap.
+
+**The total is a hard byte bound**, not a count of buffers. `used`, the sum of
+every ring of every spec including per-record overhead (`logRecord.size`), never
+exceeds `total` after any write (`enforceTotalLocked`). Over it, the agent first
+drops whole **unwatched** specs, every stream together, least-recently-written
+first (`evictLocked`; never the spec just written, never a watched one). If that
+is not enough because every other spec is watched, the ring just written gives up
+its own oldest bytes, counted as its gap; the one exception is a marker just
+appended, which is never trimmed away (it has no text a gap could stand for), and
+the room it needs is taken from the oldest bytes anywhere in the store instead
+(`trimOldestLocked`). `NewLogStore` raises the total to at least
+`perSpec + 4 × 64 KiB`, so one spec with four log files always fits
+(`perSpec + 4 × fileCap ≤ total` by construction), and `Capacity` reports the
+effective numbers for the startup log line. The consequence to size against: a
+spec with four log files can hold up to five times the per-spec size, so fewer
+specs fit under the same total.
+
+Worst case, precisely: the total, plus at most 64 KiB of live queue per
+**watched (spec, stream) unit** (`logPendingBytes`; five units for a spec with
+four files), plus — while a history replay is in flight for a spec — a
+scrollback snapshot that shares its strings with the retention rings
+(`specLog.snapshot`). A replay is chunked, so that snapshot lives for as long as
+the replay does rather than for a single 250 ms flush window: roughly two windows
+per full 1 MiB ring, and longer at a raised buffer. With the defaults and the one
+or two specs an operator watches at a time, that is 16 MiB steady-state and under
+17 MiB while watching a spec without log files; each watched file adds at most
+64 KiB of live queue.
 
 ### 14.4 The wire
 
 | Frame | Direction | Payload |
 |---|---|---|
 | `runtime_log_config` | gateway → agent | `{"spec_ids":[…],"epochs":{…}}` — the **full** desired set, never a delta. Self-contained and idempotent, so last-one-wins and a dropped frame costs nothing; the epoch adds no state to the frame, it makes "a viewer arrived" expressible. `epochs` is one counter per spec id, bumped whenever a **viewer arrives**, and the agent re-snapshots any spec whose epoch differs from the one its last snapshot was taken for — even one it is already streaming. That is the fact the agent cannot derive for itself: watching is a *set*, so a second viewer of the same spec produces a byte-identical `spec_ids`, and a rule keyed to "this id is new" leaves that viewer's window blank while the agent believes it delivered. Compared with `!=`, never `<`, because a gateway restart resets the counters. Re-sent on **every** new agent connection, including the empty set and with every epoch bumped, so neither a watch set nor a history the gateway owes can outlive the connection it was issued on. |
-| `runtime_log` | agent → gateway | One batch for one spec — either the entries accumulated since the previous flush **or one chunk of a history replay**: `{"spec_id", "scrollback", "scrollback_more", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command","instance"}]}`. A retained history no longer necessarily fits one frame ([§14.3](#143-the-memory-bound-is-the-operators-to-set)), so a replay is a *sequence* of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more` ("another chunk of this replay follows"). `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). `instance` is the index of the spec instance that produced a text entry or marker, omitted for instance 0 ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)); the gateway relays it unchanged, reading a negative value as 0. |
+| `runtime_log` | agent → gateway | One batch for one spec — either the entries accumulated since the previous flush **or one chunk of a history replay**: `{"spec_id", "scrollback", "scrollback_more", "entries":[{"pid","at","text","dropped_bytes","event","exit_code","command","instance","stream"}]}`. A retained history no longer necessarily fits one frame ([§14.3](#143-the-memory-bound-is-the-operators-to-set)), so a replay is a *sequence* of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more` ("another chunk of this replay follows"). `event` is a closed set — `started`, `exited`, `start_failed` — and `command` is the resolved launch command, present only on an **opening** marker ([§14.7](#147-the-resolved-command-what-actually-ran)). `instance` is the index of the spec instance that produced a text entry or marker, omitted for instance 0 ([§14.2](#142-retention-belongs-to-the-spec-not-the-process)); the gateway relays it unchanged, reading a negative value as 0. `stream` names the declared log file an entry belongs to, omitted for process output ([§14.9](#149-log-files)); an entry of a file stream carries its own closed event set (`file_opened`, `file_rotated`, `file_truncated`, `file_line_cut`, `file_stale`, `file_waiting`, `file_not_permitted`, `file_binary`, `file_missing`), disjoint from the process set. One batch may mix streams of its spec. |
 
 The markers are **typed records carrying no text** — `event` plus `pid`/
 `exit_code`/`command`, with the `── … ──` line written by the portal. That is
@@ -11189,8 +11527,12 @@ into one is what hid the one that emits nothing.
 printed are missing immediately before this entry's text*. **Three** of the four
 produce it, and those three are deliberately indistinguishable to the reader,
 who needs only the one fact: eviction from the agent's retention buffer, the
-agent's per-spec live queue overflowing between flushes, and the gateway's
-per-subscriber queue overflowing.
+agent's live queue of one (spec, stream) unit overflowing between flushes, and the
+gateway's per-subscriber queue overflowing. A log-file stream adds one more source
+of the same signal, the tailer's own read-rate cap and the masking carry it
+discards at a cut ([§14.9](#149-log-files)). Every gap names its stream
+(`stream` on the entry), so a file's loss is shown in that file's tab and never
+blamed on the process output, or the reverse.
 
 The fourth is the **browser's own display cap** (4,000 rendered entries), and it
 produces a *different* signal, because the bytes it drops were delivered and are
@@ -11232,9 +11574,11 @@ instead of degraded — its `EventSource` reconnects, a reconnect re-snapshots,
 and it comes back with a complete history rather than a silently incomplete one.
 
 Rate limits, all only in effect while someone is watching: the agent sends at
-most **one batch per spec per 250 ms flush**, replay chunks included; at most
-64 KiB per spec per window of live output; at most 128 KiB per window across all
-specs (round-robin, so the budget cannot starve whichever spec sorts last); and,
+most **one batch per (spec, stream) unit per 250 ms flush**, and one replay chunk
+per spec, covering all its streams; at most 64 KiB per unit per window of live
+output; at most 128 KiB per window across all units (process units first, then
+file units, each group round-robin, so the budget cannot starve whichever unit
+sorts last, [§14.9](#149-log-files)); and,
 on a budget of its own, at most one frame's worth of history replay per window
 **fleet-wide** (`maxLogBatchBytes`, just under 1 MiB). The replay budget is
 separate because a replay is one-shot and only ever follows a viewer arriving,
@@ -11265,7 +11609,13 @@ argv and environment are not prompt-bearing but are closer to user data than
 status ever was, and have no more business on disk. The agent-side twin plants
 two needles, one in a plain argument and one behind `${AGENT_ENV:…}`: finding the
 first would mean it was persisted, finding the second would mean the masking was
-bypassed.
+bypassed. Log files (#430) add one more pair: the agent-side
+`TestManagerLogFileRetentionIsNotWrittenToDisk` has a child write a needle into
+its declared log file and finds it on disk in that file and nowhere else (the
+agent reads the file into memory only), and the gateway-side
+`TestRuntimeLogFileStreamNeverReachesDiskOrDatabase` relays a file stream and a
+`last_error.log_file_tails` entry carrying a needle through the real ingest paths
+with a SQLite store attached, then searches the directory.
 
 The portal's authorization boundary is the ordinary one — server
 ownership/admin-group via the same `authorizeServer` path as the live-status
@@ -11390,8 +11740,11 @@ server; case 2 points at the operator's own file.
 string as much as here. A model server that prints its own argv or environment
 at startup — llama.cpp and vLLM both do — puts the resolved value into the very
 stream this command rides on, and `last_error.stderr_tail` is a second route to
-the same screen (§8.3). Nothing agent-side can mask what the child chose to
-print, so the alert says so and carries the guidance that follows: secrets go in
+the same screen (§8.3). Since agent 0.26.0 the agent masks literal occurrences
+of the values it resolved itself (at least 8 bytes) in that output too
+([§3.2](#resolved-secrets-are-masked-in-the-output-too-agent-0260)), but not an
+encoded or line-split echo, a shorter value, or anything an older agent sends, so
+the alert says exactly that and carries the guidance that follows: secrets go in
 `env` as `${AGENT_ENV:NAME}`, never as plain text in an argument.
 
 And, equally deliberately, what is **not** masked, because masking it would cost
@@ -11433,7 +11786,7 @@ its only options would be to mask everything (destroying the field) or to guess
 by pattern (worse than not masking, because it looks like a guarantee). It clamps
 sizes instead, dropping over-long entries **whole** and setting `truncated`, and
 relays the rest verbatim. A command is capped at 16 KiB and **charged against the
-per-spec buffer capacity** like the output text, so §14.3's memory bound stays
+process ring's capacity** like the output text, so §14.3's memory bound stays
 true with no new number in it.
 
 **The accepted cost, stated as a decision.** Living on a record inside the
@@ -11463,6 +11816,237 @@ process printed nothing": an agent with an empty buffer sends an empty
 scrollback, and the view says the buffer is empty. Same rule as the overflow
 markers.
 
+### 14.9 Log files
+
+Some model servers write the diagnostics that explain a failure only to a **log
+file**, not to stdout or stderr: Strata's engine log names the commit-limit death
+and the per-GPU free VRAM, and llama.cpp (`--log-file`), vLLM and SGLang can do
+the same. A spec can therefore declare up to four log files; the agent tails each
+into a **stream** of its own beside the process output, holds the text under the
+rules of §14.1–§14.6, and adds the end of each file to a failed generation's
+`last_error` (#430, agent 0.26.0, feature `runtime_log_files`,
+[ADR-121](../09-architecture-decisions.md#adr-121--the-agent-may-read-files-the-gateway-names-under-these-rules)).
+The agent honours `log_files` only while the gateway declares `runtime_log_files`
+too, in file mode as well; otherwise the declaration is as absent (§7).
+Nothing is inferred from `args` or a config file's content: only the explicit
+field counts.
+
+#### The declaration
+
+`log_files: [{name, path}]`, at most four entries. The **name** is the tab label
+and the stream id: `^[A-Za-z0-9._-]{1,32}$`, unique case-insensitively, and never
+`process` in any case (the wire's omitted `stream` is the process output, and the
+portal labels it). The **path** is 1–1024 bytes, may use the non-secret
+placeholders of config-file content (`${CONFIG_DIR}`, `${PORT}`, `${MODEL}`, …) and
+never `${API_TOKEN}` or `${AGENT_ENV:…}`, because a secret must never become part
+of a path the agent opens or reports. It is expanded per instance, so each
+instance of a replicable spec tails its own `${CONFIG_DIR}` file. The rules are
+enforced three times:
+
+- the gateway's spec PUT (`validateRuntimeSpecLogFiles`,
+  `internal/portal/service_runtime.go`), the last validation in its order, which
+  also refuses a control character and requires a path that starts with
+  `${CONFIG_DIR}` followed by a separator or the end, or is absolute in POSIX or
+  Windows form, and refuses a path that is exactly `${CONFIG_DIR}/<name>` or
+  `${CONFIG_DIR}\<name>` for a `<name>` of the spec's own `config_files`
+  (case-insensitively, `logFilePathIsConfigFile`), because the agent removes such a
+  file before exec; it answers `400 runtime_spec.log_files_invalid` with the entry and
+  the rule, **never the path**
+  ([HTTP API Surface](../reference/api-surface.md)). The list is stored as opaque
+  JSON in `agent_runtime_specs.log_files` (migration 118) and carried on the
+  spec GET and in the agent's runtime document (`omitempty` there, so a spec
+  without log files hashes as before);
+- the agent's `ParseConfig` (`checkLogFiles`), whose failure is the file-mode
+  parse-error code `invalid_log_files` (§8.3);
+- the agent's path policy at tail time (§3.1.3, and §3.8 for a `wsl` spec), which
+  alone knows `${CONFIG_DIR}` and the allowlist, plus its refusal of a
+  `${CONFIG_DIR}` file named like one of the spec's config files (§3.5), which it
+  marks `file_not_permitted` instead of removing that file.
+
+The portal's spec editor (at most four rows of name and path) applies the
+gateway's rules, explains the `${CONFIG_DIR}/…` form and the allowlist in its hint,
+and warns, without blocking the save, when the connected agent does not declare
+`runtime_log_files`. A
+`log_files` change is not launch-affecting (§5.6): it applies at the next
+generation start.
+
+#### The lifecycle of one generation
+
+`manager_log_files.go` wires the declarations into a generation N:
+
+- **Before exec** (`startProcess`): `prepareLogFiles` resolves every declaration,
+  creates the instance's `${CONFIG_DIR}` if a file lies directly in it, and
+  removes each such file, or marks its name stale when that fails (§3.5). A
+  refused name — by the path policy, or because it names one of the spec's config
+  files (`logFileShadowsConfigFile`) — is only remembered: a log file never fails a
+  start.
+  `endPredecessorGraces` then ends the grace of generation N−1's tailers for the
+  same names (`fileTailer.EndGrace`), so their final read starts before N runs.
+- **After exec**, once the started marker is recorded: `startLogFileTailers`
+  starts one tailer per accepted declaration, writing into the generation's
+  sibling stream (`procLog.ForStream`), which carries the generation, the instance
+  prefix and the generation's secret masker (§3.2). A refused name gets
+  `file_not_permitted` on its stream (not when the exec itself fails); a stale name
+  `file_stale`, and its tail starts at the end of what is there; an external path
+  (one not directly in `${CONFIG_DIR}`) starts at its end as of this start, so
+  earlier runs are not replayed; a `${CONFIG_DIR}` file starts at offset 0. A
+  `${CONFIG_DIR}` stream therefore normally shows `file_waiting` and then
+  `file_opened`.
+- **At any exit**, before anything can start N+1, `onProcExited` stops every
+  tailer of N first (`stopLogFileTailers`: its 2 s grace begins) and keeps them on
+  the instance state until N+1 ends that grace. A superseded generation, a removed
+  spec, a deleted instance state (`deleteState`) and the agent's shutdown end the
+  grace at once.
+
+**The N/N+1 residual.** `EndGrace` is not awaited, so N+1's exec does not wait for
+N's last read and restart timing is unchanged. Where both generations read one
+inode — an external path, or a stale `${CONFIG_DIR}` name — a few early bytes of
+N+1 can therefore still reach N's stream. A `${CONFIG_DIR}` file that was removed
+is fully separated: N's handle holds the unlinked file, and N's grace never adopts
+the new one.
+
+#### The tailer
+
+One goroutine per generation and declared file (`fileTailer`,
+`logfile_tailer.go`), polling every **250 ms** (`logFileTailInterval`); no
+filesystem notification, for portability. Every poll **probes** the path through
+the full policy (`openLogFile`, §3.1.3) instead of a plain `os.Stat`, which would
+re-resolve every parent outside the `os.Root` anchor; the probe's handle is
+compared with the held one (`os.SameFile`: inode and device, or file id and
+volume serial) to see a rotation, and the file a rotation leaves behind the name
+has passed every check before a byte of it is read.
+
+- **Read.** The held handle is read from its offset; a size below the offset is a
+  truncation (`file_truncated`, read from 0). After a rotation the old handle is
+  read to its end first, then `file_rotated` and the new file from offset 0.
+- **Missing.** Before the first open, a missing file is `file_waiting` once and
+  is polled further; one that never appeared by the end is `file_missing`.
+- **Refused.** A first open the policy refuses ends the tailer with
+  `file_not_permitted`. After a successful open a refusal is retried on the next
+  polls, because a rotation by `link()` + `unlink()` briefly gives the new file
+  two links; three consecutive refusals (`logFileReopenRefusals`) end it, after
+  the held handle was read to its end. Other open errors are retried quietly and
+  logged once each, at most four (`logFileOpenErrLogs`).
+- **Stop and the grace.** After `Stop`, the next poll is the **last** probe of the
+  path; from then on the grace (`logFileTailGrace`, 2 s, the crash case) only
+  drains the handle already held and never opens or adopts another file. In a
+  crash loop the next generation recreates a `${CONFIG_DIR}` file under the same
+  name; that file belongs to the next generation's tailer, never to this one.
+  `EndGrace` ends the grace early with one final drain.
+- **Caps.** At most **64 KiB per poll** (`logFileTickBytes`, 256 KiB/s); when more
+  is waiting, the **older** excess is skipped and counted as a gap, the newest
+  64 KiB are read, and reading resumes at the next line start (the partial line is
+  dropped and counted too), so the lines a crashing server wrote last are kept. A
+  line longer than **16 KiB** (`logFileMaxLine`) is cut: its first 16 KiB are
+  written, the tailer inserts a newline, records `file_line_cut`, and discards the
+  rest of that line.
+- **Text.** Invalid UTF-8 becomes U+FFFD, and every control byte except `\t`, `\n`
+  and `\r` is shown as `\xNN` (the ANSI ESC byte included), so nothing a terminal
+  or a renderer would interpret reaches the ring. A file judged binary
+  (`looksBinary`: over a window of at least 512 bytes, more than 30 % invalid UTF-8,
+  NUL, DEL or control bytes that text does not use; ESC and the usual text
+  controls count as text, so an ANSI-coloured UTF-8 log is text) gets
+  `file_binary` and is no longer tailed for that generation. Known limits: a UTF-16
+  log reads as binary, and a truncation followed by a rewrite past the old offset
+  within one poll looks like an append (copytruncate's race).
+- **Masking.** Every byte goes through the generation's masker in
+  `procLog.Write` (§3.2). At a natural boundary (a rotation, a truncation, the end)
+  the carry is resolved; at the tailer's own cuts it is discarded and counted as
+  dropped, never emitted in clear.
+
+#### Retention, the live queue and the replay
+
+Each declared file is a ring of its own under the hard byte total of §14.3, its
+gaps counted per stream; instances share each stream's ring, and a further
+instance's file lines carry the same `[#k] ` prefix as its process output.
+`LogStore.tail`, the source of `last_error.stderr_tail`, reads the **process
+stream only**, so file text never leaks into it.
+
+The live queue is per **(spec, stream) unit**, 64 KiB each (`logPendingBytes`),
+so a file at its rate cap overflows its own queue, never the process output's.
+`Drain` serves the **process units first** (round-robin among themselves), then
+the file units (round-robin among themselves), at most one batch per unit and at
+most 128 KiB per drain (`logDrainBudget`), the first unit of a round whatever its
+size. Because `logDrainBudget > logPendingBytes` holds per unit, a unit's whole
+queue always fits a fresh drain; a file can never defer or cost a byte of a
+process unit, and a file unit waits only while the fleet's process output alone
+sustains more than 256 KiB/s. One drain may send several batches for one spec. A
+history replay stays one chunk sequence per spec (`specLog.snapshot`): the process
+stream first, then the files by name, each ring's eviction gap stamped once on its
+own stream's first record, and every chunk but the last flagged `scrollback_more`.
+
+#### The gateway's half
+
+Entries carry `stream`, omitted for the process output. On ingest
+(`ingestRuntimeLog`, `internal/gateway/runtime_logs.go`) an entry whose `stream`
+fails the name pattern or is `process` is dropped whole, because it cannot be
+attributed and the name keys a portal tab. The file events are a closed set of
+their own (`runtimeLogFileEvents`), valid only on an entry with a `stream` and
+disjoint from the process set (`runtimeLogEvents`): an event outside the entry's
+set degrades to a plain entry, and a file event has its text, exit code and pid
+cleared, because it is a typed marker. The gateway does **not** check a stream
+name against the spec's declaration (neither the ingest nor the registry knows the
+runtime document); the portal shows tabs only for declared names, so an
+undeclared stream is never rendered. Each subscriber counts its drops per stream,
+the agent's own `dropped_bytes` included (saturating), and emits one gap entry per
+lossy stream; a subscriber that sees more than 16 distinct streams
+(`runtimeLogSubMaxStreams`) is resynced rather than let its map grow.
+
+#### `last_error.log_file_tails`
+
+When a generation fails, its `last_error` gains `log_file_tails: [{name, tail}]`:
+the last at most 2048 bytes (`logFileTailBytes`, cut on a character boundary) of
+each declared file's text that generation wrote, in declaration order, at most
+four entries; a refused, missing, binary or empty file has none. The tails are
+masked like every stream and never persisted, exactly like `stderr_tail`, and
+`stderr_tail` stays process output only.
+
+They arrive **after** the exit: `last_error` is recorded at the exit, and
+`awaitLogFileTails` waits for every tailer of the generation to finish its grace,
+then posts the tails to the owner (`cmdLogFileTails`). `handleLogFileTails`
+attaches them only while the instance's `last_error` is still the very value that
+failure recorded (pointer identity) and replaces it by a copy, so a last_error
+replaced since — the next failure, a refusal, an admission wait — or cleared by a
+successful start never gets another generation's tails. A portal therefore
+briefly sees a `last_error` without file tails, then one with them. The
+failures covered are every non-intentional exit and the failures the agent
+records right **before** it kills the child for them (`noteGenerationFailure`:
+the startup timeout, a relay that never listened, an RPC device-count mismatch, a
+RAM bootstrap that never measured); a plain stop or a removal gets none. The
+gateway clamps the list on ingest (`clampRuntimeLogFileTails`,
+`internal/gateway/agent_ingest.go`): at most four entries, an invalid, duplicate or
+`process` name dropped, each tail cut to its **last** 2048 bytes on a rune
+boundary, kept in the volatile runtime registry only.
+
+#### The portal
+
+The live-log dialog keeps its instance row and adds a **source row** below it
+(Process and one tab per declared file) only when the spec declares `log_files`,
+for an agent without the feature too, so that its tabs can say why they are empty.
+A spec without log files looks exactly as before. Each row keeps its selection
+while the other changes, every opening starts on the process source, and under
+All a file shows every instance's lines with their `[#k]` prefixes, the rule of
+§14.2. The browser keeps one window of 4,000 entries **per stream**, so a chatty
+file cannot trim the process output's view. A file tab with nothing to show says
+why, in a portal-owned sentence: its latest status (under All only a status every
+instance shares), an agent that lacks `runtime_log_files`, or nothing written yet.
+A file-mode spec takes its log-file names from the agent's report. Text is never
+rendered as HTML. The `last_error` block shows one section per `log_file_tails`
+entry below the stderr tail, headed by the file name, as text
+(`RuntimeLogView.tsx`, `RuntimeAdminSection.tsx`).
+
+#### Accepted residuals
+
+- **The N/N+1 overlap** on an external path or a stale name, above.
+- **The hard-link window** of the anchored open (§3.1.3).
+- **Masking catches literal occurrences only** (§3.2).
+- **`wsl` specs tail only `${CONFIG_DIR}` and `/mnt/<drive>` paths**; distro-internal
+  paths are refused until the `\\wsl.localhost` check is done (§3.8).
+- **Not run on Windows.** The Windows open path compiles and passes `go vet`, but
+  has not run on a Windows host; neither has a `wsl` spec's tail through
+  `/mnt/<drive>` nor the forward-slash `${CONFIG_DIR}` inside a real Strata run
+  (§3.1.3, [Risks](../11-risks-and-technical-debt.md)).
+
 ## 15. Configuration reference
 
 Agent settings on the agent's existing precedence — flag, then environment,
@@ -11481,14 +12065,15 @@ registers, over the authoritative table in
 | `runtime_config` / `OP_AGENT_RUNTIME_CONFIG` | unset | Path to the local runtime-config JSON; required when the source is `file`. |
 | `runtime_allowed_binaries` / `OP_AGENT_RUNTIME_ALLOWED_BINARIES` (**no flag form**) | empty | The binary allowlist: native absolute paths, and `wsl://<distro>/<absolute Linux path>` entries for binaries inside a WSL2 distro ([§3.8](#38-execution-modes-wsl2)). **Empty means nothing starts** (a `wsl` spec needs a `wsl://` entry for its distro). The earlier `runtime_wsl_allowed_*` settings are removed; an agent that still carries one starts and logs a warning. |
 | `runtime_allowed_dirs` / `OP_AGENT_RUNTIME_ALLOWED_DIRS` (**no flag form**) | empty | Permitted work/model directories (a bare entry or a trailing `/*` both mean the subtree, §3.1.1). A spec that sets no `work_dir` runs beside its binary and is permitted regardless (§3.1); a spec that *does* set one must place it inside a permitted subtree. `wsl://<distro>/<path>` entries do the same for `wsl` specs of that distro and never affect native ones. |
+| `runtime_allowed_log_dirs` / `OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS` (**no flag form**) | empty | Directories, besides a spec's own `${CONFIG_DIR}`, from which the agent may tail the `log_files` a spec declares ([§3.1.3](#313-runtime_allowed_log_dirs-which-files-the-agent-may-read)). **Empty means only `${CONFIG_DIR}`** — the inverse of `runtime_allowed_dirs`, which is why that list is not reused. Same entry syntax (a bare entry or a trailing `/*` is the subtree); a relative entry is ignored with a startup warning. `wsl://<distro>/<path>` entries are accepted but permit nothing yet: a distro-internal log path is refused (§3.8). **The gateway never supplies it.** |
 | `runtime_allow_binary_dirs` / `OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS` (**no flag form**) | `false` | Auto-allow each allowed binary's parent directory as a `work_dir` subtree (§3.1.2). On while `runtime_allowed_dirs` is empty flips work-dir handling permissive→restrictive. |
 | `runtime_wsl_exe` / `OP_AGENT_RUNTIME_WSL_EXE` (**no flag form**) | `C:\Program Files\WSL\wsl.exe` on Windows, empty elsewhere | The `wsl.exe` a `wsl` spec is launched through ([§3.8](#38-execution-modes-wsl2)). **Empty means no `wsl` spec starts.** |
 | `runtime_wsl_user` / `OP_AGENT_RUNTIME_WSL_USER` (**no flag form**) | empty | The Linux user every `wsl.exe` call runs as (`-u`). `root` and UID 0 are refused. **Empty means no `wsl` spec starts.** |
 | `runtime_cache` / `OP_AGENT_RUNTIME_CACHE` | next to the binary | Path to the persisted last-good runtime-config document. |
 | `config_files_dir` / `OP_AGENT_CONFIG_FILES_DIR` | `server-agent-config-files` next to the binary | Base directory the agent writes spec config files under, one `<spec-id>/` subdirectory each; `${CONFIG_DIR}` resolves to it ([§3.5](#35-config-files-the-agent-writes-before-it-launches-the-child)). A relative config-file value resolves beside that file. **The gateway never supplies it.** |
 | `runtime_router_bind` / `OP_AGENT_RUNTIME_ROUTER_BIND` | empty | Router bind host (§4.6). Empty derives the mesh identity, else all interfaces with a warning. **The gateway supplies only the port.** |
-| `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
-| `runtime_log_buffer_total_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` (**no flag form**) | 16 MiB | Ceiling on that retention across all specs. |
+| `runtime_log_buffer_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_BYTES` (**no flag form**) | 1 MiB | Managed-process output retained per spec, and the upper limit of each of its log-file rings ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). Below 64 KiB is raised to it. |
+| `runtime_log_buffer_total_bytes` / `OP_AGENT_RUNTIME_LOG_BUFFER_TOTAL_BYTES` (**no flag form**) | 16 MiB | A hard byte ceiling on that retention across every ring of every spec, log files included; raised to at least the per-spec size plus 4 × 64 KiB, and a log-file ring shrinks below the per-spec size only when one spec's rings would not fit it ([§14.3](#143-the-memory-bound-is-the-operators-to-set)). |
 | `OP_AGENT_VRAM_HEADROOM_MB` (**no flag form**, env-only) | `0` | MB held back from each **auto-detected** per-GPU VRAM budget, for the driver, a display or another tenant; never applied to a budget the operator set ([§5.1](#51-the-per-gpu-data-model), [ADR-083](../09-architecture-decisions.md#adr-083--resource-accounting-is-on-by-default-vram-budgets-auto-detect-from-device-totals-and-an-operator-budget-overrides)). `0` is a real value; a negative or malformed one falls back to `0`. |
 | `OP_AGENT_HOST_RAM_RESERVE_MB` (**no flag form**, env-only) | `2048` | Host RAM held back from the host-RAM admission pool (`MemAvailable` + what managed processes hold − this), room for the OS, the agent and whatever else shares the host ([§5.2](#52-the-three-gates), [ADR-085](../09-architecture-decisions.md#adr-085--ram-is-a-co-equal-host-scoped-admission-axis-one-host-wide-pool-on-live-available-memory)). `0` is a real value (reserve nothing); a negative or malformed one falls back to the default. |
 | `OP_AGENT_RAM_BOOTSTRAP_GUESS_MB` (**no flag form**, env-only) | `4096` | Conservative host RAM charged to a spec of unknown RAM demand on its first start, until it is measured ([§5.3](#53-unknown-vram-resolves-itself-by-measurement), [ADR-086](../09-architecture-decisions.md#adr-086--cold-start-bootstrap-measure-first-safely-with-a-guarded-ram-start-a-one-shot-vram-eviction-and-a-bounded-failure-path)). Errs high on purpose; `0` turns the charge off (not the bootstrap interlock); a negative or malformed value falls back to the default. Raise it for a RAM-heavy model whose demand is not yet declared. |
@@ -11532,4 +12117,5 @@ mechanics of the generated agent config document are in
   ADR-029, ADR-031 to ADR-036, ADR-087 to ADR-089 (the co-residency mode,
   the derived role and role-aware eviction), ADR-090 to ADR-093 (model
   instances: addressing, burst admission, the scaler, the audio benchmark), and
-  ADR-101 (the WSL2 execution mode).
+  ADR-101 (the WSL2 execution mode), and ADR-121 (the agent reads the log files a
+  spec names, under its own rules).

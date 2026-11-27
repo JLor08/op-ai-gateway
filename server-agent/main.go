@@ -177,6 +177,7 @@ func main() {
 	localPolicy := runtimectl.LocalPolicy{
 		AllowedBinaries: cfg.RuntimeAllowedBinaries,
 		AllowedDirs:     cfg.RuntimeAllowedDirs,
+		AllowedLogDirs:  cfg.RuntimeAllowedLogDirs,
 		AllowBinaryDirs: cfg.RuntimeAllowBinaryDirs,
 		WSL: runtimectl.WSLPolicy{
 			Exe:  cfg.RuntimeWSLExe,
@@ -548,6 +549,7 @@ func resolvedConfigAttrs(cfg config.Config) []any {
 		"config_files_dir", cfg.ConfigFilesDir,
 		"runtime_allowed_binaries", len(cfg.RuntimeAllowedBinaries),
 		"runtime_allowed_dirs", len(cfg.RuntimeAllowedDirs),
+		"runtime_allowed_log_dirs", len(cfg.RuntimeAllowedLogDirs),
 		"runtime_allow_binary_dirs", cfg.RuntimeAllowBinaryDirs,
 		"vram_headroom_mb", cfg.VRAMHeadroomMB,
 		"host_ram_reserve_mb", cfg.HostRAMReserveMB,

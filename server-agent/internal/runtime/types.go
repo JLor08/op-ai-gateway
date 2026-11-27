@@ -72,7 +72,8 @@ type Spec struct {
 	Binary                      string            `json:"binary"`
 	Args                        []string          `json:"args"`
 	Env                         map[string]string `json:"env"`
-	ConfigFiles                 []ConfigFile      `json:"config_files"` // #257; non-nil after ParseConfig, names validated there
+	ConfigFiles                 []ConfigFile      `json:"config_files"`        // #257; non-nil after ParseConfig, names validated there
+	LogFiles                    []LogFile         `json:"log_files,omitempty"` // #430; log files the agent tails, validated by checkLogFiles
 	WorkDir                     string            `json:"work_dir"`
 	GPUs                        []SpecGPU         `json:"gpus"`
 	RAMMB                       int               `json:"ram_mb"` // host-RAM demand (max(measured, estimate)); 0 = unknown, never "needs none"
@@ -447,6 +448,13 @@ const (
 	// rules at submit time, so only a hand-authored file-mode runtime.json can
 	// reach it.
 	ParseErrorInvalidConfigFileName ParseErrorCode = "invalid_config_file_name"
+	// ParseErrorInvalidLogFiles: a spec's log_files breaks the declaration
+	// rules (more than maxLogFiles entries, a bad or reserved or repeated
+	// name, an empty or oversized path, or a path naming ${API_TOKEN} or
+	// ${AGENT_ENV:...}). Structural and fatal to the whole document, like an
+	// invalid config file name: the gateway enforces the same rules at submit
+	// time, so only a hand-authored file-mode runtime.json can reach it.
+	ParseErrorInvalidLogFiles ParseErrorCode = "invalid_log_files"
 	// ParseErrorFileMissing: nothing exists at the configured path. The
 	// file never got parsed, so this is not a parse failure at all -- it
 	// rides the same field because the field's real subject is "why the
@@ -613,6 +621,9 @@ func ParseConfig(raw []byte) (Config, error) {
 			cfg.Specs[i].ConfigFiles = []ConfigFile{}
 		}
 		if err := checkConfigFileNames(cfg.Specs[i]); err != nil {
+			return Config{}, err
+		}
+		if err := checkLogFiles(cfg.Specs[i]); err != nil {
 			return Config{}, err
 		}
 		sanitizeInstanceFields(&cfg.Specs[i])
@@ -831,6 +842,83 @@ func checkConfigFileNames(spec Spec) error {
 	return nil
 }
 
+// LogFile declares one log file a spec's server writes, which the agent tails
+// while the process runs (#430). Name is the tab label and the key of the
+// gateway's per-file tail; Path is the file location, with ${CONFIG_DIR} and
+// the other non-secret placeholders expanded at tail time.
+type LogFile struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+const (
+	// maxLogFiles bounds log_files per spec: every entry is a tailer and a
+	// ring, so the count is a resource bound, not a presentation choice.
+	maxLogFiles = 4
+	// maxLogFileNameLen and maxLogFilePathBytes bound the two strings.
+	maxLogFileNameLen   = 32
+	maxLogFilePathBytes = 1024
+	// reservedLogFileName is the process stream's tab name; a file may not
+	// shadow it (compared case-insensitively).
+	reservedLogFileName = "process"
+)
+
+// checkLogFiles validates spec's log_files: at most maxLogFiles entries, each
+// name matching validLogFileName and unique case-insensitively, each path
+// non-empty, at most maxLogFilePathBytes, and free of ${API_TOKEN} and
+// ${AGENT_ENV:...} (a secret must never become part of a path the agent opens
+// or reports). Whether the expanded path is absolute and inside the agent's
+// allowed log directories is checked at tail time, not here: the expansion
+// depends on the agent-local ${CONFIG_DIR} and allowlist, which the parser
+// does not know. The error names the spec and the offending name, never a
+// path's content beyond what the operator wrote.
+func checkLogFiles(spec Spec) error {
+	if len(spec.LogFiles) > maxLogFiles {
+		return &ParseError{Code: ParseErrorInvalidLogFiles, Err: fmt.Errorf(
+			"spec %q: %d log files declared, at most %d are allowed", spec.ID, len(spec.LogFiles), maxLogFiles)}
+	}
+	seen := make(map[string]struct{}, len(spec.LogFiles))
+	for _, f := range spec.LogFiles {
+		if !validLogFileName(f.Name) {
+			return &ParseError{Code: ParseErrorInvalidLogFiles, Err: fmt.Errorf(
+				"spec %q: log file name %q must be 1-%d characters of letters, digits, \".\", \"_\" or \"-\", and not %q",
+				spec.ID, f.Name, maxLogFileNameLen, reservedLogFileName)}
+		}
+		key := strings.ToLower(f.Name)
+		if _, dup := seen[key]; dup {
+			return &ParseError{Code: ParseErrorInvalidLogFiles, Err: fmt.Errorf(
+				"spec %q: duplicate log file name %q (names are compared case-insensitively)", spec.ID, f.Name)}
+		}
+		seen[key] = struct{}{}
+		if f.Path == "" || len(f.Path) > maxLogFilePathBytes {
+			return &ParseError{Code: ParseErrorInvalidLogFiles, Err: fmt.Errorf(
+				"spec %q: log file %q needs a path of 1-%d bytes", spec.ID, f.Name, maxLogFilePathBytes)}
+		}
+		if strings.Contains(f.Path, "${API_TOKEN}") || strings.Contains(f.Path, "${AGENT_ENV:") {
+			return &ParseError{Code: ParseErrorInvalidLogFiles, Err: fmt.Errorf(
+				"spec %q: log file %q path must not use ${API_TOKEN} or ${AGENT_ENV:...}", spec.ID, f.Name)}
+		}
+	}
+	return nil
+}
+
+// validLogFileName reports whether name matches ^[A-Za-z0-9._-]{1,32}$ and is
+// not the reserved "process" (case-insensitive). Hand-rolled instead of a
+// regexp: it is the whole ruleset and the gateway applies the same one.
+func validLogFileName(name string) bool {
+	if name == "" || len(name) > maxLogFileNameLen || strings.EqualFold(name, reservedLogFileName) {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // validConfigFileName reports whether name is one plain file name safe to join
 // under a per-spec config directory: non-blank, not "." or "..", no path
 // separator of either OS, no volume or alternate-data-stream marker (":"), and
@@ -912,6 +1000,23 @@ type LastError struct {
 	// runtime.device_backend_mismatch) for lifecycle failures the gateway maps
 	// to a specific operator message; empty for a plain start failure or crash.
 	Code string `json:"code,omitempty"`
+	// LogFileTails is the end of each declared log file the failed generation
+	// wrote (#430 §9): at most one entry per declared file (so at most four),
+	// each at most 2 KiB, in declaration order; a file with no text of that
+	// generation (refused, missing, binary, empty) has none. It is added after
+	// the exit, once the generation's tailers have finished their grace, and
+	// only while this last_error still describes that generation -- so a
+	// last_error briefly has none, then has them. Masked like every stream
+	// (§8), and never persisted, exactly like StderrTail.
+	LogFileTails []LogFileTail `json:"log_file_tails,omitempty"`
+}
+
+// LogFileTail is one declared log file's entry in LastError.LogFileTails: the
+// declaration's name (the stream id) and the last bytes of that file's text
+// the failed generation wrote.
+type LogFileTail struct {
+	Name string `json:"name"`
+	Tail string `json:"tail"`
 }
 
 // Status is one INSTANCE's current runtime status, as tracked by the process

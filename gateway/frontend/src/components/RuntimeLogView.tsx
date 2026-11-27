@@ -69,12 +69,32 @@ import type { PortalApi, Translation } from './shared/types';
  * -- see `instanceView`. Opened from an instance's row, the
  * view starts on that instance's tab. A gap belongs to no instance (the
  * bytes lost may have come from any of them), so every tab shows every gap.
+ *
+ * A spec may also declare log files (#430) that the agent tails beside the
+ * process output, each as its own STREAM named after the file (`stream` on the
+ * entry; absent for the process). The view then offers a SECOND row of tabs
+ * below the instance row: the source -- "Process" and one tab per declared
+ * file, in declaration order. The two rows are independent filters over the
+ * history: each stream has its own bounded window (see StreamWindows; one
+ * stream never evicts another), the source row picks one, and the instance
+ * row's `allView` / `instanceView` then work on its entries exactly as they
+ * do on process output, because a file line of instance k >= 1 carries
+ * the same `[#k] ` prefix and `instance` field. Each row keeps its selection
+ * while the other changes; every opening starts on the process source. A gap
+ * names its stream, so it shows in its own source's tabs only. A spec without
+ * log files shows no source row, and the dialog looks as it did before. An
+ * empty file tab says why -- the file's latest status (see `fileStatus`;
+ * under "All" only a status every instance shares), an agent without
+ * `runtime_log_files`, or simply nothing written yet -- and a stream the spec
+ * does not declare is never kept or shown at all. A file tab is titled
+ * "Logs" and has its own intro; "Process output" stays the process tab's.
  */
 
 /**
- * How many entries the browser keeps. The agent's own buffer is the history
- * (megabytes, operator-sized); this is only what the DOM holds, so it is sized
- * for rendering cost rather than for retention. Trimming past it is reported,
+ * How many entries the browser keeps PER STREAM (see StreamWindows). The
+ * agent's own buffer is the history (megabytes, operator-sized); this is only
+ * what the DOM holds -- one stream is rendered at a time -- so it is sized for
+ * rendering cost rather than for retention. Trimming past it is reported,
  * never silent -- see LogWindow.
  *
  * Exported so a test can name the cap instead of restating 4000, which would
@@ -144,8 +164,133 @@ function appendBounded(prev: LogWindow, incoming: readonly RuntimeLogEntry[]): L
   };
 }
 
+/**
+ * One `LogWindow` per stream, keyed like `streamView`'s source: `''` for the
+ * process output, otherwise the declared log file's name.
+ *
+ * One window per stream, each under its own display cap, because the agent
+ * keeps one ring per stream and replays them one after another: with a single
+ * shared window a busy file pushed every process line out of the view (and the
+ * process tab then said the agent retained nothing, beside a trimmed notice
+ * that belonged to the file), and a process flood trimmed a file's status
+ * event away. The trimmed count is per window as well, so a tab reports only
+ * its own loss. A Map, not an object: `__proto__` is a valid stream name.
+ */
+type StreamWindows = ReadonlyMap<string, LogWindow>;
+
+const noStreamWindows: StreamWindows = new Map();
+
+/**
+ * Appends a batch to the windows of the streams it names, each bounded by
+ * `appendBounded`. Entries of a stream outside `declared` are dropped: they
+ * are never shown, and keeping them would let an undeclared name grow the
+ * view's memory past the per-stream bound.
+ */
+function appendToStreams(
+  prev: StreamWindows,
+  incoming: readonly RuntimeLogEntry[],
+  declared: ReadonlySet<string>,
+): StreamWindows {
+  const keys = new Set(incoming.map((e) => e.stream ?? ''));
+  let next: Map<string, LogWindow> | null = null;
+  for (const key of keys) {
+    if (!declared.has(key)) continue;
+    next ??= new Map(prev);
+    next.set(key, appendBounded(prev.get(key) ?? emptyLogWindow, streamView(incoming, key)));
+  }
+  return next ?? prev;
+}
+
 /** Which part of the history the view shows: everything, or one instance's. */
 type LogTab = 'all' | number;
+
+/**
+ * The entries of one source: `''` is the process output (entries that name no
+ * stream, which is all an agent without log files sends, gaps included), any
+ * other value the declared log file of that name. Applied BEFORE `allView` /
+ * `instanceView`, so the instance row filters within the selected source.
+ */
+export function streamView(entries: readonly RuntimeLogEntry[], source: string): RuntimeLogEntry[] {
+  return entries.filter((e) => (e.stream ?? '') === source);
+}
+
+/** Why a file tab has nothing, or nothing more, to show. */
+export type FileStatus = 'waiting' | 'not_permitted' | 'binary' | 'missing';
+
+// The file events that set or clear a file's status. `file_opened` clears it:
+// the file is there and being read. The remaining file events (rotated,
+// truncated, line cut, stale) are markers inside the history and change no
+// status.
+const fileStatusByEvent = new Map<string, FileStatus | null>([
+  ['file_opened', null],
+  ['file_waiting', 'waiting'],
+  ['file_not_permitted', 'not_permitted'],
+  ['file_binary', 'binary'],
+  ['file_missing', 'missing'],
+]);
+
+/**
+ * The status of a file stream as the shown entries leave it: the latest
+ * status-bearing event decides, and none -- or `file_opened` latest -- means
+ * the file has no status to report. A generation of a `${CONFIG_DIR}` file
+ * normally begins with `file_waiting` (the agent removed the file before exec)
+ * followed by `file_opened`, so "waiting" stands only until the process
+ * creates its file.
+ */
+export function fileStatus(entries: readonly RuntimeLogEntry[]): FileStatus | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const event = entries[i].event;
+    if (event !== undefined && fileStatusByEvent.has(event)) {
+      return fileStatusByEvent.get(event) ?? null;
+    }
+  }
+  return null;
+}
+
+/**
+ * A file's status under "All" while the view offers instance tabs: every
+ * instance tails its own copy of the file, so the latest event of the
+ * interleaved history says nothing about the others -- instance 1's
+ * `file_opened` would hide instance 0's `file_not_permitted`, and instance 0's
+ * refusal would be claimed for instance 1. A status is therefore stated only
+ * when every known instance has that same one; otherwise none, and the
+ * instance tabs carry the details.
+ */
+function sharedFileStatus(
+  entries: readonly RuntimeLogEntry[],
+  instances: readonly number[],
+): FileStatus | null {
+  let shared: FileStatus | null = null;
+  for (const k of instances) {
+    const status = fileStatus(entries.filter((e) => entryInstance(e) === k));
+    if (status === null || (shared !== null && status !== shared)) return null;
+    shared = status;
+  }
+  return shared;
+}
+
+/**
+ * The portal's wording for a marker inside a file's history, or null for any
+ * other event. Like the generation markers, the agent sends only the kind.
+ */
+function fileMarkerLabel(event: string | undefined, t: Translation): string | null {
+  switch (event) {
+    case 'file_opened':
+      return t.runtimeLogsFileOpened;
+    case 'file_rotated':
+      return t.runtimeLogsFileRotated;
+    case 'file_truncated':
+      return t.runtimeLogsFileTruncated;
+    case 'file_line_cut':
+      return t.runtimeLogsFileLineCut;
+    case 'file_stale':
+      return t.runtimeLogsFileStale;
+    default:
+      return null;
+  }
+}
+
+const noLogFiles: readonly string[] = [];
 
 /**
  * The instance an entry belongs to. An agent from before instances sends no
@@ -325,8 +470,10 @@ function ownEntryShown(
 }
 
 /**
- * One rendered line: process output, or a boundary marker together with the
- * resolved command it carries, or a gap notice.
+ * One rendered line: process or file output, or a boundary marker together
+ * with the resolved command it carries, or a file marker, or a gap notice. A
+ * file STATUS event renders nothing here: it is stated above the log instead
+ * (see `fileStatus`).
  */
 function LogLine({ entry, t }: Readonly<{ entry: RuntimeLogEntry; t: Translation }>) {
   const gap =
@@ -335,6 +482,23 @@ function LogLine({ entry, t }: Readonly<{ entry: RuntimeLogEntry; t: Translation
         {`\n${t.runtimeLogsDropped(entry.dropped_bytes)}\n`}
       </Box>
     ) : null;
+
+  // A marker inside a file's history. It carries no pid and no command: a file
+  // is not a process.
+  const fileMarker = fileMarkerLabel(entry.event, t);
+  if (fileMarker !== null) {
+    return (
+      <>
+        {gap}
+        <Box
+          component="span"
+          sx={{ color: 'text.secondary', fontStyle: 'italic', display: 'block', my: 0.5 }}
+        >
+          {`── ${fileMarker} ──`}
+        </Box>
+      </>
+    );
+  }
 
   // A boundary between two runs of the same spec. The wording is OURS: the
   // backend allow-lists the event kind to a closed set precisely so that what
@@ -585,6 +749,8 @@ export function RuntimeLogView({
   allInstances = false,
   instances = [],
   initialTab = 'all',
+  logFiles = noLogFiles,
+  logFilesSupported = true,
 }: Readonly<{
   open: boolean;
   onClose: () => void;
@@ -607,6 +773,13 @@ export function RuntimeLogView({
   // The tab the view opens on: the instance whose row the operator opened it
   // from, or "All". A view that opens without tabs opens on "All".
   initialTab?: LogTab;
+  // #430: the names of the spec's declared log files, in declaration order.
+  // Non-empty, they add the source row; empty, the view is as before.
+  logFiles?: readonly string[];
+  // Whether the server's agent declares `runtime_log_files`. An agent without
+  // it never sends a file stream, so each file tab says so instead of staying
+  // blank. Unknown counts as supported.
+  logFilesSupported?: boolean;
 }>) {
   // The tab every opening starts on. Whether the view shows tabs at that
   // moment depends on the props alone, because the instances the stream names
@@ -615,12 +788,18 @@ export function RuntimeLogView({
   const openingTab: LogTab = showsTabs(allInstances, knownInstances(instances, noInstancesSeen))
     ? initialTab
     : 'all';
-  const [win, setWin] = useState<LogWindow>(emptyLogWindow);
+  const [windows, setWindows] = useState<StreamWindows>(noStreamWindows);
+  // The streams the view keeps: the process output and the declared files.
+  // A ref, synced by an effect, so a changed declaration does not re-subscribe.
+  const declaredRef = useRef<ReadonlySet<string>>(new Set(['', ...logFiles]));
   // Every instance the stream has named since the dialog opened. Kept across a
   // scrollback: an instance that has left the retained history keeps its tab
   // while the dialog is open, so a tab never vanishes under the operator.
   const [seenInstances, setSeenInstances] = useState<ReadonlySet<number>>(() => new Set());
   const [tab, setTab] = useState<LogTab>(openingTab);
+  // The selected source: '' is the process output, otherwise a declared log
+  // file's name. Independent of `tab`: switching one keeps the other.
+  const [source, setSource] = useState('');
   const [state, setState] = useState<RuntimeLogState | null>(null);
   // `scrollbackSeen` is what separates "the agent's buffer is empty" from
   // "nothing has arrived yet". The agent always sends a scrollback batch on
@@ -639,8 +818,12 @@ export function RuntimeLogView({
   const logId = useId();
 
   useEffect(() => {
+    declaredRef.current = new Set(['', ...logFiles]);
+  }, [logFiles]);
+
+  useEffect(() => {
     if (!open) return undefined;
-    setWin(emptyLogWindow);
+    setWindows(noStreamWindows);
     setState(null);
     setScrollbackSeen(false);
     setConnectionError(false);
@@ -654,12 +837,13 @@ export function RuntimeLogView({
         // appending it to what is on screen would duplicate the history. The
         // counter is replaced too, not zeroed -- a retained history longer than
         // the display cap loses its head to that same slice, and this path used
-        // to drop it with no counter and no notice.
+        // to drop it with no counter and no notice. Every stream's window is
+        // replaced: the scrollback replays all of them.
         setScrollbackSeen(true);
-        setWin(appendBounded(emptyLogWindow, batch.entries));
+        setWindows(appendToStreams(noStreamWindows, batch.entries, declaredRef.current));
         return;
       }
-      setWin((prev) => appendBounded(prev, batch.entries));
+      setWindows((prev) => appendToStreams(prev, batch.entries, declaredRef.current));
     };
 
     return api.subscribeRuntimeLogs(serverId, specId, onBatch, setState, (status) =>
@@ -674,18 +858,33 @@ export function RuntimeLogView({
     if (open) setTab(openingTab);
   }, [open, openingTab]);
 
+  // Every opening starts on the process output, as before log files existed.
+  useEffect(() => {
+    if (open) setSource('');
+  }, [open]);
+
   const tabInstances = useMemo(
     () => knownInstances(instances, seenInstances),
     [instances, seenInstances],
   );
   const showTabs = showsTabs(allInstances, tabInstances);
   const activeTab: LogTab = showTabs ? tab : 'all';
+  const showSources = logFiles.length > 0;
+  // A source the spec no longer declares falls back to the process output.
+  const activeSource = logFiles.includes(source) ? source : '';
+  const fileSource = activeSource !== '';
+  // The selected stream's own window: its entries, and its own trim counts.
+  const win = windows.get(activeSource) ?? emptyLogWindow;
+  const streamEntries = win.entries;
   const shown = useMemo(
     () =>
       activeTab === 'all'
-        ? { entries: showTabs ? allView(win.entries) : win.entries, own: win.entries.length }
-        : instanceView(win.entries, activeTab),
-    [win.entries, activeTab, showTabs],
+        ? {
+            entries: showTabs ? allView(streamEntries) : streamEntries,
+            own: streamEntries.length,
+          }
+        : instanceView(streamEntries, activeTab),
+    [streamEntries, activeTab, showTabs],
   );
 
   useEffect(() => {
@@ -695,16 +894,31 @@ export function RuntimeLogView({
   }, [shown.entries]);
 
   const entries = shown.entries;
-  const hasOutput = win.entries.length > 0;
-  const commandGap = opensWithoutACommand(entries);
+  // Per source: the agent keeps one ring per stream, so "nothing retained" is
+  // a fact about the selected one. Without log files it is the whole history.
+  const hasOutput = streamEntries.length > 0;
+  // A file has no generation marker and no command, so only the process
+  // output can be missing one.
+  const commandGap = !fileSource && opensWithoutACommand(entries);
+  const fileStatusText: Readonly<Record<FileStatus, string>> = {
+    waiting: t.runtimeLogsFileWaiting,
+    not_permitted: t.runtimeLogsFileNotPermitted,
+    binary: t.runtimeLogsFileBinary,
+    missing: t.runtimeLogsFileMissing,
+  };
   const notice = (() => {
     if (connectionError) return { severity: 'warning' as const, text: t.runtimeLogsDisconnected };
     if (state === 'offline') return { severity: 'warning' as const, text: t.runtimeLogsOffline };
     if (state === 'unsupported')
       return { severity: 'warning' as const, text: t.runtimeLogsUnsupported };
+    // An agent without runtime_log_files never sends this stream, whatever
+    // else its history holds: say so before any sentence about the history.
+    if (fileSource && !logFilesSupported)
+      return { severity: 'warning' as const, text: t.runtimeLogsFileUnsupported };
     // A connected, capable agent that delivered an EMPTY history: say so, or
-    // the blank area reads as "the process printed nothing".
-    if (state === 'streaming' && scrollbackSeen && !hasOutput)
+    // the blank area reads as "the process printed nothing". (An empty FILE
+    // stream gets its own sentence below.)
+    if (!fileSource && state === 'streaming' && scrollbackSeen && !hasOutput)
       return { severity: 'info' as const, text: t.runtimeLogsEmptyBuffer };
     if (!scrollbackSeen && !hasOutput)
       return { severity: 'info' as const, text: t.runtimeLogsWaiting };
@@ -712,12 +926,27 @@ export function RuntimeLogView({
     // tab reads as "this instance prints nothing".
     if (activeTab !== 'all' && shown.own === 0)
       return { severity: 'info' as const, text: t.runtimeLogsInstanceEmpty(activeTab) };
+    if (!fileSource) return null;
+    // A file tab: its latest status (under "All" with instance tabs, the one
+    // every instance shares), else -- with no line and no gap shown -- that
+    // the file has written nothing yet.
+    const status =
+      activeTab === 'all' && showTabs
+        ? sharedFileStatus(entries, tabInstances)
+        : fileStatus(entries);
+    if (status !== null) return { severity: 'info' as const, text: fileStatusText[status] };
+    if (!entries.some((e) => (e.text ?? '') !== '' || hasGap(e)))
+      return { severity: 'info' as const, text: t.runtimeLogsFileEmpty };
     return null;
   })();
 
+  const logLabel = fileSource ? t.runtimeLogs : t.runtimeLogsTitle;
+
   return (
     <Dialog open={open} onClose={onClose} fullWidth maxWidth="lg">
-      <DialogTitle>{`${t.runtimeLogsTitle} — ${title}`}</DialogTitle>
+      {/* "Process output" names the process stream; a file tab gets the
+          neutral "Logs" instead. */}
+      <DialogTitle>{`${logLabel} — ${title}`}</DialogTitle>
       <DialogContent>
         {showTabs && (
           <Tabs
@@ -738,8 +967,27 @@ export function RuntimeLogView({
             ))}
           </Tabs>
         )}
+        {showSources && (
+          <Tabs
+            value={activeSource}
+            onChange={(_event, value: string) => {
+              // A different source is a different view: start it at its tail.
+              followRef.current = true;
+              setSource(value);
+            }}
+            variant="scrollable"
+            scrollButtons="auto"
+            aria-label={t.runtimeLogsSourceLabel}
+            sx={{ mb: 1, borderBottom: 1, borderColor: 'divider' }}
+          >
+            <Tab label={t.runtimeLogsSourceProcess} value="" aria-controls={logId} />
+            {logFiles.map((name) => (
+              <Tab key={name} label={name} value={name} aria-controls={logId} />
+            ))}
+          </Tabs>
+        )}
         <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-          {t.runtimeLogsIntro}
+          {fileSource ? t.runtimeLogsFileIntro(activeSource) : t.runtimeLogsIntro}
         </Typography>
         {showTabs && (
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
@@ -773,7 +1021,7 @@ export function RuntimeLogView({
           ref={boxRef}
           id={logId}
           role="log"
-          aria-label={t.runtimeLogsTitle}
+          aria-label={logLabel}
           aria-live="polite"
           onScroll={(e) => {
             const el = e.currentTarget;

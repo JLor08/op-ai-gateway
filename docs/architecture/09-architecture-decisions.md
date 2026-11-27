@@ -649,7 +649,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -705,7 +705,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -874,7 +874,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1086,7 +1086,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1301,7 +1301,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-117-migrations),
+[§4](reference/data-model.md#4-migration-history-118-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1527,7 +1527,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-117-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-118-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1674,7 +1674,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-117-migrations),
+[§4](reference/data-model.md#4-migration-history-118-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3645,7 +3645,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-117-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-118-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3875,7 +3875,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-117-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-118-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4907,7 +4907,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5033,7 +5033,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-117-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-118-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5179,7 +5179,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-117-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-118-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7693,7 +7693,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-117-migrations),
+[Data Model](reference/data-model.md#4-migration-history-118-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7916,7 +7916,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-117-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-118-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8057,7 +8057,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-117-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-118-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8321,7 +8321,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-117-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-118-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -12189,7 +12189,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-117-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-118-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -13653,7 +13653,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 
 **Decision.**
 
-- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-117-migrations))
+- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-118-migrations))
   holds the same JSON as `api_tokens.vendor_provider_access` and goes through the same codec, validated like a token policy against the user's own
   reach. `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}` (`store.ChatSessionVendorAccess`), so every existing user keeps
   today's behavior with no backfill. An explicit save whose encoding would be `''` is stored as `{"all":false}`, so "no providers" never collapses into
@@ -13702,7 +13702,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 - → [External Vendor Accounts §11.4](cross-cutting/external-vendor-accounts.md#114-who-is-restricted-api-tokens-and-the-owners-chat-session-policy),
   [Security, Auth & RBAC §5](cross-cutting/security-auth-rbac.md),
   [HTTP API surface](reference/api-surface.md),
-  [Data model](reference/data-model.md#4-migration-history-117-migrations).
+  [Data model](reference/data-model.md#4-migration-history-118-migrations).
 
 ## ADR-115 — VM CPU power via a host-attributed synthetic RAPL tree over virtiofs
 
@@ -14191,3 +14191,78 @@ without saying why. What llama.cpp actually checks is the **RPC protocol version
 - Agent version 0.25.2 (PATCH): the new field is read when present and an old agent sends none, so nothing is negotiated.
 - → [Agent-Managed Model Runtime §3.6, §3.7](cross-cutting/agent-runtime-manager.md#37-the-gateways-half-of-a-cluster),
   [HTTP API Surface](reference/api-surface.md), [Data model](reference/data-model.md).
+
+## ADR-121 — The agent may read files the gateway names, under these rules
+
+**Context.** Some model servers write the diagnostics that explain a failure only to a log file, never to stdout or stderr: a Strata
+engine that died on a Windows host left the commit-limit death and the per-GPU free VRAM in its engine log, and the file had to be copied
+off the host by hand. llama.cpp (`--log-file`), vLLM and SGLang can do the same, so the feature is generic (#430). Letting a spec name
+files for the agent to tail is the **first time the agent reads a file the gateway chose**. Until now the gateway named binaries and
+work dirs only, and the agent's allowlists decided what may run (ADR-024); a read is a different capability, because the file's
+content travels to the gateway and to every portal admin who opens the live log. A gateway that can name `/etc/shadow`, a `..`, a
+symlink planted by the server, a UNC share or a device must not get its content, and a refusal must not reveal the agent's local
+layout either.
+
+**Decision.**
+
+1. **An explicit, bounded declaration.** A spec carries `log_files: [{name, path}]`, at most four. The name is the stream id
+   (`^[A-Za-z0-9._-]{1,32}$`, unique case-insensitively, never `process`); the path may use the non-secret placeholders only. The
+   gateway validates it early (`validateRuntimeSpecLogFiles`, `runtime_spec.log_files_invalid`), the agent again (`checkLogFiles`,
+   `invalid_log_files`). Nothing is inferred from `args` or a config file.
+2. **An agent-local allowlist, fail closed.** A file is tailable only strictly below the instance's own `${CONFIG_DIR}` or an entry of
+   the new `runtime_allowed_log_dirs` / `OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS`, which comes from the agent's file or environment only,
+   never from the gateway. **Empty means `${CONFIG_DIR}` only.** The lexical check (`resolveLogFile`) refuses relative paths, `..`
+   escapes, UNC and device paths, `/proc`, `/sys`, `/dev`, Windows reserved names, streams and names Win32 rewrites.
+3. **The open is anchored, not compared afterwards.** `openLogFile` opens the file through an `os.Root` at the root the path matched;
+   `os.Root` follows a link below the root only while it stays below it and refuses absolute links, junctions and `..` escapes, so a
+   swapped parent directory cannot lead out. The instance directory is a root only while it is a real directory chain below
+   `config_files_dir` (`openInstanceRoot`). A link between two allowed roots is refused. Only regular files are opened, never
+   blocking, and on Windows with full share mode, so the server's writes, renames and deletes are never hindered.
+4. **Hard links are refused.** After the open the descriptor must have exactly one link, and one more root-anchored observation of the
+   name must show the same file with one link (`bindOpenedLogFile`, `statLogFileName`).
+5. **Every open runs the whole policy**, the probe of every 250 ms poll and the reopen after a rotation included, because the file
+   behind a name can change.
+6. **Refusals name the setting and a count, never a path.** The paths go to the agent's own log only.
+7. **Nothing is persisted.** File text is retained like process output: in agent memory, in per-stream rings under the existing
+   byte total, streamed on demand, relayed by the gateway in memory, never written to disk or the database (the needle tests of Agent-Managed
+   Model Runtime §14.6 cover the file streams and `last_error.log_file_tails`).
+8. **The agent masks its own secrets.** Literal occurrences of the values it resolved for `${API_TOKEN}` and `${AGENT_ENV:NAME}` in
+   this generation, at least 8 bytes, are replaced by their placeholder before anything is retained, in file text and process output
+   alike, with a carry that holds back only a possible secret start, so a secret split across two reads is masked too.
+9. **Agent 0.26.0, feature `runtime_log_files`.** An agent without it ignores the field; the gateway keeps it regardless. The agent
+   honours the field only while the gateway declares the same name, in file mode too, so a gateway that cannot tell a file stream
+   from the process output never receives one.
+
+**Alternatives rejected.**
+- *Inferring the paths from `args` or config-file content* (`--log-file`, Strata's `log`): every server spells it differently, a
+  parser per server would drift, and an explicit field is what the agent can validate and the operator can see.
+- *Reusing `runtime_allowed_dirs`:* empty there means **any** `work_dir`, which here would mean any file, and a work dir is defence in
+  depth behind an allowlisted binary while this list is the boundary itself.
+- *A separate SSE endpoint, or a subscription per stream:* every stream of a spec rides the existing watch, epochs and replay; a second
+  endpoint would double the watch state, the 64-spec bound and the authorization path for no gain.
+- *Path-based checks after the open* (`EvalSymlinks` or `GetFinalPathNameByHandle`, then comparing the resolved path with the root):
+  raced in review. The resolution and the open are separate steps, so a server that swaps a parent for a link between them escapes,
+  and re-resolving the path re-walks every directory above the root. Anchoring the open itself at the root removes the window by
+  construction.
+- *Reading distro-internal WSL paths through `\\wsl.localhost` now:* whether link resolution through that share holds for the anchored
+  open is unverified, so such a path fails closed until it is checked on a real host (or replaced by a read helper inside the distro).
+
+**Consequences.**
+- An operator who wants a server's log in the portal points it at `${CONFIG_DIR}/<file>` and declares that path; the agent creates the
+  instance directory if needed and removes a direct child of it before exec, so each generation's file is its own. A `<file>` that is
+  one of the spec's config files is refused instead (by the gateway at submit time, by the agent at start time), because the removal
+  would delete the config file. The portal's Strata import points the engine log there only for an agent that declares
+  `runtime_log_files`: an older one writes `${CONFIG_DIR}` natively into config-file content, which is invalid JSON on Windows. Anything else needs
+  an explicit `runtime_allowed_log_dirs` entry on that host and is tailed from its end as of the start, never removed.
+- Accepted residual windows: the lookup and the link-count read of the hard-link check are separate steps, exploitable only by a
+  server that can link an outside file it could not read itself (macOS, or Linux without `fs.protected_hardlinks`); and the previous
+  generation's grace is ended but not awaited, so on an external or stale path a few early bytes of the next generation can reach the
+  previous generation's stream. Masking catches literal occurrences only: encoded forms, line-split values, values under 8 bytes and
+  older agents are not covered.
+- A `wsl` spec can tail only `${CONFIG_DIR}` and `/mnt/<drive>` paths in this version; a `wsl://` entry in `runtime_allowed_log_dirs`
+  permits nothing yet.
+- The Windows half compiles and passes `go vet` but has not run on a Windows host; that acceptance is outstanding.
+- A spec with four log files holds up to five rings, so fewer specs fit under the same total; the total became a hard byte bound over
+  every ring instead of a count of buffers.
+- → [Agent-Managed Model Runtime §3.1.3, §3.2, §3.5, §3.8, §14.9](cross-cutting/agent-runtime-manager.md#149-log-files),
+  [HTTP API Surface](reference/api-surface.md), [Risks](11-risks-and-technical-debt.md).

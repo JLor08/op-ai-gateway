@@ -1636,6 +1636,10 @@ const de = {
     'layer_split ist positionsabhängig: Eine andere GPU-Reihenfolge ändert seine Bedeutung.',
   strataImportWarnApiKey:
     'api_key wurde nicht übernommen: Der Schlüssel gehört in das Token der Spec, nicht in die Datei.',
+  strataImportWarnLogFilesCapped:
+    'Mehr als 4 Replikate: Nur die Logs der ersten 4 wurden als Log-Dateien eingetragen.',
+  strataImportWarnEngineLogNeedsAgent:
+    'Der Agent dieses Servers meldet „runtime_log_files“ nicht: „log“ bleibt wie im Run-Config, und es wird keine Log-Datei eingetragen. Das Engine-Log kann angezeigt werden, sobald der Agent Version 0.26.0 oder neuer hat; dann den Import wiederholen.',
   strataImportDone: 'Importiert: strata.json, GPU-Reihenfolge und Startup-Timeout wurden gesetzt.',
   strataImportTooLarge: 'Die importierte Datei überschreitet das Limit von 64 KiB.',
   strataImportNoFreeSlot: 'Es ist kein Platz für eine weitere Konfigurationsdatei (Maximum 16).',
@@ -1648,6 +1652,32 @@ const de = {
     'Der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten – die Datei wird unverschlüsselt geschrieben. Secrets über Umgebung oder Argumente übergeben.',
   runtimeSpecAgentNoConfigFiles:
     'Der verbundene Agent meldet „runtime_config_files“ nicht (benötigt Version 0.10.0 oder neuer): Er schreibt diese Dateien nicht, und ${CONFIG_DIR} wird nicht ersetzt.',
+  runtimeSpecLogFiles: 'Log-Dateien',
+  runtimeSpecLogFilesHint:
+    'Der Agent liest diese Dateien mit und zeigt sie im Log-Dialog als eigene Reiter. Der Pfad beginnt mit ${CONFIG_DIR}/… (das Verzeichnis dieser Spezifikation; ${CONFIG_DIR} wird in Konfigurationsdateien unter Windows mit / geschrieben) oder ist absolut; außerhalb von ${CONFIG_DIR} muss der Agent das Verzeichnis lokal freigeben. Erlaubt sind die nicht geheimen Platzhalter wie ${PORT} und ${MODEL}; ${API_TOKEN} und ${AGENT_ENV:NAME} sind hier nicht erlaubt. Höchstens 4 Dateien.',
+  runtimeSpecLogFileName: 'Name des Log-Streams',
+  runtimeSpecLogFileNamePlaceholder: 'z. B. server',
+  runtimeSpecLogFilePath: 'Pfad der Log-Datei',
+  runtimeSpecLogFilePathPlaceholder: 'z. B. ${CONFIG_DIR}/server.log',
+  runtimeSpecLogFileAdd: 'Log-Datei hinzufügen',
+  runtimeSpecLogFileRemove: 'Log-Datei entfernen',
+  runtimeSpecLogFileNameBlank: 'Der Name fehlt.',
+  runtimeSpecLogFileNameInvalid:
+    'Der Name darf 1 bis 32 Zeichen haben: Buchstaben, Ziffern, „.“, „_“ und „-“.',
+  runtimeSpecLogFileNameReserved: '„process“ ist für die Prozessausgabe reserviert.',
+  runtimeSpecLogFileNameDuplicate:
+    'Namen müssen eindeutig sein; Groß- und Kleinschreibung wird nicht unterschieden.',
+  runtimeSpecLogFilePathBlank: 'Der Pfad fehlt.',
+  runtimeSpecLogFilePathTooLong: 'Der Pfad ist länger als 1024 Bytes.',
+  runtimeSpecLogFilePathControl: 'Der Pfad darf keine Steuerzeichen enthalten.',
+  runtimeSpecLogFilePathSecret:
+    'Der Pfad darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten – er wird unverschlüsselt übertragen und angezeigt.',
+  runtimeSpecLogFilePathNotAbsolute:
+    'Der Pfad muss absolut sein oder mit ${CONFIG_DIR} und einem Pfadtrenner beginnen.',
+  runtimeSpecLogFilePathIsConfigFile:
+    'Der Pfad ist eine der Konfigurationsdateien dieser Spezifikation in ${CONFIG_DIR}: Der Agent entfernt eine Log-Datei dort vor dem Start und würde die Konfigurationsdatei löschen. Wählen Sie einen anderen Dateinamen.',
+  runtimeSpecAgentNoLogFiles:
+    'Der verbundene Agent meldet „runtime_log_files“ nicht (benötigt Version 0.26.0 oder neuer): Er liest diese Log-Dateien nicht mit. Speichern ist trotzdem möglich.',
   runtimeSpecArgsHint:
     'Ein Argument pro Zeile – Leerzeichen trennen hier nichts. Ein Schalter und sein Wert sind zwei Zeilen; ein Pfad mit Leerzeichen bleibt eine. Den Port nicht fest eintragen: Bei Listen-Port 0 vergibt ihn der Agent, ${PORT} setzt ihn ein.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
@@ -1704,6 +1734,7 @@ const de = {
   runtimeLastErrorExitCode: 'Exit-Code',
   runtimeLastErrorFailures: 'Fehlversuche',
   runtimeLastErrorStderr: 'stderr (Auszug)',
+  runtimeLastErrorLogFile: (name: string) => `Log-Datei „${name}“ (Auszug)`,
   runtimeRestart: 'Neu starten',
   // Task 22, Fix-Runde 2 (N-Accepted): der Hover-Grund fuer eine
   // ausgegraute Aktion. Nach einem erfolgreichen Neustart ist genau dieser
@@ -1772,6 +1803,8 @@ const de = {
   runtimeParseErrorDuplicateSpecId: 'Zwei Einträge in der Datei haben dieselbe Spec-ID.',
   runtimeParseErrorInvalidConfigFileName:
     'Ein Eintrag enthält in „config_files“ einen ungültigen oder doppelten Namen – nötig ist je Spezifikation ein eindeutiger, einzelner Dateiname ohne Pfad.',
+  runtimeParseErrorInvalidLogFiles:
+    'Ein Eintrag enthält in „log_files“ einen ungültigen, doppelten oder reservierten Namen oder einen unzulässigen Pfad.',
   runtimeParseErrorFileMissing: 'Am konfigurierten Pfad liegt keine Datei.',
   runtimeParseErrorReadFailed:
     'Die Datei ist vorhanden, ließ sich aber nicht lesen — Eigentümer und Berechtigungen prüfen.',
@@ -1814,6 +1847,32 @@ const de = {
   runtimeLogsTrimmed: (bytes: number) =>
     `Ältere Ausgabe wird in dieser Ansicht nicht mehr angezeigt (${bytes} Byte). Das Fenster erneut öffnen, um den vom Agenten vorgehaltenen Verlauf wieder vollständig zu laden.`,
   runtimeLogsProcessStartFailed: 'Prozess nicht gestartet',
+  // #430: die Quellen-Zeile und die Marker und Zustände einer deklarierten
+  // Log-Datei. Der Agent sendet nur die Art des Ereignisses (eine geschlossene
+  // Menge); der Wortlaut ist unserer. Ein Zustand nennt die Einstellung, nie
+  // einen Pfad.
+  runtimeLogsSourceLabel: 'Quelle',
+  runtimeLogsSourceProcess: 'Prozess',
+  runtimeLogsFileIntro: (name: string) =>
+    `Die Zeilen, die der Modellprozess in die Log-Datei „${name}“ schreibt – bei mehreren Instanzen die jeder Instanz –, so wie sie geschrieben wurden. Der Agent liest die Datei mit, hält die Zeilen im Arbeitsspeicher vor (auch über einen Absturz hinaus) und überträgt sie nur, solange dieses Fenster offen ist. Nichts davon wird vom Gateway gespeichert — weder auf der Festplatte noch in der Datenbank.`,
+  runtimeLogsFileOpened: 'Datei geöffnet',
+  runtimeLogsFileRotated: 'Datei rotiert – weiter in der neuen Datei',
+  runtimeLogsFileTruncated: 'Datei gekürzt – erneut ab ihrem Anfang gelesen',
+  runtimeLogsFileLineCut: 'Zeile gekürzt: länger als 16 KiB, der Rest der Zeile fehlt',
+  runtimeLogsFileStale:
+    'Die Datei des vorigen Laufs ließ sich nicht entfernen – gelesen wird ab ihrem bisherigen Ende',
+  runtimeLogsFileWaiting:
+    'Die Datei gibt es (noch) nicht. Der Agent prüft weiter, ob sie angelegt wird, und zeigt ihren Inhalt hier, sobald der Modellprozess sie anlegt.',
+  runtimeLogsFileNotPermitted:
+    'Der Agent liest diese Datei nicht: Ihr Pfad liegt nach dem Auflösen von Verknüpfungen nicht in einem erlaubten Verzeichnis, oder sie ist keine gewöhnliche Datei – etwa eine Verknüpfung oder eine Datei mit mehr als einem Hardlink. Erlaubt sind ${CONFIG_DIR} und die Verzeichnisse der Agent-Einstellung „runtime_allowed_log_dirs“ auf dem AI-Server.',
+  runtimeLogsFileBinary:
+    'Die Datei enthält überwiegend Binärdaten statt Text. Der Agent hat das Mitlesen für diesen Lauf eingestellt.',
+  runtimeLogsFileMissing:
+    'Der Lauf ist beendet, ohne dass die Datei je angelegt wurde. Prüfen Sie, ob der Pfad dem entspricht, wohin der Modellserver sein Log schreibt.',
+  runtimeLogsFileUnsupported:
+    'Der Agent dieses Servers meldet die Funktion „runtime_log_files“ nicht (benötigt Version 0.26.0 oder neuer). Er liest keine Log-Dateien mit — dieser Reiter bliebe dauerhaft leer. Den Agenten aktualisieren.',
+  runtimeLogsFileEmpty:
+    'Aus dieser Datei enthält der vorgehaltene Verlauf noch nichts. Neue Zeilen erscheinen hier, sobald der Modellprozess sie schreibt.',
   // Der tatsächlich ausgeführte Befehl, direkt an der Startmarkierung der
   // jeweiligen Generation. Der Betreiber hat eine Vorlage geschrieben; ${PORT},
   // ${MODEL}, ${HOST_GPU_IDS} und ${AGENT_ENV:NAME} werden erst beim Start
@@ -1828,7 +1887,7 @@ const de = {
   runtimeCommandTrimmedHere:
     'Die angezeigte Ausgabe beginnt ohne Startmarkierung, weil diese Ansicht ihre eigenen ältesten Einträge entfernt hat — nicht, weil der Agent sie nicht mehr vorhält. Das Fenster erneut öffnen, um den vom Agenten vorgehaltenen Verlauf neu zu laden: Hält er die Startmarkierung dieser Generation noch, kommt ihr ausgeführter Befehl mit.',
   runtimeCommandMasked:
-    'Werte aus „${AGENT_ENV:NAME}“ werden als genau dieser Platzhalter angezeigt, niemals als Wert — der Platzhalter nennt die Variable, die auf dem AI-Server nachzusehen ist. Diese Maskierung gilt für den hier gemeldeten Befehl und für nichts darüber hinaus: Ein Modellserver, der beim Start seine eigene Befehlszeile oder Umgebung ausgibt, schreibt den aufgelösten Wert in die Ausgabe unten und in den Fehlerauszug auf der Runtime-Seite. Was der Prozess selbst ausgibt, kann der Agent nicht maskieren — deshalb gehört ein Geheimnis als „${AGENT_ENV:NAME}“ nach „env“ und niemals als Klartext in ein Argument.',
+    'Werte aus „${AGENT_ENV:NAME}“ werden als genau dieser Platzhalter angezeigt, niemals als Wert — der Platzhalter nennt die Variable, die auf dem AI-Server nachzusehen ist. Diese genaue Maskierung gilt für den hier gemeldeten Befehl. Ein Modellserver, der beim Start seine eigene Befehlszeile oder Umgebung ausgibt, schreibt den aufgelösten Wert in seine Ausgabe: Ein Agent ab Version 0.26.0 ersetzt dort, in den Log-Dateien und im Fehlerauszug auf der Runtime-Seite wörtliche Vorkommen der Geheimnisse, die er selbst eingesetzt hat, ab 8 Bytes Länge ebenfalls durch ihren Platzhalter. Nicht erkannt werden kodierte Formen (URL, Base64, JSON-escaped), über Zeilen verteilte oder kürzere Werte und alles, was ein älterer Agent sendet — deshalb gehört ein Geheimnis als „${AGENT_ENV:NAME}“ nach „env“ und niemals als Klartext in ein Argument.',
   runtimeCommandEnvRedacted:
     'Dieser Agent bezieht seine Startspezifikationen aus einer lokalen Datei. Deshalb wird jeder Wert, den die Spezifikation selbst unter „env“ setzt, vollständig zurückgehalten: Der Schlüssel bleibt sichtbar, der Wert wird durch eine Maske ersetzt. Das ist dieselbe Grenze, die der Bericht des Agenten an das Gateway bereits zieht — eine lokale Datei ist das Dokument des Betreibers und darf einen Wert im Klartext enthalten. Es gibt hier keinen Platzhalter und nichts nachzuschlagen. Argumente fallen nicht darunter: Ein Argument wird so gemeldet, wie es geschrieben wurde.',
   runtimeCommandTruncated:
@@ -2341,6 +2400,8 @@ const de = {
     'Auf diesem Server läuft gerade ein Benchmark. Eine Änderung an einer Startvorgabe – insbesondere eine Admin-Übersteuerung – oder ein Starten oder Stoppen eines Modells würde dessen Messung verfälschen. Warten Sie, bis der Lauf fertig ist, oder brechen Sie ihn ab.',
   errorRuntimeSpecConfigFilesInvalid:
     'Ungültige Konfigurationsdateien: Jeder Name muss ein einzelner, eindeutiger Dateiname sein (keine Pfadtrenner, „.“ oder „..“, Doppelpunkt, Steuerzeichen), höchstens 16 Dateien zu je 64 KiB, und der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten.',
+  errorRuntimeSpecLogFilesInvalid:
+    'Ungültige Log-Dateien: höchstens 4 Einträge; jeder Name aus 1 bis 32 Zeichen A–Z, a–z, 0–9, „.“, „_“ oder „-“, eindeutig ohne Rücksicht auf Groß- und Kleinschreibung und nicht „process“; jeder Pfad nicht leer, höchstens 1024 Bytes, absolut oder beginnend mit ${CONFIG_DIR} und einem Pfadtrenner, ohne Steuerzeichen und ohne ${API_TOKEN} oder ${AGENT_ENV:…}.',
   errorRuntimeSpecInstancesInvalid:
     'Ungültige Instanzeinstellungen: Mindest- und Höchstanzahl müssen ganze Zahlen von 0 bis 64 sein, die Mindestanzahl darf eine gesetzte Höchstanzahl nicht übersteigen, und die parallelen Anfragen pro Instanz müssen eine ganze Zahl von 1 bis 1024 sein.',
   errorRuntimeSpecInstancesNeedEphemeralPort:
@@ -5857,6 +5918,10 @@ const en: PortalMessages = {
   strataImportWarnLayerSplit: 'layer_split is positional: reordering the GPUs changes its meaning.',
   strataImportWarnApiKey:
     'api_key was not imported: the key belongs in the spec token, not in the file.',
+  strataImportWarnLogFilesCapped:
+    'More than 4 replicas: only the logs of the first 4 were declared as log files.',
+  strataImportWarnEngineLogNeedsAgent:
+    'This server\'s agent does not report "runtime_log_files": "log" stays as in the run config and no log file is declared. The engine log can be shown once the agent is version 0.26.0 or newer; repeat the import then.',
   strataImportDone: 'Imported: strata.json, the GPU order and the startup timeout were set.',
   strataImportTooLarge: 'The imported file exceeds the 64 KiB limit.',
   strataImportNoFreeSlot: 'There is no room for another config file (maximum 16).',
@@ -5869,6 +5934,32 @@ const en: PortalMessages = {
     'The content must not contain ${API_TOKEN} or ${AGENT_ENV:…} — the file is written unencrypted. Pass secrets through env or args.',
   runtimeSpecAgentNoConfigFiles:
     'The connected agent does not report "runtime_config_files" (needs version 0.10.0 or newer): it does not write these files, and ${CONFIG_DIR} is not expanded.',
+  runtimeSpecLogFiles: 'Log files',
+  runtimeSpecLogFilesHint:
+    "The agent tails these files and shows each as its own tab in the log dialog. The path starts with ${CONFIG_DIR}/… (this spec's directory; in config files ${CONFIG_DIR} is written with / on Windows) or is absolute; outside ${CONFIG_DIR} the agent must allow the directory locally. The non-secret placeholders such as ${PORT} and ${MODEL} are allowed; ${API_TOKEN} and ${AGENT_ENV:NAME} are not. At most 4 files.",
+  runtimeSpecLogFileName: 'Log stream name',
+  runtimeSpecLogFileNamePlaceholder: 'e.g. server',
+  runtimeSpecLogFilePath: 'Log file path',
+  runtimeSpecLogFilePathPlaceholder: 'e.g. ${CONFIG_DIR}/server.log',
+  runtimeSpecLogFileAdd: 'Add log file',
+  runtimeSpecLogFileRemove: 'Remove log file',
+  runtimeSpecLogFileNameBlank: 'The name is missing.',
+  runtimeSpecLogFileNameInvalid:
+    'The name must be 1 to 32 characters: letters, digits, ".", "_" and "-".',
+  runtimeSpecLogFileNameReserved: '"process" is reserved for the process output.',
+  runtimeSpecLogFileNameDuplicate:
+    'Names must be unique; upper and lower case are not distinguished.',
+  runtimeSpecLogFilePathBlank: 'The path is missing.',
+  runtimeSpecLogFilePathTooLong: 'The path is longer than 1024 bytes.',
+  runtimeSpecLogFilePathControl: 'The path must not contain control characters.',
+  runtimeSpecLogFilePathSecret:
+    'The path must not contain ${API_TOKEN} or ${AGENT_ENV:…} — it is sent and shown unencrypted.',
+  runtimeSpecLogFilePathNotAbsolute:
+    'The path must be absolute or start with ${CONFIG_DIR} followed by a path separator.',
+  runtimeSpecLogFilePathIsConfigFile:
+    "The path is one of this spec's config files in ${CONFIG_DIR}: the agent removes a log file there before the start and would delete the config file. Choose another file name.",
+  runtimeSpecAgentNoLogFiles:
+    'The connected agent does not report "runtime_log_files" (needs version 0.26.0 or newer): it does not tail these log files. Saving still works.',
   runtimeSpecArgsHint:
     'One argument per line — spaces separate nothing here. A flag and its value are two lines; a path containing spaces stays one. Do not hard-code the port: with listen port 0 the agent assigns it and ${PORT} fills it in.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
@@ -5922,6 +6013,7 @@ const en: PortalMessages = {
   runtimeLastErrorExitCode: 'Exit code',
   runtimeLastErrorFailures: 'Failures',
   runtimeLastErrorStderr: 'stderr (tail)',
+  runtimeLastErrorLogFile: (name: string) => `Log file "${name}" (tail)`,
   runtimeRestart: 'Restart',
   // Task 22, fix round 2 (accepted): the hover reason for a greyed-out
   // action. A successful restart leaves the row in exactly this state, so it
@@ -5989,6 +6081,8 @@ const en: PortalMessages = {
   runtimeParseErrorDuplicateSpecId: 'Two entries in the file share the same spec id.',
   runtimeParseErrorInvalidConfigFileName:
     'An entry has an invalid or repeated name in "config_files" — each spec needs unique, single file names without a path.',
+  runtimeParseErrorInvalidLogFiles:
+    'An entry has an invalid, repeated or reserved name, or an unacceptable path, in "log_files".',
   runtimeParseErrorFileMissing: 'There is no file at the configured path.',
   runtimeParseErrorReadFailed:
     'The file is there but could not be read — check its ownership and permissions.',
@@ -6027,6 +6121,31 @@ const en: PortalMessages = {
   runtimeLogsTrimmed: (bytes: number) =>
     `Older output is no longer shown in this view (${bytes} bytes). Reopen the window to reload the agent's retained history in full.`,
   runtimeLogsProcessStartFailed: 'Process did not start',
+  // #430: the source row and a declared log file's markers and statuses. The
+  // agent sends only the event kind (a closed set); the wording is ours. A
+  // status names the setting to change, never a path.
+  runtimeLogsSourceLabel: 'Source',
+  runtimeLogsSourceProcess: 'Process',
+  runtimeLogsFileIntro: (name: string) =>
+    `The lines the model process writes to the log file "${name}" (with several instances, those of every instance), as they were written. The agent reads the file as it grows, keeps the lines in memory (across a crash, too) and only transmits them while this window is open. The gateway stores none of it — not on disk, not in the database.`,
+  runtimeLogsFileOpened: 'File opened',
+  runtimeLogsFileRotated: 'File rotated — continuing in the new file',
+  runtimeLogsFileTruncated: 'File truncated — reading again from its start',
+  runtimeLogsFileLineCut: 'Line cut: longer than 16 KiB, the rest of the line is missing',
+  runtimeLogsFileStale:
+    "The previous run's file could not be removed — reading from its current end",
+  runtimeLogsFileWaiting:
+    'The file does not exist (yet). The agent keeps checking for it and shows its content here once the model process creates it.',
+  runtimeLogsFileNotPermitted:
+    'The agent does not read this file: after resolving links, its path is not inside an allowed directory, or it is not a regular file, such as a link or a file with more than one hard link. Allowed are ${CONFIG_DIR} and the directories of the agent setting "runtime_allowed_log_dirs" on the AI server.',
+  runtimeLogsFileBinary:
+    'The file holds mostly binary data rather than text. The agent stopped reading it for this run.',
+  runtimeLogsFileMissing:
+    'The run ended without the file ever being created. Check that the path matches where the model server writes its log.',
+  runtimeLogsFileUnsupported:
+    'This server\'s agent does not declare the "runtime_log_files" feature (needs version 0.26.0 or newer). It does not read log files — this tab would stay empty forever. Update the agent.',
+  runtimeLogsFileEmpty:
+    'The retained history holds nothing from this file yet. New lines appear here as the model process writes them.',
   // The command the agent actually executed, attached to that generation's own
   // start marker. The operator wrote a template; ${PORT}, ${MODEL},
   // ${HOST_GPU_IDS} and ${AGENT_ENV:NAME} are resolved only at launch -- and
@@ -6041,7 +6160,7 @@ const en: PortalMessages = {
   runtimeCommandTrimmedHere:
     "The output shown begins without a start marker because this view trimmed its own oldest entries, not because the agent stopped retaining them. Reopen the window to load the agent's retained history again — if it still holds that generation's marker, its executed command comes with it.",
   runtimeCommandMasked:
-    'Values resolved from "${AGENT_ENV:NAME}" are shown as exactly that placeholder, never as the value — the placeholder names the variable to go and check on the AI server. That masking covers this reported command and nothing beyond it: a model server that prints its own command line or environment at startup writes the resolved value into the output below, and into the error tail on the runtime screen. Nothing the agent does can mask what the process itself prints — which is why a secret belongs in "env" as "${AGENT_ENV:NAME}" and never as plain text in an argument.',
+    'Values resolved from "${AGENT_ENV:NAME}" are shown as exactly that placeholder, never as the value — the placeholder names the variable to go and check on the AI server. That exact masking covers this reported command. A model server that prints its own command line or environment at startup writes the resolved value into its output: an agent from version 0.26.0 on also replaces literal occurrences of the secrets it substituted itself, 8 bytes or longer, with their placeholder there, in the log files and in the error tail on the runtime screen. It does not catch encoded forms (URL, base64, JSON-escaped), values split across lines or shorter values, or anything an older agent sends — which is why a secret belongs in "env" as "${AGENT_ENV:NAME}" and never as plain text in an argument.',
   runtimeCommandEnvRedacted:
     'This agent takes its launch specs from a local file, so every value the spec itself sets in "env" is withheld in full: the key stays visible, the value is replaced by a mask. That is the same line the agent\'s report to the gateway already draws — a local file is the operator\'s own document and may legitimately hold a plain-text value. There is no placeholder here and nothing to look up. Arguments are not covered: an argument is reported exactly as it was written.',
   runtimeCommandTruncated:
@@ -6499,6 +6618,8 @@ const en: PortalMessages = {
     'A benchmark run is in flight on this server. Changing a launch spec now — an admin override above all — or starting or stopping a model would contaminate its measurement. Wait for the run to finish, or cancel it.',
   errorRuntimeSpecConfigFilesInvalid:
     'Invalid config files: every name must be a single, unique file name (no path separators, "." or "..", colon, control characters), at most 16 files of 64 KiB each, and the content must not contain ${API_TOKEN} or ${AGENT_ENV:…}.',
+  errorRuntimeSpecLogFilesInvalid:
+    'Invalid log files: at most 4 entries; every name 1 to 32 characters of A–Z, a–z, 0–9, ".", "_" or "-", unique regardless of case, and not "process"; every path non-empty, at most 1024 bytes, absolute or starting with ${CONFIG_DIR} and a path separator, without control characters and without ${API_TOKEN} or ${AGENT_ENV:…}.',
   errorRuntimeSpecInstancesInvalid:
     'Invalid instance settings: the minimum and maximum must be whole numbers from 0 to 64, the minimum must not exceed a set maximum, and the parallel requests per instance must be a whole number from 1 to 1024.',
   errorRuntimeSpecInstancesNeedEphemeralPort:

@@ -239,6 +239,16 @@ type Config struct {
 	// wsl://<distro>/<path> entries bound the work_dir of WSL specs in that
 	// distro only.
 	RuntimeAllowedDirs []string
+	// RuntimeAllowedLogDirs lists the directories, besides a spec's own
+	// ${CONFIG_DIR}, from which the agent may tail the log_files a runtime
+	// spec declares. EMPTY (the default) means ONLY the spec's own
+	// ${CONFIG_DIR} -- fail closed. RuntimeAllowedDirs is deliberately not
+	// reused: there an empty list means "any work_dir", the opposite of what a
+	// file-read allowlist needs. Same operator-only provenance as the other
+	// allowlists: it comes ONLY from this local file/env, never from the
+	// gateway. Same entry syntax as RuntimeAllowedDirs (a trailing \* or /*
+	// is a subtree synonym; wsl://<distro>/<path> entries name a WSL distro).
+	RuntimeAllowedLogDirs []string
 	// RuntimeAllowBinaryDirs, when true, treats each RuntimeAllowedBinaries
 	// entry's PARENT directory as an allowed work_dir prefix WITHOUT the
 	// operator listing it in RuntimeAllowedDirs (see
@@ -334,8 +344,11 @@ type Config struct {
 	// RuntimeLogBufferTotalBytes caps the SUM of those buffers across every
 	// spec, so a server with twenty specs is not twenty times the per-spec
 	// number. 0 (the default) means runtime.DefaultLogBufferTotalBytes
-	// (16 MiB). The agent keeps at most total/per-spec buffers, evicting the
-	// least-recently-written unwatched one.
+	// (16 MiB). It is a hard byte bound over every stream of every spec --
+	// process output and each declared log file have a ring of their own --
+	// kept by evicting whole unwatched specs, least-recently-written first.
+	// It is raised to at least the per-spec size plus four 64 KiB log-file
+	// rings, so one spec with all its rings always fits.
 	RuntimeLogBufferTotalBytes int
 	// VRAMHeadroomMB is how much of each GPU's DETECTED total memory, in MB, the
 	// agent keeps out of the VRAM budget it derives for runtime admission. The
@@ -493,6 +506,7 @@ type fileConfig struct {
 	RuntimeConfigPath      string   `json:"runtime_config"`
 	RuntimeAllowedBinaries []string `json:"runtime_allowed_binaries"`
 	RuntimeAllowedDirs     []string `json:"runtime_allowed_dirs"`
+	RuntimeAllowedLogDirs  []string `json:"runtime_allowed_log_dirs"`
 	// RuntimeAllowBinaryDirs is a pointer bool (matching TLSInsecure/Verbose)
 	// so an absent key is distinguishable from an explicit false -- required by
 	// the reflection parity test and resolveBool's env>file precedence.
@@ -634,6 +648,7 @@ func Load(args []string, getenv func(string) string) (Config, error) {
 		RuntimeConfigPath:      strings.TrimSpace(resolveStr("runtime-config", *runtimeConfigPath, "OP_AGENT_RUNTIME_CONFIG", file.RuntimeConfigPath)),
 		RuntimeAllowedBinaries: resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_BINARIES"), file.RuntimeAllowedBinaries),
 		RuntimeAllowedDirs:     resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_DIRS"), file.RuntimeAllowedDirs),
+		RuntimeAllowedLogDirs:  resolveStringList(getenv("OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS"), file.RuntimeAllowedLogDirs),
 		RuntimeAllowBinaryDirs: resolveBool(false, false, getenv("OP_AGENT_RUNTIME_ALLOW_BINARY_DIRS"), file.RuntimeAllowBinaryDirs),
 		RuntimeWSLExe:          resolveWSLExe(getenv("OP_AGENT_RUNTIME_WSL_EXE"), file.RuntimeWSLExe),
 		AgentKey:               resolveTrimmed(getenv("OP_AGENT_AGENT_KEY"), file.AgentKey),
@@ -795,7 +810,7 @@ func runtimeAllowlistWarnings(cfg Config, fileKeys map[string]bool, getenv func(
 	for _, list := range []struct {
 		name    string
 		entries []string
-	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}} {
+	}{{"runtime_allowed_binaries", cfg.RuntimeAllowedBinaries}, {"runtime_allowed_dirs", cfg.RuntimeAllowedDirs}, {"runtime_allowed_log_dirs", cfg.RuntimeAllowedLogDirs}} {
 		for i, e := range list.entries {
 			if msg := allowlistEntryWarning(list.name, i, e); msg != "" {
 				w = append(w, msg)
@@ -821,6 +836,7 @@ func removedWSLSettingWarnings(fileKeys map[string]bool, getenv func(string) str
 // allowlist, or "" when the entry is fine.
 func allowlistEntryWarning(listName string, i int, e string) string {
 	isDirs := listName == "runtime_allowed_dirs"
+	isLogDirs := listName == "runtime_allowed_log_dirs"
 	if wslentry.Is(e) {
 		if _, _, ok := wslentry.Parse(e); ok {
 			return ""
@@ -829,9 +845,15 @@ func allowlistEntryWarning(listName string, i int, e string) string {
 		if isDirs {
 			msg = "%s[%d] is a malformed wsl:// entry and is ignored, but WSL work_dir containment stays on: only well-formed wsl:// dir entries (and binary dirs with runtime_allow_binary_dirs) permit a WSL work_dir (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
 		}
+		if isLogDirs {
+			msg = "%s[%d] is a malformed wsl:// entry and is ignored: only well-formed wsl://<distro>/<absolute Linux path> entries permit log files of WSL specs (lowercase scheme, forward slashes)"
+		}
 		return fmt.Sprintf(msg, listName, i)
 	}
 	if !wslentry.LooksLike(e) {
+		if isLogDirs && !isAbsoluteLogDirEntry(e) {
+			return fmt.Sprintf("%s[%d] is not an absolute path and can never match a resolved log file path: it is ignored (use an absolute path such as /var/log/models or C:\\logs)", listName, i)
+		}
 		return ""
 	}
 	msg := "%s[%d] looks like a WSL entry but is not wsl:// (the scheme must be exactly lowercase wsl://); it is not a WSL entry and is treated as a native path"
@@ -839,6 +861,22 @@ func allowlistEntryWarning(listName string, i int, e string) string {
 		msg += ", and WSL work_dir containment stays on"
 	}
 	return fmt.Sprintf(msg, listName, i)
+}
+
+// isAbsoluteLogDirEntry reports whether a native runtime_allowed_log_dirs
+// entry is absolute on either platform's syntax: a leading slash or
+// backslash (UNC included), or a drive letter followed by a separator. The
+// check is lexical and OS-independent on purpose, so a config written for
+// Windows is judged the same when validated elsewhere.
+func isAbsoluteLogDirEntry(e string) bool {
+	if e == "" {
+		return false
+	}
+	if e[0] == '/' || e[0] == '\\' {
+		return true
+	}
+	return len(e) >= 3 && e[1] == ':' && (e[2] == '/' || e[2] == '\\') &&
+		(e[0] >= 'A' && e[0] <= 'Z' || e[0] >= 'a' && e[0] <= 'z')
 }
 
 // resolveInt applies env > file for a plain integer setting that (per the

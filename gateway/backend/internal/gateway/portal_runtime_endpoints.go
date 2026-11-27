@@ -210,6 +210,16 @@ var portalRuntimeSpecErrRows = []errRow{
 			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecConfigFilesInvalid.Error()+": ")
 		},
 	},
+	// Dynamic message like the config_files row: the entry and the rule, never
+	// the path (#430).
+	{
+		err:    portal.ErrRuntimeSpecLogFilesInvalid,
+		status: http.StatusBadRequest,
+		code:   "runtime_spec.log_files_invalid",
+		msgFn: func(err error) string {
+			return strings.TrimPrefix(err.Error(), portal.ErrRuntimeSpecLogFilesInvalid.Error()+": ")
+		},
+	},
 	{err: portal.ErrRuntimeSpecMetricsPathInvalid, status: http.StatusBadRequest, code: "runtime_spec.metrics_path_invalid", msg: "metrics_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	{err: portal.ErrRuntimeSpecContextProbePathInvalid, status: http.StatusBadRequest, code: "runtime_spec.context_probe_path_invalid", msg: "context_probe_path must be a relative path beginning with a single \"/\" (no scheme, host, or whitespace)"},
 	// The two instance-settings refusals (#340); a negative count answers with

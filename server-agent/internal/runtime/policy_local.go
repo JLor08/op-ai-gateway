@@ -385,6 +385,13 @@ type LocalPolicy struct {
 	// spec: no wsl:// entry of its distro) -- unlike AllowedBinaries, an operator who does
 	// not care about work_dir containment is not forced to enumerate one.
 	AllowedDirs []string
+	// AllowedLogDirs lists the directories, besides a spec's own
+	// ${CONFIG_DIR}, from which a spec's declared log_files may be tailed.
+	// EMPTY means ONLY the spec's own ${CONFIG_DIR} (fail closed) -- unlike
+	// AllowedDirs, where empty means any work_dir. Same entry syntax as
+	// AllowedDirs, same operator-only provenance (local config, never the
+	// gateway).
+	AllowedLogDirs []string
 	// AllowBinaryDirs (R3), when true, treats each allowed binary's PARENT
 	// directory as an allowed dir WITHOUT the operator listing it in
 	// AllowedDirs -- so a spec whose work_dir sits under any allowlisted
@@ -1084,10 +1091,11 @@ var deviceBackendByToken = map[string]string{
 // expansion rather than once per match.
 //
 // This is the ONE copy of that resolution. expandSpec (Args/Env) and
-// expandConfigFileContent (config_files content, #257) both call it, so the two
-// surfaces cannot drift apart on what ${MODEL} or ${CONFIG_DIR} means. The
-// secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are deliberately NOT here:
-// expandSpec resolves and masks them, expandConfigFileContent refuses them.
+// expandNonSecretText (config_files content, #257, and log_files paths, #430)
+// both call it, so the surfaces cannot drift apart on what ${MODEL} or
+// ${CONFIG_DIR} means. The secret tokens (${API_TOKEN}, ${AGENT_ENV:NAME}) are
+// deliberately NOT here: expandSpec resolves and masks them,
+// expandNonSecretText refuses them.
 func resolveNonSecretToken(inner string, spec Spec, port int, gpuIDs, configFilesDir string, dev deviceContext) (value string, handled bool, err error) {
 	if v, ok, derr := resolveClusterDeviceToken(inner, spec, dev); ok {
 		return v, true, derr
@@ -1286,7 +1294,10 @@ func (e placeholderExpander) writeAgentEnv(b *strings.Builder, spans *[]secretSp
 	// network egress from the child, because a model server that
 	// echoes its argv (vLLM and llama.cpp both do) and then
 	// exits non-zero has that line captured into
-	// LastError.StderrTail and reported upward.
+	// LastError.StderrTail and reported upward. (Since #430
+	// a LITERAL echo of a resolved secret is masked in the
+	// child's output -- secret_mask.go -- but any encoded or
+	// reshaped form is not, so this refusal stays the guard.)
 	//
 	// Deliberately folded on unix too, where a variable named
 	// "op_agent_token" IS distinct from "OP_AGENT_TOKEN":

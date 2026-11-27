@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { useCallback, useEffect, useMemo, useRef, useState, type SubmitEvent } from 'react';
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type SubmitEvent,
+} from 'react';
 import {
   Alert,
   Box,
@@ -98,6 +106,7 @@ import {
   configFileIssues,
   type ConfigFileIssue,
 } from './shared/configFiles';
+import { LOG_FILES_MAX, logFileIssues, type LogFileIssue } from './shared/logFiles';
 import { ConfirmDialog } from './shared/ConfirmDialog';
 import { formatArgsText, formatEnvText, parseArgsText, parseEnvText } from './shared/specText';
 import { Breadcrumbs, type BreadcrumbItem } from './shared/Breadcrumbs';
@@ -264,6 +273,33 @@ const configFileIssueLabel: Record<ConfigFileIssue, MessageKey> = {
   content_secret: 'runtimeSpecConfigFileSecretPlaceholder',
 };
 
+// One row of the spec form's log-file editor (#430); `rowKey` is a render-only
+// identity like ConfigFileRow's and never reaches the wire.
+type LogFileRow = {
+  rowKey: string;
+  name: string;
+  path: string;
+};
+
+// The log-file rows a Strata run-config import declares (engine, or
+// engine-r<i> per replica): a re-import replaces exactly these.
+const STRATA_ENGINE_LOG_NAME = /^engine(-r\d+)?$/i;
+
+// One sentence per LogFileIssue, inline on the offending field and (the first
+// one) as the refusal at submit.
+const logFileIssueLabel: Record<LogFileIssue, MessageKey> = {
+  name_blank: 'runtimeSpecLogFileNameBlank',
+  name_invalid: 'runtimeSpecLogFileNameInvalid',
+  name_reserved: 'runtimeSpecLogFileNameReserved',
+  name_duplicate: 'runtimeSpecLogFileNameDuplicate',
+  path_blank: 'runtimeSpecLogFilePathBlank',
+  path_too_long: 'runtimeSpecLogFilePathTooLong',
+  path_control: 'runtimeSpecLogFilePathControl',
+  path_secret: 'runtimeSpecLogFilePathSecret',
+  path_not_absolute: 'runtimeSpecLogFilePathNotAbsolute',
+  path_is_config_file: 'runtimeSpecLogFilePathIsConfigFile',
+};
+
 // The warning codes RuntimeWarnings emits today (see
 // gateway/backend/internal/portal/service_runtime.go); an unmapped future
 // code falls back to its raw wire value rather than a misleading label.
@@ -343,6 +379,7 @@ function emptySpec(mappingId: string): RuntimeSpec {
     metrics_path: '',
     context_probe_path: '',
     config_files: [],
+    log_files: [],
     device_backend: 'auto',
     cluster_enabled: false,
     member_mode: 'automatic',
@@ -371,7 +408,9 @@ function emptySpec(mappingId: string): RuntimeSpec {
 //
 // `invalid_config_file_name` (#257) is a structural failure inside the
 // document: a spec's `config_files` carries a name that is not one plain file
-// name, or two names that collide case-insensitively.
+// name, or two names that collide case-insensitively. `invalid_log_files`
+// (#430) is the same for a spec's `log_files`: a bad, repeated or reserved name
+// or an unacceptable path.
 //
 // `file_missing` and `read_failed` are named for parsing only because the WIRE
 // FIELD is: the agent raises them before any parsing happens, for a
@@ -383,6 +422,7 @@ const runtimeParseErrorReasonByCode: Record<string, MessageKey> = {
   json_syntax: 'runtimeParseErrorJsonSyntax',
   duplicate_spec_id: 'runtimeParseErrorDuplicateSpecId',
   invalid_config_file_name: 'runtimeParseErrorInvalidConfigFileName',
+  invalid_log_files: 'runtimeParseErrorInvalidLogFiles',
   file_missing: 'runtimeParseErrorFileMissing',
   read_failed: 'runtimeParseErrorReadFailed',
 };
@@ -537,6 +577,10 @@ type ReportSpec = {
   setVisibleDevices: boolean;
   visibleDevicesMode: 'env' | 'args';
   idleTimeoutSeconds: number;
+  // #430: the names of the spec's declared log files, in order, for the log
+  // view's source row (a file-mode spec has no gateway document to read them
+  // from). See narrowReportLogFiles.
+  logFiles: string[];
 };
 
 type ReportConfig = {
@@ -549,6 +593,41 @@ type ReportConfig = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// The log-file rules the agent's own ParseConfig enforces (#430), re-checked
+// here because the report config is `unknown`: only names the agent could
+// have accepted become source tabs.
+const reportLogFileNamePattern = /^[A-Za-z0-9._-]{1,32}$/;
+const reportLogFilesMax = 4;
+
+/**
+ * The declared log file NAMES of a report spec's `log_files` (paths are not
+ * needed by the view). A name must match the agent's pattern and must not be
+ * the reserved `process`; a repeat (case-insensitively) is dropped; at most
+ * four are kept. An entry that is not a record with a string name is a shape
+ * the report should not have and flags the config as unrecognised.
+ */
+function narrowReportLogFiles(value: unknown, flag: { unrecognised: boolean }): string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    flag.unrecognised = true;
+    return [];
+  }
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.name !== 'string') {
+      flag.unrecognised = true;
+      continue;
+    }
+    const key = entry.name.toLowerCase();
+    if (!reportLogFileNamePattern.test(entry.name) || key === 'process' || seen.has(key)) continue;
+    if (names.length >= reportLogFilesMax) break;
+    seen.add(key);
+    names.push(entry.name);
+  }
+  return names;
 }
 
 // A spec entry with no usable identity cannot be rendered as a row at all
@@ -592,6 +671,7 @@ function narrowReportSpec(value: unknown, flag: { unrecognised: boolean }): Repo
     visibleDevicesMode: value.visible_devices_mode === 'args' ? 'args' : 'env',
     idleTimeoutSeconds:
       typeof value.idle_timeout_seconds === 'number' ? value.idle_timeout_seconds : 0,
+    logFiles: narrowReportLogFiles(value.log_files, flag),
   };
 }
 
@@ -2202,6 +2282,10 @@ export function RuntimeAdminSection({
   const reportReady = reportStatus === 'ready';
   const agentFeatures = reportReady ? (reportData?.agent_features ?? []) : [];
   const agentVersion = reportReady ? (reportData?.agent_version ?? '') : '';
+  // The Strata import and template point `log` into ${CONFIG_DIR} and declare
+  // it only for an agent that declares runtime_log_files (0.26.0, #430); an
+  // unsettled report gives no features, so it counts as not declared.
+  const agentDeclaresLogFiles = agentFeatures.includes('runtime_log_files');
   // Spec §9's visible half: gateway-side specs exist and the agent reports no
   // managed process at all. Without a banner here an operator configures specs
   // and watches nothing happen, with no clue why.
@@ -2268,6 +2352,9 @@ export function RuntimeAdminSection({
     allInstances: boolean;
     instances: number[];
     initialTab: number;
+    // #430: the names of the spec's declared log files, which add the view's
+    // source row.
+    logFiles: string[];
   } | null>(null);
   const [overrideBusy, setOverrideBusy] = useState(false);
   // The live-status Start and Stop requests in flight, keyed per action and
@@ -2883,6 +2970,8 @@ export function RuntimeAdminSection({
   // `config_files` clears the stored set, so this state is what keeps a save of
   // an unrelated field from deleting files that were set through the API.
   const [configFiles, setConfigFiles] = useState<ConfigFileRow[]>([]);
+  // The spec's log files (#430): same full-document rule as `configFiles`.
+  const [logFiles, setLogFiles] = useState<LogFileRow[]>([]);
   // The Strata "Import run config" panel (importStrataRunConfig).
   const [strataImportOpen, setStrataImportOpen] = useState(false);
   const [strataImportText, setStrataImportText] = useState('');
@@ -3009,6 +3098,7 @@ export function RuntimeAdminSection({
     setMetricsPath('');
     setContextProbePath('');
     setConfigFiles([]);
+    setLogFiles([]);
     setCluster(emptyClusterState());
     setSpecFlavorsBeforeKindDefault(null);
     setSpecLoadedType(null);
@@ -3088,6 +3178,9 @@ export function RuntimeAdminSection({
         name: f.name,
         content: f.content,
       })),
+    );
+    setLogFiles(
+      (spec.log_files ?? []).map((f) => ({ rowKey: makeRowKey(), name: f.name, path: f.path })),
     );
     setCluster(clusterStateFromSpec(spec));
     setSpecFlavorsBeforeKindDefault(null);
@@ -3215,7 +3308,9 @@ export function RuntimeAdminSection({
   // 1 = main), the startup timeout, and the upstream model name when it is
   // still empty. Nothing is touched when the text is refused.
   function applyStrataImport() {
-    const result = importStrataRunConfig(strataImportText);
+    const result = importStrataRunConfig(strataImportText, {
+      declareEngineLog: agentDeclaresLogFiles,
+    });
     if (!result.ok) {
       let message = t.strataImportErrorMissingArgs;
       if (result.error === 'invalid_json') message = t.strataImportErrorInvalidJson;
@@ -3256,14 +3351,28 @@ export function RuntimeAdminSection({
         ),
       );
     }
+    // Replace this import's own rows (engine, engine-r<i>), keep the
+    // operator's others, and stay within the cap. Without runtime_log_files
+    // the import declares none and the rows are left alone.
+    if (result.logFiles.length > 0) {
+      setLogFiles((rows) =>
+        [
+          ...rows.filter((r) => !STRATA_ENGINE_LOG_NAME.test(r.name)),
+          ...result.logFiles.map((f) => ({ rowKey: makeRowKey(), name: f.name, path: f.path })),
+        ].slice(0, LOG_FILES_MAX),
+      );
+    }
     setStartupTimeoutSeconds(result.startupTimeoutSeconds);
     if (result.upstreamModel !== undefined && appName === '') setAppName(result.upstreamModel);
     setStrataImportError('');
     setStrataImportNotes([
       t.strataImportDone,
-      ...result.warnings.map((w) =>
-        w === 'layer_split_positional' ? t.strataImportWarnLayerSplit : t.strataImportWarnApiKey,
-      ),
+      ...result.warnings.map((w) => {
+        if (w === 'layer_split_positional') return t.strataImportWarnLayerSplit;
+        if (w === 'log_files_capped') return t.strataImportWarnLogFilesCapped;
+        if (w === 'engine_log_needs_agent') return t.strataImportWarnEngineLogNeedsAgent;
+        return t.strataImportWarnApiKey;
+      }),
     ]);
     setStrataImportText('');
     setStrataImportOpen(false);
@@ -3273,6 +3382,31 @@ export function RuntimeAdminSection({
   }
   function updateConfigFile(idx: number, patch: Partial<Pick<ConfigFileRow, 'name' | 'content'>>) {
     setConfigFiles((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+  function addLogFile() {
+    setLogFiles((rows) =>
+      rows.length >= LOG_FILES_MAX ? rows : [...rows, { rowKey: makeRowKey(), name: '', path: '' }],
+    );
+  }
+  function removeLogFile(idx: number) {
+    setLogFiles((rows) => rows.filter((_, i) => i !== idx));
+  }
+  function updateLogFile(idx: number, patch: Partial<Pick<LogFileRow, 'name' | 'path'>>) {
+    setLogFiles((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  }
+  // The early refusal at submit, like configFilesError: the gateway rejects the
+  // same lists with a 400, and on a CREATE the mapping is written before its
+  // spec. Names the offending row, never its path.
+  function logFilesError(): string | undefined {
+    const issues = logFileIssues(
+      logFiles,
+      configFiles.map((r) => r.name),
+    );
+    const idx = issues.findIndex((issue) => issue !== null);
+    if (idx < 0) return undefined;
+    const issue = issues[idx]!;
+    const label = logFiles[idx].name.trim() === '' ? `#${idx + 1}` : logFiles[idx].name;
+    return `${t.runtimeSpecLogFiles} (${label}): ${t[logFileIssueLabel[issue]]}`;
   }
   // The early refusal at submit (create AND edit): the gateway rejects the same
   // lists with a 400, and on a CREATE the mapping is written before its spec,
@@ -3574,6 +3708,8 @@ export function RuntimeAdminSection({
       // and this is the one place that decides what the full document says.
       // Plain {name, content} -- the row key is a render identity only.
       config_files: configFiles.map(({ name, content }) => ({ name, content })),
+      // Always sent, [] included, for the same reason; the row key stays off the wire.
+      log_files: logFiles.map(({ name, path }) => ({ name, path })),
       ...clusterBodyFields(cluster),
     };
   }
@@ -3657,7 +3793,7 @@ export function RuntimeAdminSection({
   // select's own default rule, which already gives /health.
   function applyStrataTemplate() {
     if (!specFirstWrite) return;
-    const template = strataSpecTemplate();
+    const template = strataSpecTemplate({ declareEngineLog: agentDeclaresLogFiles });
     if (argsText === '') setArgsText(formatArgsText(template.args));
     if (envText === '') setEnvText(formatEnvText(template.env));
     if (startupTimeoutSeconds === 180) setStartupTimeoutSeconds(template.startupTimeoutSeconds);
@@ -3667,6 +3803,9 @@ export function RuntimeAdminSection({
     setSpecResponsesMode(template.responsesMode);
     setSpecMessagesMode(template.messagesMode);
     setProcessTree(template.processTree);
+    if (logFiles.length === 0) {
+      setLogFiles(template.logFiles.map((f) => ({ rowKey: makeRowKey(), ...f })));
+    }
   }
 
   async function submitCreate(event: SubmitEvent<HTMLFormElement>) {
@@ -3686,6 +3825,11 @@ export function RuntimeAdminSection({
     const configFilesProblem = configFilesError();
     if (configFilesProblem) {
       showError(configFilesProblem);
+      return;
+    }
+    const logFilesProblem = logFilesError();
+    if (logFilesProblem) {
+      showError(logFilesProblem);
       return;
     }
     const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
@@ -3799,6 +3943,11 @@ export function RuntimeAdminSection({
     const configFilesProblem = configFilesError();
     if (configFilesProblem) {
       showError(configFilesProblem);
+      return;
+    }
+    const logFilesProblem = logFilesError();
+    if (logFilesProblem) {
+      showError(logFilesProblem);
       return;
     }
     const duplicateGpu = duplicateGpuIndex(gpuRows.map((r) => r.index));
@@ -4459,6 +4608,21 @@ export function RuntimeAdminSection({
                 </Box>
               </>
             ) : null}
+            {/* #430: the end of each declared log file at the failed
+                generation, one section per file, as text. */}
+            {(err.log_file_tails ?? []).map((file, i) => (
+              // Index-qualified: the gateway filters tail names by pattern but
+              // not for uniqueness, and each section is stateless text.
+              <Fragment key={`${i}:${file.name}`}>
+                <Typography variant="caption">{t.runtimeLastErrorLogFile(file.name)}:</Typography>
+                <Box
+                  component="pre"
+                  sx={{ m: 0, whiteSpace: 'pre-wrap', wordBreak: 'break-all', fontSize: 12 }}
+                >
+                  {file.tail}
+                </Box>
+              </Fragment>
+            ))}
           </Box>
         }
       >
@@ -4718,6 +4882,16 @@ export function RuntimeAdminSection({
     },
   ];
 
+  // The declared log file names of the spec a status row belongs to: from the
+  // gateway's document, else -- a file-mode spec has none -- from the agent's
+  // report, whose spec `id` is the base spec ID a status row's `spec_id`
+  // carries (the agent reports specBase for every instance).
+  function logFileNamesFor(specId: string): string[] {
+    const spec = specByRuntimeId.get(specId);
+    if (spec) return (spec.log_files ?? []).map((f) => f.name);
+    return reportConfig?.specs.find((s) => s.id === specId)?.logFiles ?? [];
+  }
+
   function statusActions(row: RuntimeStatus): RowAction[] {
     // The log view comes FIRST, and before every gate below it, deliberately.
     // Reading what a process printed is not a write, so it is available in
@@ -4748,6 +4922,8 @@ export function RuntimeAdminSection({
             instances: logInstanceIndexes(statusRows, row.spec_id),
             // It opens on the tab of the instance whose row was clicked.
             initialTab: instanceIndex(row),
+            // #430: one source tab per declared log file, in declaration order.
+            logFiles: logFileNamesFor(row.spec_id),
           }),
       },
     ];
@@ -5043,6 +5219,15 @@ export function RuntimeAdminSection({
     const configFileRowIssues = configFileIssues(configFiles);
     const showAgentNoConfigFiles =
       configFiles.length > 0 && reportReady && !agentFeatures.includes('runtime_config_files');
+    // Same advisory shape for log files (#430): an agent without
+    // runtime_log_files ignores the list, but the gateway stores it, so saving
+    // stays possible.
+    const logFileRowIssues = logFileIssues(
+      logFiles,
+      configFiles.map((r) => r.name),
+    );
+    const showAgentNoLogFiles =
+      logFiles.length > 0 && reportReady && !agentFeatures.includes('runtime_log_files');
     // ${HOST_GPU_IDS_MAIN_LAST} (#424) is expanded by the agent only when it
     // declares runtime_gpu_main_last; an older one leaves it literal. Same
     // advisory shape as above: only once the placeholder is actually used.
@@ -5225,7 +5410,7 @@ export function RuntimeAdminSection({
               required
               placeholder={
                 specType === 'strata'
-                  ? strataSpecTemplate().binaryHint
+                  ? strataSpecTemplate({ declareEngineLog: agentDeclaresLogFiles }).binaryHint
                   : '/usr/local/bin/llama-server'
               }
             />
@@ -5562,6 +5747,95 @@ export function RuntimeAdminSection({
                     {note}
                   </Alert>
                 ))}
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <Typography variant="subtitle2" component="h3">
+                {t.runtimeSpecLogFiles}
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                {t.runtimeSpecLogFilesHint}
+              </Typography>
+              {showAgentNoLogFiles && (
+                <Alert severity="warning">
+                  {`${t.runtimeSpecAgentNoLogFiles} (${t.runtimeAgentVersion}: ${agentVersion || '—'})`}
+                </Alert>
+              )}
+              {logFiles.map((row, idx) => {
+                const issue = logFileRowIssues[idx];
+                // A blank field is refused at submit but not painted red while
+                // the row is still new and empty.
+                const nameIssue =
+                  issue === 'name_invalid' ||
+                  issue === 'name_reserved' ||
+                  issue === 'name_duplicate'
+                    ? issue
+                    : null;
+                const pathIssue =
+                  issue === 'path_too_long' ||
+                  issue === 'path_control' ||
+                  issue === 'path_secret' ||
+                  issue === 'path_not_absolute' ||
+                  issue === 'path_is_config_file'
+                    ? issue
+                    : null;
+                return (
+                  <Box
+                    key={row.rowKey}
+                    sx={{
+                      display: 'flex',
+                      gap: 1.5,
+                      alignItems: 'flex-start',
+                      p: 1.5,
+                      border: 1,
+                      borderColor: 'divider',
+                      borderRadius: 1,
+                    }}
+                  >
+                    <Field
+                      id={`runtime-spec-log-file-name-${idx}`}
+                      label={t.runtimeSpecLogFileName}
+                      value={row.name}
+                      onChange={(e) => updateLogFile(idx, { name: e.target.value })}
+                      placeholder={t.runtimeSpecLogFileNamePlaceholder}
+                      error={nameIssue !== null}
+                      helperText={nameIssue ? t[logFileIssueLabel[nameIssue]] : undefined}
+                      inputProps={{ spellCheck: false }}
+                      sx={{ maxWidth: 240 }}
+                    />
+                    <Field
+                      id={`runtime-spec-log-file-path-${idx}`}
+                      label={t.runtimeSpecLogFilePath}
+                      value={row.path}
+                      onChange={(e) => updateLogFile(idx, { path: e.target.value })}
+                      placeholder={t.runtimeSpecLogFilePathPlaceholder}
+                      error={pathIssue !== null}
+                      helperText={pathIssue ? t[logFileIssueLabel[pathIssue]] : undefined}
+                      inputProps={{ spellCheck: false }}
+                      sx={{ '& input': { fontFamily: 'monospace' } }}
+                    />
+                    <Button
+                      type="button"
+                      size="small"
+                      color="secondary"
+                      sx={{ flexShrink: 0, mt: 0.5 }}
+                      onClick={() => removeLogFile(idx)}
+                    >
+                      {t.runtimeSpecLogFileRemove}
+                    </Button>
+                  </Box>
+                );
+              })}
+              <Box>
+                <Button
+                  type="button"
+                  variant="outlined"
+                  size="small"
+                  disabled={logFiles.length >= LOG_FILES_MAX}
+                  onClick={addLogFile}
+                >
+                  {t.runtimeSpecLogFileAdd}
+                </Button>
+              </Box>
             </Box>
             <Field
               id="runtime-spec-work-dir"
@@ -6810,6 +7084,10 @@ export function RuntimeAdminSection({
           allInstances={logSpec.allInstances}
           instances={logSpec.instances}
           initialTab={logSpec.initialTab}
+          logFiles={logSpec.logFiles}
+          // Before the report GET settles the agent's features are unknown;
+          // unknown is not "too old", so the file tabs do not say it is.
+          logFilesSupported={!reportReady || agentFeatures.includes('runtime_log_files')}
         />
       )}
     </>

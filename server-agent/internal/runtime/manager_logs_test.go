@@ -291,6 +291,47 @@ func TestManagerLastErrorStderrTailStillWorks(t *testing.T) {
 	}
 }
 
+// TestManagerMasksSecretInChildOutput (#430 §8): a child that prints the value
+// the agent substituted for ${API_TOKEN} -- the way vLLM and llama.cpp echo
+// their argv -- has that value replaced by its placeholder before it reaches
+// the retained history, and therefore before LastError.StderrTail.
+func TestManagerMasksSecretInChildOutput(t *testing.T) {
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	const token = "tok-secret-0123456789"
+	spec := baseSpec("spec-mask", "mask-model")
+	spec.APIToken = token
+	spec.Args = append(stubArgs(0, 100*time.Millisecond, 7, ""), "-print", `--api-key ${API_TOKEN}\n`)
+	spec.Pinned = true
+	m.Apply(Config{ETag: "e1", MaxProcesses: 1, Specs: []Spec{spec}})
+
+	deadline := time.Now().Add(5 * time.Second)
+	var last *LastError
+	for last == nil || !strings.Contains(last.StderrTail, "stubchild: scripted crash") {
+		if time.Now().After(deadline) {
+			t.Fatalf("LastError.StderrTail never carried the crash output; last = %+v", last)
+		}
+		time.Sleep(20 * time.Millisecond)
+		for _, st := range m.Status() {
+			if st.SpecID == "spec-mask" {
+				last = st.LastError
+			}
+		}
+	}
+	if strings.Contains(last.StderrTail, token) {
+		t.Errorf("LastError.StderrTail = %q carries the resolved api token", last.StderrTail)
+	}
+	if !strings.Contains(last.StderrTail, "--api-key ${API_TOKEN}") {
+		t.Errorf("LastError.StderrTail = %q, want the printed token masked as ${API_TOKEN}", last.StderrTail)
+	}
+
+	b := waitForLogText(t, m, "spec-mask", "--api-key ${API_TOKEN}\n")
+	if strings.Contains(batchText(b), token) {
+		t.Errorf("scrollback = %q carries the resolved api token", batchText(b))
+	}
+}
+
 // --- the resolved launch command, against a live process -------------------
 
 // waitForCommand polls the spec's retained history until the newest

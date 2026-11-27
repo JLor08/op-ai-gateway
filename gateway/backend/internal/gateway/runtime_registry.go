@@ -36,6 +36,17 @@ type RuntimeErrorDTO struct {
 	// "" for a plain failure. The router's answer to the start stays the
 	// generic sentinel, so this is where the cause travels.
 	Code string `json:"code,omitempty"`
+	// LogFileTails are the last bytes of each declared log file at the moment
+	// the process failed (#430), keyed by the file's name. RAM only, exactly
+	// like StderrTail: a log file can hold prompt text.
+	LogFileTails []RuntimeLogFileTailDTO `json:"log_file_tails,omitempty"`
+}
+
+// RuntimeLogFileTailDTO is one declared log file's tail inside a last_error.
+// Mirrors the agent's wire shape; clampRuntimeLogFileTails bounds it on ingest.
+type RuntimeLogFileTailDTO struct {
+	Name string `json:"name"`
+	Tail string `json:"tail"`
 }
 
 // RuntimeRPCStatusDTO is an rpc_server member's live state (mirrors the

@@ -25,7 +25,7 @@ import (
 //
 // It shipped violating that property under DEFAULT configuration. Retention
 // (DefaultLogBufferBytes) and the gateway's read limit were the same number,
-// trimLocked holds a busy spec at exactly the retention cap, and the scrollback
+// trimRing holds a busy ring at exactly the retention cap, and the scrollback
 // was then emitted whole -- so any spec that had ever printed a megabyte
 // produced a frame structurally over the limit the moment an operator opened its
 // log view. coder/websocket answers that by failing the read and closing 1009,
@@ -52,7 +52,7 @@ func logFrame(t *testing.T, b LogBatch) []byte {
 }
 
 // fillSpec writes line to specID until the retention buffer is well past full,
-// so the scrollback is exactly the worst case: a buffer trimLocked is holding
+// so the scrollback is exactly the worst case: a ring trimRing is holding
 // at the per-spec cap.
 func fillSpec(t *testing.T, s *LogStore, specID, line string, capacity int) *procLog {
 	t.Helper()

@@ -4161,6 +4161,8 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // spec stored through a FORM save carries `[]`, one from an older fixture
     // carries nothing, and the override must restate exactly what it read.
     ...(spec.config_files !== undefined ? { config_files: spec.config_files } : {}),
+    // #430: log_files travels the same way as config_files.
+    ...(spec.log_files !== undefined ? { log_files: spec.log_files } : {}),
     // The cluster configuration rides the same way: an absent cluster_enabled
     // would clear a head's membership. Its read view never travels back.
     ...Object.fromEntries(
@@ -5942,6 +5944,18 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorDuplicateSpecId}`),
     ).toBeInTheDocument();
     expect(screen.queryByText('duplicate_spec_id', { exact: false })).not.toBeInTheDocument();
+  });
+
+  // #430: the code of a hand-authored runtime.json whose log_files is invalid.
+  it('maps the invalid_log_files code to its own sentence', async () => {
+    renderFileMode(fileConfig, { parse_error: 'invalid_log_files' });
+    expect(
+      await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorInvalidLogFiles}`),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('invalid_log_files', { exact: false })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(t.runtimeParseErrorUnknown, { exact: false }),
+    ).not.toBeInTheDocument();
   });
 
   // #257: the agent's code for a hand-authored runtime.json whose config_files
@@ -11172,6 +11186,187 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', () => {
 });
 
 // ---------------------------------------------------------------------------
+// #430: a spec's log files. A repeatable {name, path} list; like config_files
+// it rides a FULL-document PUT, so the load -> save round trip matters most.
+// ---------------------------------------------------------------------------
+describe('RuntimeAdminSection log files editor (#430)', () => {
+  const filesOnTheServer = [
+    { name: 'engine', path: '${CONFIG_DIR}/engine.log' },
+    { name: 'Access', path: '/var/log/access.log' },
+  ];
+
+  async function openEditFor(spec: Partial<RuntimeSpec>, extra: { report?: RuntimeReport } = {}) {
+    const rendered = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          ...spec,
+        }),
+      },
+      ...extra,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return rendered;
+  }
+
+  async function settleReport() {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  function nameFields() {
+    return screen.queryAllByLabelText(t.runtimeSpecLogFileName) as HTMLInputElement[];
+  }
+  function pathFields() {
+    return screen.queryAllByLabelText(t.runtimeSpecLogFilePath) as HTMLInputElement[];
+  }
+  const addButton = () => screen.getByRole('button', { name: t.runtimeSpecLogFileAdd });
+
+  it('starts with no rows and adds an empty name + path pair per click', async () => {
+    await openEditFor({ log_files: [] });
+    expect(nameFields()).toHaveLength(0);
+    fireEvent.click(addButton());
+    expect(nameFields()).toHaveLength(1);
+    expect(pathFields()[0]).toHaveValue('');
+  });
+
+  it('round-trips loaded log files into the PUT body, edits included, without a row key', async () => {
+    const { putSpecs } = await openEditFor({ log_files: filesOnTheServer });
+    expect(nameFields().map((f) => f.value)).toEqual(['engine', 'Access']);
+    expect(pathFields().map((f) => f.value)).toEqual([
+      '${CONFIG_DIR}/engine.log',
+      '/var/log/access.log',
+    ]);
+
+    // An unrelated save carries the list verbatim.
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.log_files).toEqual(filesOnTheServer);
+  });
+
+  it('sends the edited list', async () => {
+    const { putSpecs } = await openEditFor({ log_files: filesOnTheServer });
+    fireEvent.change(pathFields()[1], { target: { value: '/var/log/other.log' } });
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecLogFileRemove })[0]);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.log_files).toEqual([{ name: 'Access', path: '/var/log/other.log' }]);
+  });
+
+  it('sends an explicit empty list when the spec has none', async () => {
+    const { putSpecs } = await openEditFor({});
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.log_files).toEqual([]);
+  });
+
+  it('stops offering Add at the limit of 4 files', async () => {
+    await openEditFor({
+      log_files: [1, 2, 3].map((i) => ({ name: `l${i}`, path: `/var/log/l${i}.log` })),
+    });
+    expect(addButton()).toBeEnabled();
+    fireEvent.click(addButton());
+    expect(nameFields()).toHaveLength(4);
+    expect(addButton()).toBeDisabled();
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecLogFileRemove })[0]);
+    expect(addButton()).toBeEnabled();
+  });
+
+  it('shows an inline error for the reserved name "process" and refuses the save', async () => {
+    const { putSpecs } = await openEditFor({ log_files: [] });
+    fireEvent.click(addButton());
+    fireEvent.change(nameFields()[0], { target: { value: 'Process' } });
+    fireEvent.change(pathFields()[0], { target: { value: '/var/log/x.log' } });
+    expect(await screen.findByText(t.runtimeSpecLogFileNameReserved)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(
+      await screen.findByText(
+        `${t.runtimeSpecLogFiles} (Process): ${t.runtimeSpecLogFileNameReserved}`,
+      ),
+    ).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('shows an inline error for a relative path', async () => {
+    await openEditFor({ log_files: [] });
+    fireEvent.click(addButton());
+    fireEvent.change(nameFields()[0], { target: { value: 'x' } });
+    fireEvent.change(pathFields()[0], { target: { value: 'relative/x.log' } });
+    expect(await screen.findByText(t.runtimeSpecLogFilePathNotAbsolute)).toBeInTheDocument();
+  });
+
+  it("refuses a log file at the path of one of the spec's config files", async () => {
+    const { putSpecs } = await openEditFor({
+      config_files: [{ name: 'run.json', content: '{}' }],
+      log_files: [{ name: 'x', path: '${CONFIG_DIR}/RUN.json' }],
+    });
+    expect(await screen.findByText(t.runtimeSpecLogFilePathIsConfigFile)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(
+      await screen.findByText(
+        `${t.runtimeSpecLogFiles} (x): ${t.runtimeSpecLogFilePathIsConfigFile}`,
+      ),
+    ).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  describe('agent feature warning (runtime_log_files)', () => {
+    const withFiles = { log_files: [filesOnTheServer[0]] };
+
+    it('warns, naming the agent version, when the agent does not declare runtime_log_files', async () => {
+      await openEditFor(withFiles, {
+        report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }),
+      });
+      const warning = await screen.findByText(t.runtimeSpecAgentNoLogFiles, { exact: false });
+      expect(warning).toHaveTextContent('0.25.2');
+    });
+
+    it('stays quiet when the agent declares runtime_log_files', async () => {
+      await openEditFor(withFiles, {
+        report: makeReport({
+          agent_version: '0.26.0',
+          agent_features: ['runtime_manager', 'runtime_log_files'],
+        }),
+      });
+      await settleReport();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoLogFiles, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('stays quiet for a spec without log files', async () => {
+      await openEditFor(
+        { log_files: [] },
+        { report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }) },
+      );
+      await settleReport();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoLogFiles, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('is advisory: saving still works', async () => {
+      const { putSpecs } = await openEditFor(withFiles, {
+        report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }),
+      });
+      await screen.findByText(t.runtimeSpecAgentNoLogFiles, { exact: false });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.log_files).toEqual(withFiles.log_files);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #257: a spec's config files. The editor is a repeatable {name, content}
 // list; the form's PUT is a FULL document, so the load -> save round trip of
 // files set through the API (which this form may never have touched) is the
@@ -13878,6 +14073,28 @@ describe('RuntimeAdminSection process_tree control (#424)', () => {
     expect(putSpecs[0].body.process_tree).toBe('job');
   });
 
+  it('the strata template pre-fills the engine log file when the list is empty', async () => {
+    renderSection({
+      report: makeReport({
+        agent_version: '0.26.0',
+        agent_features: ['runtime_manager', 'runtime_log_files'],
+      }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.getByLabelText(t.runtimeSpecLogFileName)).toHaveValue('engine');
+    expect(screen.getByLabelText(t.runtimeSpecLogFilePath)).toHaveValue('${CONFIG_DIR}/engine.log');
+  });
+
+  it('the strata template declares no engine log when the agent lacks runtime_log_files', async () => {
+    renderSection({
+      report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.queryByLabelText(t.runtimeSpecLogFileName)).not.toBeInTheDocument();
+  });
+
   it('labels the process_tree_agent_unknown warning', async () => {
     renderSection({ warnings: ['process_tree_agent_unknown'] });
     expect(await screen.findByText(t.runtimeProcessTreeAgentUnknownWarning)).toBeInTheDocument();
@@ -13945,8 +14162,15 @@ describe('RuntimeAdminSection process_tree control (#424)', () => {
 });
 
 describe('RuntimeAdminSection strata run-config import', () => {
-  async function openImport() {
-    const view = renderSection();
+  // The engine-log rewrite needs an agent that declares runtime_log_files
+  // (0.26.0): an older one writes ${CONFIG_DIR} natively into the JSON.
+  const logFilesAgent = () =>
+    makeReport({
+      agent_version: '0.26.0',
+      agent_features: ['runtime_manager', 'runtime_log_files'],
+    });
+  async function openImport(report: RuntimeReport = logFilesAgent()) {
+    const view = renderSection({ report });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     await pickFlavorFormType(t.runtimeSpecTypeStrata);
     fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
@@ -13983,11 +14207,236 @@ describe('RuntimeAdminSection strata run-config import', () => {
     expect(screen.getByLabelText(t.mappingAppName)).toHaveValue('qwen3.8-flash-next-unsloth-q8_0');
   });
 
+  it('fills the log-files list with the engine log and rewrites log in the file', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByLabelText(t.runtimeSpecLogFileName)).toHaveValue('engine');
+    expect(screen.getByLabelText(t.runtimeSpecLogFilePath)).toHaveValue('${CONFIG_DIR}/engine.log');
+    const content = screen.getByLabelText(t.runtimeSpecConfigFileContent) as HTMLTextAreaElement;
+    expect(JSON.parse(content.value).log).toBe('${CONFIG_DIR}/engine.log');
+  });
+
+  it('replaces engine* log rows on a second import and keeps the others', async () => {
+    await openImport();
+    const base = JSON.parse(strataFixtureText) as Record<string, unknown>;
+    const importText = (o: Record<string, unknown>) => {
+      fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+        target: { value: JSON.stringify(o) },
+      });
+      fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    };
+    const names = () =>
+      (screen.getAllByLabelText(t.runtimeSpecLogFileName) as HTMLInputElement[]).map(
+        (n) => n.value,
+      );
+    importText({ ...base, replicas: 2 });
+    expect(names()).toEqual(['engine-r0', 'engine-r1']);
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecLogFileAdd }));
+    const all = screen.getAllByLabelText(t.runtimeSpecLogFileName);
+    fireEvent.change(all[2], { target: { value: 'access' } });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
+    importText({ ...base });
+    expect(names()).toEqual(['access', 'engine']);
+  });
+
+  it('keeps a log row merely starting with "engine" on a re-import', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecLogFileAdd }));
+    fireEvent.change(screen.getAllByLabelText(t.runtimeSpecLogFileName)[1], {
+      target: { value: 'engineering' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(
+      (screen.getAllByLabelText(t.runtimeSpecLogFileName) as HTMLInputElement[]).map(
+        (n) => n.value,
+      ),
+    ).toEqual(['engineering', 'engine']);
+  });
+
+  it('keeps log as is, declares no engine log and says why when the agent lacks runtime_log_files', async () => {
+    await openImport(makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }));
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    const content = screen.getByLabelText(t.runtimeSpecConfigFileContent) as HTMLTextAreaElement;
+    expect(JSON.parse(content.value).log).toBe(
+      (JSON.parse(strataFixtureText) as Record<string, unknown>).log,
+    );
+    expect(content.value).not.toContain('${CONFIG_DIR}');
+    expect(screen.queryByLabelText(t.runtimeSpecLogFileName)).not.toBeInTheDocument();
+    expect(screen.getByText(t.strataImportWarnEngineLogNeedsAgent)).toBeInTheDocument();
+  });
+
+  it('warns when more than four replicas were capped', async () => {
+    await openImport();
+    const base = JSON.parse(strataFixtureText) as Record<string, unknown>;
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: JSON.stringify({ ...base, replicas: 6 }) },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(screen.getByText(t.strataImportWarnLogFilesCapped)).toBeInTheDocument();
+    expect(screen.getAllByLabelText(t.runtimeSpecLogFileName)).toHaveLength(4);
+  });
+
   it('shows an inline error and writes nothing for a bad paste', async () => {
     await openImport();
     fireEvent.change(screen.getByLabelText(t.strataImportLabel), { target: { value: '{nope' } });
     fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
     expect(screen.getByText(t.strataImportErrorInvalidJson)).toBeInTheDocument();
     expect(screen.queryByLabelText(t.runtimeSpecConfigFileName)).not.toBeInTheDocument();
+  });
+});
+
+// #430: a spec's declared log files reach the live log as a second row of tabs,
+// and a failed generation's file tails reach the last-error tooltip.
+describe('RuntimeAdminSection declared log files', () => {
+  function renderWithLogFiles(report?: RuntimeReport, lastError?: RuntimeStatus['last_error']) {
+    const handles = renderSection({
+      mappings: [makeMapping({ id: 'map_1', gateway_model_name: 'Alpha' })],
+      specsByMappingId: {
+        map_1: fullSpec({
+          log_files: [
+            { name: 'engine', path: '${CONFIG_DIR}/engine.log' },
+            { name: 'access', path: '/var/log/model/access.log' },
+          ],
+        }),
+      },
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'app-model', last_error: lastError })],
+      ...(report ? { report } : {}),
+    });
+    handles.stream.setStatus('open');
+    return handles;
+  }
+
+  it("passes the spec's declared log files to the log view, in order", async () => {
+    renderWithLogFiles(
+      makeReport({ agent_version: '0.26.0', agent_features: ['runtime_log_files'] }),
+    );
+    await openStatusTab();
+    await screen.findByText('Alpha');
+    fireEvent.click(inRowWith('Alpha').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    const sources = within(dialog).getByRole('tablist', { name: t.runtimeLogsSourceLabel });
+    expect(
+      within(sources)
+        .getAllByRole('tab')
+        .map((tab) => tab.textContent),
+    ).toEqual([t.runtimeLogsSourceProcess, 'engine', 'access']);
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'engine' }));
+    expect(within(dialog).queryByText(t.runtimeLogsFileUnsupported)).not.toBeInTheDocument();
+  });
+
+  it('tells the log view when the agent lacks runtime_log_files', async () => {
+    renderWithLogFiles(makeReport({ agent_version: '0.25.2', agent_features: ['runtime_logs'] }));
+    await openStatusTab();
+    await screen.findByText('Alpha');
+    fireEvent.click(inRowWith('Alpha').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'engine' }));
+    expect(within(dialog).getByText(t.runtimeLogsFileUnsupported)).toBeInTheDocument();
+  });
+
+  it('renders one section per log file tail under the stderr tail, as text', async () => {
+    renderWithLogFiles(undefined, {
+      message: 'exited with code 1',
+      at: '2026-11-27T10:00:00Z',
+      exit_code: 1,
+      failures: 1,
+      stderr_tail: 'stderr says bye',
+      log_file_tails: [
+        { name: 'engine', tail: 'engine: <b>fatal</b> error' },
+        { name: 'access', tail: 'GET /health 500' },
+      ],
+    });
+    await openStatusTab();
+
+    fireEvent.mouseOver(await screen.findByText('exited with code 1'));
+    const tooltip = await screen.findByRole('tooltip');
+    expect(
+      within(tooltip).getByText(`${t.runtimeLastErrorLogFile('engine')}:`),
+    ).toBeInTheDocument();
+    expect(
+      within(tooltip).getByText(`${t.runtimeLastErrorLogFile('access')}:`),
+    ).toBeInTheDocument();
+    // Text, never HTML.
+    expect(within(tooltip).getByText('engine: <b>fatal</b> error')).toBeInTheDocument();
+    expect(tooltip.querySelector('b')).toBeNull();
+    expect(within(tooltip).getByText('GET /health 500')).toBeInTheDocument();
+    // Below the stderr tail, in the order the agent sent them.
+    const text = tooltip.textContent ?? '';
+    expect(text.indexOf('stderr says bye')).toBeLessThan(text.indexOf('engine: <b>fatal</b>'));
+    expect(text.indexOf('engine: <b>fatal</b>')).toBeLessThan(text.indexOf('GET /health 500'));
+  });
+
+  // A file-mode agent's specs exist only in its report; its declared log files
+  // reach the view from there, narrowed defensively (the config is unknown).
+  it("takes a file-mode spec's log files from the agent's report", async () => {
+    const { stream } = renderSection({
+      report: fileModeReport(
+        {
+          specs: [
+            {
+              id: 'spec_1',
+              model: 'app-model',
+              log_files: [
+                { name: 'engine', path: '${CONFIG_DIR}/engine.log' },
+                { name: 'Process', path: '/var/log/p.log' },
+                { name: 'ENGINE', path: '/var/log/dup.log' },
+                { name: 'bad/name', path: '/var/log/bad.log' },
+                { path: '/var/log/nameless.log' },
+                'not-a-record',
+                { name: 'a', path: '/var/log/a.log' },
+                { name: 'b', path: '/var/log/b.log' },
+                { name: 'c', path: '/var/log/c.log' },
+                { name: 'd', path: '/var/log/d.log' },
+              ],
+            },
+          ],
+        },
+        {},
+        { agent_version: '0.26.0', agent_features: ['runtime_manager', 'runtime_log_files'] },
+      ),
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'app-model' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('app-model');
+    fireEvent.click(inRowWith('app-model').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    const sources = within(dialog).getByRole('tablist', { name: t.runtimeLogsSourceLabel });
+    expect(
+      within(sources)
+        .getAllByRole('tab')
+        .map((tab) => tab.textContent),
+    ).toEqual([t.runtimeLogsSourceProcess, 'engine', 'a', 'b', 'c']);
+  });
+
+  it('shows no source row for a file-mode spec without log files', async () => {
+    const { stream } = renderSection({
+      report: fileModeReport({ specs: [{ id: 'spec_1', model: 'app-model' }] }),
+      statusRows: [makeStatus({ spec_id: 'spec_1', model: 'app-model' })],
+    });
+    stream.setStatus('open');
+    await openStatusTab();
+    await screen.findByText('app-model');
+    fireEvent.click(inRowWith('app-model').getByRole('button', { name: t.runtimeLogs }));
+
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).queryAllByRole('tablist')).toHaveLength(0);
   });
 });

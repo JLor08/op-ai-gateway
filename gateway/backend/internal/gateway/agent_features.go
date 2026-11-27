@@ -85,7 +85,17 @@ import (
 // rpc_server member specs and cluster heads; the agent honours a document's
 // kind, cluster and rpc fields only while this list carries the name, so a
 // file-mode document or an older gateway can never start a member as a model.
-var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature, runtimeInstancesFeature, rpcClusterFeature}
+var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runtimeConfigAckFeature, capabilitySourceSdcppFeature, capabilitySourceAudioCppFeature, runtimeInstancesFeature, rpcClusterFeature, runtimeLogFilesFeature}
+
+// runtimeLogFilesFeature says this gateway's runtime documents may carry a
+// spec's log_files (#430) and that it accepts the agent's file-tail events and
+// log_file_tails in a failure record. The agent's declaration of the same
+// string says it tails them, and the agent reads this declaration as a
+// precondition, in file mode too (runtime.Driver.Sync): an older gateway, which
+// would relay a file's text as process output, never receives a file stream.
+// An agent that does not declare it, or a gateway that does not, leaves the
+// process stream exactly as it was.
+const runtimeLogFilesFeature = "runtime_log_files"
 
 // rpcClusterFeature says this gateway derives llama.cpp RPC cluster heads and
 // their rpc_server members into runtime documents; the agent's declaration of

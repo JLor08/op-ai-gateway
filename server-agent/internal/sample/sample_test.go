@@ -47,11 +47,18 @@ type wireRuntimeGPU struct {
 }
 
 type wireRuntimeError struct {
-	Message    string    `json:"message"`
-	At         time.Time `json:"at"`
-	ExitCode   int       `json:"exit_code"`
-	Failures   int       `json:"failures"`
-	StderrTail string    `json:"stderr_tail,omitempty"`
+	Message      string            `json:"message"`
+	At           time.Time         `json:"at"`
+	ExitCode     int               `json:"exit_code"`
+	Failures     int               `json:"failures"`
+	StderrTail   string            `json:"stderr_tail,omitempty"`
+	LogFileTails []wireLogFileTail `json:"log_file_tails,omitempty"`
+}
+
+// wireLogFileTail mirrors one log_file_tails entry (#430 §9).
+type wireLogFileTail struct {
+	Name string `json:"name"`
+	Tail string `json:"tail"`
 }
 
 type wireRuntimeSample struct {
@@ -330,6 +337,9 @@ func TestSampleCarriesRuntimes(t *testing.T) {
 					ExitCode:   1,
 					Failures:   3,
 					StderrTail: "CUDA error: out of memory",
+					LogFileTails: []LogFileTailSample{
+						{Name: "engine", Tail: "engine: CUDA error\n"},
+					},
 				},
 			},
 		},
@@ -366,6 +376,9 @@ func TestSampleCarriesRuntimes(t *testing.T) {
 	}
 	if rt.LastError.ExitCode != 1 || rt.LastError.Failures != 3 || rt.LastError.StderrTail != "CUDA error: out of memory" {
 		t.Errorf("runtimes[0].last_error = %+v", rt.LastError)
+	}
+	if len(rt.LastError.LogFileTails) != 1 || rt.LastError.LogFileTails[0] != (wireLogFileTail{Name: "engine", Tail: "engine: CUDA error\n"}) {
+		t.Errorf("runtimes[0].last_error.log_file_tails = %+v", rt.LastError.LogFileTails)
 	}
 
 	// A Sample with no Runtimes at all -- the byte-neutrality case a nil

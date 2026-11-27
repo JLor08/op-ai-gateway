@@ -162,6 +162,18 @@
   // work_dir containment on (then only well-formed entries permit one).
   "runtime_allowed_dirs": [],
 
+  // Directories, besides a runtime spec's own ${CONFIG_DIR}, from which the
+  // agent may tail the log files that spec declares (log_files) for the
+  // portal's runtime log dialog. Empty (the default) means ONLY the spec's own
+  // ${CONFIG_DIR} -- fail closed, deliberately the inverse of
+  // runtime_allowed_dirs above (empty there means ANY work_dir), which is why
+  // that list is not reused. Comes ONLY from this local file (or
+  // OP_AGENT_RUNTIME_ALLOWED_LOG_DIRS); the gateway can never widen it. A bare
+  // entry, or a trailing "/*" ("/var/log/models" and "/var/log/models/*" are
+  // the same), permits that directory and its whole subtree; it is not a
+  // glob. wsl://<distro>/<absolute Linux path> entries name a WSL distro.
+  "runtime_allowed_log_dirs": [],
+
   // When true, each runtime_allowed_binaries entry's PARENT directory is
   // treated as an allowed work_dir prefix WITHOUT listing it in
   // runtime_allowed_dirs above -- convenient when a model's work_dir sits
@@ -226,9 +238,10 @@
 
   // Ceiling on the SUM of those buffers across every spec, in BYTES, so a
   // server with twenty specs is not twenty times the number above. 0 (the
-  // default) means 16777216 (16 MiB). The agent keeps at most
-  // total/per-spec buffers, evicting the least-recently-written one nobody is
-  // watching to stay inside the ceiling.
+  // default) means 16777216 (16 MiB). It is a hard bound over every ring --
+  // the process output and each declared log file have one of their own --
+  // kept by dropping whole specs nobody is watching, least-recently-written
+  // first. Raised to at least the number above plus 4 x 64 KiB.
   "runtime_log_buffer_total_bytes": 0,
 
   // Skip TLS certificate verification. Self-signed dev gateways only. Default false.

@@ -713,7 +713,7 @@ semantics.
 | `/api/portal/servers/{id}/gpu-budgets` | GET/PUT | server | `{"budgets":[…]}` on both GET and PUT — the server's complete per-GPU budget list |
 | `/api/portal/servers/{id}/runtime/report` | GET | server | The file-mode agent's reported effective configuration |
 | `/api/portal/servers/{id}/runtime/events` | GET (SSE) | server | Live per-spec runtime status (`GetServer` ownership check runs **before the first stream byte**). An RPC cluster member's row (`kind: "rpc_server"`) carries `display_name`, resolved for the reader from the stored membership: `RPC (<head's gateway model name>)(<head server's name>)`. The member's own server is the one being viewed, so the name says which head it serves. A head the reader may not see (its mapping is beyond the reader's rights) and a head whose spec or mapping is gone show as `RPC (—)`, naming neither model nor server, and a manual member spec no head uses shows as `RPC (<binary's file name>)`. The row also carries the name's parts, `head_model` and `head_server`, so a client can sort and filter by them; both are absent whenever the name names no head. `spec_id` stays the member's identity. Each stream looks the names up when its set of members changes and on the first frame 15 s or more after the last lookup, so a renamed model or head server shows on that frame. A failed lookup is retried after 5 s; until then the names already known stay, but never longer than 15 s after the last successful lookup, and a refusal of the server (the reader lost its rights) drops them at once |
-| `/api/portal/servers/{id}/runtime/logs?spec_id=…` | GET (SSE) | server | Live stdout+stderr of ONE managed process. Each generation's **opening marker entry** additionally carries the **resolved launch command** (`command`: binary, argv, work_dir and the complete effective environment, with every `${AGENT_ENV:NAME}`-derived value masked agent-side as its own placeholder). Same ownership check, before the first stream byte — argv is closer to user data than status, and the boundary is the same one, not a laxer one. `spec_id` is validated as well as authorized, because it is also shipped to the agent inside the watch command: `400 runtime_logs.spec_required` without it, `400 runtime_logs.spec_invalid` when it is over-long (rejected, never clamped), and `503 runtime_logs.too_many_specs` when the server already has the maximum number of distinct specs under view. Subscribing is what makes the agent stream, and unsubscribing is what stops it. |
+| `/api/portal/servers/{id}/runtime/logs?spec_id=…` | GET (SSE) | server | Live stdout+stderr of ONE managed process. Each generation's **opening marker entry** additionally carries the **resolved launch command** (`command`: binary, argv, work_dir and the complete effective environment, with every `${AGENT_ENV:NAME}`-derived value masked agent-side as its own placeholder). One subscription carries every stream of the spec: the process output (no `stream`) and, from agent 0.26.0, each declared log file (`stream` set to its name) with its typed file events ([Agent-Managed Model Runtime §14.9](../cross-cutting/agent-runtime-manager.md#149-log-files)); there is no per-stream endpoint. Same ownership check, before the first stream byte — argv is closer to user data than status, and the boundary is the same one, not a laxer one. `spec_id` is validated as well as authorized, because it is also shipped to the agent inside the watch command: `400 runtime_logs.spec_required` without it, `400 runtime_logs.spec_invalid` when it is over-long (rejected, never clamped), and `503 runtime_logs.too_many_specs` when the server already has the maximum number of distinct specs under view. Subscribing is what makes the agent stream, and unsubscribing is what stops it. |
 
 Conventions worth stating, because each is a judgement call a client depends on:
 
@@ -798,7 +798,7 @@ Conventions worth stating, because each is a judgement call a client depends on:
   is mapping-scoped, so a client fans out one GET per mapping.
   `configured: false` is the *only* signal for "this mapping has no spec row
   yet". The document is then synthesized: `id` is absent and `mapping_id` is
-  set; the spec's own fields are zero values (`gpus`/`args`/`env`/`api_flavors`/`config_files`
+  set; the spec's own fields are zero values (`gpus`/`args`/`env`/`api_flavors`/`config_files`/`log_files`
   non-nil but empty, `responses_mode`/`messages_mode` `""`), except
   `visible_devices_mode` (`env`) and `api_token_mode`/`api_token_header_source`
   (`app`), which carry their defaults; `app_api_token_set`/`app_api_token_header`
@@ -980,7 +980,8 @@ Conventions worth stating, because each is a judgement call a client depends on:
   address (`m`, `m#k`), `instance` is always present (`0` for every spec that never
   replicates) and `startup_ms` (omitted while unknown) is the instance's measured
   startup; a spec that never replicates has exactly its one row — with `last_error =
-  {message, at, exit_code, failures, stderr_tail?}` and `gpus = [{index,
+  {message, at, exit_code, failures, stderr_tail?, code?, log_file_tails?}` (`log_file_tails`
+  below) and `gpus = [{index,
   vram_measured_mb}]`. Unlike `gpus`/`measured_at` (below),
   `context_size`/`active_requests`/`queue_depth`/`metrics_probe`/
   `context_probe`/`live_progress_support` are **never omitted** — they are the
@@ -1007,6 +1008,18 @@ Conventions worth stating, because each is a judgement call a client depends on:
   although the registry holds them for that child: they are an in-process
   hand-off to `GET /api/portal/model-image-options` (above), kept off this
   frame on purpose, and a client wanting them reads that endpoint.
+- **`last_error.log_file_tails`** (#430, agent 0.26.0) is `[{name, tail}]`: the end
+  of each declared log file of the failed generation, in declaration order, beside
+  `stderr_tail`, which stays process output only. The agent attaches it after the
+  generation's log tailers have finished their post-exit grace, and only while that
+  `last_error` still describes the failure, so a row briefly carries a `last_error`
+  without it and then one with it; a plain stop gets none, and a refused, missing,
+  binary or empty file has no entry. The gateway clamps it on ingest: at most four
+  entries, an entry whose name fails `^[A-Za-z0-9._-]{1,32}$`, is `process` or
+  repeats an earlier name (case-insensitively) is dropped, and each `tail` keeps
+  its **last** 2048 bytes on a rune boundary. Volatile like `stderr_tail`: kept in
+  the runtime registry only, never persisted
+  ([Agent-Managed Model Runtime §14.9](../cross-cutting/agent-runtime-manager.md#149-log-files)).
 - **The status row carries the live measured RAM as `ram_measured_mb`, omitted when
   unknown.** The agent's runtime sample has a spec-level `ram_measured_mb` (beside
   `gpus[]`, not inside it, `omitempty`, `0` = unknown); the gateway writes it back onto
@@ -1059,7 +1072,7 @@ sentinel is a breaking API change that must be applied in both places):
 | Code | Status |
 |---|---|
 | `runtime_spec.not_found` | 404 |
-| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid` | 400 |
+| `runtime_spec.binary_required`, `.args_invalid`, `.env_invalid`, `.gpu_invalid`, `.tuning_invalid`, `.admin_state_invalid`, `.visible_devices_no_gpus`, `.visible_devices_conflict`, `.visible_devices_mode_invalid`, `.visible_devices_args_no_placeholder`, `.application_not_server_agent`, `.api_token_mode_invalid`, `.api_token_no_placeholder`, `.api_token_placeholder_without_mode`, `.api_token_header_invalid`, `.type_invalid`, `.config_files_invalid`, `.log_files_invalid` | 400 |
 | `runtime_spec.api_token_key_required` | 400 — not a validation sentinel: `capture.SealSecret` returned `capture.ErrKeyRequired` while sealing a `set`/`random` token (a disk-backed store with no encryption key configured). Mapped from the shared `capture.ErrKeyRequired`, not a `portal.Err*` value of its own, and checked **before any persist** — a `set`/`random` write that cannot be sealed writes nothing, never a `plain:` fallback |
 | `runtime_spec.execution_mode_invalid`, `.wsl_distro_invalid`, `.wsl_path_not_linux`, `.wsl_cluster_unsupported` | 400 — the execution mode (#381): an `execution_mode` other than `native`/`wsl` (`""` stores `native`); for `wsl`, a `wsl_distro` that is empty or not a plain name (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), a `binary` or non-empty `work_dir` that is not a Linux absolute path (no leading `/`), and a spec that is an RPC cluster head (`cluster_enabled`). Checked in that order, as the last of the request's own shape checks |
 | `runtime_spec.process_tree_invalid`, `runtime_spec.process_tree_unsupported` | 400 — the process-tree mode (#424): a `process_tree` other than `direct`/`job` (`""` stores `direct`); a write that moves a spec into `job` (a new spec, or one not stored as `job`) for a server whose reported OS is not `windows` or whose agent declared its features without `runtime_process_tree_job` (operator path only, checked last; a re-save of a spec already stored as `job` is not refused) |
@@ -1248,6 +1261,26 @@ blank, control character) or repeats another case-insensitively; a `content` ove
 64 KiB; or a content naming one of the two secret placeholders. Its message names
 the file and the rule, **never the content**, and the check runs before any
 mutation like every other spec validation rule.
+
+`RuntimeSpecDTO`/`PutRuntimeSpecRequest` carry `log_files` (#430, migration 118), an
+array of `{name, path}` objects: up to four log files the agent tails into streams of
+their own for the live-log view and `last_error.log_file_tails`
+([Agent-Managed Model Runtime §14.9](../cross-cutting/agent-runtime-manager.md#149-log-files)).
+The **GET** response always carries the array (`[]` for none, never `null`). Like
+`config_files`, an **absent** `log_files` in the PUT clears the stored set, so a client that builds a body from a loaded spec must carry it through.
+`runtime_spec.log_files_invalid` (400), the last spec validation in order, rejects a
+list with more than four entries; a `name` that does not match
+`^[A-Za-z0-9._-]{1,32}$`, is `process` in any case, or repeats another
+case-insensitively; an empty `path`, one over 1024 bytes, one with a control
+character, or one naming `${API_TOKEN}` or `${AGENT_ENV:…}`; and a `path` that neither
+starts with `${CONFIG_DIR}` followed by `/`, `\` or the end, nor is an absolute POSIX
+or Windows path; and a `path` that is exactly `${CONFIG_DIR}/<name>` or
+`${CONFIG_DIR}\<name>` where `<name>` is one of the request's `config_files` names,
+compared case-insensitively (the agent removes a log file there before every start,
+which would delete the config file). Its message names the entry (by position or name) and the rule,
+**never the path**. These are early-feedback rules: which files the agent actually
+reads is decided on the agent, by its own policy and the agent-local
+`runtime_allowed_log_dirs`, which the gateway never sees.
 
 `RuntimeSpecDTO` additionally carries the runtime-spec **API token** fields —
 see [agent-runtime-manager.md](../cross-cutting/agent-runtime-manager.md#the-runtime-spec-api-token-a-deliberate-one-off-exception-to-no-secret-enters-the-gateway)
@@ -2018,7 +2051,7 @@ header-only representation would silently disagree across the two transports.
 A pushed frame must therefore carry the full document **including** its `etag`.
 
 `/features` returns the gateway's declared names —
-`{"features":["runtime_manager","runtime_logs","runtime_config_ack","capability_source_sdcpp","capability_source_audiocpp","runtime_instances"]}`. Gating is
+`{"features":["runtime_manager","runtime_logs","runtime_config_ack","capability_source_sdcpp","capability_source_audiocpp","runtime_instances","rpc_cluster","runtime_log_files"]}`. Gating is
 name-based string equality: a flag both sides declare is active only when the
 gateway and the agent both declare it. A flag that states a fact about one side
 alone need only be on that side's list, and `capability_source_sdcpp` (the ingest accepts
@@ -2066,7 +2099,11 @@ independent implementations must agree on:
   `health_timeout_seconds`, `startup_timeout_seconds`, `idle_timeout_seconds`,
   `admission_wait_timeout_seconds`, `pinned`, `set_visible_devices`,
   `visible_devices_mode`, `admin_state`, `type`, `role`, `metrics_path`,
-  `context_probe_path`, and — only for a replicable spec on an agent that declares
+  `context_probe_path`, `log_files[{name, path}]` (#430; omitted when the spec
+  declares none, so such a spec's entry and the ETag are byte-for-byte what they
+  were before the field; the path still carries its placeholders, which the agent
+  resolves and checks against its own policy — [§14.9](../cross-cutting/agent-runtime-manager.md#149-log-files)),
+  and — only for a replicable spec on an agent that declares
   `runtime_instances` — `replicable: true`, `min_instances` and `max_instances`
   (each omitted otherwise, so every other document is byte-for-byte the
   pre-instances one, ETag included; `idle_timeout_seconds` is then the effective
@@ -2162,10 +2199,12 @@ Four frame types join the existing doorbells on `/api/agent/v1/stream`:
 | `runtime_config` | gateway → agent | The **complete** runtime-config document plus its `etag` — the first gateway→agent frame that carries a payload rather than being a content-free doorbell. Never a delta, never a command. Best-effort: a full per-connection queue drops it (logged at Debug) with no error, because the agent's own conditional GET is the authoritative path. |
 | `runtime_report` | agent → gateway | The same payload as the POST below. |
 | `runtime_log_config` | gateway → agent | `{"spec_ids":[…],"epochs":{…}}` — the **full** set of specs whose managed-process output the gateway currently wants streamed, never a delta. `epochs` is one counter per spec id, bumped whenever a **viewer arrives**; the agent re-snapshots a spec whose epoch differs from the one its last snapshot was taken for, which is how the second viewer of an already-watched spec gets a history at all (the set alone is byte-identical for it). Sent on every subscribe/unsubscribe transition and restated — including as the empty set, and with every epoch bumped — on **every** new agent connection, so neither a watch set nor a history the gateway owes can outlive the connection it was issued on. A list of ids the gateway itself supplied, each with a counter, is the entire expressive power of the frame: it can never carry an instruction. Not feature-gated — an agent that does not understand it discards it, whereas gating the send would skip a freshly started agent whose features are not yet known. |
-| `runtime_log` | agent → gateway | `{"spec_id","scrollback","scrollback_more","entries":[{"pid","at","text","dropped_bytes","event","exit_code","command":{"binary","args","work_dir","env","masked","env_redacted","truncated"},"instance"}]}` — one spec's output since the previous flush, **or one chunk of a history replay**. A retained history need not fit one frame, so a replay is a sequence of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more`; the gateway collapses that sequence back to the portal's one-reset-then-appends contract and never forwards `scrollback_more`. `event` is a closed, allow-listed set (`started`/`exited`/`start_failed`); anything else is stripped on ingest. `command` is the **resolved** launch command of the generation an OPENING marker (`started`/`start_failed`) opens, and is stripped from any other entry by the same allow-list. `start_failed` has no pid and no output: the exec itself failed. `instance` names the spec instance whose generation produced a text entry or marker — omitted for instance 0, and absent from an agent that predates instances; instance k's text keeps its `[#k] ` line prefix, and a gap belongs to no instance: an entry carrying only `dropped_bytes` names none, and one that also carries text names the instance of its text. It is relayed unchanged (a negative value is read as 0). `masked` and `env_redacted` are the agent's two withholding reasons — a `${AGENT_ENV:NAME}` span replaced by its own placeholder, and a file-mode agent withholding the values its local document sets — independent, both settable at once, and relayed as they arrive. The gateway clamps `command` lengths and counts, dropping over-long entries whole and setting `truncated`, but never re-masks — only the agent knows which bytes came from which placeholder. Relayed to open portal log views in memory and forgotten: **never stored, never logged**. |
+| `runtime_log` | agent → gateway | `{"spec_id","scrollback","scrollback_more","entries":[{"pid","at","text","dropped_bytes","event","exit_code","command":{"binary","args","work_dir","env","masked","env_redacted","truncated"},"instance","stream"}]}` — one spec's output since the previous flush, **or one chunk of a history replay**. A retained history need not fit one frame, so a replay is a sequence of batches, every one flagged `scrollback` and every one but the last also flagged `scrollback_more`; the gateway collapses that sequence back to the portal's one-reset-then-appends contract and never forwards `scrollback_more`. `event` is a closed, allow-listed set (`started`/`exited`/`start_failed`); anything else is stripped on ingest. `stream` (#430, agent 0.26.0) names the declared log file an entry belongs to and is omitted for process output, which is all an older agent sends; an entry whose `stream` does not match `^[A-Za-z0-9._-]{1,32}$` or is `process` (any case) is dropped whole. A file stream has its own closed event set — `file_opened`, `file_rotated`, `file_truncated`, `file_line_cut`, `file_stale` (markers) and `file_waiting`, `file_not_permitted`, `file_binary`, `file_missing` (statuses) — valid only on an entry with a `stream` and disjoint from the process set: an event outside the entry's set degrades to a plain entry, and a file event's `text`, `exit_code` and `pid` are cleared. The gateway does not check a stream name against the spec's declaration; the portal renders declared names only. A batch may mix streams of its spec, and a replay delivers the process stream first, then the files by name. `command` is the **resolved** launch command of the generation an OPENING marker (`started`/`start_failed`) opens, and is stripped from any other entry by the same allow-list. `start_failed` has no pid and no output: the exec itself failed. `instance` names the spec instance whose generation produced a text entry or marker — omitted for instance 0, and absent from an agent that predates instances; instance k's text keeps its `[#k] ` line prefix, and a gap belongs to no instance: an entry carrying only `dropped_bytes` names none, and one that also carries text names the instance of its text. It is relayed unchanged (a negative value is read as 0). `masked` and `env_redacted` are the agent's two withholding reasons — a `${AGENT_ENV:NAME}` span replaced by its own placeholder, and a file-mode agent withholding the values its local document sets — independent, both settable at once, and relayed as they arrive. The gateway clamps `command` lengths and counts, dropping over-long entries whole and setting `truncated`, but never re-masks — only the agent knows which bytes came from which placeholder. Relayed to open portal log views in memory and forgotten: **never stored, never logged**. |
 
 `dropped_bytes` means the same thing wherever it appears: *N bytes the process
-printed are missing immediately before this entry's text*. See
+printed are missing immediately before this entry's text*, counted **per stream**:
+a gap entry names the stream whose bytes are missing (`stream`, omitted for process
+output), on the agent and in the gateway's per-subscriber accounting alike. See
 [Agent-Managed Model Runtime §14](../cross-cutting/agent-runtime-manager.md#14-managed-process-logs-t3).
 
 The runtime report has different transport semantics on each path, and the WS
@@ -2187,7 +2226,9 @@ mirror of the runtime-config schema and re-marshalled, so any field the agent
 sent that the struct does not model is silently dropped — a spec's `config_files`
 and `api_token` among them: the mirror models neither, so the files'
 names and content never reach storage — and every `env` value across every spec
-is overwritten with a fixed mask before anything is stored.
+is overwritten with a fixed mask before anything is stored. A spec's `log_files`
+(names and paths, never a secret) is modelled and kept, so the portal can name the
+log-file tabs of a file-mode spec.
 `source` and `parse_error` are clamped, and an empty or unparseable `config`
 degrades to `"{}"` rather than rejecting the report — which is what makes a
 broken local file diagnosable. Adding a `json.RawMessage` field here for

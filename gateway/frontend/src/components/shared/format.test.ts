@@ -241,6 +241,31 @@ describe('formatPortalError', () => {
     );
   });
 
+  // #430: the gateway's refusal of a runtime spec's log_files (too many, a
+  // bad, reserved or repeated name, an empty, oversized, relative,
+  // control-character or secret-carrying path). Same reasoning as above: the
+  // mapped label replaces the server's English message, so it states the rules.
+  it('labels runtime_spec.log_files_invalid with its own label, in both locales', () => {
+    const err = new PortalApiError(
+      400,
+      'runtime_spec.log_files_invalid',
+      'log file name "process" is reserved for the process output',
+    );
+    for (const locale of ['de', 'en'] as const) {
+      const label = messages[locale].errorRuntimeSpecLogFilesInvalid;
+      expect(label.length).toBeGreaterThan(0);
+      expect(formatPortalError(err, messages[locale])).toBe(
+        `runtime_spec.log_files_invalid: ${label}`,
+      );
+    }
+    expect(messages.de.errorRuntimeSpecLogFilesInvalid).not.toBe(
+      messages.en.errorRuntimeSpecLogFilesInvalid,
+    );
+    expect(messages.en.errorRuntimeSpecLogFilesInvalid).not.toBe(
+      messages.en.errorRuntimeSpecConfigFilesInvalid,
+    );
+  });
+
   // The refusals the vendor model discovery adds: a malformed model prefix, a
   // stored credential the models refresh cannot open, the models and the usage
   // refresh's own 500s and a malformed Codex client_version. Each renders its localized label, never the

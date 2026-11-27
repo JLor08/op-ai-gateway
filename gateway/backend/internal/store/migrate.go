@@ -150,6 +150,7 @@ var migrations = []migration{
 	{version: 115, name: "user_chat_vendor_access", up: migration115Up},
 	{version: 116, name: "server_lan_interfaces", up: migration116Up},
 	{version: 117, name: "server_binaries_rpc_protocol", up: migration117Up},
+	{version: 118, name: "runtime_spec_log_files", up: migration118Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -4209,6 +4210,22 @@ func migration92Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // keeps it re-runnable on both dialects.
 func migration93Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "config_files text not null default ''")
+}
+
+// migration118Up adds agent_runtime_specs.log_files (#430), the opaque JSON
+// array of {name, path} objects naming the log files a spec's server writes
+// besides stdout/stderr, which the agent tails per generation. Same contract as
+// config_files (migration 93): the store never parses it, the portal validates
+// and canonicalises it at write time, and the agent decodes it at launch.
+//
+// The column is `text not null` with an empty-string default: every existing
+// spec reads back "" = no log files, so no running deployment changes, and ""
+// is what RuntimeSpec.LogFiles holds for "none" everywhere else.
+//
+// Append-only: it does NOT touch the frozen baseline nor migration65Up's
+// create-table. addColumnIfMissing keeps it re-runnable on both dialects.
+func migration118Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	return addColumnIfMissing(ctx, tx, dl, "agent_runtime_specs", "log_files text not null default ''")
 }
 
 // migration94Up creates model_mapping_cache (#251) -- a GENERAL per-mapping

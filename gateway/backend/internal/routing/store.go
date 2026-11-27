@@ -3089,7 +3089,12 @@ type RuntimeSpec struct {
 	// (the Args/Env pattern, "" = none): the files the agent writes before it
 	// launches the child. Content is plain text, never a secret -- the portal
 	// refuses the secret placeholders at write time.
-	ConfigFiles                 string
+	ConfigFiles string
+	// LogFiles is an opaque JSON array string of {name, path} objects (the
+	// ConfigFiles pattern, "" = none, #430): the log files the agent tails
+	// besides the process output. Paths are not secrets; the portal refuses
+	// the secret placeholders in them at write time.
+	LogFiles                    string
 	WorkDir                     string
 	ListenPort                  int // 0 = agent picks a free loopback port
 	HealthPath                  string

@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	goruntime "runtime"
@@ -363,5 +364,62 @@ func TestWriteSpecConfigFilesFilesystemFailure(t *testing.T) {
 	}
 	if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err == nil {
 		t.Fatal("write under a regular file: error = nil, want the filesystem error")
+	}
+}
+
+// useSlashesInContent flips the contentPathsUseSlashes seam for one test.
+func useSlashesInContent(t *testing.T, v bool) {
+	t.Helper()
+	old := contentPathsUseSlashes
+	contentPathsUseSlashes = v
+	t.Cleanup(func() { contentPathsUseSlashes = old })
+}
+
+func TestConfigDirInContentUsesSlashesOnWindows(t *testing.T) {
+	useSlashesInContent(t, true)
+	spec := Spec{ID: "strata"}
+	got, err := expandConfigFileContent(`{"log":"${CONFIG_DIR}/engine.log"}`, spec, 1, GPUVendorNone, nil, nil, `C:\agent\cfg`)
+	if err != nil {
+		t.Fatalf("expandConfigFileContent: %v", err)
+	}
+	if !json.Valid([]byte(got)) {
+		t.Fatalf("content %q is not valid JSON", got)
+	}
+	if want := `{"log":"C:/agent/cfg/strata/engine.log"}`; got != want {
+		t.Errorf("content = %q, want %q", got, want)
+	}
+}
+
+func TestConfigDirInContentKeepsNativeWhenSeamOff(t *testing.T) {
+	useSlashesInContent(t, false)
+	got, err := expandConfigFileContent(`${CONFIG_DIR}`, Spec{ID: "strata"}, 1, GPUVendorNone, nil, nil, `C:\agent\cfg`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `C:\agent\cfg`) {
+		t.Errorf("content = %q, want the native backslash form", got)
+	}
+}
+
+func TestConfigDirInArgsKeepsNativeForm(t *testing.T) {
+	useSlashesInContent(t, true)
+	spec := Spec{ID: "strata", Args: []string{"--config", "${CONFIG_DIR}"}}
+	ex, err := expandSpec(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, `C:\agent\cfg`)
+	if err != nil {
+		t.Fatalf("expandSpec: %v", err)
+	}
+	if got := ex.args[1]; !strings.Contains(got, `C:\agent\cfg`) {
+		t.Errorf("arg = %q, want the native backslash form", got)
+	}
+}
+
+func TestConfigDirInLogFilePathKeepsNativeForm(t *testing.T) {
+	useSlashesInContent(t, true)
+	got, err := expandNonSecretText(`${CONFIG_DIR}/engine.log`, surfaceLogFilePath, Spec{ID: "strata"}, 1, GPUVendorNone, nil, `C:\agent\cfg`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got, `C:\agent\cfg`) {
+		t.Errorf("log path = %q, want the native backslash form (the path policy compares native roots)", got)
 	}
 }

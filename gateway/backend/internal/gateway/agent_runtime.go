@@ -308,6 +308,11 @@ const runtimeReportParseErrorGeneric = "config parse error"
 // names that collide case-insensitively. The gateway enforces the same rules
 // at submit time, so only a hand-authored file-mode runtime.json reaches it.
 //
+// invalid_log_files (#430) is the same kind of structural failure for a spec's
+// log_files: a hand-authored file-mode runtime.json whose list has too many
+// entries, a bad, reserved or repeated name, or an empty or oversized path. The
+// gateway enforces the same rules at submit time (validateRuntimeSpecLogFiles).
+//
 // The last two are not parse failures at all: the agent raises them BEFORE
 // parsing, for a runtime.json that is not there or cannot be read. They ride
 // this field because its subject is "why the local file was not adopted", and
@@ -318,6 +323,7 @@ var runtimeReportParseErrorCodes = map[string]bool{
 	"json_syntax":              true,
 	"duplicate_spec_id":        true,
 	"invalid_config_file_name": true,
+	"invalid_log_files":        true,
 	"file_missing":             true,
 	"read_failed":              true,
 }
@@ -449,6 +455,10 @@ type agentRuntimeReportSpec struct {
 	// ProcessTree is "job" for a Windows Job Object spec
 	// (AgentRuntimeSpecDTO's), omitted for direct like the DTO's. Not a secret.
 	ProcessTree string `json:"process_tree,omitempty"`
+	// LogFiles are the declared log files (AgentRuntimeSpecDTO's), omitempty
+	// like the DTO's. Names and paths only, never a secret: the portal refuses
+	// the secret placeholders in a path at write time.
+	LogFiles []portal.LogFileDTO `json:"log_files,omitempty"`
 }
 
 // agentRuntimeReportGPUBudget mirrors AgentGPUBudgetDTO.

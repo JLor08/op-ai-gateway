@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // seedRuntimeIngestSpec creates a server_agent application + mapping on the
@@ -149,6 +150,45 @@ func TestIngestTelemetrySampleRuntimeClampsStderrTail(t *testing.T) {
 	}
 	if snap[0].LastError.ExitCode != 1 || snap[0].LastError.Failures != 3 || snap[0].LastError.Message != "boom" {
 		t.Fatalf("last_error other fields not preserved: %#v", snap[0].LastError)
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeClampsLogFileTails proves the log_file_tails
+// on a runtime's last_error (#430) are bounded before they reach the volatile
+// registry: at most four entries, each tail at most maxRuntimeStderrTail bytes,
+// and an entry whose name is not a valid log file name is dropped.
+func TestIngestTelemetrySampleRuntimeClampsLogFileTails(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_tails")
+
+	big := strings.Repeat("y", 4096)
+	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_tails","state":"crashed",` +
+		`"last_error":{"message":"boom","exit_code":1,"failures":1,"log_file_tails":[` +
+		`{"name":"a/b","tail":"bad name"},` +
+		`{"name":"one","tail":"1"},{"name":"two","tail":"` + big + `"},{"name":"three","tail":"3"},` +
+		`{"name":"four","tail":"4"},{"name":"five","tail":"5"}]}}]}`
+	req, raw := ingestReq(t, body)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	snap, _, unsub := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsub()
+	if len(snap) != 1 || snap[0].LastError == nil {
+		t.Fatalf("snapshot = %#v, want one entry with a last_error", snap)
+	}
+	tails := snap[0].LastError.LogFileTails
+	if len(tails) != 4 {
+		t.Fatalf("tails = %d entries, want 4 (invalid name dropped first, then the cap): %+v", len(tails), tails)
+	}
+	var names []string
+	for _, tl := range tails {
+		names = append(names, tl.Name)
+	}
+	if strings.Join(names, ",") != "one,two,three,four" {
+		t.Fatalf("names = %v, want [one two three four]", names)
+	}
+	if len(tails[1].Tail) != maxRuntimeStderrTail {
+		t.Fatalf("tail length = %d, want clamped to %d", len(tails[1].Tail), maxRuntimeStderrTail)
 	}
 }
 
@@ -3771,5 +3811,30 @@ func TestUnsupportedAPIVersionWarnNamesTheInstance(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no unsupported api_version Warn logged")
+	}
+}
+
+// TestClampRuntimeLogFileTailsKeepsTheEndAndDropsDuplicates: the END of an
+// over-long tail survives (cut on a rune boundary), and duplicate or reserved
+// names are dropped.
+func TestClampRuntimeLogFileTailsKeepsTheEndAndDropsDuplicates(t *testing.T) {
+	long := strings.Repeat("a", 3000) + "THE-END"
+	got := clampRuntimeLogFileTails([]RuntimeLogFileTailDTO{
+		{Name: "engine", Tail: long},
+		{Name: "ENGINE", Tail: "dup"},
+		{Name: "Process", Tail: "reserved"},
+		{Name: "app", Tail: "ok"},
+	})
+	if len(got) != 2 || got[0].Name != "engine" || got[1].Name != "app" {
+		t.Fatalf("got %+v, want engine and app only", got)
+	}
+	if len(got[0].Tail) > maxRuntimeStderrTail || !strings.HasSuffix(got[0].Tail, "THE-END") {
+		t.Fatalf("tail len %d, suffix kept = %v; want the last <=%d bytes", len(got[0].Tail), strings.HasSuffix(got[0].Tail, "THE-END"), maxRuntimeStderrTail)
+	}
+	// A cut that lands inside a multi-byte rune starts after it.
+	multi := strings.Repeat("\u00e4", 2000) // 4000 bytes
+	tail := clampRuntimeLogFileTails([]RuntimeLogFileTailDTO{{Name: "m", Tail: multi}})[0].Tail
+	if !utf8.ValidString(tail) || len(tail) > maxRuntimeStderrTail || len(tail) < maxRuntimeStderrTail-3 {
+		t.Fatalf("tail valid=%v len=%d, want valid UTF-8 within 3 bytes of the cap", utf8.ValidString(tail), len(tail))
 	}
 }

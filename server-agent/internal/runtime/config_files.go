@@ -5,7 +5,9 @@ package runtime
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"unicode"
 )
@@ -67,9 +69,47 @@ type plannedConfigFile struct {
 // ${AGENT_ENV:NAME} is refused without looking the variable up. An error names
 // the offending token's text, never any value.
 func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, _ func(string) string, configFilesDir string) (string, error) {
-	matches := placeholderPattern.FindAllStringIndex(content, -1)
+	return expandNonSecretText(content, surfaceConfigFileContent, spec, port, vendor, vendors, configFilesDir)
+}
+
+// contentPathsUseSlashes makes ${CONFIG_DIR} resolve with forward slashes in
+// config-file CONTENT. It is a seam: true on Windows, where the native
+// C:\... form is invalid inside a JSON string (\U, \s are not escapes) and
+// the Strata import writes "log": "${CONFIG_DIR}/engine.log" into strata.json
+// (design §4.1, #430). Only the content surface uses it: args, env and
+// log-file paths keep the native form (the path policy compares native
+// roots), and a WSL spec already resolves to a POSIX path.
+var contentPathsUseSlashes = goruntime.GOOS == "windows"
+
+// nonSecretSurface names the surface expandNonSecretText expands, which its
+// errors name and which picks the wording of a secret-token refusal.
+type nonSecretSurface int
+
+const (
+	surfaceConfigFileContent nonSecretSurface = iota // config_files content (#257)
+	surfaceLogFilePath                               // a log_files path (#430)
+)
+
+func (s nonSecretSurface) String() string {
+	if s == surfaceLogFilePath {
+		return "log file path"
+	}
+	return "config file content"
+}
+
+// expandNonSecretText is the one expansion loop behind every surface that
+// resolves only the NON-SECRET placeholders: config file content (#257) and a
+// declared log file's path (#430). The rules are expandConfigFileContent's (see
+// its doc): resolveNonSecretToken for the non-secret tokens, ${API_TOKEN} and
+// every ${AGENT_ENV...} spelling a hard error, a malformed ${PORT...} a hard
+// error, every other "${...}" and all plain text passed through literally.
+// what names the surface in the errors, so a refusal says where the token was
+// found. The agent
+// environment is never read.
+func expandNonSecretText(text string, what nonSecretSurface, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (string, error) {
+	matches := placeholderPattern.FindAllStringIndex(text, -1)
 	if len(matches) == 0 {
-		return content, nil
+		return text, nil
 	}
 	gpuIDs := hostGPUIDs(spec)
 	dev := newDeviceContext(spec, vendor, vendors)
@@ -77,9 +117,9 @@ func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVend
 	var b strings.Builder
 	copied := 0
 	for _, m := range matches {
-		b.WriteString(content[copied:m[0]])
+		b.WriteString(text[copied:m[0]])
 		copied = m[1]
-		match := content[m[0]:m[1]]
+		match := text[m[0]:m[1]]
 		inner := match[2 : len(match)-1] // strip "${" and "}"
 
 		v, handled, err := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir, dev)
@@ -87,28 +127,59 @@ func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVend
 			return "", err
 		}
 		if handled {
+			if inner == "CONFIG_DIR" && what == surfaceConfigFileContent && contentPathsUseSlashes && !spec.IsWSL() {
+				v = strings.ReplaceAll(v, `\`, "/")
+			}
 			b.WriteString(v)
 			continue
 		}
 
-		// The two secret tokens. Exact-match ${API_TOKEN}; for the agent
-		// environment ANY ${AGENT_ENV...} spelling is refused (valid, empty-name
-		// or typo'd), because the only safe thing to do with a reference to a
-		// secret source in a file is not to guess what was meant.
-		if inner == "API_TOKEN" {
-			return "", fmt.Errorf("%s may not appear in config file content: a written file never carries a secret (pass it through args or env instead)", match)
-		}
-		upper := strings.ToUpper(inner)
-		if strings.HasPrefix(upper, "AGENT_ENV") {
-			return "", fmt.Errorf("%s may not appear in config file content: a written file never carries a secret read from the agent environment (pass it through env instead)", match)
-		}
-		if strings.HasPrefix(upper, "PORT") {
-			return "", fmt.Errorf("malformed placeholder %s looks like a PORT reference but does not match the expected syntax", match)
+		if err := refuseUnresolvedToken(match, inner, what); err != nil {
+			return "", err
 		}
 		b.WriteString(match)
 	}
-	b.WriteString(content[copied:])
+	b.WriteString(text[copied:])
 	return b.String(), nil
+}
+
+// refuseUnresolvedToken is expandNonSecretText's verdict on a placeholder
+// (match, with inner its text between "${" and "}") that
+// resolveNonSecretToken did not handle: an error for a secret token or a
+// malformed ${PORT...}, nil for a "${...}" that passes through literally. The
+// checks run in this order: ${API_TOKEN}, every ${AGENT_ENV...} spelling,
+// then the PORT near miss.
+func refuseUnresolvedToken(match, inner string, what nonSecretSurface) error {
+	// The two secret tokens. Exact-match ${API_TOKEN}; for the agent
+	// environment ANY ${AGENT_ENV...} spelling is refused (valid, empty-name
+	// or typo'd), because the only safe thing to do with a reference to a
+	// secret source here is not to guess what was meant.
+	if inner == "API_TOKEN" {
+		return fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, false))
+	}
+	upper := strings.ToUpper(inner)
+	if strings.HasPrefix(upper, "AGENT_ENV") {
+		return fmt.Errorf("%s may not appear in %s: %s", match, what, secretTokenRefusalReason(what, true))
+	}
+	if strings.HasPrefix(upper, "PORT") {
+		return fmt.Errorf("malformed placeholder %s looks like a PORT reference but does not match the expected syntax", match)
+	}
+	return nil
+}
+
+// secretTokenRefusalReason is the "why" of a secret-token refusal on surface
+// what. The config-file wording is the long-standing one, kept verbatim.
+func secretTokenRefusalReason(what nonSecretSurface, agentEnv bool) string {
+	switch {
+	case what == surfaceConfigFileContent && agentEnv:
+		return "a written file never carries a secret read from the agent environment (pass it through env instead)"
+	case what == surfaceConfigFileContent:
+		return "a written file never carries a secret (pass it through args or env instead)"
+	case agentEnv:
+		return "a path the agent reads is never built from a secret read from the agent environment"
+	default:
+		return "a path the agent reads is never built from a secret"
+	}
 }
 
 // planSpecConfigFiles validates and expands every one of spec's config files
@@ -196,6 +267,15 @@ func writeSpecConfigFiles(spec Spec, port int, vendor GPUVendor, vendors GPUVend
 		}
 	}
 	return nil
+}
+
+// ensureInstanceConfigDir creates the instance's ${CONFIG_DIR} (0755) when it
+// is missing, the way writeFileAtomic creates it for a config file, for a spec
+// that needs the directory without writing a config file into it: a declared
+// log file there (#430, prepareLogFiles) is created by the server, which
+// cannot do so in a directory that does not exist.
+func ensureInstanceConfigDir(dir string) error {
+	return os.MkdirAll(dir, 0o755)
 }
 
 // checkConfigFileName is the WRITE-BOUNDARY name check. validConfigFileName

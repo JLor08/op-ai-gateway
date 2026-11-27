@@ -776,8 +776,9 @@ func TestStatusAndLastErrorJSONTags(t *testing.T) {
 // The table is the exhaustive reachable surface, not a sample. Config, Spec
 // and GPUBudget declare no custom UnmarshalJSON, so a malformed document can
 // only fail in two places: json.Unmarshal (syntax errors and type mismatches,
-// including the whole-document non-object cases) and the two structural
-// checks (duplicate spec id, bad config_files name). Each is covered below.
+// including the whole-document non-object cases) and the three structural
+// checks (duplicate spec id, bad config_files name, bad log_files). Each is
+// covered below.
 //
 // It also pins the literal wire VALUES. They are a three-sided contract --
 // this set, the gateway's allow-list (redactRuntimeReportParseError), and the
@@ -794,6 +795,7 @@ func TestParseConfigErrorsAreAllClassified(t *testing.T) {
 		{ParseErrorJSONSyntax, "json_syntax"},
 		{ParseErrorDuplicateSpecID, "duplicate_spec_id"},
 		{ParseErrorInvalidConfigFileName, "invalid_config_file_name"},
+		{ParseErrorInvalidLogFiles, "invalid_log_files"},
 		{ParseErrorFileMissing, "file_missing"},
 		{ParseErrorReadFailed, "read_failed"},
 		{ParseErrorUnclassified, "unclassified"},
@@ -807,6 +809,7 @@ func TestParseConfigErrorsAreAllClassified(t *testing.T) {
 		ParseErrorJSONSyntax:            true,
 		ParseErrorDuplicateSpecID:       true,
 		ParseErrorInvalidConfigFileName: true,
+		ParseErrorInvalidLogFiles:       true,
 	}
 
 	const dupSpecs = `{"specs":[{"id":"dup","binary":"/bin/a"},{"id":"dup","binary":"/bin/b"}]}`
@@ -828,6 +831,7 @@ func TestParseConfigErrorsAreAllClassified(t *testing.T) {
 		{"gpu budget index given a string", `{"gpu_budgets":[{"index":"zero"}]}`, ParseErrorJSONSyntax},
 		{"duplicate spec id", dupSpecs, ParseErrorDuplicateSpecID},
 		{"config file name with a path", `{"specs":[{"id":"a","binary":"/bin/a","config_files":[{"name":"../x","content":""}]}]}`, ParseErrorInvalidConfigFileName},
+		{"log file with a reserved name", `{"specs":[{"id":"a","binary":"/bin/a","log_files":[{"name":"process","path":"x.log"}]}]}`, ParseErrorInvalidLogFiles},
 		{"config file given as a string", `{"specs":[{"id":"a","config_files":"x"}]}`, ParseErrorJSONSyntax},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

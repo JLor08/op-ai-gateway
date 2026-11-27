@@ -1801,7 +1801,9 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 			// and only a non-empty seed makes an UNWIRED column visible, since
 			// it would otherwise read back the DDL default "".
 			ConfigFiles: `[{"name":"server.json","content":"id ${MODEL}"}]`,
-			HealthPath:  "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
+			// log_files (#430) follows the same opaque-JSON contract.
+			LogFiles:   `[{"name":"engine","path":"${CONFIG_DIR}/engine.log"}]`,
+			HealthPath: "/health", HealthTimeoutSeconds: 5, StartupTimeoutSeconds: 180,
 			IdleTimeoutSeconds: 900, AdmissionWaitTimeoutSeconds: 30, Pinned: true,
 			AdminState: "force_running", SetVisibleDevices: true,
 			APIFlavors:    []string{routing.APIFlavorOpenAI, routing.APIFlavorAnthropic},
@@ -1853,6 +1855,9 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		if got.ConfigFiles != spec.ConfigFiles {
 			t.Fatalf("config_files round-trip mismatch: got %q, want %q", got.ConfigFiles, spec.ConfigFiles)
 		}
+		if got.LogFiles != spec.LogFiles {
+			t.Fatalf("log_files round-trip mismatch: got %q, want %q", got.LogFiles, spec.LogFiles)
+		}
 		if got.Binary != spec.Binary || got.Args != spec.Args || got.Env != spec.Env ||
 			!got.Enabled || !got.Pinned || !got.SetVisibleDevices ||
 			got.AdminState != "force_running" || !got.CreatedAt.Equal(now) {
@@ -1888,6 +1893,7 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		// columns, so a config_files column named only in the insert would
 		// persist on the first save and be silently ignored by this one.
 		spec.ConfigFiles = `[{"name":"server.json","content":"id ${MODEL} v2"},{"name":"b.conf","content":"x"}]`
+		spec.LogFiles = `[{"name":"engine","path":"/var/log/engine-v2.log"}]`
 		spec.UpdatedAt = now.Add(time.Minute)
 		if err := s.UpsertRuntimeSpec(ctx, spec); err != nil {
 			t.Fatalf("upsert overwrite: %v", err)
@@ -1895,6 +1901,9 @@ func TestRoutingStoreRuntimeSpecs(t *testing.T) {
 		got, _, _ = s.RuntimeSpecByMapping(ctx, "map_rt2")
 		if got.Binary != "/usr/bin/vllm" || !got.CreatedAt.Equal(now) {
 			t.Fatalf("overwrite must keep created_at, got %+v", got)
+		}
+		if got.LogFiles != spec.LogFiles {
+			t.Fatalf("overwrite lost the new log_files (the do-update list omits the column): got %q, want %q", got.LogFiles, spec.LogFiles)
 		}
 		if got.ConfigFiles != spec.ConfigFiles {
 			t.Fatalf("overwrite lost the new config_files (the do-update list omits the column): got %q, want %q", got.ConfigFiles, spec.ConfigFiles)

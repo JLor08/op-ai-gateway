@@ -1188,6 +1188,9 @@ func TestCollectOnceRuntimePopulatesRuntimesAndOverridesLoadedModels(t *testing.
 				ExitCode:   1,
 				Failures:   3,
 				StderrTail: "oom",
+				LogFileTails: []runtimectl.LogFileTail{
+					{Name: "engine", Tail: "engine: out of memory\n"},
+				},
 			},
 		},
 	})
@@ -1221,6 +1224,10 @@ func TestCollectOnceRuntimePopulatesRuntimesAndOverridesLoadedModels(t *testing.
 	r1 := got.Runtimes[1]
 	if r1.LastError == nil || r1.LastError.Message != "boom" || r1.LastError.ExitCode != 1 || r1.LastError.Failures != 3 || r1.LastError.StderrTail != "oom" {
 		t.Errorf("Runtimes[1].LastError = %+v", r1.LastError)
+	}
+	if r1.LastError != nil && (len(r1.LastError.LogFileTails) != 1 ||
+		r1.LastError.LogFileTails[0] != (sample.LogFileTailSample{Name: "engine", Tail: "engine: out of memory\n"})) {
+		t.Errorf("Runtimes[1].LastError.LogFileTails = %+v, want the manager's log_file_tails copied (#430)", r1.LastError.LogFileTails)
 	}
 
 	if len(got.LoadedModels) != 1 || got.LoadedModels[0] != "qwen-coder" {
