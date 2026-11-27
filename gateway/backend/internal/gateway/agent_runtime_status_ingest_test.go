@@ -923,7 +923,7 @@ func TestIngestTelemetrySampleRuntimeStatusRAMIsNotAVRAMWatermark(t *testing.T) 
 	if len(snap[0].GPUs) != 0 || !snap[0].MeasuredAt.IsZero() {
 		t.Fatalf("status gpus = %#v measured_at = %v, want neither for a RAM-only frame", snap[0].GPUs, snap[0].MeasuredAt)
 	}
-	if got := vramMeasuredFromFrame(snap, "rspec_live_ram_only"); len(got) != 0 {
+	if got := vramMeasuredFromFrame(snap, "rspec_live_ram_only", ""); len(got) != 0 {
 		t.Fatalf("vramMeasuredFromFrame = %#v, want nothing from a RAM-only frame", got)
 	}
 }

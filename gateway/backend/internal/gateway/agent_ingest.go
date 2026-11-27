@@ -784,9 +784,11 @@ const maxRuntimeGPUsPerSample = 64
 // telemetry sample (foldInstanceRows): what the spec-level columns the ingest
 // writes back are compared with and written from.
 type foldedSpec struct {
-	// MaxGPU is the largest measured VRAM per GPU index over the spec's rows
-	// (only measured, > 0, figures; nil when no row measured any).
-	MaxGPU map[int]int
+	// MaxGPU is the largest measured VRAM per GPU over the spec's rows, keyed
+	// by (vendor, index) with a vendor-less GPU resolved to the server's
+	// legacy vendor (resolvedGPUKey): only measured, > 0, figures; nil when no
+	// row measured any.
+	MaxGPU map[routing.GPUKey]int
 	// MaxRAM is the largest measured host RAM over the spec's rows, 0 when no
 	// row measured any.
 	MaxRAM int
@@ -821,7 +823,12 @@ type foldedSpec struct {
 // expected to be capped at maxRuntimeSamplesPerSample by the caller; each
 // row's GPUs are capped here at maxRuntimeGPUsPerSample, so one row cannot
 // drive an unbounded number of per-GPU writes.
-func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
+//
+// The GPUs fold per (vendor, index): a mixed NVIDIA + AMD host has an index 0
+// of each vendor, two cards with one index. A GPU reported without a vendor
+// (an agent without gpu_vendor_identity) is the server's legacy vendor's
+// (legacyVendor, AIServer.GPULegacyVendor) -- see resolvedGPUKey.
+func foldInstanceRows(rows []RuntimeStatusDTO, legacyVendor string) map[string]foldedSpec {
 	out := make(map[string]foldedSpec, len(rows))
 	for _, row := range rows {
 		specID := strings.TrimSpace(row.SpecID)
@@ -838,9 +845,10 @@ func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
 				continue
 			}
 			if f.MaxGPU == nil {
-				f.MaxGPU = make(map[int]int, len(gpus))
+				f.MaxGPU = make(map[routing.GPUKey]int, len(gpus))
 			}
-			f.MaxGPU[g.Index] = max(f.MaxGPU[g.Index], g.VRAMMeasuredMB)
+			key := resolvedGPUKey(g.Vendor, g.Index, legacyVendor)
+			f.MaxGPU[key] = max(f.MaxGPU[key], g.VRAMMeasuredMB)
 		}
 		f.MaxRAM = max(f.MaxRAM, row.RAMMeasuredMB)
 		f.MaxStartupMS = max(f.MaxStartupMS, row.StartupMS)
@@ -854,6 +862,36 @@ func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
 		out[specID] = f
 	}
 	return out
+}
+
+// resolvedGPUKey is the key of a GPU a frame or a sample reports. An empty
+// vendor -- what an agent without gpu_vendor_identity sends -- stands for the
+// server's stored legacy vendor (AIServer.GPULegacyVendor): the vendor the
+// backfill rewrote the server's empty-vendor rows to, and the vendor that
+// agent treats as the host's only one. With none stored (the server was never
+// backfilled) the key keeps the empty vendor, as the rows still do.
+func resolvedGPUKey(vendor string, index int, legacyVendor string) routing.GPUKey {
+	if vendor == "" {
+		vendor = legacyVendor
+	}
+	return routing.GPUKey{Vendor: vendor, Index: index}
+}
+
+// storedGPURowKey is the key of the stored row a folded measurement for key
+// lands on: the row with that very key, else -- for the legacy vendor -- the
+// row with the empty vendor and key's index, which stands for the legacy
+// vendor too (a row saved without a vendor after the backfill, as a portal
+// save for an agent without gpu_vendor_identity writes it). Otherwise key
+// itself, and the write finds no row. stored nil (unreadable) is key.
+func storedGPURowKey(stored map[routing.GPUKey]int, key routing.GPUKey, legacyVendor string) routing.GPUKey {
+	if _, ok := stored[key]; ok || legacyVendor == "" || key.Vendor != legacyVendor {
+		return key
+	}
+	empty := routing.GPUKey{Index: key.Index}
+	if _, ok := stored[empty]; ok {
+		return empty
+	}
+	return key
 }
 
 // primaryRowIndexes picks, per spec id, the index of the row that speaks for
@@ -975,6 +1013,12 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 // maxRuntimeGPUsPerSample before any store call, bounding the worst case
 // regardless of how many distinct ids a hostile/buggy sample names.
 //
+// Each measurement is keyed by (vendor, index) (foldInstanceRows), so NVIDIA 0
+// and AMD 0 of a mixed host land on their own rows; a vendor-less one was
+// resolved to legacyVendor, the server's stored legacy vendor, and a
+// measurement of the legacy vendor also reaches an empty-vendor row
+// (storedGPURowKey).
+//
 // AN UNCHANGED MEASUREMENT IS NOT REWRITTEN, and that is a cost fix rather
 // than a tidiness one. Telemetry arrives once per second and every sample is
 // a FULL SNAPSHOT, so a spec whose measurement is merely stable -- the normal
@@ -1005,7 +1049,7 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 // unconditionally", never to "skip the write": staleness must not be able to
 // suppress a real measurement. Called only AFTER every store write in
 // ingestTelemetrySample has succeeded.
-func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, folded map[string]foldedSpec) {
+func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID, legacyVendor string, folded map[string]foldedSpec) {
 	if s.Routes == nil {
 		return
 	}
@@ -1017,35 +1061,36 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, fold
 			continue
 		}
 		stored := s.storedMeasuredVRAM(ctx, serverID, specID)
-		for index, measured := range f.MaxGPU {
-			if was, known := stored[index]; known && was == measured {
+		for key, measured := range f.MaxGPU {
+			row := storedGPURowKey(stored, key, legacyVendor)
+			if was, known := stored[row]; known && was == measured {
 				continue // already on file, byte for byte
 			}
-			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, routing.GPUKey{Vendor: "", Index: index}, measured); err != nil {
+			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, row, measured); err != nil {
 				// Tolerates ErrNotFound (a GPU row deleted out from under an
 				// in-flight sample) the same as any other failure here: log
 				// and move on, never reject the sample.
-				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu_index", index, "err", err)
+				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu", row.String(), "err", err)
 			}
 		}
 	}
 }
 
 // storedMeasuredVRAM reads specID's currently-stored measured value per GPU
-// index, for writeBackRuntimeVRAM's change detection. A read failure returns
+// row key (vendor, index), for writeBackRuntimeVRAM's change detection. A read failure returns
 // nil, which the caller reads as "nothing known" and therefore writes
 // unconditionally -- the safe direction: a missed comparison costs one
 // redundant UPDATE, whereas a wrongly-assumed match would silently drop a
 // real measurement.
-func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string) map[int]int {
+func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string) map[routing.GPUKey]int {
 	gpus, err := s.Routes.RuntimeSpecGPUs(ctx, specID)
 	if err != nil {
 		slog.Debug("runtime vram write-back: current gpu rows unreadable, writing unconditionally", "server_id", serverID, "spec_id", specID, "err", err)
 		return nil
 	}
-	out := make(map[int]int, len(gpus))
+	out := make(map[routing.GPUKey]int, len(gpus))
 	for _, g := range gpus {
-		out[g.GPUIndex] = g.VRAMMeasuredMB
+		out[g.Key()] = g.VRAMMeasuredMB
 	}
 	return out
 }
@@ -2359,14 +2404,15 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// records -- see clusterUsage.observe. A member spec has no runtime spec
 	// row, so the per-spec write-backs below never see its measurement. Never
 	// rejects the sample.
-	s.clusterUsage.observe(ctx, serverID, capped)
+	s.clusterUsage.observe(ctx, serverID, server.GPULegacyVendor, capped)
 	// One fold of the sample's rows per spec (foldInstanceRows), which every
 	// write-back below reads, over at most maxRuntimeSamplesPerSample rows.
-	folded := foldInstanceRows(capped)
+	// A vendor-less GPU in it is the server's legacy vendor's (resolvedGPUKey).
+	folded := foldInstanceRows(capped, server.GPULegacyVendor)
 	// Best-effort write-back of each spec's measured VRAM onto its launch
 	// spec -- see writeBackRuntimeVRAM. Never rejects the sample; a failure
 	// here is logged and dropped.
-	s.writeBackRuntimeVRAM(ctx, serverID, folded)
+	s.writeBackRuntimeVRAM(ctx, serverID, server.GPULegacyVendor, folded)
 	// Best-effort write-back of each spec's measured host RAM and startup onto
 	// its launch spec -- see writeBackRuntimeRAM and writeBackRuntimeStartup,
 	// which share one ownership resolution per spec. A no-op for an agent that

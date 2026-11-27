@@ -292,34 +292,34 @@ func vramTargetInstancesNotQuiet(targetSpecID string, stateBySpec map[string]str
 // non-managed neighbour, which §13 blesses. So an undeclared figure is
 // reported as unattributable, alongside a warning, and never as the headline
 // on its own.
-func vramUndeclaredAllocations(watched []int, baseline, after routing.TelemetrySample, measured map[int]int) []int {
-	isWatched := make(map[int]bool, len(watched))
-	for _, index := range watched {
-		isWatched[index] = true
+func vramUndeclaredAllocations(watched []routing.GPUKey, baseline, after routing.TelemetrySample, measured map[routing.GPUKey]int) []routing.GPUKey {
+	isWatched := make(map[routing.GPUKey]bool, len(watched))
+	for _, key := range watched {
+		isWatched[key] = true
 	}
-	beforeByIndex := vramGPUByIndex(baseline)
-	afterByIndex := vramGPUByIndex(after)
+	beforeByKey := vramGPUByKey(baseline)
+	afterByKey := vramGPUByKey(after)
 
-	seen := map[int]struct{}{}
-	var out []int
-	consider := func(index int, allocated bool) {
-		if isWatched[index] || !allocated {
+	seen := map[routing.GPUKey]struct{}{}
+	var out []routing.GPUKey
+	consider := func(key routing.GPUKey, allocated bool) {
+		if isWatched[key] || !allocated {
 			return
 		}
-		if _, dup := seen[index]; dup {
+		if _, dup := seen[key]; dup {
 			return
 		}
-		seen[index] = struct{}{}
-		out = append(out, index)
+		seen[key] = struct{}{}
+		out = append(out, key)
 	}
-	for index, gpu := range afterByIndex {
-		delta := vramDeltaMB(beforeByIndex[index].MemUsedBytes, gpu.MemUsedBytes)
-		consider(index, delta >= vramCardToleranceMB(gpu))
+	for key, gpu := range afterByKey {
+		delta := vramDeltaMB(beforeByKey[key].MemUsedBytes, gpu.MemUsedBytes)
+		consider(key, delta >= vramCardToleranceMB(gpu))
 	}
-	for index, mb := range measured {
-		consider(index, mb > 0)
+	for key, mb := range measured {
+		consider(key, mb > 0)
 	}
-	sort.Ints(out)
+	sortGPUKeys(out)
 	return out
 }
 
@@ -338,7 +338,7 @@ func vramUndeclaredAllocations(watched []int, baseline, after routing.TelemetryS
 // strategy exists for -- has nothing to cross-check against, and demanding a
 // second opinion there would refuse every run on exactly those hosts.
 func vramStrategiesDisagree(items []VRAMGPUItem, after routing.TelemetrySample) bool {
-	afterByIndex := vramGPUByIndex(after)
+	afterByKey := vramGPUByKey(after)
 	for _, item := range items {
 		if item.DeltaMB <= 0 || item.MeasuredMB <= 0 {
 			continue
@@ -347,7 +347,7 @@ func vramStrategiesDisagree(items []VRAMGPUItem, after routing.TelemetrySample) 
 		if gap < 0 {
 			gap = -gap
 		}
-		allowance := vramCardToleranceMB(afterByIndex[item.Index])
+		allowance := vramCardToleranceMB(afterByKey[routing.GPUKey{Vendor: item.Vendor, Index: item.Index}])
 		if vramCrossCheckAllowanceMB > allowance {
 			allowance = vramCrossCheckAllowanceMB
 		}
@@ -389,7 +389,7 @@ func vramVisibleItems(items []VRAMGPUItem) []VRAMGPUItem {
 }
 
 // vramDeclaredGPUMissing is the fifth precondition: refuse when the target's
-// launch spec declares a GPU index this host does not report. See
+// launch spec declares a GPU (vendor, index) this host does not report. See
 // codeBenchmarkVRAMDeclaredGPUMissing for why this is a refusal and not an
 // inconclusive result.
 //
@@ -398,35 +398,50 @@ func vramVisibleItems(items []VRAMGPUItem) []VRAMGPUItem {
 // is returned as itself: this gate may not swallow a read failure into "no
 // missing cards", which is the direction that drains a fleet for a run that
 // cannot succeed.
-func (s *Server) vramDeclaredGPUMissing(ctx context.Context, targetSpecID string, sample routing.TelemetrySample) error {
+//
+// sample is already resolved to the server's legacy vendor
+// (vramResolveSampleVendors), and the spec's rows are resolved the same way
+// here, so a vendor-less row and a vendor-less sample both name the legacy
+// vendor's card.
+func (s *Server) vramDeclaredGPUMissing(ctx context.Context, targetSpecID, legacyVendor string, sample routing.TelemetrySample) error {
 	specGPUs, err := s.Routes.RuntimeSpecGPUs(ctx, targetSpecID)
 	if err != nil {
 		return err
 	}
-	present := vramGPUByIndex(sample)
-	seen := map[int]struct{}{}
-	var missing []int
-	for _, row := range specGPUs {
-		if _, ok := present[row.GPUIndex]; ok {
+	present := vramGPUByKey(sample)
+	seen := map[routing.GPUKey]struct{}{}
+	var missing []routing.GPUKey
+	for _, row := range vramResolveSpecGPUVendors(specGPUs, legacyVendor) {
+		key := row.Key()
+		if _, ok := present[key]; ok {
 			continue
 		}
-		if _, dup := seen[row.GPUIndex]; dup {
+		if _, dup := seen[key]; dup {
 			continue
 		}
-		seen[row.GPUIndex] = struct{}{}
-		missing = append(missing, row.GPUIndex)
+		seen[key] = struct{}{}
+		missing = append(missing, key)
 	}
 	if len(missing) == 0 {
 		return nil
 	}
-	sort.Ints(missing)
+	sortGPUKeys(missing)
 	labels := make([]string, 0, len(missing))
-	for _, index := range missing {
-		labels = append(labels, strconv.Itoa(index))
+	for _, key := range missing {
+		labels = append(labels, vramGPULabel(key))
 	}
 	return &vramRefusal{
 		code: codeBenchmarkVRAMDeclaredGPUMissing,
-		msg: "this launch spec declares GPU index " + strings.Join(labels, ", ") +
+		msg: "this launch spec declares GPU " + strings.Join(labels, ", ") +
 			", which this server does not report; correct the spec's GPU rows first",
 	}
+}
+
+// vramGPULabel names a GPU in a refusal message: "index 1" for a GPU without
+// a vendor, as before vendors existed, else its key ("NVIDIA 0", "AMD 1").
+func vramGPULabel(key routing.GPUKey) string {
+	if key.Vendor == "" {
+		return "index " + strconv.Itoa(key.Index)
+	}
+	return key.String()
 }

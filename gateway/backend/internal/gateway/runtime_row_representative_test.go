@@ -67,7 +67,7 @@ func TestEveryReaderPicksTheSameRepresentativeRow(t *testing.T) {
 		if got := specImageOptions(rows); got != rows[wantIndex].ImageOptions {
 			t.Errorf("%s: specImageOptions = %+v, want instance %d's", tc.name, got, tc.want)
 		}
-		if primary := foldInstanceRows(rows)["S"].Primary; primary == nil || primary.Instance != tc.want {
+		if primary := foldInstanceRows(rows, "")["S"].Primary; primary == nil || primary.Instance != tc.want {
 			t.Errorf("%s: foldInstanceRows Primary = %+v, want instance %d's row", tc.name, primary, tc.want)
 		}
 		picked := primaryRowIndexes(len(samples), func(i int) (string, int, string) {

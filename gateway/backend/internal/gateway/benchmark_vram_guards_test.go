@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"op-ai-gateway/internal/routing"
 	"testing"
 	"time"
 )
@@ -102,8 +103,8 @@ func TestVRAMAwaitMeasuredTakesOnlyTheTargetSpecsMeasurement(t *testing.T) {
 		}
 	})
 
-	got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target")
-	if len(got) != 1 || got[0] != 12345 {
+	got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target", "")
+	if len(got) != 1 || got[routing.GPUKey{Index: 0}] != 12345 {
 		t.Fatalf("measured = %v, want map[0:12345] -- the TARGET's measurement, never a sibling's", got)
 	}
 }
@@ -126,7 +127,7 @@ func TestVRAMAwaitMeasuredRequiresAMeasurementTimestamp(t *testing.T) {
 		}}
 	})
 
-	if got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target"); got != nil {
+	if got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target", ""); got != nil {
 		t.Fatalf("measured = %v, want nothing: a reading with no measurement time is of unknown age", got)
 	}
 }
@@ -149,7 +150,7 @@ func TestVRAMAwaitMeasuredRejectsANonPositiveMeasurement(t *testing.T) {
 		}}
 	})
 
-	if got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target"); got != nil {
+	if got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target", ""); got != nil {
 		t.Fatalf("measured = %v, want nothing: 0 means unknown, and a negative reading is nonsense", got)
 	}
 }
@@ -177,7 +178,7 @@ func TestVRAMAwaitMeasuredNeverReadsTheSubscriptionSnapshot(t *testing.T) {
 		return []RuntimeStatusDTO{{SpecID: "rspec_target", State: "starting"}}
 	})
 
-	if got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target"); got != nil {
+	if got := srv.vramAwaitMeasured(context.Background(), "srv1", "rspec_target", ""); got != nil {
 		t.Fatalf("measured = %v, want nothing: the subscription's snapshot predates the load", got)
 	}
 }
@@ -261,7 +262,7 @@ func TestVRAMStableWindowSettlesBeforeItOpens(t *testing.T) {
 		<-done
 	})
 
-	sample, sawSample, stable := srv.vramStableWindow(context.Background(), "srv1", []int{0})
+	sample, sawSample, stable := srv.vramStableWindow(context.Background(), "srv1", "", []routing.GPUKey{{Index: 0}})
 	if !sawSample || !stable {
 		t.Fatalf("vramStableWindow = (sawSample %v, stable %v), want a stable window", sawSample, stable)
 	}

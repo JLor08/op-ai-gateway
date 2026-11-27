@@ -183,8 +183,10 @@ func runIdentity(t time.Time) time.Time { return t.UTC().Truncate(time.Milliseco
 // on serverID. A frame without member rows costs nothing, unless the
 // server's sessions are not synced yet or it has a session open.
 // Best-effort like every write-back of the ingest: a failure is logged,
-// never returned.
-func (u *clusterUsage) observe(ctx context.Context, serverID string, rows []RuntimeStatusDTO) {
+// never returned. legacyVendor is serverID's stored legacy GPU vendor
+// (AIServer.GPULegacyVendor), which a vendor-less GPU stands for
+// (resolvedGPUKey).
+func (u *clusterUsage) observe(ctx context.Context, serverID, legacyVendor string, rows []RuntimeStatusDTO) {
 	if u == nil || u.store == nil || !u.relevant(serverID, rows) {
 		return
 	}
@@ -206,7 +208,7 @@ func (u *clusterUsage) observe(ctx context.Context, serverID string, rows []Runt
 		row, ok := u.heldRow(ctx, serverID, m, byID)
 		held[m.HeadSpecID] = ok
 		if ok {
-			u.raise(ctx, m, row)
+			u.raise(ctx, m, row, legacyVendor)
 		}
 	}
 	u.syncSessions(ctx, serverID, held, u.now())
@@ -291,9 +293,10 @@ func gpusOf(gpus []routing.ClusterMemberGPU, serverID string) []routing.ClusterM
 // measurement of 0 is unknown and changes nothing. A GPU the membership does
 // not list is ignored. Outside a run nothing counts. An unchanged row is not
 // written, so a stable member costs one read per sample; the write applies
-// only while the row is still in the run it read.
-func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row RuntimeStatusDTO) {
-	vram := measuredVRAM(row)
+// only while the row is still in the run it read. legacyVendor is the member
+// server's stored legacy GPU vendor (see raiseMeasured).
+func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row RuntimeStatusDTO, legacyVendor string) {
+	vram := measuredVRAM(row, legacyVendor)
 	if row.RAMMeasuredMB <= 0 && len(vram) == 0 {
 		return
 	}
@@ -307,7 +310,7 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 	if !ok || cur.RunStartedAt.IsZero() {
 		return
 	}
-	peak, stored := raiseMeasured(&cur, gpus, row.RAMMeasuredMB, vram)
+	peak, stored := raiseMeasured(&cur, gpus, legacyVendor, row.RAMMeasuredMB, vram)
 	if !peak && !stored {
 		return
 	}
@@ -319,14 +322,16 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 	}
 }
 
-// measuredVRAM is row's measured VRAM per GPU index, its largest reading of
-// each GPU among the first maxRuntimeGPUsPerSample; a reading of 0 is unknown
-// and left out.
-func measuredVRAM(row RuntimeStatusDTO) map[int]int {
-	vram := make(map[int]int, len(row.GPUs))
+// measuredVRAM is row's measured VRAM per GPU (vendor, index), its largest
+// reading of each GPU among the first maxRuntimeGPUsPerSample; a reading of 0
+// is unknown and left out. A GPU without a vendor is legacyVendor's
+// (resolvedGPUKey).
+func measuredVRAM(row RuntimeStatusDTO, legacyVendor string) map[routing.GPUKey]int {
+	vram := make(map[routing.GPUKey]int, len(row.GPUs))
 	for _, g := range row.GPUs[:min(len(row.GPUs), maxRuntimeGPUsPerSample)] {
 		if g.VRAMMeasuredMB > 0 {
-			vram[g.Index] = max(vram[g.Index], g.VRAMMeasuredMB)
+			key := resolvedGPUKey(g.Vendor, g.Index, legacyVendor)
+			vram[key] = max(vram[key], g.VRAMMeasuredMB)
 		}
 	}
 	return vram
@@ -334,8 +339,10 @@ func measuredVRAM(row RuntimeStatusDTO) map[int]int {
 
 // raiseMeasured raises cur's and gpus' run peaks and stored values, each only
 // upwards, to ram (0: unknown) and the per-GPU vram, and reports whether a
-// run peak rose and whether a stored value rose.
-func raiseMeasured(cur *routing.ClusterMember, gpus []routing.ClusterMemberGPU, ram int, vram map[int]int) (peak, stored bool) {
+// run peak rose and whether a stored value rose. A member GPU row is matched
+// by its (vendor, index), an empty vendor standing for legacyVendor as it
+// does in vram (resolvedGPUKey).
+func raiseMeasured(cur *routing.ClusterMember, gpus []routing.ClusterMemberGPU, legacyVendor string, ram int, vram map[routing.GPUKey]int) (peak, stored bool) {
 	if ram > 0 {
 		if ram > cur.RunPeakRAMMB {
 			cur.RunPeakRAMMB, peak = ram, true
@@ -345,7 +352,7 @@ func raiseMeasured(cur *routing.ClusterMember, gpus []routing.ClusterMemberGPU, 
 		}
 	}
 	for i := range gpus {
-		v := vram[gpus[i].GPUIndex]
+		v := vram[resolvedGPUKey(gpus[i].GPUVendor, gpus[i].GPUIndex, legacyVendor)]
 		if v > gpus[i].RunPeakVRAMMB {
 			gpus[i].RunPeakVRAMMB, peak = v, true
 		}

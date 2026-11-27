@@ -138,7 +138,7 @@ func usageRow(spec, heldBy string, ramMB int, vram map[int]int) RuntimeStatusDTO
 
 // observeGPU reports one sample of the GPU member's server.
 func (f *usageFixture) observeGPU(heldBy string, ramMB int, vram map[int]int) {
-	f.u.observe(f.ctx, usageGPUServer, []RuntimeStatusDTO{usageRow(usageMemberSpec(usageGPUServer), heldBy, ramMB, vram)})
+	f.u.observe(f.ctx, usageGPUServer, "", []RuntimeStatusDTO{usageRow(usageMemberSpec(usageGPUServer), heldBy, ramMB, vram)})
 }
 
 // member returns the stored row of serverID's membership and its GPUs by
@@ -209,8 +209,8 @@ func TestMemberUsageOnlyFromOwningServer(t *testing.T) {
 	f := newUsageFixture(t)
 	f.begin()
 	forged := usageRow(usageMemberSpec(usageGPUServer), usageHead, 9000, map[int]int{0: 20000})
-	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{forged})
-	f.u.observe(f.ctx, usageHeadServer, []RuntimeStatusDTO{forged})
+	f.u.observe(f.ctx, usageCPUServer, "", []RuntimeStatusDTO{forged})
+	f.u.observe(f.ctx, usageHeadServer, "", []RuntimeStatusDTO{forged})
 	f.wantStored(usageGPUServer, 0, map[int]int{0: 0})
 
 	// A manual member whose spec lives on srv_m1 while its membership row
@@ -228,12 +228,12 @@ func TestMemberUsageOnlyFromOwningServer(t *testing.T) {
 	}
 	f.begin()
 	manual := usageRow("rpcm_moved", usageHead, 7000, nil)
-	f.u.observe(f.ctx, usageGPUServer, []RuntimeStatusDTO{manual})
-	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{manual})
+	f.u.observe(f.ctx, usageGPUServer, "", []RuntimeStatusDTO{manual})
+	f.u.observe(f.ctx, usageCPUServer, "", []RuntimeStatusDTO{manual})
 	f.wantStored(usageGPUServer, 0, nil)
 
 	// The owner's own sample counts.
-	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{usageRow(usageMemberSpec(usageCPUServer), usageHead, 3000, nil)})
+	f.u.observe(f.ctx, usageCPUServer, "", []RuntimeStatusDTO{usageRow(usageMemberSpec(usageCPUServer), usageHead, 3000, nil)})
 	f.wantStored(usageCPUServer, 3000, nil)
 }
 
@@ -329,7 +329,7 @@ func TestMemberUsagePushesMemberServerAtRunEnd(t *testing.T) {
 	f.storeUsage(usageGPUServer, 8000, map[int]int{0: 12000}, false)
 	run := f.begin()
 	f.observeGPU(usageHead, 5000, map[int]int{0: 9000})
-	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{usageRow(usageMemberSpec(usageCPUServer), usageHead, 3000, nil)})
+	f.u.observe(f.ctx, usageCPUServer, "", []RuntimeStatusDTO{usageRow(usageMemberSpec(usageCPUServer), usageHead, 3000, nil)})
 	if pushed := f.takePushes(); len(pushed) != 0 {
 		t.Fatalf("rises pushed %v", pushed)
 	}
@@ -390,14 +390,14 @@ func TestRPCSessionsOpenAndClose(t *testing.T) {
 	// with the hold adopts the session, the first without it closes it.
 	f.advance(time.Minute)
 	f.observeGPU(usageHead, 0, nil)
-	f.u.observe(f.ctx, usageCPUServer, []RuntimeStatusDTO{usageRow(usageMemberSpec(usageCPUServer), usageHead, 0, nil)})
+	f.u.observe(f.ctx, usageCPUServer, "", []RuntimeStatusDTO{usageRow(usageMemberSpec(usageCPUServer), usageHead, 0, nil)})
 	if got := f.openSessions(); !slices.Equal(got, []string{usageGPUServer, usageCPUServer}) {
 		t.Fatalf("open before the restart = %v, want both members'", got)
 	}
 	f.u = f.newUsage()
 	f.advance(time.Second)
 	f.observeGPU(usageHead, 0, nil)
-	f.u.observe(f.ctx, usageCPUServer, nil)
+	f.u.observe(f.ctx, usageCPUServer, "", nil)
 	// The GPU member's session is listed once: adopted, not opened again.
 	if got := f.openSessions(); !slices.Equal(got, []string{usageGPUServer}) {
 		t.Fatalf("after the restart open = %v, want the GPU member's adopted and the CPU member's closed", got)
@@ -896,7 +896,7 @@ func TestSessionsOfAGoneMembershipCloseAtTheFirstFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.advance(time.Second)
-	f.u.observe(f.ctx, usageGPUServer, nil)
+	f.u.observe(f.ctx, usageGPUServer, "", nil)
 	open, err := f.store.OpenRPCSessionsByMember(f.ctx, usageGPUServer)
 	if err != nil || len(open) != 0 {
 		t.Fatalf("open sessions = %+v err=%v, want the gone head's closed", open, err)

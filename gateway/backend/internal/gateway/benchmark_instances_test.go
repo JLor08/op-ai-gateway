@@ -321,12 +321,12 @@ func TestVRAMMeasuredFromFrameReadsInstanceZero(t *testing.T) {
 		GPUs: []RuntimeGPUStatusDTO{{Index: 0, VRAMMeasuredMB: 9000}},
 	}
 	for _, frame := range [][]RuntimeStatusDTO{{burst, own}, {own, burst}} {
-		got := vramMeasuredFromFrame(frame, "S")
-		if len(got) != 1 || got[0] != 9000 {
+		got := vramMeasuredFromFrame(frame, "S", "")
+		if len(got) != 1 || got[routing.GPUKey{Index: 0}] != 9000 {
 			t.Fatalf("vramMeasuredFromFrame(%+v) = %v, want instance 0's {0: 9000}", frame, got)
 		}
 	}
-	if got := vramMeasuredFromFrame([]RuntimeStatusDTO{burst}, "S"); got != nil {
+	if got := vramMeasuredFromFrame([]RuntimeStatusDTO{burst}, "S", ""); got != nil {
 		t.Fatalf("vramMeasuredFromFrame(only another instance) = %v, want nil", got)
 	}
 }

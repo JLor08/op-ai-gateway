@@ -124,6 +124,9 @@ type CapacityReportDTO struct {
 // attributed per-process measurement vs the model's marginal cost on the card
 // -- and must never be averaged; 0 means unknown for both.
 type VRAMGPUItemDTO struct {
+	// Vendor is the GPU's vendor, empty for a host whose GPUs carry none;
+	// with Index it names the card (a mixed host has an index 0 of each).
+	Vendor          string `json:"vendor,omitempty"`
 	Index           int    `json:"index"`
 	Fingerprint     string `json:"fingerprint,omitempty"`
 	FingerprintKind string `json:"fingerprint_kind,omitempty"`

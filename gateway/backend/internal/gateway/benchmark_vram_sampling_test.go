@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"testing"
 )
 
@@ -63,21 +64,21 @@ func TestVRAMWindowStable(t *testing.T) {
 	cases := []struct {
 		name    string
 		window  []routing.TelemetrySample
-		watched []int
+		watched []routing.GPUKey
 		want    bool
 	}{
-		{"a steady window over both watched cards", steady, []int{0, 1}, true},
-		{"a steady window over one watched card", steady, []int{1}, true},
-		{"a drifting card is not stable", drifting, []int{0}, false},
-		{"a window shorter than K is never stable", steady[:2], []int{0}, false},
+		{"a steady window over both watched cards", steady, legacyKeys(0, 1), true},
+		{"a steady window over one watched card", steady, legacyKeys(1), true},
+		{"a drifting card is not stable", drifting, legacyKeys(0), false},
+		{"a window shorter than K is never stable", steady[:2], legacyKeys(0), false},
 		{
 			name:    "a watched card missing from one sample is not stable",
 			window:  []routing.TelemetrySample{steady[0], vramSample(vramGPU(0, 500, 24576)), steady[2]},
-			watched: []int{0, 1},
+			watched: legacyKeys(0, 1),
 			want:    false,
 		},
 		{"an empty watched set proves nothing", steady, nil, false},
-		{"an empty window proves nothing", nil, []int{0}, false},
+		{"an empty window proves nothing", nil, legacyKeys(0), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -157,34 +158,34 @@ func TestVRAMFingerprintOf(t *testing.T) {
 	}
 }
 
-// TestVRAMWatchedIndexes pins which cards a run reads, and the attribution
-// that rides with the choice: the spec's declared rows are the index set
+// TestVRAMWatchedKeys pins which cards a run reads, and the attribution
+// that rides with the choice: the spec's declared rows are the key set
 // admission actually uses, so a number measured there has a row to be applied
-// to. A spec that declares none has no such row anywhere, so every index is
+// to. A spec that declares none has no such row anywhere, so every card is
 // watched and every result is marked unattributable.
-func TestVRAMWatchedIndexes(t *testing.T) {
+func TestVRAMWatchedKeys(t *testing.T) {
 	sample := vramSample(vramGPU(0, 100, 24576), vramGPU(1, 100, 24576), vramGPU(2, 100, 24576))
 
-	idx, attributable := vramWatchedIndexes([]routing.RuntimeSpecGPU{{GPUIndex: 2}, {GPUIndex: 0}}, sample)
+	keys, attributable := vramWatchedKeys([]routing.RuntimeSpecGPU{{GPUIndex: 2}, {GPUIndex: 0}}, sample)
 	if !attributable {
 		t.Fatal("declared GPU rows must be attributable")
 	}
-	if len(idx) != 2 || idx[0] != 0 || idx[1] != 2 {
-		t.Fatalf("declared indexes = %v, want [0 2] (ascending)", idx)
+	if want := legacyKeys(0, 2); !slices.Equal(keys, want) {
+		t.Fatalf("declared keys = %v, want %v (ascending)", keys, want)
 	}
 
-	idx, attributable = vramWatchedIndexes(nil, sample)
+	keys, attributable = vramWatchedKeys(nil, sample)
 	if attributable {
 		t.Fatal("a spec with no declared GPU rows has no row to attribute a number to")
 	}
-	if len(idx) != 3 || idx[0] != 0 || idx[2] != 2 {
-		t.Fatalf("undeclared indexes = %v, want every index in the sample", idx)
+	if want := legacyKeys(0, 1, 2); !slices.Equal(keys, want) {
+		t.Fatalf("undeclared keys = %v, want every card in the sample", keys)
 	}
 
 	// A GPU-less sample yields nothing to watch, which is what makes the
 	// GPU-less host inconclusive rather than zero.
-	if idx, _ := vramWatchedIndexes(nil, routing.TelemetrySample{ServerID: "srv1"}); len(idx) != 0 {
-		t.Fatalf("a sample with no GPUs yielded %v, want nothing to watch", idx)
+	if keys, _ := vramWatchedKeys(nil, routing.TelemetrySample{ServerID: "srv1"}); len(keys) != 0 {
+		t.Fatalf("a sample with no GPUs yielded %v, want nothing to watch", keys)
 	}
 }
 
@@ -195,10 +196,10 @@ func TestVRAMWatchedIndexes(t *testing.T) {
 func TestVRAMFloorMB(t *testing.T) {
 	sample := vramSample(vramGPU(0, 100, 2048), vramGPU(1, 100, 49152))
 	// Card 1's 1 % (480 MiB) dominates card 0's absolute floor (64 MiB).
-	if got, want := vramFloorMB([]int{0, 1}, sample), 491; got != want {
+	if got, want := vramFloorMB(legacyKeys(0, 1), sample), 491; got != want {
 		t.Fatalf("vramFloorMB([0 1]) = %d, want %d", got, want)
 	}
-	if got, want := vramFloorMB([]int{0}, sample), 64; got != want {
+	if got, want := vramFloorMB(legacyKeys(0), sample), 64; got != want {
 		t.Fatalf("vramFloorMB([0]) = %d, want %d", got, want)
 	}
 	// No watched card at all: the floor is the absolute one, so a bogus

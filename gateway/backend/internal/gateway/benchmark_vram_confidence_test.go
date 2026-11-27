@@ -284,7 +284,7 @@ func TestVRAMReportItemsKeepsASmallCardsRealAllocation(t *testing.T) {
 		vramCard(0, "H100", "GPU-a", 5100, 80*gib),
 		vramCard(1, "Small", "GPU-b", 700, 8*gib),
 	)
-	items := vramReportItems([]int{0, 1}, false, vramRunPlanned{baseline: before}, before, after, nil)
+	items := vramReportItems(legacyKeys(0, 1), false, vramRunPlanned{baseline: before}, before, after, nil)
 	if len(items) != 2 {
 		t.Fatalf("items = %#v, want both cards: the small card's 600 MB is a real allocation, not noise on the H100", items)
 	}
@@ -308,7 +308,7 @@ func TestVRAMReportItemsSumsBeforeItFilters(t *testing.T) {
 		vramCard(0, "L40S", "GPU-a", 400, 48*gib),
 		vramCard(1, "L40S", "GPU-b", 400, 48*gib),
 	)
-	watched := []int{0, 1}
+	watched := legacyKeys(0, 1)
 	plan := vramRunPlanned{baseline: before}
 	declared := vramReportItems(watched, true, plan, before, after, nil)
 	undeclared := vramReportItems(watched, false, plan, before, after, nil)
@@ -362,7 +362,7 @@ func TestVRAMReportItemsFingerprintComesFromTheMeasuredWindow(t *testing.T) {
 	before := vramSampleOf(vramCard(0, "NEW", "GPU-new", 100, 24*gib))
 	after := vramSampleOf(vramCard(0, "NEW", "GPU-new", 21500, 24*gib))
 
-	items := vramReportItems([]int{0}, true, vramRunPlanned{baseline: triggerTime}, before, after, nil)
+	items := vramReportItems(legacyKeys(0), true, vramRunPlanned{baseline: triggerTime}, before, after, nil)
 	if len(items) != 1 {
 		t.Fatalf("items = %#v", items)
 	}
