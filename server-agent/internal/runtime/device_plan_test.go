@@ -113,6 +113,33 @@ func TestPlanDevices(t *testing.T) {
 			want: devicePlan{Prefix: "Vulkan", Names: []string{"Vulkan1"}, Keys: []GPUKey{k(GPUVendorAMD, 1)}},
 		},
 		{
+			name: "no detected vendor, explicit cuda", topo: GPUTopology{}, gpus: []SpecGPU{{Index: 0}}, backend: "cuda", inject: true,
+			want: devicePlan{Prefix: "CUDA", Names: []string{"CUDA0"}, Keys: []GPUKey{k(GPUVendorNone, 0)}},
+		},
+		{
+			name: "empty vendor reads as legacy", topo: nv2, gpus: []SpecGPU{{Index: 1}}, backend: "auto", inject: true,
+			want: devicePlan{
+				Prefix: "CUDA", VisVar: "CUDA_VISIBLE_DEVICES", VisValue: "1", Names: []string{"CUDA0"},
+				Keys: []GPUKey{k(GPUVendorNVIDIA, 1)},
+			},
+		},
+		{
+			name: "sycl across vendors is refused", topo: mixed, gpus: []SpecGPU{nv(0), amd(0)}, backend: "sycl", inject: true,
+			wantErr: codeGPUVendorBackendMismatch,
+		},
+		{
+			name: "sycl single vendor", topo: nv2, gpus: []SpecGPU{nv(1)}, backend: "sycl", inject: true,
+			want: devicePlan{
+				Prefix: "SYCL", VisVar: "CUDA_VISIBLE_DEVICES", VisValue: "1", Names: []string{"SYCL1"},
+				Keys: []GPUKey{k(GPUVendorNVIDIA, 1)},
+			},
+		},
+		{
+			name: "metal single vendor has no variable", topo: GPUTopology{Legacy: GPUVendorApple, Vendors: GPUVendors{GPUVendorApple}},
+			gpus: []SpecGPU{{Vendor: GPUVendorApple, Index: 0}}, backend: "metal", inject: true,
+			want: devicePlan{Prefix: "MTL", Names: []string{"MTL0"}, Keys: []GPUKey{k(GPUVendorApple, 0)}},
+		},
+		{
 			name: "no GPUs never injects", topo: mixed, backend: "vulkan", inject: true,
 			want: devicePlan{Prefix: "Vulkan", Keys: []GPUKey{}},
 		},

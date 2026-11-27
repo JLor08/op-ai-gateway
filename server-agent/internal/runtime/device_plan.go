@@ -68,6 +68,9 @@ func resolveDevicePrefix(spec Spec, topo GPUTopology) (string, error) {
 	keys := planKeys(spec, topo)
 	var vendors []GPUVendor
 	for _, k := range keys {
+		if k.Vendor == GPUVendorNone {
+			continue // host without a detected vendor: vendor-agnostic, as before
+		}
 		if !knownGPUVendor(k.Vendor) {
 			return "", fmt.Errorf("unknown gpu vendor %q", string(k.Vendor))
 		}
@@ -98,12 +101,18 @@ func resolveDevicePrefix(spec Spec, topo GPUTopology) (string, error) {
 	want := map[string]GPUVendor{backendCUDA: GPUVendorNVIDIA, backendROCm: GPUVendorAMD, backendMetal: GPUVendorApple}[prefix]
 	if want != GPUVendorNone {
 		for _, k := range keys {
-			if k.Vendor != want {
+			if k.Vendor != want && k.Vendor != GPUVendorNone {
 				return "", &GPUPlanError{
 					Code:    codeGPUVendorBackendMismatch,
 					Message: fmt.Sprintf("device_backend %s cannot drive GPU %s %d", strings.ToLower(prefix), k.Vendor, k.Index),
 				}
 			}
+		}
+	}
+	if prefix == backendSYCL && len(vendors) > 1 {
+		return "", &GPUPlanError{
+			Code:    codeGPUVendorBackendMismatch,
+			Message: "device_backend sycl cannot drive GPUs of several vendors",
 		}
 	}
 	return prefix, nil
@@ -166,10 +175,16 @@ func planDevices(spec Spec, topo GPUTopology) (devicePlan, error) {
 	}
 
 	switch prefix {
-	case backendCUDA:
+	case backendCUDA, backendROCm:
+		if keys[0].Vendor == GPUVendorNone { // no detected vendor: no variable, as before
+			plan.Names = hostNames()
+			break
+		}
+		if prefix == backendROCm {
+			plan.VisVar, plan.VisValue, plan.Names = "ROCR_VISIBLE_DEVICES", joinInts(hostIdx), renumbered(len(hostIdx))
+			break
+		}
 		plan.VisVar, plan.VisValue, plan.Names = "CUDA_VISIBLE_DEVICES", joinInts(hostIdx), renumbered(len(hostIdx))
-	case backendROCm:
-		plan.VisVar, plan.VisValue, plan.Names = "ROCR_VISIBLE_DEVICES", joinInts(hostIdx), renumbered(len(hostIdx))
 	case backendVulkan:
 		ords := make([]int, 0, len(keys))
 		mapped := true
