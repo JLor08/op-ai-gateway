@@ -192,6 +192,10 @@ func (s *Server) handlePortalServerItem(w http.ResponseWriter, r *http.Request) 
 		s.handlePortalServerGPUBudgets(w, r, token, parts[0])
 		return
 	}
+	if len(parts) == 3 && parts[1] == "gpu-vendor-note" && parts[2] == "dismiss" && parts[0] != "" {
+		s.handlePortalServerGPUVendorNoteDismiss(w, r, token, parts[0])
+		return
+	}
 	if len(parts) == 2 && parts[1] == "certificate" && parts[0] != "" {
 		s.handlePortalServerCertificate(w, r, token, parts[0])
 		return

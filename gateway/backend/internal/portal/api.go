@@ -129,6 +129,7 @@ type API interface {
 	GetRuntimeSpec(context.Context, auth.Token, string) (RuntimeSpecDTO, error)
 	GetServer(context.Context, auth.Token, string) (ServerDTO, error)
 	GetServerGPUBudgets(context.Context, auth.Token, string) ([]GPUBudgetDTO, error)
+	DismissServerGPUVendorNote(context.Context, auth.Token, string) error
 	GetService(context.Context, auth.Token, string) (ServiceDTO, error)
 	GetVendorAccount(context.Context, auth.Token, string) (VendorAccountDTO, error)
 	GroupMemberCandidates(context.Context, auth.Token, string) ([]UserRefDTO, error)

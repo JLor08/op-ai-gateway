@@ -3838,3 +3838,29 @@ func TestClampRuntimeLogFileTailsKeepsTheEndAndDropsDuplicates(t *testing.T) {
 		t.Fatalf("tail valid=%v len=%d, want valid UTF-8 within 3 bytes of the cap", utf8.ValidString(tail), len(tail))
 	}
 }
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsRowsTheSpecLacks: when the
+// spec's stored rows are known and the frame's resolved key is not among them
+// -- the window before the legacy-vendor backfill (an explicit vendor against
+// a row still stored with the empty one) or a card the spec never declared --
+// no UPDATE is issued: it could not match, on every frame.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsRowsTheSpecLacks(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lacks")
+	counting := &countingMeasuredWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	for _, gpus := range []string{
+		`[{"index":0,"vendor":"nvidia","vram_measured_mb":21234}]`, // row still stored with the empty vendor
+		`[{"index":3,"vram_measured_mb":21234}]`,                   // index the spec never declared
+	} {
+		body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_lacks","state":"running","gpus":` + gpus + `}]}`
+		req, raw := ingestReq(t, body)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+	}
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf("UpdateRuntimeSpecGPUMeasured calls = %d for rows the spec lacks, want 0", got)
+	}
+}

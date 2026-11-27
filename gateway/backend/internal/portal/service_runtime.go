@@ -2955,6 +2955,18 @@ func (s *Service) GetServerGPUBudgets(ctx context.Context, principal auth.Token,
 	return gpuBudgetDTOs(budgets), nil
 }
 
+// DismissServerGPUVendorNote lowers the review note a mixed-vendor backfill
+// raised on the server and keeps its legacy vendor. Gated like every server
+// write (authorizeServer): no rights on the server is the no-leak
+// ErrServerNotFound.
+func (s *Service) DismissServerGPUVendorNote(ctx context.Context, principal auth.Token, serverID string) error {
+	server, err := s.authorizeServer(ctx, principal, serverID)
+	if err != nil {
+		return err
+	}
+	return s.routes.ClearServerGPUVendorNote(ctx, server.ID)
+}
+
 // SetServerGPUBudgets validates and atomically replaces serverID's whole
 // per-GPU budget set. index must be >= 0 and each GPU key (vendor, index)
 // unique across the request; budget_mb must be >= 0 (both ErrGPUBudgetInvalid,

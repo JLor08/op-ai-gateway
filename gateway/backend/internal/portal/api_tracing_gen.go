@@ -925,6 +925,18 @@ func (_d *APIWithTracing) DetachProjectToken(ctx context.Context, t1 auth.Token,
 	return _d.API.DetachProjectToken(ctx, t1, s1, s2)
 }
 
+func (_d *APIWithTracing) DismissServerGPUVendorNote(ctx context.Context, t1 auth.Token, s1 string) (err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DismissServerGPUVendorNote")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.DismissServerGPUVendorNote(ctx, t1, s1)
+}
+
 func (_d *APIWithTracing) DisplayNames(ctx context.Context, sa1 []string) (m1 map[string]string) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.DisplayNames")
 	defer span.End()

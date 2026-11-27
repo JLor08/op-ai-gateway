@@ -1063,8 +1063,17 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID, legacyVendo
 		stored := s.storedMeasuredVRAM(ctx, serverID, specID)
 		for key, measured := range f.MaxGPU {
 			row := storedGPURowKey(stored, key, legacyVendor)
-			if was, known := stored[row]; known && was == measured {
-				continue // already on file, byte for byte
+			if stored != nil {
+				was, known := stored[row]
+				if !known {
+					// No such row on the spec -- the window before the
+					// legacy-vendor backfill, or a card the spec never
+					// declared: the UPDATE could not match, on every frame.
+					continue
+				}
+				if was == measured {
+					continue // already on file, byte for byte
+				}
 			}
 			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, row, measured); err != nil {
 				// Tolerates ErrNotFound (a GPU row deleted out from under an
@@ -2715,8 +2724,48 @@ func (s *Server) ingestSystemReport(ctx context.Context, serverID string, raw js
 		slog.Error("agent system report: upsert failed", "server_id", serverID, "err", err)
 		return &storeTelemetryError{code: "agent.system_report_failed", message: "system report upsert failed", cause: err}
 	}
+	s.backfillGPUVendorFromReport(ctx, serverID, req.GPUs)
 	slog.Debug("agent system report stored", "server_id", serverID, "gpus", len(req.GPUs))
 	return nil
+}
+
+// backfillGPUVendorFromReport makes the server's legacy empty GPU vendor
+// explicit from a sanitized hardware report that carries vendors: the vendor
+// the empty one stands for is the report's first of nvidia, amd, apple, and a
+// host with more than one vendor raises the review note. A report without any
+// vendor (an agent without gpu_vendor_identity) calls nothing and never clears
+// what is stored. The store persists the legacy vendor on every call and
+// rewrites rows only the first time, so a repeated report costs one
+// transaction and no push. Best-effort: a failure is logged, never fails the
+// report it rode in on.
+//
+// When rows were rewritten the server's runtime document changes (its specs
+// and budgets), and so can its cluster heads' (the member GPU rows on this
+// server feed a head's document): the server is pushed itself, and
+// NotifyClustersOfServer pushes every server sharing a cluster with it.
+func (s *Server) backfillGPUVendorFromReport(ctx context.Context, serverID string, gpus []agentGPUInfo) {
+	var vendors []string
+	for _, g := range gpus {
+		if g.Vendor != "" && !slices.Contains(vendors, g.Vendor) {
+			vendors = append(vendors, g.Vendor)
+		}
+	}
+	if len(vendors) == 0 {
+		return
+	}
+	rewritten, err := s.Routes.BackfillServerGPUVendor(ctx, serverID, routing.LegacyGPUVendor(vendors), len(vendors) > 1)
+	if err != nil {
+		slog.Warn("agent system report: gpu vendor backfill failed", "server_id", serverID, "err", err)
+		return
+	}
+	if rewritten == 0 {
+		return
+	}
+	slog.Info("agent system report: legacy gpu vendor made explicit", "server_id", serverID, "rows", rewritten)
+	s.PushRuntimeConfig(serverID)
+	if s.Portal != nil {
+		s.Portal.NotifyClustersOfServer(ctx, serverID)
+	}
 }
 
 // agentSystemReportErrRows is writeAgentSystemReportError's one
