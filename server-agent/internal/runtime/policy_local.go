@@ -958,9 +958,12 @@ var placeholderPattern = regexp.MustCompile(`\$\{[^}]*\}`)
 //
 // A spec the plan refuses -- a device_backend that cannot drive one of its
 // GPUs, a Vulkan spec on a host with NVIDIA and AMD GPUs whose cards are not
-// mapped or that runs without the variable -- fails with a *GPUPlanError where
-// the plan is consumed (the variable, ${DEVICES}, the Vulkan tokens); its
-// stable code reaches last_error.
+// mapped or that runs without the variable -- fails with a *GPUPlanError; its
+// stable code reaches last_error. On such a mixed host a model spec is refused
+// outright, and a Vulkan device token is refused unless the agent injected
+// GGML_VK_VISIBLE_DEVICES. On any other host the refusal is raised only where
+// the plan is consumed (the variable, ${DEVICES}, the Vulkan tokens), so a spec
+// that uses none of them starts as it did before the plan existed.
 //
 // The four traps this option has to defuse, and where each is handled:
 //
@@ -1474,6 +1477,9 @@ func agentBaseEnv(spec Spec, visVar, visValue string, getenv func(string) string
 // device plan decides the visibility variable and the device tokens.
 func expandSpec(spec Spec, port int, topo GPUTopology, getenv func(string) string, configFilesDir string) (expandedSpec, error) {
 	dev := newSpecDevices(spec, topo)
+	if err := dev.mixedHostRefusal(spec); err != nil {
+		return expandedSpec{}, err
+	}
 
 	expand := placeholderExpander{spec: spec, port: port, configFilesDir: configFilesDir, dev: dev, getenv: getenv}.expand
 

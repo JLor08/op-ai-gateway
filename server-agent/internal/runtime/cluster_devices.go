@@ -136,10 +136,12 @@ func newDeviceContext(vendor GPUVendor, vendors GPUVendors) deviceContext {
 // visibility variable and every device token read this one value, so they
 // always describe the same decision.
 //
-// A plan that cannot be made is not by itself a refusal: it refuses what
-// consumes it (the injected variable, ${DEVICES}, the Vulkan tokens), so a
-// spec that uses none of them starts exactly as it did before the plan
-// existed.
+// On a single-vendor or vendorless host a plan that cannot be made is not by
+// itself a refusal: it refuses what consumes it (the injected variable,
+// ${DEVICES}, the Vulkan tokens), so a spec that uses none of them starts
+// exactly as it did before the plan existed. On a host with NVIDIA and AMD GPUs
+// a coded plan refusal refuses the model spec outright (mixedHostRefusal): a
+// mixed host never guesses a card.
 type specDevices struct {
 	topo    GPUTopology
 	keys    []GPUKey
@@ -150,6 +152,17 @@ type specDevices struct {
 func newSpecDevices(spec Spec, topo GPUTopology) specDevices {
 	plan, err := planDevices(spec, topo)
 	return specDevices{topo: topo, keys: planKeys(spec, topo), plan: plan, planErr: err}
+}
+
+// mixedHostRefusal is the plan's coded refusal of a model spec on a host with
+// NVIDIA and AMD GPUs, refused whether or not anything consumes the plan. nil
+// on any other host, for a plan that was made, and for an rpc_server member,
+// whose device decision is the member path's (rpc_member.go).
+func (d specDevices) mixedHostRefusal(spec Spec) error {
+	if !d.topo.Mixed() || spec.Kind == SpecKindRPCServer || !errors.As(d.planErr, new(*GPUPlanError)) {
+		return nil
+	}
+	return fmt.Errorf("runtime: %w", d.planErr)
 }
 
 // hostIndices is the spec's declared host indices, one per key.
@@ -208,17 +221,23 @@ func (d specDevices) visibility(spec Spec) (name, value string, err error) {
 // vulkanNames is what ${VULKAN_DEVICES} and ${VULKAN_FIRST_DEVICE} render: the
 // plan's renumbered Vulkan0.. names when the agent injected
 // GGML_VK_VISIBLE_DEVICES, else the declared host indices (the documented
-// caveat: VulkanN need not be host GPU N). A Vulkan plan this host refused
-// (no injection, or an unmapped card, on a host with NVIDIA and AMD GPUs)
-// refuses the token with the plan's code: a host index there names the wrong
-// card.
+// caveat: VulkanN need not be host GPU N). On a host with NVIDIA and AMD GPUs a
+// host index names no reliable Vulkan device, so there the token is refused
+// with runtime.vulkan_visible_devices_required (or the plan's own Vulkan
+// refusal) unless the agent injected the variable.
 func (d specDevices) vulkanNames(inner string) ([]string, error) {
 	if d.planErr == nil && d.plan.Prefix == backendVulkan && d.plan.VisVar == vulkanVisibleDevicesVar {
 		return d.plan.Names, nil
 	}
-	var pe *GPUPlanError
-	if errors.As(d.planErr, &pe) && (pe.Code == codeVulkanVisibleDevicesRequired || pe.Code == codeVulkanMappingUnavailable) {
-		return nil, fmt.Errorf("${%s} cannot be resolved: %w", inner, d.planErr)
+	if d.topo.Mixed() {
+		var pe *GPUPlanError
+		if errors.As(d.planErr, &pe) && (pe.Code == codeVulkanVisibleDevicesRequired || pe.Code == codeVulkanMappingUnavailable) {
+			return nil, fmt.Errorf("${%s} cannot be resolved: %w", inner, d.planErr)
+		}
+		return nil, fmt.Errorf("${%s} cannot be resolved: %w", inner, &GPUPlanError{
+			Code:    codeVulkanVisibleDevicesRequired,
+			Message: "on a host with NVIDIA and AMD GPUs a Vulkan device name needs a vulkan spec with set_visible_devices in env mode, so the agent injects GGML_VK_VISIBLE_DEVICES",
+		})
 	}
 	if err := d.refuseSpanning(inner); err != nil {
 		return nil, err

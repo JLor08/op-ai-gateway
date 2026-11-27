@@ -3472,21 +3472,32 @@ func TestStartRefusalCarriesGPUPlanCode(t *testing.T) {
 		t.Cleanup(m.Close)
 		return m
 	}
+	nvOnly := []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA, VRAMMB: 1}}
 	cases := []struct {
 		name     string
+		gpus     []SpecGPU
 		backend  string
+		inject   bool
+		extra    []string
 		wantCode string
 	}{
-		{"cuda on both vendors", "cuda", codeGPUVendorBackendMismatch},
-		{"vulkan before the cards are mapped", "vulkan", codeVulkanMappingUnavailable},
+		{"cuda on both vendors", nvAMD, "cuda", true, nil, codeGPUVendorBackendMismatch},
+		{"vulkan before the cards are mapped", nvAMD, "vulkan", true, nil, codeVulkanMappingUnavailable},
+		// Ruling C2-R1: on a mixed host a plan refusal refuses the model
+		// spec even when neither the variable nor a device token uses it.
+		{"cuda on both vendors, no tokens, no injection", nvAMD, "cuda", false, nil, codeGPUVendorBackendMismatch},
+		// Ruling C2-R2: on a mixed host a Vulkan token never renders a host
+		// index; without injected GGML_VK_VISIBLE_DEVICES it is refused.
+		{"vulkan token on an nvidia-only auto spec", nvOnly, "", false, []string{"--device", "${VULKAN_DEVICES}"}, codeVulkanVisibleDevicesRequired},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			shrinkTimings(t)
 			spec := baseSpec("spec-a", "model-a")
-			spec.GPUs = nvAMD
+			spec.Args = append(spec.Args, tc.extra...)
+			spec.GPUs = tc.gpus
 			spec.DeviceBackend = tc.backend
-			spec.SetVisibleDevices = true
+			spec.SetVisibleDevices = tc.inject
 			m := newMixed(t)
 			m.Apply(Config{Specs: []Spec{spec}})
 

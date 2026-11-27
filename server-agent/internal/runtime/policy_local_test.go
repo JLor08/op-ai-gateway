@@ -2244,3 +2244,89 @@ func TestExpandMixedHostGPUPlanRefusals(t *testing.T) {
 		t.Errorf("args %q env %v: want ROCm0 and ROCR_VISIBLE_DEVICES=1", args, env)
 	}
 }
+
+// TestExpandMixedHostRefusesEagerly is ruling C2-R1: on a host with NVIDIA and
+// AMD GPUs a model spec the device plan refuses is refused even when nothing
+// consumes the plan -- a mixed host never guesses a card. An rpc_server member
+// is exempt here: its device decision is the member path's.
+func TestExpandMixedHostRefusesEagerly(t *testing.T) {
+	getenv := func(string) string { return "" }
+	nvAMD := []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}, {Index: 0, Vendor: GPUVendorAMD}}
+	cases := []struct {
+		name     string
+		spec     Spec
+		wantCode string
+	}{
+		{"cuda on both vendors", Spec{GPUs: nvAMD, DeviceBackend: "cuda", Args: []string{"--port", "${PORT}"}}, codeGPUVendorBackendMismatch},
+		{"vulkan without injection", Spec{GPUs: nvAMD, DeviceBackend: "vulkan"}, codeVulkanVisibleDevicesRequired},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := ExpandPlaceholders(tc.spec, 0, mixedTopo, getenv, "")
+			var pe *GPUPlanError
+			if !errors.As(err, &pe) || pe.Code != tc.wantCode {
+				t.Fatalf("err = %v, want a *GPUPlanError with code %s", err, tc.wantCode)
+			}
+		})
+	}
+	member := Spec{Kind: SpecKindRPCServer, GPUs: nvAMD, DeviceBackend: "cuda"}
+	if _, _, err := ExpandPlaceholders(member, 0, mixedTopo, getenv, ""); err != nil {
+		t.Errorf("rpc_server member refused by the model-spec rule: %v", err)
+	}
+}
+
+// TestExpandMixedHostVulkanTokensNeedInjection is ruling C2-R2: on a mixed
+// host ${VULKAN_DEVICES} and ${VULKAN_FIRST_DEVICE} never render a host index
+// as a Vulkan device name; without injected GGML_VK_VISIBLE_DEVICES they are
+// refused with runtime.vulkan_visible_devices_required.
+func TestExpandMixedHostVulkanTokensNeedInjection(t *testing.T) {
+	getenv := func(string) string { return "" }
+	for _, tok := range []string{"${VULKAN_DEVICES}", "${VULKAN_FIRST_DEVICE}"} {
+		for _, inject := range []bool{false, true} {
+			spec := Spec{GPUs: []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}}, SetVisibleDevices: inject, Args: []string{tok}}
+			_, _, err := ExpandPlaceholders(spec, 0, mixedTopo, getenv, "")
+			var pe *GPUPlanError
+			if !errors.As(err, &pe) || pe.Code != codeVulkanVisibleDevicesRequired {
+				t.Errorf("%s (inject=%v): err = %v, want code %s", tok, inject, err, codeVulkanVisibleDevicesRequired)
+			}
+		}
+	}
+	// ${DEVICES} on a mixed-host Vulkan spec without injection renders no
+	// Vulkan name either.
+	spec := Spec{GPUs: []SpecGPU{{Index: 0, Vendor: GPUVendorAMD}}, DeviceBackend: "vulkan", SetVisibleDevices: true, VisibleDevicesMode: VisibleDevicesModeArgs, Args: []string{"${DEVICES}"}}
+	_, _, err := ExpandPlaceholders(spec, 0, mixedTopo, getenv, "")
+	var pe *GPUPlanError
+	if !errors.As(err, &pe) || pe.Code != codeVulkanVisibleDevicesRequired {
+		t.Errorf("${DEVICES}, args mode: err = %v, want code %s", err, codeVulkanVisibleDevicesRequired)
+	}
+}
+
+// TestExpandSingleVendorHostKeepsLazyPlanRefusal: on a single-vendor host
+// (rulings C2-R1/R2 apply to mixed hosts only) a plan refusal still refuses
+// only what consumes the plan, and a Vulkan token without injection keeps
+// rendering the host index (the documented caveat), as before the plan.
+func TestExpandSingleVendorHostKeepsLazyPlanRefusal(t *testing.T) {
+	getenv := func(string) string { return "" }
+	nv := GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}
+	mismatch := Spec{GPUs: []SpecGPU{{Index: 3, Vendor: GPUVendorNVIDIA}}, DeviceBackend: "rocm", Args: []string{"--port", "${PORT}", "${HOST_GPU_IDS}"}}
+	args, _, err := ExpandPlaceholders(mismatch, 8080, nv, getenv, "")
+	if err != nil {
+		t.Fatalf("unconsumed plan refusal refused the spec on a single-vendor host: %v", err)
+	}
+	if want := []string{"--port", "8080", "3"}; !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %q, want %q", args, want)
+	}
+	mismatch.Args = []string{"${DEVICES}"}
+	var pe *GPUPlanError
+	if _, _, err := ExpandPlaceholders(mismatch, 8080, nv, getenv, ""); !errors.As(err, &pe) || pe.Code != codeGPUVendorBackendMismatch {
+		t.Errorf("${DEVICES} on a mismatched spec: err = %v, want code %s", err, codeGPUVendorBackendMismatch)
+	}
+	vk := Spec{GPUs: []SpecGPU{{Index: 3, Vendor: GPUVendorNVIDIA}}, Args: []string{"${VULKAN_DEVICES}", "${VULKAN_FIRST_DEVICE}"}}
+	args, _, err = ExpandPlaceholders(vk, 8080, nv, getenv, "")
+	if err != nil {
+		t.Fatalf("vulkan tokens on a single-vendor host: %v", err)
+	}
+	if want := []string{"Vulkan3", "Vulkan3"}; !reflect.DeepEqual(args, want) {
+		t.Errorf("args = %q, want %q", args, want)
+	}
+}
