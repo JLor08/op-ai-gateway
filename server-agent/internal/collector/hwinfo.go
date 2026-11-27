@@ -135,7 +135,7 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 	var ordinals map[pciAddr]int
 	if len(r.GPUs) > 0 {
 		if devs, ok := vulkanFn(ctx); ok {
-			r.VulkanDeviceCount = len(devs)
+			r.VulkanDeviceCount = vulkanDeviceCount(devs)
 			ordinals = vulkanOrdinalsByPCI(devs)
 		}
 	}

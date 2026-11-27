@@ -89,3 +89,21 @@ func TestParseVulkaninfoHexPCI(t *testing.T) {
 		t.Fatalf("%+v", devs)
 	}
 }
+
+// A "GPU<n>:" header repeated later in the output (another section about the
+// same device) opens no second device: the first section per ordinal wins and
+// the device count stays the number of distinct ordinals.
+func TestParseVulkaninfoRepeatedHeaderFirstWins(t *testing.T) {
+	out := append(synthVulkan(
+		[4]string{vkDiscrete, "NVIDIA GeForce RTX 3080 Ti", "1"},
+		[4]string{vkDiscrete, "AMD Radeon RX 7900 XT (RADV NAVI31)", "3"},
+	), []byte("GPU0:\nVkPhysicalDeviceProperties:\n\tdeviceType = "+vkCPU+"\n\tdeviceName = other\n"+
+		"VkPhysicalDevicePCIBusInfoPropertiesEXT:\n\tpciDomain   = 0\n\tpciBus      = 9\n\tpciDevice   = 0\n\tpciFunction = 0\n")...)
+	devs := parseVulkaninfo(out)
+	if len(devs) != 2 || devs[0].Name != "NVIDIA GeForce RTX 3080 Ti" || devs[0].Type != vkDiscrete || devs[0].PCI != (pciAddr{0, 1, 0, 0}) {
+		t.Fatalf("%+v", devs)
+	}
+	if n := vulkanDeviceCount([]VulkanDevice{{Ordinal: 0}, {Ordinal: 1}, {Ordinal: 0}}); n != 2 {
+		t.Fatalf("vulkanDeviceCount = %d, want 2 distinct ordinals", n)
+	}
+}

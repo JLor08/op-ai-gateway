@@ -3483,10 +3483,10 @@ func TestStartRefusalCarriesGPUPlanCode(t *testing.T) {
 	}{
 		{"cuda on both vendors", nvAMD, "cuda", true, nil, codeGPUVendorBackendMismatch},
 		{"vulkan before the cards are mapped", nvAMD, "vulkan", true, nil, codeVulkanMappingUnavailable},
-		// Ruling C2-R1: on a mixed host a plan refusal refuses the model
+		// On a mixed host a plan refusal refuses the model
 		// spec even when neither the variable nor a device token uses it.
 		{"cuda on both vendors, no tokens, no injection", nvAMD, "cuda", false, nil, codeGPUVendorBackendMismatch},
-		// Ruling C2-R2: on a mixed host a Vulkan token never renders a host
+		// On a mixed host a Vulkan token never renders a host
 		// index; without injected GGML_VK_VISIBLE_DEVICES it is refused.
 		{"vulkan token on an nvidia-only auto spec", nvOnly, "", false, []string{"--device", "${VULKAN_DEVICES}"}, codeVulkanVisibleDevicesRequired},
 	}

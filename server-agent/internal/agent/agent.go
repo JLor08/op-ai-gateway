@@ -691,15 +691,15 @@ type runtimeWaker interface {
 // portal click should feel like network latency, not the next 1s telemetry
 // tick... let alone the 60s runtime-config poll). *runtimectl.Driver
 // implements it (delegating to its Manager's own Transitions() channel).
-// hardwareVulkanProbe overrides the hardware inventory's vulkaninfo probe
-// (nil = the real one); tests set it so no test runs the host's vulkaninfo.
-var hardwareVulkanProbe func(context.Context) ([]collector.VulkanDevice, bool)
-
 // NewFromDeps derives it via a type assertion on d.RuntimeDriver, mirroring
 // how certWaker/trustWaker are derived from d.Poster.
 type runtimeTransitionsWaker interface {
 	Transitions() <-chan struct{}
 }
+
+// hardwareVulkanProbe overrides the hardware inventory's vulkaninfo probe
+// (nil = the real one); tests set it so no test runs the host's vulkaninfo.
+var hardwareVulkanProbe func(context.Context) ([]collector.VulkanDevice, bool)
 
 // runtimeLogWaker is the optional interface a poster may additionally
 // implement to deliver the gateway's runtime_log_config command (T3): the

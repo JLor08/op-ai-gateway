@@ -27,10 +27,12 @@ type VulkanDevice struct {
 
 // parseVulkaninfo reads the per-device "GPU<n>:" sections of `vulkaninfo`.
 // Lines such as "GPU id = 0 (...)" in surface sections are not headers. Inside
-// a section the first deviceType, deviceName and pci* values win. The result
-// is ordered by n.
+// a section the first deviceType, deviceName and pci* values win, and the
+// first section per n wins: a header repeated later in the output opens no
+// second device and its values are ignored. The result is ordered by n.
 func parseVulkaninfo(out []byte) []VulkanDevice {
 	var devs []VulkanDevice
+	seen := make(map[int]bool)
 	cur := -1
 	var pci [4]uint32
 	var pciSeen [4]bool
@@ -47,8 +49,12 @@ func parseVulkaninfo(out []byte) []VulkanDevice {
 		line := strings.TrimSpace(raw)
 		if n, ok := vulkanGPUHeader(line); ok {
 			finish()
-			devs = append(devs, VulkanDevice{Ordinal: n})
-			cur = len(devs) - 1
+			cur = -1 // a repeated header: skip its section
+			if !seen[n] {
+				seen[n] = true
+				devs = append(devs, VulkanDevice{Ordinal: n})
+				cur = len(devs) - 1
+			}
 			continue
 		}
 		if cur < 0 {
@@ -100,6 +106,16 @@ func vulkanGPUHeader(line string) (int, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// vulkanDeviceCount is the number of distinct ordinals in devs: the Vulkan
+// devices the host exposes, CPU devices included.
+func vulkanDeviceCount(devs []VulkanDevice) int {
+	seen := make(map[int]bool, len(devs))
+	for _, d := range devs {
+		seen[d.Ordinal] = true
+	}
+	return len(seen)
 }
 
 // vulkanOrdinalsByPCI maps PCI addresses to Vulkan ordinals. CPU devices and

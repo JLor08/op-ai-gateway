@@ -2245,8 +2245,8 @@ func TestExpandMixedHostGPUPlanRefusals(t *testing.T) {
 	}
 }
 
-// TestExpandMixedHostRefusesEagerly is ruling C2-R1: on a host with NVIDIA and
-// AMD GPUs a model spec the device plan refuses is refused even when nothing
+// TestExpandMixedHostRefusesEagerly: on a host with NVIDIA and AMD GPUs a
+// model spec the device plan refuses is refused even when nothing
 // consumes the plan -- a mixed host never guesses a card. An rpc_server member
 // is exempt here: its device decision is the member path's.
 func TestExpandMixedHostRefusesEagerly(t *testing.T) {
@@ -2275,8 +2275,8 @@ func TestExpandMixedHostRefusesEagerly(t *testing.T) {
 	}
 }
 
-// TestExpandMixedHostVulkanTokensNeedInjection is ruling C2-R2: on a mixed
-// host ${VULKAN_DEVICES} and ${VULKAN_FIRST_DEVICE} never render a host index
+// TestExpandMixedHostVulkanTokensNeedInjection: on a mixed host
+// ${VULKAN_DEVICES} and ${VULKAN_FIRST_DEVICE} never render a host index
 // as a Vulkan device name; without injected GGML_VK_VISIBLE_DEVICES they are
 // refused with runtime.vulkan_visible_devices_required.
 func TestExpandMixedHostVulkanTokensNeedInjection(t *testing.T) {
@@ -2302,7 +2302,8 @@ func TestExpandMixedHostVulkanTokensNeedInjection(t *testing.T) {
 }
 
 // TestExpandSingleVendorHostKeepsLazyPlanRefusal: on a single-vendor host
-// (rulings C2-R1/R2 apply to mixed hosts only) a plan refusal still refuses
+// (eager refusal and Vulkan tokens needing injection apply to mixed hosts
+// only) a plan refusal still refuses
 // only what consumes the plan, and a Vulkan token without injection keeps
 // rendering the host index (the documented caveat), as before the plan.
 func TestExpandSingleVendorHostKeepsLazyPlanRefusal(t *testing.T) {

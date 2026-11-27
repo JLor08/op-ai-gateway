@@ -3619,7 +3619,9 @@ Windows PDH resolve through it to the key.
 
 **The Vulkan mapping.** With each hardware report on a host with GPUs the agent runs
 `vulkaninfo` (when on `PATH`, 5 s timeout), reads every `GPU<n>:` device's PCI
-address (`VK_EXT_pci_bus_info`) and type, and maps each card's PCI address to its
+address (`VK_EXT_pci_bus_info`) and type (the first section per `n` counts; a
+header repeated later opens no second device, and `vulkan_device_count` is the
+number of distinct ordinals), and maps each card's PCI address to its
 Vulkan enumeration ordinal. CPU devices (llvmpipe) are left out of the map but
 keep their ordinal, since `GGML_VK_VISIBLE_DEVICES` addresses the loader's
 enumeration order; a PCI address listed twice (two Vulkan drivers for one card,

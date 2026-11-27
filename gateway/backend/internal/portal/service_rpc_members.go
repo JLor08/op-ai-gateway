@@ -28,9 +28,10 @@ var (
 	ErrRPCMemberDeviceBackendInvalid = errors.New("runtime_spec.device_backend_invalid")
 	// ErrRPCMemberVRAMEstimateRequired rejects a GPU row without a VRAM
 	// estimate when its VRAM cannot be measured: the report lists the GPU as
-	// non-NVIDIA, except AMD on a Linux host with only AMD GPUs under the
-	// ROCm or auto device backend (measured from KFD, ADR-113). Admission
-	// needs the operator's number for every other non-NVIDIA GPU.
+	// non-NVIDIA and its vram_measurable does not name the member's resolved
+	// backend (gpuMeasurable); a report without that list keeps the KFD rule
+	// (AMD on a Linux host with only AMD GPUs, ROCm or auto backend, ADR-113).
+	// Admission needs the operator's number for every other non-NVIDIA GPU.
 	ErrRPCMemberVRAMEstimateRequired = errors.New("runtime_spec.member_vram_estimate_required")
 	// ErrRPCMemberInUse rejects disabling or deleting a member spec that a
 	// cluster head still references.

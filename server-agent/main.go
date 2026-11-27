@@ -472,8 +472,10 @@ func collectorNames(gpus []collector.GPUCollector) []string {
 }
 
 // runtimeGPUVendors lists every distinct recognised vendor among the detected
-// collectors, in detection order. It feeds only the "auto" device backend
-// choice; the single vendor from runtimeGPUVendor still drives visibility.
+// collectors, in detection order. The runtime uses it as the host's vendor
+// set only until the first host info names a GPU; from then on the vendors of
+// the reported GPUs stand (runtime topology), so an installed but GPU-less
+// tool never makes the host look mixed.
 func runtimeGPUVendors(gpus []collector.GPUCollector) runtimectl.GPUVendors {
 	var out runtimectl.GPUVendors
 	for _, g := range gpus {
