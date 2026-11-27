@@ -513,7 +513,15 @@ import (
 // generation's last_error (#430). The gateway reads the new fields when present
 // and an old agent simply sends none. This is the ONE bump for the whole
 // branch; later commits on it do not bump again.
-const Version = "0.26.0"
+//
+// 0.26.0 -> 0.26.1 is the single bump for the rpc_cluster flip under an
+// unchanged ETag. PATCH: the manager's same-ETag short circuit now also
+// compares the set of spec IDs, so a change of the gateway's rpc_cluster
+// declaration starts or drains rpc_server members and cluster heads at once
+// (in file mode it waited for the document's next etag), and a drain while
+// runtime_manager is inactive restarts the once-per-transition Warn for
+// withheld cluster specs. No agent.Features entry is added.
+const Version = "0.26.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

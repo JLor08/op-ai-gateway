@@ -6046,8 +6046,16 @@ send those documents at all, and the agent reads it before it honours `kind`,
 `cluster` and `rpc`: while it is absent (an older gateway, or a file-mode document)
 the agent drops every `rpc_server` spec and every head, with the pairs that name
 them, so a member can never start as a model and a literal `${RPC_SERVERS}` can
-never reach a child. A document change in either direction bypasses the
-ETag short-circuit, like `runtime_instances`. `server-agent`'s `Version` moved
+never reach a child. A change of the declaration in either direction applies the
+same document again, and the manager takes it under an unchanged ETag because the
+set of spec IDs differs (`sameSpecIDs` in `applyConfig`'s short circuit, next to
+`runtime_instances`' `sameReplicableOptIn`): members and heads start once the name
+is declared and drain once it is withdrawn, in file mode too, where the ETag is the
+document's own `etag` and does not move with the gateway. Before agent 0.26.1 the
+short circuit compared no spec IDs, so in file mode a flip took effect only at the
+document's next ETag change. The withheld Warn is logged once per transition, and
+the drain of `stopAll` starts that streak over (`TestDriverRPCClusterFlipUnderSameETagStartsAndDrainsMembers`,
+`TestDriverWarnsRPCWithheldAgainAfterStopAll`). `server-agent`'s `Version` moved
 `0.17.0` → `0.18.0` for this entry, MINOR per the same rule
 (`FeatureRPCCluster`, pinned with the version by `TestFeaturesDeclareRPCCluster`).
 
