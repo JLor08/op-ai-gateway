@@ -122,8 +122,9 @@ const (
 	// (250 ms). Deliberately independent of the retention capacity: this is a
 	// rate bound, not a history bound, and 64 KiB per flush window (256 KiB/s
 	// for one stream) is already far more than any real model server
-	// sustains, and exactly a log-file tailer's read-rate cap. Past it, bytes are dropped and
-	// COUNTED, and the count travels in the very next entry -- see Drain.
+	// sustains, and exactly a log-file tailer's read-rate cap. Past it, bytes
+	// are dropped and COUNTED, and the count travels in the very next entry --
+	// see Drain.
 	logPendingBytes = 64 << 10
 	// logDrainBudget bounds one Drain across ALL watched specs, so a chatty
 	// fleet cannot monopolize the single agent->gateway WebSocket writer that
@@ -464,14 +465,16 @@ type LogStore struct {
 	// scrollbackReady records that one is in flight -- separately, because an
 	// EMPTY history is a meaningful answer that still has to be delivered. A
 	// replay is per SPEC: one record sequence covering every stream, each
-	// stream's eviction gap carried on its own first record (snapshotLocked).
+	// stream's eviction gap carried on its own first record (specLog.snapshot).
 	scrollback      map[string][]logRecord
 	scrollbackReady map[string]bool
 
 	nextGen uint64
-	// rr rotates Drain's starting point over the (spec, stream) units so the
-	// per-drain byte budget cannot systematically starve whichever sorts last.
-	rr int
+	// rr and rrFile rotate Drain's starting point over the process units and
+	// over the file units respectively, so the per-drain byte budget cannot
+	// systematically starve whichever unit sorts last in either list.
+	rr     int
+	rrFile int
 
 	now func() time.Time
 }
@@ -742,10 +745,18 @@ func trimRing(r *streamRing, limit int) {
 
 // enforceTotalLocked restores used <= total after a write to ring r of spec
 // keep. First by dropping whole UNWATCHED specs other than keep, least-
-// recently-written first (evictLocked); if every remaining spec is keep or
-// watched, by trimming r -- the ring that just grew -- by the excess. That
-// always suffices: used was within total before the write, so the excess is
-// at most what r just gained.
+// recently-written first (evictLocked). If every remaining spec is keep or
+// watched, r -- the ring that just grew -- gives up its own oldest bytes by
+// the excess, which is at most what r just gained, since used was within total
+// before the write.
+//
+// Except the record r was just given, when it is a MARKER: a typed event has
+// no text to count as a gap, so trimming it would make it vanish without a
+// trace -- a file tab's first file_waiting, say. It is kept: r's older records
+// give what they can, and the rest is taken from the oldest bytes elsewhere in
+// the store (trimOldestLocked), counted as that ring's gap like any eviction.
+// There is always enough: a marker is at most maxResolvedCommandBytes plus
+// overhead, far below what the other rings hold when the total is full.
 func (s *LogStore) enforceTotalLocked(keep string, r *streamRing) {
 	if s.used <= s.total {
 		return
@@ -755,8 +766,53 @@ func (s *LogStore) enforceTotalLocked(keep string, r *streamRing) {
 		return
 	}
 	before := r.bytes
+	n := len(r.recs)
+	if n == 0 || r.recs[n-1].event == "" {
+		trimRing(r, max(0, r.bytes-(s.used-s.total)))
+		s.used += r.bytes - before
+		return
+	}
+	// r's older records first, exactly as for text; the marker is set aside
+	// for the trim and put back.
+	last := r.recs[n-1]
+	r.recs, r.bytes = r.recs[:n-1], r.bytes-last.size()
 	trimRing(r, max(0, r.bytes-(s.used-s.total)))
+	r.recs, r.bytes = append(r.recs, last), r.bytes+last.size()
 	s.used += r.bytes - before
+	s.trimOldestLocked(r)
+}
+
+// trimOldestLocked takes the excess over the total from the rings whose oldest
+// record is oldest, store-wide -- protect's older records included, protect's
+// newest record (the marker enforceTotalLocked keeps) never.
+func (s *LogStore) trimOldestLocked(protect *streamRing) {
+	for s.used > s.total {
+		var victim *streamRing
+		var victimAt time.Time
+		for _, l := range s.logs {
+			for _, r := range l.streams {
+				if len(r.recs) == 0 || (r == protect && len(r.recs) == 1) {
+					continue
+				}
+				if victim == nil || r.recs[0].at.Before(victimAt) {
+					victim, victimAt = r, r.recs[0].at
+				}
+			}
+		}
+		if victim == nil {
+			return
+		}
+		before := victim.bytes
+		limit := max(0, victim.bytes-(s.used-s.total))
+		if victim == protect {
+			limit = max(limit, protect.recs[len(protect.recs)-1].size())
+		}
+		trimRing(victim, limit)
+		s.used += victim.bytes - before
+		if victim.bytes == before {
+			return // cannot happen; a guard against looping forever
+		}
+	}
 }
 
 // evictLocked enforces the TOTAL ceiling by dropping whole spec histories --
@@ -991,9 +1047,23 @@ func (s *LogStore) Retain(specIDs []string) {
 // queue of at most logPendingBytes, so the load-bearing relation
 // logDrainBudget > logPendingBytes holds per unit exactly as it held per spec:
 // a unit's whole queue always fits a fresh drain's budget, so deferring rather
-// than tearing a batch can never strand one. A file at its read-rate cap fills
-// its own unit, and the process unit beside it is served from the same budget
-// in the same interval.
+// than tearing a batch can never strand one.
+//
+// PROCESS UNITS GO FIRST. Every drain visits the process unit of every watched
+// spec (round-robin among themselves) before any file unit (round-robin among
+// themselves), and the first unit of a round is served whatever its size. What
+// that guarantees, exactly:
+//
+//   - files can never defer a process unit: the process units see the whole
+//     budget before any file is taken, so a file at its read-rate cap costs
+//     the live process view nothing -- not a delay and not a dropped byte. Only
+//     other specs' process output competes with it, exactly as before files;
+//   - a file unit is served in every drain in which the process units took at
+//     most logDrainBudget - logPendingBytes (64 KiB), because its whole queue
+//     then fits what is left; and when no process unit has anything, the first
+//     file unit of the round is served whatever its size. A file unit waits
+//     only while the fleet's process output alone sustains more than 256 KiB/s,
+//     and what it cannot hold meanwhile is dropped and counted, never silent.
 //
 // THE SNAPSHOT IS TAKEN HERE, and the reason is the interaction between a
 // re-snapshot and the live queue. Everything queued for a spec at the instant
@@ -1023,15 +1093,11 @@ func (s *LogStore) Drain() []LogBatch {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	units := s.watchedUnitsLocked()
-	if len(units) == 0 {
+	procUnits, fileUnits := s.watchedUnitsLocked()
+	if len(procUnits)+len(fileUnits) == 0 {
 		return nil
 	}
-	if s.rr >= len(units) {
-		s.rr = 0
-	}
-	ordered := append(append([]streamKey(nil), units[s.rr:]...), units[:s.rr]...)
-	s.rr++
+	ordered := append(rotate(procUnits, &s.rr), rotate(fileUnits, &s.rrFile)...)
 
 	budget := logDrainBudget
 	replayBudget := maxLogBatchBytes
@@ -1111,17 +1177,22 @@ func (s *LogStore) Drain() []LogBatch {
 	return out
 }
 
-// watchedUnitsLocked lists the (spec, stream) units Drain visits, sorted: the
-// process unit of every watched spec -- always, because that is where a due or
-// in-flight replay is found even when nothing is queued -- plus every unit of a
-// watched spec whose live queue holds anything.
-func (s *LogStore) watchedUnitsLocked() []streamKey {
+// watchedUnitsLocked lists the (spec, stream) units Drain visits, as two
+// sorted lists: the process unit of every watched spec -- always, because that
+// is where a due or in-flight replay is found even when nothing is queued --
+// and every file unit of a watched spec whose live queue holds anything.
+func (s *LogStore) watchedUnitsLocked() (procUnits, fileUnits []streamKey) {
 	seen := make(map[streamKey]bool, len(s.watching))
-	out := make([]streamKey, 0, len(s.watching))
+	procUnits = make([]streamKey, 0, len(s.watching))
 	add := func(k streamKey) {
-		if s.watching[k.spec] && !seen[k] {
-			seen[k] = true
-			out = append(out, k)
+		if !s.watching[k.spec] || seen[k] {
+			return
+		}
+		seen[k] = true
+		if k.stream == "" {
+			procUnits = append(procUnits, k)
+		} else {
+			fileUnits = append(fileUnits, k)
 		}
 	}
 	for id := range s.watching {
@@ -1133,12 +1204,32 @@ func (s *LogStore) watchedUnitsLocked() []streamKey {
 	for k := range s.pendingDropped {
 		add(k)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].spec != out[j].spec {
-			return out[i].spec < out[j].spec
+	sortUnits(procUnits)
+	sortUnits(fileUnits)
+	return procUnits, fileUnits
+}
+
+// sortUnits orders units by spec, then stream.
+func sortUnits(u []streamKey) {
+	sort.Slice(u, func(i, j int) bool {
+		if u[i].spec != u[j].spec {
+			return u[i].spec < u[j].spec
 		}
-		return out[i].stream < out[j].stream
+		return u[i].stream < u[j].stream
 	})
+}
+
+// rotate returns units starting at *rr (wrapped into range) and advances it, so
+// successive drains start one unit further on.
+func rotate(units []streamKey, rr *int) []streamKey {
+	if len(units) == 0 {
+		return nil
+	}
+	if *rr >= len(units) {
+		*rr = 0
+	}
+	out := append(append([]streamKey(nil), units[*rr:]...), units[:*rr]...)
+	*rr++
 	return out
 }
 
@@ -1359,7 +1450,10 @@ func splitRecord(r logRecord, budget int) (head, tail logRecord, ok bool) {
 	if r.event != "" || r.command != nil || r.text == "" {
 		return logRecord{}, logRecord{}, false
 	}
-	room := budget - logEntryWireOverhead - 2 // the two quotes
+	// The head is charged entryWireMax by the caller, so everything in it but
+	// the text -- the envelope, the stream field, the two quotes -- is
+	// reserved before the text is sized.
+	room := budget - logEntryWireOverhead - streamWireMax(r.stream) - 2
 	n, cost := 0, 0
 	for n < len(r.text) {
 		c := jsonByteMaxBytes(r.text[n])
@@ -1553,8 +1647,8 @@ type procLog struct {
 
 // ForStream returns a sibling of p that records on the stream name: the same
 // store, spec, generation, instance and line prefix, so a file's text is
-// attributed exactly like the process output of the same generation, but its
-// own line state and its own ring, live queue and gap count. It carries no
+// attributed exactly like the process output of the same generation, but with
+// its own line state, its own ring, its own live queue and its own gap count. It carries no
 // pid -- a file is not the process's pipe -- so its text and markers have pid
 // 0. The log-file tailer of one generation and declared file writes through
 // it.

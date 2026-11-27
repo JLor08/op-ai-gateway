@@ -573,3 +573,119 @@ func TestAGapNamesNoInstanceUntilTextJoinsIt(t *testing.T) {
 		t.Fatalf("replay = %+v, want instance 2's prefixed text carrying the gap", eng)
 	}
 }
+
+// TestASplitRecordReservesItsStream: a record too big for one frame is split,
+// and the head's wire cost -- its stream field included -- must still fit the
+// frame. A split that sized the text without the stream overshot the limit by
+// the stream's own encoding.
+func TestASplitRecordReservesItsStream(t *testing.T) {
+	for name, stream := range map[string]string{
+		"plain name":         strings.Repeat("n", 32),
+		"escape-heavy name":  strings.Repeat("<", 32),
+		"process (no field)": "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := logRecord{gen: 1, at: mustParseWidestTime(t), text: strings.Repeat("x", 2<<20), stream: stream}
+			specID := strings.Repeat("s", 128)
+			entries, rest, used := takeStreamChunk(specID, stream, []logRecord{rec}, 0, maxLogBatchBytes)
+			if len(entries) != 1 || len(rest) != 1 {
+				t.Fatalf("takeStreamChunk = %d entries, %d left, want the record split in two", len(entries), len(rest))
+			}
+			if used > maxLogBatchBytes {
+				t.Fatalf("used = %d, over the limit %d by %d", used, maxLogBatchBytes, used-maxLogBatchBytes)
+			}
+			raw, err := json.Marshal(LogBatch{SpecID: specID, Scrollback: true, More: true, Entries: entries})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if len(raw) > maxLogBatchBytes {
+				t.Fatalf("the batch marshals to %d bytes, over maxLogBatchBytes %d", len(raw), maxLogBatchBytes)
+			}
+		})
+	}
+}
+
+// TestProcessUnitIsServedBeforeFileUnits: files at their read-rate cap must not
+// defer the live process view. Three files each holding a full 64 KiB queue and
+// a process unit with a sizeable queue of its own: the process unit is drained
+// in the very first Drain, whichever unit the round-robin would start at, and
+// the files still all drain within a few rounds.
+func TestProcessUnitIsServedBeforeFileUnits(t *testing.T) {
+	s := newTestLogStore(t, 1<<20, 0)
+	p := s.newProc("S")
+	p.Started(1, ResolvedCommand{})
+	files := []*procLog{p.ForStream("a"), p.ForStream("b"), p.ForStream("c")}
+	s.SetWatch([]string{"S"}, nil)
+	s.Drain() // the (marker-only) scrollback
+
+	chunk := strings.Repeat("f", 4096)
+	procText := strings.Repeat("p", 40<<10)
+	for round := range 4 {
+		for _, f := range files {
+			for range 20 { // 80 KiB into a 64 KiB queue
+				f.Write([]byte(chunk))
+			}
+		}
+		p.Write([]byte(procText))
+		if got := streamText(s.Drain(), ""); got != procText {
+			t.Fatalf("round %d: the first drain carried %d process bytes, want all %d -- file units deferred the process view",
+				round, len(got), len(procText))
+		}
+		for range 6 {
+			s.Drain()
+		}
+		s.mu.Lock()
+		left := len(s.pending)
+		s.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("round %d: %d file units still queued after 7 drains; the files must still drain", round, left)
+		}
+	}
+}
+
+// TestASelfTrimNeverDropsTheMarkerJustRecorded: when only watched specs hold
+// the total, the ring just written makes room -- but never by removing the
+// marker it was just given. A file tab's first file_waiting must not vanish
+// without a trace; the room comes from the oldest bytes elsewhere, counted.
+func TestASelfTrimNeverDropsTheMarkerJustRecorded(t *testing.T) {
+	const per = 64 << 10
+	s := newTestLogStore(t, per, per) // raised to per + 4*64 KiB: one full five-ring spec
+	s.SetWatch([]string{"w"}, nil)
+	w := s.newProc("w")
+	chunk := strings.Repeat("w", 4096)
+	writers := []*procLog{w, w.ForStream("a"), w.ForStream("b"), w.ForStream("c"), w.ForStream("d")}
+	for _, sw := range writers {
+		for range 2 * per / len(chunk) {
+			sw.Write([]byte(chunk))
+		}
+	}
+	late := s.newProc("late").ForStream("engine")
+	late.Mark(logEventFileWaiting)
+
+	s.mu.Lock()
+	used, total, truth := s.used, s.total, ringBytesTotal(s)
+	var marker bool
+	if l := s.logs["late"]; l != nil && l.streams["engine"] != nil {
+		for _, r := range l.streams["engine"].recs {
+			marker = marker || r.event == logEventFileWaiting
+		}
+	}
+	var wRetained, wDropped int64
+	for _, r := range s.logs["w"].streams {
+		wDropped += r.dropped
+		for _, rec := range r.recs {
+			wRetained += int64(len(rec.text))
+		}
+	}
+	s.mu.Unlock()
+	if used > total || used != truth {
+		t.Fatalf("used = %d (rings %d), want at most the total %d", used, truth, total)
+	}
+	if !marker {
+		t.Fatal("the file_waiting marker just recorded was trimmed away")
+	}
+	if want := int64(len(writers) * 2 * per); wRetained+wDropped != want {
+		t.Fatalf("w retained(%d) + dropped(%d) = %d, want the %d bytes written -- room taken elsewhere must be counted",
+			wRetained, wDropped, wRetained+wDropped, want)
+	}
+}

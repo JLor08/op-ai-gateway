@@ -344,8 +344,11 @@ type Config struct {
 	// RuntimeLogBufferTotalBytes caps the SUM of those buffers across every
 	// spec, so a server with twenty specs is not twenty times the per-spec
 	// number. 0 (the default) means runtime.DefaultLogBufferTotalBytes
-	// (16 MiB). The agent keeps at most total/per-spec buffers, evicting the
-	// least-recently-written unwatched one.
+	// (16 MiB). It is a hard byte bound over every stream of every spec --
+	// process output and each declared log file have a ring of their own --
+	// kept by evicting whole unwatched specs, least-recently-written first.
+	// It is raised to at least the per-spec size plus four 64 KiB log-file
+	// rings, so one spec with all its rings always fits.
 	RuntimeLogBufferTotalBytes int
 	// VRAMHeadroomMB is how much of each GPU's DETECTED total memory, in MB, the
 	// agent keeps out of the VRAM budget it derives for runtime admission. The
