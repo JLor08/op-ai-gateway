@@ -515,7 +515,15 @@ import (
 // and an old agent simply sends none. This is the ONE bump for the whole
 // branch; later commits on it do not bump again.
 //
-// 0.26.0 -> 0.27.0 is the single bump for mixed NVIDIA+AMD hosts. MINOR: the
+// 0.26.0 -> 0.26.1 is the single bump for the rpc_cluster flip under an
+// unchanged ETag. PATCH: the manager's same-ETag short circuit now also
+// compares the set of spec IDs, so a change of the gateway's rpc_cluster
+// declaration starts or drains rpc_server members and cluster heads at once
+// (in file mode it waited for the document's next etag), and a drain while
+// runtime_manager is inactive restarts the once-per-transition Warn for
+// withheld cluster specs. No agent.Features entry is added.
+//
+// 0.26.1 -> 0.27.0 is the single bump for mixed NVIDIA+AMD hosts. MINOR: the
 // agent reports a `vendor` (nvidia, amd, apple) on every GPU it describes --
 // telemetry, hardware report and runtime GPU samples -- plus the optional
 // hardware fields vram_measurable, vulkan_ordinal and vulkan_device_count, so

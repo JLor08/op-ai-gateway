@@ -296,3 +296,114 @@ func TestDriverWarnsOncePerRPCWithheldTransition(t *testing.T) {
 		t.Fatalf("withheld Warns = %d after a withdrawal, want 2", n)
 	}
 }
+
+// TestDriverRPCClusterFlipUnderSameETagStartsAndDrainsMembers is the file-mode
+// scenario end to end against the real manager: the document carries an
+// rpc_server member under its own etag, and only the gateway's rpc_cluster
+// declaration changes. Declared, the member must start; withdrawn, it must
+// drain -- all under the same ETag, which the manager's short circuit would
+// otherwise take for an already-applied document.
+func TestDriverRPCClusterFlipUnderSameETagStartsAndDrainsMembers(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	member := memberSpec("rpcm_a", "rspec_h", "-tcp-listen")
+	member.RPC.BindIP = "127.0.0.1"
+	member.RPC.Port = freeTCPPort(t)
+	member.AdminState = "force_running"
+	raw, err := json.Marshal(Config{Specs: []Spec{member, {ID: "P", UpstreamModel: "p", Binary: stubchildPath}}, ETag: "file-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "runtime.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	without := []string{runtimeManagerFeature, gatewayFeatureRuntimeInstances}
+	with := append(append([]string(nil), without...), gatewayFeatureRPCCluster)
+	features, setFeatures := newSwitchableFeaturesServer(t, without)
+	d := NewDriver(m, NewFileSource(path), features, nil, "")
+	t.Cleanup(d.Close)
+	ctx := context.Background()
+
+	d.Sync(ctx, nil)
+	if s := statusFor(m, "rpcm_a"); s != nil {
+		t.Fatalf("member status = %+v, want none while the gateway does not declare rpc_cluster", s)
+	}
+
+	memberRunning := func() bool {
+		s := statusFor(m, "rpcm_a")
+		return s != nil && s.State == StateRunning
+	}
+	memberGone := func() bool { return statusFor(m, "rpcm_a") == nil }
+	for i, step := range []struct {
+		features []string
+		what     string
+		done     func() bool
+	}{
+		{with, "member running once the gateway declares rpc_cluster", memberRunning},
+		{without, "member drained and removed once the declaration is withdrawn", memberGone},
+		{with, "member running again once rpc_cluster is declared again", memberRunning},
+	} {
+		setFeatures(step.features)
+		d.Sync(ctx, nil)
+		waitUntil(t, 5*time.Second, step.what, step.done)
+		if got := m.AppliedETag(); got != "file-v1" {
+			t.Errorf("step %d: AppliedETag() = %q, want the document's own file-v1", i, got)
+		}
+		if s := statusFor(m, "P"); s == nil {
+			t.Errorf("step %d: the plain spec vanished: the flip touches only cluster specs", i)
+		}
+	}
+}
+
+// TestApplySameETagWithAChangedSpecSetIsApplied pins the manager half: a
+// document arriving again under the applied ETag with a different set of spec
+// IDs -- the shape a change in the gateway's rpc_cluster declaration gives it --
+// is applied, not short-circuited.
+func TestApplySameETagWithAChangedSpecSetIsApplied(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := newTestManager(t, allowlistPolicy())
+
+	member := memberSpec("rpcm_a", "rspec_h", "-tcp-listen")
+	member.RPC.BindIP = "127.0.0.1"
+	member.RPC.Port = freeTCPPort(t)
+	member.AdminState = "force_running"
+	plain := Spec{ID: "P", UpstreamModel: "p", Binary: stubchildPath}
+
+	m.Apply(Config{Specs: []Spec{plain}, ETag: "e1"})
+	m.Apply(Config{Specs: []Spec{plain, member}, ETag: "e1"})
+	waitUntil(t, 5*time.Second, "member running after the same ETag arrived with it added", func() bool {
+		s := statusFor(m, "rpcm_a")
+		return s != nil && s.State == StateRunning
+	})
+	m.Apply(Config{Specs: []Spec{plain}, ETag: "e1"})
+	waitUntil(t, 5*time.Second, "member removed after the same ETag arrived without it", func() bool {
+		return statusFor(m, "rpcm_a") == nil
+	})
+}
+
+// TestDriverWarnsRPCWithheldAgainAfterStopAll: stopAll applies the empty
+// document, which withholds nothing, so the next active Sync that withholds
+// cluster specs again is a new transition and Warns again -- as the
+// withheld-instances and withheld-log-files bookkeeping already do.
+func TestDriverWarnsRPCWithheldAgainAfterStopAll(t *testing.T) {
+	logs := withCountedLogs(t)
+	member := Spec{ID: "rpcm_1", Kind: SpecKindRPCServer, RPC: &RPCMember{Transport: "direct", BindIP: "127.0.0.1", Port: 47001}}
+	src := &fakeSource{cfg: Config{ETag: "e1", Specs: []Spec{member, {ID: "P", UpstreamModel: "p"}}}}
+	mgr := &fakeManager{}
+	features, setFeatures := newSwitchableFeaturesServer(t, []string{runtimeManagerFeature})
+	d := newDriver(mgr, src, features, nil, "")
+	ctx := context.Background()
+
+	d.Sync(ctx, nil)
+	setFeatures(nil) // runtime_manager withdrawn: stopAll
+	d.Sync(ctx, nil)
+	setFeatures([]string{runtimeManagerFeature})
+	d.Sync(ctx, nil)
+	if n := logs.count(withheldRPCWarn); n != 2 {
+		t.Fatalf("withheld Warns = %d, want 2: the apply after stopAll is a new transition into the withheld state", n)
+	}
+}

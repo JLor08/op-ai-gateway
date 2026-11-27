@@ -2039,15 +2039,17 @@ func (o *owner) applyConfig(cfg Config) {
 	// reconcileSpec sees no change -- no relaunch on upgrade (#434).
 	cfg = resolveLegacyGPUVendors(cfg, o.gpuVendor)
 	cfg.Specs = withoutReservedSpecIDs(cfg.Specs)
-	// The ETag names the document, and the multi-instance opt-in and the
-	// log_files declarations are parts of it this agent may withhold on its
-	// own (Driver.Sync clears Replicable until the gateway declares
-	// runtime_instances, and log_files until it declares runtime_log_files),
-	// so a document can arrive a second time under the same ETag with only
-	// those changed -- when the gateway's declaration changes. That second
-	// arrival is a different desired state and must be applied, not
-	// short-circuited.
-	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag && sameReplicableOptIn(cfg.Specs, o.cfg.Specs) && sameLogFileDeclarations(cfg.Specs, o.cfg.Specs) {
+	// The ETag names the document, and the multi-instance opt-in, the
+	// log_files declarations and the cluster specs are parts of it this agent
+	// may withhold on its own (Driver.Sync clears Replicable until the gateway
+	// declares runtime_instances, log_files until it declares
+	// runtime_log_files, and drops rpc_server members and cluster heads until
+	// it declares rpc_cluster), so a document can arrive a second time under
+	// the same ETag with only those changed -- when the gateway's declaration
+	// changes. That second arrival is a different desired state and must be
+	// applied, not short-circuited.
+	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag && sameSpecIDs(cfg.Specs, o.cfg.Specs) &&
+		sameReplicableOptIn(cfg.Specs, o.cfg.Specs) && sameLogFileDeclarations(cfg.Specs, o.cfg.Specs) {
 		return
 	}
 	o.cfg = cfg
@@ -2245,8 +2247,29 @@ func (o *owner) ensureProtectedFloor() {
 	}
 }
 
+// sameSpecIDs reports whether two spec lists carry the same set of spec IDs
+// (see applyConfig's short circuit): Driver.Sync drops rpc_server members and
+// cluster heads, and the coresident pairs naming them, while the gateway does
+// not declare rpc_cluster, so the same document can arrive under the same ETag
+// with specs added or removed.
+func sameSpecIDs(a, b []Spec) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ids := make(map[string]bool, len(a))
+	for _, spec := range a {
+		ids[spec.ID] = true
+	}
+	for _, spec := range b {
+		if !ids[spec.ID] {
+			return false
+		}
+	}
+	return true
+}
+
 // sameReplicableOptIn reports whether two spec lists opt the same spec IDs into
-// instances (Spec.Replicable) -- the one field of an already-applied document
+// instances (Spec.Replicable) -- one of the parts of an already-applied document
 // that can change without its ETag changing (applyConfig's short circuit).
 func sameReplicableOptIn(a, b []Spec) bool {
 	replicable := make(map[string]bool, len(a))
