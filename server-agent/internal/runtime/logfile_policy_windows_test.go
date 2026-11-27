@@ -15,9 +15,9 @@ import (
 )
 
 // These tests exercise the Windows half of the log-file policy (#430): the
-// CreateFile/GetFileType/GetFinalPathNameByHandle open, junctions (which need
-// no privilege, unlike symlinks), the link count, the share mode and the
-// Windows naming rules. CI runs no Windows job; they compile and vet under
+// os.Root-anchored open with its GetFileType check, junctions (which need no
+// privilege, unlike symlinks, and which os.Root never crosses below a root),
+// the link count, the share mode and the Windows naming rules. CI runs no Windows job; they compile and vet under
 // GOOS=windows and run on a real Windows host as part of the PR's acceptance
 // checklist.
 
@@ -33,7 +33,7 @@ func mklinkJunction(t *testing.T, link, target string) {
 }
 
 // TestOpenLogFileWindowsJunctionEscape: a junction inside ${CONFIG_DIR}
-// pointing outside is refused on the handle's final path; an instance dir
+// pointing outside is refused by the root-anchored open; an instance dir
 // replaced by a junction is neither a root nor a place the agent deletes in.
 func TestOpenLogFileWindowsJunctionEscape(t *testing.T) {
 	dir := t.TempDir()
@@ -63,7 +63,8 @@ func TestOpenLogFileWindowsJunctionEscape(t *testing.T) {
 }
 
 // TestOpenLogFileWindowsJunctionRoot: an allowed root that is a junction
-// compares correctly, because roots are resolved through a handle too.
+// works, because os.OpenRoot follows links in the root's own name (operator
+// configuration).
 func TestOpenLogFileWindowsJunctionRoot(t *testing.T) {
 	dir := t.TempDir()
 	realDir := filepath.Join(dir, "real")
@@ -118,7 +119,7 @@ func TestOpenLogFileWindowsShareMode(t *testing.T) {
 // TestResolveLogFileWindowsNames runs Windows-native paths through both
 // halves: every refusal is lexical (resolveLogFile), and a positive control
 // proves the table's base is usable. A direct openLogFile of a reserved name,
-// bypassing the lexical half, is refused by GetFileType as defence in depth.
+// bypassing the lexical half, is refused at open as defence in depth.
 func TestResolveLogFileWindowsNames(t *testing.T) {
 	dir := t.TempDir()
 	cfgDir := filepath.Join(dir, "cfg")
@@ -161,10 +162,12 @@ func TestResolveLogFileWindowsNames(t *testing.T) {
 		})
 	}
 
-	// NUL always exists as a device; CON or COM1 may fail to open at all,
-	// which would not prove the GetFileType check.
+	// A target that names a reserved device below its root, bypassing the
+	// lexical half, is refused at open: filepath.IsLocal rejects "NUL" on
+	// Windows before os.Root (which refuses reserved names too) or
+	// GetFileType see it.
 	mustRefuseOpen(t, logFileTarget{
-		Name: "e", OpenPath: filepath.Join(inst, "NUL"), Roots: []string{inst},
+		Name: "e", OpenPath: filepath.Join(inst, "NUL"), Root: inst, Rel: "NUL", Roots: []string{inst},
 		ConfigBase: cfgDir, ConfigDir: inst,
 	})
 }

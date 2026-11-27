@@ -7,93 +7,41 @@ package runtime
 
 import (
 	"os"
-	"strings"
 	"syscall"
 
 	"golang.org/x/sys/windows"
 )
 
-// logFileShareMode lets the server write, rename and delete the file while the
-// agent holds it open for tailing (§5.2 step 4).
-const logFileShareMode = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE
-
-// The GetFinalPathNameByHandle flags (fileapi.h), which x/sys/windows does not
-// define: a normalized name with its drive letter. Both are 0, the default.
-const (
-	fileNameNormalized = 0x0 // FILE_NAME_NORMALIZED
-	volumeNameDOS      = 0x0 // VOLUME_NAME_DOS
-)
-
-// openLogFileHandle opens target.OpenPath read-only with full sharing for
-// openLogFile. CreateFile without FILE_FLAG_BACKUP_SEMANTICS cannot open a
-// directory; GetFileType refuses every handle that is not a disk file (a
-// pipe, a console, a reserved device name such as NUL or CON) before anything
-// reads from it. The link count and the final path are openLogFile's steps.
-func openLogFileHandle(target logFileTarget) (*os.File, error) {
-	p16, err := windows.UTF16PtrFromString(target.OpenPath)
+// openInRoot opens target.Rel read-only inside root for openLogFile.
+//
+// Share mode (§5.2 step 4): Root.OpenFile reaches internal/syscall/windows
+// Openat, which calls NtCreateFile with ShareAccess
+// FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE for every open (Go 1.26,
+// src/internal/syscall/windows/at_windows.go), so the server can still write,
+// rename and delete the file while the agent tails it; there is no flag to
+// ask for less. Each component is opened relative to its parent's handle with
+// OBJ_DONT_REPARSE, so a junction or symlink is never crossed silently: os.Root
+// reads it and follows it only if it stays below the root (a junction's
+// target is absolute, so it never does).
+//
+// O_RDONLY does not exclude directories there (no FILE_NON_DIRECTORY_FILE),
+// so the opened handle must be a disk file (GetFileType: not a pipe, a
+// console or a device) whose stat is a regular file. os.Root also refuses
+// reserved device names such as NUL.
+func openInRoot(root *os.Root, target logFileTarget) (*os.File, error) {
+	f, err := root.OpenFile(target.Rel, os.O_RDONLY, 0)
 	if err != nil {
-		return nil, logOpenRefusal(target, "", "is not a valid Windows path")
+		return nil, classifyInRootErr(target, err)
 	}
-	h, err := windows.CreateFile(p16, windows.GENERIC_READ, logFileShareMode, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
-	if err != nil {
-		return nil, openErr(err)
+	if t, err := windows.GetFileType(windows.Handle(f.Fd())); err != nil || t != windows.FILE_TYPE_DISK {
+		_ = f.Close()
+		return nil, logOpenRefusal(target, "is not a regular file")
 	}
-	if t, err := windows.GetFileType(h); err != nil || t != windows.FILE_TYPE_DISK {
-		_ = windows.CloseHandle(h)
-		return nil, logOpenRefusal(target, "", "is not a regular file")
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, logOpenRefusal(target, "is not a regular file")
 	}
-	return os.NewFile(uintptr(h), target.OpenPath), nil
-}
-
-// openedFinalPath is the final path of the handle f holds
-// (GetFinalPathNameByHandle): every symlink and junction actually followed.
-func openedFinalPath(f *os.File, _ string) (string, error) {
-	return finalPathByHandle(windows.Handle(f.Fd()))
-}
-
-// resolveLogRoot resolves an allowed root through the same API as the opened
-// file (a directory handle and GetFinalPathNameByHandle), so a root that is a
-// symlink or junction, or spelled with another case, compares against the
-// file's final path in the same normalized form. filepath.EvalSymlinks would
-// not do: it no longer follows mount points (junctions) on Windows.
-func resolveLogRoot(root string) (string, error) {
-	p16, err := windows.UTF16PtrFromString(root)
-	if err != nil {
-		return "", err
-	}
-	h, err := windows.CreateFile(p16, windows.FILE_READ_ATTRIBUTES, logFileShareMode, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = windows.CloseHandle(h) }()
-	return finalPathByHandle(h)
-}
-
-// finalPathByHandle is the normalized DOS path of h, with the \\?\ prefix
-// GetFinalPathNameByHandle adds stripped (\\?\UNC\srv\share becomes
-// \\srv\share, which openLogFile then refuses as a UNC path).
-func finalPathByHandle(h windows.Handle) (string, error) {
-	buf := make([]uint16, windows.MAX_PATH)
-	for {
-		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), fileNameNormalized|volumeNameDOS)
-		if err != nil {
-			return "", err
-		}
-		if n < uint32(len(buf)) {
-			return stripExtendedPathPrefix(windows.UTF16ToString(buf[:n])), nil
-		}
-		buf = make([]uint16, n)
-	}
-}
-
-func stripExtendedPathPrefix(p string) string {
-	if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
-		return `\\` + rest
-	}
-	if rest, ok := strings.CutPrefix(p, `\\?\`); ok {
-		return rest
-	}
-	return p
+	return f, nil
 }
 
 // openedLinkCount is the hard-link count of the file f is open on
@@ -107,40 +55,36 @@ func openedLinkCount(f *os.File) (uint64, error) {
 }
 
 // isReparsePoint reports FILE_ATTRIBUTE_REPARSE_POINT (a symlink, a junction,
-// a mount point) on an os.Lstat result.
+// a mount point) on an os.Lstat or Root.Lstat result.
 func isReparsePoint(fi os.FileInfo) bool {
 	d, ok := fi.Sys().(*syscall.Win32FileAttributeData)
 	return ok && d != nil && d.FileAttributes&syscall.FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-// statFinalBinding observes final through ONE GetFileInformationByHandle on a
-// handle to the name itself (FILE_FLAG_OPEN_REPARSE_POINT, so a link is seen
-// as a link, not followed): attributes, volume serial, file index and link
-// count all come from that single call, and the identity is compared with the
-// opened handle's, which cannot change (bindFinalPath's doc says why).
-func statFinalBinding(f *os.File, final string) (finalBinding, error) {
+// statLogFileName observes rel through root once. Root.Lstat's FileInfo
+// carries no link count on Windows, so rel is opened again through the same
+// root (the same component-wise, link-checked walk as the open itself) and ONE
+// GetFileInformationByHandle on that handle yields the attributes, the
+// identity (volume serial and file index, compared with the descriptor's,
+// which cannot change) and NumberOfLinks.
+func statLogFileName(root *os.Root, f *os.File, rel string) (nameBinding, error) {
 	var opened windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &opened); err != nil {
-		return finalBinding{}, err
+		return nameBinding{}, err
 	}
-	p16, err := windows.UTF16PtrFromString(final)
+	nf, err := root.OpenFile(rel, os.O_RDONLY, 0)
 	if err != nil {
-		return finalBinding{}, err
+		return nameBinding{}, err
 	}
-	h, err := windows.CreateFile(p16, windows.FILE_READ_ATTRIBUTES, logFileShareMode, nil, windows.OPEN_EXISTING,
-		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
-	if err != nil {
-		return finalBinding{}, err
-	}
-	defer func() { _ = windows.CloseHandle(h) }()
+	defer func() { _ = nf.Close() }()
 	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
-		return finalBinding{}, err
+	if err := windows.GetFileInformationByHandle(windows.Handle(nf.Fd()), &info); err != nil {
+		return nameBinding{}, err
 	}
-	return finalBinding{
-		regular: info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+	return nameBinding{
 		same: info.VolumeSerialNumber == opened.VolumeSerialNumber &&
 			info.FileIndexHigh == opened.FileIndexHigh && info.FileIndexLow == opened.FileIndexLow,
-		nlink: uint64(info.NumberOfLinks),
+		regular: info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0,
+		nlink:   uint64(info.NumberOfLinks),
 	}, nil
 }

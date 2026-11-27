@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
+	"syscall"
 )
 
 // This file is the agent's path policy for a spec's log_files (#430, design
@@ -30,19 +31,21 @@ import (
 //     separator-boundary containment against the allowed roots: the
 //     instance's own ${CONFIG_DIR} and the agent-local runtime_allowed_log_dirs
 //     (never gateway-supplied; empty means ${CONFIG_DIR} only).
-//   - openLogFile is RESOLVED. It opens read-only without blocking, requires a
-//     regular file with a single hard link, and checks the opened file's
-//     FINAL path -- after every symlink and junction -- against the same
-//     roots, each itself resolved. The lexical half alone would let a symlink
-//     planted in ${CONFIG_DIR} point at /etc/shadow; this half is what makes
+//   - openLogFile is ANCHORED. It opens the file read-only without blocking,
+//     through an os.Root at the root the path matched, so every symlink and
+//     junction below the root is followed only while it stays below it and
+//     a parent swapped for a link cannot lead out; it then requires a
+//     regular file with a single hard link, bound to the name inside the
+//     root. The lexical half alone would let a symlink planted in
+//     ${CONFIG_DIR} point at /etc/shadow; this half is what makes
 //     containment a boundary. The tailer runs it on every open and every
 //     reopen after a rotation, because the file behind the path can change.
 //
 // The instance's ${CONFIG_DIR} is a root only while it is a REAL directory
 // chain under config_files_dir (no symlink or junction from the base down):
-// only the base is resolved, the instance part is joined to it. Otherwise a
-// server able to replace its own instance directory with a link to /etc
-// would make /etc an allowed root. The same condition guards
+// openInstanceRoot walks it component by component on directory handles.
+// Otherwise a server able to replace its own instance directory with a link
+// to /etc would make /etc an allowed root. The same walk guards
 // removeConfigDirLogFile, the only place the agent deletes a log file.
 //
 // Every refusal wraps errLogFileNotPermitted. Its text travels to the gateway,
@@ -61,15 +64,21 @@ type logFileTarget struct {
 	// OpenPath is the agent-side path to open: for a WSL spec the native
 	// Windows path of the file, never the distro path.
 	OpenPath string
-	// Roots are the allowed roots of this spec, as configured (instance
-	// config dir first, then the applicable runtime_allowed_log_dirs bases):
-	// openLogFile requires the opened file's final path strictly inside one
-	// of them, each resolved at check time.
+	// Root is the allowed root OpenPath matched, as configured (for a
+	// ${CONFIG_DIR} file the instance config dir), and Rel is OpenPath below
+	// it: a local, native-separated relative path. openLogFile opens exactly
+	// Rel inside an os.Root anchored at Root, so nothing above Root is
+	// resolved again once the root is open.
+	Root string
+	Rel  string
+	// Roots are all the allowed roots of this spec, as configured (instance
+	// config dir first, then the applicable runtime_allowed_log_dirs bases).
+	// Refusal messages count them; the open uses Root alone.
 	Roots []string
 	// ConfigBase and ConfigDir are the absolute config_files_dir and the
 	// instance's ${CONFIG_DIR} beneath it ("" when the spec has none).
 	// ConfigDir counts as a root only while it is a real directory chain
-	// under ConfigBase (resolveInstanceConfigDir).
+	// under ConfigBase (openInstanceRoot).
 	ConfigBase string
 	ConfigDir  string
 	// InConfigDir reports that OpenPath is a DIRECT child of the instance's
@@ -88,7 +97,8 @@ const logFileSettingNames = "runtime_allowed_log_dirs (OP_AGENT_RUNTIME_ALLOWED_
 
 // pseudoFSRoots are the Linux kernel pseudo filesystems: their "files" are
 // process memory, kernel state and devices, never a server's log. Refused on
-// the cleaned path and again on the resolved one, whatever the allowlist says.
+// the cleaned path, whatever the allowlist says; the anchored open cannot
+// reach them from a root outside them (an absolute link is never followed).
 var pseudoFSRoots = []string{"/proc", "/sys", "/dev"}
 
 // windowsNameReason is the refusal reason for windowsNameRefused.
@@ -165,14 +175,19 @@ func (r logFileResolution) resolveNative(roots []string) (logFileTarget, error) 
 	if matched == "" {
 		return logFileTarget{}, r.refuse(fmt.Sprintf("lies outside the spec's ${CONFIG_DIR} and every entry of %s; the list holds %d native entries", logFileSettingNames, r.nativeEntries))
 	}
+	rel, err := filepath.Rel(matched, c)
+	if err != nil {
+		return logFileTarget{}, r.refuse(fmt.Sprintf("does not lie below its root; %s does not apply to it", logFileSettingNames))
+	}
 	// Windows opens "NUL" or "x.log." as something other than the name says;
 	// checked on the part below the matched root, which the spec chose.
-	if goruntime.GOOS == "windows" {
-		if rel, err := filepath.Rel(matched, c); err != nil || windowsNameRefused(rel) {
-			return logFileTarget{}, r.refuse(windowsNameReason)
-		}
+	if goruntime.GOOS == "windows" && windowsNameRefused(rel) {
+		return logFileTarget{}, r.refuse(windowsNameReason)
 	}
-	return r.target(c, r.withInst(roots)), nil
+	if !filepath.IsLocal(rel) {
+		return logFileTarget{}, r.refuse(fmt.Sprintf("does not lie below its root; %s does not apply to it", logFileSettingNames))
+	}
+	return r.target(c, matched, rel, r.withInst(roots)), nil
 }
 
 func (r logFileResolution) resolveWSL(configFilesDir string, winRoots []string, distroEntries int) (logFileTarget, error) {
@@ -198,7 +213,7 @@ func (r logFileResolution) resolveWSL(configFilesDir string, winRoots []string, 
 				if !strictlyWithinDir(open, r.inst) {
 					return logFileTarget{}, r.refuse(fmt.Sprintf("does not map into the spec's ${CONFIG_DIR}; %s does not apply to it", logFileSettingNames))
 				}
-				return r.target(open, all), nil
+				return r.target(open, r.inst, filepath.FromSlash(rel), all), nil
 			}
 		}
 	}
@@ -208,7 +223,7 @@ func (r logFileResolution) resolveWSL(configFilesDir string, winRoots []string, 
 				if windowsNameRefused(rel) {
 					return logFileTarget{}, r.refuse(windowsNameReason)
 				}
-				return r.target(win, all), nil
+				return r.target(win, root, filepath.FromSlash(rel), all), nil
 			}
 		}
 		return logFileTarget{}, r.refuse(fmt.Sprintf("is a /mnt/<drive> path outside the spec's ${CONFIG_DIR} and every native entry of %s; the list holds %d native entries", logFileSettingNames, r.nativeEntries))
@@ -216,9 +231,10 @@ func (r logFileResolution) resolveWSL(configFilesDir string, winRoots []string, 
 	return logFileTarget{}, r.refuse(fmt.Sprintf("is a path inside the wsl distro; only ${CONFIG_DIR} and /mnt/<drive> paths of a wsl spec are tailed in this version, even under a wsl:// entry of %s (%d wsl:// entries name this distro)", logFileSettingNames, distroEntries))
 }
 
-// target builds the accepted target for the agent-side path openPath.
-func (r logFileResolution) target(openPath string, roots []string) logFileTarget {
-	t := logFileTarget{Name: r.lf.Name, OpenPath: openPath, Roots: roots}
+// target builds the accepted target for the agent-side path openPath, which
+// lies at rel below the allowed root root.
+func (r logFileResolution) target(openPath, root, rel string, roots []string) logFileTarget {
+	t := logFileTarget{Name: r.lf.Name, OpenPath: openPath, Root: root, Rel: rel, Roots: roots}
 	if r.instOK {
 		t.ConfigBase, t.ConfigDir = r.base, r.inst
 		t.InConfigDir = filepath.Dir(openPath) == r.inst
@@ -263,34 +279,62 @@ func instanceConfigDir(spec Spec, configFilesDir string) (base, dir string, ok b
 	return base, dir, true
 }
 
-// resolveInstanceConfigDir resolves the instance config dir for comparison
-// with a final path, WITHOUT following anything below the base: every
-// component from base down to dir must be a real directory (os.Lstat; a
-// symlink or a junction is refused), and the result is the resolved base
-// joined with that relative part. The base itself is operator configuration
-// and may be a link (a mounted volume); the part below it is reachable by the
-// server and may not.
-func resolveInstanceConfigDir(base, dir string) (string, error) {
+// errInstanceDirNotReal is the refusal cause of an instance config dir that
+// is not a real directory chain under config_files_dir.
+var errInstanceDirNotReal = fmt.Errorf("%w: the instance config dir is not a real directory under config_files_dir", errLogFileNotPermitted)
+
+// openInstanceRoot opens the instance config dir as an os.Root WITHOUT
+// following anything below the base. It opens the base (operator
+// configuration, which may itself be a link, such as a mounted volume), then
+// walks down one component at a time, each step anchored at the directory
+// handle of the step before: the component is Root.Lstat'ed (a symlink, a
+// junction or any other reparse point is refused), opened with
+// Root.OpenRoot, and the opened directory must be os.SameFile with the one
+// just Lstat'ed. A server that swaps a component for a link between the two
+// calls gets a refusal; once a handle is verified, later swaps of its name do
+// not move it. The part below the base is reachable by the server, so a link
+// there must not turn another directory (another instance's, or /etc) into
+// this instance's root. A missing component is an fs.ErrNotExist error; a
+// refusal wraps errLogFileNotPermitted (errInstanceDirNotReal).
+func openInstanceRoot(base, dir string) (*os.Root, error) {
 	rel, err := filepath.Rel(base, dir)
 	if err != nil || rel == "." || !filepath.IsLocal(rel) {
-		return "", fmt.Errorf("%w: the instance config dir is not inside config_files_dir", errLogFileNotPermitted)
+		return nil, fmt.Errorf("%w: the instance config dir is not inside config_files_dir", errLogFileNotPermitted)
 	}
-	cur := base
-	for seg := range strings.SplitSeq(rel, string(filepath.Separator)) {
-		cur = filepath.Join(cur, seg)
-		fi, err := os.Lstat(cur)
-		if err != nil {
-			return "", openErr(err)
-		}
-		if !isRealDir(fi) {
-			return "", fmt.Errorf("%w: the instance config dir is not a real directory under config_files_dir", errLogFileNotPermitted)
-		}
-	}
-	rb, err := resolveLogRoot(base)
+	cur, err := os.OpenRoot(base)
 	if err != nil {
-		return "", openErr(err)
+		return nil, openErr(err)
 	}
-	return filepath.Join(rb, rel), nil
+	for seg := range strings.SplitSeq(rel, string(filepath.Separator)) {
+		next, err := openRealSubdir(cur, seg)
+		_ = cur.Close()
+		if err != nil {
+			return nil, err
+		}
+		cur = next
+	}
+	return cur, nil
+}
+
+// openRealSubdir is one step of openInstanceRoot: the single component seg
+// of parent, which must be a real directory, opened as an os.Root.
+func openRealSubdir(parent *os.Root, seg string) (*os.Root, error) {
+	fi, err := parent.Lstat(seg)
+	if err != nil {
+		return nil, openErr(err)
+	}
+	if !isRealDir(fi) {
+		return nil, errInstanceDirNotReal
+	}
+	next, err := parent.OpenRoot(seg)
+	if err != nil {
+		return nil, openErr(err)
+	}
+	if nfi, err := next.Stat("."); err != nil || !os.SameFile(fi, nfi) {
+		_ = next.Close()
+		return nil, errInstanceDirNotReal
+	}
+	return next, nil
 }
 
 // isRealDir reports a directory that is nothing else: not a symlink, and not a
@@ -304,15 +348,13 @@ func isRealDir(fi fs.FileInfo) bool {
 // removeConfigDirLogFile removes target's file before exec (§5.3), the only
 // deletion the log-file feature performs. It refuses (errLogFileNotPermitted)
 // unless target is a direct child of the instance config dir and that dir is
-// a real directory chain under config_files_dir (resolveInstanceConfigDir),
-// re-verified at call time.
+// a real directory chain under config_files_dir, re-verified at call time.
 //
-// The removal itself runs on a directory handle, not a path: the instance dir
-// is opened as an os.Root beneath an os.Root of the base, and that handle
-// must be os.SameFile with the dir just Lstat'd as a real directory. A server
-// that swaps its instance dir for a link after the check therefore gets a
-// refusal, never a deletion through the link; once the handle is verified,
-// later swaps no longer matter. The leaf is removed without following it
+// The removal runs on a directory handle, not a path: the instance dir is
+// opened by openInstanceRoot, which verifies every component below the base
+// as a real directory on the handle it then uses, so a server that swaps its
+// instance dir (or a component above it) for a link gets a refusal, never a
+// deletion through the link. The leaf is removed without following it
 // (Root.Remove of a symlink removes the link), a leaf that is a directory is
 // refused, and a missing dir or file is not an error.
 func removeConfigDirLogFile(target logFileTarget) error {
@@ -320,24 +362,16 @@ func removeConfigDirLogFile(target logFileTarget) error {
 	if !target.InConfigDir || target.ConfigDir == "" || filepath.Dir(leaf) != target.ConfigDir {
 		return logRemoveRefusal(target, "is not a direct child of the spec's ${CONFIG_DIR}")
 	}
-	if _, err := resolveInstanceConfigDir(target.ConfigBase, target.ConfigDir); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil // no directory, so no file to remove
-		}
-		return logRemoveRefusal(target, "is not in a real directory under config_files_dir")
-	}
-	dirFi, err := os.Lstat(target.ConfigDir)
-	if err != nil || !isRealDir(dirFi) {
-		return logRemoveRefusal(target, "is not in a real directory under config_files_dir")
-	}
 	inst, err := openInstanceRoot(target.ConfigBase, target.ConfigDir)
-	if err != nil {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil // no directory, so no file to remove
+	case errors.Is(err, errLogFileNotPermitted):
+		return logRemoveRefusal(target, "is not in a real directory under config_files_dir")
+	case err != nil:
 		return logRemoveRefusal(target, "is in a directory the agent cannot open")
 	}
 	defer func() { _ = inst.Close() }()
-	if rfi, err := inst.Stat("."); err != nil || !os.SameFile(dirFi, rfi) {
-		return logRemoveRefusal(target, "is in a directory that changed while it was checked")
-	}
 	name := filepath.Base(leaf)
 	fi, err := inst.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -353,21 +387,6 @@ func removeConfigDirLogFile(target logFileTarget) error {
 		return openErr(err)
 	}
 	return nil
-}
-
-// openInstanceRoot opens dir as an os.Root, reached through an os.Root of
-// base, so the walk from base to dir cannot leave base.
-func openInstanceRoot(base, dir string) (*os.Root, error) {
-	rel, err := filepath.Rel(base, dir)
-	if err != nil {
-		return nil, err
-	}
-	b, err := os.OpenRoot(base)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = b.Close() }()
-	return b.OpenRoot(rel)
 }
 
 func logRemoveRefusal(target logFileTarget, reason string) error {
@@ -499,57 +518,134 @@ func underPseudoFS(p string) bool {
 }
 
 // openLogFile opens target read-only for tailing and runs the resolved half of
-// the policy (see the file comment). The platform open (openLogFileHandle)
-// never blocks, never hinders the server's writes, renames or deletes, and
-// refuses anything but a regular file. Then, in this order, because the
-// server can change the file's names while the agent looks:
+// the policy (see the file comment).
 //
-//  1. the descriptor's link count must be 1 (checkLinkCount), an early
-//     refusal of an in-tree hard link to an outside file, whose final path
-//     would be inside;
-//  2. the final path is computed (openedFinalPath);
-//  3. the BINDING (bindFinalPath): the final path must still name THIS file
-//     and that file must have exactly one name, both read from ONE stat of
-//     the final path (statFinalBinding: os.Lstat on POSIX, one
-//     GetFileInformationByHandle on Windows). One observation that shows the
-//     inside name is this file and has a single link proves no other name
-//     existed at that instant. Separate syscalls would not: a server toggling
-//     an inside hard link could show "one link" to one call and "this file"
-//     to the next. This step is the guarantee; 1 and 4 are extra layers;
-//  4. the descriptor's link count is read again and must still be 1;
-//  5. the final path must lie strictly inside one of target.Roots, each
-//     resolved the same way, and outside the pseudo filesystems.
+// Containment is by construction, not by comparing paths afterwards: an
+// os.Root is opened at target.Root (for a ${CONFIG_DIR} file the instance
+// dir, through openInstanceRoot's real-directory walk; otherwise the
+// configured root, whose own links are operator configuration and are
+// followed once), and target.Rel is opened INSIDE it (openInRoot, per
+// platform). os.Root walks the relative path one component at a time from the
+// root's handle (openat with O_NOFOLLOW on Unix, NtCreateFile relative to the
+// parent handle with OBJ_DONT_REPARSE on Windows). It follows a symlink only
+// when the link stays below the root, refuses an absolute link, a junction to
+// an absolute target and a ".." that climbs above the root, and resolves ".."
+// by restarting from the root rather than by opening the parent, so swapping
+// a parent directory for a link mid-walk cannot lead outside. The platform
+// open never blocks, never hinders the server's writes, renames or deletes,
+// and refuses anything but a regular file.
 //
-// On a refusal the file is closed and the error wraps errLogFileNotPermitted.
-// A file whose last name went away during these steps (descriptor link count
-// 0) is errLogFileVanished, an fs.ErrNotExist like a file not created yet: the
-// tailer retries it. Any other error carries the OS cause without the path.
+// Containment of the opened file still leaves hard links: an inside name of an
+// outside file passes every walk. So, after the open (bindOpenedLogFile):
+//
+//  1. the descriptor's link count must be 1 (an early refusal; 0 means the
+//     file lost its last name and is errLogFileVanished);
+//  2. target.Rel is observed ONCE more through the same root
+//     (statLogFileName: one Root.Stat on Unix, one GetFileInformationByHandle
+//     on a handle opened through the root on Windows). That observation must
+//     show the descriptor's file and a link count of 1. It is root-anchored,
+//     so it re-resolves nothing above the root, and it follows a link below
+//     the root only if the link stays below it, so the name it finds is an
+//     inside name. An inside name that is this file, on a file with a single
+//     name, means no outside name existed when the count was read.
+//
+// The residual window is honest but narrow: the lookup of the last component
+// and the read of the link count are separate steps inside the kernel (or two
+// calls on one handle on Windows), so a name can change between them, and a
+// directory the walk already holds can be renamed away from below the root
+// without the walk noticing (os.Root tracks directories by handle). Exploiting
+// either needs a name of the outside file the server can remove or relink,
+// which a server that could do so does not need the agent for.
+//
+// Classification: a name that is missing in the root, or that names another
+// file, or that now leads out of the root, AFTER the open succeeded, is
+// errLogFileVanished (an fs.ErrNotExist, like a file not created yet): a
+// rotation or a delete in the window, which the tailer retries, and the
+// retry's own open refuses a lasting escape. A link count above 1, a file that
+// is not regular, and an escape os.Root refuses AT the open wrap
+// errLogFileNotPermitted. On a refusal the file is closed. Any other error
+// carries the OS cause without the path.
 func openLogFile(target logFileTarget) (*os.File, error) {
-	f, err := openLogFileHandle(target)
+	if target.Root == "" || !filepath.IsLocal(target.Rel) {
+		return nil, logOpenRefusal(target, "does not lie below an allowed root")
+	}
+	root, err := openLogRoot(target)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := checkOpenedLogFile(f, target); err != nil {
+	defer func() { _ = root.Close() }()
+	f, err := openInRoot(root, target)
+	if err != nil {
+		return nil, err
+	}
+	if err := bindOpenedLogFile(root, f, target); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	return f, nil
 }
 
-// logFileOpenStage names the moments of checkOpenedLogFile the test seam can
-// interpose at.
+// openLogRoot opens the os.Root openLogFile anchors at (see its doc).
+func openLogRoot(target logFileTarget) (*os.Root, error) {
+	if target.ConfigDir != "" && target.Root == target.ConfigDir {
+		root, err := openInstanceRoot(target.ConfigBase, target.ConfigDir)
+		if errors.Is(err, errLogFileNotPermitted) {
+			return nil, logOpenRefusal(target, "is in an instance config dir that is not a real directory under config_files_dir")
+		}
+		return root, err
+	}
+	root, err := os.OpenRoot(target.Root)
+	if err != nil {
+		return nil, openErr(err)
+	}
+	return root, nil
+}
+
+// classifyInRootErr turns an error of opening or stat'ing target.Rel through
+// the root, BEFORE the open succeeded, into the policy's answer: a missing
+// name stays an fs.ErrNotExist error, os.Root's refusal of a path that would
+// leave the root (and a symlink loop, which os.Root also stops) is a refusal,
+// and anything else is the OS cause without the path.
+func classifyInRootErr(target logFileTarget, err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return openErr(err)
+	}
+	if isRootEscape(err) {
+		return logOpenRefusal(target, "is reached through a link or a path that leaves its allowed root")
+	}
+	return openErr(err)
+}
+
+// isRootEscape reports os.Root's refusal to leave the root. os.Root signals it
+// with an unexported error ("path escapes from parent", os/file.go
+// errPathEscapes) inside the *PathError, which is the only cause it returns
+// that is not a syscall.Errno; ELOOP is counted too (a link loop, or more than
+// os.Root's eight links).
+func isRootEscape(err error) bool {
+	var pe *fs.PathError
+	if !errors.As(err, &pe) {
+		return false
+	}
+	var errno syscall.Errno
+	if errors.As(pe.Err, &errno) {
+		return errno == syscall.ELOOP
+	}
+	return true
+}
+
+// logFileOpenStage names the moments after the open the test seam can
+// interpose at: the real windows in which a server can change the file's
+// names while the agent looks.
 type logFileOpenStage int
 
 const (
-	stageBeforeLinkCount logFileOpenStage = iota // before step 1
-	stageAfterLinkCount                          // between steps 1 and 2
-	stageAfterFinalPath                          // between steps 2 and 3
-	stageAfterBinding                            // between steps 3 and 4
+	stageAfterOpen      logFileOpenStage = iota // the file is open; before step 1
+	stageAfterLinkCount                         // between steps 1 and 2
 )
 
-// logFileOpenSeam, when set, runs at each stage of checkOpenedLogFile. It is a
-// TEST SEAM only: the tests use it to change the file's names at exactly the
-// moments the race checks guard.
+// logFileOpenSeam, when set, runs at each stage of bindOpenedLogFile. It is a
+// TEST SEAM only, nil in production: the tests use it to change the file's
+// names at exactly the moments the binding guards.
 var logFileOpenSeam func(logFileOpenStage)
 
 func runLogFileOpenSeam(stage logFileOpenStage) {
@@ -558,115 +654,55 @@ func runLogFileOpenSeam(stage logFileOpenStage) {
 	}
 }
 
-// errLogFileVanished is the fs.ErrNotExist of a file whose last name was
-// removed while openLogFile looked at it.
+// errLogFileVanished is the fs.ErrNotExist of a file whose name went away (or
+// came to name something else) while openLogFile looked at it.
 var errLogFileVanished = fmt.Errorf("runtime: open log file: the file was removed while it was opened: %w", fs.ErrNotExist)
 
-// checkOpenedLogFile runs steps 1-5 of openLogFile on the opened f and returns
-// the final path, or the refusal (or errLogFileVanished).
-func checkOpenedLogFile(f *os.File, target logFileTarget) (string, error) {
-	runLogFileOpenSeam(stageBeforeLinkCount)
-	if err := checkLinkCount(f, target, ""); err != nil {
-		return "", err
-	}
-	runLogFileOpenSeam(stageAfterLinkCount)
-	final, err := openedFinalPath(f, target.OpenPath)
-	if err != nil {
-		// Off Linux, openedFinalPath resolves the path by name, so a rotation
-		// or delete in this window lands here.
-		return "", vanishedOrRefusal(f, target, "", "has a final path that cannot be determined")
-	}
-	runLogFileOpenSeam(stageAfterFinalPath)
-	if err := bindFinalPath(f, target, final); err != nil {
-		return "", err
-	}
-	runLogFileOpenSeam(stageAfterBinding)
-	if err := checkLinkCount(f, target, final); err != nil {
-		return "", err
-	}
-	if hasTwoLeadingSeparators(final) || !filepath.IsAbs(final) {
-		return "", logOpenRefusal(target, final, "resolves to a UNC, device or relative path")
-	}
-	if underPseudoFS(final) {
-		return "", logOpenRefusal(target, final, "resolves under a kernel pseudo filesystem (proc, sys or dev)")
-	}
-	for _, root := range target.Roots {
-		var resolved string
-		var err error
-		if target.ConfigDir != "" && root == target.ConfigDir {
-			resolved, err = resolveInstanceConfigDir(target.ConfigBase, target.ConfigDir)
-		} else {
-			resolved, err = resolveLogRoot(root)
-		}
-		if err != nil {
-			continue // a root that does not exist, or may not be used, contains nothing
-		}
-		if strictlyWithinDir(final, resolved) {
-			return final, nil
-		}
-	}
-	return "", logOpenRefusal(target, final, "resolves outside every allowed root")
-}
-
-// checkLinkCount requires the descriptor's link count to be exactly 1; 0
-// means the file has no name left (errLogFileVanished).
-func checkLinkCount(f *os.File, target logFileTarget, final string) error {
-	n, err := openedLinkCount(f)
-	switch {
-	case err != nil:
-		return logOpenRefusal(target, final, "has a link count that cannot be read")
-	case n == 0:
-		return errLogFileVanished
-	case n != 1:
-		return logOpenRefusal(target, final, "has more than one hard link")
-	}
-	return nil
-}
-
-// vanishedOrRefusal is errLogFileVanished when the descriptor's file has no
-// name left (it was rotated away or deleted: the tailer retries), else the
-// refusal for reason.
-func vanishedOrRefusal(f *os.File, target logFileTarget, final, reason string) error {
-	if n, err := openedLinkCount(f); err == nil && n == 0 {
-		return errLogFileVanished
-	}
-	return logOpenRefusal(target, final, reason)
-}
-
-// finalBinding is what ONE stat of the final path says about it, compared
-// with the opened file: whether it is a plain regular file (no link, no
-// directory), whether it is the same file as the descriptor, and how many
-// names that file has. The three come from the same observation by
-// construction (statFinalBinding), which is what makes the binding race-free.
-type finalBinding struct {
-	regular bool
+// nameBinding is what ONE observation of target.Rel through the root says,
+// compared with the opened file: whether the name leads to the same file as
+// the descriptor, whether that is a plain regular file, and how many names the
+// file has.
+type nameBinding struct {
 	same    bool
+	regular bool
 	nlink   uint64
 }
 
-// bindFinalPath is step 3 of openLogFile: final must still name the file f is
-// open on, and that file must have exactly one name, in one observation.
-func bindFinalPath(f *os.File, target logFileTarget, final string) error {
-	if strings.HasSuffix(final, " (deleted)") {
-		return vanishedOrRefusal(f, target, final, "lost its name while it was opened")
-	}
-	b, err := statFinalBinding(f, final)
+// bindOpenedLogFile runs steps 1 and 2 of openLogFile's doc on the opened f.
+func bindOpenedLogFile(root *os.Root, f *os.File, target logFileTarget) error {
+	runLogFileOpenSeam(stageAfterOpen)
+	n, err := openedLinkCount(f)
 	switch {
 	case err != nil:
-		return vanishedOrRefusal(f, target, final, "lost its name while it was opened")
-	case !b.regular:
-		return logOpenRefusal(target, final, "has a final path that is not a regular file")
+		return logOpenRefusal(target, "has a link count that cannot be read")
+	case n == 0:
+		return errLogFileVanished
+	case n != 1:
+		return logOpenRefusal(target, "has more than one hard link")
+	}
+	runLogFileOpenSeam(stageAfterLinkCount)
+	b, err := statLogFileName(root, f, target.Rel)
+	switch {
+	case err != nil && (errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) || isRootEscape(err)):
+		// Deleted, rotated, or a parent replaced (by a file, or by a link
+		// leading out of the root) after the open.
+		return errLogFileVanished
+	case err != nil:
+		return openErr(err)
 	case !b.same:
-		return vanishedOrRefusal(f, target, final, "has a final path that names another file")
+		// Rotated, or replaced by a directory or a link, after the open.
+		return errLogFileVanished
+	case !b.regular:
+		return logOpenRefusal(target, "is not a regular file")
 	case b.nlink != 1:
-		return logOpenRefusal(target, final, "has more than one hard link")
+		return logOpenRefusal(target, "has more than one hard link")
 	}
 	return nil
 }
 
 // logOpenRefusal is the refusal of an opened (or about-to-be-opened) file.
-func logOpenRefusal(target logFileTarget, final, reason string) error {
-	slog.Warn("runtime: log file refused at open", "log_file", target.Name, "path", target.OpenPath, "resolved", final, "reason", reason)
+func logOpenRefusal(target logFileTarget, reason string) error {
+	slog.Warn("runtime: log file refused at open", "log_file", target.Name, "path", target.OpenPath, "root", target.Root, "reason", reason)
 	return fmt.Errorf("%w: log file %q %s (allowed: the spec's ${CONFIG_DIR} and %s, %d roots); see the agent log", errLogFileNotPermitted, target.Name, reason, logFileSettingNames, len(target.Roots))
 }
 

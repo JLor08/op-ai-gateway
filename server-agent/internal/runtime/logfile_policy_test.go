@@ -225,6 +225,13 @@ func TestResolveLogFile(t *testing.T) {
 			if len(got.Roots) == 0 {
 				t.Fatalf("resolveLogFile(%q) returned no roots", tc.path)
 			}
+			// The open is anchored at Root and names Rel below it.
+			if got.Root == "" || !filepath.IsLocal(got.Rel) {
+				t.Fatalf("resolveLogFile(%q) = %+v, want a root and a local path below it", tc.path, got)
+			}
+			if _, drive := windowsDirKey(got.OpenPath); !drive && filepath.Join(got.Root, got.Rel) != got.OpenPath {
+				t.Fatalf("resolveLogFile(%q): Root %q + Rel %q != OpenPath %q", tc.path, got.Root, got.Rel, got.OpenPath)
+			}
 		})
 	}
 }
@@ -345,7 +352,7 @@ func mustOpenAndRead(t *testing.T, target logFileTarget, want string) {
 	}
 }
 
-// TestOpenLogFileRefusesSymlinkEscape is the resolved-path half (§5.2 steps
+// TestOpenLogFileRefusesSymlinkEscape is the anchored half (§5.2 steps
 // 2, 3 and 5): a path that passes the lexical check but resolves outside the
 // allowed tree, or is not a regular file, is refused at open, and refused again
 // when a reopen finds the file swapped for an escaping link.
@@ -373,8 +380,19 @@ func TestOpenLogFileRefusesSymlinkEscape(t *testing.T) {
 		mustRefuseOpen(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/sub/secret.txt"))
 	})
 	t.Run("symlink to a file inside", func(t *testing.T) {
-		mustSymlink(t, filepath.Join(inst, "real.log"), filepath.Join(inst, "in.log"))
+		mustSymlink(t, "real.log", filepath.Join(inst, "in.log"))
 		mustOpenAndRead(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/in.log"), "inside")
+	})
+	t.Run("relative symlink through a subdirectory, staying inside", func(t *testing.T) {
+		mustWrite(t, filepath.Join(inst, "logs", "app.log"), "nested")
+		mustSymlink(t, "logs/../logs/app.log", filepath.Join(inst, "nested.log"))
+		mustOpenAndRead(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/nested.log"), "nested")
+	})
+	t.Run("absolute symlink is refused even when it points inside", func(t *testing.T) {
+		// The open is anchored at the root (os.Root), which never follows an
+		// absolute link: what it names is decided outside the root.
+		mustSymlink(t, filepath.Join(inst, "real.log"), filepath.Join(inst, "abs.log"))
+		mustRefuseOpen(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/abs.log"))
 	})
 	t.Run("regular file", func(t *testing.T) {
 		mustOpenAndRead(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/real.log"), "inside")
@@ -394,7 +412,8 @@ func TestOpenLogFileRefusesSymlinkEscape(t *testing.T) {
 			t.Skip("no /proc on this host")
 		}
 		// Allowed everywhere the lexical check looks: the link sits in the
-		// instance's own directory; /proc is refused on the resolved path.
+		// instance's own directory; the anchored open never follows the
+		// absolute link to /proc.
 		mustSymlink(t, "/proc/self/environ", filepath.Join(inst, "env.log"))
 		mustRefuseOpen(t, openTarget(t, cfgDir, nil, "${CONFIG_DIR}/env.log"))
 	})
@@ -426,7 +445,8 @@ func TestOpenLogFileRefusesSymlinkEscape(t *testing.T) {
 
 // TestOpenLogFileRootIsSymlink: an allowed root that is itself a symlink (a
 // mounted volume, macOS's /var -> /private/var) compares correctly, because
-// the roots are resolved too; a link under it that escapes is still refused.
+// os.OpenRoot follows links in the root's own name; a link under it that
+// escapes is still refused.
 func TestOpenLogFileRootIsSymlink(t *testing.T) {
 	if goruntime.GOOS == "windows" {
 		t.Skip("creating symlinks needs a privilege on Windows")
@@ -475,7 +495,8 @@ func TestWindowsNameRefused(t *testing.T) {
 }
 
 // TestOpenLogFileRefusesHardLink: a hard link inside ${CONFIG_DIR} to a file
-// outside has an inside final path, so only the link count can refuse it.
+// outside is reached through inside names only, so only the link count can
+// refuse it.
 func TestOpenLogFileRefusesHardLink(t *testing.T) {
 	if goruntime.GOOS == "windows" {
 		t.Skip("covered by the Windows test file")

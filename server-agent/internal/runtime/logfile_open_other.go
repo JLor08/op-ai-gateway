@@ -7,35 +7,32 @@ package runtime
 
 import (
 	"os"
-	"path/filepath"
-	goruntime "runtime"
-	"strconv"
 	"syscall"
 )
 
-// openLogFileHandle opens target.OpenPath read-only for openLogFile. A
-// pre-open stat refuses a target that is not a regular file before open(2)
-// can run a device's open side effects; the authoritative check is the fstat
-// of the opened descriptor. O_NONBLOCK makes the open itself never wait (a
-// FIFO swapped in after the stat would otherwise block until a writer
+// openInRoot opens target.Rel read-only inside root for openLogFile. A
+// pre-open Root.Stat refuses a target that is not a regular file before
+// open(2) can run a device's open side effects; the authoritative check is
+// the fstat of the opened descriptor. O_NONBLOCK makes the open itself never
+// wait (a FIFO swapped in after the stat would otherwise block until a writer
 // appears); it is cleared once the descriptor is known to be a regular file.
 // O_NOCTTY keeps a terminal from becoming the agent's controlling terminal.
-// The link count and the final path are openLogFile's steps, not this one's.
-func openLogFileHandle(target logFileTarget) (*os.File, error) {
-	fi, err := os.Stat(target.OpenPath)
+// Both calls go through root, so neither can leave it (openLogFile's doc).
+func openInRoot(root *os.Root, target logFileTarget) (*os.File, error) {
+	fi, err := root.Stat(target.Rel)
 	if err != nil {
-		return nil, openErr(err)
+		return nil, classifyInRootErr(target, err)
 	}
 	if !fi.Mode().IsRegular() {
-		return nil, logOpenRefusal(target, "", "is not a regular file")
+		return nil, logOpenRefusal(target, "is not a regular file")
 	}
-	f, err := os.OpenFile(target.OpenPath, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
+	f, err := root.OpenFile(target.Rel, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
 	if err != nil {
-		return nil, openErr(err)
+		return nil, classifyInRootErr(target, err)
 	}
 	if ofi, err := f.Stat(); err != nil || !ofi.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, logOpenRefusal(target, "", "is not a regular file")
+		return nil, logOpenRefusal(target, "is not a regular file")
 	}
 	if err := clearNonblock(f); err != nil {
 		_ = f.Close()
@@ -59,65 +56,16 @@ func clearNonblock(f *os.File) error {
 	return serr
 }
 
-// openedFinalPath is the final path of the file f is open on. On Linux it is
-// the kernel's own answer for the descriptor (/proc/self/fd/N), which for a
-// name unlinked since the open ends in " (deleted)" -- openLogFile refuses
-// that. Elsewhere (and on a Linux host without /proc) it is
-// filepath.EvalSymlinks of the path. Either way openLogFile then binds the
-// result to the descriptor (os.Lstat + os.SameFile), so a path swapped after
-// the open cannot vouch for a different file.
-func openedFinalPath(f *os.File, openPath string) (string, error) {
-	if goruntime.GOOS == "linux" {
-		if p, err := fdPath(f); err == nil && filepath.IsAbs(p) {
-			return p, nil
-		}
-	}
-	final, err := filepath.EvalSymlinks(openPath)
-	if err != nil {
-		return "", err
-	}
-	ofi, err := f.Stat()
-	if err != nil {
-		return "", err
-	}
-	rfi, err := os.Lstat(final)
-	if err != nil {
-		return "", err
-	}
-	if !os.SameFile(ofi, rfi) {
-		return "", os.ErrInvalid
-	}
-	return final, nil
-}
-
-// fdPath reads /proc/self/fd/N for f's descriptor.
-func fdPath(f *os.File) (string, error) {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return "", err
-	}
-	var p string
-	var rerr error
-	if err := rc.Control(func(fd uintptr) {
-		p, rerr = os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(fd), 10))
-	}); err != nil {
-		return "", err
-	}
-	return p, rerr
-}
-
-// resolveLogRoot resolves an allowed root the way the opened file's final
-// path is resolved, so a root that is itself a symlink compares correctly.
-func resolveLogRoot(root string) (string, error) {
-	return filepath.EvalSymlinks(root)
-}
-
 // openedLinkCount is the hard-link count of the file f is open on (fstat).
 func openedLinkCount(f *os.File) (uint64, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return 0, err
 	}
+	return statNlink(fi)
+}
+
+func statNlink(fi os.FileInfo) (uint64, error) {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok || st == nil {
 		return 0, os.ErrInvalid
@@ -128,25 +76,23 @@ func openedLinkCount(f *os.File) (uint64, error) {
 // isReparsePoint is a Windows notion; elsewhere a link is ModeSymlink.
 func isReparsePoint(os.FileInfo) bool { return false }
 
-// statFinalBinding observes final with ONE os.Lstat: its type, its identity
-// (compared with the descriptor's, which cannot change) and its link count
-// all come from that single stat (bindFinalPath's doc says why).
-func statFinalBinding(f *os.File, final string) (finalBinding, error) {
+// statLogFileName observes rel through root with ONE Root.Stat: its last step
+// is an fstatat(AT_SYMLINK_NOFOLLOW) on the final non-link name the root walk
+// reached (a link below the root is followed only if it stays below it), so
+// identity and link count come from the same stat. The descriptor's identity
+// cannot change, so comparing it from a separate fstat is sound.
+func statLogFileName(root *os.Root, f *os.File, rel string) (nameBinding, error) {
 	ofi, err := f.Stat()
 	if err != nil {
-		return finalBinding{}, err
+		return nameBinding{}, err
 	}
-	lfi, err := os.Lstat(final)
+	fi, err := root.Stat(rel)
 	if err != nil {
-		return finalBinding{}, err
+		return nameBinding{}, err
 	}
-	st, ok := lfi.Sys().(*syscall.Stat_t)
-	if !ok || st == nil {
-		return finalBinding{}, os.ErrInvalid
+	n, err := statNlink(fi)
+	if err != nil {
+		return nameBinding{}, err
 	}
-	return finalBinding{
-		regular: lfi.Mode().IsRegular(),
-		same:    os.SameFile(ofi, lfi),
-		nlink:   uint64(st.Nlink), //nolint:unconvert // Nlink is narrower than uint64 on some GOOS
-	}, nil
+	return nameBinding{same: os.SameFile(ofi, fi), regular: fi.Mode().IsRegular(), nlink: n}, nil
 }
