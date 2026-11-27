@@ -503,7 +503,17 @@ import (
 // present and an old agent simply sends none, so nothing is negotiated and no
 // agent.Features entry is added. This is the ONE bump for the whole branch;
 // later commits on it do not bump again.
-const Version = "0.25.2"
+//
+// 0.25.2 -> 0.26.0 is the single bump for runtime log files. MINOR:
+// agent.Features gains runtime_log_files. The agent tails a spec's declared
+// log_files (a ${CONFIG_DIR} file or one under the agent-local
+// runtime_allowed_log_dirs, behind a path policy) into a live-log stream of
+// their own per file, masks the generation's own resolved secrets in every
+// stream, process output included, and adds log_file_tails to a failed
+// generation's last_error (#430). The gateway reads the new fields when present
+// and an old agent simply sends none. This is the ONE bump for the whole
+// branch; later commits on it do not bump again.
+const Version = "0.26.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -2772,6 +2782,9 @@ func (a *Agent) collectOnce(ctx context.Context) {
 						Failures:   st.LastError.Failures,
 						StderrTail: st.LastError.StderrTail,
 						Code:       st.LastError.Code,
+					}
+					for _, lt := range st.LastError.LogFileTails {
+						rs.LastError.LogFileTails = append(rs.LastError.LogFileTails, sample.LogFileTailSample{Name: lt.Name, Tail: lt.Tail})
 					}
 				}
 				a.fillClusterTelemetry(&rs, st, a.cfg.ConfigFilesDir)

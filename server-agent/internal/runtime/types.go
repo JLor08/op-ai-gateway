@@ -1000,6 +1000,23 @@ type LastError struct {
 	// runtime.device_backend_mismatch) for lifecycle failures the gateway maps
 	// to a specific operator message; empty for a plain start failure or crash.
 	Code string `json:"code,omitempty"`
+	// LogFileTails is the end of each declared log file the failed generation
+	// wrote (#430 §9): at most one entry per declared file (so at most four),
+	// each at most 2 KiB, in declaration order; a file with no text of that
+	// generation (refused, missing, binary, empty) has none. It is added after
+	// the exit, once the generation's tailers have finished their grace, and
+	// only while this last_error still describes that generation -- so a
+	// last_error briefly has none, then has them. Masked like every stream
+	// (§8), and never persisted, exactly like StderrTail.
+	LogFileTails []LogFileTail `json:"log_file_tails,omitempty"`
+}
+
+// LogFileTail is one declared log file's entry in LastError.LogFileTails: the
+// declaration's name (the stream id) and the last bytes of that file's text
+// the failed generation wrote.
+type LogFileTail struct {
+	Name string `json:"name"`
+	Tail string `json:"tail"`
 }
 
 // Status is one INSTANCE's current runtime status, as tracked by the process

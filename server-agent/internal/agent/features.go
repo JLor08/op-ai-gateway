@@ -412,6 +412,19 @@ var Features = []Feature{
 	//
 	// Since is 0.21.0: agent.Features gains an entry, so the rule is a MINOR bump.
 	{Name: FeatureRuntimeProcessTreeJob, Since: "0.21.0"},
+
+	// runtime_log_files: the agent tails a spec's declared log_files (#430):
+	// each accepted file becomes a live-log stream of its own (entries carry
+	// `stream`), tailed per generation, and a failed generation's last_error
+	// gains log_file_tails. The agent alone decides which files it may read
+	// (its path policy and runtime_allowed_log_dirs, never gateway-supplied).
+	// An agent without this name ignores log_files; the gateway keeps the
+	// field in the runtime document regardless, and the portal reads the name
+	// to explain an empty file tab. The gateway spells the same string in its
+	// own constant; this module cannot import it.
+	//
+	// Since is 0.26.0: agent.Features gains an entry, so the rule is a MINOR bump.
+	{Name: FeatureRuntimeLogFiles, Since: "0.26.0"},
 }
 
 // FeatureRuntimeInstances names the runtime_instances feature (see its registry
@@ -441,6 +454,10 @@ const FeatureRuntimeGPUMainLast = "runtime_gpu_main_last"
 // FeatureRuntimeProcessTreeJob names the runtime_process_tree_job feature (see
 // its registry entry above): process-tree supervision of a spec's launcher.
 const FeatureRuntimeProcessTreeJob = "runtime_process_tree_job"
+
+// FeatureRuntimeLogFiles names the runtime_log_files feature (see its registry
+// entry above): declared log files tailed into streams of their own.
+const FeatureRuntimeLogFiles = "runtime_log_files"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {

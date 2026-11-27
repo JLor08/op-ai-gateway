@@ -615,8 +615,8 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.25.2" {
-		t.Fatalf("Version = %q, want 0.25.2; runtime_stop keeps Since 0.17.0", Version)
+	if Version != "0.26.0" {
+		t.Fatalf("Version = %q, want 0.26.0; runtime_stop keeps Since 0.17.0", Version)
 	}
 }
 
@@ -639,8 +639,8 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.25.2" {
-		t.Fatalf("Version = %q, want 0.25.2; rpc_cluster keeps Since 0.18.0", Version)
+	if Version != "0.26.0" {
+		t.Fatalf("Version = %q, want 0.26.0; rpc_cluster keeps Since 0.18.0", Version)
 	}
 }
 
@@ -696,8 +696,8 @@ func TestFeaturesDeclareRealtimeProxy(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "realtime_proxy") {
 		t.Fatal("FeatureNames() does not carry realtime_proxy, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.25.2" {
-		t.Fatalf("Version = %q, want 0.25.2; realtime_proxy keeps Since 0.20.0", Version)
+	if Version != "0.26.0" {
+		t.Fatalf("Version = %q, want 0.26.0; realtime_proxy keeps Since 0.20.0", Version)
 	}
 }
 
@@ -725,7 +725,40 @@ func TestFeaturesDeclareStrataFlags(t *testing.T) {
 			t.Fatalf("FeatureNames() does not carry %s", name)
 		}
 	}
-	if Version != "0.25.2" {
-		t.Fatalf("Version = %q, want 0.25.2", Version)
+	if Version != "0.26.0" {
+		t.Fatalf("Version = %q, want 0.26.0", Version)
+	}
+}
+
+// TestAgentFeaturesDeclaresRuntimeLogFiles pins the log-file tailing capability
+// (#430) and the version bump it brought: the agent tails a spec's declared
+// log_files into their own live-log streams and adds log_file_tails to
+// last_error. The gateway and the portal read the name to tell an agent that
+// ignores log_files from one whose files simply say nothing yet; they spell the
+// same string in their own constants, which this module cannot import.
+//
+// 0.26.0 is MINOR because agent.Features gained runtime_log_files -- the one
+// bump for the log-files branch, whatever its commit count.
+func TestAgentFeaturesDeclaresRuntimeLogFiles(t *testing.T) {
+	if FeatureRuntimeLogFiles != "runtime_log_files" {
+		t.Fatalf("FeatureRuntimeLogFiles = %q, want the wire literal runtime_log_files", FeatureRuntimeLogFiles)
+	}
+	found := false
+	for _, f := range Features {
+		if f.Name == FeatureRuntimeLogFiles {
+			found = true
+			if f.Since != "0.26.0" {
+				t.Fatalf("runtime_log_files Since = %q, want 0.26.0", f.Since)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("Features does not declare runtime_log_files")
+	}
+	if !slices.Contains(FeatureNames(), "runtime_log_files") {
+		t.Fatal("FeatureNames() does not carry runtime_log_files, so it never reaches the gateway in capabilities.features")
+	}
+	if Version != "0.26.0" {
+		t.Fatalf("Version = %q, want 0.26.0", Version)
 	}
 }

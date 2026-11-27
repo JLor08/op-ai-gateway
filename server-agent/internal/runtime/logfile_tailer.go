@@ -235,6 +235,17 @@ func (t *fileTailer) EndGrace() {
 	t.endOnce.Do(func() { close(t.endGrace) })
 }
 
+// finished reports whether the tailer has ended: the channel Stop returns is
+// closed.
+func (t *fileTailer) finished() bool {
+	select {
+	case <-t.done:
+		return true
+	default:
+		return false
+	}
+}
+
 func (t *fileTailer) run() {
 	defer close(t.done)
 	ticker := time.NewTicker(t.cfg.Interval)

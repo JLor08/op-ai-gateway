@@ -1310,6 +1310,12 @@ type runningProc struct {
 	// the collector (#424): set at start for a control that lists its tree
 	// (procTreeLister), called by waitForExit at the reap. nil otherwise.
 	unregisterTree func()
+
+	// tailers follow this generation's declared log files (#430), one per
+	// declaration the path policy accepted, in declaration order; set at
+	// start, stopped at the exit (manager_log_files.go). nil without log
+	// files.
+	tailers []*fileTailer
 }
 
 // control is p.ctl, or the native control for a runningProc built without one.
@@ -1407,6 +1413,13 @@ type specState struct {
 	restarts     int
 
 	backoffTimer *time.Timer // pending "backoff elapsed, try again" callback
+
+	// graceTailers are the log-file tailers (#430) of this instance's exited
+	// generations that may still be in their post-exit grace. The next
+	// generation's start ends the grace of those whose name it declares
+	// again (endPredecessorGraces), and Close ends them all; finished ones
+	// are dropped at the next start.
+	graceTailers []*fileTailer
 
 	// backoffOnExit records an enterBackoff call that arrived while this
 	// spec's process was still alive (the start-timeout path: terminateNow
@@ -1842,6 +1855,8 @@ func (o *owner) handle(cmd command) {
 		o.handleRelease(c)
 	case cmdChildExited:
 		o.handleChildExited(c)
+	case cmdLogFileTails:
+		o.handleLogFileTails(c)
 	case cmdStartResult:
 		o.handleStartResult(c)
 	case cmdBackoffFire:
@@ -4786,6 +4801,14 @@ func (o *owner) startProcess(st *specState) {
 		distroUID = uid
 	}
 
+	// The declared log files (#430), resolved with the port this launch
+	// really uses. Removing a ${CONFIG_DIR} file must happen before exec, so
+	// the server writes a fresh file of its own, and ending the predecessor's
+	// grace before exec keeps this generation's text out of its stream. A log
+	// file never fails the start (see prepareLogFiles).
+	logTargets, logRefused, logStale := prepareLogFiles(spec, o.policy, port, o.gpuVendor, o.gpuVendors, o.configFilesDir)
+	endPredecessorGraces(st, logTargets)
+
 	// One writer for BOTH streams: the requirement is stdout AND stderr, and
 	// sharing the writer means the interleaving an operator reads back is
 	// the interleaving the process actually produced. procLog.Write is
@@ -4897,6 +4920,9 @@ func (o *owner) startProcess(st *specState) {
 		log:       plog,
 		startedAt: time.Now(),
 		exited:    make(chan struct{}),
+		// After Started, so each file stream's file_opened follows the
+		// generation's opening marker in time.
+		tailers: startLogFileTailers(plog, logTargets, logRefused, logStale),
 	}
 	if wslUnit != "" {
 		proc.wslUnit, proc.wslDistro = wslUnit, spec.WSLDistro()
@@ -5210,13 +5236,33 @@ func (o *owner) handleStableRun(c cmdStableRun) {
 func (o *owner) handleChildExited(c cmdChildExited) {
 	st := o.specs[c.proc.specID]
 	if st == nil || st.proc != c.proc {
-		return // superseded generation: this exit no longer matters
+		// Superseded generation: this exit no longer matters -- but its
+		// log-file tailers (#430) still have to end, or they would poll
+		// forever.
+		o.stopLogFileTailers(nil, c.proc)
+		o.awaitLogFileTails(c.proc, nil)
+		return
 	}
 	o.onProcExited(st, c.exitErr)
 }
 
 func (o *owner) onProcExited(st *specState, exitErr error) {
 	proc := st.proc
+	// The generation's log-file tailers (#430) begin their grace first, for
+	// EVERY kind of exit, before anything below can start the next generation.
+	// tailsFor is the last_error this exit records, which their tails attach
+	// to once they are done (awaitLogFileTails); it stays nil for an exit that
+	// records none -- a stop, a removal -- and is set right where each failure
+	// branch below records its last_error, before anything else in this turn
+	// could replace it. A removed spec's tailers have no next generation and
+	// no reader left, so their grace ends at once.
+	var tailsFor *LastError
+	if st.removed {
+		o.stopLogFileTailers(nil, proc)
+	} else {
+		o.stopLogFileTailers(st, proc)
+	}
+	defer func() { o.awaitLogFileTails(proc, tailsFor) }()
 	// Task 4.4: capture the cold-start RAM bootstrap's memory-pressure
 	// classification inputs BEFORE the lines below clear them -- st.measuredRAM
 	// (the last RSS) is zeroed a few lines down, and the host-RAM budget is read
@@ -5443,6 +5489,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	// ordinary crash path, which records the failure and does not restart it.
 	if bootstrapSpec && o.wantsUp(st) && bootstrapDiedOfMemoryPressure(oomSignaled, lastMeasuredRAM, ramBudgetAtDeath) {
 		o.handleBootstrapMemoryPressure(st, exitCode, tail)
+		tailsFor = st.lastError
 		o.wakeAdmissionCandidates()
 		return
 	}
@@ -5457,6 +5504,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	if classified && class.Terminal && !wasHealthy {
 		o.setTerminalVerdict(st, exitClassMessage(rule, exitCode), class.Code)
 		st.lastError.ExitCode, st.lastError.StderrTail = exitCode, tail
+		tailsFor = st.lastError
 		o.wakeAdmissionCandidates()
 		return
 	}
@@ -5469,6 +5517,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 	if wasHealthy {
 		o.setState(st, StateCrashed)
 		o.recordFailure(st, fmt.Sprintf("runtime: process exited unexpectedly (exit code %d)", exitCode), exitCode, tail)
+		tailsFor = st.lastError
 		o.enterBackoff(st)
 	} else {
 		// I2 fix: route a failed START through backoff too, exactly like a
@@ -5486,6 +5535,7 @@ func (o *owner) onProcExited(st *specState, exitErr error) {
 		}
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, message, exitCode, tail)
+		tailsFor = st.lastError
 		o.failPending(st, ErrStartFailed)
 		o.enterBackoff(st)
 	}
@@ -6392,6 +6442,11 @@ func (o *owner) handleClose() {
 	// wake.
 	cancelTimer(o.m, &o.graceTimer)
 	o.graceTimerAt = time.Time{}
+	// Every log-file tailer still in its post-exit grace ends now, with one
+	// final read (#430): the agent is going away, and Close waits for each of
+	// them (awaitLogFileTails is in m.wg). The tailers of the drains begun
+	// below end at their exit (stopLogFileTailers, o.closing).
+	o.endAllLogFileGraces()
 	for id, st := range o.specs {
 		if st.state == StateBackoff {
 			cancelTimer(o.m, &st.backoffTimer)

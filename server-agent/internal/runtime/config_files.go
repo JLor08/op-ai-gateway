@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	goruntime "runtime"
 	"strings"
@@ -253,6 +254,15 @@ func writeSpecConfigFiles(spec Spec, port int, vendor GPUVendor, vendors GPUVend
 		}
 	}
 	return nil
+}
+
+// ensureInstanceConfigDir creates the instance's ${CONFIG_DIR} (0755) when it
+// is missing, the way writeFileAtomic creates it for a config file, for a spec
+// that needs the directory without writing a config file into it: a declared
+// log file there (#430, prepareLogFiles) is created by the server, which
+// cannot do so in a directory that does not exist.
+func ensureInstanceConfigDir(dir string) error {
+	return os.MkdirAll(dir, 0o755)
 }
 
 // checkConfigFileName is the WRITE-BOUNDARY name check. validConfigFileName

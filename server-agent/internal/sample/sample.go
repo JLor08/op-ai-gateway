@@ -136,6 +136,19 @@ type RuntimeErrorSample struct {
 	// gateway maps to a specific operator message (for example
 	// runtime.device_backend_mismatch); omitted for a plain failure.
 	Code string `json:"code,omitempty"`
+	// LogFileTails is the end of each declared log file of the failed
+	// generation (runtime.LastError.LogFileTails, #430 §9): at most four
+	// entries of at most 2 KiB each, already masked; omitted when there is
+	// none, which is all an agent without runtime_log_files ever sends. The
+	// gateway keeps it in RAM only, like StderrTail.
+	LogFileTails []LogFileTailSample `json:"log_file_tails,omitempty"`
+}
+
+// LogFileTailSample mirrors runtime.LogFileTail for the wire: a declared log
+// file's name and the end of its text.
+type LogFileTailSample struct {
+	Name string `json:"name"`
+	Tail string `json:"tail"`
 }
 
 // RuntimeRPCSample is an rpc_server member's live state: which head holds it

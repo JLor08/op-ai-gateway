@@ -63,6 +63,10 @@ func main() {
 	spawnGrandchild := flag.Bool("spawn-grandchild", false, "start one more copy of this binary in -idle mode, sharing this process's stdout, and print \"stubchild: grandchild pid=<pid>\" -- a descendant the Windows process_tree job tests (#424) must see in the job and see die with it")
 	ignoreCtrlBreak := flag.Bool("ignore-ctrlbreak", false, "survive CTRL_BREAK_EVENT (and Ctrl-C) on Windows -- and SIGINT elsewhere -- so the job's kill, not the graceful stop, is what ends this process; passed on to a -spawn-grandchild")
 	idle := flag.Bool("idle", false, "do nothing but stay alive: the -spawn-grandchild descendant's mode")
+	logFile := flag.String("log-file", "", "if set, append -log-text to this file at startup (creating it), and -log-exit-text right before a scripted exit -- stands in for a server that writes its own log file instead of stdout/stderr (#430)")
+	logText := flag.String("log-text", "", "what -log-file gets at startup, with \\n read as a newline and {pid} as this process's PID")
+	logExitText := flag.String("log-exit-text", "", "what -log-file gets right before -crash-after or -exit-when ends the process (same escapes as -log-text): a crashing server's last lines")
+	exitWhen := flag.String("exit-when", "", "if set, exit with -exit-code as soon as this file can be REMOVED by this process (polled every 10ms): the test decides the moment of the exit, and since the first process to remove the file consumes it, the next generation started with the same argv does not exit too")
 	flag.Parse()
 
 	// On Windows a Go program dies of CTRL_BREAK_EVENT unless os/signal is
@@ -86,6 +90,8 @@ func main() {
 	if *printText != "" {
 		fmt.Print(strings.ReplaceAll(*printText, `\n`, "\n"))
 	}
+
+	appendLog(*logFile, *logText)
 
 	if *argvLog != "" {
 		if err := os.WriteFile(*argvLog, []byte(strings.Join(os.Args[1:], " ")), 0o644); err != nil {
@@ -170,7 +176,19 @@ func main() {
 				// Unreachable once the signal lands; keep the goroutine honest.
 				select {}
 			}
+			appendLog(*logFile, *logExitText)
 			fmt.Fprintln(os.Stderr, "stubchild: scripted crash")
+			os.Exit(*exitCode)
+		}()
+	}
+
+	if *exitWhen != "" {
+		go func() {
+			for os.Remove(*exitWhen) != nil {
+				time.Sleep(10 * time.Millisecond)
+			}
+			appendLog(*logFile, *logExitText)
+			fmt.Fprintln(os.Stderr, "stubchild: scripted exit")
 			os.Exit(*exitCode)
 		}()
 	}
@@ -280,6 +298,27 @@ func spawnIdleGrandchild(ignoreCtrlBreak bool) {
 		log.Fatalf("stubchild: start grandchild: %v", err)
 	}
 	fmt.Printf("stubchild: grandchild pid=%d\n", gc.Process.Pid)
+}
+
+// appendLog appends text (\n read as a newline, {pid} as this process's PID)
+// to path, creating it; a no-op when either is empty. Opened, written and
+// closed per call, so every line is in the file before the process moves on.
+func appendLog(path, text string) {
+	if path == "" || text == "" {
+		return
+	}
+	text = strings.ReplaceAll(text, `\n`, "\n")
+	text = strings.ReplaceAll(text, "{pid}", strconv.Itoa(os.Getpid()))
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Fatalf("stubchild: open log file: %v", err)
+	}
+	if _, err := f.WriteString(text); err != nil {
+		log.Fatalf("stubchild: write log file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		log.Fatalf("stubchild: close log file: %v", err)
+	}
 }
 
 // serveTCPOnly accepts connections on addr and closes each at once; it never
