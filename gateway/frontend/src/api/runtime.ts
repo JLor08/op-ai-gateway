@@ -191,6 +191,16 @@ export interface ConfigFile {
   content: string;
 }
 
+// One declared log file of a runtime spec (#430): the agent tails `path` and
+// streams it as its own log stream called `name`. `name` is 1-32 characters of
+// [A-Za-z0-9._-], unique case-insensitively, never "process"; `path` starts
+// with ${CONFIG_DIR} or is absolute, and carries no secret placeholder. Mirrors
+// the Go LogFileDTO (portal/service_runtime.go).
+export interface LogFile {
+  name: string;
+  path: string;
+}
+
 // A model's single derived role: the functional kind it plays, which is both the
 // co-residency editor's group and the agent's eviction "type". Mirrors the Go
 // routing.ModelRole values. The backend derives it (routing.DeriveRole over the
@@ -381,6 +391,10 @@ export interface RuntimeSpec {
   // body from a loaded spec must carry it through (the form binds it to state;
   // specBodyWithAdminState spreads it in `rest`).
   config_files?: ConfigFile[];
+  // log_files (#430): same full-document rule as config_files -- a PUT that
+  // omits it clears the stored list, so a caller building a body from a loaded
+  // spec carries it through.
+  log_files?: LogFile[];
   // effective_type / resolved_metrics_path / resolved_context_probe_path are
   // READ-ONLY echoes of the backend's auto-detection + per-type defaulting
   // (routing.EffectiveRuntimeSpecType / routing.DeriveProbePaths): what the
@@ -564,6 +578,9 @@ export interface RuntimeError {
   // runtime.device_backend_mismatch); the portal labels it through
   // errorLabelByCode. Absent for failures without one.
   code?: string;
+  // The last bytes of each declared log file at the failed generation (#430),
+  // volatile like stderr_tail. Absent from a gateway or agent without log files.
+  log_file_tails?: { name: string; tail: string }[];
 }
 
 // One peer that reached an RPC member without being the holding head.
@@ -726,6 +743,9 @@ export interface RuntimeLogEntry {
   exit_code?: number;
   command?: RuntimeLogCommand;
   instance?: number;
+  // The stream the entry belongs to (#430): absent for the process output,
+  // otherwise a declared log file's name.
+  stream?: string;
 }
 
 // The RESOLVED launch command of ONE generation: what the agent actually

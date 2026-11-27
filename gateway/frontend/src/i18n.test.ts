@@ -4866,3 +4866,38 @@ describe('realtime capability i18n keys', () => {
     }
   });
 });
+
+describe('runtime log files i18n keys (#430)', () => {
+  it('defines all log-files keys in de and en', () => {
+    const keys = [
+      'runtimeSpecLogFiles',
+      'runtimeSpecLogFilesHint',
+      'runtimeSpecLogFileName',
+      'runtimeSpecLogFileNamePlaceholder',
+      'runtimeSpecLogFilePath',
+      'runtimeSpecLogFilePathPlaceholder',
+      'runtimeSpecLogFileAdd',
+      'runtimeSpecLogFileRemove',
+      // One per LogFileIssue.
+      'runtimeSpecLogFileNameBlank',
+      'runtimeSpecLogFileNameInvalid',
+      'runtimeSpecLogFileNameReserved',
+      'runtimeSpecLogFileNameDuplicate',
+      'runtimeSpecLogFilePathBlank',
+      'runtimeSpecLogFilePathTooLong',
+      'runtimeSpecLogFilePathControl',
+      'runtimeSpecLogFilePathSecret',
+      'runtimeSpecLogFilePathNotAbsolute',
+      'runtimeSpecAgentNoLogFiles',
+      'runtimeParseErrorInvalidLogFiles',
+    ] as const;
+    for (const k of keys) {
+      expect(typeof messages.de[k]).toBe('string');
+      expect(typeof messages.en[k]).toBe('string');
+      expect(messages.de[k].length).toBeGreaterThan(0);
+      expect(messages.en[k].length).toBeGreaterThan(0);
+    }
+    expect(messages.en.runtimeSpecAgentNoLogFiles).toContain('0.26.0');
+    expect(messages.de.runtimeSpecAgentNoLogFiles).toContain('runtime_log_files');
+  });
+});

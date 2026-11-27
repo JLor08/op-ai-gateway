@@ -1648,6 +1648,30 @@ const de = {
     'Der Inhalt darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten – die Datei wird unverschlüsselt geschrieben. Secrets über Umgebung oder Argumente übergeben.',
   runtimeSpecAgentNoConfigFiles:
     'Der verbundene Agent meldet „runtime_config_files“ nicht (benötigt Version 0.10.0 oder neuer): Er schreibt diese Dateien nicht, und ${CONFIG_DIR} wird nicht ersetzt.',
+  runtimeSpecLogFiles: 'Log-Dateien',
+  runtimeSpecLogFilesHint:
+    'Der Agent liest diese Dateien mit und zeigt sie im Log-Dialog als eigene Reiter. Der Pfad beginnt mit ${CONFIG_DIR}/… (das Verzeichnis dieser Spezifikation; ${CONFIG_DIR} wird in Konfigurationsdateien unter Windows mit / geschrieben) oder ist absolut; außerhalb von ${CONFIG_DIR} muss der Agent das Verzeichnis lokal freigeben. Erlaubt sind die nicht geheimen Platzhalter wie ${PORT} und ${MODEL}; ${API_TOKEN} und ${AGENT_ENV:NAME} sind hier nicht erlaubt. Höchstens 4 Dateien.',
+  runtimeSpecLogFileName: 'Name des Log-Streams',
+  runtimeSpecLogFileNamePlaceholder: 'z. B. server',
+  runtimeSpecLogFilePath: 'Pfad der Log-Datei',
+  runtimeSpecLogFilePathPlaceholder: 'z. B. ${CONFIG_DIR}/logs/server.log',
+  runtimeSpecLogFileAdd: 'Log-Datei hinzufügen',
+  runtimeSpecLogFileRemove: 'Log-Datei entfernen',
+  runtimeSpecLogFileNameBlank: 'Der Name fehlt.',
+  runtimeSpecLogFileNameInvalid:
+    'Der Name darf 1 bis 32 Zeichen haben: Buchstaben, Ziffern, „.“, „_“ und „-“.',
+  runtimeSpecLogFileNameReserved: '„process“ ist für die Prozessausgabe reserviert.',
+  runtimeSpecLogFileNameDuplicate:
+    'Namen müssen eindeutig sein; Groß- und Kleinschreibung wird nicht unterschieden.',
+  runtimeSpecLogFilePathBlank: 'Der Pfad fehlt.',
+  runtimeSpecLogFilePathTooLong: 'Der Pfad ist länger als 1024 Bytes.',
+  runtimeSpecLogFilePathControl: 'Der Pfad darf keine Steuerzeichen enthalten.',
+  runtimeSpecLogFilePathSecret:
+    'Der Pfad darf weder ${API_TOKEN} noch ${AGENT_ENV:…} enthalten – er wird unverschlüsselt übertragen und angezeigt.',
+  runtimeSpecLogFilePathNotAbsolute:
+    'Der Pfad muss absolut sein oder mit ${CONFIG_DIR} und einem Pfadtrenner beginnen.',
+  runtimeSpecAgentNoLogFiles:
+    'Der verbundene Agent meldet „runtime_log_files“ nicht (benötigt Version 0.26.0 oder neuer): Er liest diese Log-Dateien nicht mit. Speichern ist trotzdem möglich.',
   runtimeSpecArgsHint:
     'Ein Argument pro Zeile – Leerzeichen trennen hier nichts. Ein Schalter und sein Wert sind zwei Zeilen; ein Pfad mit Leerzeichen bleibt eine. Den Port nicht fest eintragen: Bei Listen-Port 0 vergibt ihn der Agent, ${PORT} setzt ihn ein.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
@@ -1772,6 +1796,8 @@ const de = {
   runtimeParseErrorDuplicateSpecId: 'Zwei Einträge in der Datei haben dieselbe Spec-ID.',
   runtimeParseErrorInvalidConfigFileName:
     'Ein Eintrag enthält in „config_files“ einen ungültigen oder doppelten Namen – nötig ist je Spezifikation ein eindeutiger, einzelner Dateiname ohne Pfad.',
+  runtimeParseErrorInvalidLogFiles:
+    'Ein Eintrag enthält in „log_files“ einen ungültigen, doppelten oder reservierten Namen oder einen unzulässigen Pfad.',
   runtimeParseErrorFileMissing: 'Am konfigurierten Pfad liegt keine Datei.',
   runtimeParseErrorReadFailed:
     'Die Datei ist vorhanden, ließ sich aber nicht lesen — Eigentümer und Berechtigungen prüfen.',
@@ -5869,6 +5895,30 @@ const en: PortalMessages = {
     'The content must not contain ${API_TOKEN} or ${AGENT_ENV:…} — the file is written unencrypted. Pass secrets through env or args.',
   runtimeSpecAgentNoConfigFiles:
     'The connected agent does not report "runtime_config_files" (needs version 0.10.0 or newer): it does not write these files, and ${CONFIG_DIR} is not expanded.',
+  runtimeSpecLogFiles: 'Log files',
+  runtimeSpecLogFilesHint:
+    "The agent tails these files and shows each as its own tab in the log dialog. The path starts with ${CONFIG_DIR}/… (this spec's directory; in config files ${CONFIG_DIR} is written with / on Windows) or is absolute; outside ${CONFIG_DIR} the agent must allow the directory locally. The non-secret placeholders such as ${PORT} and ${MODEL} are allowed; ${API_TOKEN} and ${AGENT_ENV:NAME} are not. At most 4 files.",
+  runtimeSpecLogFileName: 'Log stream name',
+  runtimeSpecLogFileNamePlaceholder: 'e.g. server',
+  runtimeSpecLogFilePath: 'Log file path',
+  runtimeSpecLogFilePathPlaceholder: 'e.g. ${CONFIG_DIR}/logs/server.log',
+  runtimeSpecLogFileAdd: 'Add log file',
+  runtimeSpecLogFileRemove: 'Remove log file',
+  runtimeSpecLogFileNameBlank: 'The name is missing.',
+  runtimeSpecLogFileNameInvalid:
+    'The name must be 1 to 32 characters: letters, digits, ".", "_" and "-".',
+  runtimeSpecLogFileNameReserved: '"process" is reserved for the process output.',
+  runtimeSpecLogFileNameDuplicate:
+    'Names must be unique; upper and lower case are not distinguished.',
+  runtimeSpecLogFilePathBlank: 'The path is missing.',
+  runtimeSpecLogFilePathTooLong: 'The path is longer than 1024 bytes.',
+  runtimeSpecLogFilePathControl: 'The path must not contain control characters.',
+  runtimeSpecLogFilePathSecret:
+    'The path must not contain ${API_TOKEN} or ${AGENT_ENV:…} — it is sent and shown unencrypted.',
+  runtimeSpecLogFilePathNotAbsolute:
+    'The path must be absolute or start with ${CONFIG_DIR} followed by a path separator.',
+  runtimeSpecAgentNoLogFiles:
+    'The connected agent does not report "runtime_log_files" (needs version 0.26.0 or newer): it does not tail these log files. Saving still works.',
   runtimeSpecArgsHint:
     'One argument per line — spaces separate nothing here. A flag and its value are two lines; a path containing spaces stays one. Do not hard-code the port: with listen port 0 the agent assigns it and ${PORT} fills it in.',
   runtimeSpecArgsExample: '--port\n${PORT}\n-m\nC:\\Program Files\\models\\Qwen3-27B-Q4.gguf',
@@ -5989,6 +6039,8 @@ const en: PortalMessages = {
   runtimeParseErrorDuplicateSpecId: 'Two entries in the file share the same spec id.',
   runtimeParseErrorInvalidConfigFileName:
     'An entry has an invalid or repeated name in "config_files" — each spec needs unique, single file names without a path.',
+  runtimeParseErrorInvalidLogFiles:
+    'An entry has an invalid, repeated or reserved name, or an unacceptable path, in "log_files".',
   runtimeParseErrorFileMissing: 'There is no file at the configured path.',
   runtimeParseErrorReadFailed:
     'The file is there but could not be read — check its ownership and permissions.',

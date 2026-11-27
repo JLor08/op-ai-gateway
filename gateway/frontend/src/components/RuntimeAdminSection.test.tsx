@@ -4161,6 +4161,8 @@ function expectedBody(spec: RuntimeSpec, adminState: string): PutRuntimeSpecRequ
     // spec stored through a FORM save carries `[]`, one from an older fixture
     // carries nothing, and the override must restate exactly what it read.
     ...(spec.config_files !== undefined ? { config_files: spec.config_files } : {}),
+    // #430: log_files travels the same way as config_files.
+    ...(spec.log_files !== undefined ? { log_files: spec.log_files } : {}),
     // The cluster configuration rides the same way: an absent cluster_enabled
     // would clear a head's membership. Its read view never travels back.
     ...Object.fromEntries(
@@ -5942,6 +5944,18 @@ describe('RuntimeAdminSection file mode (spec §10.2)', () => {
       await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorDuplicateSpecId}`),
     ).toBeInTheDocument();
     expect(screen.queryByText('duplicate_spec_id', { exact: false })).not.toBeInTheDocument();
+  });
+
+  // #430: the code of a hand-authored runtime.json whose log_files is invalid.
+  it('maps the invalid_log_files code to its own sentence', async () => {
+    renderFileMode(fileConfig, { parse_error: 'invalid_log_files' });
+    expect(
+      await screen.findByText(`${t.runtimeParseError} ${t.runtimeParseErrorInvalidLogFiles}`),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('invalid_log_files', { exact: false })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(t.runtimeParseErrorUnknown, { exact: false }),
+    ).not.toBeInTheDocument();
   });
 
   // #257: the agent's code for a hand-authored runtime.json whose config_files
@@ -11168,6 +11182,171 @@ describe('RuntimeAdminSection audio_cpp launch-spec kind', () => {
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(putSpecs).toHaveLength(1));
     expect(putSpecs[0].body.api_flavors).toEqual(['openai']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #430: a spec's log files. A repeatable {name, path} list; like config_files
+// it rides a FULL-document PUT, so the load -> save round trip matters most.
+// ---------------------------------------------------------------------------
+describe('RuntimeAdminSection log files editor (#430)', () => {
+  const filesOnTheServer = [
+    { name: 'engine', path: '${CONFIG_DIR}/engine.log' },
+    { name: 'Access', path: '/var/log/access.log' },
+  ];
+
+  async function openEditFor(spec: Partial<RuntimeSpec>, extra: { report?: RuntimeReport } = {}) {
+    const rendered = renderSection({
+      mappings: [makeMapping({ id: 'map_1' })],
+      specsByMappingId: {
+        map_1: makeSpec({
+          configured: true,
+          id: 'spec_1',
+          mapping_id: 'map_1',
+          binary: '/usr/bin/llama-server',
+          ...spec,
+        }),
+      },
+      ...extra,
+    });
+    await screen.findByText('gw-model');
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecEditAction }));
+    await screen.findByLabelText(t.runtimeSpecBinary);
+    return rendered;
+  }
+
+  async function settleReport() {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  function nameFields() {
+    return screen.queryAllByLabelText(t.runtimeSpecLogFileName) as HTMLInputElement[];
+  }
+  function pathFields() {
+    return screen.queryAllByLabelText(t.runtimeSpecLogFilePath) as HTMLInputElement[];
+  }
+  const addButton = () => screen.getByRole('button', { name: t.runtimeSpecLogFileAdd });
+
+  it('starts with no rows and adds an empty name + path pair per click', async () => {
+    await openEditFor({ log_files: [] });
+    expect(nameFields()).toHaveLength(0);
+    fireEvent.click(addButton());
+    expect(nameFields()).toHaveLength(1);
+    expect(pathFields()[0]).toHaveValue('');
+  });
+
+  it('round-trips loaded log files into the PUT body, edits included, without a row key', async () => {
+    const { putSpecs } = await openEditFor({ log_files: filesOnTheServer });
+    expect(nameFields().map((f) => f.value)).toEqual(['engine', 'Access']);
+    expect(pathFields().map((f) => f.value)).toEqual([
+      '${CONFIG_DIR}/engine.log',
+      '/var/log/access.log',
+    ]);
+
+    // An unrelated save carries the list verbatim.
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.log_files).toEqual(filesOnTheServer);
+  });
+
+  it('sends the edited list', async () => {
+    const { putSpecs } = await openEditFor({ log_files: filesOnTheServer });
+    fireEvent.change(pathFields()[1], { target: { value: '/var/log/other.log' } });
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecLogFileRemove })[0]);
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.log_files).toEqual([{ name: 'Access', path: '/var/log/other.log' }]);
+  });
+
+  it('sends an explicit empty list when the spec has none', async () => {
+    const { putSpecs } = await openEditFor({});
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(putSpecs).toHaveLength(1));
+    expect(putSpecs[0].body.log_files).toEqual([]);
+  });
+
+  it('stops offering Add at the limit of 4 files', async () => {
+    await openEditFor({
+      log_files: [1, 2, 3].map((i) => ({ name: `l${i}`, path: `/var/log/l${i}.log` })),
+    });
+    expect(addButton()).toBeEnabled();
+    fireEvent.click(addButton());
+    expect(nameFields()).toHaveLength(4);
+    expect(addButton()).toBeDisabled();
+    fireEvent.click(screen.getAllByRole('button', { name: t.runtimeSpecLogFileRemove })[0]);
+    expect(addButton()).toBeEnabled();
+  });
+
+  it('shows an inline error for the reserved name "process" and refuses the save', async () => {
+    const { putSpecs } = await openEditFor({ log_files: [] });
+    fireEvent.click(addButton());
+    fireEvent.change(nameFields()[0], { target: { value: 'Process' } });
+    fireEvent.change(pathFields()[0], { target: { value: '/var/log/x.log' } });
+    expect(await screen.findByText(t.runtimeSpecLogFileNameReserved)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(
+      await screen.findByText(
+        `${t.runtimeSpecLogFiles} (Process): ${t.runtimeSpecLogFileNameReserved}`,
+      ),
+    ).toBeInTheDocument();
+    expect(putSpecs).toHaveLength(0);
+  });
+
+  it('shows an inline error for a relative path', async () => {
+    await openEditFor({ log_files: [] });
+    fireEvent.click(addButton());
+    fireEvent.change(nameFields()[0], { target: { value: 'x' } });
+    fireEvent.change(pathFields()[0], { target: { value: 'relative/x.log' } });
+    expect(await screen.findByText(t.runtimeSpecLogFilePathNotAbsolute)).toBeInTheDocument();
+  });
+
+  describe('agent feature warning (runtime_log_files)', () => {
+    const withFiles = { log_files: [filesOnTheServer[0]] };
+
+    it('warns, naming the agent version, when the agent does not declare runtime_log_files', async () => {
+      await openEditFor(withFiles, {
+        report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }),
+      });
+      const warning = await screen.findByText(t.runtimeSpecAgentNoLogFiles, { exact: false });
+      expect(warning).toHaveTextContent('0.25.2');
+    });
+
+    it('stays quiet when the agent declares runtime_log_files', async () => {
+      await openEditFor(withFiles, {
+        report: makeReport({
+          agent_version: '0.26.0',
+          agent_features: ['runtime_manager', 'runtime_log_files'],
+        }),
+      });
+      await settleReport();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoLogFiles, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('stays quiet for a spec without log files', async () => {
+      await openEditFor(
+        { log_files: [] },
+        { report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }) },
+      );
+      await settleReport();
+      expect(
+        screen.queryByText(t.runtimeSpecAgentNoLogFiles, { exact: false }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('is advisory: saving still works', async () => {
+      const { putSpecs } = await openEditFor(withFiles, {
+        report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }),
+      });
+      await screen.findByText(t.runtimeSpecAgentNoLogFiles, { exact: false });
+      fireEvent.click(screen.getByRole('button', { name: t.save }));
+      await waitFor(() => expect(putSpecs).toHaveLength(1));
+      expect(putSpecs[0].body.log_files).toEqual(withFiles.log_files);
+    });
   });
 });
 
