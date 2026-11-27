@@ -3,6 +3,7 @@
 
 import type { EndpointMode } from '../../api';
 import type { LogFile } from './logFiles';
+import type { StrataImportOptions } from './strataRunConfig';
 
 /**
  * The launch-spec form values a kind's template fills in. Only the fields a
@@ -25,7 +26,8 @@ export type RuntimeSpecDraft = {
   // Windows job-object process tree: Strata's launcher (strata.cmd) spawns a
   // child tree, and only a job stops it as a unit.
   processTree: 'direct' | 'job';
-  // The engine log the run-config import points `log` at (#430).
+  // The engine log the run-config import points `log` at (#430); empty when
+  // the agent does not declare runtime_log_files (StrataImportOptions).
   logFiles: LogFile[];
 };
 
@@ -50,8 +52,11 @@ export type RuntimeSpecDraft = {
  *   argv or the config file.
  * - 960 s startup: Strata waits up to 900 s for its engine by default, so the
  *   agent must not give up before Strata does.
+ * - The engine log at ${CONFIG_DIR}/engine.log, the file the run-config import
+ *   points `log` at, only when `declareEngineLog` (the same flag as the
+ *   import's, StrataImportOptions).
  */
-export function strataSpecTemplate(): RuntimeSpecDraft {
+export function strataSpecTemplate({ declareEngineLog }: StrataImportOptions): RuntimeSpecDraft {
   return {
     binaryHint: String.raw`%LOCALAPPDATA%\Strata\terminal\current\bin\strata.cmd`,
     args: [
@@ -76,6 +81,6 @@ export function strataSpecTemplate(): RuntimeSpecDraft {
     responsesMode: 'passthrough',
     messagesMode: 'passthrough',
     processTree: 'job',
-    logFiles: [{ name: 'engine', path: '${CONFIG_DIR}/engine.log' }],
+    logFiles: declareEngineLog ? [{ name: 'engine', path: '${CONFIG_DIR}/engine.log' }] : [],
   };
 }

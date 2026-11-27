@@ -281,6 +281,10 @@ type LogFileRow = {
   path: string;
 };
 
+// The log-file rows a Strata run-config import declares (engine, or
+// engine-r<i> per replica): a re-import replaces exactly these.
+const STRATA_ENGINE_LOG_NAME = /^engine(-r\d+)?$/i;
+
 // One sentence per LogFileIssue, inline on the offending field and (the first
 // one) as the refusal at submit.
 const logFileIssueLabel: Record<LogFileIssue, MessageKey> = {
@@ -2278,6 +2282,10 @@ export function RuntimeAdminSection({
   const reportReady = reportStatus === 'ready';
   const agentFeatures = reportReady ? (reportData?.agent_features ?? []) : [];
   const agentVersion = reportReady ? (reportData?.agent_version ?? '') : '';
+  // The Strata import and template point `log` into ${CONFIG_DIR} and declare
+  // it only for an agent that declares runtime_log_files (0.26.0, #430); an
+  // unsettled report gives no features, so it counts as not declared.
+  const agentDeclaresLogFiles = agentFeatures.includes('runtime_log_files');
   // Spec §9's visible half: gateway-side specs exist and the agent reports no
   // managed process at all. Without a banner here an operator configures specs
   // and watches nothing happen, with no clue why.
@@ -3300,7 +3308,9 @@ export function RuntimeAdminSection({
   // 1 = main), the startup timeout, and the upstream model name when it is
   // still empty. Nothing is touched when the text is refused.
   function applyStrataImport() {
-    const result = importStrataRunConfig(strataImportText);
+    const result = importStrataRunConfig(strataImportText, {
+      declareEngineLog: agentDeclaresLogFiles,
+    });
     if (!result.ok) {
       let message = t.strataImportErrorMissingArgs;
       if (result.error === 'invalid_json') message = t.strataImportErrorInvalidJson;
@@ -3341,14 +3351,17 @@ export function RuntimeAdminSection({
         ),
       );
     }
-    // Replace this import's own rows (names starting with "engine"), keep the
-    // operator's others, and stay within the cap.
-    setLogFiles((rows) =>
-      [
-        ...rows.filter((r) => !r.name.startsWith('engine')),
-        ...result.logFiles.map((f) => ({ rowKey: makeRowKey(), name: f.name, path: f.path })),
-      ].slice(0, LOG_FILES_MAX),
-    );
+    // Replace this import's own rows (engine, engine-r<i>), keep the
+    // operator's others, and stay within the cap. Without runtime_log_files
+    // the import declares none and the rows are left alone.
+    if (result.logFiles.length > 0) {
+      setLogFiles((rows) =>
+        [
+          ...rows.filter((r) => !STRATA_ENGINE_LOG_NAME.test(r.name)),
+          ...result.logFiles.map((f) => ({ rowKey: makeRowKey(), name: f.name, path: f.path })),
+        ].slice(0, LOG_FILES_MAX),
+      );
+    }
     setStartupTimeoutSeconds(result.startupTimeoutSeconds);
     if (result.upstreamModel !== undefined && appName === '') setAppName(result.upstreamModel);
     setStrataImportError('');
@@ -3357,6 +3370,7 @@ export function RuntimeAdminSection({
       ...result.warnings.map((w) => {
         if (w === 'layer_split_positional') return t.strataImportWarnLayerSplit;
         if (w === 'log_files_capped') return t.strataImportWarnLogFilesCapped;
+        if (w === 'engine_log_needs_agent') return t.strataImportWarnEngineLogNeedsAgent;
         return t.strataImportWarnApiKey;
       }),
     ]);
@@ -3779,7 +3793,7 @@ export function RuntimeAdminSection({
   // select's own default rule, which already gives /health.
   function applyStrataTemplate() {
     if (!specFirstWrite) return;
-    const template = strataSpecTemplate();
+    const template = strataSpecTemplate({ declareEngineLog: agentDeclaresLogFiles });
     if (argsText === '') setArgsText(formatArgsText(template.args));
     if (envText === '') setEnvText(formatEnvText(template.env));
     if (startupTimeoutSeconds === 180) setStartupTimeoutSeconds(template.startupTimeoutSeconds);
@@ -5396,7 +5410,7 @@ export function RuntimeAdminSection({
               required
               placeholder={
                 specType === 'strata'
-                  ? strataSpecTemplate().binaryHint
+                  ? strataSpecTemplate({ declareEngineLog: agentDeclaresLogFiles }).binaryHint
                   : '/usr/local/bin/llama-server'
               }
             />

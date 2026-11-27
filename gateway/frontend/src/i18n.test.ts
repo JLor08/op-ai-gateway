@@ -4908,6 +4908,7 @@ describe('runtime log files i18n keys (#430)', () => {
       'runtimeSpecLogFilePathIsConfigFile',
       'runtimeSpecAgentNoLogFiles',
       'runtimeParseErrorInvalidLogFiles',
+      'strataImportWarnEngineLogNeedsAgent',
     ] as const;
     for (const k of keys) {
       expect(typeof messages.de[k]).toBe('string');

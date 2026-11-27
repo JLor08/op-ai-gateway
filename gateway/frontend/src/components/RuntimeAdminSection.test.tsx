@@ -14074,11 +14074,25 @@ describe('RuntimeAdminSection process_tree control (#424)', () => {
   });
 
   it('the strata template pre-fills the engine log file when the list is empty', async () => {
-    renderSection();
+    renderSection({
+      report: makeReport({
+        agent_version: '0.26.0',
+        agent_features: ['runtime_manager', 'runtime_log_files'],
+      }),
+    });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     await pickFlavorFormType(t.runtimeSpecTypeStrata);
     expect(screen.getByLabelText(t.runtimeSpecLogFileName)).toHaveValue('engine');
     expect(screen.getByLabelText(t.runtimeSpecLogFilePath)).toHaveValue('${CONFIG_DIR}/engine.log');
+  });
+
+  it('the strata template declares no engine log when the agent lacks runtime_log_files', async () => {
+    renderSection({
+      report: makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }),
+    });
+    fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
+    await pickFlavorFormType(t.runtimeSpecTypeStrata);
+    expect(screen.queryByLabelText(t.runtimeSpecLogFileName)).not.toBeInTheDocument();
   });
 
   it('labels the process_tree_agent_unknown warning', async () => {
@@ -14148,8 +14162,15 @@ describe('RuntimeAdminSection process_tree control (#424)', () => {
 });
 
 describe('RuntimeAdminSection strata run-config import', () => {
-  async function openImport() {
-    const view = renderSection();
+  // The engine-log rewrite needs an agent that declares runtime_log_files
+  // (0.26.0): an older one writes ${CONFIG_DIR} natively into the JSON.
+  const logFilesAgent = () =>
+    makeReport({
+      agent_version: '0.26.0',
+      agent_features: ['runtime_manager', 'runtime_log_files'],
+    });
+  async function openImport(report: RuntimeReport = logFilesAgent()) {
+    const view = renderSection({ report });
     fireEvent.click(await screen.findByRole('button', { name: t.runtimeSpecCreate }));
     await pickFlavorFormType(t.runtimeSpecTypeStrata);
     fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
@@ -14219,6 +14240,43 @@ describe('RuntimeAdminSection strata run-config import', () => {
     fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
     importText({ ...base });
     expect(names()).toEqual(['access', 'engine']);
+  });
+
+  it('keeps a log row merely starting with "engine" on a re-import', async () => {
+    await openImport();
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecLogFileAdd }));
+    fireEvent.change(screen.getAllByLabelText(t.runtimeSpecLogFileName)[1], {
+      target: { value: 'engineering' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportOpen }));
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    expect(
+      (screen.getAllByLabelText(t.runtimeSpecLogFileName) as HTMLInputElement[]).map(
+        (n) => n.value,
+      ),
+    ).toEqual(['engineering', 'engine']);
+  });
+
+  it('keeps log as is, declares no engine log and says why when the agent lacks runtime_log_files', async () => {
+    await openImport(makeReport({ agent_version: '0.25.2', agent_features: ['runtime_manager'] }));
+    fireEvent.change(screen.getByLabelText(t.strataImportLabel), {
+      target: { value: strataFixtureText },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.strataImportApply }));
+    const content = screen.getByLabelText(t.runtimeSpecConfigFileContent) as HTMLTextAreaElement;
+    expect(JSON.parse(content.value).log).toBe(
+      (JSON.parse(strataFixtureText) as Record<string, unknown>).log,
+    );
+    expect(content.value).not.toContain('${CONFIG_DIR}');
+    expect(screen.queryByLabelText(t.runtimeSpecLogFileName)).not.toBeInTheDocument();
+    expect(screen.getByText(t.strataImportWarnEngineLogNeedsAgent)).toBeInTheDocument();
   });
 
   it('warns when more than four replicas were capped', async () => {

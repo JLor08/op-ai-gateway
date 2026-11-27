@@ -1638,6 +1638,8 @@ const de = {
     'api_key wurde nicht übernommen: Der Schlüssel gehört in das Token der Spec, nicht in die Datei.',
   strataImportWarnLogFilesCapped:
     'Mehr als 4 Replikate: Nur die Logs der ersten 4 wurden als Log-Dateien eingetragen.',
+  strataImportWarnEngineLogNeedsAgent:
+    'Der Agent dieses Servers meldet „runtime_log_files“ nicht: „log“ bleibt wie im Run-Config, und es wird keine Log-Datei eingetragen. Das Engine-Log kann angezeigt werden, sobald der Agent Version 0.26.0 oder neuer hat; dann den Import wiederholen.',
   strataImportDone: 'Importiert: strata.json, GPU-Reihenfolge und Startup-Timeout wurden gesetzt.',
   strataImportTooLarge: 'Die importierte Datei überschreitet das Limit von 64 KiB.',
   strataImportNoFreeSlot: 'Es ist kein Platz für eine weitere Konfigurationsdatei (Maximum 16).',
@@ -5918,6 +5920,8 @@ const en: PortalMessages = {
     'api_key was not imported: the key belongs in the spec token, not in the file.',
   strataImportWarnLogFilesCapped:
     'More than 4 replicas: only the logs of the first 4 were declared as log files.',
+  strataImportWarnEngineLogNeedsAgent:
+    'This server\'s agent does not report "runtime_log_files": "log" stays as in the run config and no log file is declared. The engine log can be shown once the agent is version 0.26.0 or newer; repeat the import then.',
   strataImportDone: 'Imported: strata.json, the GPU order and the startup timeout were set.',
   strataImportTooLarge: 'The imported file exceeds the 64 KiB limit.',
   strataImportNoFreeSlot: 'There is no room for another config file (maximum 16).',

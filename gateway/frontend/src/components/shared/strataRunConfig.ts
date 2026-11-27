@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import type { LogFile } from './logFiles';
+import { LOG_FILES_MAX, type LogFile } from './logFiles';
 
 /**
  * Turns the JSON run config `strata launch` writes into the runtime spec's
  * config file (`strata.json`) plus the spec fields it proposes. Pure; the
  * stored file is a normal, editable config file afterwards.
  */
-export type StrataImportWarning = 'layer_split_positional' | 'api_key_dropped' | 'log_files_capped';
+export type StrataImportWarning =
+  'layer_split_positional' | 'api_key_dropped' | 'log_files_capped' | 'engine_log_needs_agent';
+
+export type StrataImportOptions = {
+  // The server's agent declares runtime_log_files (agent 0.26.0, #430): it
+  // writes ${CONFIG_DIR} with forward slashes inside config-file content on
+  // Windows and tails declared log files. Only then is `log` pointed into
+  // ${CONFIG_DIR} and declared. An older agent would write the native
+  // C:\... form into the JSON string, which is invalid JSON, so the import
+  // keeps the source's `log` and warns (engine_log_needs_agent). A report
+  // that has not settled counts as not declared.
+  declareEngineLog: boolean;
+};
 
 export type StrataImport =
   | {
@@ -18,7 +30,8 @@ export type StrataImport =
       startupTimeoutSeconds: number;
       upstreamModel?: string;
       // The engine log(s) the rewritten `log` key produces, ready for the
-      // spec's log_files (#430).
+      // spec's log_files (#430); empty when the agent does not declare
+      // runtime_log_files (StrataImportOptions).
       logFiles: LogFile[];
       warnings: StrataImportWarning[];
     }
@@ -68,12 +81,11 @@ function withoutApiKeys(v: unknown, dropped: { count: number }): unknown {
 }
 
 // The per-instance engine log. The agent provisions ${CONFIG_DIR} per
-// instance and writes it with forward slashes inside config-file content on
-// Windows, so the JSON stays valid.
+// instance and, from 0.26.0 on, writes it with forward slashes inside
+// config-file content on Windows, so the JSON stays valid
+// (StrataImportOptions).
 const CONFIG_DIR_PLACEHOLDER = '${CONFIG_DIR}';
 const ENGINE_LOG = `${CONFIG_DIR_PLACEHOLDER}/engine.log`;
-// runtimeSpecLogFilesMax: a spec declares at most this many files.
-const MAX_LOG_FILES = 4;
 
 // replicaCount reads the run config's `replicas` the way Strata's replica_cfg
 // does: a list is one entry per replica, a positive integer is a count.
@@ -88,13 +100,13 @@ function replicaCount(v: unknown): number {
 function engineLogFiles(replicas: unknown): { logFiles: LogFile[]; capped: boolean } {
   const n = replicaCount(replicas);
   if (n < 2) return { logFiles: [{ name: 'engine', path: ENGINE_LOG }], capped: false };
-  const shown = Math.min(n, MAX_LOG_FILES);
+  const shown = Math.min(n, LOG_FILES_MAX);
   return {
     logFiles: Array.from({ length: shown }, (_, i) => ({
       name: `engine-r${i}`,
       path: `${CONFIG_DIR_PLACEHOLDER}/engine.r${i}.log`,
     })),
-    capped: n > MAX_LOG_FILES,
+    capped: n > LOG_FILES_MAX,
   };
 }
 
@@ -124,7 +136,7 @@ function gpuOrderOf(o: Record<string, unknown>): number[] {
   return [...new Set(order)];
 }
 
-export function importStrataRunConfig(text: string): StrataImport {
+export function importStrataRunConfig(text: string, options: StrataImportOptions): StrataImport {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -153,10 +165,18 @@ export function importStrataRunConfig(text: string): StrataImport {
   }
   // The source's `log` names an absolute path on the machine that ran
   // `strata launch`, where the diagnostics are unreachable. Point it into the
-  // per-instance config directory and declare it for the live log.
-  out.log = ENGINE_LOG;
-  const { logFiles, capped } = engineLogFiles(src.replicas);
-  if (capped) warnings.push('log_files_capped');
+  // per-instance config directory and declare it for the live log -- only for
+  // an agent that can take ${CONFIG_DIR} in the content (StrataImportOptions);
+  // otherwise `log` is kept as written.
+  let logFiles: LogFile[] = [];
+  if (options.declareEngineLog) {
+    out.log = ENGINE_LOG;
+    const engine = engineLogFiles(src.replicas);
+    logFiles = engine.logFiles;
+    if (engine.capped) warnings.push('log_files_capped');
+  } else {
+    warnings.push('engine_log_needs_agent');
+  }
   out.model_name = '${MODEL}';
   // `strata serve` has no --gpu flag, so the card list goes into the file. A
   // comma-separated string is valid JSON before the agent expands the
