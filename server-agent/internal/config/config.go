@@ -832,7 +832,8 @@ func removedWSLSettingWarnings(fileKeys map[string]bool, getenv func(string) str
 // allowlistEntryWarning returns the warning for entry e at index i of the named
 // allowlist, or "" when the entry is fine.
 func allowlistEntryWarning(listName string, i int, e string) string {
-	isDirs := listName == "runtime_allowed_dirs" || listName == "runtime_allowed_log_dirs"
+	isDirs := listName == "runtime_allowed_dirs"
+	isLogDirs := listName == "runtime_allowed_log_dirs"
 	if wslentry.Is(e) {
 		if _, _, ok := wslentry.Parse(e); ok {
 			return ""
@@ -841,9 +842,15 @@ func allowlistEntryWarning(listName string, i int, e string) string {
 		if isDirs {
 			msg = "%s[%d] is a malformed wsl:// entry and is ignored, but WSL work_dir containment stays on: only well-formed wsl:// dir entries (and binary dirs with runtime_allow_binary_dirs) permit a WSL work_dir (expected wsl://<distro>/<absolute Linux path>, lowercase scheme, forward slashes)"
 		}
+		if isLogDirs {
+			msg = "%s[%d] is a malformed wsl:// entry and is ignored: only well-formed wsl://<distro>/<absolute Linux path> entries permit log files of WSL specs (lowercase scheme, forward slashes)"
+		}
 		return fmt.Sprintf(msg, listName, i)
 	}
 	if !wslentry.LooksLike(e) {
+		if isLogDirs && !isAbsoluteLogDirEntry(e) {
+			return fmt.Sprintf("%s[%d] is not an absolute path and can never match a resolved log file path: it is ignored (use an absolute path such as /var/log/models or C:\\logs)", listName, i)
+		}
 		return ""
 	}
 	msg := "%s[%d] looks like a WSL entry but is not wsl:// (the scheme must be exactly lowercase wsl://); it is not a WSL entry and is treated as a native path"
@@ -851,6 +858,22 @@ func allowlistEntryWarning(listName string, i int, e string) string {
 		msg += ", and WSL work_dir containment stays on"
 	}
 	return fmt.Sprintf(msg, listName, i)
+}
+
+// isAbsoluteLogDirEntry reports whether a native runtime_allowed_log_dirs
+// entry is absolute on either platform's syntax: a leading slash or
+// backslash (UNC included), or a drive letter followed by a separator. The
+// check is lexical and OS-independent on purpose, so a config written for
+// Windows is judged the same when validated elsewhere.
+func isAbsoluteLogDirEntry(e string) bool {
+	if e == "" {
+		return false
+	}
+	if e[0] == '/' || e[0] == '\\' {
+		return true
+	}
+	return len(e) >= 3 && e[1] == ':' && (e[2] == '/' || e[2] == '\\') &&
+		(e[0] >= 'A' && e[0] <= 'Z' || e[0] >= 'a' && e[0] <= 'z')
 }
 
 // resolveInt applies env > file for a plain integer setting that (per the

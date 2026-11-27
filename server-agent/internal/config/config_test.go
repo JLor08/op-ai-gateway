@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"op-ai-server-agent/internal/collector"
@@ -2372,21 +2373,48 @@ func TestLoadRuntimeAllowedLogDirs(t *testing.T) {
 	}
 }
 
-// TestRuntimeAllowedLogDirsWarnings proves malformed and look-alike wsl:
-// entries of the new list warn, naming runtime_allowed_log_dirs, with the dir
-// wording of runtime_allowed_dirs.
+// TestRuntimeAllowedLogDirsWarnings proves the new list warns, naming
+// runtime_allowed_log_dirs[i], on a malformed wsl: entry, a look-alike WSL://
+// entry and a relative entry, with log-file wording (not work_dir
+// containment), and stays silent for valid entries.
 func TestRuntimeAllowedLogDirsWarnings(t *testing.T) {
-	cfg := Config{RuntimeAllowedLogDirs: []string{`wsl://Ubuntu-24.04\srv`, "WSL://Ubuntu-24.04/srv", "wsl://Ubuntu-24.04/srv/logs", "/var/log"}}
+	cfg := Config{RuntimeAllowedLogDirs: []string{
+		`wsl://Ubuntu-24.04\srv`,      // 0 malformed
+		"WSL://Ubuntu-24.04/srv",      // 1 look-alike
+		"logs/models",                 // 2 relative
+		"wsl://Ubuntu-24.04/srv/logs", // 3 valid
+		"/var/log",                    // 4 valid
+		`C:\logs\*`,                   // 5 valid
+	}}
 	w := runtimeAllowlistWarnings(cfg, nil, func(string) string { return "" })
-	if len(w) != 2 {
-		t.Fatalf("Warnings = %v, want 2", w)
+	if len(w) != 3 {
+		t.Fatalf("Warnings = %v, want 3", w)
 	}
-	for _, m := range w {
-		if !strings.Contains(m, "runtime_allowed_log_dirs[") {
-			t.Errorf("warning %q does not name runtime_allowed_log_dirs", m)
+	for i, idx := range []int{0, 1, 2} {
+		want := fmt.Sprintf("runtime_allowed_log_dirs[%d]", idx)
+		if !strings.Contains(w[i], want) {
+			t.Errorf("warning %q does not name %s", w[i], want)
 		}
-		if !strings.Contains(m, "WSL work_dir containment stays on") {
-			t.Errorf("warning %q lacks the dir semantics", m)
+		if strings.Contains(w[i], "work_dir containment") {
+			t.Errorf("warning %q carries work_dir wording", w[i])
 		}
+	}
+	if !strings.Contains(w[0], "log files of WSL specs") {
+		t.Errorf("malformed wsl warning = %q", w[0])
+	}
+	if !strings.Contains(w[2], "not an absolute path") {
+		t.Errorf("relative warning = %q", w[2])
+	}
+	for _, valid := range []int{3, 4, 5} {
+		name := fmt.Sprintf("runtime_allowed_log_dirs[%d]", valid)
+		for _, m := range w {
+			if strings.Contains(m, name) {
+				t.Errorf("valid entry %s produced a warning: %q", name, m)
+			}
+		}
+	}
+	// runtime_allowed_dirs behaviour is unchanged: a relative entry is silent.
+	if got := runtimeAllowlistWarnings(Config{RuntimeAllowedDirs: []string{"rel/dir"}}, nil, func(string) string { return "" }); len(got) != 0 {
+		t.Errorf("runtime_allowed_dirs relative entry warned: %v", got)
 	}
 }
