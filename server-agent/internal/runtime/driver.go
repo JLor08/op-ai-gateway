@@ -92,6 +92,18 @@ const gatewayFeatureRuntimeInstances = "runtime_instances"
 // model. It is one-sided: the agent's own registry entry is a separate feature.
 const gatewayFeatureRPCCluster = "rpc_cluster"
 
+// gatewayFeatureRuntimeLogFiles is the gateway-declared feature that says the
+// gateway understands a spec's log_files (#430): the stream a runtime_log
+// entry carries, the file statuses and a failure record's log_file_tails. An
+// older gateway decodes runtime_log frames without their stream, so a file's
+// text would reach its portal mixed into the process output. The agent honours
+// log_files only while it is declared (fail-closed, in file mode too, like
+// rpc_cluster); otherwise a declaration is as absent -- no tailer, no removal
+// before exec, no file stream, no log_file_tails. It is one-sided: the agent's
+// own registry entry (internal/agent's FeatureRuntimeLogFiles) is the same
+// string, and each side reads the other's declaration.
+const gatewayFeatureRuntimeLogFiles = "runtime_log_files"
+
 // RuntimeReporter is the upward file-mode report sink: both *client.Client
 // and *client.WSSender satisfy it already via their existing
 // PostRuntimeReport methods (Task 17). A nil RuntimeReporter simply means
@@ -199,14 +211,19 @@ type Driver struct {
 	// that config actually had a replicable flag cleared, kept only to Warn
 	// once per transition into that state rather than on every Sync.
 	// appliedRPC is the same for rpc_cluster: whether the last applied config
-	// kept its rpc_server members and cluster heads.
+	// kept its rpc_server members and cluster heads. appliedLogFiles is the
+	// same for runtime_log_files: whether it kept its specs' log_files.
 	appliedInstances  bool
 	appliedRPC        bool
+	appliedLogFiles   bool
 	instancesWithheld bool
 	// rpcWithheld is whether the last applied config had cluster specs
 	// dropped because the gateway does not declare rpc_cluster, kept to Warn
 	// once per transition like instancesWithheld.
 	rpcWithheld bool
+	// logFilesWithheld is the same for log_files cleared because the gateway
+	// does not declare runtime_log_files.
+	logFilesWithheld bool
 	// active is the CURRENT feature-negotiation outcome (Sync step 1),
 	// read from a different goroutine (Active, called from
 	// internal/agent.collectOnce on whatever goroutine is building a
@@ -380,7 +397,7 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 		return
 	}
 
-	active, instances, rpc := d.featureActive(ctx)
+	active, instances, rpc, logFiles := d.featureActive(ctx)
 	if !active {
 		d.stopAll()
 		return
@@ -418,7 +435,7 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 	// process, or recovering from a drain via stopAll clearing applied) OR
 	// the gateway's runtime_instances declaration changed since the last
 	// apply: what the manager is handed depends on that too (below).
-	if !changed && d.applied && instances == d.appliedInstances && rpc == d.appliedRPC {
+	if !changed && d.applied && instances == d.appliedInstances && rpc == d.appliedRPC && logFiles == d.appliedLogFiles {
 		return
 	}
 
@@ -442,13 +459,25 @@ func (d *Driver) Sync(ctx context.Context, pushed json.RawMessage) {
 	if !rpc {
 		effective, rpcWithheld = withoutRPCCluster(effective)
 	}
+	// A spec's log_files (#430) are tailed into streams of their own, which
+	// only a gateway that declares runtime_log_files tells apart from the
+	// process output. Until it does they are as absent, in file mode too. The
+	// declaration is not launch-affecting (Manager's comparison ignores
+	// log_files), so a change of it, like an edit of log_files, takes effect
+	// at each spec's next start.
+	logFilesWithheld := false
+	if !logFiles {
+		effective, logFilesWithheld = withoutLogFiles(effective)
+	}
 	d.noteInstancesWithheld(withheld)
 	d.noteRPCWithheld(rpcWithheld)
+	d.noteLogFilesWithheld(logFilesWithheld)
 	d.mgr.Apply(effective)
 	d.applied = true
 	d.appliedSpecCount = len(cfg.Specs)
 	d.appliedInstances = instances
 	d.appliedRPC = rpc
+	d.appliedLogFiles = logFiles
 
 	if _, isFile := d.src.(*FileSource); isFile {
 		d.sendReport(ctx, cfg)
@@ -518,6 +547,30 @@ func withoutRPCCluster(cfg Config) (Config, bool) {
 	return cfg, true
 }
 
+// withoutLogFiles returns cfg with every spec's log_files cleared, and whether
+// any spec declared one. Like withoutReplicable it clears a copy -- cfg's Specs
+// slice is the Source's cached document -- and returns cfg as is when no spec
+// declares a log file.
+func withoutLogFiles(cfg Config) (Config, bool) {
+	declared := false
+	for _, spec := range cfg.Specs {
+		if len(spec.LogFiles) > 0 {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return cfg, false
+	}
+	specs := make([]Spec, len(cfg.Specs))
+	for i, spec := range cfg.Specs {
+		spec.LogFiles = nil
+		specs[i] = spec
+	}
+	cfg.Specs = specs
+	return cfg, true
+}
+
 // noteInstancesWithheld logs the transition into, and out of, a state in which
 // the applied config had its replicable flags cleared because the gateway does
 // not declare runtime_instances -- once per transition, not on every Sync.
@@ -545,20 +598,34 @@ func (d *Driver) noteRPCWithheld(withheld bool) {
 	d.rpcWithheld = withheld
 }
 
+// noteLogFilesWithheld logs the transition into, and out of, a state in which
+// the applied config had its log_files cleared because the gateway does not
+// declare runtime_log_files -- once per transition, not on every apply.
+func (d *Driver) noteLogFilesWithheld(withheld bool) {
+	switch {
+	case withheld && !d.logFilesWithheld:
+		slog.Warn("runtime: the gateway does not declare runtime_log_files; declared log files are not tailed, from each spec's next start, until it does")
+	case !withheld && d.logFilesWithheld:
+		slog.Info("runtime: declared log files are tailed again from each spec's next start (the gateway declares runtime_log_files, or no spec declares one any more)")
+	}
+	d.logFilesWithheld = withheld
+}
+
 // featureActive fetches the gateway's currently declared feature set and
 // reports whether runtime_manager is present in it (active), and whether
 // runtime_instances is (instances: honour the replicable flag, see Sync), and
-// whether rpc_cluster is (rpc: run member and head specs, see Sync).
+// whether rpc_cluster is (rpc: run member and head specs, see Sync), and
+// whether runtime_log_files is (logFiles: tail declared log files, see Sync).
 // FeaturesClient.Fetch already implements the ETag-conditional-GET /
 // last-known-good discipline (a transient gateway hiccup returns the LAST
 // fetched set, never an empty one caused only by a network blip) -- Sync
 // trusts that contract exactly as every other caller of Fetch in this module
 // does. A nil features client (never constructed this way in production;
 // defensive only) is treated as inactive rather than panicking, and a gateway
-// that declares nothing declares neither name: both answers fail closed.
-func (d *Driver) featureActive(ctx context.Context) (active, instances, rpc bool) {
+// that declares nothing declares none of the names: every answer fails closed.
+func (d *Driver) featureActive(ctx context.Context) (active, instances, rpc, logFiles bool) {
 	if d.features == nil {
-		return false, false, false
+		return false, false, false, false
 	}
 	names, err := d.features.Fetch(ctx)
 	if err != nil {
@@ -580,9 +647,11 @@ func (d *Driver) featureActive(ctx context.Context) (active, instances, rpc bool
 			instances = true
 		case gatewayFeatureRPCCluster:
 			rpc = true
+		case gatewayFeatureRuntimeLogFiles:
+			logFiles = true
 		}
 	}
-	return active, instances, rpc
+	return active, instances, rpc, logFiles
 }
 
 // stopAll drains every managed process (an empty Apply, reusing Manager's
@@ -596,8 +665,9 @@ func (d *Driver) stopAll() {
 	d.applied = false
 	d.appliedSpecCount = 0
 	// The empty document withholds nothing; the next active Sync's apply
-	// starts the withheld-instances bookkeeping over.
+	// starts the withheld-instances and withheld-log-files bookkeeping over.
 	d.instancesWithheld = false
+	d.logFilesWithheld = false
 	if err := d.StartRouter(0); err != nil {
 		slog.Debug("runtime: router stop failed", "error", err)
 	}

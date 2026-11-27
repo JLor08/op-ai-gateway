@@ -90,8 +90,11 @@ var gatewayAgentFeatures = []string{"runtime_manager", runtimeLogsFeature, runti
 // runtimeLogFilesFeature says this gateway's runtime documents may carry a
 // spec's log_files (#430) and that it accepts the agent's file-tail events and
 // log_file_tails in a failure record. The agent's declaration of the same
-// string says it tails them; an agent that does not declare it, or a gateway
-// that does not, leaves the process stream exactly as it was.
+// string says it tails them, and the agent reads this declaration as a
+// precondition, in file mode too (runtime.Driver.Sync): an older gateway, which
+// would relay a file's text as process output, never receives a file stream.
+// An agent that does not declare it, or a gateway that does not, leaves the
+// process stream exactly as it was.
 const runtimeLogFilesFeature = "runtime_log_files"
 
 // rpcClusterFeature says this gateway derives llama.cpp RPC cluster heads and

@@ -1088,6 +1088,18 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(t.runtimeLogsFileUnsupported).toContain('runtime_log_files');
     });
 
+    it('covers every refusal in the not-permitted sentence: directory, link, hard links', () => {
+      // The agent also refuses a file that is a link or has more than one hard
+      // link; the sentence names those causes too, and still names the setting
+      // rather than any path.
+      const causes = locale === 'de' ? [/Verknüpfung/, /Hardlink/] : [/\blink\b/, /hard link/];
+      for (const cause of causes) {
+        expect(t.runtimeLogsFileNotPermitted).toMatch(cause);
+      }
+      expect(t.runtimeLogsFileNotPermitted).toContain('runtime_allowed_log_dirs');
+      expect(t.runtimeLogsFileNotPermitted).not.toMatch(/\/[a-z]/);
+    });
+
     it('drops the waiting sentence once the file is opened, and says a quiet file is empty', () => {
       const h = renderLogView(false, undefined, { logFiles: ['engine'] });
       h.state('streaming');

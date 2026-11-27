@@ -4917,4 +4917,15 @@ describe('runtime log files i18n keys (#430)', () => {
     expect(messages.en.runtimeSpecAgentNoLogFiles).toContain('0.26.0');
     expect(messages.de.runtimeSpecAgentNoLogFiles).toContain('runtime_log_files');
   });
+
+  it('suggests a log path directly in ${CONFIG_DIR}', () => {
+    // The agent removes and tails from offset 0 only a file directly in the
+    // instance's ${CONFIG_DIR}, and it creates no subdirectory there: a file
+    // in a subdirectory would be read from its end and never removed.
+    for (const locale of ['de', 'en'] as const) {
+      const placeholder = messages[locale].runtimeSpecLogFilePathPlaceholder;
+      expect(placeholder).toContain('${CONFIG_DIR}/server.log');
+      expect(placeholder).not.toContain('/logs/');
+    }
+  });
 });

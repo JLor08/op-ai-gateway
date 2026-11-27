@@ -420,8 +420,11 @@ var Features = []Feature{
 	// (its path policy and runtime_allowed_log_dirs, never gateway-supplied).
 	// An agent without this name ignores log_files; the gateway keeps the
 	// field in the runtime document regardless, and the portal reads the name
-	// to explain an empty file tab. The gateway spells the same string in its
-	// own constant; this module cannot import it.
+	// to explain an empty file tab. The gateway declares the same string (its
+	// own constant; this module cannot import it) for a fact of its own -- it
+	// understands the streams -- and the agent honours log_files only while
+	// the gateway declares it (runtime.Driver.Sync, withoutLogFiles), in file
+	// mode too, so an older gateway never receives a file stream.
 	//
 	// Since is 0.26.0: agent.Features gains an entry, so the rule is a MINOR bump.
 	{Name: FeatureRuntimeLogFiles, Since: "0.26.0"},

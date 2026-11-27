@@ -1958,13 +1958,15 @@ func (o *owner) handle(cmd command) {
 // no spec ID in the owner's table ever collides with an instance key.
 func (o *owner) applyConfig(cfg Config) {
 	cfg.Specs = withoutReservedSpecIDs(cfg.Specs)
-	// The ETag names the document, and the multi-instance opt-in is the one
-	// part of it this agent may withhold on its own (Driver.Sync clears
-	// Replicable until the gateway declares runtime_instances), so a document
-	// can arrive a second time under the same ETag with only that opt-in
-	// changed -- when the gateway's declaration changes. That second arrival is
-	// a different desired state and must be applied, not short-circuited.
-	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag && sameReplicableOptIn(cfg.Specs, o.cfg.Specs) {
+	// The ETag names the document, and the multi-instance opt-in and the
+	// log_files declarations are parts of it this agent may withhold on its
+	// own (Driver.Sync clears Replicable until the gateway declares
+	// runtime_instances, and log_files until it declares runtime_log_files),
+	// so a document can arrive a second time under the same ETag with only
+	// those changed -- when the gateway's declaration changes. That second
+	// arrival is a different desired state and must be applied, not
+	// short-circuited.
+	if cfg.ETag != "" && cfg.ETag == o.cfg.ETag && sameReplicableOptIn(cfg.Specs, o.cfg.Specs) && sameLogFileDeclarations(cfg.Specs, o.cfg.Specs) {
 		return
 	}
 	o.cfg = cfg
@@ -2183,6 +2185,29 @@ func sameReplicableOptIn(a, b []Spec) bool {
 		n++
 	}
 	return n == len(replicable)
+}
+
+// sameLogFileDeclarations reports whether a and b declare the same log_files
+// for every spec ID, in the same order (see applyConfig's short circuit). A
+// spec in one list only compares against no declaration.
+func sameLogFileDeclarations(a, b []Spec) bool {
+	declared := make(map[string][]LogFile, len(a))
+	for _, spec := range a {
+		if len(spec.LogFiles) > 0 {
+			declared[spec.ID] = spec.LogFiles
+		}
+	}
+	n := 0
+	for _, spec := range b {
+		if len(spec.LogFiles) == 0 {
+			continue
+		}
+		if !slices.Equal(declared[spec.ID], spec.LogFiles) {
+			return false
+		}
+		n++
+	}
+	return n == len(declared)
 }
 
 // instanceLess is the owner's order over instances wherever the order decides

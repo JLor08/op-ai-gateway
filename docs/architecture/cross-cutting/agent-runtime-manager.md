@@ -5260,7 +5260,7 @@ up. So:
 | `admin_state` set to `force_stopped` | **Applied immediately** — a running child drains. |
 | A **launch-affecting** field of a running spec changes (`binary`, `args`, `env`, `config_files` — the files the agent writes before the exec and the child reads at startup, so a content edit relaunches — `work_dir`, the GPU **index** set, `set_visible_devices`, `visible_devices_mode`, `listen_port`, `process_tree` (`direct` and an absent value are the same launch, [§3.9](#39-the-windows-process-tree-process_tree)), the `${API_TOKEN}` material, or `upstream_model` — which a `${MODEL}` placeholder can substitute into the command, so any change to it relaunches) | **Applied immediately** — the child drains (in-flight requests finish first, up to the drain grace) and relaunches with the new shape. A pinned/force-running child comes back at once; an on-demand one on its next request. |
 | A **metadata-only** field changes (idle timeout, admission-wait timeout, `pinned`, `admin_state` `force_running`, the health/probe paths, `api_token_header` (read only by the agent's own child probes, §3.2), startup/health timeouts, the reported runtime `type`, the client-facing model name, **the spec's `role`, or a GPU row's `vram_mb` or the spec's `ram_mb`** — admission inputs (the role orders eviction), not launch inputs; the gateway pushes each demand as `max(measured, estimate)`, so a fresh measurement alone changes the document without relaunching a healthy child, and a verdict change that moves the derived role does the same) | **Applied in place** — no relaunch; the next event that needs it reads it from the stored spec (an admission-arithmetic input such as `vram_mb` or `ram_mb` binds at the next start, per the not-retroactive rule below). |
-| A spec's `log_files` change (#430, [§14.9](#149-log-files)) | **Applied at the next generation start** — no relaunch (`sameLaunchShape` strips `LogFiles`): the child neither sees nor needs the list, which only says what the agent tails. The tailers of a running generation are not re-armed; the next start resolves the new list (`prepareLogFiles`). |
+| A spec's `log_files` change (#430, [§14.9](#149-log-files)), or a change of the gateway's `runtime_log_files` declaration, which gates them (§7) | **Applied at the next generation start** — no relaunch (`sameLaunchShape` strips `LogFiles`): the child neither sees nor needs the list, which only says what the agent tails. The tailers of a running generation are not re-armed; the next start resolves the new list (`prepareLogFiles`). |
 | Lowered per-GPU VRAM budget | **Not retroactive.** Binds at the next start. |
 | Removed or newly forbidden co-residency pair (an explicit `forbid`, or a mode switch that closes pairs) | **Not retroactive.** Binds at the next start. |
 | Lowered `runtime_max_processes` | **Not retroactive.** Binds at the next start. |
@@ -5781,8 +5781,7 @@ and backports. A flag both sides declare is active if and only if a string-equal
 name appears on both sides' lists. Not every flag is on both lists: a flag that
 states a fact about one side alone need only be declared by that side, and the
 other side reads it off that side's list without declaring it back (the gateway
-declares `runtime_logs`, `runtime_config_ack` and `runtime_log_files` anyway, for
-completeness). Eighteen
+declares `runtime_logs` and `runtime_config_ack` anyway, for completeness). Eighteen
 are on the agent's list only, for the gateway or the portal to read off the
 agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_upstream_props`, `runtime_ensure`, `multipart_proxy`,
@@ -5791,8 +5790,9 @@ agent's sample (`gpu_selection`, `runtime_api_token`, `runtime_model_probe`,
 `runtime_role_eviction`, `runtime_stop`, `runtime_exec_wsl`, `realtime_proxy`,
 `runtime_gpu_main_last`, `runtime_process_tree_job`); two,
 `capability_source_sdcpp` and `capability_source_audiocpp`, are on the gateway's list
-only and read by the agent (below); and two, `runtime_instances` and `rpc_cluster`, are on **both** lists
-with a different fact behind each declaration, each side reading the other's (below).
+only and read by the agent (below); and three, `runtime_instances`, `rpc_cluster` and
+`runtime_log_files`, are on **both** lists with a different fact behind each
+declaration, each side reading the other's (below).
 See [ADR-025](../09-architecture-decisions.md#adr-025--agent-capabilities-negotiate-by-named-feature-flags-not-versions).
 
 | Direction | Channel |
@@ -6053,16 +6053,24 @@ on evidence (§3.9). `TestFeaturesDeclareStrataFlags` pins both names and their 
 [ADR-121](../09-architecture-decisions.md#adr-121--the-agent-may-read-files-the-gateway-names-under-these-rules))
 says the agent tails a spec's declared `log_files` into streams of their own,
 sends their file events and adds `log_file_tails` to a failed generation's
-`last_error` (`FeatureRuntimeLogFiles`, `Since: "0.26.0"`). The gateway declares
-the same string (`runtimeLogFilesFeature`) for completeness, like `runtime_logs`:
-the agent reads nothing off it, and tails what a file-mode document declares as
-well. Neither side gates behaviour on the other's declaration. The gateway keeps
-`log_files` in the runtime document whatever the agent declares, an agent without
-the name ignores the field, and the portal reads the agent's declaration only to
-explain itself: the spec editor warns, without blocking the save, that the
+`last_error` (`FeatureRuntimeLogFiles`, `Since: "0.26.0"`). **The gateway's
+declaration** of the same string (`runtimeLogFilesFeature`) says it understands the
+`stream` a `runtime_log` entry carries, the file events and `log_file_tails`, and
+the agent reads it fail-closed, in file mode too, like `rpc_cluster`: while it is
+absent `Driver.Sync` clears every spec's `log_files` (`withoutLogFiles`), so the
+agent starts no tailer, removes no file before exec and sends no file stream and
+no `log_file_tails`, and an older gateway, which would relay a file's text as
+process output, never receives one. The declaration is not launch-affecting: a
+change of it, like an edit of `log_files`, applies at each spec's next start, and
+it bypasses the ETag short-circuit like `runtime_instances`
+(`sameLogFileDeclarations`); the Warn is logged once per transition. The gateway
+keeps `log_files` in the runtime document whatever the agent declares, an agent
+without the name ignores the field, and the portal reads the agent's declaration
+only to explain itself: the spec editor warns, without blocking the save, that the
 connected agent would not tail the files, and a file tab of such an agent says
 so instead of staying blank (§14.9). `TestAgentFeaturesDeclaresRuntimeLogFiles`
-pins the name, its `Since` and the version.
+pins the name, its `Since` and the version;
+`TestDriverWithoutRuntimeLogFilesTailsNothing` pins the agent's gate.
 
 `runtime_exec_wsl` (#381, [§3.8](#38-execution-modes-wsl2),
 [ADR-101](../09-architecture-decisions.md#adr-101--wsl2-execution-mode-a-rootless-systemd-user-scope-cgroup-ram-and-vram-attributed-from-the-vm-worker-by-start-delta-with-the-remainder-charged))
@@ -6701,11 +6709,10 @@ Windows (§3.5), and the file-mode parse-error code `invalid_log_files` (§8.3).
 version. In gateway mode there is **no upgrade order**: an older agent ignores `log_files` and
 sends no `stream`, no file event and no `log_file_tails`, so it behaves as before
 (the portal explains its empty file tabs), and an older gateway never sends
-`log_files`. One combination mixes the streams: a 0.26.0 agent in file mode whose
-local document declares `log_files`, behind a gateway older than the feature. The
-agent does not read the gateway's declaration, so it tails and sends the files;
-that gateway knows no `stream`, so it relays the file text as process output and
-strips the file events as unknown. A current gateway behind an older agent receives exactly what it did;
+`log_files`. A 0.26.0 agent in file mode whose local document declares `log_files`,
+behind a gateway older than the feature, does not mix the streams either: that
+gateway does not declare `runtime_log_files`, so the agent treats the declaration
+as absent and tails nothing (§7). A current gateway behind an older agent receives exactly what it did;
 behind a 0.26.0 agent it receives masked process output where it received the
 value before.
 
@@ -11795,6 +11802,8 @@ into a **stream** of its own beside the process output, holds the text under the
 rules of §14.1–§14.6, and adds the end of each file to a failed generation's
 `last_error` (#430, agent 0.26.0, feature `runtime_log_files`,
 [ADR-121](../09-architecture-decisions.md#adr-121--the-agent-may-read-files-the-gateway-names-under-these-rules)).
+The agent honours `log_files` only while the gateway declares `runtime_log_files`
+too, in file mode as well; otherwise the declaration is as absent (§7).
 Nothing is inferred from `args` or a config file's content: only the explicit
 field counts.
 

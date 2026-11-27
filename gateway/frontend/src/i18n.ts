@@ -1656,7 +1656,7 @@ const de = {
   runtimeSpecLogFileName: 'Name des Log-Streams',
   runtimeSpecLogFileNamePlaceholder: 'z. B. server',
   runtimeSpecLogFilePath: 'Pfad der Log-Datei',
-  runtimeSpecLogFilePathPlaceholder: 'z. B. ${CONFIG_DIR}/logs/server.log',
+  runtimeSpecLogFilePathPlaceholder: 'z. B. ${CONFIG_DIR}/server.log',
   runtimeSpecLogFileAdd: 'Log-Datei hinzufügen',
   runtimeSpecLogFileRemove: 'Log-Datei entfernen',
   runtimeSpecLogFileNameBlank: 'Der Name fehlt.',
@@ -1860,7 +1860,7 @@ const de = {
   runtimeLogsFileWaiting:
     'Die Datei gibt es (noch) nicht. Der Agent prüft weiter, ob sie angelegt wird, und zeigt ihren Inhalt hier, sobald der Modellprozess sie anlegt.',
   runtimeLogsFileNotPermitted:
-    'Der Agent liest diese Datei nicht: Ihr Pfad liegt nach dem Auflösen von Verknüpfungen nicht in einem erlaubten Verzeichnis, oder sie ist keine gewöhnliche Datei. Erlaubt sind ${CONFIG_DIR} und die Verzeichnisse der Agent-Einstellung „runtime_allowed_log_dirs“ auf dem AI-Server.',
+    'Der Agent liest diese Datei nicht: Ihr Pfad liegt nach dem Auflösen von Verknüpfungen nicht in einem erlaubten Verzeichnis, oder sie ist keine gewöhnliche Datei – etwa eine Verknüpfung oder eine Datei mit mehr als einem Hardlink. Erlaubt sind ${CONFIG_DIR} und die Verzeichnisse der Agent-Einstellung „runtime_allowed_log_dirs“ auf dem AI-Server.',
   runtimeLogsFileBinary:
     'Die Datei enthält überwiegend Binärdaten statt Text. Der Agent hat das Mitlesen für diesen Lauf eingestellt.',
   runtimeLogsFileMissing:
@@ -5934,7 +5934,7 @@ const en: PortalMessages = {
   runtimeSpecLogFileName: 'Log stream name',
   runtimeSpecLogFileNamePlaceholder: 'e.g. server',
   runtimeSpecLogFilePath: 'Log file path',
-  runtimeSpecLogFilePathPlaceholder: 'e.g. ${CONFIG_DIR}/logs/server.log',
+  runtimeSpecLogFilePathPlaceholder: 'e.g. ${CONFIG_DIR}/server.log',
   runtimeSpecLogFileAdd: 'Add log file',
   runtimeSpecLogFileRemove: 'Remove log file',
   runtimeSpecLogFileNameBlank: 'The name is missing.',
@@ -6129,7 +6129,7 @@ const en: PortalMessages = {
   runtimeLogsFileWaiting:
     'The file does not exist (yet). The agent keeps checking for it and shows its content here once the model process creates it.',
   runtimeLogsFileNotPermitted:
-    'The agent does not read this file: after resolving links, its path is not inside an allowed directory, or it is not a regular file. Allowed are ${CONFIG_DIR} and the directories of the agent setting "runtime_allowed_log_dirs" on the AI server.',
+    'The agent does not read this file: after resolving links, its path is not inside an allowed directory, or it is not a regular file, such as a link or a file with more than one hard link. Allowed are ${CONFIG_DIR} and the directories of the agent setting "runtime_allowed_log_dirs" on the AI server.',
   runtimeLogsFileBinary:
     'The file holds mostly binary data rather than text. The agent stopped reading it for this run.',
   runtimeLogsFileMissing:

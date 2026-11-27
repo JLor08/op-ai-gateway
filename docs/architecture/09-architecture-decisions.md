@@ -14229,7 +14229,9 @@ layout either.
 8. **The agent masks its own secrets.** Literal occurrences of the values it resolved for `${API_TOKEN}` and `${AGENT_ENV:NAME}` in
    this generation, at least 8 bytes, are replaced by their placeholder before anything is retained, in file text and process output
    alike, with a carry that holds back only a possible secret start, so a secret split across two reads is masked too.
-9. **Agent 0.26.0, feature `runtime_log_files`.** An agent without it ignores the field; the gateway keeps it regardless.
+9. **Agent 0.26.0, feature `runtime_log_files`.** An agent without it ignores the field; the gateway keeps it regardless. The agent
+   honours the field only while the gateway declares the same name, in file mode too, so a gateway that cannot tell a file stream
+   from the process output never receives one.
 
 **Alternatives rejected.**
 - *Inferring the paths from `args` or config-file content* (`--log-file`, Strata's `log`): every server spells it differently, a
