@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // agentIngestPortal is the narrow slice of portal.API this file's handlers
@@ -609,21 +610,43 @@ func clampRuntimeStderrTail(s string) string {
 const maxRuntimeLogFileTails = 4
 
 // clampRuntimeLogFileTails bounds an agent-reported log_file_tails list: entries
-// whose name is not a valid log file name are dropped, at most
-// maxRuntimeLogFileTails are kept, and each tail is clamped like a stderr tail.
-// It returns a fresh slice (nil for none), so the decoded input is never shared.
+// whose name is not a valid log file name, is the reserved "process", or repeats
+// an earlier name (case-insensitively) are dropped, at most
+// maxRuntimeLogFileTails are kept, and each tail is cut to its LAST
+// maxRuntimeStderrTail bytes on a rune boundary -- the end of a log is what
+// explains a crash. It returns a fresh slice (nil for none), so the decoded
+// input is never shared.
 func clampRuntimeLogFileTails(in []RuntimeLogFileTailDTO) []RuntimeLogFileTailDTO {
 	var out []RuntimeLogFileTailDTO
+	seen := make(map[string]struct{}, maxRuntimeLogFileTails)
 	for _, t := range in {
 		if len(out) == maxRuntimeLogFileTails {
 			break
 		}
-		if !validLogStreamName(t.Name) {
+		key := strings.ToLower(t.Name)
+		if !validLogStreamName(t.Name) || key == "process" {
 			continue
 		}
-		out = append(out, RuntimeLogFileTailDTO{Name: t.Name, Tail: clampRuntimeStderrTail(t.Tail)})
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, RuntimeLogFileTailDTO{Name: t.Name, Tail: tailBytesOnRuneBoundary(t.Tail, maxRuntimeStderrTail)})
 	}
 	return out
+}
+
+// tailBytesOnRuneBoundary returns the last at most n bytes of s, starting on a
+// rune boundary (so it may be a few bytes shorter than n).
+func tailBytesOnRuneBoundary(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	s = s[len(s)-n:]
+	for len(s) > 0 && !utf8.RuneStart(s[0]) {
+		s = s[1:]
+	}
+	return s
 }
 
 // runtimeStatusDTOsFromSamples maps the wire-decoded runtime samples to the

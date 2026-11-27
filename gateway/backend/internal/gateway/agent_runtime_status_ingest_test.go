@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // seedRuntimeIngestSpec creates a server_agent application + mapping on the
@@ -3810,5 +3811,30 @@ func TestUnsupportedAPIVersionWarnNamesTheInstance(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no unsupported api_version Warn logged")
+	}
+}
+
+// TestClampRuntimeLogFileTailsKeepsTheEndAndDropsDuplicates: the END of an
+// over-long tail survives (cut on a rune boundary), and duplicate or reserved
+// names are dropped.
+func TestClampRuntimeLogFileTailsKeepsTheEndAndDropsDuplicates(t *testing.T) {
+	long := strings.Repeat("a", 3000) + "THE-END"
+	got := clampRuntimeLogFileTails([]RuntimeLogFileTailDTO{
+		{Name: "engine", Tail: long},
+		{Name: "ENGINE", Tail: "dup"},
+		{Name: "Process", Tail: "reserved"},
+		{Name: "app", Tail: "ok"},
+	})
+	if len(got) != 2 || got[0].Name != "engine" || got[1].Name != "app" {
+		t.Fatalf("got %+v, want engine and app only", got)
+	}
+	if len(got[0].Tail) > maxRuntimeStderrTail || !strings.HasSuffix(got[0].Tail, "THE-END") {
+		t.Fatalf("tail len %d, suffix kept = %v; want the last <=%d bytes", len(got[0].Tail), strings.HasSuffix(got[0].Tail, "THE-END"), maxRuntimeStderrTail)
+	}
+	// A cut that lands inside a multi-byte rune starts after it.
+	multi := strings.Repeat("\u00e4", 2000) // 4000 bytes
+	tail := clampRuntimeLogFileTails([]RuntimeLogFileTailDTO{{Name: "m", Tail: multi}})[0].Tail
+	if !utf8.ValidString(tail) || len(tail) > maxRuntimeStderrTail || len(tail) < maxRuntimeStderrTail-3 {
+		t.Fatalf("tail valid=%v len=%d, want valid UTF-8 within 3 bytes of the cap", utf8.ValidString(tail), len(tail))
 	}
 }

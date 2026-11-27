@@ -8,11 +8,14 @@ import (
 	"context"
 	"encoding/json"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/store"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -566,14 +569,25 @@ func TestRuntimeLogFileStreamNeverReachesDiskOrDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenSQLite: %v", err)
 	}
+	if err := st.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
 	srv := NewTestServer()
 	srv.Routes = st
 	srv.RuntimeLogs = newRuntimeLogRegistry()
 	sub, unsub, _ := srv.RuntimeLogs.subscribe("mock-host-qwen", "spec-a")
 	defer unsub()
-	status, _, unsubStatus := srv.RuntimeStatus.subscribe("mock-host-qwen")
-	_ = status
-	defer unsubStatus()
+	// The server and the spec must exist in THIS store, or the sample is
+	// rejected before any write or publish and the test would prove nothing.
+	now := time.Now().UTC()
+	if err := st.CreateAIServer(context.Background(), routing.AIServer{
+		ID: "mock-host-qwen", Name: "mock-host-qwen", Domain: "mock-host-qwen.example.test",
+		Provider: routing.ProviderMock, Endpoint: "mock://mock-host-qwen",
+		Status: routing.ServerStatusActive, HealthStatus: routing.HealthHealthy, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	seedRuntimeIngestSpecForServer(t, srv, "mock-host-qwen", "rspec_tails")
 
 	const needle = "OP-AI-GATEWAY-FILE-NEEDLE-9d21"
 	frame, err := json.Marshal(RuntimeLogBatchDTO{
@@ -596,15 +610,17 @@ func TestRuntimeLogFileStreamNeverReachesDiskOrDatabase(t *testing.T) {
 		}
 	}
 
-	// The tails ride the telemetry path. Its spec lookup is irrelevant here:
-	// whether or not the sample is accepted, the needle must not reach disk.
 	body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_tails","state":"crashed",` +
 		`"last_error":{"message":"boom","exit_code":1,"failures":1,"log_file_tails":[{"name":"engine","tail":"tail: ` + needle + `"}]}}]}`
 	req, raw := ingestReq(t, body)
-	_ = srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw)
-	if got := runtimeStatusDTOsFromSamples(req.Runtimes, time.Now()); len(got) != 1 || got[0].LastError == nil ||
-		len(got[0].LastError.LogFileTails) != 1 || !strings.Contains(got[0].LastError.LogFileTails[0].Tail, needle) {
-		t.Fatalf("the tail did not reach the in-memory DTO, so this test would pass vacuously: %+v", got)
+	if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+		t.Fatalf("ingestTelemetrySample = %v; a rejected sample would make this test vacuous", err)
+	}
+	snap, _, unsubStatus := srv.RuntimeStatus.subscribe("mock-host-qwen")
+	defer unsubStatus()
+	if len(snap) != 1 || snap[0].LastError == nil || len(snap[0].LastError.LogFileTails) != 1 ||
+		!strings.Contains(snap[0].LastError.LogFileTails[0].Tail, needle) {
+		t.Fatalf("the tail is not in the in-memory status registry, so the disk search below would be vacuous: %+v", snap)
 	}
 
 	if err := st.Close(); err != nil {
@@ -1263,5 +1279,131 @@ func TestRuntimeLogGapIsPerStream(t *testing.T) {
 	}
 	if again := sub.take(RuntimeLogBatchDTO{SpecID: "spec-a"}); len(again.Entries) != 0 {
 		t.Fatalf("gap reported twice: %+v", again.Entries)
+	}
+}
+
+// fillQueue publishes enough one-entry batches to fill sub's queue without
+// reading, so the next publish is dropped.
+func fillQueue(r *runtimeLogRegistry) {
+	for range runtimeLogSubBuffer {
+		r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{{Text: "x"}}})
+	}
+}
+
+// TestRuntimeLogStreamCountIsBounded: a hostile agent naming ever more distinct
+// valid streams at a blocked subscriber must not grow its loss map; past the
+// cap the subscriber is resynced instead.
+func TestRuntimeLogStreamCountIsBounded(t *testing.T) {
+	r, _ := newSpiedLogRegistry()
+	sub, unsub, _ := r.subscribe("srv-1", "spec-a")
+	defer unsub()
+	fillQueue(r)
+
+	for i := range runtimeLogSubMaxStreams {
+		r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{{Stream: "s" + strconv.Itoa(i), Text: "lost"}}})
+	}
+	select {
+	case <-sub.resync:
+		t.Fatal("resynced at the cap; only a stream beyond it should resync")
+	default:
+	}
+	sub.mu.Lock()
+	n := len(sub.dropped)
+	sub.mu.Unlock()
+	if n != runtimeLogSubMaxStreams {
+		t.Fatalf("tracked %d streams, want %d", n, runtimeLogSubMaxStreams)
+	}
+	r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{{Stream: "one-too-many", Text: "lost"}}})
+	select {
+	case <-sub.resync:
+	default:
+		t.Fatal("a stream beyond the cap did not resync the subscriber")
+	}
+	sub.mu.Lock()
+	n = len(sub.dropped)
+	sub.mu.Unlock()
+	if n > runtimeLogSubMaxStreams {
+		t.Fatalf("loss map grew to %d", n)
+	}
+}
+
+// TestRuntimeLogAgentGapSurvivesADroppedBatch: a batch dropped for a full queue
+// whose only entry for a stream is the agent's own gap still reports it, and a
+// hostile value saturates instead of wrapping negative.
+func TestRuntimeLogAgentGapSurvivesADroppedBatch(t *testing.T) {
+	r, _ := newSpiedLogRegistry()
+	sub, unsub, _ := r.subscribe("srv-1", "spec-a")
+	defer unsub()
+	fillQueue(r)
+	r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{
+		{Stream: "engine", DroppedBytes: 500},
+		{Stream: "engine", Text: "abc"},
+	}})
+	r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{{Stream: "huge", DroppedBytes: math.MaxInt64}}})
+	r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{{Stream: "huge", DroppedBytes: 10, Text: "zz"}}})
+	for range runtimeLogSubBuffer {
+		<-sub.ch
+	}
+	r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{{Text: "live"}}})
+	got := <-sub.ch
+	gaps := map[string]int64{}
+	for _, e := range got.Entries {
+		if e.DroppedBytes != 0 {
+			gaps[e.Stream] = e.DroppedBytes
+		}
+	}
+	if gaps["engine"] != 503 {
+		t.Fatalf("engine gap = %d, want 503 (agent gap 500 + 3 dropped text bytes): %+v", gaps["engine"], got.Entries)
+	}
+	if gaps["huge"] != math.MaxInt64 {
+		t.Fatalf("huge gap = %d, want saturated at MaxInt64", gaps["huge"])
+	}
+}
+
+// TestRuntimeLogTakeReportsPerStreamGapsBehindQueuedBatches: the SSE writer
+// stamps gaps through take() while batches from BEFORE the drop are still
+// queued; take puts one gap entry per stream in front of the batch it is given,
+// and only once.
+func TestRuntimeLogTakeReportsPerStreamGapsBehindQueuedBatches(t *testing.T) {
+	r, _ := newSpiedLogRegistry()
+	sub, unsub, _ := r.subscribe("srv-1", "spec-a")
+	defer unsub()
+	fillQueue(r) // queued, pre-drop batches stay in sub.ch
+	r.publish("srv-1", RuntimeLogBatchDTO{SpecID: "spec-a", Entries: []RuntimeLogEntryDTO{
+		{Text: "0123456789"}, {Stream: "engine", Text: "abc"},
+	}})
+
+	first := sub.take(<-sub.ch) // an old, queued batch
+	if len(first.Entries) != 3 || first.Entries[0].Stream != "" || first.Entries[0].DroppedBytes != 10 ||
+		first.Entries[1].Stream != "engine" || first.Entries[1].DroppedBytes != 3 || first.Entries[2].Text != "x" {
+		t.Fatalf("first taken batch = %+v, want gap(\"\",10), gap(engine,3), then its own entry", first.Entries)
+	}
+	second := sub.take(<-sub.ch)
+	if len(second.Entries) != 1 || second.Entries[0].DroppedBytes != 0 {
+		t.Fatalf("gap reported twice: %+v", second.Entries)
+	}
+}
+
+// TestRuntimeLogFileEventsCarryNoPayloadAndProcessStreamIsReserved: a file
+// event is a bare marker, and a stream named "process" (any case) is dropped.
+func TestRuntimeLogFileEventsCarryNoPayloadAndProcessStreamIsReserved(t *testing.T) {
+	srv := &Server{RuntimeLogs: newRuntimeLogRegistry()}
+	sub, unsub, _ := srv.RuntimeLogs.subscribe("srv-1", "spec-a")
+	defer unsub()
+	srv.ingestRuntimeLog("srv-1", json.RawMessage(`{"spec_id":"spec-a","entries":[
+		{"stream":"engine","event":"file_opened","text":"smuggled","exit_code":9,"pid":77},
+		{"stream":"engine","pid":77,"text":"plain\n"},
+		{"stream":"process","text":"x"},
+		{"stream":"PrOcEsS","text":"y"}
+	]}`))
+	got := <-sub.ch
+	if len(got.Entries) != 2 {
+		t.Fatalf("entries = %+v, want the two engine entries only", got.Entries)
+	}
+	if e := got.Entries[0]; e.Event != "file_opened" || e.Text != "" || e.ExitCode != 0 || e.PID != 0 {
+		t.Errorf("file event carried a payload: %+v", e)
+	}
+	if e := got.Entries[1]; e.Text != "plain\n" || e.PID != 77 {
+		t.Errorf("a plain file entry was altered: %+v", e)
 	}
 }

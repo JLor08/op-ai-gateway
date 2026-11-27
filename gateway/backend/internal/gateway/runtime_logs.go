@@ -6,7 +6,9 @@ package gateway
 import (
 	"encoding/json"
 	"log/slog"
+	"math"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -361,18 +363,41 @@ func (s *runtimeLogSub) stampedLocked(batch RuntimeLogBatchDTO) RuntimeLogBatchD
 	return batch
 }
 
-// addDroppedLocked accounts the text of a batch that did not fit the queue,
-// per stream.
+// runtimeLogSubMaxStreams bounds how many distinct streams one subscriber
+// tracks losses for. A spec declares at most 4 log files plus the process
+// stream, so 16 is far above any honest agent; past it the agent is hostile
+// or broken and the subscriber is resynced rather than letting the map grow.
+const runtimeLogSubMaxStreams = 16
+
+// addDroppedLocked accounts, per stream, what a batch that did not fit the
+// queue was carrying: its text bytes and any gap the agent itself reported on
+// an entry (dropped_bytes), so an agent-side loss is not erased by a
+// gateway-side one. Addition saturates so a hostile value cannot wrap
+// negative. A stream beyond runtimeLogSubMaxStreams resyncs the subscriber.
 func (s *runtimeLogSub) addDroppedLocked(batch RuntimeLogBatchDTO) {
 	for _, e := range batch.Entries {
-		if len(e.Text) == 0 {
+		n := satAddInt64(int64(len(e.Text)), max(e.DroppedBytes, 0))
+		if n == 0 {
 			continue
+		}
+		if _, known := s.dropped[e.Stream]; !known && len(s.dropped) >= runtimeLogSubMaxStreams {
+			s.dropped = nil
+			s.resyncLocked()
+			return
 		}
 		if s.dropped == nil {
 			s.dropped = make(map[string]int64)
 		}
-		s.dropped[e.Stream] += int64(len(e.Text))
+		s.dropped[e.Stream] = satAddInt64(s.dropped[e.Stream], n)
 	}
+}
+
+// satAddInt64 adds two non-negative values, clamping at math.MaxInt64.
+func satAddInt64(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 // droppedGapEntries turns per-stream drop counts into one gap entry per stream
@@ -844,11 +869,12 @@ func (s *Server) ingestRuntimeLog(serverID string, raw json.RawMessage) {
 	if len(batch.Entries) > runtimeLogMaxEntries {
 		batch.Entries = batch.Entries[:runtimeLogMaxEntries]
 	}
-	// An entry naming an invalid stream is dropped whole: it cannot be
+	// An entry naming an invalid stream, or the reserved "process" (the
+	// stream-less process output's own key), is dropped whole: it cannot be
 	// attributed to anything, and the stream name keys a portal tab.
 	kept := batch.Entries[:0]
 	for _, e := range batch.Entries {
-		if e.Stream == "" || validLogStreamName(e.Stream) {
+		if e.Stream == "" || (validLogStreamName(e.Stream) && !strings.EqualFold(e.Stream, "process")) {
 			kept = append(kept, e)
 		}
 	}
@@ -858,6 +884,12 @@ func (s *Server) ingestRuntimeLog(serverID string, raw json.RawMessage) {
 		allowed := runtimeLogEvents
 		if batch.Entries[i].Stream != "" {
 			allowed = runtimeLogFileEvents
+		}
+		if batch.Entries[i].Stream != "" && allowed[batch.Entries[i].Event] {
+			// A file event is a typed marker: no text, no exit code, no pid.
+			batch.Entries[i].Text = ""
+			batch.Entries[i].ExitCode = 0
+			batch.Entries[i].PID = 0
 		}
 		if !allowed[batch.Entries[i].Event] {
 			batch.Entries[i].Event = ""

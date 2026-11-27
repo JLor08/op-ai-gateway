@@ -2405,7 +2405,7 @@ func validateRuntimeSpecLogFiles(files []LogFileDTO) (string, error) {
 			}
 		}
 		if !hasLogFileConfigDirRoot(f.Path) && !isAbsPOSIXBinaryPath(f.Path) && !isAbsWindowsBinaryPath(f.Path) {
-			return "", fmt.Errorf("%w: the path of log file %q must be absolute or start with %s",
+			return "", fmt.Errorf("%w: the path of log file %q must be absolute or start with %s, which must be followed by a path separator",
 				ErrRuntimeSpecLogFilesInvalid, f.Name, runtimeSpecLogFileConfigDir)
 		}
 	}
