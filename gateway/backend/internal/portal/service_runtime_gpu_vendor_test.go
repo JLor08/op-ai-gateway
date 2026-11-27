@@ -794,6 +794,31 @@ func TestSaveSpecRefusesVendorBackendMismatch(t *testing.T) {
 	}
 }
 
+// TestSaveSpecMismatchReSendSavesEditRefused: a cuda spec stored on a
+// vendor-less GPU that the backfill then named AMD is mismatched. A re-send
+// of it as it is (an override) saves; an edit of its GPUs or its backend
+// that stays mismatched is refused.
+func TestSaveSpecMismatchReSendSavesEditRefused(t *testing.T) {
+	f := newGPUVendorFixture(t)
+	legacyGPU := RuntimeSpecGPUDTO{Index: 0}
+	if err := f.putSpec("cuda", true, "env", nil, legacyGPU); err != nil {
+		t.Fatalf("store before the backfill: %v", err)
+	}
+	f.legacy("amd")
+	if err := f.putSpec("cuda", true, "env", nil, legacyGPU); err != nil {
+		t.Fatalf("re-send of the stored spec: %v", err)
+	}
+	if err := f.putSpec("cuda", true, "env", nil, legacyGPU, RuntimeSpecGPUDTO{Vendor: "amd", Index: 1}); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("gpu edit: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+	if err := f.putSpec("rocm", true, "env", nil, specNVIDIA0); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("backend and gpu edit: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+	if err := f.putSpec("metal", true, "env", nil, legacyGPU); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("backend edit: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+}
+
 func TestSaveSpecRefusesVulkanWithoutEnvVisibilityOnMixedHost(t *testing.T) {
 	f := newGPUVendorFixture(t)
 	f.hardware(mixedHostReport(`["rocm","vulkan"]`))
@@ -829,6 +854,25 @@ func TestSaveSpecRefusesVulkanWithoutEnvVisibilityOnMixedHost(t *testing.T) {
 	f.hardware(mixedHostReport(`["rocm","vulkan"]`))
 	if err := f.putSpec("vulkan", false, "", nil, specAMD0, RuntimeSpecGPUDTO{Vendor: "amd", Index: 1}); err != nil {
 		t.Fatalf("re-save of a stored spec on a host turned mixed: %v", err)
+	}
+	// An edit that changes the GPUs, or a backend that still resolves to
+	// Vulkan, without visibility is refused.
+	if err := f.putSpec("vulkan", false, "", nil, specAMD0); !errors.Is(err, ErrRuntimeSpecVulkanVisibleDevicesRequired) {
+		t.Fatalf("gpu edit on a host turned mixed: err = %v, want ErrRuntimeSpecVulkanVisibleDevicesRequired", err)
+	}
+	if err := f.putSpec("auto", false, "", nil, specNVIDIA0, specAMD0); !errors.Is(err, ErrRuntimeSpecVulkanVisibleDevicesRequired) {
+		t.Fatalf("backend and gpu edit on a host turned mixed: err = %v, want ErrRuntimeSpecVulkanVisibleDevicesRequired", err)
+	}
+	if err := f.putSpec("vulkan", true, "args", nil, specAMD0, RuntimeSpecGPUDTO{Vendor: "amd", Index: 1}); err != nil {
+		t.Fatalf("args mode keeps the agent from injecting, the inputs unchanged: %v", err)
+	}
+
+	// A vendor-less report of an older agent names no vendor, so the host
+	// is not known to be mixed.
+	g := newGPUVendorFixture(t)
+	g.hardware(`{"gpus":[{"index":0,"name":"NVIDIA GeForce RTX 3080 Ti","pci_bus_id":"00000000:01:00.0"},{"index":1,"name":"AMD Radeon RX 7900 XT","pci_bus_id":"0000:03:00.0"}]}`)
+	if err := g.putSpec("vulkan", false, "", nil, specNVIDIA0, specAMD0); err != nil {
+		t.Fatalf("vendor-less report: %v", err)
 	}
 }
 

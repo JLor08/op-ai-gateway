@@ -1269,10 +1269,11 @@ func (s *Service) operatorClusterPlan(ctx context.Context, p auth.Token, app rou
 		return clusterPlan{}, fmt.Errorf("%w: the version of the head binary %s is unknown; add it in the Binaries tab",
 			ErrClusterHeadBinaryVersionUnknown, fields.binary)
 	}
-	// The process-tree check runs after those. It refuses only a write that moves the spec into job: a re-save of a spec
-	// stored as job (the portal's Stop/Start/Pin/Clear overrides re-send the
-	// whole spec) succeeds, and RuntimeWarnings reports the agent's lack of
-	// support (runtimeProcessTreeAgentUnsupportedWarning).
+	// The process-tree check runs after those. It refuses only a write that
+	// moves the spec into job: a re-save of a spec stored as job (the
+	// portal's Stop/Start/Pin/Clear overrides re-send the whole spec)
+	// succeeds, and RuntimeWarnings reports the agent's lack of support
+	// (runtimeProcessTreeAgentUnsupportedWarning).
 	movesIntoJob := !prior.ok || normalizeProcessTree(prior.spec.ProcessTree) != routing.ProcessTreeJob
 	if fields.processTree == routing.ProcessTreeJob && movesIntoJob {
 		if err := s.checkProcessTreeSupported(ctx, app.ServerID); err != nil {

@@ -165,13 +165,17 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 		return "", false, err
 	}
 	// A backend that cannot drive one of the GPUs is refused unless the
-	// stored spec already was (movesIntoDeviceRefusal); a member is exempt
-	// from the Vulkan visibility rule, the agent pins its devices itself.
-	var priorErr error
+	// write leaves the stored spec's backend and GPUs as they are
+	// (refusalUnlessUnchanged); a member is exempt from the Vulkan
+	// visibility rule, the agent pins its devices itself.
+	var stored *devicePlanInputs
 	if prior.ID != "" {
-		priorErr = specDeviceRefusal(prior.DeviceBackend, storedKeys, vendors.legacy, false, false)
+		in := newDevicePlanInputs(prior.DeviceBackend, storedKeys, vendors.legacy, false)
+		stored = &in
 	}
-	if err := movesIntoDeviceRefusal(specDeviceRefusal(backend, specGPUKeys(req.GPUs), vendors.legacy, false, false), priorErr); err != nil {
+	keys := specGPUKeys(req.GPUs)
+	if err := refusalUnlessUnchanged(specDeviceRefusal(backend, keys, vendors.legacy, false, false),
+		newDevicePlanInputs(backend, keys, vendors.legacy, false), stored); err != nil {
 		return "", false, err
 	}
 	groups, err := s.rpcMemberHeadGroups(ctx, server.ID, req.AllowedHeadGroups, prior)

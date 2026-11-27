@@ -687,7 +687,7 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 	ramCeiling := 0
 	if m.row.Stale {
 		var err error
-		if gpuCeiling, ramCeiling, err = s.serverMemoryCeilings(ctx, m.server.ID); err != nil {
+		if gpuCeiling, ramCeiling, err = s.serverMemoryCeilings(ctx, m.server.ID, m.server.GPULegacyVendor); err != nil {
 			return AgentRuntimeSpecDTO{}, err
 		}
 	}
@@ -764,15 +764,12 @@ func memberDemand(stored, estimate int, stale bool, ceiling int) int {
 // serverID: per GPU the operator's budget, else the card's memory from the
 // hardware report; for RAM the host's memory. A figure that is not known is
 // absent (0). GPUs are keyed by (vendor, index) with an empty vendor read as
-// the server's legacy vendor (resolveLegacyGPUKey), on the report's and the
-// budgets' side alike, so a caller looks a member GPU up by its resolved
-// key and gets its own card's ceiling, never another vendor's at that index.
-func (s *Service) serverMemoryCeilings(ctx context.Context, serverID string) (map[routing.GPUKey]int, int, error) {
+// the server's legacy vendor legacy (resolveLegacyGPUKey), on the report's
+// and the budgets' side alike, so a caller looks a member GPU up by its
+// resolved key and gets its own card's ceiling, never another vendor's at
+// that index.
+func (s *Service) serverMemoryCeilings(ctx context.Context, serverID, legacy string) (map[routing.GPUKey]int, int, error) {
 	gpus := map[routing.GPUKey]int{}
-	legacy, err := s.serverLegacyGPUVendor(ctx, serverID)
-	if err != nil {
-		return nil, 0, err
-	}
 	hosts, err := s.serverHostGPUs(ctx, serverID)
 	if err != nil {
 		return nil, 0, err

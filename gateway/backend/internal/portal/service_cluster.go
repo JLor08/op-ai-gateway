@@ -1206,11 +1206,11 @@ func (s *Service) normalizeClusterMemberGPUVendors(entries []clusterEntry, prevG
 // Vulkan visibility rule: the agent pins a member's devices itself), right
 // after the vendors are normalized. A manual member's backend and GPUs were
 // checked when its spec was saved, and an entry the caller cannot see is
-// kept as it is. Only a member moved into the mismatch is refused
-// (movesIntoDeviceRefusal): the stored member on the same server, with its
-// stored backend and GPUs, is not mismatched the same way.
+// kept as it is. A member that leaves the stored automatic member at its
+// position on the same server with the same backend and GPUs is not refused
+// (refusalUnlessUnchanged): a head override re-sends it.
 func checkClusterMemberBackends(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) error {
-	for _, e := range entries {
+	for i, e := range entries {
 		if e.manual || !e.visible {
 			continue
 		}
@@ -1219,19 +1219,20 @@ func checkClusterMemberBackends(entries []clusterEntry, prevMembers []routing.Cl
 		if refusal == nil {
 			continue
 		}
-		var prior error
-		if i := slices.IndexFunc(prevMembers, func(m routing.ClusterMember) bool {
-			return m.ServerID == e.server.ID && m.MemberSpecID == ""
-		}); i >= 0 {
-			var stored []routing.GPUKey
+		var stored *devicePlanInputs
+		if j := slices.IndexFunc(prevMembers, func(m routing.ClusterMember) bool {
+			return m.Position == i && m.ServerID == e.server.ID && m.MemberSpecID == ""
+		}); j >= 0 {
+			var keys []routing.GPUKey
 			for _, g := range prevGPUs {
-				if g.ServerID == e.server.ID {
-					stored = append(stored, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
+				if g.MemberPosition == i && g.ServerID == e.server.ID {
+					keys = append(keys, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
 				}
 			}
-			prior = specDeviceRefusal(prevMembers[i].DeviceBackend, stored, legacy, false, false)
+			in := newDevicePlanInputs(prevMembers[j].DeviceBackend, keys, legacy, false)
+			stored = &in
 		}
-		if err := movesIntoDeviceRefusal(refusal, prior); err != nil {
+		if err := refusalUnlessUnchanged(refusal, newDevicePlanInputs(e.req.DeviceBackend, e.gpus, legacy, false), stored); err != nil {
 			return e.refusal(err, "the device backend of the member on server %q cannot drive its GPUs", e.server.Name)
 		}
 	}
@@ -2026,7 +2027,7 @@ func (s *Service) peaksAboveBudget(ctx context.Context, members []clusterMemberS
 		if !measured {
 			continue
 		}
-		gpuCeilings, ramCeiling, err := s.serverMemoryCeilings(ctx, m.server.ID)
+		gpuCeilings, ramCeiling, err := s.serverMemoryCeilings(ctx, m.server.ID, m.server.GPULegacyVendor)
 		if err != nil {
 			return nil, err
 		}

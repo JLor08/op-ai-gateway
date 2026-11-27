@@ -325,31 +325,74 @@ func specDeviceRefusal(backend string, keys []routing.GPUKey, legacy string, inj
 	return nil
 }
 
-// movesIntoDeviceRefusal is specDeviceRefusal's answer for a write, unless
-// the stored object the write replaces is refused the same way (prior; nil
-// for a new object or none): like the process-tree rule, only a write that
-// moves an object into the refusal is refused, so the portal's overrides,
-// which re-send the whole stored object, keep working on one stored before
-// the rule applied (or before its host turned mixed). The agent refuses
-// such an object at launch with the same code.
-func movesIntoDeviceRefusal(refusal, prior error) error {
-	if refusal != nil && errors.Is(prior, refusal) {
+// devicePlanInputs is what the device-plan refusals (specDeviceRefusal)
+// read of one stored or requested object besides its host: the normalized
+// device backend, the set of its GPU keys with an empty vendor read as the
+// server's legacy vendor, and whether the agent injects the visibility
+// variable (injectsVisibleDevices; always false for an RPC member).
+type devicePlanInputs struct {
+	backend string
+	keys    []routing.GPUKey
+	injects bool
+}
+
+// newDevicePlanInputs builds the devicePlanInputs of an object with device
+// backend backend and GPU keys on a server whose legacy vendor is legacy.
+func newDevicePlanInputs(backend string, keys []routing.GPUKey, legacy string, injects bool) devicePlanInputs {
+	set := make([]routing.GPUKey, 0, len(keys))
+	for _, k := range keys {
+		if r := resolveLegacyGPUKey(k, legacy); !slices.Contains(set, r) {
+			set = append(set, r)
+		}
+	}
+	slices.SortFunc(set, func(a, b routing.GPUKey) int {
+		if c := strings.Compare(a.Vendor, b.Vendor); c != 0 {
+			return c
+		}
+		return a.Index - b.Index
+	})
+	return devicePlanInputs{
+		backend: normalizeDeviceBackend(strings.ToLower(strings.TrimSpace(backend))),
+		keys:    set,
+		injects: injects,
+	}
+}
+
+func (d devicePlanInputs) equal(o devicePlanInputs) bool {
+	return d.backend == o.backend && d.injects == o.injects && slices.Equal(d.keys, o.keys)
+}
+
+// refusalUnlessUnchanged is a write's device-plan refusal, except for a
+// write that leaves the stored object's device-plan inputs as they are
+// (prior; nil for a new object or none): the portal's overrides re-send the
+// whole stored object, so like the process-tree rule they keep working on
+// one stored before the rule applied (or before its host turned mixed);
+// the agent refuses such an object at launch with the same code. Any change
+// of the backend, the GPUs or the visibility injection is refused.
+func refusalUnlessUnchanged(refusal error, write devicePlanInputs, prior *devicePlanInputs) error {
+	if refusal != nil && prior != nil && write.equal(*prior) {
 		return nil
 	}
 	return refusal
 }
 
+// injectsVisibleDevices mirrors the agent's rule of the same name: the
+// agent puts a visibility variable into the child's environment only for a
+// set_visible_devices spec in env mode (the default; any mode but args).
+func injectsVisibleDevices(setVisible bool, mode routing.VisibleDevicesMode) bool {
+	return setVisible && mode != routing.VisibleDevicesModeArgs
+}
+
 // checkSpecDevicePlan is specDeviceRefusal for an operator's runtime-spec
 // write on serverID, after its GPU vendors are normalized: the Vulkan
 // visibility rule applies when the server's stored hardware report lists
-// both NVIDIA and AMD GPUs (read only when the spec could need it), and the
-// agent injects the visibility variable for set_visible_devices in env mode
-// (the default). Only a write that moves the spec into a refusal is refused
-// (movesIntoDeviceRefusal against the stored spec and its stored GPU rows).
+// both NVIDIA and AMD GPUs (read only when the spec could need it). A write
+// that leaves the stored spec's device-plan inputs unchanged is not refused
+// (refusalUnlessUnchanged against the stored spec and its stored GPU rows).
 func (s *Service) checkSpecDevicePlan(ctx context.Context, serverID string, req PutRuntimeSpecRequest, f runtimeSpecFields, prior runtimeSpecPrior) error {
 	legacy := prior.legacyVendor
 	keys := specGPUKeys(req.GPUs)
-	injects := req.SetVisibleDevices && f.visibleMode != routing.VisibleDevicesModeArgs
+	injects := injectsVisibleDevices(req.SetVisibleDevices, f.visibleMode)
 	mixed := false
 	if resolved, _ := resolveSpecBackend(f.deviceBackend, specGPUVendors(keys, legacy)); resolved == deviceBackendVulkan && len(keys) > 0 && !injects {
 		host, err := s.serverHostGPUs(ctx, serverID)
@@ -358,11 +401,12 @@ func (s *Service) checkSpecDevicePlan(ctx context.Context, serverID string, req 
 		}
 		mixed = hostIsMixed(host)
 	}
-	refusal := specDeviceRefusal(f.deviceBackend, keys, legacy, injects, mixed)
-	if refusal == nil || !prior.ok {
-		return refusal
+	var stored *devicePlanInputs
+	if prior.ok {
+		in := newDevicePlanInputs(prior.spec.DeviceBackend, slices.Collect(maps.Keys(prior.measuredByKey)), legacy,
+			injectsVisibleDevices(prior.spec.SetVisibleDevices, prior.spec.VisibleDevicesMode))
+		stored = &in
 	}
-	priorInjects := prior.spec.SetVisibleDevices && prior.spec.VisibleDevicesMode != routing.VisibleDevicesModeArgs
-	priorKeys := slices.Collect(maps.Keys(prior.measuredByKey))
-	return movesIntoDeviceRefusal(refusal, specDeviceRefusal(prior.spec.DeviceBackend, priorKeys, legacy, priorInjects, mixed))
+	return refusalUnlessUnchanged(specDeviceRefusal(f.deviceBackend, keys, legacy, injects, mixed),
+		newDevicePlanInputs(f.deviceBackend, keys, legacy, injects), stored)
 }

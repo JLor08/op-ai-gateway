@@ -2249,6 +2249,18 @@ func TestClusterMemberSaveRefusesVendorBackendMismatch(t *testing.T) {
 	if _, err := f.put(ownerToken(), clusterHeadRequest(legacyMember)); err != nil {
 		t.Fatalf("re-save of a stored mismatched member: %v", err)
 	}
+	// An edit of the stored mismatched member's GPUs is refused.
+	edited := autoMember(a.ID, 0, 1)
+	edited.DeviceBackend = "cuda"
+	if _, err := f.put(ownerToken(), clusterHeadRequest(edited)); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("edit of the stored mismatched member's gpus: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+	// So is a backend edit that still cannot drive the GPU.
+	edited = autoMember(a.ID, 0)
+	edited.DeviceBackend = "metal"
+	if _, err := f.put(ownerToken(), clusterHeadRequest(edited)); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("backend edit of the stored mismatched member: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
 	moved := autoMember(a.ID, 0)
 	moved.DeviceBackend = "rocm"
 	f.mustPut(clusterHeadRequest(moved))

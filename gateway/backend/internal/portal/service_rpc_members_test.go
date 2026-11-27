@@ -491,6 +491,17 @@ func TestPutRPCMemberSpecRefusesVendorBackendMismatch(t *testing.T) {
 	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, stored.ID, legacy); err != nil {
 		t.Fatalf("re-save of a stored mismatched spec: %v", err)
 	}
+	editedGPUs := legacy
+	editedGPUs.GPUs = []RuntimeSpecGPUDTO{{Index: 0}, {Vendor: "amd", Index: 1}}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, stored.ID, editedGPUs); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("gpu edit of a stored mismatched spec: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+	editedBackend := legacy
+	editedBackend.DeviceBackend = "rocm"
+	editedBackend.GPUs = []RuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, stored.ID, editedBackend); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("backend edit of a stored mismatched spec: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
 	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", legacy); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
 		t.Fatalf("new spec like it: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
 	}

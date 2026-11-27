@@ -973,7 +973,7 @@ func TestServerMemoryCeilingsKeyedByVendor(t *testing.T) {
 	if err := f.routes.SetServerGPUBudgets(f.ctx, a.ID, []routing.ServerGPUBudget{{ServerID: a.ID, GPUVendor: "nvidia", GPUIndex: 0, BudgetMB: 10000, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow}}); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := f.svc.serverMemoryCeilings(f.ctx, a.ID)
+	got, _, err := f.svc.serverMemoryCeilings(f.ctx, a.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -987,7 +987,7 @@ func TestServerMemoryCeilingsKeyedByVendor(t *testing.T) {
 	if err := f.routes.SetServerGPUBudgets(f.ctx, a.ID, []routing.ServerGPUBudget{{ServerID: a.ID, GPUIndex: 0, BudgetMB: 9000, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow}}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _, err = f.svc.serverMemoryCeilings(f.ctx, a.ID); err != nil {
+	if got, _, err = f.svc.serverMemoryCeilings(f.ctx, a.ID, "amd"); err != nil {
 		t.Fatal(err)
 	}
 	if got[routing.GPUKey{Vendor: "amd", Index: 0}] != 9000 || got[routing.GPUKey{Vendor: "nvidia", Index: 0}] != 11264 || len(got) != 2 {
