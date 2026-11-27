@@ -55,7 +55,7 @@ function hasControlCharacter(text: string): boolean {
 function hasConfigDirRoot(path: string): boolean {
   if (!path.startsWith(CONFIG_DIR)) return false;
   const rest = path.slice(CONFIG_DIR.length);
-  return rest === '' || rest[0] === '/' || rest[0] === '\\';
+  return rest === '' || rest.startsWith('/') || rest.startsWith('\\');
 }
 
 // logFilePathIsConfigFile: exactly ${CONFIG_DIR}/<name> or ${CONFIG_DIR}\<name>
@@ -92,19 +92,29 @@ function bytesOf(text: string): number[] {
 }
 
 // windowsPathHasPrefixFold: ASCII case-insensitive, `\` and `/` equivalent; a
-// longer path must continue with a separator.
+// longer path must continue with a separator. Like the Go original it compares
+// the prefix's UTF-8 bytes (bytesOf); every prefix passed here is one of the
+// ASCII device prefixes below, whose bytes are their UTF-16 code units.
 function hasPrefixFold(path: number[], prefix: string): boolean {
-  if (path.length < prefix.length) return false;
-  for (let i = 0; i < prefix.length; i += 1) {
-    const p = prefix.charCodeAt(i);
+  const pre = bytesOf(prefix);
+  if (path.length < pre.length) return false;
+  for (let i = 0; i < pre.length; i += 1) {
+    const p = pre[i]!;
     if (isSep(p)) {
       if (!isSep(path[i]!)) return false;
     } else if (upper(p) !== upper(path[i]!)) {
       return false;
     }
   }
-  return path.length === prefix.length || isSep(path[prefix.length]!);
+  return path.length === pre.length || isSep(path[pre.length]!);
 }
+
+// The Windows device prefixes volumeNameLen recognises, written raw:
+// \\.\UNC, \\., \\? and \??.
+const DEVICE_UNC_PREFIX = String.raw`\\.\UNC`;
+const DEVICE_DOT_PREFIX = String.raw`\\.`;
+const DEVICE_QUESTION_PREFIX = String.raw`\\?`;
+const NT_OBJECT_PREFIX = String.raw`\??`;
 
 // windowsUNCLen: the length of a UNC path's `host\share` volume prefix.
 function uncLen(path: number[], prefixLen: number): number {
@@ -122,8 +132,13 @@ function uncLen(path: number[], prefixLen: number): number {
 function volumeNameLen(path: number[]): number {
   if (path.length >= 2 && path[1] === COLON) return 2;
   if (path.length === 0 || !isSep(path[0]!)) return 0;
-  if (hasPrefixFold(path, '\\\\.\\UNC')) return uncLen(path, '\\\\.\\UNC\\'.length);
-  if (hasPrefixFold(path, '\\\\.') || hasPrefixFold(path, '\\\\?') || hasPrefixFold(path, '\\??')) {
+  // `\\.\UNC\`: the device UNC prefix and the separator after it.
+  if (hasPrefixFold(path, DEVICE_UNC_PREFIX)) return uncLen(path, DEVICE_UNC_PREFIX.length + 1);
+  if (
+    hasPrefixFold(path, DEVICE_DOT_PREFIX) ||
+    hasPrefixFold(path, DEVICE_QUESTION_PREFIX) ||
+    hasPrefixFold(path, NT_OBJECT_PREFIX)
+  ) {
     if (path.length === 3) return 3;
     const afterPrefix = path.slice(4);
     const cut = afterPrefix.findIndex(isSep);
