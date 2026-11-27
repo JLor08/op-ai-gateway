@@ -26,8 +26,9 @@ type SystemReport struct {
 	Mainboard    Mainboard  `json:"mainboard"`
 	BIOS         BIOS       `json:"bios"`
 	GPUs         []GPUInfo  `json:"gpus"`
-	// VulkanDeviceCount is the number of Vulkan devices the host exposes;
-	// 0 means unknown or none. Filled by a later commit.
+	// VulkanDeviceCount is the number of Vulkan devices the host exposes,
+	// CPU devices such as llvmpipe included; 0 means unknown or none.
+	// collector.CollectHardware fills it from vulkaninfo on a host with GPUs.
 	VulkanDeviceCount int `json:"vulkan_device_count,omitempty"`
 }
 
@@ -81,10 +82,12 @@ type GPUInfo struct {
 	// importantly, what it is not.
 	PCIBusID string `json:"pci_bus_id,omitempty"`
 	// VRAMMeasurable lists the APIs (cuda, rocm, vulkan) whose per-process
-	// VRAM measurement works for this card. Filled by a later commit.
+	// VRAM measurement works for this card. collector.CollectHardware fills
+	// it per vendor from the VRAM measurer's Measurable.
 	VRAMMeasurable []string `json:"vram_measurable,omitempty"`
 	// VulkanOrdinal is the card's Vulkan device ordinal; nil when unknown
-	// (0 is a valid ordinal, hence the pointer). Filled by a later commit.
+	// (0 is a valid ordinal, hence the pointer). collector.CollectHardware
+	// fills it from vulkaninfo, matched to the card by PCI address.
 	VulkanOrdinal *int `json:"vulkan_ordinal,omitempty"`
 }
 

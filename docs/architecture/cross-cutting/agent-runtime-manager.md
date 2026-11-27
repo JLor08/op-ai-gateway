@@ -899,7 +899,7 @@ spec's own GPUs**. The agent decides it **per spec** (`planDevices`,
 vendor read as the host's legacy vendor, [§3.10](#310-mixed-vendor-gpu-hosts))
 and the backend they resolve to, against the hardware it detected itself:
 
-| Spec's GPUs | `device_backend` | Variable set (`env` mode) | Device names the tokens render |
+| Spec's GPUs | `device_backend` | Variable set (`env` mode) | Device names `${DEVICES}` renders |
 |---|---|---|---|
 | NVIDIA only | `auto` or `cuda` | `CUDA_VISIBLE_DEVICES` = the host indices | `CUDA0..k-1` |
 | AMD only | `auto` or `rocm` | `ROCR_VISIBLE_DEVICES` = the host indices — **and nothing else** | `ROCm0..k-1` |
@@ -3634,10 +3634,10 @@ report's legacy vendor in `ai_servers.gpu_legacy_vendor` on every such report, a
 rewrites that server's empty-vendor rows (its specs' GPU rows, its budgets, its
 manual member specs' GPU rows, its cluster member GPU rows) to it in one
 transaction; an empty row whose owner already has an explicit row of that vendor
-at the same index is deleted instead (the explicit one wins). A vendor-less report
-(an older agent) calls nothing and never clears what is stored, and the stored
-legacy vendor is deliberately not re-derived from later reports, so a downgraded
-agent keeps being sent the rows it got. When the backfill rewrote rows and the
+at the same index is deleted instead (the explicit one wins). The legacy vendor is
+written again on every vendor-reporting report; a vendor-less report (an older
+agent) calls nothing, so it never re-derives or clears the stored legacy vendor,
+and a downgraded agent keeps being sent the rows it got. When the backfill rewrote rows and the
 report lists more than one vendor, it raises `ai_servers.gpu_vendor_note`: the
 portal shows an informational note on the server that legacy GPU assignments were
 mapped to the legacy vendor and should be reviewed, until an operator dismisses it
@@ -4961,7 +4961,7 @@ collector's PCI join is published** (read at every call): the AMD index is the K
 rank joined to the rocm-smi card by PCI address, and without a complete join an
 AMD index would be a guess, so nothing is measured on AMD and nothing is reported
 measurable. KFD reads about 130 MiB more than fdinfo for one ROCm process (3593
-against 3462 MiB on the AMD test VM); the under-read is accepted, since fdinfo is the
+against 3462 MiB raw fdinfo on the AMD test VM); the under-read is accepted, since fdinfo is the
 one source that also covers Vulkan, and §5.1's `max(measured, estimate)` and the
 run-peak history absorb it.
 
@@ -4974,7 +4974,8 @@ evaluated on every report because the AMD part follows the PCI join. The portal
 reads it for its RPC-member estimate and `--tensor-split` exemptions (§3.7).
 
 Verified on two single-vendor test VMs (2026-11-27): on the AMD test VM (two
-Radeon RX 6800, kernel 6.8, Mesa RADV) a HIP llama-server measured 3461 MiB and a
+Radeon RX 6800, kernel 6.8, Mesa RADV) a HIP llama-server measured 3461 MiB (the raw
+fdinfo reading of 3462 MiB under the agent's truncating KiB→MiB conversion) and a
 Vulkan one 3323 MiB on the card it used, with no double count and the other card
 absent below the noise floor; on the NVIDIA test VM (two RTX 2080 Ti, proprietary
 driver, which exposes no fdinfo memory keys) a CUDA run measured 8052 MiB
@@ -9204,8 +9205,8 @@ nothing else. Three numbers, three meanings, one owner each: the operator's
 estimate (editable), the agent's measurement (read-only text), the benchmark's
 (read-only, applied on request). Apply is a **form-state** change: no request is
 made until the operator saves, which is the whole of D4's ownership rule
-expressed as an affordance. It is matched **by GPU index**, never by row
-position, and it is absent — rather than showing a `0` — for the create form, an
+expressed as an affordance. It is matched **by GPU key** (vendor and index, an empty vendor read as the
+host's legacy vendor), never by row position, and it is absent — rather than showing a `0` — for the create form, an
 inconclusive run, a run whose isolation was never proven, and a declared card
 the run watched but measured nothing on. Which of the two reported quantities
 the number is (the delta, or the agent's per-process measurement) is named on
@@ -9544,8 +9545,9 @@ would lock operators out of the screen they need to fix it. Editing a row's inde
 clears the locally held expected values, because they described the old GPU
 identity; the backend re-snapshots on save.
 
-A **duplicate GPU index is refused by the backend as a whole-write failure, not
-deduped**, before any store call — so no filled-in row is silently discarded, but
+A **duplicate GPU (vendor, index) is refused by the backend as a whole-write
+failure, not deduped** (an empty vendor and the legacy vendor at one index are one
+card; NVIDIA 0 and AMD 0 are two), before any store call — so no filled-in row is silently discarded, but
 the entire write is rejected after a round trip with a code naming neither the row
 nor the reason. The portal therefore validates client-side at submit in both
 forms, naming the colliding index, and deliberately **allows** a collision *while
@@ -12540,5 +12542,7 @@ mechanics of the generated agent config document are in
   ADR-029, ADR-031 to ADR-036, ADR-087 to ADR-089 (the co-residency mode,
   the derived role and role-aware eviction), ADR-090 to ADR-093 (model
   instances: addressing, burst admission, the scaler, the audio benchmark), and
-  ADR-101 (the WSL2 execution mode), and ADR-121 (the agent reads the log files a
-  spec names, under its own rules).
+  ADR-101 (the WSL2 execution mode), ADR-121 (the agent reads the log files a
+  spec names, under its own rules), and ADR-122 (mixed NVIDIA + AMD hosts: GPU
+  keys, DRM-fdinfo measurement, per-spec visibility, the Vulkan mapping and
+  same-host RPC members).

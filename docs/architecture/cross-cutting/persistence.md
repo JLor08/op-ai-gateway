@@ -636,8 +636,8 @@ consequence of each.
 `nil` where SQL returns a conflict — a behavioural divergence between two
 supported drivers. Five were closed on the runtime tables: a runtime-spec id
 reused across mappings, an exact-duplicate co-residency pair within one
-`SetCoResidencyRules` call, duplicate GPU indexes in `SetRuntimeSpecGPUs` and in
-`SetServerGPUBudgets`, and a second `server_agent` application on one server. A
+`SetCoResidencyRules` call, duplicate GPU keys (vendor, index; NVIDIA 0 and AMD 0 are
+not duplicates) in `SetRuntimeSpecGPUs` and in `SetServerGPUBudgets`, and a second `server_agent` application on one server. A
 related decision, pinned so nobody "fixes" it: a **reversed** co-residency pair
 `(b, a)` stays a distinct row in *both* backends — canonical ordering is
 portal-level validation, not store-level canonicalization.

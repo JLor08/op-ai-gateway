@@ -14298,7 +14298,7 @@ two RTX 2080 Ti, proprietary driver, kernel 6.12), llama.cpp from one commit:
 
 - amdgpu DRM fdinfo (`/proc/<pid>/fdinfo/<fd>`) carries `drm-driver`, `drm-pdev` (the
   PCI address), `drm-client-id` and `drm-memory-vram` and covers ROCm **and** Vulkan
-  allocations (HIP 3462 MiB, Vulkan 3323 MiB on one card); KFD covers ROCm only
+  allocations (HIP 3462 MiB raw fdinfo, which the agent's truncating conversion reports as 3461; Vulkan 3323 MiB on one card); KFD covers ROCm only
   (3593 MiB for the HIP run, nothing for Vulkan). A Vulkan process held two fds per
   render node with one client id, and both runs opened the other card with ≤ 32 KiB
   of VRAM.

@@ -3190,8 +3190,9 @@ paths:
       tags: [portal]
       summary: Servers the llama.cpp RPC cluster head on the mapping may add as members ({"data":[...],"head_binary_known":bool,"head_rpc_protocol":string})
       description: >
-        Servers other than the head's that the caller manages and whose member
-        consent admits the head (system scope included). binary is the head
+        Servers other than the head's (the head's own included when its agent
+        is known to declare rpc_cluster_same_host) that the caller manages and
+        whose member consent admits the head (system scope included). binary is the head
         binary the operator's form has (default: the stored spec's); its
         version is read from the head server's inventory as the save check
         reads it, and head_binary_known says whether it is known (a commit, a
