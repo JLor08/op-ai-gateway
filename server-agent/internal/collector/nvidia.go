@@ -119,6 +119,7 @@ func parseNvidiaCSV(data []byte) ([]sample.GPU, error) {
 			parts[i] = strings.TrimSpace(parts[i])
 		}
 		gpu := sample.GPU{
+			Vendor:        VendorNVIDIA,
 			Index:         naInt(parts[0]),
 			Name:          parts[1],
 			UUID:          parts[2],

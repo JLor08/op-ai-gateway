@@ -97,11 +97,12 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 		for _, gp := range gpus {
 			r.GPUs = append(r.GPUs, sample.GPUInfo{
 				Index:            gp.Index,
+				Vendor:           gp.Vendor,
 				Name:             gp.Name,
 				UUID:             gp.UUID,
 				DriverVersion:    gp.DriverVersion,
 				MemoryTotalBytes: gp.MemTotalBytes,
-				// Empty for every collector but NVIDIA, and that is the
+				// NVIDIA and AMD fill it; Apple has none, and that is the
 				// intended degradation -- see sample.GPU.PCIBusID.
 				PCIBusID: gp.PCIBusID,
 			})

@@ -369,3 +369,19 @@ func TestGPUInfoOmitsEmptyPCIBusID(t *testing.T) {
 		t.Fatalf("GPUInfo without a bus id marshalled as %s, want the key omitted entirely", without)
 	}
 }
+
+func TestParseNvidiaCSVSetsVendor(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "nvidia-smi.csv"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	gpus, err := parseNvidiaCSV(data)
+	if err != nil || len(gpus) == 0 {
+		t.Fatalf("parseNvidiaCSV: %v (%d gpus)", err, len(gpus))
+	}
+	for _, g := range gpus {
+		if g.Vendor != VendorNVIDIA {
+			t.Fatalf("vendor = %q, want %q", g.Vendor, VendorNVIDIA)
+		}
+	}
+}

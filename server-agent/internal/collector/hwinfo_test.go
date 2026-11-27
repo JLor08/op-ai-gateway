@@ -68,3 +68,20 @@ func TestHelperMemoryModulesNeeded(t *testing.T) {
 		}
 	}
 }
+
+// fixedGPUCollector returns the GPUs it was given.
+type fixedGPUCollector struct{ gpus []sample.GPU }
+
+func (fixedGPUCollector) Name() string    { return "fixed" }
+func (fixedGPUCollector) Available() bool { return true }
+func (f fixedGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
+	return f.gpus, nil
+}
+
+func TestCollectHardwareCopiesVendor(t *testing.T) {
+	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", HardwareOptions{})
+	if len(r.GPUs) != 1 || r.GPUs[0].Vendor != VendorAMD || r.GPUs[0].PCIBusID != "0000:02:00.0" {
+		t.Fatalf("%+v", r.GPUs)
+	}
+}

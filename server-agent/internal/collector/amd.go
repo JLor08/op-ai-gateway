@@ -92,7 +92,8 @@ func parseRocmJSON(data []byte) ([]sample.GPU, error) {
 			continue
 		}
 		gpus = append(gpus, sample.GPU{
-			Index: cardIndex(k),
+			Vendor: VendorAMD,
+			Index:  cardIndex(k),
 			Name: firstNonEmpty(
 				rocmString(fields["Device Name"]),
 				rocmString(fields["Card Series"]),

@@ -65,7 +65,7 @@ func (c *appleCollector) Collect(ctx context.Context) ([]sample.GPU, error) {
 func parseIoregGPU(data []byte) ([]sample.GPU, error) {
 	text := string(data)
 
-	gpu := sample.GPU{Index: 0}
+	gpu := sample.GPU{Index: 0, Vendor: VendorApple}
 	if m := ioregModelRe.FindStringSubmatch(text); m != nil {
 		gpu.Name = m[1]
 	} else if m := ioregGPUModelRe.FindStringSubmatch(text); m != nil {

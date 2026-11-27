@@ -26,6 +26,9 @@ type SystemReport struct {
 	Mainboard    Mainboard  `json:"mainboard"`
 	BIOS         BIOS       `json:"bios"`
 	GPUs         []GPUInfo  `json:"gpus"`
+	// VulkanDeviceCount is the number of Vulkan devices the host exposes;
+	// 0 means unknown or none. Filled by a later commit.
+	VulkanDeviceCount int `json:"vulkan_device_count,omitempty"`
 }
 
 // CPUInfo is the CPU section (from gopsutil cpu.Info + cpu.Counts).
@@ -68,6 +71,7 @@ type BIOS struct {
 // GPUInfo is one GPU's static inventory (mapped from a GPU collector's sample.GPU).
 type GPUInfo struct {
 	Index            int    `json:"index"`
+	Vendor           string `json:"vendor,omitempty"`
 	Name             string `json:"name"`
 	UUID             string `json:"uuid,omitempty"`
 	DriverVersion    string `json:"driver_version,omitempty"`
@@ -76,6 +80,12 @@ type GPUInfo struct {
 	// Apple) -- see sample.GPU.PCIBusID for what it is for and, more
 	// importantly, what it is not.
 	PCIBusID string `json:"pci_bus_id,omitempty"`
+	// VRAMMeasurable lists the APIs (cuda, rocm, vulkan) whose per-process
+	// VRAM measurement works for this card. Filled by a later commit.
+	VRAMMeasurable []string `json:"vram_measurable,omitempty"`
+	// VulkanOrdinal is the card's Vulkan device ordinal; nil when unknown
+	// (0 is a valid ordinal, hence the pointer). Filled by a later commit.
+	VulkanOrdinal *int `json:"vulkan_ordinal,omitempty"`
 }
 
 // Normalize forces non-nil slices so the payload always decodes on the gateway.

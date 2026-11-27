@@ -5,6 +5,7 @@ package sample
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -46,4 +47,23 @@ func contains(s, sub string) bool {
 		}
 		return false
 	}()
+}
+
+func TestGPUInfoOmitsUnknownVulkanOrdinal(t *testing.T) {
+	b, err := json.Marshal(GPUInfo{Index: 0, Vendor: "nvidia"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"vendor":"nvidia"`) ||
+		strings.Contains(string(b), "vulkan_ordinal") || strings.Contains(string(b), "vram_measurable") {
+		t.Fatal(string(b))
+	}
+	zero := 0
+	b, err = json.Marshal(GPUInfo{VulkanOrdinal: &zero})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"vulkan_ordinal":0`) {
+		t.Fatal(string(b))
+	}
 }

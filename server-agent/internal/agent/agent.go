@@ -513,7 +513,17 @@ import (
 // generation's last_error (#430). The gateway reads the new fields when present
 // and an old agent simply sends none. This is the ONE bump for the whole
 // branch; later commits on it do not bump again.
-const Version = "0.26.0"
+//
+// 0.26.0 -> 0.27.0 is the single bump for mixed NVIDIA+AMD hosts. MINOR: the
+// agent reports a `vendor` (nvidia, amd, apple) on every GPU it describes --
+// telemetry, hardware report and runtime GPU samples -- plus the optional
+// hardware fields vram_measurable, vulkan_ordinal and vulkan_device_count, so
+// GPU indices that collide across vendors can be told apart (#434). The branch
+// adds the feature flags gpu_vendor_identity and rpc_cluster_same_host, both
+// with Since 0.27.0. The gateway reads the new fields when present and an old
+// agent simply sends none. This is the ONE bump for the whole branch; later
+// commits on it do not bump again.
+const Version = "0.27.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine

@@ -119,8 +119,12 @@ type NetInterface struct {
 // simply absent from RuntimeSample.GPUs, and the gateway keeps the
 // operator-entered estimate it already has.
 type RuntimeGPUSample struct {
-	Index          int `json:"index"`
-	VRAMMeasuredMB int `json:"vram_measured_mb"`
+	// Vendor is the GPU's vendor (nvidia, amd, apple); it disambiguates
+	// indices that collide across vendors on a mixed host. Empty on legacy
+	// samples.
+	Vendor         string `json:"vendor,omitempty"`
+	Index          int    `json:"index"`
+	VRAMMeasuredMB int    `json:"vram_measured_mb"`
 }
 
 // RuntimeErrorSample mirrors runtime.LastError for the wire: the most
@@ -501,6 +505,9 @@ type Net struct {
 // gateway through the static hardware report (CollectHardware -> GPUInfo)
 // rather than through the per-second telemetry mirror, which decodes neither.
 type GPU struct {
+	// Vendor is the collector that found the GPU: nvidia, amd or apple. An
+	// index alone is ambiguous on a mixed-vendor host.
+	Vendor        string `json:"vendor,omitempty"`
 	Index         int    `json:"index"`
 	Name          string `json:"name"`
 	UUID          string `json:"uuid"`
@@ -508,14 +515,13 @@ type GPU struct {
 	// PCIBusID is the card's PCI address, e.g. "00000000:65:00.0". NVIDIA
 	// reports it via nvidia-smi pci.bus_id and AMD via rocm-smi --showbus;
 	// Apple/ioreg has no such address and must leave it empty rather than
-	// inventing an equivalent. It is a DISPLAY and disambiguation aid: on
-	// the 4x/8x identical-card hosts that are the normal AI-server build it
-	// is the one handle that maps to a physical slot and survives the index
+	// inventing an equivalent. It is the cross-API anchor: the VRAM measurers
+	// and the Vulkan device mapping join on it to tie one physical card
+	// across CUDA/ROCm/Vulkan numbering, and on the 4x/8x identical-card hosts
+	// it is the one handle that maps to a physical slot and survives the index
 	// renumbering across reboots that expected_uuid/expected_name drift
-	// detection exists to catch. It is deliberately NOT an identity:
-	// admission, budgets and spec GPU rows all key on the index, and nothing
-	// matches on this field (the portal only reads it as an NVIDIA fallback
-	// signal behind an AMD name check).
+	// detection exists to catch. It is not itself the GPU's identity (that is
+	// vendor plus index).
 	PCIBusID      string  `json:"pci_bus_id,omitempty"`
 	UtilPct       float64 `json:"util_pct"`
 	MemUsedBytes  int64   `json:"mem_used_bytes"`
