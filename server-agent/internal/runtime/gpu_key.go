@@ -106,3 +106,19 @@ func resolveLegacyGPUVendors(cfg Config, legacy GPUVendor) Config {
 	}
 	return cfg
 }
+
+// GPUTopology is what the per-spec device planner needs to know about the
+// host: Legacy is the vendor an empty-vendor GPU stands for, Vendors every
+// vendor detection found, Vulkan how the host's Vulkan devices line up with
+// its GPUs.
+type GPUTopology struct {
+	Legacy  GPUVendor
+	Vendors GPUVendors
+	Vulkan  VulkanMap
+}
+
+// Mixed reports whether the host has both an NVIDIA and an AMD GPU, the one
+// combination whose per-vendor device numbering collides.
+func (t GPUTopology) Mixed() bool {
+	return slices.Contains(t.Vendors, GPUVendorNVIDIA) && slices.Contains(t.Vendors, GPUVendorAMD)
+}
