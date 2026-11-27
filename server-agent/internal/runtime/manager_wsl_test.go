@@ -994,13 +994,13 @@ func TestWSLTargetsNeverReachThePIDRAMMeasurer(t *testing.T) {
 		}
 		return out
 	})
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		mu.Lock()
 		defer mu.Unlock()
-		out := make(map[int]map[int]int, len(pids))
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
 			vramPIDs[p] = true
-			out[p] = map[int]int{0: 4242}
+			out[p] = map[GPUKey]int{{Index: 0}: 4242}
 		}
 		return out
 	})
@@ -1061,7 +1061,7 @@ func TestWSLTargetsNeverReachThePIDRAMMeasurer(t *testing.T) {
 // its synchronous measurer recorded in *vramPIDs, and a 1024 MB WSL reserve.
 func newWSLPoolOwner(vramPIDs *[]int) (o *owner, native, wsl *specState) {
 	m := &Manager{}
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		*vramPIDs = append(*vramPIDs, pids...)
 		return nil
 	})

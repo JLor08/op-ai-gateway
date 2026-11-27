@@ -71,11 +71,11 @@ type wslStartWindow struct {
 	// proc is the generation the window measures.
 	proc *runningProc
 	// baseline is the VM's per-GPU figure read just before proc's exec.
-	baseline map[int]int
+	baseline map[GPUKey]int
 	// exitedCredit is the attributed VRAM of the wsl processes that exited
 	// while the window was open, summed per GPU: the VM's figure dropped by
 	// that much for reasons that are not proc's, so it is added back.
-	exitedCredit map[int]int
+	exitedCredit map[GPUKey]int
 	// void is set when the baseline could not be read, or when a wsl process
 	// with no attribution exited during the window: what it held left the VM's
 	// figure and cannot be added back, so the delta would be too low by an
@@ -93,8 +93,8 @@ type wslStartWindow struct {
 // them apart (open question 1 of #381), and counting another VM's GPU memory as
 // WSL's charges it to the unattributed remainder, so admission sees less free
 // VRAM than there is, never more. nil when no worker holds anything.
-func sumVMVRAM(byPID map[int]map[int]int, vmPIDs []int) map[int]int {
-	var out map[int]int
+func sumVMVRAM(byPID map[int]map[GPUKey]int, vmPIDs []int) map[GPUKey]int {
+	var out map[GPUKey]int
 	seen := make(map[int]bool, len(vmPIDs))
 	for _, pid := range vmPIDs {
 		if seen[pid] {
@@ -106,7 +106,7 @@ func sumVMVRAM(byPID map[int]map[int]int, vmPIDs []int) map[int]int {
 				continue
 			}
 			if out == nil {
-				out = make(map[int]int)
+				out = make(map[GPUKey]int)
 			}
 			out[g] += mb
 		}
@@ -118,18 +118,18 @@ func sumVMVRAM(byPID map[int]map[int]int, vmPIDs []int) map[int]int {
 // minus the one before, plus what exited processes took with them (credit),
 // floored at 0. A GPU that did not grow is left out, and nil means the start
 // grew the VM on no GPU at all.
-func wslDelta(after, baseline, credit map[int]int) map[int]int {
-	gpus := make(map[int]bool, len(after)+len(baseline)+len(credit))
-	for _, m := range []map[int]int{after, baseline, credit} {
+func wslDelta(after, baseline, credit map[GPUKey]int) map[GPUKey]int {
+	gpus := make(map[GPUKey]bool, len(after)+len(baseline)+len(credit))
+	for _, m := range []map[GPUKey]int{after, baseline, credit} {
 		for g := range m {
 			gpus[g] = true
 		}
 	}
-	var out map[int]int
+	var out map[GPUKey]int
 	for g := range gpus {
 		if v := after[g] - baseline[g] + credit[g]; v > 0 {
 			if out == nil {
-				out = make(map[int]int, len(gpus))
+				out = make(map[GPUKey]int, len(gpus))
 			}
 			out[g] = v
 		}
@@ -150,12 +150,12 @@ func wslDelta(after, baseline, credit map[int]int) map[int]int {
 // the VM's figure.
 // A remainder below zero (attributions that came out high) is no credit:
 // the attributions stand, as the max rule keeps any figure above its demand.
-func wslRemainder(vm, charged map[int]int) map[int]int {
-	var out map[int]int
+func wslRemainder(vm, charged map[GPUKey]int) map[GPUKey]int {
+	var out map[GPUKey]int
 	for g, mb := range vm {
 		if r := mb - charged[g]; r > 0 {
 			if out == nil {
-				out = make(map[int]int, len(vm))
+				out = make(map[GPUKey]int, len(vm))
 			}
 			out[g] = r
 		}
@@ -185,7 +185,7 @@ func wslDeclaresGPU(spec Spec) bool {
 // runs in has one), or nothing held while a live wsl process is attributed
 // VRAM (the VM holds at least that). Attributions are deleted on exit, so
 // every one in wslAttrib is a live generation's.
-func (o *owner) vmReadingFailed(vmPIDs []int, vm map[int]int) bool {
+func (o *owner) vmReadingFailed(vmPIDs []int, vm map[GPUKey]int) bool {
 	if len(vmPIDs) == 0 {
 		return o.wslLive()
 	}
@@ -205,7 +205,7 @@ func (o *owner) vmReadingFailed(vmPIDs []int, vm map[int]int) bool {
 // reading can be taken -- no VRAM measurer or no worker finder -- or when it is
 // detectably failed (vmReadingFailed). A finder that names no worker with
 // nothing wsl live reads as an empty VM: a stopped VM holds nothing.
-func (o *owner) readVMVRAM() (vm map[int]int, ok bool) {
+func (o *owner) readVMVRAM() (vm map[GPUKey]int, ok bool) {
 	mp, vf := o.m.measurer.Load(), o.m.wslVMPIDs.Load()
 	if mp == nil || vf == nil {
 		return nil, false
@@ -254,10 +254,10 @@ func (o *owner) endVMPeriodIfIdle() {
 // (WSLStartInFlight), so there is none here; were there one, the new start
 // would be growing the VM inside it, so that window is voided, and proc goes
 // without a window of its own -- unmeasured, covered by the remainder.
-func (o *owner) beginWSLVRAM(proc *runningProc, spec Spec, window bool, baseline map[int]int, baselineOK bool) {
+func (o *owner) beginWSLVRAM(proc *runningProc, spec Spec, window bool, baseline map[GPUKey]int, baselineOK bool) {
 	if !wslDeclaresGPU(spec) {
 		if o.wslAttrib == nil {
-			o.wslAttrib = make(map[*runningProc]map[int]int)
+			o.wslAttrib = make(map[*runningProc]map[GPUKey]int)
 		}
 		o.wslAttrib[proc] = nil
 		return
@@ -303,7 +303,7 @@ func (o *owner) settleWSLWindow(w *wslStartWindow, c cmdMeasured) (landed bool) 
 	}
 	attrib := onGPUs(wslDelta(after, w.baseline, w.exitedCredit), st.spec.GPUs)
 	if o.wslAttrib == nil {
-		o.wslAttrib = make(map[*runningProc]map[int]int)
+		o.wslAttrib = make(map[*runningProc]map[GPUKey]int)
 	}
 	o.wslAttrib[w.proc] = attrib
 	if attrib == nil {
@@ -329,18 +329,18 @@ func (o *owner) settleWSLWindow(w *wslStartWindow, c cmdMeasured) (landed bool) 
 // no more than the process is charged, so the sum admission sees on a GPU
 // stays at least what the VM holds there. Whatever the process holds beyond
 // its demand stays in the remainder until the settle attributes it.
-func provisionalWSLAttribution(vm map[int]int, w *wslStartWindow, charged map[int]int) map[int]int {
+func provisionalWSLAttribution(vm map[GPUKey]int, w *wslStartWindow, charged map[GPUKey]int) map[GPUKey]int {
 	if w.void {
 		return nil
 	}
-	var out map[int]int
+	var out map[GPUKey]int
 	for g, mb := range wslDelta(vm, w.baseline, w.exitedCredit) {
 		c, ok := charged[g]
 		if !ok || c <= 0 {
 			continue
 		}
 		if out == nil {
-			out = make(map[int]int, len(charged))
+			out = make(map[GPUKey]int, len(charged))
 		}
 		out[g] = min(mb, c)
 	}
@@ -349,14 +349,14 @@ func provisionalWSLAttribution(vm map[int]int, w *wslStartWindow, charged map[in
 
 // onGPUs keeps the entries of byGPU on the GPUs gpus names, nil when none is
 // left.
-func onGPUs(byGPU map[int]int, gpus []SpecGPU) map[int]int {
-	var out map[int]int
+func onGPUs(byGPU map[GPUKey]int, gpus []SpecGPU) map[GPUKey]int {
+	var out map[GPUKey]int
 	for _, g := range gpus {
-		if mb, ok := byGPU[g.Index]; ok {
+		if mb, ok := byGPU[g.Key()]; ok {
 			if out == nil {
-				out = make(map[int]int, len(gpus))
+				out = make(map[GPUKey]int, len(gpus))
 			}
-			out[g.Index] = mb
+			out[g.Key()] = mb
 		}
 	}
 	return out
@@ -383,7 +383,7 @@ func (o *owner) noteWSLExit(proc *runningProc) {
 			o.wslWindow = nil
 		case attributed:
 			if w.exitedCredit == nil {
-				w.exitedCredit = make(map[int]int, len(attrib))
+				w.exitedCredit = make(map[GPUKey]int, len(attrib))
 			}
 			for g, mb := range attrib {
 				w.exitedCredit[g] += mb

@@ -264,7 +264,11 @@ func main() {
 	// per process, parses to 0, and would override every operator estimate
 	// with a measured zero. Do not call a specific measurer's constructor from
 	// here; that routes around the split.
-	mgr.SetMeasurer(collector.NewVRAMMeasurer())
+	//
+	// The collector measurer still answers by bare GPU index; runtimeMeasurer
+	// keys its answer by the legacy vendor until the measurers report their
+	// own vendor (#434).
+	mgr.SetMeasurer(runtimeMeasurer(collector.NewVRAMMeasurer(), runtimeGPUVendor(gpus)))
 	// Per-process host-RAM measurement is the same kind of hardware capability
 	// and is wired the same way: NewRAMMeasurer picks RSS off Windows and the
 	// private working set on it, and returns nil on a host that cannot read
@@ -493,6 +497,37 @@ func runtimeGPUVendor(gpus []collector.GPUCollector) runtimectl.GPUVendor {
 		}
 	}
 	return runtimectl.GPUVendorNone
+}
+
+// runtimeMeasurer adapts a collector VRAM measurer, which answers
+// pid -> GPU index -> MB, to the runtime manager's pid -> GPU key -> MB by
+// keying every index with vendor, the host's legacy vendor (runtimeGPUVendor):
+// the vendor whose measurer the collector package picks on a host with more
+// than one. A nil measurer stays nil, which is SetMeasurer's "no measurement".
+// Temporary: it goes once the collector measurers return keys themselves.
+func runtimeMeasurer(f func(pids []int) map[int]map[int]int, vendor runtimectl.GPUVendor) func(pids []int) map[int]map[runtimectl.GPUKey]int {
+	if f == nil {
+		return nil
+	}
+	return func(pids []int) map[int]map[runtimectl.GPUKey]int {
+		byPID := f(pids)
+		if byPID == nil {
+			return nil
+		}
+		out := make(map[int]map[runtimectl.GPUKey]int, len(byPID))
+		for pid, byIndex := range byPID {
+			if byIndex == nil {
+				out[pid] = nil
+				continue
+			}
+			keyed := make(map[runtimectl.GPUKey]int, len(byIndex))
+			for idx, mb := range byIndex {
+				keyed[runtimectl.GPUKey{Vendor: vendor, Index: idx}] = mb
+			}
+			out[pid] = keyed
+		}
+		return out
+	}
 }
 
 // powerConfig maps the resolved config onto the power collectors' settings.

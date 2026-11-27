@@ -10,6 +10,8 @@ import (
 	"go/token"
 	"op-ai-server-agent/internal/collector"
 	"op-ai-server-agent/internal/config"
+	runtimectl "op-ai-server-agent/internal/runtime"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -212,5 +214,24 @@ func TestPowerConfigForwardsEveryField(t *testing.T) {
 	}
 	if got := powerConfig(cfg); got != want {
 		t.Fatalf("powerConfig = %+v, want %+v", got, want)
+	}
+}
+
+// TestRuntimeMeasurerKeysByTheLegacyVendor: the temporary adapter hands the
+// manager the collector measurer's answer keyed by the legacy vendor, and a
+// host with no measurer keeps none.
+func TestRuntimeMeasurerKeysByTheLegacyVendor(t *testing.T) {
+	if runtimeMeasurer(nil, runtimectl.GPUVendorNVIDIA) != nil {
+		t.Fatal("a nil collector measurer must stay nil (no measurement)")
+	}
+	f := runtimeMeasurer(func([]int) map[int]map[int]int {
+		return map[int]map[int]int{4242: {0: 7874, 1: 3323}}
+	}, runtimectl.GPUVendorAMD)
+	want := map[int]map[runtimectl.GPUKey]int{4242: {
+		{Vendor: runtimectl.GPUVendorAMD, Index: 0}: 7874,
+		{Vendor: runtimectl.GPUVendorAMD, Index: 1}: 3323,
+	}}
+	if got := f([]int{4242}); !reflect.DeepEqual(got, want) {
+		t.Errorf("measured = %v, want %v", got, want)
 	}
 }

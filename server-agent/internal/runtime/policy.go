@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -42,7 +43,7 @@ type RunningProc struct {
 	// co-residency matrix (pairAllowed): a member runs next to anything, and
 	// anything next to it, while VRAM, RAM and the process limit still apply.
 	Member bool
-	GPUs   map[int]int // gpu index -> effective VRAM MB
+	GPUs   map[GPUKey]int // gpu key -> effective VRAM MB
 	// RAMMB is the EFFECTIVE host RAM the process occupies, in MB: the live
 	// measurement when the agent has one, floored at the spec's pushed demand.
 	// It is host-scoped -- one number per process, not per GPU -- and Admit
@@ -128,7 +129,7 @@ type PolicySnapshot struct {
 	// before the first hardware sample (a positive operator budget always wins
 	// verbatim). The gateway-side comment on routing.ServerGPUBudget.BudgetMB
 	// states the same.
-	Budgets map[int]int
+	Budgets map[GPUKey]int
 	// HostRAMBudgetMB is the host-RAM pool in MB that every running process's
 	// RAMMB plus the candidate's own demand must fit under: the capacity
 	// available to the MANAGED set, a total like a per-GPU budget rather than a
@@ -182,7 +183,7 @@ type PolicySnapshot struct {
 	// only the candidate and its budget. owner.buildSnapshot reads it fresh from
 	// the VM at every admission (wslRemainder); nil -- every native-only host,
 	// every table test -- charges nothing.
-	UnattributedVRAM map[int]int
+	UnattributedVRAM map[GPUKey]int
 	// WSLStartInFlight is true while a wsl start's VRAM window is open: its
 	// figure is the VM's growth across the start (owner.wslStartWindow), which
 	// holds only if no other wsl start grows the VM meanwhile. So every wsl
@@ -519,37 +520,41 @@ func withinGrace(lastUsed, now time.Time, grace time.Duration) bool {
 	return grace > 0 && now.Sub(lastUsed) <= grace
 }
 
-// firstSharedGPU returns the first index in idx that r occupies, and whether
-// there is one. idx is spec.GPUs order (see specGPUIndexes), so the answer is
+// firstSharedGPU returns the first key in keys that r occupies, and whether
+// there is one. keys is spec.GPUs order (see specGPUKeys), so the answer is
 // deterministic and names the same card rule 3's messages name.
-func firstSharedGPU(r RunningProc, idx []int) (int, bool) {
-	for _, i := range idx {
-		if _, ok := r.GPUs[i]; ok {
-			return i, true
+func firstSharedGPU(r RunningProc, keys []GPUKey) (GPUKey, bool) {
+	for _, k := range keys {
+		if _, ok := r.GPUs[k]; ok {
+			return k, true
 		}
 	}
-	return 0, false
+	return GPUKey{}, false
 }
 
-// touchesAnyGPU reports whether r occupies any GPU index named in idx.
-func touchesAnyGPU(r RunningProc, idx []int) bool {
-	_, ok := firstSharedGPU(r, idx)
+// touchesAnyGPU reports whether r occupies any GPU named in keys.
+func touchesAnyGPU(r RunningProc, keys []GPUKey) bool {
+	_, ok := firstSharedGPU(r, keys)
 	return ok
 }
 
-// specGPUIndexes returns every GPU index spec.GPUs names, known-VRAM and
+// specGPUKeys returns every GPU key spec.GPUs names, known-VRAM and
 // unknown-VRAM alike. It is the set of cards the candidate CONTESTS, and both
 // unknown-VRAM rules are keyed on it: rule 4 requires a spec of unknown
 // demand to start alone on ALL of its GPUs, not only the one(s) whose demand
 // happens to be unknown, and rule 5 asks the mirror question of an occupant
 // -- does it hold any of these cards -- so that the two sides agree on what
-// "the same card" means.
-func specGPUIndexes(spec Spec) []int {
-	idx := make([]int, len(spec.GPUs))
-	for i, g := range spec.GPUs {
-		idx[i] = g.Index
+// "the same card" means. The keys are in declared order, a card named twice
+// once (its first occurrence): every reader asks "the first of these the
+// occupant holds" or "does it hold any", which a repeat cannot change.
+func specGPUKeys(spec Spec) []GPUKey {
+	keys := make([]GPUKey, 0, len(spec.GPUs))
+	for _, g := range spec.GPUs {
+		if k := g.Key(); !slices.Contains(keys, k) {
+			keys = append(keys, k)
+		}
 	}
-	return idx
+	return keys
 }
 
 // specHasUnknownVRAM reports whether spec has any GPU whose declared demand
@@ -590,24 +595,36 @@ func needsRAMBootstrap(spec Spec, measuredRAMMB int) bool {
 	return specHasUnknownRAM(spec) && measuredRAMMB <= 0
 }
 
-// firstUnknownGPU returns the LOWEST GPU index whose demand r reports as
-// unknown (a key PRESENT with a value of 0), and whether there is one.
+// firstUnknownGPU returns the LOWEST GPU key whose demand r reports as
+// unknown (a key PRESENT with a value of 0), and whether there is one. Keys
+// order by vendor, then index (gpuKeyLess), so on a single-vendor host it is
+// the lowest index.
 //
 // The lowest, not the first one found: RunningProc.GPUs is a map and Go
 // randomizes map iteration, so "the first hit" would name a different card on
 // every admission for a process with two unknown cards -- and this index goes
 // into an operator-facing Message.
-func firstUnknownGPU(r RunningProc) (int, bool) {
-	lowest, found := 0, false
-	for i, v := range r.GPUs {
+func firstUnknownGPU(r RunningProc) (GPUKey, bool) {
+	var lowest GPUKey
+	found := false
+	for k, v := range r.GPUs {
 		if v != 0 {
 			continue
 		}
-		if !found || i < lowest {
-			lowest, found = i, true
+		if !found || gpuKeyLess(k, lowest) {
+			lowest, found = k, true
 		}
 	}
 	return lowest, found
+}
+
+// gpuKeyLess orders GPU keys by vendor, then index: a total order, so every
+// "lowest card" pick and every sorted listing is the same on every call.
+func gpuKeyLess(a, b GPUKey) bool {
+	if a.Vendor != b.Vendor {
+		return a.Vendor < b.Vendor
+	}
+	return a.Index < b.Index
 }
 
 // procHasUnknownVRAM reports whether r occupies ANY GPU whose demand is
@@ -648,7 +665,7 @@ func firstUnknownGPU(r RunningProc) (int, bool) {
 // with touchesAnyGPU, exactly as rule 4 does. It was narrower once -- "is r
 // unknown at one of the CANDIDATE's indexes" -- which made rule 5 a mirror in
 // name only, because rule 4's promise is aloneness on ALL of the unknown
-// spec's GPUs (see specGPUIndexes), not just its unknown ones. Measured on
+// spec's GPUs (see specGPUKeys), not just its unknown ones. Measured on
 // the narrow version: an occupant of {gpu 0: unknown, gpu 1: 5000} was
 // admitted by rule 4 only on the promise of running alone on BOTH cards, yet
 // a candidate asking for gpu 1 alone found nothing unknown there and got
@@ -711,7 +728,7 @@ func ownDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
 		// Absent from Budgets and a budget of 0 both mean unconstrained and
 		// must behave identically -- see PolicySnapshot.Budgets, and the
 		// longer note at rule 3, which is the other reader of this rule.
-		budget := snap.Budgets[g.Index]
+		budget := snap.Budgets[g.Key()]
 		if budget <= 0 {
 			continue
 		}
@@ -850,10 +867,10 @@ func wslRAMOwnDemandRefusal(snap PolicySnapshot, spec Spec) (Decision, bool) {
 // The pair is read exactly as rule 1 reads it (pairAllowed): by base spec, with
 // siblings always open, so a pinned sibling of unknown demand is reported as
 // the missing number it is, never as a closed cell the matrix cannot even hold.
-func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []RunningProc, gpuIdx []int) (Decision, bool) {
+func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []RunningProc, gpuKeys []GPUKey) (Decision, bool) {
 	var (
 		blocker    RunningProc
-		sharedGPU  int
+		sharedGPU  GPUKey
 		pairClosed bool
 		found      bool
 	)
@@ -862,7 +879,7 @@ func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []Runn
 		if !r.Pinned || !procHasUnknownVRAM(r) {
 			continue
 		}
-		gpu, shares := firstSharedGPU(r, gpuIdx)
+		gpu, shares := firstSharedGPU(r, gpuKeys)
 		if !shares {
 			continue
 		}
@@ -880,7 +897,7 @@ func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []Runn
 			Reason: StateNotPermitted,
 			Message: fmt.Sprintf(
 				"spec %s: gpu %d is held by pinned spec %s, and that pair is not permitted by the co-residency matrix",
-				spec.ID, sharedGPU, blocker.SpecID,
+				spec.ID, sharedGPU.Index, blocker.SpecID,
 			),
 			Evict: []string{},
 		}, true
@@ -890,7 +907,7 @@ func pinnedUnknownOccupantRefusal(snap PolicySnapshot, spec Spec, running []Runn
 		Reason: StatePendingVRAMUnknown,
 		Message: fmt.Sprintf(
 			"spec %s: gpu %d is held by pinned spec %s, whose own demand on gpu %d is unknown",
-			spec.ID, sharedGPU, blocker.SpecID, unknownGPU,
+			spec.ID, sharedGPU.Index, blocker.SpecID, unknownGPU.Index,
 		),
 		Evict: []string{},
 	}, true
@@ -1050,7 +1067,7 @@ type admission struct {
 	// before S#1 before S, and each finds its higher siblings already queued.
 	running     []RunningProc
 	unknownVRAM bool
-	gpuIdx      []int
+	gpuKeys     []GPUKey
 	// base is specBase(spec): the spec the candidate is an instance of, the side
 	// every sibling test and every matrix lookup uses (#340).
 	base string
@@ -1192,7 +1209,7 @@ func newAdmission(snap PolicySnapshot, spec Spec) *admission {
 		spec:          spec,
 		running:       running,
 		unknownVRAM:   specHasUnknownVRAM(spec),
-		gpuIdx:        specGPUIndexes(spec),
+		gpuKeys:       specGPUKeys(spec),
 		base:          specBase(spec),
 		candidateRole: roleOf(spec.Role),
 		toEvict:       make(map[string]RunningProc),
@@ -1415,7 +1432,7 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	// contention seen from opposite ends -- one card, two processes, and no
 	// number for at least one of them.
 	if a.unknownVRAM {
-		if dec, refuse := pinnedUnknownCandidateRefusal(a.running, a.gpuIdx); refuse {
+		if dec, refuse := pinnedUnknownCandidateRefusal(a.running, a.gpuKeys); refuse {
 			return dec
 		}
 	}
@@ -1424,7 +1441,7 @@ func admitSteps(snap PolicySnapshot, spec Spec) Decision {
 	// either -- whatever spec declares for itself. This half DOES name the
 	// occupant it refuses on, so it picks one deterministically and reports
 	// a closed co-residency pair as the closed pair it is.
-	if dec, refuse := pinnedUnknownOccupantRefusal(snap, spec, a.running, a.gpuIdx); refuse {
+	if dec, refuse := pinnedUnknownOccupantRefusal(snap, spec, a.running, a.gpuKeys); refuse {
 		return dec
 	}
 
@@ -1470,9 +1487,9 @@ func wslStartWait(snap PolicySnapshot, spec Spec) (Decision, bool) {
 // that), so it may only run alone on its GPUs, and a pinned process holds one of
 // them. Every qualifying occupant yields the identical Decision, so this half
 // needs no tie-break to stay deterministic over a map-ordered Running.
-func pinnedUnknownCandidateRefusal(running []RunningProc, gpuIdx []int) (Decision, bool) {
+func pinnedUnknownCandidateRefusal(running []RunningProc, gpuKeys []GPUKey) (Decision, bool) {
 	for _, r := range running {
-		if r.Pinned && touchesAnyGPU(r, gpuIdx) {
+		if r.Pinned && touchesAnyGPU(r, gpuKeys) {
 			return Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}}, true
 		}
 	}
@@ -1528,7 +1545,7 @@ func (a *admission) ruleUnknownVRAMCandidate() {
 // toucher exactly as rule 5 treats an unknown one: evict it if idle, block on it
 // otherwise, so the candidate gets its card(s) to itself and is measured.
 //
-// The aloneness demand is on ALL of its cards (specGPUIndexes), so every
+// The aloneness demand is on ALL of its cards (specGPUKeys), so every
 // known-demand toucher must go -- idle ones are queued, a non-evictable one
 // (busy or still loading) blocks the whole start rather than yielding a partial,
 // unmeasured co-residency (the same "any non-evictable blocker -> Wait"
@@ -1543,7 +1560,7 @@ func (a *admission) ruleUnknownVRAMCandidate() {
 // never resolve.
 func (a *admission) bootstrapEvictTouchers() {
 	for _, r := range a.running {
-		if !touchesAnyGPU(r, a.gpuIdx) || procHasUnknownVRAM(r) {
+		if !touchesAnyGPU(r, a.gpuKeys) || procHasUnknownVRAM(r) {
 			continue
 		}
 		if a.evictable(r) {
@@ -1593,7 +1610,7 @@ func (a *admission) bootstrapEvictTouchers() {
 //
 // A TOUCHER OF UNKNOWN DEMAND IS RULE 5's SUBJECT AND IS LEFT TO IT.
 // ruleUnknownVRAMOccupant scans exactly procHasUnknownVRAM(r) &&
-// touchesAnyGPU(r, gpuIdx) over this same running set, ungated by the
+// touchesAnyGPU(r, gpuKeys) over this same running set, ungated by the
 // candidate's own demand, so every occupant this loop would still have evicted
 // after the change -- an equally-unknown one, the tie the order does not decide
 // -- gets the identical evict-if-idle / block-otherwise treatment there.
@@ -1623,11 +1640,11 @@ func (a *admission) bootstrapEvictTouchers() {
 func (a *admission) blockOnKnownTouchers() {
 	var (
 		precedenceBlocker string
-		precedenceGPU     int
+		precedenceGPU     GPUKey
 		foundBlocker      bool
 	)
 	for _, r := range a.running {
-		gpu, shares := firstSharedGPU(r, a.gpuIdx)
+		gpu, shares := firstSharedGPU(r, a.gpuKeys)
 		if !shares || procHasUnknownVRAM(r) {
 			continue
 		}
@@ -1646,12 +1663,12 @@ func (a *admission) blockOnKnownTouchers() {
 	}
 	// Both cards are named because they need not be the same one: rule 4
 	// demands aloneness on ALL of the candidate's cards, so the card being held
-	// and the card whose number is missing can differ (see specGPUIndexes).
+	// and the card whose number is missing can differ (see specGPUKeys).
 	// firstSpecUnknownGPU is the first in spec.GPUs order, which is the order
 	// rule 3's messages already name cards in.
 	a.waitMessage = fmt.Sprintf(
 		"spec %s: its own demand on gpu %d is unknown, so it waits for spec %s to leave gpu %d rather than evicting it",
-		a.spec.ID, firstSpecUnknownGPU(a.spec), precedenceBlocker, precedenceGPU,
+		a.spec.ID, firstSpecUnknownGPU(a.spec), precedenceBlocker, precedenceGPU.Index,
 	)
 }
 
@@ -1687,7 +1704,7 @@ func firstSpecUnknownGPU(spec Spec) int {
 // earlier rules have not already supplied.
 func (a *admission) ruleUnknownVRAMOccupant() {
 	for _, r := range a.running {
-		if !procHasUnknownVRAM(r) || !touchesAnyGPU(r, a.gpuIdx) {
+		if !procHasUnknownVRAM(r) || !touchesAnyGPU(r, a.gpuKeys) {
 			continue
 		}
 		if a.evictable(r) {
@@ -1736,17 +1753,17 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 	if g.VRAMMB == 0 {
 		return
 	}
-	budget := a.snap.Budgets[g.Index]
+	budget := a.snap.Budgets[g.Key()]
 	if budget <= 0 {
 		return
 	}
-	sum := g.VRAMMB + a.snap.UnattributedVRAM[g.Index]
+	sum := g.VRAMMB + a.snap.UnattributedVRAM[g.Key()]
 	var touchers []RunningProc
 	for _, r := range a.running {
 		if _, already := a.toEvict[r.SpecID]; already {
 			continue // already guaranteed to be gone
 		}
-		v, ok := r.GPUs[g.Index]
+		v, ok := r.GPUs[g.Key()]
 		if !ok {
 			continue
 		}
@@ -1767,7 +1784,7 @@ func (a *admission) chargeGPUBudget(g SpecGPU) {
 			continue // a higher sibling stays running (higherSiblingStays)
 		}
 		a.toEvict[r.SpecID] = r
-		sum -= r.GPUs[g.Index]
+		sum -= r.GPUs[g.Key()]
 	}
 	if sum > budget {
 		a.blocked = true

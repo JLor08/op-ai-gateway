@@ -36,7 +36,7 @@ func gatedSpec(t *testing.T, id, upstreamModel string) (spec Spec, openGate func
 // housekeeping dispatch never calls it.
 func admissionProbe(m *Manager) <-chan struct{} {
 	admissions := make(chan struct{}, 16)
-	m.SetMeasurer(func([]int) map[int]map[int]int {
+	m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
 		select {
 		case admissions <- struct{}{}:
 		default:

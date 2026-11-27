@@ -54,6 +54,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -230,7 +231,7 @@ var (
 
 // measurerFunc mirrors SetMeasurer's function parameter, named so it can be
 // held behind an atomic.Pointer.
-type measurerFunc func(pids []int) map[int]map[int]int
+type measurerFunc func(pids []int) map[int]map[GPUKey]int
 
 // ramMeasurerFunc mirrors SetRAMMeasurer's function parameter, named so it can
 // be held behind an atomic.Pointer. It is deliberately not measurerFunc: host
@@ -839,7 +840,7 @@ func (m *Manager) Transitions() <-chan struct{} {
 // performance-counter provider is a broken host, and the alternative is a
 // goroutine handing an abandoned buffer to the kernel), not overlooked -- but
 // do not read "the shipped measurer is deadline-bounded" off this comment.
-func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
+func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[GPUKey]int) {
 	if f == nil {
 		m.measurer.Store(nil)
 		return
@@ -905,19 +906,32 @@ func (m *Manager) SetWSLVMPIDs(f func() []int) {
 // HostInfo is the latest hardware sample as far as admission is concerned: the
 // figures the owner cannot get from a managed process's own measurement.
 //
-// GPUTotalsMB maps a GPU index (the same index spec.GPUs and GPUBudget use) to
-// that device's total memory in MB, as the GPU collector last reported it. An
-// index the collector did not report, or reported as 0, is simply absent --
-// there is nothing detected for it, which is never the same as "a device with
-// no memory".
+// GPUTotalsMB maps a GPU key (the same vendor and index spec.GPUs and
+// GPUBudget use) to that device's total memory in MB, as the GPU collector
+// last reported it. A GPU the collector did not report, or reported as 0, is
+// simply absent -- there is nothing detected for it, which is never the same
+// as "a device with no memory".
 //
 // MemAvailableMB is the host RAM obtainable right now (the sample's
 // MemAvailable, not total-minus-used), in MB. 0 means "no reading": either no
 // sample has arrived yet or the read failed, and a consumer must treat it as
 // unknown rather than as an exhausted host.
+//
+// Vulkan is the host's Vulkan device mapping (see VulkanMap); its zero value
+// is "unknown".
 type HostInfo struct {
-	GPUTotalsMB    map[int]int
+	GPUTotalsMB    map[GPUKey]int
 	MemAvailableMB int
+	Vulkan         VulkanMap
+}
+
+// VulkanMap is how the host's Vulkan devices line up with its GPUs: Ordinals
+// maps a GPU's key to its Vulkan device ordinal, and DeviceCount is the number
+// of Vulkan devices the host exposes. A GPU absent from Ordinals has no known
+// ordinal; a DeviceCount of 0 is unknown or none.
+type VulkanMap struct {
+	Ordinals    map[GPUKey]int
+	DeviceCount int
 }
 
 // SetHostInfo records the newest hardware figures for the owner's next
@@ -927,9 +941,10 @@ type HostInfo struct {
 // number, never poll hardware or shell out. Each call replaces the previous one
 // wholesale.
 //
-// The manager keeps its own copy of the GPUTotalsMB map. The caller is a
-// different goroutine from the owner that reads it, so retaining the caller's
-// map would let a caller that goes on to reuse or edit it race that read.
+// The manager keeps its own copy of the GPUTotalsMB and Vulkan.Ordinals maps.
+// The caller is a different goroutine from the owner that reads them, so
+// retaining the caller's maps would let a caller that goes on to reuse or edit
+// them race that read.
 //
 // Storing is not the whole job. The host-RAM pool is built from the live
 // MemAvailable, so the sample that follows a victim's exit is the one that
@@ -941,12 +956,12 @@ type HostInfo struct {
 // owner.wakeOnHostSample). It never blocks this caller, and costs the owner
 // nothing when no such start is waiting.
 func (m *Manager) SetHostInfo(hi HostInfo) {
-	cp := HostInfo{MemAvailableMB: hi.MemAvailableMB}
+	cp := HostInfo{MemAvailableMB: hi.MemAvailableMB, Vulkan: VulkanMap{DeviceCount: hi.Vulkan.DeviceCount}}
 	if len(hi.GPUTotalsMB) > 0 {
-		cp.GPUTotalsMB = make(map[int]int, len(hi.GPUTotalsMB))
-		for i, mb := range hi.GPUTotalsMB {
-			cp.GPUTotalsMB[i] = mb
-		}
+		cp.GPUTotalsMB = maps.Clone(hi.GPUTotalsMB)
+	}
+	if len(hi.Vulkan.Ordinals) > 0 {
+		cp.Vulkan.Ordinals = maps.Clone(hi.Vulkan.Ordinals)
 	}
 	m.hostInfo.Store(&cp)
 	m.hostSeq.Add(1)
@@ -1211,7 +1226,7 @@ type measureTarget struct {
 // a health probe -- and nil otherwise.
 type cmdMeasured struct {
 	targets   []measureTarget
-	byPID     map[int]map[int]int
+	byPID     map[int]map[GPUKey]int
 	ramByPID  map[int]int
 	ramByUnit map[string]int
 	wslVM     *wslVMInfo
@@ -1463,7 +1478,7 @@ type specState struct {
 	// every Status(), the agent kept attaching `gpus` to every telemetry
 	// sample, and the gateway kept writing the same value back once per
 	// second per (spec, gpu) forever -- on a server doing nothing at all.
-	measuredVRAM map[int]int
+	measuredVRAM map[GPUKey]int
 
 	// measuredRAM is the last real resident host-RAM measurement (MB) of THIS
 	// SPEC'S CURRENT PROCESS, from the recurring measurement beat
@@ -1494,7 +1509,7 @@ type specState struct {
 	// read. Cleared by onProcExited with the measurements themselves, for the
 	// same reason. readyVRAM may share its map with measuredVRAM; nothing
 	// writes through either.
-	readyVRAM map[int]int
+	readyVRAM map[GPUKey]int
 	readyRAM  int
 
 	// vramBootstrapDone is the DURABLE guard on the one-shot VRAM bootstrap
@@ -1710,7 +1725,7 @@ type owner struct {
 	// measurement carries the count it was dispatched under
 	// (cmdMeasured.vmPeriod), and one that lands in a later period does not
 	// record its reading here.
-	vmVRAM   map[int]int
+	vmVRAM   map[GPUKey]int
 	vmPeriod uint64
 	// wslAttrib is each wsl generation's attributed VRAM (per GPU, MB): the
 	// VM's growth across its start, recorded when its window closes
@@ -1719,7 +1734,7 @@ type owner struct {
 	// the VM by nothing -- and one without is not: its window was void, it
 	// started with nothing to measure it, or its window is still open. What
 	// the VM holds beyond these figures is the unattributed remainder.
-	wslAttrib map[*runningProc]map[int]int
+	wslAttrib map[*runningProc]map[GPUKey]int
 	// wslWindow is the open wsl start window, nil when none is: wsl starts are
 	// serialized through it (PolicySnapshot.WSLStartInFlight), so the VM's
 	// growth across one start is that start's alone. See wslStartWindow.
@@ -1957,6 +1972,11 @@ func (o *owner) handle(cmd command) {
 // document a Source parses; this covers a Config handed to Apply directly, so
 // no spec ID in the owner's table ever collides with an instance key.
 func (o *owner) applyConfig(cfg Config) {
+	// First, before anything compares or stores the document: an empty GPU
+	// vendor (a gateway from before the field) means this host's legacy vendor,
+	// so the stored spec is the one an upgraded gateway's backfill pushes, and
+	// reconcileSpec sees no change -- no relaunch on upgrade (#434).
+	cfg = resolveLegacyGPUVendors(cfg, o.gpuVendor)
 	cfg.Specs = withoutReservedSpecIDs(cfg.Specs)
 	// The ETag names the document, and the multi-instance opt-in and the
 	// log_files declarations are parts of it this agent may withhold on its
@@ -3211,7 +3231,7 @@ func (o *owner) chargeSpec(st *specState) Spec {
 	vram, ram := o.siblingPeak(st)
 	for idx, mb := range st.readyVRAM {
 		if vram == nil {
-			vram = make(map[int]int, len(st.readyVRAM))
+			vram = make(map[GPUKey]int, len(st.readyVRAM))
 		}
 		vram[idx] = mb // its own ready figure supersedes the inherited one
 	}
@@ -3225,11 +3245,11 @@ func (o *owner) chargeSpec(st *specState) Spec {
 // and the host-RAM demand raised to ram -- never lowered: the pushed demand is a
 // floor. The GPU list is copied before it is written, because it is shared with
 // the pushed config; vram is only read.
-func raisedDemand(spec Spec, vram map[int]int, ram int) Spec {
+func raisedDemand(spec Spec, vram map[GPUKey]int, ram int) Spec {
 	if len(vram) > 0 && len(spec.GPUs) > 0 {
 		gpus := make([]SpecGPU, len(spec.GPUs))
 		for i, g := range spec.GPUs {
-			if v := vram[g.Index]; v > g.VRAMMB {
+			if v := vram[g.Key()]; v > g.VRAMMB {
 				g.VRAMMB = v
 			}
 			gpus[i] = g
@@ -3249,7 +3269,7 @@ func raisedDemand(spec Spec, vram map[int]int, ram int) Spec {
 // fraction, where it is meant to wait for a measured running sibling. A ready
 // reading describes its sibling's CURRENT process (cleared on exit), so only
 // siblings with a process count, and st's own figures never do.
-func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
+func (o *owner) siblingPeak(st *specState) (vram map[GPUKey]int, ram int) {
 	base := specBase(st.spec)
 	for _, sib := range o.specs {
 		if sib == st || sib.proc == nil || specBase(sib.spec) != base {
@@ -3260,7 +3280,7 @@ func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
 				continue
 			}
 			if vram == nil {
-				vram = make(map[int]int, len(sib.readyVRAM))
+				vram = make(map[GPUKey]int, len(sib.readyVRAM))
 			}
 			vram[idx] = mb
 		}
@@ -4057,14 +4077,14 @@ func (o *owner) measurementTargets() (targets []measureTarget, declaresGPU bool)
 // the gateway's is: a multi-GPU spec can have one index answered and another
 // not, and throwing away a real number because a sibling index came back
 // unknown would be its own bug.
-func realMeasurement(byGPU map[int]int) map[int]int {
-	var out map[int]int
+func realMeasurement(byGPU map[GPUKey]int) map[GPUKey]int {
+	var out map[GPUKey]int
 	for idx, mb := range byGPU {
 		if mb <= 0 {
 			continue
 		}
 		if out == nil {
-			out = make(map[int]int, len(byGPU))
+			out = make(map[GPUKey]int, len(byGPU))
 		}
 		out[idx] = mb
 	}
@@ -4332,7 +4352,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// whose first reading fails -- a CPU-only wsl generation whose VM is still
 	// booting has no worker yet -- falls back to nothing, which is what a booting
 	// VM holds, never to an earlier period's figure.
-	var measured map[int]map[int]int
+	var measured map[int]map[GPUKey]int
 	var vmPIDs []int
 	vmRead := false
 	if mp := o.m.measurer.Load(); mp != nil {
@@ -4344,7 +4364,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		}
 		measured = (*mp)(ask)
 	}
-	var vmVRAM map[int]int
+	var vmVRAM map[GPUKey]int
 	if vmRead {
 		vmVRAM = sumVMVRAM(measured, vmPIDs)
 		if o.vmReadingFailed(vmPIDs, vmVRAM) {
@@ -4382,13 +4402,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	ramBoundMB := 0
 	// attributedMB is, per GPU, the WSL VM's VRAM the wsl generations' charges
 	// account for; the rest of the VM's figure is the unattributed remainder.
-	var attributedMB map[int]int
+	var attributedMB map[GPUKey]int
 	// Two passes over the live processes. The first records this call's
 	// measurements; the second charges every process. They are separate
 	// because an instance's demand inherits its siblings' ready measurements
 	// (chargeSpec, #340): charging in the same pass would let map order decide
 	// whether a sibling's figure is this call's or the previous beat's.
-	fresh := make(map[string]map[int]int, len(o.specs))
+	fresh := make(map[string]map[GPUKey]int, len(o.specs))
 	for id, st := range o.specs {
 		// A wsl generation has no pid reading (see above): its live figure is
 		// its attribution, read in the second pass.
@@ -4446,13 +4466,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			// figure: the VM's growth across its start (wsl_vram.go).
 			byGPU = o.wslAttrib[st.proc]
 		}
-		gpus := make(map[int]int, len(demand.GPUs))
+		gpus := make(map[GPUKey]int, len(demand.GPUs))
 		for _, g := range demand.GPUs {
 			charge := g.VRAMMB
-			if v, ok := byGPU[g.Index]; ok && v > charge {
+			if v, ok := byGPU[g.Key()]; ok && v > charge {
 				charge = v
 			}
-			gpus[g.Index] = charge
+			gpus[g.Key()] = charge
 		}
 		if wsl {
 			// What the VM holds that this generation's charge accounts for:
@@ -4470,7 +4490,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			for g, mb := range counted {
 				if _, ok := gpus[g]; ok {
 					if attributedMB == nil {
-						attributedMB = make(map[int]int, len(byGPU))
+						attributedMB = make(map[GPUKey]int, len(byGPU))
 					}
 					attributedMB[g] += mb
 				}
@@ -4546,9 +4566,9 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// device totals (fillDetectedBudgets), which is what makes VRAM accounting
 	// default-on. That is a different thing from filtering: it adds a value,
 	// it never removes or reinterprets a row.
-	budgets := make(map[int]int, len(o.cfg.GPUBudgets))
+	budgets := make(map[GPUKey]int, len(o.cfg.GPUBudgets))
 	for _, b := range o.cfg.GPUBudgets {
-		budgets[b.Index] = b.BudgetMB
+		budgets[b.Key()] = b.BudgetMB
 	}
 	o.fillDetectedBudgets(budgets, hi)
 
@@ -4729,16 +4749,15 @@ func (o *owner) pendingRAMFreedMB() int {
 // An Apple GPU is skipped entirely: it has no dedicated VRAM, and the
 // "total" its collector reports is the system memory the GPU has allocated at
 // that instant, which moves with load and is not a ceiling. Budgeting against
-// it would refuse a spec larger than whatever is allocated right now.
-func (o *owner) fillDetectedBudgets(budgets map[int]int, hi HostInfo) {
-	if o.gpuVendor == GPUVendorApple {
-		return
-	}
-	for idx, total := range hi.GPUTotalsMB {
-		if total <= 0 || budgets[idx] > 0 {
+// it would refuse a spec larger than whatever is allocated right now. The skip
+// is per GPU (its key's vendor), not per host, so a card of another vendor on
+// the same host still gets its detected budget.
+func (o *owner) fillDetectedBudgets(budgets map[GPUKey]int, hi HostInfo) {
+	for key, total := range hi.GPUTotalsMB {
+		if key.Vendor == GPUVendorApple || total <= 0 || budgets[key] > 0 {
 			continue
 		}
-		budgets[idx] = max(1, total-o.vramHeadroomMB)
+		budgets[key] = max(1, total-o.vramHeadroomMB)
 	}
 }
 
@@ -4925,7 +4944,7 @@ func (o *owner) startProcess(st *specState) {
 	// baseline. Only for a spec that declares a GPU, and only where that figure
 	// can be read at all (vramMeasurable); the window itself opens once the
 	// exec has succeeded (beginWSLVRAM), so a failed exec leaves none behind.
-	var vmBaseline map[int]int
+	var vmBaseline map[GPUKey]int
 	vramWindow, baselineOK := false, false
 	if spec.IsWSL() && wslDeclaresGPU(spec) && o.vramMeasurable(spec) {
 		vramWindow = true
@@ -6421,7 +6440,7 @@ func (o *owner) snapshotStatus() []Status {
 			// returned -- that map is shared with every Status() caller
 			// and, once a real measurer exists (Task 18), may be reused
 			// by its next call.
-			cp := make(map[int]int, len(st.measuredVRAM))
+			cp := make(map[GPUKey]int, len(st.measuredVRAM))
 			for k, v := range st.measuredVRAM {
 				cp[k] = v
 			}

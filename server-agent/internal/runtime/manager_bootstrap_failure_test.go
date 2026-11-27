@@ -452,7 +452,7 @@ func TestBootstrapNoMeasurementCounterNeverAdvancesWithoutARAMMeasurer(t *testin
 	cases := []struct {
 		name string
 		// vramMeasurer is installed (or not) beside the absent RAM measurer.
-		vramMeasurer func(pids []int) map[int]map[int]int
+		vramMeasurer func(pids []int) map[int]map[GPUKey]int
 		// beat is the measurement answer delivered each cycle.
 		beat func(targets []measureTarget) cmdMeasured
 	}{
@@ -465,11 +465,11 @@ func TestBootstrapNoMeasurementCounterNeverAdvancesWithoutARAMMeasurer(t *testin
 		},
 		{
 			name: "a VRAM measurer only, answering without a RAM reading",
-			vramMeasurer: func(pids []int) map[int]map[int]int {
-				return map[int]map[int]int{}
+			vramMeasurer: func(pids []int) map[int]map[GPUKey]int {
+				return map[int]map[GPUKey]int{}
 			},
 			beat: func(targets []measureTarget) cmdMeasured {
-				return cmdMeasured{targets: targets, byPID: map[int]map[int]int{pid: {0: 0}}}
+				return cmdMeasured{targets: targets, byPID: map[int]map[GPUKey]int{pid: {{Index: 0}: 0}}}
 			},
 		},
 	}
@@ -536,9 +536,9 @@ func TestBootstrapMeasurerlessHostStaysRunning(t *testing.T) {
 	// declares a GPU, which is the VRAM measurer's gate) and answers with nothing.
 	// No RAM measurer is installed.
 	var beats atomic.Int64
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		beats.Add(1)
-		return map[int]map[int]int{}
+		return map[int]map[GPUKey]int{}
 	})
 
 	boot := baseSpec("boot", "model-boot")

@@ -107,7 +107,7 @@ func TestAppliedETagNeverOutrunsReconciliation(t *testing.T) {
 	// waits on the same goroutine) and hang the whole package's test binary
 	// until the go-test timeout instead of reporting the failure.
 	t.Cleanup(releaseNow)
-	m.SetMeasurer(func([]int) map[int]map[int]int {
+	m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
 		enteredOnce.Do(func() { close(entered) })
 		<-release
 		return nil

@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"op-ai-server-agent/internal/certinstall"
 	"op-ai-server-agent/internal/collector"
@@ -954,7 +955,8 @@ type Agent struct {
 	// hostInfo is the optional receiver of each cycle's device totals and
 	// available RAM (see hostInfoSink); nil = nothing is published.
 	hostInfo hostInfoSink
-	// gpuTotalsMB is the last-known total memory per GPU index (MB). It is
+	// gpuTotalsMB is the last-known total memory per GPU (MB), keyed by vendor
+	// and index: on a mixed host NVIDIA 0 and AMD 0 are two cards. It is
 	// seeded from the hardware inventory at the top of Run (seedHostInfo) and
 	// refreshed by publishHostInfo, and is touched only from Run's own
 	// goroutine (collectOnce runs there) -- the same access pattern as
@@ -962,7 +964,7 @@ type Agent struct {
 	// a device's total is static hardware: one cycle whose GPU collector failed
 	// must not erase it (see publishHostInfo). nil until the first GPU total is
 	// seen.
-	gpuTotalsMB map[int]int
+	gpuTotalsMB map[runtimectl.GPUKey]int
 	// runtimeWake is the optional wake channel derived from the poster (see
 	// runtimeWaker); nil when the poster does not support it (the POST
 	// transport, or a test poster). A nil channel in a select case simply
@@ -2549,7 +2551,7 @@ func (a *Agent) publishHostInfo(s *sample.Sample) {
 		return
 	}
 	for _, g := range s.GPUs {
-		a.noteGPUTotal(g.Index, g.MemTotalBytes)
+		a.noteGPUTotal(gpuKeyOf(g.Vendor, g.Index), g.MemTotalBytes)
 	}
 	var availableBytes int64
 	if s.Host != nil {
@@ -2580,24 +2582,33 @@ func (a *Agent) seedHostInfo(hw *sample.SystemReport) {
 		return
 	}
 	for _, g := range hw.GPUs {
-		a.noteGPUTotal(g.Index, g.MemoryTotalBytes)
+		a.noteGPUTotal(gpuKeyOf(g.Vendor, g.Index), g.MemoryTotalBytes)
 	}
 	a.pushHostInfo(0)
+}
+
+// gpuKeyOf is the runtime's key for a GPU a collector reported: its vendor
+// (the wire value, parsed by runtimectl.ParseGPUVendor; an unknown or empty
+// one is GPUVendorNone) and its index.
+func gpuKeyOf(vendor string, index int) runtimectl.GPUKey {
+	return runtimectl.GPUKey{Vendor: runtimectl.ParseGPUVendor(vendor), Index: index}
 }
 
 // noteGPUTotal records a GPU's total memory (bytes in, MB stored, truncating)
 // as its last-known total, ignoring a total that is not positive -- an N/A
 // field parses to 0, which is "no reading", never "a device with no memory".
-func (a *Agent) noteGPUTotal(index int, totalBytes int64) {
+// Keyed by vendor and index, so two vendors' card 0 never overwrite each
+// other (#434).
+func (a *Agent) noteGPUTotal(key runtimectl.GPUKey, totalBytes int64) {
 	const bytesPerMB = 1024 * 1024
 	mb := int(totalBytes / bytesPerMB)
 	if mb <= 0 {
 		return
 	}
 	if a.gpuTotalsMB == nil {
-		a.gpuTotalsMB = make(map[int]int)
+		a.gpuTotalsMB = make(map[runtimectl.GPUKey]int)
 	}
-	a.gpuTotalsMB[index] = mb
+	a.gpuTotalsMB[key] = mb
 }
 
 // pushHostInfo hands the sink the last-known GPU totals plus the given
@@ -2608,10 +2619,7 @@ func (a *Agent) pushHostInfo(availableBytes int64) {
 	if len(a.gpuTotalsMB) > 0 {
 		// A copy, so the sink (and the owner behind it) never shares the
 		// map this loop keeps editing.
-		hi.GPUTotalsMB = make(map[int]int, len(a.gpuTotalsMB))
-		for i, mb := range a.gpuTotalsMB {
-			hi.GPUTotalsMB[i] = mb
-		}
+		hi.GPUTotalsMB = maps.Clone(a.gpuTotalsMB)
 	}
 	a.hostInfo.SetHostInfo(hi)
 }
@@ -2770,13 +2778,19 @@ func (a *Agent) collectOnce(ctx context.Context) {
 				}
 				if len(st.MeasuredVRAM) > 0 {
 					gpus := make([]sample.RuntimeGPUSample, 0, len(st.MeasuredVRAM))
-					for idx, mb := range st.MeasuredVRAM {
-						gpus = append(gpus, sample.RuntimeGPUSample{Index: idx, VRAMMeasuredMB: mb})
+					for k, mb := range st.MeasuredVRAM {
+						gpus = append(gpus, sample.RuntimeGPUSample{Vendor: string(k.Vendor), Index: k.Index, VRAMMeasuredMB: mb})
 					}
-					// map iteration order is unspecified; sort by index so
-					// the wire order is deterministic (easier to diff/read,
-					// and avoids flaky-looking test assertions downstream).
-					sort.Slice(gpus, func(i, j int) bool { return gpus[i].Index < gpus[j].Index })
+					// map iteration order is unspecified; sort by (vendor,
+					// index) so the wire order is deterministic (easier to
+					// diff/read, and avoids flaky-looking test assertions
+					// downstream).
+					sort.Slice(gpus, func(i, j int) bool {
+						if gpus[i].Vendor != gpus[j].Vendor {
+							return gpus[i].Vendor < gpus[j].Vendor
+						}
+						return gpus[i].Index < gpus[j].Index
+					})
 					rs.GPUs = gpus
 				}
 				// Spec-level, so it does not ride gpus[]. 0 is the unknown

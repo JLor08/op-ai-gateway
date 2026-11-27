@@ -100,7 +100,7 @@ func TestAdmit(t *testing.T) {
 			name: "empty running set budget fits",
 			snap: PolicySnapshot{
 				Running: nil,
-				Budgets: map[int]int{0: 2000},
+				Budgets: map[GPUKey]int{{Index: 0}: 2000},
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}},
 			want: Decision{OK: true, Evict: []string{}},
@@ -145,10 +145,10 @@ func TestAdmit(t *testing.T) {
 			name: "budget exceeded evicts oldest idle toucher",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "old", GPUs: map[int]int{0: 4000}, LastUsed: t0},
-					{SpecID: "new", GPUs: map[int]int{0: 4000}, LastUsed: t1},
+					{SpecID: "old", GPUs: map[GPUKey]int{{Index: 0}: 4000}, LastUsed: t0},
+					{SpecID: "new", GPUs: map[GPUKey]int{{Index: 0}: 4000}, LastUsed: t1},
 				},
-				Budgets: map[int]int{0: 10000},
+				Budgets: map[GPUKey]int{{Index: 0}: 10000},
 				Allowed: allowPairs("cand", "old", "new"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}}},
@@ -159,10 +159,10 @@ func TestAdmit(t *testing.T) {
 			name: "budget exceeded all busy waits",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "old", GPUs: map[int]int{0: 4000}, InFlight: 1, LastUsed: t0},
-					{SpecID: "new", GPUs: map[int]int{0: 4000}, InFlight: 2, LastUsed: t1},
+					{SpecID: "old", GPUs: map[GPUKey]int{{Index: 0}: 4000}, InFlight: 1, LastUsed: t0},
+					{SpecID: "new", GPUs: map[GPUKey]int{{Index: 0}: 4000}, InFlight: 2, LastUsed: t1},
 				},
-				Budgets: map[int]int{0: 10000},
+				Budgets: map[GPUKey]int{{Index: 0}: 10000},
 				Allowed: allowPairs("cand", "old", "new"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}}},
@@ -178,10 +178,10 @@ func TestAdmit(t *testing.T) {
 			name: "disjoint gpus do not compete",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "gpu0-hog", GPUs: map[int]int{0: 8000}, LastUsed: t0},
-					{SpecID: "gpu2-hog", GPUs: map[int]int{2: 8000}, LastUsed: t1},
+					{SpecID: "gpu0-hog", GPUs: map[GPUKey]int{{Index: 0}: 8000}, LastUsed: t0},
+					{SpecID: "gpu2-hog", GPUs: map[GPUKey]int{{Index: 2}: 8000}, LastUsed: t1},
 				},
-				Budgets: map[int]int{0: 8000, 1: 10000, 2: 8000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 10000, {Index: 2}: 8000},
 				Allowed: allowPairs("cand", "gpu0-hog", "gpu2-hog"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 1, VRAMMB: 5000}}},
@@ -244,7 +244,7 @@ func TestAdmit(t *testing.T) {
 			name: "unknown vram occupied by idle known occupant waits",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0},
 				},
 				Allowed: allowPairs("cand", "occupant"),
 			},
@@ -266,7 +266,7 @@ func TestAdmit(t *testing.T) {
 			name: "unknown vram occupied by pinned is pending_vram_unknown",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 5000}, Pinned: true, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, Pinned: true, LastUsed: t0},
 				},
 				Allowed: allowPairs("cand", "occupant"),
 			},
@@ -280,10 +280,10 @@ func TestAdmit(t *testing.T) {
 			name: "tensor parallel evicts only the overbudget gpu",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "gpu0-old", GPUs: map[int]int{0: 9000}, LastUsed: t0},
-					{SpecID: "gpu1-proc", GPUs: map[int]int{1: 5000}, LastUsed: t1},
+					{SpecID: "gpu0-old", GPUs: map[GPUKey]int{{Index: 0}: 9000}, LastUsed: t0},
+					{SpecID: "gpu1-proc", GPUs: map[GPUKey]int{{Index: 1}: 5000}, LastUsed: t1},
 				},
-				Budgets: map[int]int{0: 10000, 1: 10000},
+				Budgets: map[GPUKey]int{{Index: 0}: 10000, {Index: 1}: 10000},
 				Allowed: allowPairs("cand", "gpu0-old", "gpu1-proc"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}, {Index: 1, VRAMMB: 3000}}},
@@ -313,9 +313,9 @@ func TestAdmit(t *testing.T) {
 			name: "measured vram low value fits budget",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 10000},
+				Budgets: map[GPUKey]int{{Index: 0}: 10000},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 2000}}},
@@ -329,9 +329,9 @@ func TestAdmit(t *testing.T) {
 			name: "measured vram high value overflows budget",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 9000}, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 9000}, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 10000},
+				Budgets: map[GPUKey]int{{Index: 0}: 10000},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 2000}}},
@@ -348,9 +348,9 @@ func TestAdmit(t *testing.T) {
 			name: "missing budget is unconstrained not zero",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 999999}, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 999999}, LastUsed: t0},
 				},
-				Budgets: map[int]int{}, // gpu 0 absent
+				Budgets: map[GPUKey]int{}, // gpu 0 absent
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
@@ -373,11 +373,11 @@ func TestAdmit(t *testing.T) {
 			snap: PolicySnapshot{
 				Running: []RunningProc{
 					{SpecID: "newest", LastUsed: t2}, // does not touch gpu 0
-					{SpecID: "oldest", GPUs: map[int]int{0: 8000}, LastUsed: t0},
+					{SpecID: "oldest", GPUs: map[GPUKey]int{{Index: 0}: 8000}, LastUsed: t0},
 					{SpecID: "middle", LastUsed: t1}, // does not touch gpu 0
 				},
 				MaxProcesses: 2,
-				Budgets:      map[int]int{0: 10000},
+				Budgets:      map[GPUKey]int{{Index: 0}: 10000},
 				Allowed:      allowPairs("cand", "newest", "oldest", "middle"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}}},
@@ -396,9 +396,9 @@ func TestAdmit(t *testing.T) {
 			name: "running process spanning multiple gpus only its touched index counts",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "multi", GPUs: map[int]int{0: 5000, 1: 4000}, LastUsed: t0},
+					{SpecID: "multi", GPUs: map[GPUKey]int{{Index: 0}: 5000, {Index: 1}: 4000}, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 10000},
+				Budgets: map[GPUKey]int{{Index: 0}: 10000},
 				Allowed: allowPairs("cand", "multi"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 3000}}},
@@ -422,7 +422,7 @@ func TestAdmit(t *testing.T) {
 func TestAdmitUnknownVRAMBusyBlockerWaits(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 5000}, InFlight: 1, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, InFlight: 1, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
 	}
@@ -499,7 +499,7 @@ func TestAdmitNeverWaitsOnBusySelf(t *testing.T) {
 func TestAdmitUnknownVRAMSelfIsNotAnOccupant(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "cand", GPUs: map[int]int{0: 5000}, Pinned: true, LastUsed: t0},
+			{SpecID: "cand", GPUs: map[GPUKey]int{{Index: 0}: 5000}, Pinned: true, LastUsed: t0},
 		},
 	}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
@@ -532,9 +532,9 @@ func TestAdmitSelfNotCountedTowardProcessLimit(t *testing.T) {
 func TestAdmitSelfVRAMNotDoubleCountedAgainstBudget(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "cand", GPUs: map[int]int{0: 9000}, LastUsed: t0},
+			{SpecID: "cand", GPUs: map[GPUKey]int{{Index: 0}: 9000}, LastUsed: t0},
 		},
-		Budgets: map[int]int{0: 10000},
+		Budgets: map[GPUKey]int{{Index: 0}: 10000},
 	}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}}
 	got := Admit(snap, spec)
@@ -558,7 +558,7 @@ func TestAdmitSelfVRAMNotDoubleCountedAgainstBudget(t *testing.T) {
 // the spec's binary/directory) when both surface through the same State.
 func TestAdmitCandidateAloneExceedsBudgetIsNotPermitted(t *testing.T) {
 	snap := PolicySnapshot{
-		Budgets: map[int]int{0: 8000},
+		Budgets: map[GPUKey]int{{Index: 0}: 8000},
 	}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}}
 	got := Admit(snap, spec)
@@ -616,7 +616,7 @@ func TestAdmitZeroBudgetIsUnconstrained(t *testing.T) {
 			// "demand 9000 MB exceeds budget 0 MB on its own" refusal.
 			name: "zero budget alone admits the candidate",
 			snap: PolicySnapshot{
-				Budgets: map[int]int{0: 0},
+				Budgets: map[GPUKey]int{{Index: 0}: 0},
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}},
 			want: Decision{OK: true, Evict: []string{}},
@@ -629,9 +629,9 @@ func TestAdmitZeroBudgetIsUnconstrained(t *testing.T) {
 			name: "zero budget matches an absent row exactly",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 999999}, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 999999}, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 0},
+				Budgets: map[GPUKey]int{{Index: 0}: 0},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
@@ -643,7 +643,7 @@ func TestAdmitZeroBudgetIsUnconstrained(t *testing.T) {
 			// whole-snapshot opt-out.
 			name: "zero on one gpu leaves a sibling budget enforced",
 			snap: PolicySnapshot{
-				Budgets: map[int]int{0: 0, 1: 4000},
+				Budgets: map[GPUKey]int{{Index: 0}: 0, {Index: 1}: 4000},
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}, {Index: 1, VRAMMB: 9000}}},
 			want: Decision{
@@ -657,7 +657,7 @@ func TestAdmitZeroBudgetIsUnconstrained(t *testing.T) {
 			// demand is still the terminal refusal.
 			name: "positive budget below own demand still refuses",
 			snap: PolicySnapshot{
-				Budgets: map[int]int{0: 8000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000},
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}},
 			want: Decision{
@@ -672,9 +672,9 @@ func TestAdmitZeroBudgetIsUnconstrained(t *testing.T) {
 			name: "positive budget still evicts on overflow",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 6000}, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 6000}, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 8000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
@@ -760,7 +760,7 @@ func TestAdmitTieBreaksDeterministically(t *testing.T) {
 func TestAdmitUnknownOccupantIdleIsEvicted(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 0, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, InFlight: 0, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
 	}
@@ -776,7 +776,7 @@ func TestAdmitUnknownOccupantIdleIsEvicted(t *testing.T) {
 func TestAdmitUnknownOccupantBusyWaits(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 1, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, InFlight: 1, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
 	}
@@ -792,7 +792,7 @@ func TestAdmitUnknownOccupantBusyWaits(t *testing.T) {
 func TestAdmitUnknownOccupantStartingWaits(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 0, Starting: true, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, InFlight: 0, Starting: true, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
 	}
@@ -817,7 +817,7 @@ func TestAdmitUnknownOccupantStartingWaits(t *testing.T) {
 func TestAdmitUnknownOccupantPinnedIsTerminal(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
 	}
@@ -857,9 +857,9 @@ func TestAdmitOwnDemandTerminalIsReportedAheadOfPinnedUnknown(t *testing.T) {
 			name: "own demand outranks a pinned unknown occupant",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 8000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}}},
@@ -873,9 +873,9 @@ func TestAdmitOwnDemandTerminalIsReportedAheadOfPinnedUnknown(t *testing.T) {
 			name: "own demand outranks the candidate's own unknown demand elsewhere",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{1: 5000}, Pinned: true, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 1}: 5000}, Pinned: true, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 8000, 1: 20000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 20000},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 9000}, {Index: 1, VRAMMB: 0}}},
@@ -919,9 +919,9 @@ func TestAdmitPinnedUnknownOccupantWithClosedPairNamesTheMatrix(t *testing.T) {
 			name: "closed pair is reported as the closed pair",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 8000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000},
 				// Allowed left empty: the (cand, occupant) pair is closed.
 			},
 			want: Decision{
@@ -934,9 +934,9 @@ func TestAdmitPinnedUnknownOccupantWithClosedPairNamesTheMatrix(t *testing.T) {
 			name: "control: closed pair with a KNOWN pinned occupant still waits",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 2000}, Pinned: true, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 2000}, Pinned: true, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 8000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000},
 			},
 			want: Decision{Wait: true, Evict: []string{}},
 		},
@@ -944,9 +944,9 @@ func TestAdmitPinnedUnknownOccupantWithClosedPairNamesTheMatrix(t *testing.T) {
 			name: "control: an open pair still reports the unknown demand",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t0},
 				},
-				Budgets: map[int]int{0: 8000},
+				Budgets: map[GPUKey]int{{Index: 0}: 8000},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			want: Decision{
@@ -972,8 +972,8 @@ func TestAdmitPinnedUnknownOccupantWithClosedPairNamesTheMatrix(t *testing.T) {
 // from one admission to the next.
 func TestAdmitPinnedUnknownOccupantChoiceIsDeterministic(t *testing.T) {
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}}
-	openPair := RunningProc{SpecID: "aaa-open", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t0}
-	closedPair := RunningProc{SpecID: "zzz-closed", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t1}
+	openPair := RunningProc{SpecID: "aaa-open", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t0}
+	closedPair := RunningProc{SpecID: "zzz-closed", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t1}
 
 	// A closed cell outranks an open one even though its spec id sorts last:
 	// no VRAM number resolves a closed cell, so it is the honest cause.
@@ -988,7 +988,7 @@ func TestAdmitPinnedUnknownOccupantChoiceIsDeterministic(t *testing.T) {
 	} {
 		snap := PolicySnapshot{
 			Running: order,
-			Budgets: map[int]int{0: 8000},
+			Budgets: map[GPUKey]int{{Index: 0}: 8000},
 			Allowed: allowPairs("cand", "aaa-open"),
 		}
 		assertDecision(t, "closed pair outranks open pair ("+order[0].SpecID+" first)",
@@ -997,7 +997,7 @@ func TestAdmitPinnedUnknownOccupantChoiceIsDeterministic(t *testing.T) {
 
 	// Same precedence on both sides: the lowest spec id, so the message is
 	// stable rather than whichever the map happened to yield first.
-	otherOpen := RunningProc{SpecID: "bbb-open", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t1}
+	otherOpen := RunningProc{SpecID: "bbb-open", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t1}
 	lowestID := Decision{
 		Reason:  StatePendingVRAMUnknown,
 		Message: "spec cand: gpu 0 is held by pinned spec aaa-open, whose own demand on gpu 0 is unknown",
@@ -1009,7 +1009,7 @@ func TestAdmitPinnedUnknownOccupantChoiceIsDeterministic(t *testing.T) {
 	} {
 		snap := PolicySnapshot{
 			Running: order,
-			Budgets: map[int]int{0: 8000},
+			Budgets: map[GPUKey]int{{Index: 0}: 8000},
 			Allowed: allowPairs("cand", "aaa-open", "bbb-open"),
 		}
 		assertDecision(t, "equal precedence breaks on the lowest spec id ("+order[0].SpecID+" first)",
@@ -1040,10 +1040,10 @@ func TestAdmitPinnedUnknownOccupantChoiceIsDeterministic(t *testing.T) {
 // stand: it made every mixed pair evict in both directions.
 func TestAdmitUnknownOccupantBlocksEveryCardItHolds(t *testing.T) {
 	candidate := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 1, VRAMMB: 5000}}}
-	budgets := map[int]int{0: 20000, 1: 20000}
+	budgets := map[GPUKey]int{{Index: 0}: 20000, {Index: 1}: 20000}
 
 	occupant := func(mod func(*RunningProc)) []RunningProc {
-		r := RunningProc{SpecID: "occupant", GPUs: map[int]int{0: 0, 1: 5000}, LastUsed: t0}
+		r := RunningProc{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0, {Index: 1}: 5000}, LastUsed: t0}
 		mod(&r)
 		return []RunningProc{r}
 	}
@@ -1102,7 +1102,7 @@ func TestAdmitUnknownOccupantBlocksEveryCardItHolds(t *testing.T) {
 			name: "mirror: an unknown candidate waits for a known occupant of one of its cards",
 			snap: PolicySnapshot{
 				Running: []RunningProc{
-					{SpecID: "occupant", GPUs: map[int]int{1: 5000}, LastUsed: t0},
+					{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 1}: 5000}, LastUsed: t0},
 				},
 				Budgets: budgets,
 				Allowed: allowPairs("cand", "occupant"),
@@ -1155,10 +1155,10 @@ func TestAdmitUnknownOccupantBlocksEveryCardItHolds(t *testing.T) {
 func TestAdmitRule5MustPrecedeRule3(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "known", GPUs: map[int]int{1: 1000}, LastUsed: t0},
-			{SpecID: "unknown-multi", GPUs: map[int]int{0: 0, 1: 6000}, LastUsed: t1},
+			{SpecID: "known", GPUs: map[GPUKey]int{{Index: 1}: 1000}, LastUsed: t0},
+			{SpecID: "unknown-multi", GPUs: map[GPUKey]int{{Index: 0}: 0, {Index: 1}: 6000}, LastUsed: t1},
 		},
-		Budgets: map[int]int{1: 8000},
+		Budgets: map[GPUKey]int{{Index: 1}: 8000},
 		Allowed: allowPairs("cand", "known", "unknown-multi"),
 	}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 1, VRAMMB: 2000}}}
@@ -1180,11 +1180,11 @@ func TestAdmitRule5MustPrecedeRule3(t *testing.T) {
 func TestAdmitRule5MustPrecedeRule2(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "known", GPUs: map[int]int{1: 4000}, LastUsed: t0},
-			{SpecID: "unknown", GPUs: map[int]int{0: 0}, LastUsed: t0.Add(2 * time.Minute)},
+			{SpecID: "known", GPUs: map[GPUKey]int{{Index: 1}: 4000}, LastUsed: t0},
+			{SpecID: "unknown", GPUs: map[GPUKey]int{{Index: 0}: 0}, LastUsed: t0.Add(2 * time.Minute)},
 		},
 		MaxProcesses: 2,
-		Budgets:      map[int]int{0: 8000, 1: 8000},
+		Budgets:      map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 8000},
 		Allowed: map[[2]string]bool{
 			PairKey("cand", "known"):    true,
 			PairKey("cand", "unknown"):  true,
@@ -1204,10 +1204,10 @@ func TestAdmitRule5MustPrecedeRule2(t *testing.T) {
 func TestAdmitUnknownOccupantOnOtherGPUIsIgnored(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{1: 0}, InFlight: 0, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 1}: 0}, InFlight: 0, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
-		Budgets: map[int]int{0: 8000, 1: 8000},
+		Budgets: map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 8000},
 	}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}}
 	got := Admit(snap, spec)
@@ -1224,30 +1224,30 @@ func TestAdmitKnownOccupantUnaffectedByRule5(t *testing.T) {
 
 	fits := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 2000}, InFlight: 0, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 2000}, InFlight: 0, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
-		Budgets: map[int]int{0: 8000},
+		Budgets: map[GPUKey]int{{Index: 0}: 8000},
 	}
 	assertDecision(t, "known occupant that fits is shared with", Admit(fits, spec),
 		Decision{OK: true, Evict: []string{}})
 
 	pinnedFits := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 2000}, Pinned: true, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 2000}, Pinned: true, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
-		Budgets: map[int]int{0: 8000},
+		Budgets: map[GPUKey]int{{Index: 0}: 8000},
 	}
 	assertDecision(t, "pinned known occupant that fits is shared with", Admit(pinnedFits, spec),
 		Decision{OK: true, Evict: []string{}})
 
 	overBudget := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 7500}, InFlight: 0, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 7500}, InFlight: 0, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
-		Budgets: map[int]int{0: 8000},
+		Budgets: map[GPUKey]int{{Index: 0}: 8000},
 	}
 	assertDecision(t, "known occupant over budget is evicted", Admit(overBudget, spec),
 		Decision{Evict: []string{"occupant"}})
@@ -1262,7 +1262,7 @@ func TestAdmitKnownOccupantUnaffectedByRule5(t *testing.T) {
 func TestAdmitUnknownOccupantSelfIsNotAnOccupant(t *testing.T) {
 	idleSelf := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "cand", GPUs: map[int]int{0: 0}, InFlight: 0, LastUsed: t0},
+			{SpecID: "cand", GPUs: map[GPUKey]int{{Index: 0}: 0}, InFlight: 0, LastUsed: t0},
 		},
 	}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}}
@@ -1271,7 +1271,7 @@ func TestAdmitUnknownOccupantSelfIsNotAnOccupant(t *testing.T) {
 
 	pinnedSelf := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "cand", GPUs: map[int]int{0: 0}, Pinned: true, LastUsed: t0},
+			{SpecID: "cand", GPUs: map[GPUKey]int{{Index: 0}: 0}, Pinned: true, LastUsed: t0},
 		},
 	}
 	assertDecision(t, "unknown-demand pinned self is not a terminal block", Admit(pinnedSelf, spec),
@@ -1294,7 +1294,7 @@ func TestAdmitUnknownOccupantSelfIsNotAnOccupant(t *testing.T) {
 func TestAdmitUnknownOnBothSidesEvictsOnce(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{
-			{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 0, LastUsed: t0},
+			{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, InFlight: 0, LastUsed: t0},
 		},
 		Allowed: allowPairs("cand", "occupant"),
 	}
@@ -1339,7 +1339,7 @@ func TestAdmitUnknownOnBothSidesEvictsOnce(t *testing.T) {
 func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 	unknownCandidate := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
 	occupant := func(mod func(*RunningProc)) []RunningProc {
-		r := RunningProc{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}
+		r := RunningProc{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0}
 		mod(&r)
 		return []RunningProc{r}
 	}
@@ -1363,14 +1363,14 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			// the card to itself. Now: Wait, which the occupant's own idle
 			// timeout resolves without destroying anything.
 			name: "idle known occupant is waited for, never evicted",
-			snap: PolicySnapshot{Running: occupant(idle), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			snap: PolicySnapshot{Running: occupant(idle), Allowed: allowPairs("cand", "occupant"), Budgets: map[GPUKey]int{{Index: 0}: 20000}},
 			spec: unknownCandidate,
 			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
 		{
 			// Unchanged: a busy occupant was never evictable anyway.
 			name: "busy known occupant still waits",
-			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.InFlight = 1 }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.InFlight = 1 }), Allowed: allowPairs("cand", "occupant"), Budgets: map[GPUKey]int{{Index: 0}: 20000}},
 			spec: unknownCandidate,
 			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
@@ -1378,7 +1378,7 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			// Unchanged: isEvictable's Starting clause (the C3 fix) already
 			// spared a still-loading occupant.
 			name: "still-loading known occupant still waits",
-			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.Starting = true }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.Starting = true }), Allowed: allowPairs("cand", "occupant"), Budgets: map[GPUKey]int{{Index: 0}: 20000}},
 			spec: unknownCandidate,
 			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
@@ -1388,7 +1388,7 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			// still reported as the terminal it always was, by step 2's
 			// short-circuit, ahead of rule 4's collection loop.
 			name: "pinned known occupant is still the terminal",
-			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.Pinned = true }), Allowed: allowPairs("cand", "occupant"), Budgets: map[int]int{0: 20000}},
+			snap: PolicySnapshot{Running: occupant(func(r *RunningProc) { r.Pinned = true }), Allowed: allowPairs("cand", "occupant"), Budgets: map[GPUKey]int{{Index: 0}: 20000}},
 			spec: unknownCandidate,
 			want: Decision{Reason: StatePendingVRAMUnknown, Evict: []string{}},
 		},
@@ -1400,7 +1400,7 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			// drain-stop the known one, and blocking here converges the closed
 			// mixed pair too (which evicted in both directions before).
 			name: "a closed co-residency cell does not restore the eviction right",
-			snap: PolicySnapshot{Running: occupant(idle), Budgets: map[int]int{0: 20000}},
+			snap: PolicySnapshot{Running: occupant(idle), Budgets: map[GPUKey]int{{Index: 0}: 20000}},
 			spec: unknownCandidate,
 			want: Decision{Wait: true, Message: waits, Evict: []string{}},
 		},
@@ -1412,8 +1412,8 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			// this candidate contests, and this candidate may not have it.
 			name: "a sibling gpu over budget does not restore it either",
 			snap: PolicySnapshot{
-				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{1: 5000}, LastUsed: t0}},
-				Budgets: map[int]int{1: 8000},
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 1}: 5000}, LastUsed: t0}},
+				Budgets: map[GPUKey]int{{Index: 1}: 8000},
 				Allowed: allowPairs("cand", "occupant"),
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}, {Index: 1, VRAMMB: 5000}}},
@@ -1433,7 +1433,7 @@ func TestAdmitUnknownCandidateNeverEvictsKnownOccupant(t *testing.T) {
 			// would make an unconfigured spec unable to start on an idle host.
 			name: "a known occupant of an untouched gpu is still evicted by the process limit",
 			snap: PolicySnapshot{
-				Running:      []RunningProc{{SpecID: "elsewhere", GPUs: map[int]int{7: 5000}, LastUsed: t0}},
+				Running:      []RunningProc{{SpecID: "elsewhere", GPUs: map[GPUKey]int{{Index: 7}: 5000}, LastUsed: t0}},
 				MaxProcesses: 1,
 				Allowed:      allowPairs("cand", "elsewhere"),
 			},
@@ -1476,9 +1476,9 @@ func TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor(t *testing.T) {
 			// the manager) an idle timeout of 0.
 			name: "the idle known occupant it may not evict is named, with its card",
 			snap: PolicySnapshot{
-				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0}},
 				Allowed: allowPairs("cand", "occupant"),
-				Budgets: map[int]int{0: 20000},
+				Budgets: map[GPUKey]int{{Index: 0}: 20000},
 			},
 			spec: unknownCandidate,
 			want: Decision{
@@ -1493,9 +1493,9 @@ func TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor(t *testing.T) {
 			// so the message names both.
 			name: "the contested card and the unknown card are named separately",
 			snap: PolicySnapshot{
-				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{1: 5000}, LastUsed: t0}},
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 1}: 5000}, LastUsed: t0}},
 				Allowed: allowPairs("cand", "occupant"),
-				Budgets: map[int]int{1: 20000},
+				Budgets: map[GPUKey]int{{Index: 1}: 20000},
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}, {Index: 1, VRAMMB: 5000}}},
 			want: Decision{
@@ -1523,9 +1523,9 @@ func TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor(t *testing.T) {
 			// construction, so no message.
 			name: "control: rule 5 waiting for a busy unknown occupant says nothing",
 			snap: PolicySnapshot{
-				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 1, LastUsed: t0}},
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, InFlight: 1, LastUsed: t0}},
 				Allowed: allowPairs("cand", "occupant"),
-				Budgets: map[int]int{0: 20000},
+				Budgets: map[GPUKey]int{{Index: 0}: 20000},
 			},
 			spec: Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}},
 			want: Decision{Wait: true, Evict: []string{}},
@@ -1537,9 +1537,9 @@ func TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor(t *testing.T) {
 			// block here to report.
 			name: "control: the both-unknown tie is not a precedence block",
 			snap: PolicySnapshot{
-				Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 0}, InFlight: 1, LastUsed: t0}},
+				Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, InFlight: 1, LastUsed: t0}},
 				Allowed: allowPairs("cand", "occupant"),
-				Budgets: map[int]int{0: 20000},
+				Budgets: map[GPUKey]int{{Index: 0}: 20000},
 			},
 			spec: unknownCandidate,
 			want: Decision{Wait: true, Evict: []string{}},
@@ -1560,14 +1560,14 @@ func TestAdmitPrecedenceWaitNamesWhatItIsWaitingFor(t *testing.T) {
 // tie-break is the lowest spec id, the same total order the victim ordering
 // and pinnedUnknownOccupantRefusal already use.
 func TestAdmitPrecedenceWaitMessageIsDeterministic(t *testing.T) {
-	a := RunningProc{SpecID: "occupant-a", GPUs: map[int]int{0: 4000}, LastUsed: t1}
-	b := RunningProc{SpecID: "occupant-b", GPUs: map[int]int{0: 4000}, LastUsed: t0}
+	a := RunningProc{SpecID: "occupant-a", GPUs: map[GPUKey]int{{Index: 0}: 4000}, LastUsed: t1}
+	b := RunningProc{SpecID: "occupant-b", GPUs: map[GPUKey]int{{Index: 0}: 4000}, LastUsed: t0}
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
 	allowed := allowPairs("cand", "occupant-a", "occupant-b")
 
 	const want = "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant-a to leave gpu 0 rather than evicting it"
 	for _, order := range [][]RunningProc{{a, b}, {b, a}} {
-		got := Admit(PolicySnapshot{Running: order, Allowed: allowed, Budgets: map[int]int{0: 20000}}, spec)
+		got := Admit(PolicySnapshot{Running: order, Allowed: allowed, Budgets: map[GPUKey]int{{Index: 0}: 20000}}, spec)
 		if got.Message != want {
 			t.Errorf("Running order %v -> Message = %q, want %q", []string{order[0].SpecID, order[1].SpecID}, got.Message, want)
 		}
@@ -1584,8 +1584,8 @@ func TestAdmitMixedPairConverges(t *testing.T) {
 	allowed := map[[2]string]bool{PairKey("known", "unknown"): true}
 	specKnown := Spec{ID: "known", GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}}
 	specUnknown := Spec{ID: "unknown", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
-	runKnown := RunningProc{SpecID: "known", GPUs: map[int]int{0: 5000}, LastUsed: t0}
-	runUnknown := RunningProc{SpecID: "unknown", GPUs: map[int]int{0: 0}, LastUsed: t0}
+	runKnown := RunningProc{SpecID: "known", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0}
+	runUnknown := RunningProc{SpecID: "unknown", GPUs: map[GPUKey]int{{Index: 0}: 0}, LastUsed: t0}
 
 	knownAsCandidate := Admit(PolicySnapshot{Running: []RunningProc{runUnknown}, Allowed: allowed}, specKnown)
 	unknownAsCandidate := Admit(PolicySnapshot{Running: []RunningProc{runKnown}, Allowed: allowed}, specUnknown)
@@ -1620,8 +1620,8 @@ func TestAdmitUnknownTieStillEvictsBothWays(t *testing.T) {
 	allowed := map[[2]string]bool{PairKey("a", "b"): true}
 	specA := Spec{ID: "a", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
 	specB := Spec{ID: "b", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
-	runA := RunningProc{SpecID: "a", GPUs: map[int]int{0: 0}, LastUsed: t0}
-	runB := RunningProc{SpecID: "b", GPUs: map[int]int{0: 0}, LastUsed: t0}
+	runA := RunningProc{SpecID: "a", GPUs: map[GPUKey]int{{Index: 0}: 0}, LastUsed: t0}
+	runB := RunningProc{SpecID: "b", GPUs: map[GPUKey]int{{Index: 0}: 0}, LastUsed: t0}
 
 	assertDecision(t, "unknown a evicts unknown occupant b",
 		Admit(PolicySnapshot{Running: []RunningProc{runB}, Allowed: allowed}, specA),
@@ -1660,8 +1660,8 @@ func TestVRAMBootstrapOneShotEvictsToMeasure(t *testing.T) {
 
 	t.Run("one idle known occupant is evicted and the shot is flagged", func(t *testing.T) {
 		snap := PolicySnapshot{
-			Running:               []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
-			Budgets:               map[int]int{0: 20000},
+			Running:               []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0}},
+			Budgets:               map[GPUKey]int{{Index: 0}: 20000},
 			Allowed:               allowPairs("cand", "occupant"),
 			VRAMBootstrapEligible: true,
 		}
@@ -1675,10 +1675,10 @@ func TestVRAMBootstrapOneShotEvictsToMeasure(t *testing.T) {
 	t.Run("every idle known toucher is freed so the candidate truly runs alone", func(t *testing.T) {
 		snap := PolicySnapshot{
 			Running: []RunningProc{
-				{SpecID: "new", GPUs: map[int]int{0: 4000}, LastUsed: t2},
-				{SpecID: "old", GPUs: map[int]int{0: 4000}, LastUsed: t0},
+				{SpecID: "new", GPUs: map[GPUKey]int{{Index: 0}: 4000}, LastUsed: t2},
+				{SpecID: "old", GPUs: map[GPUKey]int{{Index: 0}: 4000}, LastUsed: t0},
 			},
-			Budgets:               map[int]int{0: 20000},
+			Budgets:               map[GPUKey]int{{Index: 0}: 20000},
 			Allowed:               allowPairs("cand", "new", "old"),
 			VRAMBootstrapEligible: true,
 		}
@@ -1704,11 +1704,11 @@ func TestVRAMBootstrapOneShotEvictsToMeasure(t *testing.T) {
 			{"still loading", func(r *RunningProc) { r.Starting = true }},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				r := RunningProc{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}
+				r := RunningProc{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0}
 				tc.mod(&r)
 				snap := PolicySnapshot{
 					Running:               []RunningProc{r},
-					Budgets:               map[int]int{0: 20000},
+					Budgets:               map[GPUKey]int{{Index: 0}: 20000},
 					Allowed:               allowPairs("cand", "occupant"),
 					VRAMBootstrapEligible: true,
 				}
@@ -1732,8 +1732,8 @@ func TestVRAMBootstrapOneShotEvictsToMeasure(t *testing.T) {
 func TestVRAMBootstrapDoesNotRepeat(t *testing.T) {
 	spec := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
 	base := PolicySnapshot{
-		Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
-		Budgets: map[int]int{0: 20000},
+		Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0}},
+		Budgets: map[GPUKey]int{{Index: 0}: 20000},
 		Allowed: allowPairs("cand", "occupant"),
 	}
 	const waits = "spec cand: its own demand on gpu 0 is unknown, so it waits for spec occupant to leave gpu 0 rather than evicting it"
@@ -1769,8 +1769,8 @@ func TestADR032SteadyStatePreserved(t *testing.T) {
 
 	t.Run("unknown candidate still waits for an idle known occupant", func(t *testing.T) {
 		snap := PolicySnapshot{
-			Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 5000}, LastUsed: t0}},
-			Budgets: map[int]int{0: 20000},
+			Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 5000}, LastUsed: t0}},
+			Budgets: map[GPUKey]int{{Index: 0}: 20000},
 			Allowed: allowPairs("cand", "occupant"),
 			// VRAMBootstrapEligible defaults to false: no grant.
 		}
@@ -1783,8 +1783,8 @@ func TestADR032SteadyStatePreserved(t *testing.T) {
 
 	t.Run("a known candidate still evicts an idle unknown occupant even with the grant set", func(t *testing.T) {
 		snap := PolicySnapshot{
-			Running: []RunningProc{{SpecID: "occupant", GPUs: map[int]int{0: 0}, LastUsed: t0}},
-			Budgets: map[int]int{0: 20000},
+			Running: []RunningProc{{SpecID: "occupant", GPUs: map[GPUKey]int{{Index: 0}: 0}, LastUsed: t0}},
+			Budgets: map[GPUKey]int{{Index: 0}: 20000},
 			Allowed: allowPairs("cand", "occupant"),
 			// The grant is meaningless for a KNOWN candidate (rule 4 never runs),
 			// but set it to prove the bootstrap never touches rule 5's eviction.
@@ -1842,8 +1842,8 @@ func TestAdmitRAMEvictsIdleOldestHostWide(t *testing.T) {
 		return []RunningProc{
 			// Listed newest-first on purpose: the order victims are drawn in
 			// must come from LastUsed, never from slice order.
-			{SpecID: "new", GPUs: map[int]int{1: 1000}, RAMMB: 4000, LastUsed: t1},
-			{SpecID: "old", GPUs: map[int]int{1: 1000}, RAMMB: 10000, LastUsed: t0},
+			{SpecID: "new", GPUs: map[GPUKey]int{{Index: 1}: 1000}, RAMMB: 4000, LastUsed: t1},
+			{SpecID: "old", GPUs: map[GPUKey]int{{Index: 1}: 1000}, RAMMB: 10000, LastUsed: t0},
 		}
 	}
 	cand := Spec{ID: "cand", RAMMB: 8000, GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}}
@@ -1852,7 +1852,7 @@ func TestAdmitRAMEvictsIdleOldestHostWide(t *testing.T) {
 		// 8000 + 10000 + 4000 = 22000 > 16000; draining "old" leaves 12000.
 		snap := PolicySnapshot{
 			Running:         running(),
-			Budgets:         map[int]int{0: 24000, 1: 24000},
+			Budgets:         map[GPUKey]int{{Index: 0}: 24000, {Index: 1}: 24000},
 			HostRAMBudgetMB: 16000,
 			Allowed:         allowPairs("cand", "old", "new"),
 		}
@@ -2305,10 +2305,10 @@ func TestRAMBootstrapComposesWithOtherRules(t *testing.T) {
 		// holder. The guess must see it as already gone, not drain a second victim.
 		snap := PolicySnapshot{
 			Running: []RunningProc{
-				{SpecID: "occ", GPUs: map[int]int{0: 5000}, RAMMB: 6000, LastUsed: t0},
+				{SpecID: "occ", GPUs: map[GPUKey]int{{Index: 0}: 5000}, RAMMB: 6000, LastUsed: t0},
 				{SpecID: "other", RAMMB: 3000, LastUsed: t1},
 			},
-			Budgets:             map[int]int{0: 5000},
+			Budgets:             map[GPUKey]int{{Index: 0}: 5000},
 			HostRAMBudgetMB:     12000,
 			RAMBootstrapGuessMB: 4000,
 			Allowed:             allowPairs("cand", "occ", "other"),
@@ -2427,7 +2427,7 @@ func TestAdmitRAMOwnDemandExceedsBudgetIsTerminal(t *testing.T) {
 		// operator to fill in a number that cannot make 9000 MB fit under 8000.
 		snap := PolicySnapshot{
 			Running: []RunningProc{
-				{SpecID: "pinned", GPUs: map[int]int{0: 4000}, Pinned: true, LastUsed: t0},
+				{SpecID: "pinned", GPUs: map[GPUKey]int{{Index: 0}: 4000}, Pinned: true, LastUsed: t0},
 			},
 			HostRAMBudgetMB: 8000,
 			Allowed:         allowPairs("cand", "pinned"),
@@ -2438,7 +2438,7 @@ func TestAdmitRAMOwnDemandExceedsBudgetIsTerminal(t *testing.T) {
 
 	t.Run("a VRAM own-demand refusal keeps reporting first", func(t *testing.T) {
 		snap := PolicySnapshot{
-			Budgets:         map[int]int{0: 4000},
+			Budgets:         map[GPUKey]int{{Index: 0}: 4000},
 			HostRAMBudgetMB: 8000,
 		}
 		spec := Spec{ID: "cand", RAMMB: 9000, GPUs: []SpecGPU{{Index: 0, VRAMMB: 5000}}}
@@ -2533,10 +2533,10 @@ func TestAdmitRAMComposesWithOtherRules(t *testing.T) {
 		// would reach for the oldest idle process first and take it too.
 		snap := PolicySnapshot{
 			Running: []RunningProc{
-				{SpecID: "gpu-hog", GPUs: map[int]int{0: 8000}, RAMMB: 10000, LastUsed: t1},
+				{SpecID: "gpu-hog", GPUs: map[GPUKey]int{{Index: 0}: 8000}, RAMMB: 10000, LastUsed: t1},
 				{SpecID: "bystander", RAMMB: 6000, LastUsed: t0},
 			},
-			Budgets:         map[int]int{0: 10000},
+			Budgets:         map[GPUKey]int{{Index: 0}: 10000},
 			HostRAMBudgetMB: 16000,
 			Allowed:         allowPairs("cand", "gpu-hog", "bystander"),
 		}
@@ -2563,9 +2563,9 @@ func TestAdmitRAMComposesWithOtherRules(t *testing.T) {
 		snap := PolicySnapshot{
 			Running: []RunningProc{
 				{SpecID: "ram-victim", RAMMB: 12000, LastUsed: t2},
-				{SpecID: "gpu-victim", GPUs: map[int]int{0: 9000}, RAMMB: 100, LastUsed: t0},
+				{SpecID: "gpu-victim", GPUs: map[GPUKey]int{{Index: 0}: 9000}, RAMMB: 100, LastUsed: t0},
 			},
-			Budgets:         map[int]int{0: 10000},
+			Budgets:         map[GPUKey]int{{Index: 0}: 10000},
 			HostRAMBudgetMB: 16000,
 			Allowed:         allowPairs("cand", "ram-victim", "gpu-victim"),
 		}
@@ -2708,8 +2708,8 @@ func graceRules() []graceRule {
 			name: "rule 3 per-GPU VRAM",
 			mk: func(lu time.Time) (PolicySnapshot, Spec) {
 				return withGrace(PolicySnapshot{
-					Running: []RunningProc{{SpecID: "occ", GPUs: map[int]int{0: 800}, LastUsed: lu}},
-					Budgets: map[int]int{0: 1000},
+					Running: []RunningProc{{SpecID: "occ", GPUs: map[GPUKey]int{{Index: 0}: 800}, LastUsed: lu}},
+					Budgets: map[GPUKey]int{{Index: 0}: 1000},
 					Allowed: allowPairs("cand", "occ"),
 				}), Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 500}}}
 			},
@@ -2718,7 +2718,7 @@ func graceRules() []graceRule {
 			name: "rule 4 bootstrap one-shot",
 			mk: func(lu time.Time) (PolicySnapshot, Spec) {
 				return withGrace(PolicySnapshot{
-					Running:               []RunningProc{{SpecID: "occ", GPUs: map[int]int{0: 800}, LastUsed: lu}},
+					Running:               []RunningProc{{SpecID: "occ", GPUs: map[GPUKey]int{{Index: 0}: 800}, LastUsed: lu}},
 					VRAMBootstrapEligible: true,
 					Allowed:               allowPairs("cand", "occ"),
 				}), Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
@@ -2729,7 +2729,7 @@ func graceRules() []graceRule {
 			name: "rule 5 unknown-VRAM occupant",
 			mk: func(lu time.Time) (PolicySnapshot, Spec) {
 				return withGrace(PolicySnapshot{
-					Running: []RunningProc{{SpecID: "occ", GPUs: map[int]int{0: 0}, LastUsed: lu}},
+					Running: []RunningProc{{SpecID: "occ", GPUs: map[GPUKey]int{{Index: 0}: 0}, LastUsed: lu}},
 					Allowed: allowPairs("cand", "occ"),
 				}), Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 1000}}}
 			},
@@ -2985,10 +2985,10 @@ func TestAdmitRoleOrderingSpansEveryVictimRule(t *testing.T) {
 	t.Run("rule 3 per-GPU VRAM", func(t *testing.T) {
 		snap := PolicySnapshot{
 			Running: []RunningProc{
-				{SpecID: "idle-tts", Role: "tts", GPUs: map[int]int{0: 400}, LastUsed: t0}, // oldest
-				{SpecID: "idle-asr", Role: "asr", GPUs: map[int]int{0: 400}, LastUsed: t3},
+				{SpecID: "idle-tts", Role: "tts", GPUs: map[GPUKey]int{{Index: 0}: 400}, LastUsed: t0}, // oldest
+				{SpecID: "idle-asr", Role: "asr", GPUs: map[GPUKey]int{{Index: 0}: 400}, LastUsed: t3},
 			},
-			Budgets: map[int]int{0: 1000}, // 500 + 400 + 400 = 1300 > 1000; one 400 must go
+			Budgets: map[GPUKey]int{{Index: 0}: 1000}, // 500 + 400 + 400 = 1300 > 1000; one 400 must go
 			Allowed: allowPairs("new-asr", "idle-tts", "idle-asr"),
 		}
 		assertDecision(t, "same-role VRAM victim first",
@@ -3095,4 +3095,24 @@ func TestAdmitWaitsWhenOnlyProtectedVictimsRemain(t *testing.T) {
 				Decision{Wait: true, Evict: []string{}})
 		})
 	}
+}
+
+// TestAdmitKeysBudgetsByVendor: on a mixed host NVIDIA 0 and AMD 0 are two
+// cards with two budgets, and an occupant of one is never charged against the
+// other. Keyed by the bare index, the AMD occupant's 15000 MB would count
+// against NVIDIA 0's 1000 MB budget.
+func TestAdmitKeysBudgetsByVendor(t *testing.T) {
+	nv0 := GPUKey{Vendor: GPUVendorNVIDIA, Index: 0}
+	amd0 := GPUKey{Vendor: GPUVendorAMD, Index: 0}
+	snap := PolicySnapshot{
+		Running: []RunningProc{
+			{SpecID: "amd-tenant", GPUs: map[GPUKey]int{amd0: 15000}, InFlight: 1, LastUsed: t0},
+		},
+		Budgets: map[GPUKey]int{nv0: 1000, amd0: 20000},
+		Allowed: allowPairs("cand", "amd-tenant"),
+	}
+	onNVIDIA := Spec{ID: "cand", GPUs: []SpecGPU{{Vendor: GPUVendorNVIDIA, Index: 0, VRAMMB: 900}}}
+	assertDecision(t, "nvidia 0 is not charged the amd 0 load", Admit(snap, onNVIDIA), Decision{OK: true, Evict: []string{}})
+	onAMD := Spec{ID: "cand", GPUs: []SpecGPU{{Vendor: GPUVendorAMD, Index: 0, VRAMMB: 6000}}}
+	assertDecision(t, "amd 0 is over its budget with its busy tenant", Admit(snap, onAMD), Decision{Wait: true, Evict: []string{}})
 }

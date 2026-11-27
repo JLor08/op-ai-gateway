@@ -272,10 +272,10 @@ func TestBurstInheritsSiblingMeasurement(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
 	m := newTestManager(t, allowlistPolicy())
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		out := make(map[int]map[int]int, len(pids))
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
-			out[p] = map[int]int{0: 3000}
+			out[p] = map[GPUKey]int{{Index: 0}: 3000}
 		}
 		return out
 	})
@@ -291,7 +291,7 @@ func TestBurstInheritsSiblingMeasurement(t *testing.T) {
 	defer rel0()
 	waitUntil(t, 5*time.Second, "instance 0 measured at 3000 MB", func() bool {
 		st := instanceStatus(m, "S", 0)
-		return st != nil && st.MeasuredVRAM[0] == 3000
+		return st != nil && st.MeasuredVRAM[GPUKey{Index: 0}] == 3000
 	})
 
 	// The inherited charge is exactly 3000 -- pinned from both sides. One MB
@@ -320,13 +320,13 @@ func TestProtectedInstanceWaitsForSiblingMeasurement(t *testing.T) {
 	m := newTestManager(t, allowlistPolicy())
 
 	var answer atomic.Bool
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		if !answer.Load() {
 			return nil
 		}
-		out := make(map[int]map[int]int, len(pids))
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
-			out[p] = map[int]int{0: 3000}
+			out[p] = map[GPUKey]int{{Index: 0}: 3000}
 		}
 		return out
 	})
@@ -408,10 +408,10 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 				spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
 				spec.RAMMB = 64
 				cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: tightVRAM}}
-				m.SetMeasurer(func(pids []int) map[int]map[int]int {
-					out := make(map[int]map[int]int, len(pids))
+				m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+					out := make(map[int]map[GPUKey]int, len(pids))
 					for _, p := range pids {
-						out[p] = map[int]int{0: reading()}
+						out[p] = map[GPUKey]int{{Index: 0}: reading()}
 					}
 					return out
 				})
@@ -436,7 +436,7 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 					return false
 				}
 				if tc.vram {
-					return st.MeasuredVRAM[0] == loadingMB
+					return st.MeasuredVRAM[GPUKey{Index: 0}] == loadingMB
 				}
 				return st.MeasuredRAMMB == loadingMB
 			})
@@ -468,7 +468,7 @@ func TestFurtherInstanceWaitsForASiblingThatIsReady(t *testing.T) {
 					return false
 				}
 				if tc.vram {
-					return st.MeasuredVRAM[0] == loadedMB
+					return st.MeasuredVRAM[GPUKey{Index: 0}] == loadedMB
 				}
 				return st.MeasuredRAMMB == loadedMB
 			})
@@ -1137,10 +1137,10 @@ func TestFirstHealthyProbeMeasuresEvenWhileAMeasurementIsInFlight(t *testing.T) 
 	var enterOnce, gateOnce sync.Once
 	openGate := func() { gateOnce.Do(func() { close(gate) }) }
 	t.Cleanup(openGate)
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		out := make(map[int]map[int]int, len(pids))
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
-			out[p] = map[int]int{0: 1000}
+			out[p] = map[GPUKey]int{{Index: 0}: 1000}
 		}
 		if len(pids) > 0 {
 			first := false
@@ -1171,7 +1171,7 @@ func TestFirstHealthyProbeMeasuresEvenWhileAMeasurementIsInFlight(t *testing.T) 
 
 	waitUntil(t, 5*time.Second, "B measured right after the in-flight measurement returned", func() bool {
 		st := statusFor(m, "B")
-		return st != nil && st.MeasuredVRAM[0] == 1000
+		return st != nil && st.MeasuredVRAM[GPUKey{Index: 0}] == 1000
 	})
 }
 
@@ -1225,14 +1225,14 @@ func instanceOwner(states ...*specState) *owner {
 func TestDemandSpecInheritsLargestSiblingMeasurement(t *testing.T) {
 	s := Spec{ID: "S", UpstreamModel: "m", Replicable: true, GPUs: []SpecGPU{{Index: 0}, {Index: 1, VRAMMB: 5000}}}
 	s0 := liveInstance(s, 0, 100)
-	s0.measuredVRAM = map[int]int{0: 3000, 1: 4000}
+	s0.measuredVRAM = map[GPUKey]int{{Index: 0}: 3000, {Index: 1}: 4000}
 	s0.readyVRAM, s0.measuredRAM, s0.readyRAM = s0.measuredVRAM, 2000, 2000
 	s1 := liveInstance(s, 1, 101)
-	s1.measuredVRAM = map[int]int{0: 3500}
+	s1.measuredVRAM = map[GPUKey]int{{Index: 0}: 3500}
 	s1.readyVRAM, s1.measuredRAM, s1.readyRAM = s1.measuredVRAM, 1500, 1500
 	s2 := &specState{spec: specForInstance(s, 2), instance: 2, state: StateStopped}
 	other := liveInstance(Spec{ID: "T", UpstreamModel: "t", GPUs: []SpecGPU{{Index: 0}}}, 0, 200)
-	other.measuredVRAM = map[int]int{0: 9000}
+	other.measuredVRAM = map[GPUKey]int{{Index: 0}: 9000}
 	other.readyVRAM, other.measuredRAM, other.readyRAM = other.measuredVRAM, 9000, 9000
 	o := instanceOwner(s0, s1, s2, other)
 
@@ -1262,9 +1262,9 @@ func TestBuildSnapshotCarriesInstanceFields(t *testing.T) {
 	s2 := liveInstance(s, 2, 102)
 	plain := liveInstance(Spec{ID: "P", UpstreamModel: "p", Pinned: true}, 0, 200)
 	o := instanceOwner(s0, s1, s2, plain)
-	o.m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	o.m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		// Only instance 0 has been measured; 1 and 2 inherit its figure.
-		return map[int]map[int]int{100: {0: 3000}}
+		return map[int]map[GPUKey]int{100: {{Index: 0}: 3000}}
 	})
 
 	snap := o.buildSnapshot()
@@ -1287,7 +1287,7 @@ func TestBuildSnapshotCarriesInstanceFields(t *testing.T) {
 				want.SpecID, r.Spec, r.Instance, r.Pinned, r.Surplus, want.Spec, want.Instance, want.Pinned, want.Surplus)
 		}
 	}
-	if c := gpusChargedFor(t, snap, "S#2"); c[0] != 3000 {
+	if c := gpusChargedFor(t, snap, "S#2"); c[GPUKey{Index: 0}] != 3000 {
 		t.Errorf("instance 2 charged %v, want gpu0 3000 (its sibling's live measurement; its own is unknown)", c)
 	}
 }
@@ -1301,8 +1301,8 @@ func TestInstanceZeroInheritsProtectedSiblingMeasurement(t *testing.T) {
 	s0 := &specState{spec: specForInstance(s, 0), instance: 0, state: StateCrashed}
 	s1 := liveInstance(s, 1, 101)
 	o := instanceOwner(s0, s1)
-	o.m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		return map[int]map[int]int{101: {0: 3000}}
+	o.m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		return map[int]map[GPUKey]int{101: {{Index: 0}: 3000}}
 	})
 
 	snap := o.buildSnapshot()
@@ -1330,12 +1330,12 @@ func TestSiblingInheritanceIgnoresALoadInProgress(t *testing.T) {
 	o.cfg = Config{GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 8000}}}
 	var reading atomic.Int64
 	reading.Store(1200)
-	o.m.SetMeasurer(func([]int) map[int]map[int]int {
-		return map[int]map[int]int{100: {0: int(reading.Load())}}
+	o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
+		return map[int]map[GPUKey]int{100: {{Index: 0}: int(reading.Load())}}
 	})
 
 	snap := o.buildSnapshot()
-	if c := gpusChargedFor(t, snap, "S"); c[0] != 1200 {
+	if c := gpusChargedFor(t, snap, "S"); c[GPUKey{Index: 0}] != 1200 {
 		t.Fatalf("premise: the loading instance 0 is charged %v, want its own mid-load reading 1200", c)
 	}
 	if d := o.demandSpec(s1); !demandUnknown(d) {
@@ -1371,8 +1371,8 @@ func TestSiblingInheritanceNeedsAMeasurementTakenOnceReady(t *testing.T) {
 	o.m.done = make(chan struct{})
 	var reading atomic.Int64
 	reading.Store(1200)
-	o.m.SetMeasurer(func([]int) map[int]map[int]int {
-		return map[int]map[int]int{100: {0: int(reading.Load())}}
+	o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
+		return map[int]map[GPUKey]int{100: {{Index: 0}: int(reading.Load())}}
 	})
 	o.m.SetRAMMeasurer(func([]int) map[int]int {
 		return map[int]int{100: int(reading.Load())}
@@ -1391,7 +1391,7 @@ func TestSiblingInheritanceNeedsAMeasurementTakenOnceReady(t *testing.T) {
 	s0.state = StateRunning // ... and landing after its first passing probe
 	s0.proc.everHealthy = true
 	land()
-	if s0.measuredVRAM[0] != 1200 || s0.measuredRAM != 1200 {
+	if s0.measuredVRAM[GPUKey{Index: 0}] != 1200 || s0.measuredRAM != 1200 {
 		t.Fatalf("premise: instance 0's own figures = vram %v, ram %d, want the reading recorded (1200 each)", s0.measuredVRAM, s0.measuredRAM)
 	}
 	if d := o.demandSpec(s1); !demandUnknown(d) || d.GPUs[0].VRAMMB != 0 || d.RAMMB != 0 {
@@ -1418,8 +1418,8 @@ func TestReadyMeasurementClearedOnExit(t *testing.T) {
 		spec:            s,
 		state:           StateDraining,
 		intentionalStop: true, // a clean stop: onProcExited rests it at Stopped
-		measuredVRAM:    map[int]int{0: 6000},
-		readyVRAM:       map[int]int{0: 6000},
+		measuredVRAM:    map[GPUKey]int{{Index: 0}: 6000},
+		readyVRAM:       map[GPUKey]int{{Index: 0}: 6000},
 		measuredRAM:     3000,
 		readyRAM:        3000,
 		proc:            &runningProc{specID: "S", pid: 4242, log: logs.newProc("S"), exited: make(chan struct{}), everHealthy: true},
@@ -1826,8 +1826,8 @@ func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
 		s2 := &specState{spec: specForInstance(s, 2), instance: 2, state: StateStopped}
 		o := instanceOwner(s0, s1, s2)
 		o.cfg = Config{GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 10000}}}
-		o.m.SetMeasurer(func([]int) map[int]map[int]int {
-			return map[int]map[int]int{100: {0: 3000}, 101: {0: 3500}}
+		o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
+			return map[int]map[GPUKey]int{100: {{Index: 0}: 3000}, 101: {{Index: 0}: 3500}}
 		})
 
 		snap := o.buildSnapshot()
@@ -1835,7 +1835,7 @@ func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
 			id        string
 			vram, ram int
 		}{{"S", 3000, 3000}, {"S#1", 3500, 3500}} {
-			if got := gpusChargedFor(t, snap, want.id); got[0] != want.vram {
+			if got := gpusChargedFor(t, snap, want.id); got[GPUKey{Index: 0}] != want.vram {
 				t.Errorf("%s charged VRAM %v, want gpu0 %d (its own measurement, not the sibling peak)", want.id, got, want.vram)
 			}
 			if got := ramChargedFor(t, snap, want.id); got != want.ram {
@@ -1854,9 +1854,9 @@ func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
 
 		// A sibling that this call did not measure is still charged its own last
 		// ready figure, not the other sibling's.
-		o.m.SetMeasurer(func([]int) map[int]map[int]int { return map[int]map[int]int{100: {0: 3000}} })
+		o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int { return map[int]map[GPUKey]int{100: {{Index: 0}: 3000}} })
 		snap = o.buildSnapshot()
-		if got := gpusChargedFor(t, snap, "S#1"); got[0] != 3500 {
+		if got := gpusChargedFor(t, snap, "S#1"); got[GPUKey{Index: 0}] != 3500 {
 			t.Errorf("S#1 charged %v when this call measured only S, want gpu0 3500 (its own last ready figure)", got)
 		}
 	})
@@ -1867,14 +1867,14 @@ func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
 		s0 := liveInstance(declared, 0, 100)
 		s1 := liveInstance(declared, 1, 101)
 		o := instanceOwner(s0, s1)
-		o.m.SetMeasurer(func([]int) map[int]map[int]int {
-			return map[int]map[int]int{100: {0: 3000}, 101: {0: 5000}}
+		o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
+			return map[int]map[GPUKey]int{100: {{Index: 0}: 3000}, 101: {{Index: 0}: 5000}}
 		})
 		snap := o.buildSnapshot()
-		if got := gpusChargedFor(t, snap, "S"); got[0] != 4000 {
+		if got := gpusChargedFor(t, snap, "S"); got[GPUKey{Index: 0}] != 4000 {
 			t.Errorf("S charged %v, want gpu0 4000 (its declared demand floors its 3000 measurement)", got)
 		}
-		if got := gpusChargedFor(t, snap, "S#1"); got[0] != 5000 {
+		if got := gpusChargedFor(t, snap, "S#1"); got[GPUKey{Index: 0}] != 5000 {
 			t.Errorf("S#1 charged %v, want gpu0 5000 (its own measurement above the floor)", got)
 		}
 	})
@@ -1887,11 +1887,11 @@ func TestBuildSnapshotChargesRunningSiblingsTheirOwnMeasurement(t *testing.T) {
 		loading.proc.everHealthy = false
 		loading.measuredRAM = 1200 // a mid-load reading: never a ready one
 		o := instanceOwner(s0, loading)
-		o.m.SetMeasurer(func([]int) map[int]map[int]int {
-			return map[int]map[int]int{100: {0: 3000}, 101: {0: 1200}}
+		o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
+			return map[int]map[GPUKey]int{100: {{Index: 0}: 3000}, 101: {{Index: 0}: 1200}}
 		})
 		snap := o.buildSnapshot()
-		if got := gpusChargedFor(t, snap, "S#1"); got[0] != 3000 {
+		if got := gpusChargedFor(t, snap, "S#1"); got[GPUKey{Index: 0}] != 3000 {
 			t.Errorf("loading S#1 charged %v, want gpu0 3000 (the ready sibling's figure, above its own mid-load 1200)", got)
 		}
 		if got := ramChargedFor(t, snap, "S#1"); got != 3000 {
@@ -2125,10 +2125,10 @@ func TestInstanceZeroRestartsOnItsSiblingsMeasurement(t *testing.T) {
 	skipOnWindows(t)
 	shrinkTimings(t)
 	m := newTestManager(t, allowlistPolicy())
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		out := make(map[int]map[int]int, len(pids))
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
-			out[p] = map[int]int{0: 3000}
+			out[p] = map[GPUKey]int{{Index: 0}: 3000}
 		}
 		return out
 	})
@@ -2139,8 +2139,8 @@ func TestInstanceZeroRestartsOnItsSiblingsMeasurement(t *testing.T) {
 	m.Apply(Config{Specs: []Spec{spec}, GPUBudgets: []GPUBudget{{Index: 0, BudgetMB: 8000}}, ETag: "v1"})
 	waitUntil(t, 5*time.Second, "both protected instances running and measured", func() bool {
 		s0, s1 := instanceStatus(m, "S", 0), instanceStatus(m, "S", 1)
-		return s0 != nil && s0.State == StateRunning && s0.MeasuredVRAM[0] == 3000 &&
-			s1 != nil && s1.State == StateRunning && s1.MeasuredVRAM[0] == 3000
+		return s0 != nil && s0.State == StateRunning && s0.MeasuredVRAM[GPUKey{Index: 0}] == 3000 &&
+			s1 != nil && s1.State == StateRunning && s1.MeasuredVRAM[GPUKey{Index: 0}] == 3000
 	})
 
 	killed := killInstance(t, m, "S", 0)
@@ -2766,7 +2766,7 @@ func TestSiblingCascadeAsksEachHeldInstanceOnce(t *testing.T) {
 		mu    sync.Mutex
 		sizes []int // how many live processes each measurer call was asked about
 	)
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		mu.Lock()
 		sizes = append(sizes, len(pids))
 		mu.Unlock()
@@ -2851,7 +2851,7 @@ func TestAWakeDecidesEachInstanceOnceInATurn(t *testing.T) {
 	o.allowedPairs = allowPairs("S", "P")
 	o.rebuildUpstreamIndex()
 	decisions := 0
-	o.m.SetMeasurer(func([]int) map[int]map[int]int {
+	o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int {
 		decisions++ // the owner calls it synchronously, once per snapshot
 		return nil
 	})
