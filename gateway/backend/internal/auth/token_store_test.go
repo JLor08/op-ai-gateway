@@ -262,3 +262,33 @@ func TestTokenStoreVendorAccessIsCloned(t *testing.T) {
 		t.Fatalf("zero VendorAccess = %#v, want the strict default", zero.VendorAccess)
 	}
 }
+
+// TestUpdateTokenKeepServiceStateCarriesTheServiceFields pins the memory
+// driver's service-token edit path (#421): the replacement takes every field of
+// the incoming token except the two the bearer owes to its SERVICE — the
+// allowlist, and the service's disabled state folded into Active.
+func TestUpdateTokenKeepServiceStateCarriesTheServiceFields(t *testing.T) {
+	s := NewTokenStore()
+	s.AddPlainToken(Token{ID: "tok_svc", Active: true, Kind: "service", AllowedModels: []string{"model-a"}}, "svc")
+
+	// Active service: the edit lands, the allowlist stays.
+	s.UpdateTokenKeepServiceState(Token{ID: "tok_svc", Active: true, Kind: "service", Name: "edited"})
+	got, ok := s.LookupBearer("Bearer svc")
+	if !ok || got.Name != "edited" || len(got.AllowedModels) != 1 || got.AllowedModels[0] != "model-a" {
+		t.Fatalf("after edit: ok=%v token=%+v, want the edit with [model-a] kept", ok, got)
+	}
+
+	// Disabled service (the mirror cleared Active): an edit carrying the token's
+	// own active status must not re-activate it.
+	s.UpdateToken(Token{ID: "tok_svc", Active: false, Kind: "service", AllowedModels: []string{"model-a"}})
+	s.UpdateTokenKeepServiceState(Token{ID: "tok_svc", Active: true, Kind: "service", Name: "edited again"})
+	if _, ok := s.LookupBearer("Bearer svc"); ok {
+		t.Fatal("an edit re-activated a disabled service's token")
+	}
+
+	// Unknown id: a no-op, nothing added.
+	s.UpdateTokenKeepServiceState(Token{ID: "tok_missing", Active: true})
+	if _, ok := s.LookupBearer("Bearer missing"); ok {
+		t.Fatal("an unknown id was added")
+	}
+}

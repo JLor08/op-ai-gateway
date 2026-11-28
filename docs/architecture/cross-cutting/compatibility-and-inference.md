@@ -4120,7 +4120,7 @@ to local models in one session, under four conditions.
 
 **Token condition (opt-in).** Nothing of this section reaches a client unless the token has the
 per-token switch `send_usage_limits` (default off; user tokens create, PATCH and read, no rotation;
-service tokens create and read only, editing is issue #421). With it off, no
+service tokens likewise create, PATCH and read, issue #421). With it off, no
 `anthropic-ratelimit-unified-*` header leaves the gateway on any path (relay, cached windows,
 [§9.4](#94-claude-code-display-of-the-gateways-own-limits)'s overage window, its block) and the window
 cache neither observes nor attaches for that token. What stays: the status codes, `Retry-After`,

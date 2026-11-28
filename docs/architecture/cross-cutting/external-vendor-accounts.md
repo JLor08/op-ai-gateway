@@ -2868,7 +2868,7 @@ hint states that empty means no prefix. Accounts shared with the creator are off
 too, each labelled with its owner's name; the list is the creator's own, managed and
 member accounts, so it can offer an account the token's principal cannot actually reach,
 which is why the save-time check and the grant, not the form, are the gates. The
-service-token create form offers the same list, on create only (§11.6). The whole section is hidden while the
+service-token form offers the same list, on create and on edit (§11.6). The whole section is hidden while the
 master flag is off, and the field is then left out of the request so an edit
 cannot disturb a stored policy ([API surface: token vendor
 access](../reference/api-surface.md#token-vendor-access)).
@@ -2979,7 +2979,7 @@ The opt-in binds **API tokens**, and the owner's interactive session carries one
 | **API token** (user-owned) | Its stored policy; strict default none. Its own accounts are covered by `all`, a shared account only by a named entry. |
 | **The owner's interactive portal session** (`sessionPrincipal`, with the trusted loopback chat acting for it) | The owner's **stored chat-session policy** (`users.chat_vendor_provider_access`, migration 115, [ADR-114](../09-architecture-decisions.md#adr-114--the-token-less-chat-session-carries-a-stored-per-user-vendor-policy-and-the-models-listing-can-be-read-as-a-run-as-token)), the same JSON shape and codec as a token's. The stored `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}`: all of the owner's own active accounts under their native prefixes and all of the owner's own groups, which is what every user had before the column existed. A non-empty value is the explicit policy, verbatim; an explicit "no providers" save is stored as `{"all":false}`, never as `''`, so it never collapses into *unset*. Because `all` never covers a shared account, a shared account is reachable from the token-less chat only when the policy **names** it (or a group containing it). The same policy applies to every call the session principal makes: the chat, the session's model listings, the Models page, the dashboard's live routes (§6.7) and session-cookie inference. The decode is tolerant, so a stored entry naming a deleted account or group matches nothing and never breaks the principal. The owner edits it on the chat-session card of the token list; the save is session-only ([API Surface](../reference/api-surface.md)). |
 | **A run-as token** (a chat run, or a session call to `GET /api/portal/models`, that acts through one of the user's tokens) | That token's own stored policy, like any API call with it. It **replaces** the session policy entirely; the two are never merged. |
-| **Service token** (a service id, no user id) | Its stored policy, **create-only** (§11.6). A service owns no account, so `all: true` covers nothing for it; it reaches a shared account only when its policy **names** it **and** the service is **provisioned directly** into a resource group that contains it. A service token with no policy has no vendor access, as before. |
+| **Service token** (a service id, no user id) | Its stored policy, writable on create and update (§11.6). A service owns no account, so `all: true` covers nothing for it; it reaches a shared account only when its policy **names** it **and** the service is **provisioned directly** into a resource group that contains it. A service token with no policy has no vendor access, as before. |
 
 So by default a user sees and can chat with every account they own, and can narrow the
 token-less chat (even to nothing) like any token, while a key they hand to a script
@@ -3012,11 +3012,13 @@ enabled vendor accounts is affected.
 
 A service token carries the same opt-in as a user token, on **new plumbing**:
 
-- `vendor_access` is a field of `CreateServiceTokenRequest` and `ServiceTokenDTO`;
-  `CreateServiceToken` writes the token's `VendorProviderAccess` column and
-  `RotateServiceToken` **preserves** it (it writes only the secret columns). It is
-  **create-only**: a service token has no field-level update, so changing the opt-in
-  means creating a new token, matching every other service-token setting. The bearer
+- `vendor_access` is a field of `CreateServiceTokenRequest`,
+  `UpdateServiceTokenRequest` and `ServiceTokenDTO`; `CreateServiceToken` writes the
+  token's `VendorProviderAccess` column, `UpdateServiceToken`
+  (`PATCH /api/portal/services/{id}/tokens/{tid}`, issue #421) replaces it wholesale
+  when the field is present (absent keeps it, an empty policy resets to the strict
+  default), and `RotateServiceToken` **preserves** it (it writes only the secret
+  columns). The bearer
   lookup builds the policy onto the request principal for a service token exactly as for
   a user token.
 - A service reaches a shared account only through a **direct service provision**

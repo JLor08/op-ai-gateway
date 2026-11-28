@@ -16,12 +16,15 @@ import {
 } from '@mui/material';
 import AddIcon from '@mui/icons-material/Add';
 import DeleteIcon from '@mui/icons-material/Delete';
+import EditIcon from '@mui/icons-material/Edit';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
 import ContentCopyIcon from '@mui/icons-material/ContentCopy';
 import type {
   ModelOption,
   PortalService,
   ServiceTokenDTO,
+  UpdateServiceTokenRequest,
+  VendorAccessAccountDTO,
   VendorAccessDTO,
   VendorAccount,
 } from '../api';
@@ -38,6 +41,7 @@ import type { RowAction } from './shared/RowActionsMenu';
 import {
   ModelOverrideEditor,
   buildOverrideMap,
+  newOverrideRow,
   overrideRowsInvalid,
   overrideSummary,
   type OverrideRow,
@@ -49,6 +53,7 @@ import {
   toggleVendorAccessEntry,
   vendorAccessEntryDTO,
   vendorAccessEntryInvalid,
+  vendorAccessEntryState,
   vendorAccountOptionLabel,
   type VendorAccessEntryState,
 } from './shared/vendorAccessAccounts';
@@ -75,8 +80,15 @@ function serviceTokenCurlCommand(secret: string): string {
   return `curl -s ${base}/v1/chat/completions -H "Authorization: Bearer ${secret}" -H "Content-Type: application/json" -d '{"model":"<model>","messages":[{"role":"user","content":"Hello"}]}'`;
 }
 
+// The stored account entries of a vendor_access policy in a comparable form
+// (wire shape, sorted by account id): tells whether an edit changed the
+// selection, so an unchanged policy stays out of the PATCH body.
+function comparableVendorAccounts(accounts: readonly VendorAccessAccountDTO[]): string {
+  return JSON.stringify([...accounts].sort((a, b) => a.account_id.localeCompare(b.account_id)));
+}
+
 /**
- * The service's token sub-feature — list, create (with the shared
+ * The service's token sub-feature — list, create and edit (with the shared
  * ModelOverrideEditor), rotate, and delete — extracted from ServicesView
  * (FV-4) following the Section convention used for per-entity sub-features
  * elsewhere (see AgentTokenSection.tsx). ServicesView keeps its own
@@ -88,8 +100,15 @@ function serviceTokenCurlCommand(secret: string): string {
  * create dialog also offers the accounts a service could be given, each named
  * explicitly with an optional prefix override. A service owns no account, so these
  * are accounts SHARED with it (the service provisioned into a resource group that
- * contains them). The opt-in is create-only, like every other setting of a service
- * token: there is no edit action, and a rotation keeps it.
+ * contains them). Like every other setting of a service token it can be changed
+ * later through the edit action (#421, PATCH), and a rotation keeps it.
+ *
+ * Edit (#421) reuses the create dialog prefilled from the row and sends the
+ * form's full settings, with two deliberate omissions that keep an untouched
+ * setting out of the body (absent = keep): claude_effort_compatibility unless it
+ * changed (the backend 403s any value from a principal that may not manage token
+ * settings), and vendor_access unless the flag is on, the account list loaded and
+ * the selection changed (a stored account the dialog does not offer is kept).
  */
 export function ServiceTokensSection({
   t,
@@ -106,6 +125,7 @@ export function ServiceTokensSection({
     | 'deleteServiceToken'
     | 'rotateServiceToken'
     | 'serviceTokens'
+    | 'updateServiceToken'
     | 'vendorAccounts'
   >;
   service: PortalService;
@@ -141,15 +161,16 @@ export function ServiceTokensSection({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, service.id]);
 
-  // Token create-dialog state.
+  // Token create/edit-dialog state. editingToken is the row being edited, null
+  // while the dialog creates a new token.
   const [tokenFormOpen, setTokenFormOpen] = useState(false);
+  const [editingToken, setEditingToken] = useState<ServiceTokenDTO | null>(null);
   const [tokenName, setTokenName] = useState('');
   const [tokenOverrideRows, setTokenOverrideRows] = useState<OverrideRow[]>([]);
   const [tokenCatchAll, setTokenCatchAll] = useState('');
   // The unknown-model redirect (Task 8) — see TokenList for the field
-  // meanings. This form is create-only (no update endpoint for a service
-  // token), so there is never a last-used value to show; the display always
-  // reads the placeholder.
+  // meanings. The last-used value is read-only: shown while editing, the
+  // placeholder on create (a fresh token has never routed a request).
   const [tokenUnknownRedirect, setTokenUnknownRedirect] = useState(false);
   const [tokenUnknownRedirectBlocked, setTokenUnknownRedirectBlocked] = useState(false);
   const [tokenUnknownFallback, setTokenUnknownFallback] = useState('');
@@ -159,7 +180,7 @@ export function ServiceTokensSection({
   const [tokenClaudeEffort, setTokenClaudeEffort] = useState(false);
   const [tokenDecisionsNormalize, setTokenDecisionsNormalize] = useState(false);
   const [tokenDecisionsEmulation, setTokenDecisionsEmulation] = useState(false);
-  // Usage-limit opt-ins (#420) — see TokenList. Create-only (no edit path, #421).
+  // Usage-limit opt-ins (#420) — see TokenList.
   const [tokenSendUsageLimits, setTokenSendUsageLimits] = useState(false);
   const [tokenCodexSwitchPrompt, setTokenCodexSwitchPrompt] = useState(false);
   const [tokenLogCommunication, setTokenLogCommunication] = useState(false);
@@ -220,6 +241,39 @@ export function ServiceTokensSection({
     setTokenSecretFlag(false);
     setTokenVaEntries([]);
     setVendorAccounts(null);
+    setEditingToken(null);
+    setTokenFormOpen(true);
+  }
+
+  function openEditTokenForm(row: ServiceTokenDTO) {
+    setTokenName(row.name);
+    setTokenOverrideRows(
+      Object.entries(row.model_override_map ?? {}).map(([from, entry]) =>
+        newOverrideRow({
+          from,
+          to: entry.to,
+          offer: entry.offer ?? false,
+          hideTarget: entry.hide_target ?? false,
+        }),
+      ),
+    );
+    setTokenCatchAll(row.model_override);
+    setTokenUnknownRedirect(row.unknown_model_redirect ?? false);
+    setTokenUnknownRedirectBlocked(row.unknown_model_redirect_blocked ?? false);
+    setTokenUnknownFallback(row.unknown_model_fallback ?? '');
+    setTokenClaudeAliases(row.claude_model_aliases ?? false);
+    setTokenClaudeEffort(row.claude_effort_compatibility ?? false);
+    setTokenDecisionsNormalize(row.decisions_confidence_normalize ?? false);
+    setTokenSendUsageLimits(row.send_usage_limits ?? false);
+    setTokenCodexSwitchPrompt(
+      (row.send_usage_limits ?? false) && (row.codex_model_switch_prompt ?? false),
+    );
+    setTokenLogCommunication(row.log_communication);
+    setTokenSecretFlag(row.secret);
+    // A token without vendor_access (the strict default) reads as no access.
+    setTokenVaEntries((row.vendor_access?.accounts ?? []).map(vendorAccessEntryState));
+    setVendorAccounts(null);
+    setEditingToken(row);
     setTokenFormOpen(true);
   }
 
@@ -232,8 +286,66 @@ export function ServiceTokensSection({
     return { all: false, accounts: sentVaEntries.map(vendorAccessEntryDTO) };
   }
 
-  async function submitCreateToken(event: SubmitEvent<HTMLFormElement>) {
+  // The vendor_access update value: undefined (keep the stored policy) while the
+  // flag is off, the account list did not load (an unloaded list would read as
+  // "nothing picked" and wipe the policy), or the selection is unchanged.
+  // Otherwise the stored policy with its accounts replaced by the dialog's
+  // entries — every entry, including a stored account the dialog does not offer
+  // (the user could not see, so did not remove, it); `all` and the group fields
+  // are carried over unchanged.
+  function buildVendorAccessUpdate(row: ServiceTokenDTO): VendorAccessDTO | undefined {
+    if (!vendorAccountsEnabled || vendorAccounts === null) return undefined;
+    const stored = (row.vendor_access?.accounts ?? []).map((entry) =>
+      vendorAccessEntryDTO(vendorAccessEntryState(entry)),
+    );
+    const next = tokenVaEntries.map(vendorAccessEntryDTO);
+    if (comparableVendorAccounts(stored) === comparableVendorAccounts(next)) return undefined;
+    return { ...(row.vendor_access ?? { all: false }), accounts: next };
+  }
+
+  async function submitEditToken(row: ServiceTokenDTO) {
+    const body: UpdateServiceTokenRequest = {
+      name: tokenName,
+      model_override: tokenCatchAll,
+      model_override_map: buildOverrideMap(tokenOverrideRows),
+      // last_used_model is read-only and not part of the update request.
+      unknown_model_redirect: tokenUnknownRedirect,
+      unknown_model_redirect_blocked: tokenUnknownRedirectBlocked,
+      unknown_model_fallback: tokenUnknownFallback,
+      claude_model_aliases: tokenClaudeAliases,
+      decisions_confidence_normalize: tokenDecisionsNormalize,
+      send_usage_limits: tokenSendUsageLimits,
+      codex_model_switch_prompt: tokenSendUsageLimits && tokenCodexSwitchPrompt,
+      log_communication: tokenLogCommunication,
+      secret: tokenSecretFlag,
+    };
+    if (tokenClaudeEffort !== (row.claude_effort_compatibility ?? false)) {
+      body.claude_effort_compatibility = tokenClaudeEffort;
+    }
+    const vendorAccess = buildVendorAccessUpdate(row);
+    if (vendorAccess) body.vendor_access = vendorAccess;
+    const updated = await api.updateServiceToken(service.id, row.id, body);
+    setTokens((current) => current.map((tok) => (tok.id === row.id ? updated : tok)));
+    setTokenFormOpen(false);
+  }
+
+  async function submitTokenForm(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (editingToken === null) {
+      await submitCreateToken();
+      return;
+    }
+    setTokenBusy(true);
+    try {
+      await submitEditToken(editingToken);
+    } catch (err) {
+      showError(formatPortalError(err, t));
+    } finally {
+      setTokenBusy(false);
+    }
+  }
+
+  async function submitCreateToken() {
     setTokenBusy(true);
     try {
       const resp = await api.createServiceToken(service.id, {
@@ -344,6 +456,12 @@ export function ServiceTokensSection({
 
   const tokenRowActions = (r: ServiceTokenDTO): RowAction[] => [
     {
+      key: 'edit',
+      label: t.tokenActionEdit,
+      icon: <EditIcon fontSize="small" />,
+      onClick: () => openEditTokenForm(r),
+    },
+    {
       key: 'rotate',
       label: t.tokenActionRotate,
       icon: <AutorenewIcon fontSize="small" />,
@@ -440,8 +558,8 @@ export function ServiceTokensSection({
       </Box>
 
       <Dialog open={tokenFormOpen} onClose={() => setTokenFormOpen(false)} maxWidth="sm" fullWidth>
-        <Box component="form" onSubmit={submitCreateToken}>
-          <DialogTitle>{t.serviceTokenCreate}</DialogTitle>
+        <Box component="form" onSubmit={submitTokenForm}>
+          <DialogTitle>{editingToken ? t.tokenEditTitle : t.serviceTokenCreate}</DialogTitle>
           <DialogContent sx={{ display: 'grid', gap: 2 }}>
             <Field
               id="service-token-name"
@@ -470,7 +588,7 @@ export function ServiceTokensSection({
                       setTokenUnknownRedirect(checked);
                       // See TokenList's identical handler: the redirect being
                       // off must clear both sub-settings in STATE, not just
-                      // their disabled rendering — submitCreateToken sends
+                      // their disabled rendering — create and edit send
                       // them unconditionally.
                       if (!checked) {
                         setTokenUnknownRedirectBlocked(false);
@@ -509,8 +627,10 @@ export function ServiceTokensSection({
               <Typography variant="caption" color="text.secondary">
                 {t.tokenLastUsedModel}
               </Typography>
-              {/* Create-only form: there is never a last-used value yet. */}
-              <Typography variant="body2">{t.tokenLastUsedModelNone}</Typography>
+              {/* Read-only; a fresh token (create) has never routed a request. */}
+              <Typography variant="body2">
+                {editingToken?.last_used_model || t.tokenLastUsedModelNone}
+              </Typography>
             </Box>
             <Box sx={{ display: 'grid', gap: 1 }}>
               <FormControlLabel
@@ -601,9 +721,8 @@ export function ServiceTokensSection({
               </Typography>
             </Box>
             {/* Hidden entirely while the vendor-accounts master flag is off. Create
-                only: a service token has no edit action and a rotation keeps the
-                opt-in (the note says so). Account names are owner-supplied text:
-                rendered as text only. */}
+                and edit both offer it; a rotation keeps the opt-in (the note says
+                so). Account names are owner-supplied text: rendered as text only. */}
             {vendorAccountsEnabled && (
               <Box
                 role="group"
@@ -679,7 +798,7 @@ export function ServiceTokensSection({
               variant="contained"
               disabled={tokenBusy || tokenOverrideRowsInvalid || tokenVendorAccessInvalid}
             >
-              {t.serviceTokenCreate}
+              {editingToken ? t.tokenActionSave : t.serviceTokenCreate}
             </Button>
           </DialogActions>
         </Box>

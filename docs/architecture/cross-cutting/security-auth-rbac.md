@@ -184,8 +184,9 @@ all.
 #### Claude model aliases are discovery and resolution, not authorization
 
 The per-token `claude_model_aliases` setting (a plain boolean, default off)
-exists on user tokens and on service tokens, written at creation for a service
-token like every other setting of one ([HTTP API Surface, Token model
+exists on user tokens and on service tokens, written at creation and changeable
+by the token update on both (for a service token
+`PATCH /api/portal/services/{id}/tokens/{tid}`, issue #421; [HTTP API Surface, Token model
 settings](../reference/api-surface.md#token-model-settings)). It serves
 **external bearer-token clients**, such as Claude Desktop, that cannot select a
 local model under its real id: the token's eligible local models and groups
@@ -223,7 +224,7 @@ reach**:
 #### Claude Code effort compatibility is a management-only setting
 
 The per-token `claude_effort_compatibility` setting (a plain boolean, default
-off, on user tokens and, at creation, on service tokens) makes Claude Code's
+off, on user tokens and service tokens, at creation and on update) makes Claude Code's
 `output_config.effort` reach a llama.cpp or vLLM target as
 `chat_template_kwargs.reasoning_effort` ([API Compatibility & Inference
 §9.2](compatibility-and-inference.md#92-claude-code-reasoning-effort-compatibility)).
@@ -257,7 +258,10 @@ operation:
   can neither turn it on nor strip it off, and the foreign-token case stays a
   plain not-found because ownership is checked first; `CreateServiceToken`
   refuses a `true`, after the object gate, so a principal with no access to the
-  service gets the same not-found as without the flag (no existence leak). Service
+  service gets the same not-found as without the flag (no existence leak);
+  `UpdateServiceToken` refuses **any present value**, like `UpdateToken`, after the
+  object gate and the token-belongs-to-this-service check, before any field is
+  applied. Service
   tokens themselves are already excluded from the token routes by
   `requireWebScope`'s `IsService` rejection.
 - **A refusal has no side effect.** The service returns
@@ -283,7 +287,7 @@ operation:
 #### Decision confidence normalization is an ordinary, non-gated token setting
 
 The per-token `decisions_confidence_normalize` setting (a plain boolean, default off, on
-user tokens and, at creation, on service tokens) makes the gateway recompute `confidence`
+user tokens and service tokens, at creation and on update) makes the gateway recompute `confidence`
 on the answers of `/v1/decisions` and `/v1/systemone`
 ([API Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions),
 [ADR-098](../09-architecture-decisions.md#adr-098--openai-decisions-a-request-flavor-decision-modes-a-probe-written-decision_openai-capability-and-a-system-one-translator-phase-2-of-373)).
@@ -338,8 +342,8 @@ The option is the "Claude Code token format" and is **not** what decides whether
 sent. Two separate per-token switches do (issue #420, [ADR-110](../09-architecture-decisions.md#adr-110--usage-limit-signals-leave-the-gateway-only-for-tokens-that-opt-in-and-what-stops-a-retry-survives-without-it)): `send_usage_limits` and
 `codex_model_switch_prompt`, both default off. They are ordinary, ungated settings (any principal that may edit
 the token may change them) and need no rotation, since they do not shape the secret. A user token takes them on create and
-PATCH and always reads them back; a service token takes them on create and reads them back (editing is issue
-#421). Without `send_usage_limits` the token receives no `anthropic-ratelimit-unified-*` and no `x-codex-*`
+PATCH and always reads them back; a service token takes them on create and on its own PATCH (issue #421) and
+reads them back. Without `send_usage_limits` the token receives no `anthropic-ratelimit-unified-*` and no `x-codex-*`
 header on any path, only the status codes, `Retry-After`, `X-Should-Retry`, the block bodies and the Codex block's
 `x-codex-promo-message`. `codex_model_switch_prompt` counts only together with `send_usage_limits`. Claude Code needs the
 token format and `send_usage_limits`; Codex needs only the switch. Migration 112 switched `send_usage_limits` on for user tokens that already had the token format.
@@ -981,12 +985,16 @@ neither an override nor a redirect can ever be used to route around it. That
 is the general invariant of
 [Routing & Model Selection §2.1](routing-and-model-selection.md): those
 settings change *which* name is requested, never *what* a token may reach.
-It is also why a service token's redirect fallback is validated against the
-callable models of the principal **issuing** it (a delegate or an authorized
-admin-group manager) rather than against the service's own allowlist — the
-write-time check is a usability guard, and the allowlist still refuses the
-request at inference time if the two disagree. A service token has no update
-endpoint, so those settings are fixed when it is created.
+It is also why a service token's model-valued settings are validated against the
+callable models of the principal **writing** them (a delegate or an authorized
+admin-group manager) — the write-time check is a usability guard, and the
+allowlist still refuses the request at inference time if the two disagree. The
+one narrowing is the redirect fallback, which is checked against that callable
+set **intersected with the service's allowlist**, because the redirect only ever
+picks a candidate the allowlist admits, so a fallback outside it would be silently
+inert. The same checks run on create and on the service-token update
+(`PATCH /api/portal/services/{id}/tokens/{tid}`, issue #421), which edits the
+settings in place without a new secret.
 
 **Projects** attribute usage, not access. A project has plain members
 (`project_members`), assigned groups (`project_groups` — any tier, and every
@@ -1079,8 +1087,8 @@ the owner's single-use refresh token. The properties that matter for the securit
   the shared arm (the owner's own accounts are always kept), and an unwired seam falls
   back to owner-only, never allow-all. It decides *reach* only: a token still *uses* a
   shared account only when its policy **names** it (`all: true` and a portal session
-  whose stored chat policy is unset cover only the principal's own accounts), for a user token and, create-only, a service
-  token, and a service reaches one only through a **direct** service provision
+  whose stored chat policy is unset cover only the principal's own accounts), for a user token and a service
+  token alike (both writable on create and update), and a service reaches one only through a **direct** service provision
   ([External Vendor Accounts §4.6](external-vendor-accounts.md#46-routing-to-a-shared-account-the-pure-grant),
   [§11](external-vendor-accounts.md#11-per-token-vendor-access),
   [ADR-060](../09-architecture-decisions.md#adr-060--shared-vendor-accounts-a-tiered-share-level-a-pure-routing-grant-authorization-by-level-and-a-per-account-opt-in)).

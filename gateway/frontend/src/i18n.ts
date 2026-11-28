@@ -3659,7 +3659,7 @@ const de = {
   tokenSendUsageLimitsHint:
     'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Claude Code braucht dafür zusätzlich das Claude-Code-Token-Format. Wirkt sofort, das Geheimnis bleibt unverändert.',
   tokenSendUsageLimitsServiceHint:
-    'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Lässt sich nur beim Anlegen des Service-Tokens setzen; Bearbeiten folgt später.',
+    'Clients (Claude Code, Codex CLI) zeigen dann die verbleibende Nutzung an. Wirkt sofort, das Geheimnis bleibt unverändert.',
   tokenCodexModelSwitchPrompt: 'Codex: Wechsel auf gpt-5.4-mini anbieten',
   tokenCodexModelSwitchPromptHint:
     'Wirkt nur zusammen mit „Nutzungslimits senden“. Codex bietet dann bei 90 % seines Hauptfensters den Wechsel auf gpt-5.4-mini an, auch wenn das Limit des Gateways das angezeigte ist.',
@@ -3696,10 +3696,10 @@ const de = {
   tokenVendorAccessPrefixLabel: 'Prefix',
   tokenVendorAccessPrefixEmptyHint: 'Leer = Modelle unter Originalnamen ohne Prefix.',
   tokenVendorAccessNone: 'Keine Anbieter verbunden.',
-  // Service-Token: ein Dienst besitzt keine Konten, der Anbieter-Zugriff gilt nur beim
-  // Erstellen (kein Bearbeiten), eine Rotation behält ihn.
+  // Service-Token: ein Dienst besitzt keine Konten; der Anbieter-Zugriff lässt sich beim
+  // Erstellen und Bearbeiten wählen, eine Rotation behält ihn.
   serviceTokenVendorAccessNote:
-    'Ein Dienst besitzt keine eigenen Anbieter-Konten. Nutzbar sind nur Konten, die mit diesem Dienst geteilt sind (der Dienst gehört zu einer Ressourcengruppe, die das Konto enthält); jedes wird einzeln gewählt. Die Auswahl gilt nur beim Erstellen: Eine Rotation behält sie bei, zum Ändern muss ein neuer Token erstellt werden.',
+    'Ein Dienst besitzt keine eigenen Anbieter-Konten. Nutzbar sind nur Konten, die mit diesem Dienst geteilt sind (der Dienst gehört zu einer Ressourcengruppe, die das Konto enthält); jedes wird einzeln gewählt. Die Auswahl lässt sich über „Bearbeiten“ ändern; eine Rotation behält sie bei.',
   serviceTokenVendorAccessAccountsLabel: 'Geteilte Anbieter',
   serviceTokenVendorAccessNone: 'Es sind keine geteilten Anbieter verfügbar.',
   serviceTokenRotateKeepsVendorAccess:
@@ -3708,6 +3708,8 @@ const de = {
     'Anbieter-Zugriff ungültig: Ein gewähltes Konto ist für diesen Token nicht erreichbar, oder ein Prefix ist ungültig.',
   errorTokenVendorAccessConflict:
     'Zwei Anbieter liefern denselben Modellnamen — vergib einen eigenen Prefix.',
+  errorPortalPrincipalForbidden:
+    'Für diese Änderung fehlt die Berechtigung. Manche Einstellungen lassen sich nur über eine Portal-Sitzung oder mit einem Admin-Token ändern.',
   activityEmpty: 'Keine Anfragen',
   activityStatsLabel: 'Statistik',
   activityTilesButton: 'Kacheln',
@@ -7858,7 +7860,7 @@ const en: PortalMessages = {
   tokenSendUsageLimitsHint:
     'Clients (Claude Code, Codex CLI) then show the remaining usage. Claude Code also needs the Claude Code token format. Takes effect immediately; the secret stays unchanged.',
   tokenSendUsageLimitsServiceHint:
-    'Clients (Claude Code, Codex CLI) then show the remaining usage. It can only be set when the service token is created; editing comes later.',
+    'Clients (Claude Code, Codex CLI) then show the remaining usage. Takes effect immediately; the secret stays unchanged.',
   tokenCodexModelSwitchPrompt: 'Codex: offer switching to gpt-5.4-mini',
   tokenCodexModelSwitchPromptHint:
     'Only takes effect together with "Send usage limits". Codex then offers the switch to gpt-5.4-mini at 90 % of its main window, also when the gateway\'s own limit is the one shown.',
@@ -7895,10 +7897,10 @@ const en: PortalMessages = {
   tokenVendorAccessPrefixLabel: 'Prefix',
   tokenVendorAccessPrefixEmptyHint: 'Empty = models under their original names, no prefix.',
   tokenVendorAccessNone: 'No providers connected.',
-  // Service token: a service owns no accounts, the provider access is set at create
-  // only (no edit), and a rotation keeps it.
+  // Service token: a service owns no accounts; the provider access is chosen at create
+  // and edit, and a rotation keeps it.
   serviceTokenVendorAccessNote:
-    'A service owns no provider accounts of its own. Only accounts shared with this service (the service belongs to a resource group that contains the account) can be used, each chosen individually. The selection applies at creation only: a rotation keeps it, and changing it means creating a new token.',
+    'A service owns no provider accounts of its own. Only accounts shared with this service (the service belongs to a resource group that contains the account) can be used, each chosen individually. The selection can be changed with "Edit"; a rotation keeps it.',
   serviceTokenVendorAccessAccountsLabel: 'Shared providers',
   serviceTokenVendorAccessNone: 'No shared providers are available.',
   serviceTokenRotateKeepsVendorAccess:
@@ -7907,6 +7909,8 @@ const en: PortalMessages = {
     'Provider access is invalid: a selected account is not reachable for this token, or a prefix is invalid.',
   errorTokenVendorAccessConflict:
     'Two providers serve the same model name — give one a distinct prefix.',
+  errorPortalPrincipalForbidden:
+    'You are not allowed to make this change. Some settings can only be changed from a portal session or with an admin token.',
   activityEmpty: 'No requests yet',
   activityStatsLabel: 'Statistics',
   activityTilesButton: 'Tiles',

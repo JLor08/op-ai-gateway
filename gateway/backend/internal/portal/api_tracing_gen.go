@@ -2846,6 +2846,18 @@ func (_d *APIWithTracing) UpdateService(ctx context.Context, t1 auth.Token, s1 s
 	return _d.API.UpdateService(ctx, t1, s1, u1)
 }
 
+func (_d *APIWithTracing) UpdateServiceToken(ctx context.Context, t1 auth.Token, s1 string, s2 string, u1 UpdateServiceTokenRequest) (s3 ServiceTokenDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.UpdateServiceToken")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.UpdateServiceToken(ctx, t1, s1, s2, u1)
+}
+
 func (_d *APIWithTracing) UpdateSystemSettings(ctx context.Context, t1 auth.Token, u1 UpdateSystemSettingsRequest) (s1 SystemSettingsDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.UpdateSystemSettings")
 	defer span.End()

@@ -118,15 +118,13 @@ export type ServiceTokenDTO = {
   decisions_confidence_normalize?: boolean;
   // Decision emulation opt-in (#380), identical in meaning to PortalToken's.
   decisions_emulation?: boolean;
-  // Usage-limit opt-ins, identical in meaning to PortalToken's (#420). Set at
-  // create only: a service token has no edit path (#421).
+  // Usage-limit opt-ins, identical in meaning to PortalToken's (#420).
   send_usage_limits?: boolean;
   codex_model_switch_prompt?: boolean;
   // The token's vendor-account access (see VendorAccessDTO); absent when it has
   // none. A service owns no account, so it can only name accounts SHARED with it
   // (the service provisioned into a resource group that contains them). Set at
-  // create only and preserved by a rotation: a service token has no field-level
-  // update.
+  // create, replaced wholesale by an update (#421), preserved by a rotation.
   vendor_access?: VendorAccessDTO;
 };
 
@@ -157,10 +155,18 @@ export type CreateServiceTokenRequest = {
   // Vendor-account access (see ServiceTokenDTO); omitted = the strict default, no
   // vendor access. Each named account must be reachable for THIS SERVICE (not for
   // the admin or delegate creating the token), else 400
-  // portal.token_vendor_access_invalid. CREATE-ONLY: changing it means creating a
-  // new token, a rotation keeps it.
+  // portal.token_vendor_access_invalid. An update can replace it (#421), a
+  // rotation keeps it.
   vendor_access?: VendorAccessDTO;
 };
+
+// The field-level update of a service token (#421, PATCH): every field is
+// optional — absent keeps the stored value, present replaces it (vendor_access
+// wholesale). Exactly the create request's settings minus expires_at; scopes,
+// status and last_used_model are not editable. claude_effort_compatibility
+// present (on OR off) from a principal that may not manage token settings is a
+// 403 portal.principal_forbidden, so callers send it only when it changed.
+export type UpdateServiceTokenRequest = Partial<Omit<CreateServiceTokenRequest, 'expires_at'>>;
 
 // The one-time reveal response for both create and rotate.
 export type CreateServiceTokenResponse = {
@@ -233,6 +239,12 @@ export function servicesApi(fetcher: Fetcher) {
         fetcher,
         `/api/portal/services/${encodeURIComponent(serviceId)}/tokens/${encodeURIComponent(tokenId)}/rotate`,
         { method: 'POST' },
+      ),
+    updateServiceToken: (serviceId: string, tokenId: string, body: UpdateServiceTokenRequest) =>
+      request<ServiceTokenDTO>(
+        fetcher,
+        `/api/portal/services/${encodeURIComponent(serviceId)}/tokens/${encodeURIComponent(tokenId)}`,
+        { method: 'PATCH', body },
       ),
     deleteServiceToken: (serviceId: string, tokenId: string) =>
       request<{ ok: boolean }>(

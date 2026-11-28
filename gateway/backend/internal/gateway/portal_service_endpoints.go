@@ -59,7 +59,7 @@ func (s *Server) handlePortalServices(w http.ResponseWriter, r *http.Request) {
 // handlePortalServiceItem dispatches every "/api/portal/services/{id}[/...]"
 // route (spec §7) after a single session-scope check: "/{id}" (single
 // service), "/{id}/tokens" (token collection), "/{id}/tokens/{tid}" (a single
-// token, delete-only), "/{id}/tokens/{tid}/rotate" (rotate, post-only),
+// token, PATCH/DELETE), "/{id}/tokens/{tid}/rotate" (rotate, post-only),
 // "/{id}/admin-groups" (linkage editor), and "/{id}/resource-groups[/{rgId}]"
 // (the service-side resource-group self-service).
 // Mirrors handlePortalServerItem/handlePortalTokenItem's path-parsing shape.
@@ -168,20 +168,41 @@ func (s *Server) handlePortalServiceTokens(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// handlePortalServiceTokenSingle backs DELETE
-// /api/portal/services/{id}/tokens/{tid} (spec §7's *Tokens* route; no other
-// method is defined on this path). tokenID must belong to serviceID --
-// DeleteServiceToken 404s a cross-service id (no leak, see
-// portal.Service.serviceTokenByID).
+// handlePortalServiceTokenSingle backs PATCH and DELETE
+// /api/portal/services/{id}/tokens/{tid} (spec §7's *Tokens* route). PATCH
+// edits the token's per-token options in place (#421, 200 + ServiceTokenDTO,
+// no secret); DELETE removes it. tokenID must belong to serviceID -- both 404 a
+// cross-service id (no leak, see portal.Service.serviceTokenByID). Errors map
+// through the same writePortalServiceError rows as the create path, so an
+// invalid value is the same status and code on create and on update.
 func (s *Server) handlePortalServiceTokenSingle(w http.ResponseWriter, r *http.Request, token auth.Token, serviceID, tokenID string) {
-	if !requireMethod(w, r, http.MethodDelete) {
-		return
+	switch r.Method {
+	case http.MethodPatch:
+		raw, ok := readRawJSON(w, r)
+		if !ok {
+			return
+		}
+		var req portal.UpdateServiceTokenRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+			return
+		}
+		dto, err := s.Portal.UpdateServiceToken(r.Context(), token, serviceID, tokenID, req)
+		if err != nil {
+			writePortalServiceError(w, err, "service.token_update_failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, dto)
+	case http.MethodDelete:
+		if err := s.Portal.DeleteServiceToken(r.Context(), token, serviceID, tokenID); err != nil {
+			writePortalServiceError(w, err, "service.token_delete_failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		w.Header().Set("Allow", http.MethodPatch+", "+http.MethodDelete)
+		writeJSON(w, http.StatusMethodNotAllowed, apierror.Response(codeRequestMethodNotAllowed, msgMethodNotAllowed, ""))
 	}
-	if err := s.Portal.DeleteServiceToken(r.Context(), token, serviceID, tokenID); err != nil {
-		writePortalServiceError(w, err, "service.token_delete_failed")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // handlePortalServiceTokenRotate backs POST

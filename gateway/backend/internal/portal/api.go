@@ -273,6 +273,7 @@ type API interface {
 	UpdateResourceGroup(context.Context, auth.Token, string, UpdateResourceGroupRequest) (ResourceGroupDTO, error)
 	UpdateServer(context.Context, auth.Token, string, UpdateServerRequest) (ServerDTO, error)
 	UpdateService(context.Context, auth.Token, string, UpdateServiceRequest) (ServiceDTO, error)
+	UpdateServiceToken(context.Context, auth.Token, string, string, UpdateServiceTokenRequest) (ServiceTokenDTO, error)
 	UpdateSystemSettings(context.Context, auth.Token, UpdateSystemSettingsRequest) (SystemSettingsDTO, error)
 	UpdateToken(context.Context, auth.Token, string, UpdateTokenRequest) (TokenDTO, error)
 	UpdateVendorAccount(context.Context, auth.Token, string, UpdateVendorAccountRequest) (VendorAccountDTO, error)
