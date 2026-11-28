@@ -483,11 +483,20 @@ func TestLoopbackMemberProbeNeverHolds(t *testing.T) {
 	}
 }
 
+// The loopback debounce is the loopback-only member's alone: a remote member
+// holds on the first poll even when each poll lists its head on a different
+// source port (a loopback member's would never hold,
+// TestLoopbackMemberProbeNeverHolds), and it keeps no previous-poll set.
 func TestRemoteMemberHoldUnchanged(t *testing.T) {
 	f := newObsFixture(t, directMember())
-	f.set(connFrom(obsHead, 5000))
-	f.obs.pollAll(context.Background())
-	if got := f.holds.last(); got != "rpcm_a=rspec_h" {
-		t.Fatalf("hold = %s", got)
+	for i, port := range []uint16{5000, 5001} {
+		f.set(connFrom(obsHead, port))
+		f.obs.pollAll(context.Background())
+		if got := f.holds.last(); got != "rpcm_a=rspec_h" {
+			t.Fatalf("poll %d: hold = %s", i+1, got)
+		}
+	}
+	if prev := f.obs.members["rpcm_a"].prevHead; prev != nil {
+		t.Fatalf("a remote member tracks the previous poll's head connections: %v", prev)
 	}
 }
