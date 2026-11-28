@@ -944,6 +944,35 @@ func (s *Service) UpdateServiceToken(ctx context.Context, principal auth.Token, 
 		}
 		record.Name = name
 	}
+	if err := s.applyServiceTokenModelSettings(ctx, principal, svc.ID, &record, req); err != nil {
+		return ServiceTokenDTO{}, err
+	}
+	// Reach is asked of the SERVICE the token acts as, never of the editor.
+	if req.VendorAccess != nil {
+		if err := s.validateVendorAccess(ctx, serviceTokenPrincipal(svc.ID), req.VendorAccess); err != nil {
+			return ServiceTokenDTO{}, err
+		}
+		record.VendorProviderAccess = encodeVendorAccessDTO(req.VendorAccess)
+	}
+	applyServiceTokenFlags(&record, req)
+	record.UpdatedAt = s.clock().UTC()
+	if err := s.tokens.UpdateTokenMetadata(ctx, record); err != nil {
+		return ServiceTokenDTO{}, err
+	}
+	// Re-push the service's live state onto the memory driver's cached bearer
+	// (create does the same). Its UpdateTokenMetadata already keeps the bearer's
+	// allowlist and disabled state for a service token
+	// (auth.TokenStore.UpdateTokenKeepServiceState); this refresh also picks up
+	// a service state that changed since. A no-op for SQL drivers, which join
+	// the service state per request.
+	s.mirrorServiceTokenState(ctx, svc.ID, svc.Status)
+	return serviceTokenDTO(record), nil
+}
+
+// applyServiceTokenModelSettings validates and applies UpdateServiceToken's
+// model-valued settings: the catch-all override, the per-model override map
+// and the unknown-model redirect trio.
+func (s *Service) applyServiceTokenModelSettings(ctx context.Context, principal auth.Token, serviceID string, record *store.TokenRecord, req UpdateServiceTokenRequest) error {
 	// The callable set is built at most once, and only when a model-valued
 	// setting is touched (UpdateToken's pattern).
 	var callableSet map[string]struct{}
@@ -965,14 +994,14 @@ func (s *Service) UpdateServiceToken(ctx context.Context, principal auth.Token, 
 	if req.ModelOverride != nil && strings.TrimSpace(*req.ModelOverride) != record.ModelOverride {
 		override, err := validateModelOverride(callable(), *req.ModelOverride)
 		if err != nil {
-			return ServiceTokenDTO{}, err
+			return err
 		}
 		record.ModelOverride = override
 	}
 	if req.ModelOverrideMap != nil && store.EncodeModelOverrideRules(*req.ModelOverrideMap) != record.ModelOverrideMap {
 		overrideRules, err := validateModelOverrideRules(callable(), *req.ModelOverrideMap)
 		if err != nil {
-			return ServiceTokenDTO{}, err
+			return err
 		}
 		record.ModelOverrideMap = store.EncodeModelOverrideRules(overrideRules)
 	}
@@ -981,63 +1010,50 @@ func (s *Service) UpdateServiceToken(ctx context.Context, principal auth.Token, 
 	// NARROWED BY THE SERVICE'S ALLOWLIST — create's rule, see the comment in
 	// CreateServiceToken. Untouched, the stored values stay as they are.
 	// record.LastUsedModel is never assigned here.
-	if req.UnknownModelRedirect != nil || req.UnknownModelRedirectBlocked != nil || req.UnknownModelFallback != nil {
-		on, blocked, fallback := record.UnknownModelRedirect, record.UnknownModelRedirectBlocked, record.UnknownModelFallback
-		if req.UnknownModelRedirect != nil {
-			on = *req.UnknownModelRedirect
+	on, blocked, fallback, touched := mergedServiceTokenRedirect(record, req)
+	// An unchanged trio is not re-validated (see above).
+	if touched && (on != record.UnknownModelRedirect || blocked != record.UnknownModelRedirectBlocked || fallback != record.UnknownModelFallback) {
+		return s.applyServiceTokenRedirect(ctx, serviceID, callable, record, on, blocked, fallback)
+	}
+	return nil
+}
+
+// mergedServiceTokenRedirect returns the redirect trio this update leaves —
+// each field from req when present, else the stored value, the fallback
+// trimmed — and whether req touches the trio at all.
+func mergedServiceTokenRedirect(record *store.TokenRecord, req UpdateServiceTokenRequest) (on, blocked bool, fallback string, touched bool) {
+	on, blocked, fallback = record.UnknownModelRedirect, record.UnknownModelRedirectBlocked, record.UnknownModelFallback
+	if req.UnknownModelRedirect != nil {
+		on, touched = *req.UnknownModelRedirect, true
+	}
+	if req.UnknownModelRedirectBlocked != nil {
+		blocked, touched = *req.UnknownModelRedirectBlocked, true
+	}
+	if req.UnknownModelFallback != nil {
+		fallback, touched = strings.TrimSpace(*req.UnknownModelFallback), true
+	}
+	return on, blocked, fallback, touched
+}
+
+// applyServiceTokenFlags applies UpdateServiceToken's plain boolean settings:
+// nil keeps the stored value, non-nil replaces it.
+func applyServiceTokenFlags(record *store.TokenRecord, req UpdateServiceTokenRequest) {
+	for _, f := range []struct {
+		dst *bool
+		src *bool
+	}{
+		{&record.LogCommunication, req.LogCommunication},
+		{&record.Secret, req.Secret},
+		{&record.ClaudeModelAliases, req.ClaudeModelAliases},
+		{&record.ClaudeEffortCompatibility, req.ClaudeEffortCompatibility},
+		{&record.DecisionsConfidenceNormalize, req.DecisionsConfidenceNormalize},
+		{&record.SendUsageLimits, req.SendUsageLimits},
+		{&record.CodexModelSwitchPrompt, req.CodexModelSwitchPrompt},
+	} {
+		if f.src != nil {
+			*f.dst = *f.src
 		}
-		if req.UnknownModelRedirectBlocked != nil {
-			blocked = *req.UnknownModelRedirectBlocked
-		}
-		if req.UnknownModelFallback != nil {
-			fallback = strings.TrimSpace(*req.UnknownModelFallback)
-		}
-		// An unchanged trio is not re-validated (see above).
-		if on != record.UnknownModelRedirect || blocked != record.UnknownModelRedirectBlocked || fallback != record.UnknownModelFallback {
-			if err := s.applyServiceTokenRedirect(ctx, svc.ID, callable, &record, on, blocked, fallback); err != nil {
-				return ServiceTokenDTO{}, err
-			}
-		}
 	}
-	// Reach is asked of the SERVICE the token acts as, never of the editor.
-	if req.VendorAccess != nil {
-		if err := s.validateVendorAccess(ctx, serviceTokenPrincipal(svc.ID), req.VendorAccess); err != nil {
-			return ServiceTokenDTO{}, err
-		}
-		record.VendorProviderAccess = encodeVendorAccessDTO(req.VendorAccess)
-	}
-	if req.LogCommunication != nil {
-		record.LogCommunication = *req.LogCommunication
-	}
-	if req.Secret != nil {
-		record.Secret = *req.Secret
-	}
-	if req.ClaudeModelAliases != nil {
-		record.ClaudeModelAliases = *req.ClaudeModelAliases
-	}
-	if req.ClaudeEffortCompatibility != nil {
-		record.ClaudeEffortCompatibility = *req.ClaudeEffortCompatibility
-	}
-	if req.DecisionsConfidenceNormalize != nil {
-		record.DecisionsConfidenceNormalize = *req.DecisionsConfidenceNormalize
-	}
-	if req.SendUsageLimits != nil {
-		record.SendUsageLimits = *req.SendUsageLimits
-	}
-	if req.CodexModelSwitchPrompt != nil {
-		record.CodexModelSwitchPrompt = *req.CodexModelSwitchPrompt
-	}
-	record.UpdatedAt = s.clock().UTC()
-	if err := s.tokens.UpdateTokenMetadata(ctx, record); err != nil {
-		return ServiceTokenDTO{}, err
-	}
-	// Required, not cosmetic: the memory driver's UpdateTokenMetadata rebuilds
-	// the cached bearer from the token row alone (Active from the token status,
-	// no AllowedModels), so without this push an edit would re-activate a
-	// disabled service's token and drop its allowlist. A no-op for SQL drivers,
-	// which join the service state per request.
-	s.mirrorServiceTokenState(ctx, svc.ID, svc.Status)
-	return serviceTokenDTO(record), nil
 }
 
 // applyServiceTokenRedirect validates the redirect trio as one unit, the
