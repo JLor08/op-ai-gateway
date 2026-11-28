@@ -44,27 +44,33 @@ import SpeedIcon from '@mui/icons-material/Speed';
 import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
-import type {
-  ApplicationStatus,
-  BenchmarkRunDTO,
-  CoResidency,
-  DecisionsMode,
-  EndpointMode,
-  SystemOneMode,
-  GPUBudget,
-  HardwareGPU,
-  PortalApplication,
-  PortalModelMapping,
-  PortalServer,
-  PutRuntimeSpecRequest,
-  RuntimeActionAnswer,
-  RuntimeError,
-  RuntimeSpec,
-  RuntimeSpecGPU,
-  RuntimeStatus,
-  UpdateMappingRequest,
-  VRAMGPUItemDTO,
-  VRAMReportDTO,
+import {
+  type ApplicationStatus,
+  type BenchmarkRunDTO,
+  type CoResidency,
+  type DecisionsMode,
+  type EndpointMode,
+  type SystemOneMode,
+  type GPUBudget,
+  type GpuVendor,
+  type HardwareGPU,
+  type PortalApplication,
+  type PortalModelMapping,
+  type PortalServer,
+  type PutRuntimeSpecRequest,
+  type RuntimeActionAnswer,
+  type RuntimeError,
+  type RuntimeSpec,
+  type RuntimeSpecGPU,
+  type RuntimeStatus,
+  type UpdateMappingRequest,
+  type VRAMGPUItemDTO,
+  type VRAMReportDTO,
+  gpuDisplayName,
+  gpuKey,
+  hostGpuVendor,
+  resolveAutoBackend,
+  resolvedGpuKey,
 } from '../api';
 import type { Translation, PortalApi, MessageKey, BadgeStatus } from './shared/types';
 import { errorLabelByCode, formatPortalError, formatMetric, formatDate } from './shared/format';
@@ -128,14 +134,6 @@ import { RuntimeLogView } from './RuntimeLogView';
 import { RpcMemberName, RpcMemberSection } from './RpcMemberSection';
 import { BinariesSection } from './BinariesSection';
 import { GpuVendorNote } from './GpuVendorNote';
-import {
-  type GpuVendor,
-  gpuDisplayName,
-  gpuKey,
-  hostGpuVendor,
-  resolveAutoBackend,
-  resolvedGpuKey,
-} from '../api';
 import { BinaryPicker, binaryVersionFor, useServerBinaries } from './shared/BinaryPicker';
 import {
   ClusterHeadEditor,
@@ -3911,7 +3909,7 @@ export function RuntimeAdminSection({
     const stored = editingSpecMappingId ? specsById[editingSpecMappingId] : undefined;
     if (stored?.configured) {
       const keys = (gpus: { vendor?: GpuVendor; index: number }[]) =>
-        [...new Set(gpus.map(legacyCardKey))].sort().join(',');
+        [...new Set(gpus.map(legacyCardKey))].sort((a, b) => a.localeCompare(b)).join(',');
       const injects = (set: boolean | undefined, mode: string | undefined) =>
         set === true && mode !== 'args';
       const sameBackend = (stored.device_backend || 'auto') === cluster.deviceBackend;
@@ -6706,6 +6704,213 @@ export function RuntimeAdminSection({
     );
   }
 
+  // The limits tab's body, one state at a time (as renderCoresidencyBody):
+  // file mode shows the agent's own limits read-only; otherwise the report and
+  // then the budgets GET gate the editor, which only renders once both are in.
+  function renderLimitsBody() {
+    if (fileMode) {
+      if (parseError) {
+        return <Typography color="text.secondary">{t.runtimeConfigUnavailable}</Typography>;
+      }
+      return (
+        // Read-only: the limits live in the agent's local file, and the
+        // gateway document file mode ignores is not what is in force.
+        <Box sx={{ display: 'grid', gap: 1 }}>
+          {reportConfig?.unrecognised && (
+            <Alert severity="warning">{t.runtimeConfigUnrecognised}</Alert>
+          )}
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Typography variant="body2" color="text.secondary">
+              {t.runtimeMaxProcesses}
+            </Typography>
+            <Typography variant="body2">
+              {reportConfig?.maxProcesses === null || reportConfig === null
+                ? '—'
+                : String(reportConfig.maxProcesses)}
+            </Typography>
+          </Box>
+          <Typography variant="subtitle2" component="h3">
+            {t.runtimeGpuBudget}
+          </Typography>
+          {(reportConfig?.budgets ?? []).length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              —
+            </Typography>
+          ) : (
+            (reportConfig?.budgets ?? []).map((b) => (
+              <Typography key={gpuKey(b.vendor, b.index)} variant="body2">
+                {`${gpuDisplayName(b.vendor, b.index)}: ${b.budgetMb} MB`}
+              </Typography>
+            ))
+          )}
+        </Box>
+      );
+    }
+    if (reportStatus !== 'ready') {
+      return (
+        // Until the report resolves we do not know whether this form should
+        // exist at all. No form, no click, no write. A FAILED report GET
+        // says so instead of claiming to still be loading.
+        <ResourceFallback
+          state={reportFailed ? reportStatus : 'loading'}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeModeUnknownShort}
+        />
+      );
+    }
+    if (!gpuBudgetsReady) {
+      return (
+        // The budgets GET itself. While it is in flight `budgetRows` is
+        // still its initial `[]`, indistinguishable from "no budgets
+        // configured", and Save PUTs it as the FULL replacement -- so a
+        // premature click would erase every previously configured budget
+        // (task-21 review's Critical finding). A FAILED GET is the same
+        // hazard with a worse disguise: on a failed RELOAD `budgetRows`
+        // still holds the pre-failure values, so the form would look
+        // perfectly normal and Save would write values we had just failed
+        // to re-read. Both states get the message and the retry instead --
+        // each in its own words (fix round 1, M7), because on a failed
+        // reload "could not be loaded" is simply not what happened.
+        <ResourceFallback
+          state={gpuBudgetsStatus}
+          loadingLabel={t.loading}
+          errorLabel={t.runtimeBudgetsUnavailable}
+          staleErrorLabel={t.runtimeBudgetsStale}
+          errorDetail={gpuBudgetsError}
+          retry={{ label: t.resourceRetry, onRetry: () => void reloadGpuBudgets() }}
+        />
+      );
+    }
+    return (
+      <Box sx={{ display: 'grid', gap: 2.5 }}>
+        <Box sx={{ display: 'grid', gap: 1 }}>
+          <Typography variant="subtitle2" component="h3">
+            {t.runtimeGpuBudget}
+          </Typography>
+          {budgetRows.map((row, idx) => {
+            const live = driftFor(row);
+            return (
+              <Box
+                key={row.rowKey}
+                sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
+              >
+                {/* The spec form's card picker, for the same reason
+                          (#434): on a mixed host an index alone names two
+                          cards, and the picked card's vendor is saved. */}
+                {telemetryGpus.length > 0 && (
+                  <SelectField
+                    id={`runtime-budget-gpu-pick-${idx}`}
+                    label={t.runtimeSpecGpuPick}
+                    value={budgetSelectValue(row, idx)}
+                    onChange={(e) => {
+                      const card = budgetOptionsFor(idx).find(
+                        (g) => gpuKey(g.vendor, g.index) === e.target.value,
+                      );
+                      if (!card) return;
+                      updateBudgetRow(idx, { vendor: card.vendor ?? '', index: card.index });
+                    }}
+                    sx={{ maxWidth: 340 }}
+                  >
+                    <option value="">{t.runtimeSpecGpuPickPlaceholder}</option>
+                    {budgetOptionsFor(idx).map((g) => (
+                      <option value={gpuKey(g.vendor, g.index)} key={gpuKey(g.vendor, g.index)}>
+                        {gpuOptionLabel(g)}
+                      </option>
+                    ))}
+                  </SelectField>
+                )}
+                <Field
+                  id={`runtime-budget-index-${idx}`}
+                  label={t.runtimeSpecGpuIndex}
+                  type="number"
+                  value={String(row.index)}
+                  onChange={(e) =>
+                    updateBudgetRow(idx, {
+                      index: e.target.value === '' ? 0 : Number(e.target.value),
+                    })
+                  }
+                  inputProps={{ min: 0 }}
+                  sx={{ maxWidth: 140 }}
+                />
+                <Field
+                  id={`runtime-budget-mb-${idx}`}
+                  label={t.runtimeGpuBudget}
+                  type="number"
+                  value={String(row.budgetMb)}
+                  onChange={(e) =>
+                    updateBudgetRow(idx, {
+                      budgetMb: e.target.value === '' ? 0 : Number(e.target.value),
+                    })
+                  }
+                  inputProps={{ min: 0 }}
+                  sx={{ maxWidth: 200 }}
+                />
+                {live && (
+                  <Tooltip
+                    title={
+                      <Box sx={{ display: 'grid', gap: 0.25 }}>
+                        <Typography variant="caption">{t.runtimeGpuDriftWarning}</Typography>
+                        <Typography variant="caption">
+                          {t.runtimeGpuDriftExpected}: {row.expectedName || '—'} ({row.expectedUuid}
+                          )
+                        </Typography>
+                        <Typography variant="caption">
+                          {t.runtimeGpuDriftCurrent}: {live.name || '—'} ({live.uuid})
+                        </Typography>
+                      </Box>
+                    }
+                  >
+                    <IconButton
+                      size="small"
+                      color="warning"
+                      aria-label={`${t.runtimeGpuDriftIconLabel}: ${gpuDisplayName(row.vendor, row.index)}`}
+                    >
+                      <WarningAmberIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                )}
+                <Button
+                  type="button"
+                  size="small"
+                  color="secondary"
+                  onClick={() => removeBudgetRow(idx)}
+                >
+                  {t.runtimeSpecGpuRemove}
+                </Button>
+              </Box>
+            );
+          })}
+          <Box>
+            <Button type="button" variant="outlined" size="small" onClick={addBudgetRow}>
+              {t.runtimeSpecGpuAdd}
+            </Button>
+          </Box>
+        </Box>
+
+        <Field
+          id="runtime-max-processes"
+          type="number"
+          label={t.runtimeMaxProcesses}
+          value={String(maxProcesses)}
+          onChange={(e) => setMaxProcesses(e.target.value === '' ? 0 : Number(e.target.value))}
+          inputProps={{ min: 0 }}
+          sx={{ maxWidth: 280 }}
+        />
+
+        <Box>
+          <Button
+            type="button"
+            variant="contained"
+            disabled={limitsBusy}
+            onClick={() => void saveLimits()}
+          >
+            {t.save}
+          </Button>
+        </Box>
+      </Box>
+    );
+  }
+
   // The co-residency tab's body, one state at a time. Each early return is a
   // distinct fact about what the tab may show, in the order they gate one
   // another; none of them is the editor with an empty document.
@@ -7059,204 +7264,7 @@ export function RuntimeAdminSection({
           title={t.runtimeLimits}
           subtitle={t.runtimeLimitsIntro}
         >
-          {fileMode ? (
-            parseError ? (
-              <Typography color="text.secondary">{t.runtimeConfigUnavailable}</Typography>
-            ) : (
-              // Read-only: the limits live in the agent's local file, and the
-              // gateway document file mode ignores is not what is in force.
-              <Box sx={{ display: 'grid', gap: 1 }}>
-                {reportConfig?.unrecognised && (
-                  <Alert severity="warning">{t.runtimeConfigUnrecognised}</Alert>
-                )}
-                <Box sx={{ display: 'flex', gap: 1 }}>
-                  <Typography variant="body2" color="text.secondary">
-                    {t.runtimeMaxProcesses}
-                  </Typography>
-                  <Typography variant="body2">
-                    {reportConfig?.maxProcesses === null || reportConfig === null
-                      ? '—'
-                      : String(reportConfig.maxProcesses)}
-                  </Typography>
-                </Box>
-                <Typography variant="subtitle2" component="h3">
-                  {t.runtimeGpuBudget}
-                </Typography>
-                {(reportConfig?.budgets ?? []).length === 0 ? (
-                  <Typography variant="body2" color="text.secondary">
-                    —
-                  </Typography>
-                ) : (
-                  (reportConfig?.budgets ?? []).map((b) => (
-                    <Typography key={gpuKey(b.vendor, b.index)} variant="body2">
-                      {`${gpuDisplayName(b.vendor, b.index)}: ${b.budgetMb} MB`}
-                    </Typography>
-                  ))
-                )}
-              </Box>
-            )
-          ) : reportStatus !== 'ready' ? (
-            // Until the report resolves we do not know whether this form should
-            // exist at all. No form, no click, no write. A FAILED report GET
-            // says so instead of claiming to still be loading.
-            <ResourceFallback
-              state={reportFailed ? reportStatus : 'loading'}
-              loadingLabel={t.loading}
-              errorLabel={t.runtimeModeUnknownShort}
-            />
-          ) : !gpuBudgetsReady ? (
-            // The budgets GET itself. While it is in flight `budgetRows` is
-            // still its initial `[]`, indistinguishable from "no budgets
-            // configured", and Save PUTs it as the FULL replacement -- so a
-            // premature click would erase every previously configured budget
-            // (task-21 review's Critical finding). A FAILED GET is the same
-            // hazard with a worse disguise: on a failed RELOAD `budgetRows`
-            // still holds the pre-failure values, so the form would look
-            // perfectly normal and Save would write values we had just failed
-            // to re-read. Both states get the message and the retry instead --
-            // each in its own words (fix round 1, M7), because on a failed
-            // reload "could not be loaded" is simply not what happened.
-            <ResourceFallback
-              state={gpuBudgetsStatus}
-              loadingLabel={t.loading}
-              errorLabel={t.runtimeBudgetsUnavailable}
-              staleErrorLabel={t.runtimeBudgetsStale}
-              errorDetail={gpuBudgetsError}
-              retry={{ label: t.resourceRetry, onRetry: () => void reloadGpuBudgets() }}
-            />
-          ) : (
-            <Box sx={{ display: 'grid', gap: 2.5 }}>
-              <Box sx={{ display: 'grid', gap: 1 }}>
-                <Typography variant="subtitle2" component="h3">
-                  {t.runtimeGpuBudget}
-                </Typography>
-                {budgetRows.map((row, idx) => {
-                  const live = driftFor(row);
-                  return (
-                    <Box
-                      key={row.rowKey}
-                      sx={{ display: 'flex', gap: 1.5, alignItems: 'center', flexWrap: 'wrap' }}
-                    >
-                      {/* The spec form's card picker, for the same reason
-                          (#434): on a mixed host an index alone names two
-                          cards, and the picked card's vendor is saved. */}
-                      {telemetryGpus.length > 0 && (
-                        <SelectField
-                          id={`runtime-budget-gpu-pick-${idx}`}
-                          label={t.runtimeSpecGpuPick}
-                          value={budgetSelectValue(row, idx)}
-                          onChange={(e) => {
-                            const card = budgetOptionsFor(idx).find(
-                              (g) => gpuKey(g.vendor, g.index) === e.target.value,
-                            );
-                            if (!card) return;
-                            updateBudgetRow(idx, { vendor: card.vendor ?? '', index: card.index });
-                          }}
-                          sx={{ maxWidth: 340 }}
-                        >
-                          <option value="">{t.runtimeSpecGpuPickPlaceholder}</option>
-                          {budgetOptionsFor(idx).map((g) => (
-                            <option
-                              value={gpuKey(g.vendor, g.index)}
-                              key={gpuKey(g.vendor, g.index)}
-                            >
-                              {gpuOptionLabel(g)}
-                            </option>
-                          ))}
-                        </SelectField>
-                      )}
-                      <Field
-                        id={`runtime-budget-index-${idx}`}
-                        label={t.runtimeSpecGpuIndex}
-                        type="number"
-                        value={String(row.index)}
-                        onChange={(e) =>
-                          updateBudgetRow(idx, {
-                            index: e.target.value === '' ? 0 : Number(e.target.value),
-                          })
-                        }
-                        inputProps={{ min: 0 }}
-                        sx={{ maxWidth: 140 }}
-                      />
-                      <Field
-                        id={`runtime-budget-mb-${idx}`}
-                        label={t.runtimeGpuBudget}
-                        type="number"
-                        value={String(row.budgetMb)}
-                        onChange={(e) =>
-                          updateBudgetRow(idx, {
-                            budgetMb: e.target.value === '' ? 0 : Number(e.target.value),
-                          })
-                        }
-                        inputProps={{ min: 0 }}
-                        sx={{ maxWidth: 200 }}
-                      />
-                      {live && (
-                        <Tooltip
-                          title={
-                            <Box sx={{ display: 'grid', gap: 0.25 }}>
-                              <Typography variant="caption">{t.runtimeGpuDriftWarning}</Typography>
-                              <Typography variant="caption">
-                                {t.runtimeGpuDriftExpected}: {row.expectedName || '—'} (
-                                {row.expectedUuid})
-                              </Typography>
-                              <Typography variant="caption">
-                                {t.runtimeGpuDriftCurrent}: {live.name || '—'} ({live.uuid})
-                              </Typography>
-                            </Box>
-                          }
-                        >
-                          <IconButton
-                            size="small"
-                            color="warning"
-                            aria-label={`${t.runtimeGpuDriftIconLabel}: ${gpuDisplayName(row.vendor, row.index)}`}
-                          >
-                            <WarningAmberIcon fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
-                      )}
-                      <Button
-                        type="button"
-                        size="small"
-                        color="secondary"
-                        onClick={() => removeBudgetRow(idx)}
-                      >
-                        {t.runtimeSpecGpuRemove}
-                      </Button>
-                    </Box>
-                  );
-                })}
-                <Box>
-                  <Button type="button" variant="outlined" size="small" onClick={addBudgetRow}>
-                    {t.runtimeSpecGpuAdd}
-                  </Button>
-                </Box>
-              </Box>
-
-              <Field
-                id="runtime-max-processes"
-                type="number"
-                label={t.runtimeMaxProcesses}
-                value={String(maxProcesses)}
-                onChange={(e) =>
-                  setMaxProcesses(e.target.value === '' ? 0 : Number(e.target.value))
-                }
-                inputProps={{ min: 0 }}
-                sx={{ maxWidth: 280 }}
-              />
-
-              <Box>
-                <Button
-                  type="button"
-                  variant="contained"
-                  disabled={limitsBusy}
-                  onClick={() => void saveLimits()}
-                >
-                  {t.save}
-                </Button>
-              </Box>
-            </Box>
-          )}
+          {renderLimitsBody()}
         </Panel>
       )}
       {tab === 'status' && (
