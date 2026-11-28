@@ -1749,12 +1749,14 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(updateBody(fakeApi).claude_effort_compatibility).toBe(true);
     });
 
-    it('shows the error and keeps the dialog open when the update fails', async () => {
-      const code = 'portal.token_vendor_access_invalid';
+    it.each([
+      [400, 'portal.token_vendor_access_invalid', t.errorTokenVendorAccessInvalid],
+      [403, 'portal.principal_forbidden', t.errorPortalPrincipalForbidden],
+    ])('shows the %s %s error and keeps the dialog open', async (status, code, label) => {
       const { fakeApi, editDialog } = await openEditDialog({
         overrides: {
           updateServiceToken: vi.fn(async () => {
-            throw new PortalApiError(400, code, 'raw');
+            throw new PortalApiError(status, code, 'raw');
           }),
         },
       });
@@ -1762,9 +1764,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       fireEvent.click(editDialog.getByRole('button', { name: t.tokenActionSave }));
 
       await waitFor(() => expect(fakeApi.updateServiceToken).toHaveBeenCalledTimes(1));
-      expect(
-        await screen.findByText(`${code}: ${t.errorTokenVendorAccessInvalid}`),
-      ).toBeInTheDocument();
+      expect(await screen.findByText(`${code}: ${label}`)).toBeInTheDocument();
       expect(screen.getByText(t.tokenEditTitle)).toBeInTheDocument();
       expect(screen.getByText('Edit Me')).toBeInTheDocument();
     });

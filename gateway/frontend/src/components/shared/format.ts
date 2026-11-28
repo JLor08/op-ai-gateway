@@ -27,6 +27,7 @@ export const errorLabelByCode: Partial<Record<string, MessageKey>> = {
   'portal.token_model_override_invalid': 'errorPortalTokenModelOverrideInvalid',
   'portal.token_vendor_access_invalid': 'errorTokenVendorAccessInvalid',
   'portal.token_vendor_access_conflict': 'errorTokenVendorAccessConflict',
+  'portal.principal_forbidden': 'errorPortalPrincipalForbidden',
   'token.project_not_member': 'errorTokenProjectNotMember',
   'token.not_found': 'errorTokenNotFound',
   'server.not_found': 'errorServerNotFound',

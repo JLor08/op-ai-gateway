@@ -3699,6 +3699,8 @@ const de = {
     'Anbieter-Zugriff ungültig: Ein gewähltes Konto ist für diesen Token nicht erreichbar, oder ein Prefix ist ungültig.',
   errorTokenVendorAccessConflict:
     'Zwei Anbieter liefern denselben Modellnamen — vergib einen eigenen Prefix.',
+  errorPortalPrincipalForbidden:
+    'Diese Einstellung darf nur über eine Portal-Sitzung oder mit einem Admin-Token geändert werden.',
   activityEmpty: 'Keine Anfragen',
   activityStatsLabel: 'Statistik',
   activityTilesButton: 'Kacheln',
@@ -7889,6 +7891,8 @@ const en: PortalMessages = {
     'Provider access is invalid: a selected account is not reachable for this token, or a prefix is invalid.',
   errorTokenVendorAccessConflict:
     'Two providers serve the same model name — give one a distinct prefix.',
+  errorPortalPrincipalForbidden:
+    'This setting can only be changed from a portal session or with an admin token.',
   activityEmpty: 'No requests yet',
   activityStatsLabel: 'Statistics',
   activityTilesButton: 'Tiles',
