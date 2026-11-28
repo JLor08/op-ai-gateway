@@ -76,35 +76,56 @@ func resolveLegacyGPUVendors(cfg Config, legacy GPUVendor) Config {
 	if legacy == GPUVendorNone {
 		return cfg
 	}
-	if slices.ContainsFunc(cfg.GPUBudgets, func(b GPUBudget) bool { return b.Vendor == GPUVendorNone }) {
-		budgets := slices.Clone(cfg.GPUBudgets)
-		for i := range budgets {
-			if budgets[i].Vendor == GPUVendorNone {
-				budgets[i].Vendor = legacy
-			}
-		}
-		cfg.GPUBudgets = budgets
+	cfg.GPUBudgets = legacyResolvedBudgets(cfg.GPUBudgets, legacy)
+	cfg.Specs = legacyResolvedSpecs(cfg.Specs, legacy)
+	return cfg
+}
+
+// legacyResolvedBudgets is budgets with every empty vendor read as legacy:
+// budgets itself when none is empty, else a changed clone.
+func legacyResolvedBudgets(budgets []GPUBudget, legacy GPUVendor) []GPUBudget {
+	if !slices.ContainsFunc(budgets, func(b GPUBudget) bool { return b.Vendor == GPUVendorNone }) {
+		return budgets
 	}
-	var specs []Spec
-	for i, spec := range cfg.Specs {
+	out := slices.Clone(budgets)
+	for i := range out {
+		if out[i].Vendor == GPUVendorNone {
+			out[i].Vendor = legacy
+		}
+	}
+	return out
+}
+
+// legacyResolvedSpecs is specs with every empty GPU vendor read as legacy:
+// specs itself when no GPU's vendor is empty, else a clone whose changed
+// specs carry a changed clone of their GPUs.
+func legacyResolvedSpecs(specs []Spec, legacy GPUVendor) []Spec {
+	var out []Spec
+	for i, spec := range specs {
 		if !slices.ContainsFunc(spec.GPUs, func(g SpecGPU) bool { return g.Vendor == GPUVendorNone }) {
 			continue
 		}
-		if specs == nil {
-			specs = slices.Clone(cfg.Specs)
+		if out == nil {
+			out = slices.Clone(specs)
 		}
-		gpus := slices.Clone(spec.GPUs)
-		for j := range gpus {
-			if gpus[j].Vendor == GPUVendorNone {
-				gpus[j].Vendor = legacy
-			}
+		out[i].GPUs = legacyResolvedSpecGPUs(spec.GPUs, legacy)
+	}
+	if out == nil {
+		return specs
+	}
+	return out
+}
+
+// legacyResolvedSpecGPUs is a clone of gpus with every empty vendor read as
+// legacy.
+func legacyResolvedSpecGPUs(gpus []SpecGPU, legacy GPUVendor) []SpecGPU {
+	out := slices.Clone(gpus)
+	for j := range out {
+		if out[j].Vendor == GPUVendorNone {
+			out[j].Vendor = legacy
 		}
-		specs[i].GPUs = gpus
 	}
-	if specs != nil {
-		cfg.Specs = specs
-	}
-	return cfg
+	return out
 }
 
 // GPUTopology is what the per-spec device planner needs to know about the
