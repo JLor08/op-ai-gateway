@@ -102,7 +102,7 @@ func (s *Server) relayDecisionEmulation(w http.ResponseWriter, r *http.Request, 
 			Message: "the emulating chat model's answer could not be read",
 			Type:    decisionsUpstreamErrorType,
 		}})
-		s.recordDecisionEmulation(r, ex, resp, http.StatusBadGateway, "error", code, body, w.Header())
+		s.recordDecisionEmulation(r, ex, emulationOutcome{resp, http.StatusBadGateway, "error", code, body, w.Header()})
 		return
 	}
 	if c.token.DecisionsConfidenceNormalize {
@@ -113,7 +113,7 @@ func (s *Server) relayDecisionEmulation(w http.ResponseWriter, r *http.Request, 
 	w.WriteHeader(http.StatusOK)
 	_, writeErr := w.Write(answer)
 	status, errorCode := s.nativeTerminalStatus(r, http.StatusOK, c.req, s.serverName(target.ServerID), false, writeErr, c.start)
-	s.recordDecisionEmulation(r, ex, resp, http.StatusOK, status, errorCode, answer, w.Header())
+	s.recordDecisionEmulation(r, ex, emulationOutcome{resp, http.StatusOK, status, errorCode, answer, w.Header()})
 }
 
 // emulationExchange is what an emulated call's answer and row need beyond the
@@ -124,6 +124,18 @@ type emulationExchange struct {
 	id        string
 	capturing bool
 	sink      *provider.CaptureSink
+}
+
+// emulationOutcome is what an emulated call ended in: the upstream response (zero
+// on a failure), the status the client got, the row's status and error code, the
+// bytes sent and the response headers.
+type emulationOutcome struct {
+	resp       provider.Response
+	httpStatus int
+	status     string
+	errorCode  string
+	body       []byte
+	header     http.Header
 }
 
 // failDecisionEmulationProvider answers a provider error on the emulated route:
@@ -145,23 +157,23 @@ func (s *Server) failDecisionEmulationProvider(w http.ResponseWriter, r *http.Re
 	}
 	slog.Error("emulated decisions call failed", "path", r.URL.Path, "model", ex.c.req.Model, "account", ex.target.VendorAccountID, "code", rowCode, "err", err)
 	body := writeJSONCaptured(w, status, envelope)
-	s.recordDecisionEmulation(r, ex, provider.Response{}, status, "error", rowCode, body, w.Header())
+	s.recordDecisionEmulation(r, ex, emulationOutcome{provider.Response{}, status, "error", rowCode, body, w.Header()})
 }
 
 // recordDecisionEmulation records an emulated call's row: token-metered from the
 // Responses usage, on the serving account, provider_path /responses
 // (upstreamPath), the emulation mark from the target, and the capture of the
 // bytes the client got with the translated exchange the sink holds.
-func (s *Server) recordDecisionEmulation(r *http.Request, ex emulationExchange, resp provider.Response, httpStatus int, status, errorCode string, body []byte, respHeader http.Header) {
+func (s *Server) recordDecisionEmulation(r *http.Request, ex emulationExchange, o emulationOutcome) {
 	c := ex.c
-	ci := buildCaptureInput(ex.capturing, c.token.UserID, c.token.Secret, r, c.raw, respHeader, body, httpStatus, c.req.APIFlavor)
+	ci := buildCaptureInput(ex.capturing, c.token.UserID, c.token.Secret, r, c.raw, o.header, o.body, o.httpStatus, c.req.APIFlavor)
 	attachTranslatedCapture(ci, ex.sink)
 	var upstreamHeaders http.Header
 	if ex.sink != nil {
 		upstreamHeaders = ex.sink.ResponseHeaders()
 	}
-	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(c.req.APIFlavor), Endpoint: c.endpoint}
-	s.recordUsage(c.start, c.token, c.req, ex.target, provider.Response{Usage: emulationRowUsage(resp.Usage)}, errorCode, status, meta, ex.id, ci, upstreamHeaders)
+	meta := usageMeta{ReqPath: r.URL.Path, HTTPStatus: o.httpStatus, ContentType: jsonContentType, BillingUnit: billingUnitFor(c.req.APIFlavor), Endpoint: c.endpoint}
+	s.recordUsage(c.start, c.token, c.req, ex.target, provider.Response{Usage: emulationRowUsage(o.resp.Usage)}, o.errorCode, o.status, meta, ex.id, ci, upstreamHeaders)
 }
 
 // emulationRowUsage is the row's usage of an emulated call: the Responses usage as

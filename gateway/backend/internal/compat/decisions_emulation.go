@@ -145,32 +145,39 @@ func emulationQuestionList(questions []decisionsParsedQuestion) string {
 		if q.instructions != "" {
 			fmt.Fprintf(&b, "Instructions: %s\n", q.instructions)
 		}
-		switch q.oaType {
-		case oaTypePredicate:
-			fmt.Fprintf(&b, "Answer: the probability that the answer is yes, as answers.%s.yes.\n", key)
-		case oaTypeChoice:
-			b.WriteString("Options:\n")
-			for j, c := range q.choices {
-				fmt.Fprintf(&b, "- %s: %s", emulationOptionKey(j), c.value)
-				if c.description != "" {
-					fmt.Fprintf(&b, " (%s)", c.description)
-				}
-				b.WriteByte('\n')
-			}
-			fmt.Fprintf(&b, "Answer: a probability for each option, as answers.%s.probabilities.\n", key)
-		default: // oaTypeScore
-			b.WriteString("Levels:\n")
-			for k, l := range q.levels {
-				fmt.Fprintf(&b, "- %s: %s", emulationLevelKey(k), l.label)
-				if l.description != "" {
-					fmt.Fprintf(&b, " (%s)", l.description)
-				}
-				b.WriteByte('\n')
-			}
-			fmt.Fprintf(&b, "Answer: a probability for each level, as answers.%s.probabilities.\n", key)
-		}
+		writeEmulationAnswerSpec(&b, q, key)
 	}
 	return b.String()
+}
+
+// writeEmulationAnswerSpec writes the per-type part of a question: its options
+// or levels and where the answer goes.
+func writeEmulationAnswerSpec(b *strings.Builder, q decisionsParsedQuestion, key string) {
+	switch q.oaType {
+	case oaTypePredicate:
+		fmt.Fprintf(b, "Answer: the probability that the answer is yes, as answers.%s.yes.\n", key)
+	case oaTypeChoice:
+		b.WriteString("Options:\n")
+		for j, c := range q.choices {
+			writeEmulationListItem(b, emulationOptionKey(j), string(c.value), c.description)
+		}
+		fmt.Fprintf(b, "Answer: a probability for each option, as answers.%s.probabilities.\n", key)
+	default: // oaTypeScore
+		b.WriteString("Levels:\n")
+		for k, l := range q.levels {
+			writeEmulationListItem(b, emulationLevelKey(k), l.label, l.description)
+		}
+		fmt.Fprintf(b, "Answer: a probability for each level, as answers.%s.probabilities.\n", key)
+	}
+}
+
+// writeEmulationListItem writes one "- key: label (description)" line.
+func writeEmulationListItem(b *strings.Builder, key, label, description string) {
+	fmt.Fprintf(b, "- %s: %s", key, label)
+	if description != "" {
+		fmt.Fprintf(b, " (%s)", description)
+	}
+	b.WriteByte('\n')
 }
 
 // strictObject is a strict JSON schema object: every property required, no
