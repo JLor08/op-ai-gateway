@@ -213,6 +213,11 @@ type TokenRecord struct {
 	// CLI show its model-switch popup for this token (#420). Stored as
 	// api_tokens.codex_model_switch_prompt; ungated, like SendUsageLimits.
 	CodexModelSwitchPrompt bool
+	// DecisionsEmulation is the opt-in (default false) that lets this token use
+	// the emulated decision endpoints on an OpenAI subscription vendor account
+	// (#380). Stored as api_tokens.decisions_emulation; ungated and editable
+	// through UpdateTokenMetadata.
+	DecisionsEmulation bool
 }
 
 // UserUIPreference is one per-user UI preference: an opaque JSON value stored

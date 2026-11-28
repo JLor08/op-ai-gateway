@@ -30,7 +30,7 @@ const vendorAccountCreateColumns = vendorAccountInsertColumns + `, share_usage_w
 // vendorAccountColumns is the single column list every vendor_accounts reader
 // selects, in the order scanVendorAccount scans them: the insert columns, then
 // the three sharing columns the narrow writers own.
-const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id, share_usage_with_members`
+const vendorAccountColumns = vendorAccountInsertColumns + `, share_level, system_group_id, share_usage_with_members, decision_emulation`
 
 // CreateVendorAccount inserts a new account. The credential columns are stored
 // exactly as given -- the caller seals them first. ShareLevel and SystemGroupID
@@ -185,6 +185,17 @@ func (s *SQLiteStore) UpdateVendorAccountShareUsage(ctx context.Context, id stri
 	result, err := s.exec(ctx, `update vendor_accounts set share_usage_with_members = ? where id = ?`, enabled, id)
 	if err != nil {
 		return fmt.Errorf("update vendor account share usage: %w", err)
+	}
+	return requireAffected(result)
+}
+
+// UpdateVendorAccountDecisionEmulation writes only decision_emulation (migration
+// 120) with a targeted UPDATE of that one column, like UpdateVendorAccountShareUsage
+// (updated_at is left alone). An unknown id is ErrNotFound.
+func (s *SQLiteStore) UpdateVendorAccountDecisionEmulation(ctx context.Context, id string, enabled bool) error {
+	result, err := s.exec(ctx, `update vendor_accounts set decision_emulation = ? where id = ?`, enabled, id)
+	if err != nil {
+		return fmt.Errorf("update vendor account decision emulation: %w", err)
 	}
 	return requireAffected(result)
 }
@@ -468,7 +479,7 @@ func scanVendorAccountUsage(row rowScanner) (routing.VendorAccountUsage, error) 
 
 func scanVendorAccount(row rowScanner) (routing.VendorAccount, error) {
 	var a routing.VendorAccount
-	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID, &a.ShareUsageWithMembers)
+	err := row.Scan(&a.ID, &a.OwnerUserID, &a.Vendor, &a.AuthType, &a.Name, &a.Status, &a.APIKey, &a.OAuthTokens, &a.ModelPrefix, &a.BaseURL, &a.CreatedAt, &a.UpdatedAt, &a.ShareLevel, &a.SystemGroupID, &a.ShareUsageWithMembers, &a.DecisionEmulation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.VendorAccount{}, ErrNotFound
 	}

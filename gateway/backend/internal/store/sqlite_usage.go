@@ -63,8 +63,8 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 			total_tokens, latency_ms, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second,
 			http_status, content_type, req_path, provider_path, provider_model, stream, token_name,
 			server_name, service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
-			billing_unit, billing_quantity
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			billing_unit, billing_quantity, decision_emulated
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		event.ID,
 		event.ID,
 		event.UserID,
@@ -108,6 +108,7 @@ func (s *SQLiteStore) Record(event usage.Event) error {
 		event.CreatedAt,
 		event.BillingUnit,
 		event.BillingQuantity,
+		event.DecisionEmulated,
 	)
 	s.setLastUsageError("record", err)
 	if err != nil {
@@ -219,7 +220,7 @@ func (s *SQLiteStore) ByUser(userID string) []usage.Event {
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
 			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
-			billing_unit, billing_quantity
+			billing_unit, billing_quantity, decision_emulated
 		from usage_events
 		where user_id = ?
 		order by created_at, id`, userID)
@@ -243,7 +244,7 @@ func (s *SQLiteStore) All() []usage.Event {
 			error_code, cached_tokens, cache_write_tokens, prompt_per_second, tokens_per_second, http_status,
 			content_type, req_path, provider_path, provider_model, stream, token_name, server_name,
 			service_id, service_name, project_id, project_name, energy_wh, energy_marginal_wh, energy_source, created_at,
-			billing_unit, billing_quantity
+			billing_unit, billing_quantity, decision_emulated
 		from usage_events
 		order by created_at, id`)
 	if err != nil {
@@ -371,6 +372,7 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 	for rows.Next() {
 		var event usage.Event
 		var streamInt int64
+		var decisionEmulatedInt int64
 		if err := rows.Scan(
 			&event.ID,
 			&event.UserID,
@@ -414,10 +416,12 @@ func scanUsageEvents(rows *sql.Rows) ([]usage.Event, error) {
 			&event.CreatedAt,
 			&event.BillingUnit,
 			&event.BillingQuantity,
+			&decisionEmulatedInt,
 		); err != nil {
 			return nil, fmt.Errorf("scan usage event: %w", err)
 		}
 		event.Stream = streamInt != 0
+		event.DecisionEmulated = decisionEmulatedInt != 0
 		events = append(events, event)
 	}
 	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -433,7 +437,7 @@ const usageEventColumns = `e.id, e.user_id, e.token_id, e.session_id, e.session_
 	e.error_code, e.cached_tokens, e.cache_write_tokens, e.prompt_per_second, e.tokens_per_second, e.http_status,
 	e.content_type, e.req_path, e.provider_path, e.provider_model, e.stream, e.token_name, e.server_name,
 	e.service_id, e.service_name, e.project_id, e.project_name, e.energy_wh, e.energy_marginal_wh, e.energy_source, e.created_at,
-	e.billing_unit, e.billing_quantity`
+	e.billing_unit, e.billing_quantity, e.decision_emulated`
 
 var usageSortColumns = map[string]string{
 	"created_at":        "e.created_at",
@@ -720,6 +724,7 @@ func scanUsageRows(rows *sql.Rows) ([]usage.Row, error) {
 	for rows.Next() {
 		var row usage.Row
 		var streamInt int64
+		var decisionEmulatedInt int64
 		if err := rows.Scan(
 			&row.ID,
 			&row.UserID,
@@ -763,11 +768,13 @@ func scanUsageRows(rows *sql.Rows) ([]usage.Row, error) {
 			&row.CreatedAt,
 			&row.BillingUnit,
 			&row.BillingQuantity,
+			&decisionEmulatedInt,
 			&row.UserName,
 		); err != nil {
 			return nil, fmt.Errorf("scan usage row: %w", err)
 		}
 		row.Stream = streamInt != 0
+		row.DecisionEmulated = decisionEmulatedInt != 0
 		out = append(out, row)
 	}
 	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrNoRows) {

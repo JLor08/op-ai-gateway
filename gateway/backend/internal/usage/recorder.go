@@ -115,6 +115,10 @@ type Event struct {
 	BillingUnit     string    `json:"billing_unit"`
 	BillingQuantity float64   `json:"billing_quantity"`
 	CreatedAt       time.Time `json:"created_at"`
+	// DecisionEmulated marks a request the gateway answered by emulating a
+	// decision endpoint on a chat model (#380). false on every other request and
+	// on rows recorded before migration 120.
+	DecisionEmulated bool `json:"decision_emulated"`
 	// CostEUR is a TRANSIENT, derived display field: (EnergyWh/1000) *
 	// price(Host), where price is the serving AI-server's own price_per_kwh
 	// when set (>0) else the system-wide energy_default_price_per_kwh

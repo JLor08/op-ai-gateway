@@ -6079,6 +6079,7 @@ func (s *Service) AuthorizeRunAsToken(ctx context.Context, principal auth.Token,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
 		SendUsageLimits:                record.SendUsageLimits,
 		CodexModelSwitchPrompt:         record.CodexModelSwitchPrompt,
+		DecisionsEmulation:             record.DecisionsEmulation,
 	}
 	if !hasGatewayUse(runAs) {
 		return auth.Token{}, ErrTokenForbidden

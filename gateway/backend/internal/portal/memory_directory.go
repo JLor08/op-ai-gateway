@@ -160,6 +160,7 @@ func (m *MemoryDirectory) CreatePlainToken(ctx context.Context, token store.Toke
 		DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
 		SendUsageLimits:                token.SendUsageLimits,
 		CodexModelSwitchPrompt:         token.CodexModelSwitchPrompt,
+		DecisionsEmulation:             token.DecisionsEmulation,
 	}, secret)
 	return nil
 }
@@ -222,6 +223,7 @@ func (m *MemoryDirectory) SetServiceTokensState(ctx context.Context, serviceID s
 			DecisionsConfidenceNormalize:   token.DecisionsConfidenceNormalize,
 			SendUsageLimits:                token.SendUsageLimits,
 			CodexModelSwitchPrompt:         token.CodexModelSwitchPrompt,
+			DecisionsEmulation:             token.DecisionsEmulation,
 		})
 	}
 	return nil
@@ -314,6 +316,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.DecisionsConfidenceNormalize = token.DecisionsConfidenceNormalize
 	existing.SendUsageLimits = token.SendUsageLimits
 	existing.CodexModelSwitchPrompt = token.CodexModelSwitchPrompt
+	existing.DecisionsEmulation = token.DecisionsEmulation
 	m.tokens[token.ID] = existing
 	m.auth.UpdateToken(auth.Token{
 		ID:                 existing.ID,
@@ -347,6 +350,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		DecisionsConfidenceNormalize:   existing.DecisionsConfidenceNormalize,
 		SendUsageLimits:                existing.SendUsageLimits,
 		CodexModelSwitchPrompt:         existing.CodexModelSwitchPrompt,
+		DecisionsEmulation:             existing.DecisionsEmulation,
 	})
 	return nil
 }

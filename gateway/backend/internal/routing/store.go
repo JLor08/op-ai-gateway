@@ -389,8 +389,14 @@ type VendorAccount struct {
 	// (the portal service defaults it to true for new accounts; the column default and
 	// existing rows stay false). UpdateVendorAccount never writes it.
 	ShareUsageWithMembers bool
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
+	// DecisionEmulation is the owner's opt-in (migration 120, #380) to let tokens
+	// that enable decision emulation answer the decision endpoints through this
+	// OpenAI subscription account by emulating them on a chat model. Written only
+	// by UpdateVendorAccountDecisionEmulation; CreateVendorAccount and
+	// UpdateVendorAccount never write it, so a new account starts off.
+	DecisionEmulation bool
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // VendorAccountOperatePatch is a change to the OPERATE columns of a vendor account
@@ -3700,6 +3706,11 @@ type VendorAccountStore interface {
 	// 110) with a targeted UPDATE of that one column; updated_at is left alone.
 	// Who may change it is the service's job. An unknown id is ErrNotFound.
 	UpdateVendorAccountShareUsage(ctx context.Context, id string, enabled bool) error
+	// UpdateVendorAccountDecisionEmulation writes only decision_emulation
+	// (migration 120) with a targeted UPDATE of that one column; updated_at is
+	// left alone. Who may change it is the service's job. An unknown id is
+	// ErrNotFound.
+	UpdateVendorAccountDecisionEmulation(ctx context.Context, id string, enabled bool) error
 	// UpdateVendorAccountSystemGroup writes only system_group_id -- the
 	// containment root (migration 91) -- with a targeted UPDATE of that one
 	// column, mirroring UpdateServerSystemGroup. An unknown id is ErrNotFound.

@@ -2188,6 +2188,18 @@ func (_d *RoutingStoreWithTracing) UpdateVendorAccount(ctx context.Context, acc 
 	return _d.Store.UpdateVendorAccount(ctx, acc)
 }
 
+func (_d *RoutingStoreWithTracing) UpdateVendorAccountDecisionEmulation(ctx context.Context, id string, enabled bool) (err error) {
+	ctx, span := Start(ctx, "routing.Store.UpdateVendorAccountDecisionEmulation")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.Store.UpdateVendorAccountDecisionEmulation(ctx, id, enabled)
+}
+
 func (_d *RoutingStoreWithTracing) UpdateVendorAccountGroup(ctx context.Context, g _sourceRouting.VendorAccountGroup) (err error) {
 	ctx, span := Start(ctx, "routing.Store.UpdateVendorAccountGroup")
 	defer span.End()

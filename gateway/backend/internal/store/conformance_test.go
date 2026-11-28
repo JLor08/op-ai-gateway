@@ -6632,6 +6632,10 @@ func TestConformanceMigration40ServiceAccountsRebuild(t *testing.T) {
 				t.Fatalf("reapply api_tokens.%s after migration40RawUp: %v", col, err)
 			}
 		}
+		// ...and v120's per-token decision-emulation opt-in.
+		if _, err := s.db.ExecContext(ctx, `alter table api_tokens add column decisions_emulation integer not null default 0`); err != nil {
+			t.Fatalf("reapply api_tokens.decisions_emulation after migration40RawUp: %v", err)
+		}
 
 		// The token's OWN data survived the rebuild losslessly, via the NEW
 		// Go code path (TokenByID/scanToken, which now reads the rebuilt shape).
@@ -9503,6 +9507,145 @@ func TestTokenUsageSwitchesReachAuthTokenSQL(t *testing.T) {
 		tok, ok = s.LookupBearer("Bearer ulr-secret")
 		if !ok || tok.SendUsageLimits || tok.CodexModelSwitchPrompt {
 			t.Fatalf("after update LookupBearer ok=%v send=%v prompt=%v, want false/false", ok, tok.SendUsageLimits, tok.CodexModelSwitchPrompt)
+		}
+	})
+}
+
+// TestConformanceDecisionEmulationRoundTrip proves the three #380 flags are
+// carried by every reader and writer on both dialects: the token's
+// decisions_emulation (CreatePlainToken, TokenByID, TokensByUser, LookupBearer,
+// UpdateTokenMetadata in both directions), the vendor account's
+// decision_emulation (its narrow writer, read back by every account reader) and
+// the usage event's decision_emulated mark (Record, read back by Query and All).
+// An unset flag must read false because false is the stored value.
+func TestConformanceDecisionEmulationRoundTrip(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		now := time.Now().UTC().Truncate(time.Second)
+		if err := s.CreateUser(ctx, newTestUser("usr_de", "de@example.test", now)); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+
+		// Token.
+		on := TokenRecord{ID: "tok_de_on", UserID: "usr_de", Name: "on", CreatedAt: now, UpdatedAt: now, DecisionsEmulation: true}
+		off := TokenRecord{ID: "tok_de_off", UserID: "usr_de", Name: "off", CreatedAt: now, UpdatedAt: now}
+		if err := s.CreatePlainToken(ctx, on, "de-on-secret"); err != nil {
+			t.Fatalf("CreatePlainToken(on): %v", err)
+		}
+		if err := s.CreatePlainToken(ctx, off, "de-off-secret"); err != nil {
+			t.Fatalf("CreatePlainToken(off): %v", err)
+		}
+		gotOn, err := s.TokenByID(ctx, "tok_de_on")
+		if err != nil || !gotOn.DecisionsEmulation {
+			t.Fatalf("TokenByID(on): err=%v %+v", err, gotOn)
+		}
+		if gotOn.DecisionsConfidenceNormalize {
+			t.Fatalf("decisions_emulation leaked into decisions_confidence_normalize: %+v", gotOn)
+		}
+		gotOff, err := s.TokenByID(ctx, "tok_de_off")
+		if err != nil || gotOff.DecisionsEmulation {
+			t.Fatalf("TokenByID(off): err=%v %+v", err, gotOff)
+		}
+		byUser, err := s.TokensByUser(ctx, "usr_de")
+		if err != nil {
+			t.Fatalf("TokensByUser: %v", err)
+		}
+		listed := map[string]bool{}
+		for _, rec := range byUser {
+			listed[rec.ID] = rec.DecisionsEmulation
+		}
+		if len(listed) != 2 || !listed["tok_de_on"] || listed["tok_de_off"] {
+			t.Fatalf("TokensByUser flags = %v, want on=true off=false", listed)
+		}
+		if b, ok := s.LookupBearer("Bearer de-on-secret"); !ok || !b.DecisionsEmulation {
+			t.Fatalf("LookupBearer(on) ok=%v DecisionsEmulation=%v, want true", ok, b.DecisionsEmulation)
+		}
+		if b, ok := s.LookupBearer("Bearer de-off-secret"); !ok || b.DecisionsEmulation {
+			t.Fatalf("LookupBearer(off) ok=%v DecisionsEmulation=%v, want false", ok, b.DecisionsEmulation)
+		}
+		gotOn.DecisionsEmulation = false
+		gotOn.UpdatedAt = now.Add(time.Minute)
+		gotOff.DecisionsEmulation = true
+		gotOff.UpdatedAt = now.Add(time.Minute)
+		if err := s.UpdateTokenMetadata(ctx, gotOn); err != nil {
+			t.Fatalf("UpdateTokenMetadata(on->off): %v", err)
+		}
+		if err := s.UpdateTokenMetadata(ctx, gotOff); err != nil {
+			t.Fatalf("UpdateTokenMetadata(off->on): %v", err)
+		}
+		if b, ok := s.LookupBearer("Bearer de-on-secret"); !ok || b.DecisionsEmulation {
+			t.Fatalf("LookupBearer(on->off) ok=%v DecisionsEmulation=%v, want false", ok, b.DecisionsEmulation)
+		}
+		if b, ok := s.LookupBearer("Bearer de-off-secret"); !ok || !b.DecisionsEmulation {
+			t.Fatalf("LookupBearer(off->on) ok=%v DecisionsEmulation=%v, want true", ok, b.DecisionsEmulation)
+		}
+		if rec, err := s.TokenByID(ctx, "tok_de_off"); err != nil || !rec.DecisionsEmulation {
+			t.Fatalf("TokenByID(off->on): err=%v %+v", err, rec)
+		}
+
+		// Vendor account.
+		for _, id := range []string{"va_de_1", "va_de_2"} {
+			acc := routing.VendorAccount{
+				ID: id, OwnerUserID: "usr_de", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthSubscription,
+				Name: id, Status: routing.VendorAccountStatusActive, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := s.CreateVendorAccount(ctx, acc); err != nil {
+				t.Fatalf("CreateVendorAccount(%s): %v", id, err)
+			}
+		}
+		if acc, err := s.VendorAccountByID(ctx, "va_de_1"); err != nil || acc.DecisionEmulation {
+			t.Fatalf("new account: err=%v DecisionEmulation=%v, want false", err, acc.DecisionEmulation)
+		}
+		if err := s.UpdateVendorAccountDecisionEmulation(ctx, "va_de_1", true); err != nil {
+			t.Fatalf("UpdateVendorAccountDecisionEmulation: %v", err)
+		}
+		if err := s.UpdateVendorAccountDecisionEmulation(ctx, "nope", true); err != ErrNotFound {
+			t.Fatalf("update missing account = %v, want ErrNotFound", err)
+		}
+		accs, err := s.VendorAccountsByOwner(ctx, "usr_de")
+		if err != nil {
+			t.Fatalf("VendorAccountsByOwner: %v", err)
+		}
+		flags := map[string]bool{}
+		for _, a := range accs {
+			flags[a.ID] = a.DecisionEmulation
+		}
+		if len(flags) != 2 || !flags["va_de_1"] || flags["va_de_2"] {
+			t.Fatalf("VendorAccountsByOwner flags = %v, want va_de_1 only", flags)
+		}
+		if err := s.UpdateVendorAccountDecisionEmulation(ctx, "va_de_1", false); err != nil {
+			t.Fatalf("disable: %v", err)
+		}
+		if acc, err := s.VendorAccountByID(ctx, "va_de_1"); err != nil || acc.DecisionEmulation {
+			t.Fatalf("after disabling: err=%v DecisionEmulation=%v, want false", err, acc.DecisionEmulation)
+		}
+
+		// Usage event.
+		for _, e := range []usage.Event{
+			{ID: "evt_de_on", UserID: "usr_de", Model: "m", Provider: "p", Status: "ok", HTTPStatus: 200, CreatedAt: now, DecisionEmulated: true},
+			{ID: "evt_de_off", UserID: "usr_de", Model: "m", Provider: "p", Status: "ok", HTTPStatus: 200, CreatedAt: now.Add(-time.Second)},
+		} {
+			if err := s.Record(e); err != nil {
+				t.Fatalf("Record(%s): %v", e.ID, err)
+			}
+		}
+		page, err := s.Query(usage.Query{UserID: "usr_de", Page: 1, Limit: 25})
+		if err != nil || len(page.Data) != 2 {
+			t.Fatalf("Query: err=%v page=%+v", err, page)
+		}
+		for _, e := range page.Data {
+			if want := e.ID == "evt_de_on"; e.DecisionEmulated != want {
+				t.Errorf("Query %s DecisionEmulated=%v, want %v", e.ID, e.DecisionEmulated, want)
+			}
+		}
+		all := s.All()
+		if len(all) != 2 {
+			t.Fatalf("All = %d events, want 2", len(all))
+		}
+		for _, e := range all {
+			if want := e.ID == "evt_de_on"; e.DecisionEmulated != want {
+				t.Errorf("All %s DecisionEmulated=%v, want %v", e.ID, e.DecisionEmulated, want)
+			}
 		}
 	})
 }
