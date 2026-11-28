@@ -2063,6 +2063,10 @@ func validDecisionsMode(raw string) (routing.EndpointMode, bool) {
 
 // validSystemOneMode accepts the four systemone_mode values, the same set as
 // decisions_mode (ADR-100).
+//
+// None of the three validators accepts routing.EndpointModeEmulate: it is a
+// route value the resolver sets on an emulated decision target (#380), never a
+// stored mode.
 func validSystemOneMode(raw string) (routing.EndpointMode, bool) {
 	return validDecisionsMode(raw)
 }

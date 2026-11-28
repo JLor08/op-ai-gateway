@@ -34,6 +34,7 @@ var targetFromMayLeaveZero = map[string]bool{
 	"Subscription":                true, // false for every self-hosted target (OAuth-bearer trigger, subscription-only)
 	"OpenAIPathPrefix":            true, // empty => /v1; only an OpenAI-compatible vendor-account target sets it
 	"VendorDecisionModel":         true, // only a vendor target built for a decision request sets it (routing.IsVendorDecisionModel)
+	"DecisionEmulated":            true, // only a vendor target emulating a decision request sets it (#380, withVendorDecisionEmulation)
 }
 
 // TestTargetFromPopulatesEveryField is the routing.Target analogue of

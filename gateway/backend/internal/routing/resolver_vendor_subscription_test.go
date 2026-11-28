@@ -342,6 +342,7 @@ var vendorSubscriptionTargetMayBeZero = map[string]bool{
 	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // a subscription target never serves the decision endpoints
 	"VendorDecisionModel":         true, // a subscription account serves no decision model (IsVendorDecisionModel)
+	"DecisionEmulated":            true, // a subscription target serves decisions only by emulation (#380), never on these chat shapes
 	"VendorShareUsageWithMembers": true, // the owner opt-in; this fixture leaves it off
 	"SystemOneMode":               true, // a subscription target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server
@@ -367,6 +368,7 @@ var vendorSubscriptionOpenAITargetMayBeZero = map[string]bool{
 	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"DecisionsMode":               true, // a subscription target never serves the decision endpoints
 	"VendorDecisionModel":         true, // a subscription account serves no decision model (IsVendorDecisionModel)
+	"DecisionEmulated":            true, // a subscription target serves decisions only by emulation (#380), never on these chat shapes
 	"VendorShareUsageWithMembers": true, // the owner opt-in; this fixture leaves it off
 	"SystemOneMode":               true, // a subscription target never serves the decision endpoints
 	"ServerID":                    true, // no on-prem server

@@ -494,6 +494,7 @@ var vendorTargetMayBeZero = map[string]bool{
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
+	"DecisionEmulated":            true, // only an OpenAI subscription account emulating decisions sets it (#380), never an api-key target
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"MessagesMode":                true, // zero == translate (the OpenAI shape has no messages passthrough)
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
@@ -523,6 +524,7 @@ var vendorAnthropicMessagesTargetMayBeZero = map[string]bool{
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
+	"DecisionEmulated":            true, // only an OpenAI subscription account emulating decisions sets it (#380), never an api-key target
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; Anthropic has no Responses surface
 	"OpportunisticMetrics":        true, // no per-app opportunistic-metrics toggle for a vendor
@@ -550,6 +552,7 @@ var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
 	"DecisionsMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"SystemOneMode":               true, // only a decision request's target serves the decision endpoints (vendorDecisionTargetMayBeZero)
 	"VendorDecisionModel":         true, // set only on a decision request's target
+	"DecisionEmulated":            true, // only an OpenAI subscription account emulating decisions sets it (#380), never an api-key target
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; the compat vendors never pass Responses through
 	"MessagesMode":                true, // zero == translate; the compat vendors never pass Messages through
@@ -572,6 +575,7 @@ var vendorOpenAICompatibleTargetMayBeZero = map[string]bool{
 // model mark are non-zero (the whole point), so they are NOT listed;
 // ResponsesMode is zero-OK (a decision request is no Responses request).
 var vendorDecisionTargetMayBeZero = map[string]bool{
+	"DecisionEmulated":            true, // the native ADR-100 decision target; emulation is subscription-only (#380)
 	"VendorGroupID":               true, // set only by the group resolver after it picks a member; an account-built target never carries it
 	"ServerID":                    true, // a vendor target has no on-prem server
 	"ResponsesMode":               true, // zero == translate; a decision request is no Responses request
@@ -648,7 +652,7 @@ func vendorDecisionTarget(t *testing.T, acc VendorAccount) Target {
 	t.Helper()
 	m := VendorAccountModel{AccountID: acc.ID, GatewayModel: "oa/gpt-6-luna", UpstreamModel: "gpt-6-luna", APIFlavor: APIFlavorOpenAI}
 	req := inference.Request{Model: "oa/gpt-6-luna", APIFlavor: APIFlavorOpenAIDecisions, RequiredCapabilities: []string{CapabilityAnyDecision}}
-	target, ok := vendorAccountModelTarget(acc, m, req, APIFlavorDecisions)
+	target, ok := vendorAccountModelTarget(acc, m, ownerToken(), req, APIFlavorDecisions)
 	if !ok {
 		t.Fatal("vendorAccountModelTarget built no decision target for the OpenAI api-key decision model")
 	}
@@ -762,7 +766,7 @@ func TestVendorAccountTargetNativeGemini(t *testing.T) {
 // ok == false means "no target, fall through", not an error.
 func TestVendorAccountModelTargetNativeFailClosed(t *testing.T) {
 	acc := VendorAccount{Vendor: VendorGoogleNative, AuthType: VendorAuthAPIKey, BaseURL: ""}
-	if _, ok := vendorAccountModelTarget(acc, VendorAccountModel{}, inference.Request{Model: "gemini-2.5-pro"}, "openai"); ok {
+	if _, ok := vendorAccountModelTarget(acc, VendorAccountModel{}, ownerToken(), inference.Request{Model: "gemini-2.5-pro"}, "openai"); ok {
 		t.Fatal("empty BaseURL for a preset vendor must fail closed")
 	}
 }

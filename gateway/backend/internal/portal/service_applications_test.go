@@ -4620,3 +4620,20 @@ func TestViewRuntimeTypeStrataApplication(t *testing.T) {
 		t.Fatalf("role = %q, want chat", got)
 	}
 }
+
+// TestModeValidatorsRejectTheEmulateRouteValue pins that routing.EndpointModeEmulate
+// is a route value only (#380): no application mode validator accepts it, so it
+// can never be stored as a responses/messages, decisions or System One mode.
+func TestModeValidatorsRejectTheEmulateRouteValue(t *testing.T) {
+	for name, valid := range map[string]func(string) (routing.EndpointMode, bool){
+		"validEndpointMode":  validEndpointMode,
+		"validDecisionsMode": validDecisionsMode,
+		"validSystemOneMode": validSystemOneMode,
+	} {
+		for _, raw := range []string{string(routing.EndpointModeEmulate), " emulate ", "Emulate"} {
+			if m, ok := valid(raw); ok || m != "" {
+				t.Fatalf("%s(%q) = %q, %v; want rejected", name, raw, m, ok)
+			}
+		}
+	}
+}

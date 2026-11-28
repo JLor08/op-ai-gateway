@@ -4,6 +4,7 @@
 package routing
 
 import (
+	"op-ai-gateway/internal/auth"
 	"op-ai-gateway/internal/inference"
 	"slices"
 )
@@ -56,6 +57,17 @@ func isVendorDecisionAccount(acc VendorAccount) bool {
 	return acc.Vendor == VendorOpenAI && acc.AuthType == VendorAuthAPIKey
 }
 
+// isVendorDecisionEmulationAccount reports whether acc may serve a decision
+// request by EMULATION for token (#380): an OpenAI SUBSCRIPTION account (the
+// ChatGPT backend has no /v1/decisions, so its chat model answers the question
+// instead) whose owner opted in (DecisionEmulation) asked by a token that opted
+// in (DecisionsEmulation). Both opt-ins are required; either off keeps today's
+// ADR-100 rule (no subscription account serves a decision request).
+func isVendorDecisionEmulationAccount(acc VendorAccount, token auth.Token) bool {
+	return acc.Vendor == VendorOpenAI && acc.AuthType == VendorAuthSubscription &&
+		acc.DecisionEmulation && token.DecisionsEmulation
+}
+
 // isVendorDecisionRequest reports whether req is a decision request the vendor
 // path may serve (ADR-100): a decision endpoint's flavor (coarse decisions,
 // which both /v1/decisions and /v1/systemone fold to) with exactly the derived
@@ -89,5 +101,19 @@ func withVendorDecisionRoute(t Target) Target {
 	t.DecisionsMode = EndpointModePassthrough
 	t.SystemOneMode = EndpointModeTranslate
 	t.VendorDecisionModel = true
+	return t
+}
+
+// withVendorDecisionEmulation turns an OpenAI subscription account's target into
+// the target of a decision request it serves by emulation (#380): the decisions
+// flavor beside the chat one, both decision endpoints on the emulate route
+// (EndpointModeEmulate, a route value only), and the emulation mark the gateway
+// takes that route on without reading verdicts. VendorDecisionModel stays false:
+// the account has no native decision endpoint to pass through or translate to.
+func withVendorDecisionEmulation(t Target) Target {
+	t.APIFlavors = append(append([]string(nil), t.APIFlavors...), APIFlavorDecisions)
+	t.DecisionsMode = EndpointModeEmulate
+	t.SystemOneMode = EndpointModeEmulate
+	t.DecisionEmulated = true
 	return t
 }
