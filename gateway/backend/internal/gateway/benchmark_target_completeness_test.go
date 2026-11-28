@@ -69,6 +69,7 @@ var benchmarkOmits = map[string]bool{
 	"Subscription":                true, // a benchmark never dispatches a vendor subscription bearer
 	"OpenAIPathPrefix":            true, // a benchmark measures self-hosted servers on the default /v1 path
 	"VendorDecisionModel":         true, // a benchmark never runs against a vendor account, let alone a decision request
+	"DecisionEmulated":            true, // a benchmark never runs against a vendor account, let alone an emulated decision request
 }
 
 // TestBenchmarkTargetReqSetsEveryFieldOrDocumentsOmission guards the SECOND real

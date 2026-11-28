@@ -327,6 +327,15 @@ type Target struct {
 	// chat request for the same model keeps its target unchanged; false on every
 	// other target.
 	VendorDecisionModel bool
+	// DecisionEmulated marks the target of a DECISION request served by an
+	// opted-in OpenAI subscription account through its chat model (#380,
+	// withVendorDecisionEmulation: account DecisionEmulation and token
+	// DecisionsEmulation, row upstream gpt-6-luna). Both decision modes are then
+	// EndpointModeEmulate and the gateway takes the emulate route without reading
+	// verdicts. Only vendorAccountModelTarget sets it, and only for a decision
+	// request, so a chat request for the same row keeps its target unchanged;
+	// false on every other target.
+	DecisionEmulated bool
 	// OpenAIPathPrefix is the URL path segment OpenAICompatibleClient puts between
 	// Endpoint and the OpenAI-dialect resource ("/chat/completions", "/models"):
 	// the composed URLs are {Endpoint}{prefix}/chat/completions and {prefix}/models.
@@ -1168,10 +1177,12 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 //     verdicts, so such a request skips the branch entirely. The ONE opt-in is a
 //     decision request (isVendorDecisionRequest: the decisions flavor with
 //     exactly [any_decision], ADR-100), and for it only an OpenAI api-key
-//     account's decision models are considered (IsVendorDecisionModel), so an
-//     Anthropic, subscription, Gemini or OpenAI-compatible account is never
-//     chosen for one, whatever its rows are named. A request on the decisions
-//     flavor WITHOUT that requirement is declined too.
+//     account's decision models are considered (IsVendorDecisionModel) or, with
+//     both opt-ins, an OpenAI subscription account by emulation (#380,
+//     isVendorDecisionEmulationAccount), so an Anthropic, Gemini or
+//     OpenAI-compatible account, or a subscription account without both
+//     opt-ins, is never chosen for one, whatever its rows are named. A request
+//     on the decisions flavor WITHOUT that requirement is declined too.
 //   - apiFlavor != APIFlavorOpenAIImages: the images relay has no vendor path in
 //     this milestone (the Target serves the text flavors via translate only).
 //
@@ -1206,7 +1217,7 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 	}
 	decision := isVendorDecisionRequest(req, apiFlavor)
 	for _, acc := range accounts {
-		if !r.vendorAccountUsable(acc, apiFlavor, decision) {
+		if !r.vendorAccountUsable(acc, token, apiFlavor, decision) {
 			continue
 		}
 		prefix, allowed := TokenVendorPrefix(token, acc)
@@ -1217,7 +1228,7 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 		if err != nil {
 			return Target{}, false, fmt.Errorf("resolve vendor account models: %w", err)
 		}
-		if t, ok := vendorAccountModelMatch(acc, models, prefix, req, apiFlavor); ok {
+		if t, ok := vendorAccountModelMatch(acc, models, token, prefix, req, apiFlavor); ok {
 			return t, true, nil
 		}
 	}
@@ -1228,10 +1239,13 @@ func (r *Resolver) resolveVendorAccount(ctx context.Context, token auth.Token, r
 // model row is read: whether acc may serve this request at all, independent of
 // which token asks and under which prefix (the account loop applies
 // TokenVendorPrefix afterwards; the group step needs no token prefix per
-// member). decision is isVendorDecisionRequest for the request; for a decision
-// request only an OpenAI api-key account (isVendorDecisionAccount) serves, the
-// model row then decides (vendorAccountModelTarget).
-func (r *Resolver) vendorAccountUsable(acc VendorAccount, apiFlavor string, decision bool) bool {
+// member). token is read for one thing only, its decision-emulation opt-in.
+// decision is isVendorDecisionRequest for the request; for a decision request
+// only an OpenAI api-key account (isVendorDecisionAccount) or an OpenAI
+// subscription account emulating decisions for this token
+// (isVendorDecisionEmulationAccount) serves, the model row then decides
+// (vendorAccountModelTarget).
+func (r *Resolver) vendorAccountUsable(acc VendorAccount, token auth.Token, apiFlavor string, decision bool) bool {
 	// Only an ACTIVE account serves; needs_reconnect (a dead refresh token) and
 	// disabled accounts are skipped and fall through to the standard path.
 	if acc.Status != VendorAccountStatusActive {
@@ -1260,13 +1274,17 @@ func (r *Resolver) vendorAccountUsable(acc VendorAccount, apiFlavor string, deci
 	// guard is explicit. (Anthropic subscription and every api_key account serve
 	// both dialects and are unaffected: translate, apart from an OpenAI api_key
 	// account's openai_responses passthrough.)
-	if acc.AuthType == VendorAuthSubscription && acc.Vendor == VendorOpenAI && apiFlavor != APIFlavorOpenAI {
-		return false
+	//
+	// A decision request (ADR-100) is served by an OpenAI api-key account, the
+	// one vendor backend with an OpenAI /v1/decisions, or by an OpenAI
+	// subscription account emulating decisions for this token (#380, both
+	// opt-ins). It is decided here, before the flavor guard (its coarse flavor is
+	// decisions, never openai) and before the model read, so no other account is
+	// even asked for its rows.
+	if decision {
+		return isVendorDecisionAccount(acc) || isVendorDecisionEmulationAccount(acc, token)
 	}
-	// A decision request (ADR-100) is served by an OpenAI api-key account only:
-	// the one vendor backend with an OpenAI /v1/decisions. Checked here, before the
-	// model read, so no other account is even asked for its rows.
-	if decision && !isVendorDecisionAccount(acc) {
+	if acc.AuthType == VendorAuthSubscription && acc.Vendor == VendorOpenAI && apiFlavor != APIFlavorOpenAI {
 		return false
 	}
 	return true
@@ -1284,12 +1302,12 @@ func (r *Resolver) vendorAccountUsable(acc VendorAccount, apiFlavor string, deci
 // the provider model. ok is false when no row matches, and also when the one match
 // is a subscription account with an unknown vendor (vendorAccountModelTarget fails
 // closed) — in both cases the caller falls through to the next account.
-func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, prefix string, req inference.Request, apiFlavor string) (Target, bool) {
+func vendorAccountModelMatch(acc VendorAccount, models []VendorAccountModel, token auth.Token, prefix string, req inference.Request, apiFlavor string) (Target, bool) {
 	for _, m := range models {
 		if prefix+m.UpstreamModel != req.Model {
 			continue
 		}
-		return vendorAccountModelTarget(acc, m, req, apiFlavor)
+		return vendorAccountModelTarget(acc, m, token, req, apiFlavor)
 	}
 	return Target{}, false
 }
@@ -1343,15 +1361,21 @@ func (r *Resolver) routableVendorAccounts(ctx context.Context, token auth.Token)
 // one (OpenAI-compatible or native Gemini) with no stored root URL, which fails
 // closed the same way. A decision request (isVendorDecisionRequest) builds one
 // only for a decision model (IsVendorDecisionModel), with the decision route
-// (withVendorDecisionRoute), and fails closed for any other row.
-func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, req inference.Request, apiFlavor string) (Target, bool) {
+// (withVendorDecisionRoute), or -- on an OpenAI subscription account emulating
+// decisions for token (isVendorDecisionEmulationAccount, #380) -- for a row
+// whose upstream is an OpenAI Decisions model, with the emulated route
+// (withVendorDecisionEmulation); it fails closed for any other row.
+func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, token auth.Token, req inference.Request, apiFlavor string) (Target, bool) {
 	if isVendorDecisionRequest(req, apiFlavor) {
 		// A decision request builds a target for a decision model only, and fails
 		// closed for every other row (the caller then tries the next account).
-		if !IsVendorDecisionModel(acc, m) {
-			return Target{}, false
+		if IsVendorDecisionModel(acc, m) {
+			return withVendorDecisionRoute(vendorAccountTarget(acc, m, req.Model, apiFlavor, req.APIFlavor)), true
 		}
-		return withVendorDecisionRoute(vendorAccountTarget(acc, m, req.Model, apiFlavor, req.APIFlavor)), true
+		if IsVendorDecisionEmulationModel(acc, m, token) {
+			return withVendorDecisionEmulation(vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor, req.APIFlavor)), true
+		}
+		return Target{}, false
 	}
 	if acc.AuthType != VendorAuthSubscription {
 		if IsPresetVendor(acc.Vendor) && strings.TrimSpace(acc.BaseURL) == "" {

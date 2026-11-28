@@ -164,6 +164,9 @@ type ServiceTokenDTO struct {
 	// DecisionsConfidenceNormalize opts the token into recomputed /v1/decisions
 	// confidence (ADR-098), ungated like ClaudeModelAliases; create and update.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// DecisionsEmulation opts the token into the decision emulation (#380), ungated;
+	// create only. Always emitted.
+	DecisionsEmulation bool `json:"decisions_emulation"`
 	// SendUsageLimits and CodexModelSwitchPrompt are the usage-limit opt-ins
 	// (#420), identical in meaning to TokenDTO's; create and update.
 	SendUsageLimits        bool `json:"send_usage_limits"`
@@ -204,6 +207,9 @@ type CreateServiceTokenRequest struct {
 	// DecisionsConfidenceNormalize opts the new token into recomputed
 	// /v1/decisions confidence (ADR-098). Off when omitted.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// DecisionsEmulation opts the new token into the decision emulation (#380).
+	// Off when omitted.
+	DecisionsEmulation bool `json:"decisions_emulation"`
 	// SendUsageLimits and CodexModelSwitchPrompt opt the new token into the
 	// usage-limit signals (see TokenDTO). Off when omitted.
 	SendUsageLimits        bool `json:"send_usage_limits"`
@@ -244,6 +250,7 @@ type UpdateServiceTokenRequest struct {
 	ClaudeModelAliases           *bool            `json:"claude_model_aliases,omitempty"`
 	ClaudeEffortCompatibility    *bool            `json:"claude_effort_compatibility,omitempty"`
 	DecisionsConfidenceNormalize *bool            `json:"decisions_confidence_normalize,omitempty"`
+	DecisionsEmulation           *bool            `json:"decisions_emulation,omitempty"`
 	SendUsageLimits              *bool            `json:"send_usage_limits,omitempty"`
 	CodexModelSwitchPrompt       *bool            `json:"codex_model_switch_prompt,omitempty"`
 }
@@ -855,6 +862,7 @@ func (s *Service) CreateServiceToken(ctx context.Context, principal auth.Token, 
 		ClaudeModelAliases:           req.ClaudeModelAliases,
 		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
+		DecisionsEmulation:           req.DecisionsEmulation,
 		SendUsageLimits:              req.SendUsageLimits,
 		CodexModelSwitchPrompt:       req.CodexModelSwitchPrompt,
 	}
@@ -1047,6 +1055,7 @@ func applyServiceTokenFlags(record *store.TokenRecord, req UpdateServiceTokenReq
 		{&record.ClaudeModelAliases, req.ClaudeModelAliases},
 		{&record.ClaudeEffortCompatibility, req.ClaudeEffortCompatibility},
 		{&record.DecisionsConfidenceNormalize, req.DecisionsConfidenceNormalize},
+		{&record.DecisionsEmulation, req.DecisionsEmulation},
 		{&record.SendUsageLimits, req.SendUsageLimits},
 		{&record.CodexModelSwitchPrompt, req.CodexModelSwitchPrompt},
 	} {
@@ -1334,6 +1343,7 @@ func serviceTokenDTO(record store.TokenRecord) ServiceTokenDTO {
 		ClaudeModelAliases:           record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:    record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: record.DecisionsConfidenceNormalize,
+		DecisionsEmulation:           record.DecisionsEmulation,
 		SendUsageLimits:              record.SendUsageLimits,
 		CodexModelSwitchPrompt:       record.CodexModelSwitchPrompt,
 	}

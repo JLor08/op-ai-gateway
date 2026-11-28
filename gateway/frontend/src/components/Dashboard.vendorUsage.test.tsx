@@ -87,6 +87,7 @@ function makeAccount(overrides: Partial<VendorAccount> = {}): VendorAccount {
     is_owner: true,
     shared_by: '',
     share_usage_with_members: false,
+    decision_emulation: false,
     ...overrides,
   };
 }

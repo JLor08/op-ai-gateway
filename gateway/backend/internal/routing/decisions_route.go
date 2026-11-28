@@ -26,6 +26,8 @@ func DecisionsPassthroughCapableKind(kind string) bool {
 //     translate when it answers System One, else no route.
 //   - translate: translate, ok only with the decision verdict.
 //   - passthrough: passthrough, ok only with the decision_openai verdict.
+//   - emulate (a route value, #380): ("", false), fail closed; the gateway
+//     takes the emulated route before it reads verdicts or calls this.
 //
 // kind is the effective upstream kind (the runtime spec type for a server_agent
 // mapping with a spec, else the application type). For a kind that is not
@@ -42,6 +44,11 @@ func EffectiveDecisionsRoute(kind string, mode EndpointMode, decision, decisionO
 	switch mode {
 	case EndpointModeDisabled:
 		return EndpointModeDisabled, true
+	case EndpointModeEmulate:
+		// A route value only (#380): the gateway takes the emulated route on
+		// Target.DecisionEmulated before any verdict is read, so emulate
+		// reaching here is a stray value and fails closed, never auto.
+		return "", false
 	case EndpointModeTranslate:
 		return EndpointModeTranslate, decision
 	case EndpointModePassthrough:
@@ -68,6 +75,7 @@ func EffectiveDecisionsRoute(kind string, mode EndpointMode, decision, decisionO
 //     only with the decisionOpenAI verdict on a DecisionsPassthroughCapableKind.
 //   - auto: passthrough when the mapping answers System One, else translate when
 //     it answers /v1/decisions on a capable kind, else no route.
+//   - emulate: ("", false), as for EffectiveDecisionsRoute.
 //
 // kind is the effective upstream kind, as for EffectiveDecisionsRoute. For a
 // kind that is not DecisionsPassthroughCapableKind a decisionOpenAI verdict is
@@ -80,6 +88,9 @@ func EffectiveSystemOneRoute(kind string, mode EndpointMode, decision, decisionO
 	switch mode {
 	case EndpointModeDisabled:
 		return EndpointModeDisabled, true
+	case EndpointModeEmulate:
+		// Fails closed, as in EffectiveDecisionsRoute.
+		return "", false
 	case EndpointModePassthrough:
 		return EndpointModePassthrough, decision
 	case EndpointModeTranslate:

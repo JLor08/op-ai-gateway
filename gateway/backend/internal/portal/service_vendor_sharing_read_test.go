@@ -43,6 +43,7 @@ var vendorDTOAllowedFields = map[string]string{
 	"models":                   "metadata",
 	"usage":                    "rate-limit snapshot",
 	"share_usage_with_members": "management (the owner's opt-in to show usage to members; a member's view never sets it)",
+	"decision_emulation":       "management (the owner's opt-in to the decision emulation, #380; a member's view never sets it)",
 	"created_at":               "metadata",
 	"updated_at":               "metadata",
 	"share_level":              "management",

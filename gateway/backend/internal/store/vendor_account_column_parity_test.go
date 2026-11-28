@@ -77,8 +77,10 @@ func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 				// Rows 0 and 2 opted in, row 1 did not: a reader that drops the
 				// column reads false for the opted-in rows and fails the compare.
 				ShareUsageWithMembers: i != 1,
-				CreatedAt:             now.Add(time.Duration(-10-i) * time.Minute),
-				UpdatedAt:             now.Add(time.Duration(-3-i) * time.Minute),
+				// Only row 2 opted in to decision emulation (#380).
+				DecisionEmulation: i == 2,
+				CreatedAt:         now.Add(time.Duration(-10-i) * time.Minute),
+				UpdatedAt:         now.Add(time.Duration(-3-i) * time.Minute),
 			})
 		}
 		for _, acc := range want {
@@ -95,6 +97,9 @@ func TestConformanceVendorAccountReadersAgreeOnEveryColumn(t *testing.T) {
 			}
 			if err := s.UpdateVendorAccountShareUsage(ctx, acc.ID, acc.ShareUsageWithMembers); err != nil {
 				t.Fatalf("set share usage %s: %v", acc.ID, err)
+			}
+			if err := s.UpdateVendorAccountDecisionEmulation(ctx, acc.ID, acc.DecisionEmulation); err != nil {
+				t.Fatalf("set decision emulation %s: %v", acc.ID, err)
 			}
 		}
 
@@ -177,7 +182,7 @@ func TestVendorAccountsSchemaColumnsAllCovered(t *testing.T) {
 		assertColumnCoverage(context.Background(), t, s, "vendor_accounts", columnCoverage{
 			bools: nil,
 			seeded: []string{
-				"api_key", "auth_type", "base_url", "created_at", "id", "model_prefix", "name", "oauth_tokens",
+				"api_key", "auth_type", "base_url", "created_at", "decision_emulation", "id", "model_prefix", "name", "oauth_tokens",
 				"owner_user_id", "share_level", "share_usage_with_members", "status", "system_group_id", "updated_at", "vendor",
 			},
 			ignored: nil,

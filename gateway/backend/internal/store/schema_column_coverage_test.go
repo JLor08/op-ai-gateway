@@ -108,7 +108,7 @@ func assertColumnCoverage(ctx context.Context, t *testing.T, s *SQLStore, table 
 func TestUsageEventsSchemaColumnsAllCovered(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, s *SQLStore) {
 		assertColumnCoverage(context.Background(), t, s, "usage_events", columnCoverage{
-			bools: []string{"stream"},
+			bools: []string{"decision_emulated", "stream"},
 			seeded: []string{
 				"account_id", "agent_id", "api_flavor", "billing_quantity", "billing_unit",
 				"cache_write_tokens", "cached_tokens", "content_type", "created_at",

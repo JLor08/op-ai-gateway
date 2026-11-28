@@ -295,14 +295,14 @@ func TestVendorAccountMemberReadOfAFullyPopulatedAccount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("owner read: %v", err)
 	}
-	if zero := zeroDTOFields(owner); !slices.Equal(zero, []string{"subscription_connected", "share_usage_with_members", "shared_by"}) {
-		t.Fatalf("the owner's view of the fixture has empty fields %v, want only subscription_connected (an api key account), share_usage_with_members (off: the member-safe state, the opt-in has its own tests) and shared_by: the fixture does not populate everything, so the member assertions would be vacuous", zero)
+	if zero := zeroDTOFields(owner); !slices.Equal(zero, []string{"subscription_connected", "share_usage_with_members", "decision_emulation", "shared_by"}) {
+		t.Fatalf("the owner's view of the fixture has empty fields %v, want only subscription_connected (an api key account), share_usage_with_members and decision_emulation (off: the member-safe state, the opt-ins have their own tests) and shared_by: the fixture does not populate everything, so the member assertions would be vacuous", zero)
 	}
 	cm, err := e.svc.GetVendorAccount(e.ctx, token("usr_cm", "admin"), acc.ID)
 	if err != nil {
 		t.Fatalf("CM read: %v", err)
 	}
-	if zero := zeroDTOFields(cm); !slices.Equal(zero, []string{"subscription_connected", "share_usage_with_members", "is_owner"}) {
+	if zero := zeroDTOFields(cm); !slices.Equal(zero, []string{"subscription_connected", "share_usage_with_members", "decision_emulation", "is_owner"}) {
 		t.Fatalf("the CM's view has empty fields %v, want only subscription_connected and is_owner (the management view is whole)", zero)
 	}
 	if leaked := leakedSecrets(cm, secrets); len(leaked) > 0 {

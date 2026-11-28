@@ -256,6 +256,7 @@ type API interface {
 	SetVendorAccountAdminGroups(context.Context, auth.Token, string, []string) (VendorAccountDTO, error)
 	SetVendorAccountShareLevel(context.Context, auth.Token, string, SetVendorAccountShareLevelRequest) (VendorAccountDTO, error)
 	SetVendorAccountShareUsage(context.Context, auth.Token, string, SetVendorAccountShareUsageRequest) (VendorAccountDTO, error)
+	SetVendorAccountDecisionEmulation(context.Context, auth.Token, string, SetVendorAccountDecisionEmulationRequest) (VendorAccountDTO, error)
 	SyncApplicationModels(context.Context, auth.Token, string) (SyncResultDTO, error)
 	SyncApplicationModelsForApp(context.Context, routing.AIServer, routing.Application) (SyncResultDTO, error)
 	SystemAdminModeRequirePassword(context.Context) bool

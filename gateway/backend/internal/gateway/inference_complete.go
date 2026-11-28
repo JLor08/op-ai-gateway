@@ -856,6 +856,11 @@ func (s *Server) recordUsage(start time.Time, token auth.Token, req inference.Re
 		CreatedAt:        time.Now().UTC(),
 		BillingUnit:      meta.BillingUnit,
 		BillingQuantity:  meta.BillingQuantity,
+		// The emulated decision route's mark (#380): only the resolver sets it,
+		// and only on the target of a decision request it emulates, so every row
+		// of such a request -- success, upstream failure, or a refusal after the
+		// resolve -- carries it, and no other row does.
+		DecisionEmulated: target.DecisionEmulated,
 	}
 	// Vendor-account rows: no vendor provider reports timings, so
 	// resp.Usage.TokensPerSecond is 0 and the Activity list rendered an em-dash

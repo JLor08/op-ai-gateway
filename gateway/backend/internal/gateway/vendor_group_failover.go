@@ -112,6 +112,19 @@ func withExcludedVendorAccount(req inference.Request, accountID string) inferenc
 	return req
 }
 
+// noteVendorGroupLimit runs steps 1-2 above for lost, a group member whose vendor
+// answered a limit (h its headers, retryAfter its parsed Retry-After): it scrapes
+// the member's usage from h and sets its cooldown, so the next selection skips
+// it. It returns the cooldown's end. The emulated decision route (#380) calls it
+// alone: it sets the cooldown but does not retry the request.
+func (s *Server) noteVendorGroupLimit(lost routing.Target, h http.Header, retryAfter time.Duration) time.Time {
+	s.scrapeVendorAccountUsage(lost, h)
+	now := time.Now()
+	until := vendorLimitCooldownUntil(h, retryAfter, now)
+	s.vendorCooldowns.Set(lost.VendorAccountID, lost.ProviderModel, until, vendorLimitPublicCooldownUntil(retryAfter, now))
+	return until
+}
+
 // vendorGroupFailover runs steps 1-3 above for lost, a group member whose vendor
 // answered req with a limit (h its headers, retryAfter its parsed Retry-After), and
 // reports whether the request moves on: to the returned target, with the returned
@@ -123,10 +136,7 @@ func (s *Server) vendorGroupFailover(token *auth.Token, req inference.Request, l
 	if lost.VendorGroupID == "" {
 		return req, routing.Target{}, false
 	}
-	s.scrapeVendorAccountUsage(lost, h)
-	now := time.Now()
-	until := vendorLimitCooldownUntil(h, retryAfter, now)
-	s.vendorCooldowns.Set(lost.VendorAccountID, lost.ProviderModel, until, vendorLimitPublicCooldownUntil(retryAfter, now))
+	until := s.noteVendorGroupLimit(lost, h, retryAfter)
 	next := withExcludedVendorAccount(req, lost.VendorAccountID)
 	target, err := resolve(token, next)
 	if err != nil || target.VendorGroupID != lost.VendorGroupID || slices.Contains(next.ExcludeVendorAccountIDs, target.VendorAccountID) {

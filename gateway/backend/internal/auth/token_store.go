@@ -93,6 +93,9 @@ type Token struct {
 	// CodexModelSwitchPrompt mirrors the token record's opt-in for the Codex
 	// CLI's model-switch popup — see store.TokenRecord.
 	CodexModelSwitchPrompt bool
+	// DecisionsEmulation mirrors the token record's opt-in for the emulated
+	// decision endpoints (#380) — see store.TokenRecord.
+	DecisionsEmulation bool
 }
 
 // IsService reports whether t is a service token (Kind=="service") — the

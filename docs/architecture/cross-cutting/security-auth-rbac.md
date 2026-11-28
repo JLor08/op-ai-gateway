@@ -304,6 +304,22 @@ an opted-in token (a translated `/v1/decisions` answer is buffered for every tok
 onto the run (`AuthorizeRunAsToken` copies the field); the portal session principal itself
 never has it.
 
+#### Decision emulation needs the account owner's and the token's opt-in
+
+Answering `/v1/decisions` and `/v1/systemone` by emulation on an OpenAI subscription account's chat model
+([Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions) item 13, [ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380))
+takes **two** switches, each default off. The token's `decisions_emulation` is an ordinary, ungated token setting
+like `decisions_confidence_normalize` (user and service tokens, on create and update; a run-as token
+carries it, `AuthorizeRunAsToken` copies the field): on its own it confers nothing, because it only lets the token use
+an account whose owner allowed it. The account's `decision_emulation` is **owner-only**
+(`PUT /api/portal/vendor-accounts/{id}/decision-emulation`, the share-usage gate: a co-manager or member is
+`403 vendor_account.forbidden`, a stranger and system scope `404`), because it spends the owner's subscription on
+classification traffic, which adds to the subscription path's Terms exposure
+([External Vendor Accounts §10](external-vendor-accounts.md#10-tos-experimental-status-and-verify-live)). Neither
+switch widens reach: the account must still be one the token may use (its per-token vendor access, [External Vendor Accounts
+§11](external-vendor-accounts.md#11-per-token-vendor-access), and the share grant), and the
+answer is marked (`X-OP-Decision-Emulated: chat`, the usage row's `decision_emulated`).
+
 #### Claude Code token secret shape
 
 A user token can opt into `claude_code_usage_display` (default off). Claude Code shows an

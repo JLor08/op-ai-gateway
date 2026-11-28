@@ -92,8 +92,8 @@ flowchart TB
 | Package | Responsibility |
 |---|---|
 | `cmd/gateway` | Process entry: config load, dependency wiring per store driver, HTTP server start, background loops; the `-healthcheck` and `-license` subcommands. |
-| `gateway` | HTTP server, route registration (public mux + agent mux), request auth, and all handler wiring (inference, portal, system, agent). |
-| `compat` | OpenAI/Anthropic request/response compatibility adapters. |
+| `gateway` | HTTP server, route registration (public mux + agent mux), request auth, and all handler wiring (inference, portal, system, agent). The decision endpoints' emulated route (`decisions_emulation.go`: one structured-output call to an opted-in OpenAI subscription chat model, the `X-OP-Decision-Emulated` mark, its usage row; [ADR-123](09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380)) lives here beside `decisions_handler.go` and `systemone_handler.go`. |
+| `compat` | OpenAI/Anthropic request/response compatibility adapters, and the pure decision translators: matrix A (`decisions.go`, OpenAI Decisions to System One), matrix B (`decisions_reverse.go`, the reverse) and the decision emulator (`decisions_emulation.go`: `BuildDecisionEmulation` turns an OpenAI Decisions body into one neutral chat request with a strict output schema, `ParseDecisionEmulation` turns the model's JSON back into the answer, [ADR-123](09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380)). |
 | `apierror` | Stable JSON error response helpers (clients depend on predictable failures). |
 | `account` | Auth + session + user management: login, session resolution, logout, set/change password, invite/list/update users, last-admin guard. |
 | `auth` | Token authentication primitives; bcrypt password hashing/policy. |

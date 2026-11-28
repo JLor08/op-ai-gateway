@@ -25,4 +25,11 @@ const (
 	// where the upstream serves /v1/decisions natively, translate it to
 	// System One otherwise (ADR-098).
 	EndpointModeAuto EndpointMode = "auto"
+	// EndpointModeEmulate is a ROUTE value only (#380): the resolver sets it as
+	// both decision modes of the target of a decision request it serves through
+	// an opted-in OpenAI subscription account (withVendorDecisionEmulation), whose
+	// chat model answers it by emulation. It is never stored and never accepted
+	// by any mode validator (portal validEndpointMode / validDecisionsMode / the
+	// System One mode validator), so no application can be configured with it.
+	EndpointModeEmulate EndpointMode = "emulate"
 )

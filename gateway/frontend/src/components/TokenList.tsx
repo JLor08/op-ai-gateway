@@ -174,6 +174,7 @@ export function TokenList({
   // Opt-in decision-confidence normalization (#373): /v1/decisions and
   // /v1/systemone report a 0..1 confidence whatever the model's own scale is.
   const [decisionsNormalize, setDecisionsNormalize] = useState(false);
+  const [decisionsEmulation, setDecisionsEmulation] = useState(false);
   const [claudeCodeUsage, setClaudeCodeUsage] = useState(false);
   // Usage-limit opt-ins (#420). The Codex switch prompt only takes effect with
   // the first switch, so it is forced off whenever that one is off.
@@ -307,6 +308,7 @@ export function TokenList({
     setClaudeAliases(false);
     setClaudeEffort(false);
     setDecisionsNormalize(false);
+    setDecisionsEmulation(false);
     setClaudeCodeUsage(false);
     setSendUsageLimits(false);
     setCodexSwitchPrompt(false);
@@ -346,6 +348,7 @@ export function TokenList({
     setClaudeAliases(row.claude_model_aliases ?? false);
     setClaudeEffort(row.claude_effort_compatibility ?? false);
     setDecisionsNormalize(row.decisions_confidence_normalize ?? false);
+    setDecisionsEmulation(row.decisions_emulation ?? false);
     setClaudeCodeUsage(row.claude_code_usage_display);
     setSendUsageLimits(row.send_usage_limits);
     setCodexSwitchPrompt(row.send_usage_limits && row.codex_model_switch_prompt);
@@ -385,6 +388,7 @@ export function TokenList({
         claude_model_aliases: claudeAliases,
         claude_effort_compatibility: claudeEffort,
         decisions_confidence_normalize: decisionsNormalize,
+        decisions_emulation: decisionsEmulation,
         claude_code_usage_display: claudeCodeUsage,
         send_usage_limits: sendUsageLimits,
         codex_model_switch_prompt: sendUsageLimits && codexSwitchPrompt,
@@ -423,6 +427,7 @@ export function TokenList({
       body.claude_model_aliases = claudeAliases;
       body.claude_effort_compatibility = claudeEffort;
       body.decisions_confidence_normalize = decisionsNormalize;
+      body.decisions_emulation = decisionsEmulation;
       body.send_usage_limits = sendUsageLimits;
       body.codex_model_switch_prompt = sendUsageLimits && codexSwitchPrompt;
       body.log_communication = logCommunication;
@@ -829,6 +834,20 @@ export function TokenList({
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenDecisionsConfidenceNormalizeHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={decisionsEmulation}
+                    onChange={(e) => setDecisionsEmulation(e.target.checked)}
+                  />
+                }
+                label={t.tokenDecisionsEmulation}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenDecisionsEmulationHint}
               </Typography>
             </Box>
             {/* The option fixes the secret's shape. On an existing token a change

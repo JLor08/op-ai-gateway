@@ -49,7 +49,7 @@ func (r *Resolver) resolveVendorGroup(ctx context.Context, token auth.Token, req
 		return Target{}, false, nil
 	}
 	vr := vendorGroupRequest{
-		req: req, apiFlavor: apiFlavor, decision: isVendorDecisionRequest(req, apiFlavor),
+		req: req, token: token, apiFlavor: apiFlavor, decision: isVendorDecisionRequest(req, apiFlavor),
 		reachable: make(map[string]VendorAccount, len(reachable)), now: r.clock(),
 	}
 	for _, acc := range reachable {
@@ -72,11 +72,12 @@ func (r *Resolver) resolveVendorGroup(ctx context.Context, token auth.Token, req
 }
 
 // vendorGroupRequest is what the group step resolves one request against: the
-// request, its coarse flavor and whether it is a decision request
-// (isVendorDecisionRequest), the grant's reachable accounts by id, and the resolve's
-// clock reading.
+// request, the asking token (read for its decision-emulation opt-in), its coarse
+// flavor and whether it is a decision request (isVendorDecisionRequest), the
+// grant's reachable accounts by id, and the resolve's clock reading.
 type vendorGroupRequest struct {
 	req       inference.Request
+	token     auth.Token
 	apiFlavor string
 	decision  bool
 	reachable map[string]VendorAccount
@@ -118,7 +119,7 @@ func (r *Resolver) resolveVendorGroupMember(ctx context.Context, g VendorAccount
 func (r *Resolver) vendorGroupCandidate(ctx context.Context, g VendorAccountGroup, accountID, upstream string, vr vendorGroupRequest) (VendorGroupCandidate, Target, error) {
 	cand := VendorGroupCandidate{AccountID: accountID}
 	acc, ok := vr.reachable[accountID]
-	if !ok || acc.Vendor != g.Vendor || !r.vendorAccountUsable(acc, vr.apiFlavor, vr.decision) ||
+	if !ok || acc.Vendor != g.Vendor || !r.vendorAccountUsable(acc, vr.token, vr.apiFlavor, vr.decision) ||
 		slices.Contains(vr.req.ExcludeVendorAccountIDs, acc.ID) {
 		return cand, Target{}, nil
 	}
@@ -149,7 +150,7 @@ func (r *Resolver) vendorGroupMemberTarget(ctx context.Context, acc VendorAccoun
 	}
 	for _, row := range models {
 		if row.UpstreamModel == upstream {
-			t, ok := vendorAccountModelTarget(acc, row, vr.req, vr.apiFlavor)
+			t, ok := vendorAccountModelTarget(acc, row, vr.token, vr.req, vr.apiFlavor)
 			return t, ok, nil
 		}
 	}

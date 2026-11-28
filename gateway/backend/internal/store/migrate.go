@@ -152,6 +152,7 @@ var migrations = []migration{
 	{version: 117, name: "server_binaries_rpc_protocol", up: migration117Up},
 	{version: 118, name: "runtime_spec_log_files", up: migration118Up},
 	{version: 119, name: "gpu_vendor_keys", rawUp: migration119RawUp},
+	{version: 120, name: "decision_emulation", up: migration120Up},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -5350,4 +5351,24 @@ func pgDropConstraintOn(ctx context.Context, tx *sql.Tx, table, contype string, 
 	}
 	_, err = tx.ExecContext(ctx, `alter table `+table+` drop constraint "`+strings.ReplaceAll(found, `"`, `""`)+`"`)
 	return err
+}
+
+// migration120Up adds the three decision-emulation columns (#380): the token's
+// opt-in api_tokens.decisions_emulation, the owner's opt-in
+// vendor_accounts.decision_emulation for an OpenAI subscription account, and the
+// per-request mark usage_events.decision_emulated. Each is `integer not null
+// default 0` on both dialects, and existing rows land on 0 = off / not
+// emulated, so the upgrade changes no behavior. addColumnIfMissing keeps it
+// re-runnable.
+func migration120Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, c := range []struct{ table, col string }{
+		{"api_tokens", "decisions_emulation integer not null default 0"},
+		{"vendor_accounts", "decision_emulation integer not null default 0"},
+		{"usage_events", "decision_emulated integer not null default 0"},
+	} {
+		if err := addColumnIfMissing(ctx, tx, dl, c.table, c.col); err != nil {
+			return err
+		}
+	}
+	return nil
 }

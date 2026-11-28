@@ -92,7 +92,14 @@ function renderCell(row: UsageEvent, id: ColumnId, t: Translation): ReactNode {
     case 'requested_model':
       return row.requested_model || '—';
     case 'model':
-      return row.model;
+      return row.decision_emulated ? (
+        <span>
+          {row.model}{' '}
+          <Chip size="small" variant="outlined" color="info" label={t.usageDecisionEmulated} />
+        </span>
+      ) : (
+        row.model
+      );
     case 'server_name':
       return <ServerLabelText row={row} t={t} />;
     case 'http_status':

@@ -101,6 +101,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   }
 
   describe(`ActivityTable [${locale}]`, () => {
+    it('marks a decision row answered by emulation with the Emulated badge', () => {
+      renderTable({ rows: [makeRow({ decision_emulated: true })] });
+      expect(screen.getByText(t.usageDecisionEmulated)).toBeInTheDocument();
+    });
+
+    it('shows no Emulated badge on an ordinary row', () => {
+      renderTable({ rows: [makeRow()] });
+      expect(screen.queryByText(t.usageDecisionEmulated)).toBeNull();
+    });
+
     it('renders the default column headers and a data row', () => {
       renderTable({
         columns: columnsWithServer,

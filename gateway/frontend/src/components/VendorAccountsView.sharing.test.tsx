@@ -46,6 +46,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     is_owner: true,
     shared_by: '',
     share_usage_with_members: false,
+    decision_emulation: false,
     ...overrides,
   };
 }
@@ -257,6 +258,9 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
               .map(({ id: gid, name }) => ({ id: gid, name })),
           })),
       ),
+      setVendorAccountDecisionEmulation: vi.fn<PortalApi['setVendorAccountDecisionEmulation']>(
+        async (id, enabled) => ({ ...byId(id), decision_emulation: enabled }),
+      ),
       vendorAccountAdminGroupCandidates: vi.fn<PortalApi['vendorAccountAdminGroupCandidates']>(
         async () => opts.candidates ?? [GROUP_A],
       ),
@@ -300,6 +304,51 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   const shareRegion = () => screen.queryByRole('region', { name: t.vendorAccountShareTitle });
   const groupsRegion = () =>
     screen.queryByRole('region', { name: t.vendorAccountAdminGroupsSectionTitle });
+
+  describe(`VendorAccountsView decision emulation opt-in (#380) [${locale}]`, () => {
+    const emulationBox = () =>
+      screen.queryByRole('checkbox', { name: t.vendorAccountDecisionEmulationLabel });
+
+    it('lets the owner of an OpenAI subscription account turn it on', async () => {
+      const { fakeApi } = renderView({ accounts: [makeVendorAccount(OPENAI_SUBSCRIPTION)] });
+      await openDetail();
+
+      const box = await screen.findByRole('checkbox', {
+        name: t.vendorAccountDecisionEmulationLabel,
+      });
+      expect(box).not.toBeChecked();
+      expect(screen.getByText(t.vendorAccountDecisionEmulationHelp)).toBeInTheDocument();
+      fireEvent.click(box);
+
+      await waitFor(() =>
+        expect(fakeApi.setVendorAccountDecisionEmulation).toHaveBeenCalledWith('va_oai_sub', true),
+      );
+      await waitFor(() => expect(emulationBox()).toBeChecked());
+    });
+
+    it('is not offered on an OpenAI api key account', async () => {
+      renderView({ accounts: [makeVendorAccount()] });
+      await openDetail();
+      await screen.findByLabelText(t.vendorAccountNameLabel);
+      expect(emulationBox()).toBeNull();
+    });
+
+    it('is not offered on a non-OpenAI subscription account', async () => {
+      renderView({
+        accounts: [makeVendorAccount({ ...OPENAI_SUBSCRIPTION, vendor: 'anthropic' })],
+      });
+      await openDetail();
+      await screen.findByLabelText(t.vendorAccountNameLabel);
+      expect(emulationBox()).toBeNull();
+    });
+
+    it('is not offered to a co-manager of an OpenAI subscription account', async () => {
+      renderView({ accounts: [managed(OPENAI_SUBSCRIPTION)] });
+      await openDetail();
+      await screen.findByLabelText(t.vendorAccountNameLabel);
+      expect(emulationBox()).toBeNull();
+    });
+  });
 
   describe(`VendorAccountsView share-usage opt-in [${locale}]`, () => {
     it('lets the owner of a shared account turn the opt-in on and shows the new state', async () => {

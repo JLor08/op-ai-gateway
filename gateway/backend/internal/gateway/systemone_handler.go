@@ -66,7 +66,8 @@ const (
 // (systemOneRoute), as for /v1/decisions. The capability list is also the one
 // the vendor-account path admits (ADR-100): there only the decision model of an
 // OpenAI api-key account (routing.IsVendorDecisionModel) is considered, and its
-// route is translate, to the vendor's /v1/decisions.
+// route is translate, to the vendor's /v1/decisions, or, with both opt-ins, an
+// OpenAI subscription account by emulation (#380, the emulated route).
 func systemOneInferenceShape(model string) inferenceShape {
 	return inferenceShape{
 		apiFlavor:            apiFlavorSystemOne,
@@ -250,6 +251,10 @@ func (s *Server) relaySystemOne(w http.ResponseWriter, r *http.Request, token au
 	if target, ok = s.systemOneRoute(w, r, c, target); !ok {
 		return
 	}
+	if target.DecisionEmulated {
+		s.relaySystemOneEmulation(w, r, c, target)
+		return
+	}
 	rel := nativeRelay{
 		token:    c.token,
 		target:   target,
@@ -294,8 +299,13 @@ func (s *Server) translateSystemOneRelay(w http.ResponseWriter, r *http.Request,
 // candidate then) is answered 404 systemone.endpoint_disabled. On success the
 // returned target carries the route (translate or passthrough) as its
 // SystemOneMode, which is what upstreamPath and the usage row's provider_path
-// read.
+// read. An emulated target (Target.DecisionEmulated, #380) takes the emulate
+// route without reading verdicts, as in decisionsRoute.
 func (s *Server) systemOneRoute(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target) (routing.Target, bool) {
+	if target.DecisionEmulated {
+		target.SystemOneMode = routing.EndpointModeEmulate
+		return target, true
+	}
 	route, ok := s.settleDecisionRoute(w, r, c, target, target.SystemOneMode, routing.EffectiveSystemOneRoute, codeSystemOneEndpointDisabled)
 	if !ok {
 		return routing.Target{}, false

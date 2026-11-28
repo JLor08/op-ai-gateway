@@ -3640,6 +3640,15 @@ const de = {
   tokenDecisionsConfidenceNormalize: 'Entscheidungs-Konfidenz normalisieren',
   tokenDecisionsConfidenceNormalizeHint:
     'Meldet die Konfidenz von Entscheidungen (/v1/decisions und /v1/systemone) immer auf einer Skala von 0 bis 1, auch wenn das Modell eine andere Skala verwendet.',
+  tokenDecisionsEmulation: 'Entscheidungen per Emulation beantworten',
+  tokenDecisionsEmulationHint:
+    'Erlaubt, dass die Entscheidungsanfragen dieses Tokens auf einem Konto, dessen Besitzer es zulässt, per Emulation beantwortet werden. Die Antworten sind als emuliert gekennzeichnet.',
+  vendorAccountDecisionEmulationTitle: 'Entscheidungs-Emulation',
+  vendorAccountDecisionEmulationLabel: 'Entscheidungen per Chat-Modell emulieren',
+  vendorAccountDecisionEmulationHelp:
+    'Entscheidungsanfragen werden beantwortet, indem das Chat-Modell des Kontos Wahrscheinlichkeiten schätzt. Die Werte sind nicht kalibriert, das Konto ersetzt kein natives Entscheidungsmodell. Jede Antwort ist als emuliert gekennzeichnet, und jeder Token muss zusätzlich zustimmen. Klassifikationsverkehr über ein Consumer-Abonnement erweitert die Nutzungsbedingungs-Hinweise des Abonnements.',
+  vendorAccountDecisionEmulationSaved: 'Einstellung gespeichert.',
+  usageDecisionEmulated: 'Emuliert',
   tokenClaudeCodeUsageDisplay: 'Claude-Code-Token-Format',
   tokenClaudeCodeUsageDisplayHint:
     'Das Geheimnis bekommt die Form, die Claude Code braucht, damit es Nutzungslimits liest, wenn dieser Token als ANTHROPIC_AUTH_TOKEN verwendet wird. Die Limits selbst werden nur mit „Nutzungslimits senden“ gesendet. Bei einem bestehenden Token erzeugt eine Änderung ein neues Geheimnis.',
@@ -7832,6 +7841,15 @@ const en: PortalMessages = {
   tokenDecisionsConfidenceNormalize: 'Normalize decision confidence',
   tokenDecisionsConfidenceNormalizeHint:
     'Reports the confidence of decisions (/v1/decisions and /v1/systemone) on a 0 to 1 scale whatever scale the model uses itself.',
+  tokenDecisionsEmulation: 'Answer decisions by emulation',
+  tokenDecisionsEmulationHint:
+    "Lets this token's decision requests be answered by emulation on an account whose owner allows it. The answers are marked as emulated.",
+  vendorAccountDecisionEmulationTitle: 'Decision emulation',
+  vendorAccountDecisionEmulationLabel: 'Emulate decisions with the chat model',
+  vendorAccountDecisionEmulationHelp:
+    "Decision requests are answered by asking the account's chat model to estimate probabilities. The values are uncalibrated and this is not a native decision model. Every answer is marked as emulated, and each token must opt in as well. Classification traffic through a consumer subscription adds to the subscription's Terms caveats.",
+  vendorAccountDecisionEmulationSaved: 'Setting saved.',
+  usageDecisionEmulated: 'Emulated',
   tokenClaudeCodeUsageDisplay: 'Claude Code token format',
   tokenClaudeCodeUsageDisplayHint:
     'Gives the secret the shape Claude Code needs before it reads usage limits when this token is used as ANTHROPIC_AUTH_TOKEN. The limits themselves are sent only with "Send usage limits". On an existing token, changing it creates a new secret.',

@@ -116,6 +116,8 @@ export type ServiceTokenDTO = {
   // Opt-in decision-confidence normalization, identical in meaning to
   // PortalToken's.
   decisions_confidence_normalize?: boolean;
+  // Decision emulation opt-in (#380), identical in meaning to PortalToken's.
+  decisions_emulation?: boolean;
   // Usage-limit opt-ins, identical in meaning to PortalToken's (#420).
   send_usage_limits?: boolean;
   codex_model_switch_prompt?: boolean;
@@ -145,6 +147,8 @@ export type CreateServiceTokenRequest = {
   claude_effort_compatibility?: boolean;
   // Decision-confidence normalization (see ServiceTokenDTO); omitted = off.
   decisions_confidence_normalize?: boolean;
+  // Decision emulation (see ServiceTokenDTO); omitted = off.
+  decisions_emulation?: boolean;
   // Usage-limit switches (see ServiceTokenDTO); omitted = off.
   send_usage_limits?: boolean;
   codex_model_switch_prompt?: boolean;

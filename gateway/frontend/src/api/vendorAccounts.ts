@@ -156,6 +156,10 @@ export type VendorAccount = {
   // on the account page and the dashboard. Every read carries it, the member view
   // too (with the account's real value); only the owner may change it.
   share_usage_with_members: boolean;
+  // The owner's opt-in (#380) to answer the decision endpoints on this OpenAI
+  // subscription account by emulation on its chat model. Management views carry
+  // the stored value; member views read false.
+  decision_emulation: boolean;
 };
 
 // One resource group the OWNER of a shared account may enter it into (spec
@@ -373,6 +377,16 @@ export function vendorAccountsApi(fetcher: Fetcher) {
       request<VendorAccount>(
         fetcher,
         `/api/portal/vendor-accounts/${encodeURIComponent(id)}/share-usage`,
+        { method: 'PUT', body: { enabled } },
+      ),
+    // Turns the owner's opt-in to answer the decision endpoints by emulation on
+    // the account's chat model on or off (PUT .../decision-emulation, #380). Owner
+    // only; anything but an OpenAI subscription account is a 409
+    // vendor_account.decision_emulation_unsupported.
+    setVendorAccountDecisionEmulation: (id: string, enabled: boolean) =>
+      request<VendorAccount>(
+        fetcher,
+        `/api/portal/vendor-accounts/${encodeURIComponent(id)}/decision-emulation`,
         { method: 'PUT', body: { enabled } },
       ),
     // Replaces the management groups of an account that is already shared (PUT

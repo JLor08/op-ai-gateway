@@ -723,7 +723,8 @@ account id that served it (`account_id`, `''` off the vendor path; the account's
 display name is a separate, read-time-only `account_name` on the list DTO, see
 "Vendor-account rows" below), API flavor, model
 (requested + effective provider model), route/provider/host, token counts, latency,
-HTTP status/error code, content type, and (additively) energy/cost.
+HTTP status/error code, content type, the decision-emulation mark (`decision_emulated`, below), and
+(additively) energy/cost.
 
 The model name is carried through three stages, each its own column: `requested_model`
 (the client's original name, before any per-token resolution) → `model` (the
@@ -878,6 +879,19 @@ Activity renders it as never measured. Two things make it readable:
   SQL join against the account table in the store. Until then vendor rows fold
   into the empty-server bucket, and the expanded member rows show the attributed
   label.
+
+**Emulated decision rows: the `decision_emulated` mark** (migration 120, #380, [ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380)). A decision
+request (`/v1/decisions`, `/v1/systemone`) answered by emulation on an OpenAI subscription account's chat model
+([Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions) item 13) records
+`usage.Event.DecisionEmulated` (`json:"decision_emulated"`, always emitted, the `usage_events.decision_emulated`
+column). `recordUsage` reads it off the target (`Target.DecisionEmulated`), which only the resolver sets and only on
+the target of such a request, so **every** row of an emulated request carries it (a success, an upstream or
+provider failure, an unreadable answer, a translator or emulator refusal after the resolve) and no other row
+does. The row is otherwise a vendor row: token-metered from the Responses usage (cached tokens split off as
+above), `account_id` the serving account, `provider_path` `/responses`, cost 0. `usage.Row` embeds the event, so
+the flag reaches the Activity list API with no DTO change; the Activity table shows an outlined **Emulated** chip
+beside the model in the Model column (`ActivityTable.tsx`, i18n `usageDecisionEmulated`), so the mark is only
+visible while that column is shown (it is by default). The time-series projection does not read it.
 
 **The billable measure is a `(billing_unit, billing_quantity)` pair** (migration
 v81), not a scalar, and it is an **XOR** with the token columns.
@@ -1880,7 +1894,7 @@ live-progress verdict of `""` on every path, because Ollama exposes no
 
 The verdict is persisted as the mapping's **`live_progress` capability row**
 (`model_mapping_capabilities`, migration 78 — see [Data Model
-§4](../reference/data-model.md#4-migration-history-119-migrations)), where the
+§4](../reference/data-model.md#4-migration-history-120-migrations)), where the
 `supported`/`unsupported` vocabulary above is the row's `yes`/`no` and the
 undetermined `""` is the **absence of a row**. Both probe write paths
 translate through the one function, `routing.LiveProgressCapabilityVerdict`,
@@ -2384,7 +2398,7 @@ llama.cpp's `/props`, Ollama's `/api/show`, stable-diffusion.cpp's
 `model_mapping_capabilities` row keyed by `(mapping_id, capability)`
 (migration 78; migration 79 then dropped the eleven `model_mappings` columns
 that used to hold these verdicts — [Data Model
-§4](../reference/data-model.md#4-migration-history-119-migrations)). The four
+§4](../reference/data-model.md#4-migration-history-120-migrations)). The four
 names the `/props` detector reads are `vision`/`video`/`audio`/`tools`; every
 OTHER capability name an agent reports on the wire becomes its own row too,
 carried verbatim even when this codebase has never heard of it, so the open

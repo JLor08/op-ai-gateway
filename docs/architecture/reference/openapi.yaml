@@ -1119,7 +1119,14 @@ paths:
         buffer bound, and for a token with `decisions_confidence_normalize`
         an upstream body that is over the buffer bound or broken off. Metered in tokens from
         the answer's `usage.input_tokens` and `usage.output_tokens`. Routed to a
-        vendor account only for that decision model. Beyond those it answers the same
+        vendor account only for that decision model, or, for a token with
+        `decisions_emulation`, by EMULATION on an OpenAI subscription account
+        with `decision_emulation` (the body translated to OpenAI Decisions,
+        answered by one structured-output call to the chat model, and
+        translated back; the emulator's own refusals keep their
+        `decisions.*` codes, an unreadable answer is 502
+        `systemone.upstream_error`). Every answer of the emulated route,
+        success or error, carries `X-OP-Decision-Emulated: chat`. Beyond those it answers the same
         statuses as every other inference path (429/402 from the principal
         limiter, 503 from the capacity queue or no healthy host).
       security: [{ bearerAuth: [] }]
@@ -1130,7 +1137,11 @@ paths:
             schema: { $ref: '#/components/schemas/SystemOneRequest' }
       responses:
         '200':
-          description: The upstream's own answer, relayed verbatim (the `confidence` values rewritten for a token with `decisions_confidence_normalize`).
+          description: The upstream's own answer, relayed verbatim (the `confidence` values rewritten for a token with `decisions_confidence_normalize`); on the emulated route the answer built from the chat model's estimates.
+          headers:
+            X-OP-Decision-Emulated:
+              description: Present, with the value chat, on every answer of an emulated decision request (a chat model answered by structured output; the probabilities are uncalibrated estimates).
+              schema: { type: string, enum: [chat] }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SystemOneResponse' }
@@ -1210,7 +1221,18 @@ paths:
         max(p)/sum(p) in every mode. Metered in tokens (a passthrough also
         records `input_tokens_details.cached_tokens` and `cache_write_tokens`).
         Routed to a vendor account only for an OpenAI api-key account's
-        decision model (`gpt-6-luna`), by passthrough to api.openai.com. Beyond those it answers the same
+        decision model (`gpt-6-luna`), by passthrough to api.openai.com, or,
+        for a token with `decisions_emulation`, an OpenAI subscription
+        account with `decision_emulation`, by EMULATION: one structured-output
+        Responses call to its chat model, the verdicts derived from the
+        model's probability estimates (uncalibrated). Every answer of the
+        emulated route, success or error, carries the response header
+        `X-OP-Decision-Emulated: chat`; an image URL may be `http(s)` there,
+        an empty question list is 400 `decisions.question_invalid`, an
+        answer that is not the schema's JSON is 502
+        `decisions.upstream_error`, and a provider error keeps the chat
+        path's status and code (`provider.unavailable` becomes
+        `decisions.upstream_error`). Beyond those it answers the same
         statuses as every other inference path (429/402 from the principal
         limiter, 503 from the capacity queue or no healthy host).
       security: [{ bearerAuth: [] }]
@@ -1221,7 +1243,11 @@ paths:
             schema: { $ref: '#/components/schemas/DecisionsRequest' }
       responses:
         '200':
-          description: The answers, one per question in request order (a passthrough relays the upstream's own body).
+          description: The answers, one per question in request order (a passthrough relays the upstream's own body; the emulated route builds them from the chat model's estimates).
+          headers:
+            X-OP-Decision-Emulated:
+              description: Present, with the value chat, on every answer of an emulated decision request (a chat model answered by structured output; the probabilities are uncalibrated estimates).
+              schema: { type: string, enum: [chat] }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/DecisionsResponse' }
@@ -1577,6 +1603,10 @@ paths:
       always present on a read): when true, the confidence of the choice and
       score answers of /v1/decisions and /v1/systemone is recomputed from
       their probabilities. It is NOT management-gated. A token also
+      carries the opt-in decisions_emulation flag (default false, always
+      present on a read, not management-gated): when true, its decision
+      requests may be answered by emulation on an OpenAI subscription
+      account's chat model whose owner set decision_emulation. A token also
       carries the opt-in claude_code_usage_display flag (default false, always
       present on a read): when true, its secret has the Claude Code shape (a
       JWT-looking prefix around the opaigw_ secret) so Claude Code can read usage
@@ -1618,6 +1648,7 @@ paths:
                         claude_model_aliases: { type: boolean }
                         claude_effort_compatibility: { type: boolean }
                         decisions_confidence_normalize: { type: boolean }
+                        decisions_emulation: { type: boolean }
                         claude_code_usage_display: { type: boolean }
                         send_usage_limits: { type: boolean }
                         codex_model_switch_prompt: { type: boolean }
@@ -1647,9 +1678,10 @@ paths:
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
-                claude_effort_compatibility, decisions_confidence_normalize
-                claude_code_usage_display, send_usage_limits and
-                codex_model_switch_prompt are modeled here.
+                claude_effort_compatibility, decisions_confidence_normalize,
+                decisions_emulation, claude_code_usage_display,
+                send_usage_limits and codex_model_switch_prompt are modeled
+                here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1668,6 +1700,13 @@ paths:
                   description: >
                     Opt into recomputed decision confidence. Absent means off.
                     Not management-gated.
+                decisions_emulation:
+                  type: boolean
+                  description: >
+                    Opt into decision emulation: /v1/decisions and
+                    /v1/systemone requests may be answered by emulation on an
+                    OpenAI subscription account's chat model whose owner
+                    opted in too. Absent means off. Not management-gated.
                 claude_code_usage_display:
                   type: boolean
                   description: >
@@ -1714,9 +1753,10 @@ paths:
               description: >
                 Token fields as defined by the Go DTO (see api-surface.md);
                 only vendor_access, claude_model_aliases,
-                claude_effort_compatibility, decisions_confidence_normalize
-                claude_code_usage_display, send_usage_limits and
-                codex_model_switch_prompt are modeled here.
+                claude_effort_compatibility, decisions_confidence_normalize,
+                decisions_emulation, claude_code_usage_display,
+                send_usage_limits and codex_model_switch_prompt are modeled
+                here.
               additionalProperties: true
               properties:
                 vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
@@ -1733,6 +1773,11 @@ paths:
                     portal.principal_forbidden, and no other field of the same
                     request is applied either).
                 decisions_confidence_normalize:
+                  type: boolean
+                  description: >
+                    Replaces the stored flag when present (true or false);
+                    absent keeps it. Not management-gated.
+                decisions_emulation:
                   type: boolean
                   description: >
                     Replaces the stored flag when present (true or false);
@@ -3600,11 +3645,11 @@ paths:
       provisioned directly into a resource group that contains them); a
       rotation preserves it. A service token takes the same
       claude_model_aliases, claude_effort_compatibility,
-      decisions_confidence_normalize, send_usage_limits and
-      codex_model_switch_prompt flags as a user token, on create and update,
-      and reads them back on the token list. claude_effort_compatibility keeps
-      the management-only rule: creating a service token with it true, or
-      updating one with the field present at all, from an inference-only
+      decisions_confidence_normalize, decisions_emulation, send_usage_limits
+      and codex_model_switch_prompt flags as a user token, on create and
+      update, and reads them back on the token list. claude_effort_compatibility
+      keeps the management-only rule: creating a service token with it true,
+      or updating one with the field present at all, from an inference-only
       bearer is a 403 portal.principal_forbidden, while a portal session or an
       admin-scope bearer may.
     get:
@@ -4381,6 +4426,48 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/VendorAccountsUnavailable' }
+  /api/portal/vendor-accounts/{id}/decision-emulation:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+    put:
+      tags: [portal]
+      summary: Set the owner's opt-in to answer decision requests by emulation on the account's chat model
+      description: >
+        Body {enabled} (#380). The owner only: 403 vendor_account.forbidden for
+        a CM or a member (who can see the account), 404 vendor_account.not_found
+        for a stranger, an unknown id and system scope. Then 400
+        request.invalid_json for a malformed body or a body without enabled,
+        then 409 vendor_account.decision_emulation_unsupported for an account
+        that is not an OpenAI subscription account (nothing is written); 409
+        while the vendor-accounts module flag is off; 500
+        vendor_account.decision_emulation_failed on a store failure. Not gated
+        on the sharing switches and allowed at any share level. With the
+        opt-in on, a token with decisions_emulation may have its /v1/decisions
+        and /v1/systemone requests for gpt-6-luna answered by emulation (the
+        answers carry X-OP-Decision-Emulated: chat).
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VendorAccountDecisionEmulationRequest' }
+      responses:
+        '200':
+          description: The credential-free management view with the new opt-in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VendorAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: >
+            The Error envelope: vendor_account.decision_emulation_unsupported (not
+            an OpenAI subscription account), or vendor_accounts.module_disabled
+            while the module flag is off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
   /api/portal/vendor-accounts/{id}/admin-groups:
     parameters:
       - { name: id, in: path, required: true, schema: { type: string } }
@@ -6253,6 +6340,7 @@ components:
         claude_model_aliases: { type: boolean }
         claude_effort_compatibility: { type: boolean }
         decisions_confidence_normalize: { type: boolean }
+        decisions_emulation: { type: boolean }
         send_usage_limits: { type: boolean }
         codex_model_switch_prompt: { type: boolean }
     UpdateServiceTokenRequest:
@@ -6284,6 +6372,7 @@ components:
             MANAGEMENT-ONLY: any present value from an inference-only bearer is
             a 403 portal.principal_forbidden and nothing is written.
         decisions_confidence_normalize: { type: boolean }
+        decisions_emulation: { type: boolean }
         send_usage_limits: { type: boolean }
         codex_model_switch_prompt: { type: boolean }
     TokenVendorAccess:
@@ -6547,6 +6636,12 @@ components:
       required: [enabled]
       properties:
         enabled: { type: boolean, description: "Whether members may see the account's usage." }
+    VendorAccountDecisionEmulationRequest:
+      type: object
+      description: portal.SetVendorAccountDecisionEmulationRequest.
+      required: [enabled]
+      properties:
+        enabled: { type: boolean, description: "Whether the account's chat model may answer decision requests by emulation." }
     VendorAccountShareLevelRequest:
       type: object
       description: portal.SetVendorAccountShareLevelRequest.
@@ -6660,7 +6755,7 @@ components:
         upstream_model and the two timestamps. share_usage_with_members is
         carried (the account's actual value); usage is added to the member view
         only when it is true, and is omitted otherwise.
-      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by, share_usage_with_members]
+      required: [id, vendor, auth_type, name, status, model_prefix, base_url, api_key_set, subscription_connected, models, created_at, updated_at, share_level, admin_groups, system_group_id, system_group_name, is_owner, shared_by, share_usage_with_members, decision_emulation]
       properties:
         id: { type: string, description: 'va_-prefixed, random hex.' }
         vendor: { type: string, enum: [openai, anthropic, xai, openrouter, kilo, google, google_native, openai_compatible] }
@@ -6713,6 +6808,12 @@ components:
             The owner's opt-in to show usage to members (PUT .../share-usage).
             Carried in the member view too, as the account's actual value (a
             member who sees usage reads true).
+        decision_emulation:
+          type: boolean
+          description: >
+            The owner's opt-in to decision emulation (PUT .../decision-emulation),
+            only ever true on an OpenAI subscription account. Management view
+            only; the member view reads false.
         shared_by:
           type: string
           description: >
