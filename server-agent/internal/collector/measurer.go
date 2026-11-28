@@ -46,20 +46,28 @@ func composeMeasurers(parts ...vendorMeasurer) func(pids []int) map[int]map[GPUK
 	return func(pids []int) map[int]map[GPUKey]int {
 		var out map[int]map[GPUKey]int
 		for _, p := range live {
-			for pid, byIndex := range p.measure(pids) {
-				for idx, mib := range byIndex {
-					if out == nil {
-						out = make(map[int]map[GPUKey]int)
-					}
-					if out[pid] == nil {
-						out[pid] = make(map[GPUKey]int)
-					}
-					out[pid][GPUKey{Vendor: p.vendor, Index: idx}] = mib
-				}
-			}
+			out = mergeVendorAnswer(out, p.vendor, p.measure(pids))
 		}
 		return out
 	}
+}
+
+// mergeVendorAnswer adds one vendor's answer (pid -> that vendor's GPU index
+// -> MiB) to out under vendor-carrying keys and returns out, allocated only
+// once there is a value to hold.
+func mergeVendorAnswer(out map[int]map[GPUKey]int, vendor string, answer map[int]map[int]int) map[int]map[GPUKey]int {
+	for pid, byIndex := range answer {
+		for idx, mib := range byIndex {
+			if out == nil {
+				out = make(map[int]map[GPUKey]int)
+			}
+			if out[pid] == nil {
+				out[pid] = make(map[GPUKey]int)
+			}
+			out[pid][GPUKey{Vendor: vendor, Index: idx}] = mib
+		}
+	}
+	return out
 }
 
 // Backend lists per source. NVIDIA's measurers (Linux compute-apps, Windows

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,64 +32,94 @@ type VulkanDevice struct {
 // first section per n wins: a header repeated later in the output opens no
 // second device and its values are ignored. The result is ordered by n.
 func parseVulkaninfo(out []byte) []VulkanDevice {
-	var devs []VulkanDevice
-	seen := make(map[int]bool)
-	cur := -1
-	var pci [4]uint32
-	var pciSeen [4]bool
-	finish := func() {
-		if cur >= 0 {
-			d := &devs[cur]
-			d.PCI = pciAddr{Domain: pci[0], Bus: pci[1], Device: pci[2], Function: pci[3]}
-			d.HasPCI = pciSeen[0] && pciSeen[1] && pciSeen[2] && pciSeen[3]
-		}
-		pci, pciSeen = [4]uint32{}, [4]bool{}
-	}
-	pciKeys := [4]string{"pciDomain", "pciBus", "pciDevice", "pciFunction"}
+	p := vulkaninfoParser{seen: make(map[int]bool), cur: -1}
 	for _, raw := range strings.Split(string(out), "\n") {
 		line := strings.TrimSpace(raw)
 		if n, ok := vulkanGPUHeader(line); ok {
-			finish()
-			cur = -1 // a repeated header: skip its section
-			if !seen[n] {
-				seen[n] = true
-				devs = append(devs, VulkanDevice{Ordinal: n})
-				cur = len(devs) - 1
-			}
+			p.header(n)
 			continue
 		}
-		if cur < 0 {
-			continue
-		}
-		key, val, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key, val = strings.TrimSpace(key), strings.TrimSpace(val)
-		d := &devs[cur]
-		switch key {
-		case "deviceType":
-			if d.Type == "" {
-				d.Type = val
-			}
-		case "deviceName":
-			if d.Name == "" {
-				d.Name = val
-			}
-		default:
-			for i, k := range pciKeys {
-				if key != k || pciSeen[i] {
-					continue
-				}
-				if v, err := strconv.ParseUint(val, 0, 32); err == nil {
-					pci[i], pciSeen[i] = uint32(v), true
-				}
-			}
-		}
+		p.field(line)
 	}
-	finish()
-	sort.SliceStable(devs, func(i, j int) bool { return devs[i].Ordinal < devs[j].Ordinal })
-	return devs
+	p.finish()
+	sort.SliceStable(p.devs, func(i, j int) bool { return p.devs[i].Ordinal < p.devs[j].Ordinal })
+	return p.devs
+}
+
+// vulkanPCIKeys are the vulkaninfo keys of a device's PCI address parts, in
+// pciAddr order.
+var vulkanPCIKeys = [4]string{"pciDomain", "pciBus", "pciDevice", "pciFunction"}
+
+// vulkaninfoParser is parseVulkaninfo's state: the devices so far, the
+// ordinals already opened, the device of the current section (cur, -1: none
+// or a repeated header's) and the PCI parts read in it.
+type vulkaninfoParser struct {
+	devs    []VulkanDevice
+	seen    map[int]bool
+	cur     int
+	pci     [4]uint32
+	pciSeen [4]bool
+}
+
+// finish closes the current section: its device takes the PCI address read
+// in it (HasPCI only when all four parts were), and the parts are reset.
+func (p *vulkaninfoParser) finish() {
+	if p.cur >= 0 {
+		d := &p.devs[p.cur]
+		d.PCI = pciAddr{Domain: p.pci[0], Bus: p.pci[1], Device: p.pci[2], Function: p.pci[3]}
+		d.HasPCI = p.pciSeen[0] && p.pciSeen[1] && p.pciSeen[2] && p.pciSeen[3]
+	}
+	p.pci, p.pciSeen = [4]uint32{}, [4]bool{}
+}
+
+// header opens the section "GPU<n>:": a new device for the first header of
+// n, nothing (its section skipped) for a repeated one.
+func (p *vulkaninfoParser) header(n int) {
+	p.finish()
+	p.cur = -1 // a repeated header: skip its section
+	if !p.seen[n] {
+		p.seen[n] = true
+		p.devs = append(p.devs, VulkanDevice{Ordinal: n})
+		p.cur = len(p.devs) - 1
+	}
+}
+
+// field reads one "key = value" line of the current section; the first
+// deviceType, deviceName and pci* value wins.
+func (p *vulkaninfoParser) field(line string) {
+	if p.cur < 0 {
+		return
+	}
+	key, val, ok := strings.Cut(line, "=")
+	if !ok {
+		return
+	}
+	key, val = strings.TrimSpace(key), strings.TrimSpace(val)
+	d := &p.devs[p.cur]
+	switch key {
+	case "deviceType":
+		if d.Type == "" {
+			d.Type = val
+		}
+	case "deviceName":
+		if d.Name == "" {
+			d.Name = val
+		}
+	default:
+		p.pciField(key, val)
+	}
+}
+
+// pciField records a PCI address part unless the section already has it or
+// val is not a number.
+func (p *vulkaninfoParser) pciField(key, val string) {
+	i := slices.Index(vulkanPCIKeys[:], key)
+	if i < 0 || p.pciSeen[i] {
+		return
+	}
+	if v, err := strconv.ParseUint(val, 0, 32); err == nil {
+		p.pci[i], p.pciSeen[i] = uint32(v), true
+	}
 }
 
 // vulkanGPUHeader matches exactly "GPU<n>:".
