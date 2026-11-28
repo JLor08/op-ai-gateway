@@ -52,8 +52,9 @@ Anti-goals:
    probability for each option (predicate: one probability of "yes"). The gateway derives the
    verdict from those numbers, never from a separate "chosen" field, so verdict and
    probabilities cannot disagree.
-2. **Calibration and honesty.** The numbers are uncalibrated self-estimates. They are clamped
-   to [0, 1]; choice and score probabilities are renormalized to sum 1 (a sum of 0 is an
+2. **Calibration and honesty.** The numbers are uncalibrated self-estimates. A predicate
+   probability is clamped to [0, 1]; choice and score values are floored at 0 and
+   renormalized to sum 1, with no upper clamp (they act as relative weights; a sum of 0 is an
    unusable answer, 502). `confidence` is the largest probability (predicate:
    `max(p, 1-p)`). A confidence threshold still works mechanically, but the docs state that a
    threshold tuned on a native decision model does not carry over. The header and usage flag
