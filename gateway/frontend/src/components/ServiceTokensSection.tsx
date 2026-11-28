@@ -264,6 +264,7 @@ export function ServiceTokensSection({
     setTokenClaudeAliases(row.claude_model_aliases ?? false);
     setTokenClaudeEffort(row.claude_effort_compatibility ?? false);
     setTokenDecisionsNormalize(row.decisions_confidence_normalize ?? false);
+    setTokenDecisionsEmulation(row.decisions_emulation ?? false);
     setTokenSendUsageLimits(row.send_usage_limits ?? false);
     setTokenCodexSwitchPrompt(
       (row.send_usage_limits ?? false) && (row.codex_model_switch_prompt ?? false),
@@ -314,6 +315,7 @@ export function ServiceTokensSection({
       unknown_model_fallback: tokenUnknownFallback,
       claude_model_aliases: tokenClaudeAliases,
       decisions_confidence_normalize: tokenDecisionsNormalize,
+      decisions_emulation: tokenDecisionsEmulation,
       send_usage_limits: tokenSendUsageLimits,
       codex_model_switch_prompt: tokenSendUsageLimits && tokenCodexSwitchPrompt,
       log_communication: tokenLogCommunication,

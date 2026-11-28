@@ -1651,6 +1651,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       claude_model_aliases: true,
       claude_effort_compatibility: false,
       decisions_confidence_normalize: true,
+      decisions_emulation: true,
       send_usage_limits: true,
       codex_model_switch_prompt: true,
       log_communication: true,
@@ -1704,6 +1705,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(
         editDialog.getByRole('checkbox', { name: t.tokenDecisionsConfidenceNormalize }),
       ).toBeChecked();
+      expect(editDialog.getByRole('checkbox', { name: t.tokenDecisionsEmulation })).toBeChecked();
       expect(editDialog.getByRole('checkbox', { name: t.tokenSendUsageLimits })).toBeChecked();
       expect(
         editDialog.getByRole('checkbox', { name: t.tokenCodexModelSwitchPrompt }),
@@ -1741,6 +1743,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         unknown_model_fallback: 'gpt-oss-20b',
         claude_model_aliases: false,
         decisions_confidence_normalize: true,
+        decisions_emulation: true,
         send_usage_limits: true,
         codex_model_switch_prompt: true,
         log_communication: true,
@@ -1752,6 +1755,16 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(await screen.findByText('Renamed')).toBeInTheDocument();
       expect(screen.queryByText('Edit Me')).not.toBeInTheDocument();
       expect(screen.queryByText(t.oneTimeSecret)).not.toBeInTheDocument();
+    });
+
+    it('sends decisions_emulation off when it is unchecked (#380)', async () => {
+      const { fakeApi, editDialog } = await openEditDialog();
+
+      fireEvent.click(editDialog.getByRole('checkbox', { name: t.tokenDecisionsEmulation }));
+      fireEvent.click(editDialog.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateServiceToken).toHaveBeenCalledTimes(1));
+      expect(updateBody(fakeApi).decisions_emulation).toBe(false);
     });
 
     it('sends the effort flag only when it changed', async () => {

@@ -171,7 +171,7 @@ of **another** service is `404 service.token_not_found`. Its body carries exactl
 the create body's settings (`name`, `model_override`, `model_override_map`,
 `log_communication`, `secret`, the three `unknown_model_*` fields,
 `vendor_access`, `claude_model_aliases`, `claude_effort_compatibility`,
-`decisions_confidence_normalize`, `send_usage_limits`,
+`decisions_confidence_normalize`, `decisions_emulation`, `send_usage_limits`,
 `codex_model_switch_prompt`); `scopes` (always `[llm:invoke]`), `status` (a
 service token's liveness follows its service), `expires_at` and
 `last_used_model` are not update fields, and like every unknown key they are
@@ -1639,7 +1639,7 @@ An OpenAI **subscription** account has no Decisions endpoint, so with two opt-in
 Accounts §4.2](../cross-cutting/external-vendor-accounts.md#subscription-decision-emulation)). Wire facts:
 
 - **The two opt-ins** (migration 120, both default off): the token field `decisions_emulation` (above; portal token create and update,
-  service token create, ungated) and the vendor account's `decision_emulation`, set by its owner with
+  service token create and update, ungated) and the vendor account's `decision_emulation`, set by its owner with
   `PUT /api/portal/vendor-accounts/{id}/decision-emulation` (below) and carried on the `VendorAccount` DTO. Either off and the endpoints answer
   as before for that token (the subscription account is no decision candidate); the model is offered on the decision endpoints (the
   `decisions` flavor, `GET /v1/systemone/models`) only to a token that would be routed to it.

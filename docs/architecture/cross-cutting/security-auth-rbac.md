@@ -309,7 +309,7 @@ never has it.
 Answering `/v1/decisions` and `/v1/systemone` by emulation on an OpenAI subscription account's chat model
 ([Compatibility & Inference §3.10](compatibility-and-inference.md#310-openai-decisions) item 13, [ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380))
 takes **two** switches, each default off. The token's `decisions_emulation` is an ordinary, ungated token setting
-like `decisions_confidence_normalize` (user tokens on create and update, service tokens on create; a run-as token
+like `decisions_confidence_normalize` (user and service tokens, on create and update; a run-as token
 carries it, `AuthorizeRunAsToken` copies the field): on its own it confers nothing, because it only lets the token use
 an account whose owner allowed it. The account's `decision_emulation` is **owner-only**
 (`PUT /api/portal/vendor-accounts/{id}/decision-emulation`, the share-usage gate: a co-manager or member is

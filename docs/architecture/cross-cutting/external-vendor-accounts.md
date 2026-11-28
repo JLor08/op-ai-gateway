@@ -1166,7 +1166,7 @@ decision read, and every answer says so.
   (`UpdateVendorAccountDecisionEmulation`; neither `CreateVendorAccount` nor `UpdateVendorAccount` writes it, so a new account starts off).
   It is not gated on the sharing switches; the management DTO carries `decision_emulation`, the member view reads `false`. The token's
   `decisions_emulation` (migration 120, default off, **ungated**) is set on a portal token's create and update and on a service token's
-  create, and a run-as token carries it. The portal shows the account switch only to the owner of an OpenAI subscription account, with
+  create and update, and a run-as token carries it. The portal shows the account switch only to the owner of an OpenAI subscription account, with
   help text naming the uncalibrated values and the Terms caveat (§10).
 - **Admission.** For a decision request `vendorAccountUsable` passes an OpenAI api-key account (*Api-key Decisions*) **or**
   `isVendorDecisionEmulationAccount(acc, token)`: an OpenAI subscription account with `decision_emulation` asked by a token with

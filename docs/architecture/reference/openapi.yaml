@@ -6340,6 +6340,7 @@ components:
         claude_model_aliases: { type: boolean }
         claude_effort_compatibility: { type: boolean }
         decisions_confidence_normalize: { type: boolean }
+        decisions_emulation: { type: boolean }
         send_usage_limits: { type: boolean }
         codex_model_switch_prompt: { type: boolean }
     UpdateServiceTokenRequest:
@@ -6371,6 +6372,7 @@ components:
             MANAGEMENT-ONLY: any present value from an inference-only bearer is
             a 403 portal.principal_forbidden and nothing is written.
         decisions_confidence_normalize: { type: boolean }
+        decisions_emulation: { type: boolean }
         send_usage_limits: { type: boolean }
         codex_model_switch_prompt: { type: boolean }
     TokenVendorAccess:

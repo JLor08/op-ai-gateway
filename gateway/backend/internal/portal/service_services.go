@@ -250,6 +250,7 @@ type UpdateServiceTokenRequest struct {
 	ClaudeModelAliases           *bool            `json:"claude_model_aliases,omitempty"`
 	ClaudeEffortCompatibility    *bool            `json:"claude_effort_compatibility,omitempty"`
 	DecisionsConfidenceNormalize *bool            `json:"decisions_confidence_normalize,omitempty"`
+	DecisionsEmulation           *bool            `json:"decisions_emulation,omitempty"`
 	SendUsageLimits              *bool            `json:"send_usage_limits,omitempty"`
 	CodexModelSwitchPrompt       *bool            `json:"codex_model_switch_prompt,omitempty"`
 }
@@ -1054,6 +1055,7 @@ func applyServiceTokenFlags(record *store.TokenRecord, req UpdateServiceTokenReq
 		{&record.ClaudeModelAliases, req.ClaudeModelAliases},
 		{&record.ClaudeEffortCompatibility, req.ClaudeEffortCompatibility},
 		{&record.DecisionsConfidenceNormalize, req.DecisionsConfidenceNormalize},
+		{&record.DecisionsEmulation, req.DecisionsEmulation},
 		{&record.SendUsageLimits, req.SendUsageLimits},
 		{&record.CodexModelSwitchPrompt, req.CodexModelSwitchPrompt},
 	} {

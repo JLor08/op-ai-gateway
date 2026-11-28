@@ -48,6 +48,7 @@ func TestUpdateServiceTokenReplacesEveryEditableField(t *testing.T) {
 		ClaudeModelAliases:           boolPtr(true),
 		ClaudeEffortCompatibility:    boolPtr(true),
 		DecisionsConfidenceNormalize: boolPtr(true),
+		DecisionsEmulation:           boolPtr(true),
 		SendUsageLimits:              boolPtr(true),
 		CodexModelSwitchPrompt:       boolPtr(true),
 	})
@@ -63,7 +64,7 @@ func TestUpdateServiceTokenReplacesEveryEditableField(t *testing.T) {
 	if !got.LogCommunication || !got.Secret || !got.UnknownModelRedirect || !got.UnknownModelRedirectBlocked || got.UnknownModelFallback != "model-b" {
 		t.Fatalf("logging/secret/redirect = %+v", got)
 	}
-	if !got.ClaudeModelAliases || !got.ClaudeEffortCompatibility || !got.DecisionsConfidenceNormalize || !got.SendUsageLimits || !got.CodexModelSwitchPrompt {
+	if !got.ClaudeModelAliases || !got.ClaudeEffortCompatibility || !got.DecisionsConfidenceNormalize || !got.DecisionsEmulation || !got.SendUsageLimits || !got.CodexModelSwitchPrompt {
 		t.Fatalf("switches = %+v", got)
 	}
 	if got.SecretPrefix != tok.Token.SecretPrefix || got.SecretPrefix == "" {
@@ -78,7 +79,7 @@ func TestUpdateServiceTokenReplacesEveryEditableField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TokenByID: %v", err)
 	}
-	if rec.Name != "Renamed" || !rec.ClaudeEffortCompatibility || !rec.CodexModelSwitchPrompt || rec.UnknownModelFallback != "model-b" || rec.Status != store.TokenStatusActive {
+	if rec.Name != "Renamed" || !rec.ClaudeEffortCompatibility || !rec.DecisionsEmulation || !rec.CodexModelSwitchPrompt || rec.UnknownModelFallback != "model-b" || rec.Status != store.TokenStatusActive {
 		t.Fatalf("stored record = %+v", rec)
 	}
 	list, err := svc.ListServiceTokens(ctx, svcAdminToken(), created.ID)
@@ -95,7 +96,7 @@ func TestUpdateServiceTokenAbsentFieldsKeepTheirValues(t *testing.T) {
 		Name: "Keep", ModelOverride: "model-a", LogCommunication: true, Secret: true,
 		UnknownModelRedirect: true, UnknownModelFallback: "model-b",
 		ClaudeModelAliases: true, ClaudeEffortCompatibility: true, DecisionsConfidenceNormalize: true,
-		SendUsageLimits: true, CodexModelSwitchPrompt: true,
+		DecisionsEmulation: true, SendUsageLimits: true, CodexModelSwitchPrompt: true,
 	})
 
 	// Only one field changes; everything else stays as created.
@@ -113,6 +114,47 @@ func TestUpdateServiceTokenAbsentFieldsKeepTheirValues(t *testing.T) {
 	again, err := svc.UpdateServiceToken(ctx, svcAdminToken(), created.ID, tok.Token.ID, UpdateServiceTokenRequest{})
 	if err != nil || !reflect.DeepEqual(again, want) {
 		t.Fatalf("empty update = %+v err=%v, want %+v", again, err, want)
+	}
+}
+
+// TestUpdateServiceTokenTogglesDecisionsEmulation (#380): decisions_emulation is
+// an ungated update field exactly like decisions_confidence_normalize. An
+// inference-only bearer may switch it on and off; the stored record, the DTO and
+// the live bearer (the request path reads the opt-in there) all follow, and an
+// update without the field keeps it.
+func TestUpdateServiceTokenTogglesDecisionsEmulation(t *testing.T) {
+	ctx := context.Background()
+	svc, dir, tokenStore, _ := newServiceAccountsTestService(t, time.Now().UTC())
+	created := createTestService(t, ctx, svc)
+	tok := mintServiceToken(t, ctx, svc, created.ID, CreateServiceTokenRequest{Name: "E"})
+
+	got, err := svc.UpdateServiceToken(ctx, svcFullToken(), created.ID, tok.Token.ID, UpdateServiceTokenRequest{DecisionsEmulation: boolPtr(true)})
+	if err != nil {
+		t.Fatalf("UpdateServiceToken(on): %v", err)
+	}
+	if !got.DecisionsEmulation || got.DecisionsConfidenceNormalize {
+		t.Fatalf("after on: %+v, want only decisions_emulation set", got)
+	}
+	if rec, err := dir.TokenByID(ctx, tok.Token.ID); err != nil || !rec.DecisionsEmulation {
+		t.Fatalf("stored record = %+v err=%v, want DecisionsEmulation", rec, err)
+	}
+	if live, ok := tokenStore.LookupBearer("Bearer " + tok.Secret); !ok || !live.DecisionsEmulation {
+		t.Fatalf("live bearer = %+v ok=%v, want DecisionsEmulation", live, ok)
+	}
+
+	// Absent keeps.
+	got, err = svc.UpdateServiceToken(ctx, svcFullToken(), created.ID, tok.Token.ID, UpdateServiceTokenRequest{Name: strPtr("E2")})
+	if err != nil || !got.DecisionsEmulation {
+		t.Fatalf("after an unrelated edit: %+v err=%v, want decisions_emulation kept", got, err)
+	}
+
+	// Present false replaces.
+	got, err = svc.UpdateServiceToken(ctx, svcFullToken(), created.ID, tok.Token.ID, UpdateServiceTokenRequest{DecisionsEmulation: boolPtr(false)})
+	if err != nil || got.DecisionsEmulation {
+		t.Fatalf("after off: %+v err=%v", got, err)
+	}
+	if live, ok := tokenStore.LookupBearer("Bearer " + tok.Secret); !ok || live.DecisionsEmulation {
+		t.Fatalf("live bearer = %+v ok=%v, want DecisionsEmulation cleared", live, ok)
 	}
 }
 
