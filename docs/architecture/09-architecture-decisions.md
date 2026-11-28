@@ -14493,7 +14493,10 @@ native decision read; the gateway has to ask the model for the numbers and turn 
   in Activity. The body keeps the exact client shape of each endpoint.
 - **(h) No vendor-group failover on the emulated route.** A group may route a decision request to an emulating member, but a provider error is
   answered as the chat path answers it (`completionHTTPStatus`, `completionErrorCode`; the generic `provider.unavailable` becomes the endpoint's
-  `*.upstream_error`); a limit error does not move to the next member.
+  `*.upstream_error`); a limit error does not move the request to the next member, and the request itself is not retried. The member's
+  usage is scraped and its cooldown set as on the failover paths
+  ([External Vendor Accounts §12.4](cross-cutting/external-vendor-accounts.md#124-failover-on-vendor-limit-errors)), so the next request
+  goes to another member.
 - **(i) Account order decides between an api-key and an emulating account.** When an OpenAI api-key account (native, ADR-100) and an emulating
   subscription account serve the same name, the resolver's existing account order picks, as for any name two accounts serve; there is no
   preference for the native route.

@@ -2403,7 +2403,8 @@ side, admission and the model condition are [External Vendor Accounts §4.2](ext
   (`systemone.upstream_error` on `/v1/systemone`), recorded **with the tokens** the vendor reported (it answered and is paid). A provider
   error is answered with the chat path's status (`completionHTTPStatus`) and code (`completionErrorCode`, `provider.timeout` say); only the
   generic `provider.unavailable` becomes the endpoint's `*.upstream_error` with type `upstream_error`, while the row keeps the chat path's
-  code. There is **no vendor-group failover** on this route: a limit error from a group member is answered, not moved to the next member
+  code. There is **no vendor-group failover** on this route: a limit error from a group member is answered, not moved to the next member,
+  but the member's cooldown is set, so the next request goes to another member
   ([External Vendor Accounts §12.4](external-vendor-accounts.md#124-failover-on-vendor-limit-errors)).
 - **The mark.** Every answer written once the route settled, success or error (a refusal of the emulator or of matrix B included), carries
   **`X-OP-Decision-Emulated: chat`** (`markDecisionEmulated`); a request that never reaches the route (one without both opt-ins gets the

@@ -237,6 +237,7 @@ func TestDecisionEmulationThroughAVendorGroup(t *testing.T) {
 		{"both on", true, true, true},
 		{"token off", true, false, false},
 		{"account off", false, true, false},
+		{"both off", false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := NewMemoryStore()
@@ -314,5 +315,23 @@ func TestDecisionEmulationTargetCompleteness(t *testing.T) {
 	// The builder fails closed without the token opt-in, even past the gate.
 	if _, ok := vendorAccountModelTarget(acc, m, emulationToken(false), decisionRequest(vendorDecisionModel, APIFlavorOpenAIDecisions), APIFlavorDecisions); ok {
 		t.Fatal("vendorAccountModelTarget built an emulated target for a token without the opt-in")
+	}
+}
+
+// MemoryStore.CreateVendorAccount drops a caller's DecisionEmulation, as the SQL
+// INSERT (which omits the column) does: only
+// UpdateVendorAccountDecisionEmulation turns the opt-in on.
+func TestMemoryCreateVendorAccountIgnoresDecisionEmulation(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	must(t, store.CreateVendorAccount(ctx, VendorAccount{
+		ID: "acc_sub", OwnerUserID: vendorOwner, Vendor: VendorOpenAI, AuthType: VendorAuthSubscription,
+		Status: VendorAccountStatusActive, DecisionEmulation: true, CreatedAt: now, UpdatedAt: now,
+	}))
+	acc, err := store.VendorAccountByID(ctx, "acc_sub")
+	must(t, err)
+	if acc.DecisionEmulation {
+		t.Fatal("CreateVendorAccount kept DecisionEmulation; a new account must start off")
 	}
 }

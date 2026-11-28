@@ -66,7 +66,8 @@ const (
 // (systemOneRoute), as for /v1/decisions. The capability list is also the one
 // the vendor-account path admits (ADR-100): there only the decision model of an
 // OpenAI api-key account (routing.IsVendorDecisionModel) is considered, and its
-// route is translate, to the vendor's /v1/decisions.
+// route is translate, to the vendor's /v1/decisions, or, with both opt-ins, an
+// OpenAI subscription account by emulation (#380, the emulated route).
 func systemOneInferenceShape(model string) inferenceShape {
 	return inferenceShape{
 		apiFlavor:            apiFlavorSystemOne,

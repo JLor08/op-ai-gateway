@@ -1177,10 +1177,12 @@ func (r *Resolver) resolveStandard(ctx context.Context, token auth.Token, req in
 //     verdicts, so such a request skips the branch entirely. The ONE opt-in is a
 //     decision request (isVendorDecisionRequest: the decisions flavor with
 //     exactly [any_decision], ADR-100), and for it only an OpenAI api-key
-//     account's decision models are considered (IsVendorDecisionModel), so an
-//     Anthropic, subscription, Gemini or OpenAI-compatible account is never
-//     chosen for one, whatever its rows are named. A request on the decisions
-//     flavor WITHOUT that requirement is declined too.
+//     account's decision models are considered (IsVendorDecisionModel) or, with
+//     both opt-ins, an OpenAI subscription account by emulation (#380,
+//     isVendorDecisionEmulationAccount), so an Anthropic, Gemini or
+//     OpenAI-compatible account, or a subscription account without both
+//     opt-ins, is never chosen for one, whatever its rows are named. A request
+//     on the decisions flavor WITHOUT that requirement is declined too.
 //   - apiFlavor != APIFlavorOpenAIImages: the images relay has no vendor path in
 //     this milestone (the Target serves the text flavors via translate only).
 //

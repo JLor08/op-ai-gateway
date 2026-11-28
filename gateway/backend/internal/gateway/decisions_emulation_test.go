@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"op-ai-gateway/internal/auth"
+	"op-ai-gateway/internal/capture"
 	"op-ai-gateway/internal/inference"
 	"op-ai-gateway/internal/provider"
 	"op-ai-gateway/internal/routing"
 	"op-ai-gateway/internal/usage"
 	"op-ai-gateway/internal/vendorauth"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,6 +46,8 @@ type emulationProvider struct {
 	text    string
 	usage   inference.Usage
 	err     error
+	// errFor answers the calls on one vendor account with its error instead.
+	errFor map[string]error
 }
 
 func (p *emulationProvider) Complete(_ context.Context, target routing.Target, req inference.Request) (provider.Response, error) {
@@ -51,6 +55,9 @@ func (p *emulationProvider) Complete(_ context.Context, target routing.Target, r
 	defer p.mu.Unlock()
 	p.reqs = append(p.reqs, req)
 	p.targets = append(p.targets, target)
+	if err := p.errFor[target.VendorAccountID]; err != nil {
+		return provider.Response{}, err
+	}
 	if p.err != nil {
 		return provider.Response{}, p.err
 	}
@@ -74,6 +81,17 @@ func newDecisionEmulationServer(t *testing.T, tokenOptIn bool) (*Server, *emulat
 	srv.Cipher = cipher
 	fake := &emulationProvider{text: emulationAnswerText, usage: emulationUsage}
 	srv.Provider = fake
+	seedEmulationAccount(t, routes, cipher, emulationAccountID, emulationPrefix)
+	enableVendorAccountsFlag(t, srv)
+	setTokenDecisionsEmulation(t, srv, vaOwnerSecret, tokenOptIn)
+	return srv, fake
+}
+
+// seedEmulationAccount stores an ACTIVE OpenAI subscription account id of
+// usr_va_a serving gpt-6-luna and gpt-5 under prefix, its decision-emulation
+// opt-in on.
+func seedEmulationAccount(t *testing.T, routes *routing.MemoryStore, cipher *capture.Cipher, id, prefix string) {
+	t.Helper()
 	sealed, err := vendorauth.SealTokenSet(cipher, false, vendorauth.TokenSet{AccessToken: "emu-access", RefreshToken: "r", ExpiresAt: time.Now().Add(time.Hour), AccountID: "acct"})
 	if err != nil {
 		t.Fatalf("SealTokenSet: %v", err)
@@ -81,23 +99,20 @@ func newDecisionEmulationServer(t *testing.T, tokenOptIn bool) (*Server, *emulat
 	ctx := context.Background()
 	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
 	if err := routes.CreateVendorAccount(ctx, routing.VendorAccount{
-		ID: emulationAccountID, OwnerUserID: "usr_va_a", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthSubscription,
-		Name: emulationAccountID, Status: routing.VendorAccountStatusActive, OAuthTokens: sealed, ModelPrefix: emulationPrefix, CreatedAt: now, UpdatedAt: now,
+		ID: id, OwnerUserID: "usr_va_a", Vendor: routing.VendorOpenAI, AuthType: routing.VendorAuthSubscription,
+		Name: id, Status: routing.VendorAccountStatusActive, OAuthTokens: sealed, ModelPrefix: prefix, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateVendorAccount: %v", err)
 	}
-	if err := routes.UpdateVendorAccountDecisionEmulation(ctx, emulationAccountID, true); err != nil {
+	if err := routes.UpdateVendorAccountDecisionEmulation(ctx, id, true); err != nil {
 		t.Fatalf("UpdateVendorAccountDecisionEmulation: %v", err)
 	}
-	if err := routes.SetVendorAccountModels(ctx, emulationAccountID, []routing.VendorAccountModel{
-		{AccountID: emulationAccountID, GatewayModel: emulationModel, UpstreamModel: emulationUpstream, APIFlavor: routing.APIFlavorOpenAI},
-		{AccountID: emulationAccountID, GatewayModel: emulationPrefix + "gpt-5", UpstreamModel: "gpt-5", APIFlavor: routing.APIFlavorOpenAI},
+	if err := routes.SetVendorAccountModels(ctx, id, []routing.VendorAccountModel{
+		{AccountID: id, GatewayModel: prefix + emulationUpstream, UpstreamModel: emulationUpstream, APIFlavor: routing.APIFlavorOpenAI},
+		{AccountID: id, GatewayModel: prefix + "gpt-5", UpstreamModel: "gpt-5", APIFlavor: routing.APIFlavorOpenAI},
 	}); err != nil {
 		t.Fatalf("SetVendorAccountModels: %v", err)
 	}
-	enableVendorAccountsFlag(t, srv)
-	setTokenDecisionsEmulation(t, srv, vaOwnerSecret, tokenOptIn)
-	return srv, fake
 }
 
 // setTokenDecisionsEmulation sets the decision-emulation opt-in of the token
@@ -246,6 +261,9 @@ func TestDecisionEmulationUnparseableAnswer(t *testing.T) {
 			}
 			requireEmulatedHeader(t, rec)
 			requireErrorCode(t, rec.Body.String(), tc.code)
+			if !strings.Contains(rec.Body.String(), `"message":"the emulating chat model's answer could not be read"`) {
+				t.Fatalf("body = %s, want the fixed message without the parser's error text", rec.Body.String())
+			}
 			row := onlyEmulationRow(t, srv)
 			if !row.DecisionEmulated || row.Status != "error" || row.ErrorCode != tc.code || row.HTTPStatus != http.StatusBadGateway || row.ProviderPath != "/responses" {
 				t.Fatalf("row = %+v, want a decision_emulated error row with %s", row, tc.code)
@@ -405,5 +423,42 @@ func TestDecisionEmulationSystemOneModelsListing(t *testing.T) {
 				t.Fatalf("listing = %v, want no chat-only model", ids)
 			}
 		})
+	}
+}
+
+// A group member that answers a limit on the emulated route gets the cooldown
+// the failover paths set, though the request itself is not retried: that
+// request answers the 502 upstream_error it answered before, and the next one is served
+// by the other member.
+func TestDecisionEmulationGroupMemberLimitSetsCooldown(t *testing.T) {
+	srv, routes, cipher := newVendorGroupTestServer(t, nil)
+	fake := &emulationProvider{text: emulationAnswerText, usage: emulationUsage, errFor: map[string]error{
+		"acc_emu_a": &provider.LimitError{Status: http.StatusTooManyRequests, RetryAfter: time.Minute, Header: http.Header{"Retry-After": {"60"}}},
+	}}
+	srv.Provider = fake
+	seedEmulationAccount(t, routes, cipher, "acc_emu_a", "a/")
+	seedEmulationAccount(t, routes, cipher, "acc_emu_b", "b/")
+	seedVendorGroup(t, routes, vgGroupID, routing.VendorOpenAI, "grp/", "acc_emu_a", "acc_emu_b")
+	setTokenDecisionsEmulation(t, srv, vgSecret, true)
+	body := decisionsRequestFor("grp/" + emulationUpstream)
+
+	first := postDecisions(t, srv, vgSecret, body)
+	if first.Code != http.StatusBadGateway {
+		t.Fatalf("first status = %d body = %s, want the 502 a provider limit answers today", first.Code, first.Body.String())
+	}
+	requireEmulatedHeader(t, first)
+	requireErrorCode(t, first.Body.String(), codeDecisionsUpstreamError)
+	if _, targets := fake.calls(); len(targets) != 1 || targets[0].VendorAccountID != "acc_emu_a" {
+		t.Fatalf("first request calls = %+v, want exactly one call on acc_emu_a (no failover)", targets)
+	}
+
+	second := postDecisions(t, srv, vgSecret, body)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d body = %s, want 200 from the other member", second.Code, second.Body.String())
+	}
+	requireEmulatedHeader(t, second)
+	_, targets := fake.calls()
+	if len(targets) != 2 || targets[1].VendorAccountID != "acc_emu_b" || !targets[1].DecisionEmulated {
+		t.Fatalf("calls = %+v, want the second request on acc_emu_b's emulated target", targets)
 	}
 }

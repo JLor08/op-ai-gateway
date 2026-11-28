@@ -99,7 +99,7 @@ func (s *Server) relayDecisionEmulation(w http.ResponseWriter, r *http.Request, 
 		code := decisionsFailCode(dialect)
 		body := writeJSONCaptured(w, http.StatusBadGateway, apierror.Body{Error: apierror.ErrorBody{
 			Code:    code,
-			Message: "the emulating chat model's answer could not be read: " + err.Error(),
+			Message: "the emulating chat model's answer could not be read",
 			Type:    decisionsUpstreamErrorType,
 		}})
 		s.recordDecisionEmulation(r, ex, resp, http.StatusBadGateway, "error", code, body, w.Header())
@@ -129,8 +129,13 @@ type emulationExchange struct {
 // failDecisionEmulationProvider answers a provider error on the emulated route:
 // the chat path's status and code, the generic provider.unavailable replaced by
 // the endpoint's upstream_error (decisionsFailCode of dialect). The row records
-// the chat path's code.
+// the chat path's code. A vendor group member that answered a limit gets its
+// cooldown (noteVendorGroupLimit), so the next request goes to another member;
+// this request itself is not retried.
 func (s *Server) failDecisionEmulationProvider(w http.ResponseWriter, r *http.Request, ex emulationExchange, dialect compat.DecisionsDialect, err error) {
+	if limit, ok := groupLimitError(ex.target, err); ok {
+		s.noteVendorGroupLimit(ex.target, limit.Header, limit.RetryAfter)
+	}
 	status := completionHTTPStatus(err)
 	rowCode := completionErrorCode(err)
 	envelope := completionErrorResponse(err)

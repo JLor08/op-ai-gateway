@@ -49,7 +49,9 @@ const (
 // decided after the resolve (decisionsRoute). Like System One's list, it is the
 // one capability list the vendor-account path admits (ADR-100), and there only
 // for the decision model of an OpenAI api-key account
-// (routing.IsVendorDecisionModel), which it passes through to.
+// (routing.IsVendorDecisionModel), which it passes through to, or, with both
+// opt-ins, an OpenAI subscription account by emulation (#380, the emulated
+// route).
 func decisionsInferenceShape(model string) inferenceShape {
 	return inferenceShape{
 		apiFlavor:            apiFlavorOpenAIDecisions,

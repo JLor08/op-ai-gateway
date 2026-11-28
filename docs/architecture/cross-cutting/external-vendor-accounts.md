@@ -1191,7 +1191,8 @@ decision read, and every answer says so.
   route. A token that wants the native answer only leaves `decisions_emulation` off.
 - **Groups, without failover.** A vendor account group (§12) may route a decision request to an emulating member, but the emulated route does
   not fail over: a limit error (429, 402) is answered as the chat path answers it, as `502 decisions.upstream_error`
-  (`systemone.upstream_error`) since it unwraps to `provider.unavailable`, and sets no cooldown (§12.4).
+  (`systemone.upstream_error`) since it unwraps to `provider.unavailable`, and the request itself is not retried. The member's usage is
+  scraped and its cooldown set as on the failover paths (§12.4), so the next request goes to another member.
 - **Usage.** The row carries the serving `AccountID`, `provider_path` `/responses`, the Responses tokens (cached included), cost 0 and
   `decision_emulated = true`; the response carries `X-OP-Decision-Emulated: chat`.
 - **Not verified live** (§10): the Codex backend accepting `text.format` `json_schema` for `gpt-6-luna`, the shape of the answer text under
