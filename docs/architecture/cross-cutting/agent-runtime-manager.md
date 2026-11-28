@@ -3634,7 +3634,9 @@ AMDVLK and RADV) makes that card's mapping unavailable rather than picking a
 driver. The report carries the result (`vulkan_ordinal`, `vulkan_device_count`,
 [Telemetry §8.2.5](telemetry-usage-observability.md#825-static-hardware-inventory)),
 and the agent hands it to the runtime with the detected totals; `Run` seeds both
-from the hardware inventory before the first runtime reconciliation. On both
+from the hardware inventory before the first runtime reconciliation, and replaces
+the mapping when it re-collects an inventory that lacked GPUs telemetry sees
+([Telemetry §8.2.5](telemetry-usage-observability.md#825-static-hardware-inventory)). On both
 single-vendor test VMs the Vulkan order followed the PCI bus order, which is not
 guaranteed in general (the loader and Mesa's device-select layer may reorder),
 hence the PCI join.

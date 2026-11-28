@@ -9,6 +9,7 @@ package collector
 
 import (
 	"context"
+	"log/slog"
 	"op-ai-server-agent/internal/sample"
 	"os"
 	"runtime"
@@ -107,7 +108,14 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 		gpus, err := g.Collect(cctx)
 		cancel()
 		if err != nil {
+			// Warn, not Debug: the collector's GPUs are missing from this
+			// report, which otherwise reads exactly like a host without any
+			// (e.g. amdgpu still initializing its cards at boot).
+			slog.Warn("hardware inventory: gpu collect failed", "collector", g.Name(), "err", err)
 			continue
+		}
+		if len(gpus) == 0 {
+			slog.Debug("hardware inventory: gpu collector found no GPUs", "collector", g.Name())
 		}
 		for _, gp := range gpus {
 			r.GPUs = append(r.GPUs, sample.GPUInfo{
