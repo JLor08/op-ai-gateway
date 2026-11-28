@@ -38,43 +38,11 @@ func (s *SQLiteStore) BackfillServerGPUVendor(ctx context.Context, serverID, ven
 		return 0, ErrNotFound
 	}
 
-	const specScope = `spec_id in (select s.id from agent_runtime_specs s
-		join model_mappings m on m.id = s.mapping_id
-		join applications a on a.id = m.application_id
-		where a.server_id = ?)`
-	tables := []struct {
-		table, scope, same string
-	}{
-		{
-			"agent_runtime_spec_gpus", specScope,
-			`e.spec_id = t.spec_id`,
-		},
-		{
-			"ai_server_gpu_budgets", `server_id = ?`,
-			`e.server_id = t.server_id`,
-		},
-		{
-			"rpc_member_spec_gpus", `spec_id in (select id from rpc_member_specs where server_id = ?)`,
-			`e.spec_id = t.spec_id`,
-		},
-		{
-			"rpc_cluster_member_gpus", `server_id = ?`,
-			`e.head_spec_id = t.head_spec_id and e.member_position = t.member_position`,
-		},
-	}
 	rewritten := 0
-	for _, t := range tables {
-		del := `delete from ` + t.table + ` as t where t.gpu_vendor = '' and ` + t.scope + `
-			and exists (select 1 from ` + t.table + ` e where ` + t.same + ` and e.gpu_index = t.gpu_index and e.gpu_vendor = ?)`
-		n, err := run(del, serverID, vendor)
+	for _, t := range gpuVendorBackfillTables {
+		n, err := backfillGPUVendorTable(run, t, serverID, vendor)
 		if err != nil {
-			return 0, fmt.Errorf("backfill gpu vendor: drop shadowed %s rows: %w", t.table, err)
-		}
-		rewritten += n
-		upd := `update ` + t.table + ` set gpu_vendor = ? where gpu_vendor = '' and ` + t.scope
-		n, err = run(upd, vendor, serverID)
-		if err != nil {
-			return 0, fmt.Errorf("backfill gpu vendor: rewrite %s rows: %w", t.table, err)
+			return 0, err
 		}
 		rewritten += n
 	}
@@ -96,4 +64,53 @@ func (s *SQLiteStore) ClearServerGPUVendorNote(ctx context.Context, serverID str
 		return fmt.Errorf("clear gpu vendor note: %w", err)
 	}
 	return requireAffected(result)
+}
+
+// gpuVendorBackfillTable is one table BackfillServerGPUVendor rewrites: scope
+// selects the server's rows (one serverID argument), same matches a row e to
+// the row t of the same owner.
+type gpuVendorBackfillTable struct {
+	table, scope, same string
+}
+
+// gpuVendorBackfillTables are the GPU-keyed tables of a server.
+var gpuVendorBackfillTables = []gpuVendorBackfillTable{
+	{
+		"agent_runtime_spec_gpus", `spec_id in (select s.id from agent_runtime_specs s
+		join model_mappings m on m.id = s.mapping_id
+		join applications a on a.id = m.application_id
+		where a.server_id = ?)`,
+		`e.spec_id = t.spec_id`,
+	},
+	{
+		"ai_server_gpu_budgets", `server_id = ?`,
+		`e.server_id = t.server_id`,
+	},
+	{
+		"rpc_member_spec_gpus", `spec_id in (select id from rpc_member_specs where server_id = ?)`,
+		`e.spec_id = t.spec_id`,
+	},
+	{
+		"rpc_cluster_member_gpus", `server_id = ?`,
+		`e.head_spec_id = t.head_spec_id and e.member_position = t.member_position`,
+	},
+}
+
+// backfillGPUVendorTable backfills one table of serverID in the caller's
+// transaction (run): it deletes the empty-vendor rows a row of vendor already
+// shadows, then rewrites the remaining empty ones to vendor, and returns the
+// rows both changed.
+func backfillGPUVendorTable(run func(stmt string, args ...any) (int, error), t gpuVendorBackfillTable, serverID, vendor string) (int, error) {
+	del := `delete from ` + t.table + ` as t where t.gpu_vendor = '' and ` + t.scope + `
+			and exists (select 1 from ` + t.table + ` e where ` + t.same + ` and e.gpu_index = t.gpu_index and e.gpu_vendor = ?)`
+	dropped, err := run(del, serverID, vendor)
+	if err != nil {
+		return 0, fmt.Errorf("backfill gpu vendor: drop shadowed %s rows: %w", t.table, err)
+	}
+	upd := `update ` + t.table + ` set gpu_vendor = ? where gpu_vendor = '' and ` + t.scope
+	updated, err := run(upd, vendor, serverID)
+	if err != nil {
+		return 0, fmt.Errorf("backfill gpu vendor: rewrite %s rows: %w", t.table, err)
+	}
+	return dropped + updated, nil
 }
