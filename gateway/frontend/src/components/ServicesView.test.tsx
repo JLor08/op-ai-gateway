@@ -175,6 +175,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       serviceTokens: vi.fn(async () => ({ data: [] })),
       createServiceToken: vi.fn(),
       rotateServiceToken: vi.fn(),
+      updateServiceToken: vi.fn(),
       deleteServiceToken: vi.fn(),
       adminUsers: vi.fn(async () => ({ data: adminCandidates })),
       // Phase C admin-group linkage: the create form + the detail view's
@@ -337,6 +338,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
         deleteService: vi.fn(),
         deleteServiceToken: vi.fn(),
         rotateServiceToken: vi.fn(),
+        updateServiceToken: vi.fn(),
         serviceTokens: vi.fn(async () => ({ data: [] })),
         setServiceAdminGroups: vi.fn(),
         updateService: vi.fn(),
@@ -1412,7 +1414,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ).not.toBeInTheDocument();
     });
 
-    it('states that the opt-in is set at create only and what a rotation does with it', async () => {
+    it('states how the opt-in is changed and what a rotation does with it', async () => {
       const { createDialog } = await openCreateDialog({ vendorAccounts: [memberAccount] });
 
       await createDialog.findByRole('checkbox', { name: memberLabel });
@@ -1558,9 +1560,7 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       });
 
       fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
-      // A service token has no edit action at all: only rotate and delete.
       await screen.findByText('Rotate Me');
-      expect(screen.queryByRole('button', { name: t.tokenActionEdit })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: t.tokenActionRotate }));
 
       const confirmDialog = within(screen.getByRole('dialog'));
@@ -1600,6 +1600,204 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
           exact: false,
         }),
       ).not.toBeInTheDocument();
+    });
+  });
+
+  describe(`ServiceTokensSection edit (#421) [${locale}]`, () => {
+    const memberAccount = makeVendorAccount({
+      id: 'acc_member',
+      name: 'Team Claude',
+      vendor: 'anthropic',
+      is_owner: false,
+      shared_by: 'Alice',
+      share_level: '',
+    });
+    const otherAccount = makeVendorAccount({
+      id: 'acc_other',
+      name: 'Ops Gemini',
+      vendor: 'google',
+      is_owner: false,
+      shared_by: 'Bob',
+      share_level: 'full',
+    });
+    const memberLabel = `Team Claude (${t.vendorAccountSharedBy} Alice)`;
+    const otherLabel = `Ops Gemini (${t.vendorAccountSharedBy} Bob)`;
+
+    const storedToken = makeServiceToken({
+      id: 'tok_edit',
+      service_id: 'svc_edit',
+      name: 'Edit Me',
+      secret_prefix: 'svctok_keep',
+      model_override: 'gpt-oss-20b',
+      model_override_map: { 'claude-x': { to: 'qwen-coder', offer: true, hide_target: false } },
+      unknown_model_redirect: true,
+      unknown_model_redirect_blocked: true,
+      unknown_model_fallback: 'gpt-oss-20b',
+      claude_model_aliases: true,
+      claude_effort_compatibility: false,
+      decisions_confidence_normalize: true,
+      send_usage_limits: true,
+      codex_model_switch_prompt: true,
+      log_communication: true,
+      secret: true,
+      last_used_model: 'qwen-coder',
+      vendor_access: { all: false, accounts: [{ account_id: 'acc_member' }] },
+    });
+
+    async function openEditDialog(opts: Parameters<typeof renderServicesView>[0] = {}) {
+      const rendered = renderServicesView({
+        services: [makeService({ id: 'svc_edit' })],
+        ...opts,
+        overrides: {
+          serviceTokens: vi.fn(async () => ({ data: [storedToken] })),
+          updateServiceToken: vi.fn(
+            async (_svc: string, _tok: string, body: Record<string, unknown>) => ({
+              ...storedToken,
+              ...body,
+            }),
+          ),
+          ...opts.overrides,
+        },
+      });
+      fireEvent.click(await screen.findByRole('button', { name: t.modelDetailsAction }));
+      await screen.findByText('Edit Me');
+      fireEvent.click(screen.getByRole('button', { name: t.tokenActionEdit }));
+      const editDialog = within(screen.getByRole('dialog'));
+      return { ...rendered, editDialog };
+    }
+
+    function updateBody(fakeApi: { updateServiceToken: unknown }): Record<string, unknown> {
+      const calls = (fakeApi.updateServiceToken as { mock: { calls: unknown[][] } }).mock.calls;
+      return calls[calls.length - 1][2] as Record<string, unknown>;
+    }
+
+    it('opens the token dialog in edit mode, prefilled from the row', async () => {
+      const { editDialog } = await openEditDialog();
+
+      expect(editDialog.getByText(t.tokenEditTitle)).toBeInTheDocument();
+      expect(editDialog.getByRole('button', { name: t.tokenActionSave })).toBeInTheDocument();
+      expect(
+        editDialog.queryByRole('button', { name: t.serviceTokenCreate }),
+      ).not.toBeInTheDocument();
+      expect(editDialog.getByLabelText(t.tokenNameLabel)).toHaveValue('Edit Me');
+      expect(editDialog.getByRole('checkbox', { name: t.tokenUnknownRedirect })).toBeChecked();
+      expect(
+        editDialog.getByRole('checkbox', { name: t.tokenUnknownRedirectBlocked }),
+      ).toBeChecked();
+      expect(editDialog.getByRole('checkbox', { name: t.tokenClaudeAliases })).toBeChecked();
+      expect(editDialog.getByRole('checkbox', { name: t.tokenClaudeEffort })).not.toBeChecked();
+      expect(
+        editDialog.getByRole('checkbox', { name: t.tokenDecisionsConfidenceNormalize }),
+      ).toBeChecked();
+      expect(editDialog.getByRole('checkbox', { name: t.tokenSendUsageLimits })).toBeChecked();
+      expect(
+        editDialog.getByRole('checkbox', { name: t.tokenCodexModelSwitchPrompt }),
+      ).toBeChecked();
+      expect(
+        editDialog.getByRole('checkbox', { name: t.tokenLogCommunicationLabel }),
+      ).toBeChecked();
+      expect(editDialog.getByRole('checkbox', { name: t.tokenSecretLabel })).toBeChecked();
+      // The read-only last-used model shows the row's value, not the placeholder.
+      expect(editDialog.getByText('qwen-coder', { selector: 'p' })).toBeInTheDocument();
+    });
+
+    it('sends a PATCH with the form settings, updates the row and reveals no secret', async () => {
+      const { fakeApi, editDialog } = await openEditDialog();
+
+      fireEvent.change(editDialog.getByLabelText(t.tokenNameLabel), {
+        target: { value: 'Renamed' },
+      });
+      fireEvent.click(editDialog.getByRole('checkbox', { name: t.tokenClaudeAliases }));
+      fireEvent.click(editDialog.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateServiceToken).toHaveBeenCalledTimes(1));
+      expect(fakeApi.updateServiceToken).toHaveBeenCalledWith(
+        'svc_edit',
+        'tok_edit',
+        expect.any(Object),
+      );
+      expect(fakeApi.createServiceToken).not.toHaveBeenCalled();
+      expect(updateBody(fakeApi)).toEqual({
+        name: 'Renamed',
+        model_override: 'gpt-oss-20b',
+        model_override_map: { 'claude-x': { to: 'qwen-coder', offer: true, hide_target: false } },
+        unknown_model_redirect: true,
+        unknown_model_redirect_blocked: true,
+        unknown_model_fallback: 'gpt-oss-20b',
+        claude_model_aliases: false,
+        decisions_confidence_normalize: true,
+        send_usage_limits: true,
+        codex_model_switch_prompt: true,
+        log_communication: true,
+        secret: true,
+      });
+
+      // The dialog closes, the row shows the new name, no secret reveal opens.
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      expect(await screen.findByText('Renamed')).toBeInTheDocument();
+      expect(screen.queryByText('Edit Me')).not.toBeInTheDocument();
+      expect(screen.queryByText(t.oneTimeSecret)).not.toBeInTheDocument();
+    });
+
+    it('sends the effort flag only when it changed', async () => {
+      const { fakeApi, editDialog } = await openEditDialog();
+
+      fireEvent.click(editDialog.getByRole('checkbox', { name: t.tokenClaudeEffort }));
+      fireEvent.click(editDialog.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateServiceToken).toHaveBeenCalledTimes(1));
+      expect(updateBody(fakeApi).claude_effort_compatibility).toBe(true);
+    });
+
+    it('shows the error and keeps the dialog open when the update fails', async () => {
+      const code = 'portal.token_vendor_access_invalid';
+      const { fakeApi, editDialog } = await openEditDialog({
+        overrides: {
+          updateServiceToken: vi.fn(async () => {
+            throw new PortalApiError(400, code, 'raw');
+          }),
+        },
+      });
+
+      fireEvent.click(editDialog.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateServiceToken).toHaveBeenCalledTimes(1));
+      expect(
+        await screen.findByText(`${code}: ${t.errorTokenVendorAccessInvalid}`),
+      ).toBeInTheDocument();
+      expect(screen.getByText(t.tokenEditTitle)).toBeInTheDocument();
+      expect(screen.getByText('Edit Me')).toBeInTheDocument();
+    });
+
+    it('prefills the vendor-access selection and sends it only when it changed', async () => {
+      const { fakeApi, editDialog } = await openEditDialog({
+        vendorAccountsEnabled: true,
+        vendorAccounts: [memberAccount, otherAccount],
+      });
+
+      expect(await editDialog.findByRole('checkbox', { name: memberLabel })).toBeChecked();
+      expect(editDialog.getByRole('checkbox', { name: otherLabel })).not.toBeChecked();
+      fireEvent.click(editDialog.getByRole('checkbox', { name: otherLabel }));
+      fireEvent.click(editDialog.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateServiceToken).toHaveBeenCalledTimes(1));
+      expect(updateBody(fakeApi).vendor_access).toEqual({
+        all: false,
+        accounts: [{ account_id: 'acc_member' }, { account_id: 'acc_other' }],
+      });
+    });
+
+    it('keeps vendor_access out of the body when the selection is unchanged', async () => {
+      const { fakeApi, editDialog } = await openEditDialog({
+        vendorAccountsEnabled: true,
+        vendorAccounts: [memberAccount],
+      });
+
+      await editDialog.findByRole('checkbox', { name: memberLabel });
+      fireEvent.click(editDialog.getByRole('button', { name: t.tokenActionSave }));
+
+      await waitFor(() => expect(fakeApi.updateServiceToken).toHaveBeenCalledTimes(1));
+      expect(updateBody(fakeApi)).not.toHaveProperty('vendor_access');
     });
   });
 }
