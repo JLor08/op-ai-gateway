@@ -517,6 +517,9 @@ func TestSettingsAllowSwitchOffWithoutDirectMeshCluster(t *testing.T) {
 		"no cluster":    func(*rpcPolicyEnv) {},
 		"relay cluster": func(e *rpcPolicyEnv) { e.cluster("head", "mesh", "relay", rpcMemberSeed{"a", 47001}) },
 		"lan cluster":   func(e *rpcPolicyEnv) { e.cluster("head", "lan", "direct", rpcMemberSeed{"a", 47001}) },
+		// A member on the head's own server is dialed on loopback: no port
+		// of the cluster is open to the mesh.
+		"loopback cluster": func(e *rpcPolicyEnv) { e.cluster("head", "mesh", "direct", rpcMemberSeed{"head", 47001}) },
 	}
 	for name, seed := range setup {
 		t.Run(name, func(t *testing.T) {
@@ -1027,5 +1030,40 @@ func TestRPCPolicyRefusedWriteIsNoWrite(t *testing.T) {
 				t.Fatalf("recorded writes = %v, want %d", got, c.want)
 			}
 		})
+	}
+}
+
+// TestNetbirdPoliciesSkipLoopbackMembers: a member on the head's own server
+// is dialed on loopback and gets no NetBird grant; the head's member on
+// another server keeps its grant.
+func TestNetbirdPoliciesSkipLoopbackMembers(t *testing.T) {
+	e := newRPCPolicyEnv(t, true)
+	for _, id := range []string{"srv_a", "srv_b"} {
+		e.server(id)
+	}
+	features := e.svc.agentFeatures.(fakeAgentFeatures)
+	features["srv_a"] = append(features["srv_a"], AgentFeatureRPCClusterSameHost)
+	e.cluster("srv_a", "mesh", "direct", rpcMemberSeed{"srv_a", 47001}, rpcMemberSeed{"srv_b", 47002})
+	servers, err := e.routes.AIServers(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clusters, err := e.svc.rpcClusters(e.ctx, servers, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusters) != 1 || !clusters[0].derived {
+		t.Fatalf("clusters = %+v, want one derived cluster", clusters)
+	}
+	rules := desiredRPCRules(clusters)
+	if len(rules["srv_a"]) != 0 || len(rules["srv_b"]) != 1 {
+		t.Fatalf("rules = %+v, want none for srv_a and one for srv_b", rules)
+	}
+	e.reconcile()
+	if n := e.fake.policyCreateCountByName("op-gw-rpc-srv_a"); n != 0 {
+		t.Fatalf("policy creates for the loopback member's server = %d, want 0", n)
+	}
+	if got := policyGrants(t, e.fake.createdPolicyByName("op-gw-rpc-srv_b")); !slices.Equal(got, []string{"g-srv_a>g-srv_b:47002"}) {
+		t.Fatalf("srv_b grants = %v", got)
 	}
 }

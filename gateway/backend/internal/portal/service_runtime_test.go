@@ -117,7 +117,7 @@ func TestPutRuntimeSpecRoundTrip(t *testing.T) {
 	// satisfied by accident just because Go's zero value happens to look
 	// like "field omitted" -- it pins that the field is read from the
 	// stored row, never from the request, at all.
-	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, dto.ID, 0, 7500); err != nil {
+	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, dto.ID, routing.GPUKey{Index: 0}, 7500); err != nil {
 		t.Fatalf("seed measured value: %v", err)
 	}
 	dto2, err := svc.PutRuntimeSpec(ctx, ownerToken(), mapping.ID, PutRuntimeSpecRequest{
@@ -1520,7 +1520,7 @@ func TestAgentRuntimeConfigAssembly(t *testing.T) {
 	}
 	// GPU 0 has a measured value on file -- must win over the estimate. GPU 1
 	// has no measurement -- must fall back to the estimate.
-	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, specA.ID, 0, 22500); err != nil {
+	if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, specA.ID, routing.GPUKey{Index: 0}, 22500); err != nil {
 		t.Fatalf("seed measured value: %v", err)
 	}
 
@@ -1980,7 +1980,7 @@ func TestAgentRuntimeConfigPushesMaxOfMeasuredAndEstimate(t *testing.T) {
 			}
 			if tc.measured > 0 {
 				// The agent measured its own child and wrote it back.
-				if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, 0, tc.measured); err != nil {
+				if err := routeStore.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, routing.GPUKey{Index: 0}, tc.measured); err != nil {
 					t.Fatalf("seed measured value: %v", err)
 				}
 			}
@@ -2245,7 +2245,7 @@ func TestPutRuntimeSpecSetVisibleDevicesRequiresGPUs(t *testing.T) {
 // one value, and a spec where both are present reads identically whichever one
 // wins. Refused, not silently resolved.
 //
-// The refusal is vendor-independent — all three owned variables, on every
+// The refusal is vendor-independent — all four owned variables, on every
 // host — because this gateway cannot know what hardware the target server has,
 // and the agent's rule is deliberately written to be the same one.
 func TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv(t *testing.T) {
@@ -2254,7 +2254,7 @@ func TestPutRuntimeSpecSetVisibleDevicesConflictsWithEnv(t *testing.T) {
 	svc, routeStore := newServerTestService(t, now)
 	mappingID := seedVisibleDevicesMapping(t, svc, routeStore, now)
 
-	for _, key := range []string{"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"} {
+	for _, key := range []string{"CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "GGML_VK_VISIBLE_DEVICES"} {
 		t.Run(key, func(t *testing.T) {
 			_, err := svc.PutRuntimeSpec(ctx, ownerToken(), mappingID, PutRuntimeSpecRequest{
 				Binary:            "/usr/local/bin/llama-server",

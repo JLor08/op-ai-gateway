@@ -28,7 +28,7 @@ func instanceSpec(base string, k, vramMB int) Spec {
 
 // instanceProc is a running, idle instance k of base holding vramMB on gpu 0.
 func instanceProc(base string, k, vramMB int) RunningProc {
-	return RunningProc{SpecID: InstanceKey(base, k), Spec: base, Instance: k, GPUs: map[int]int{0: vramMB}}
+	return RunningProc{SpecID: InstanceKey(base, k), Spec: base, Instance: k, GPUs: map[GPUKey]int{{Index: 0}: vramMB}}
 }
 
 // assertNoCapacity checks the one shape a NoEvict admission answers when it
@@ -122,14 +122,14 @@ func TestAdmitInstanceInheritsSpecPairs(t *testing.T) {
 // with siblings always open. Looking up the raw instance key "S#1" would find no
 // cell and misreport an open pair as closed.
 func TestAdmitPinnedUnknownOccupantUsesBasePair(t *testing.T) {
-	pinnedUnknownT := RunningProc{SpecID: "T", Spec: "T", Pinned: true, GPUs: map[int]int{0: 0}}
+	pinnedUnknownT := RunningProc{SpecID: "T", Spec: "T", Pinned: true, GPUs: map[GPUKey]int{{Index: 0}: 0}}
 	snap := PolicySnapshot{Running: []RunningProc{pinnedUnknownT}, Allowed: allowPairs("S", "T")}
 	got := Admit(snap, instanceSpec("S", 1, 1000))
 	if got.Reason != StatePendingVRAMUnknown {
 		t.Errorf("open S/T pair: Reason = %q (%s), want %q", got.Reason, got.Message, StatePendingVRAMUnknown)
 	}
 
-	pinnedUnknownSibling := RunningProc{SpecID: "S", Spec: "S", Pinned: true, GPUs: map[int]int{0: 0}}
+	pinnedUnknownSibling := RunningProc{SpecID: "S", Spec: "S", Pinned: true, GPUs: map[GPUKey]int{{Index: 0}: 0}}
 	snap = PolicySnapshot{Running: []RunningProc{pinnedUnknownSibling}, Allowed: map[[2]string]bool{}}
 	got = Admit(snap, instanceSpec("S", 1, 1000))
 	if got.Reason != StatePendingVRAMUnknown {
@@ -151,7 +151,7 @@ func TestAdmitSiblingNeverVictim(t *testing.T) {
 	}{
 		{
 			name: "per-GPU VRAM",
-			snap: PolicySnapshot{Running: []RunningProc{s2}, Budgets: map[int]int{0: 10000}},
+			snap: PolicySnapshot{Running: []RunningProc{s2}, Budgets: map[GPUKey]int{{Index: 0}: 10000}},
 			spec: instanceSpec("S", 1, 6000),
 			want: Decision{Wait: true, Evict: []string{}},
 		},
@@ -181,7 +181,7 @@ func TestAdmitSiblingNeverVictim(t *testing.T) {
 // (highest index leaves first): instance 0 is not a victim while instance 1
 // runs, even when instance 0 is the idle one and the LRU order would pick it.
 func TestAdmitLowerIndexNotEvictableWhileHigherRuns(t *testing.T) {
-	budgets := map[int]int{0: 10000}
+	budgets := map[GPUKey]int{{Index: 0}: 10000}
 	// The instance key is listed beside its base so the matrix is open however
 	// the pair is looked up: this test is about the victim gate, not rule 1.
 	allowed := allowPairs("X", "S", "S#1", "T")
@@ -196,7 +196,7 @@ func TestAdmitLowerIndexNotEvictableWhileHigherRuns(t *testing.T) {
 
 	// Control: the same idle S with an unrelated busy neighbour is the victim,
 	// so the Wait above is the invariant and not a lack of room.
-	tBusy := RunningProc{SpecID: "T", Spec: "T", InFlight: 1, GPUs: map[int]int{0: 4000}}
+	tBusy := RunningProc{SpecID: "T", Spec: "T", InFlight: 1, GPUs: map[GPUKey]int{{Index: 0}: 4000}}
 	snap = PolicySnapshot{Running: []RunningProc{s0, tBusy}, Budgets: budgets, Allowed: allowed}
 	assertDecision(t, "idle S, no sibling", Admit(snap, x), Decision{Evict: []string{"S"}})
 
@@ -213,14 +213,14 @@ func TestAdmitLowerIndexNotEvictableWhileHigherRuns(t *testing.T) {
 // role -- since its spec keeps serving from a lower sibling.
 func TestAdmitSurplusVictimsFirst(t *testing.T) {
 	x := Spec{ID: "X", Role: "chat", GPUs: []SpecGPU{{Index: 0, VRAMMB: 4000}}}
-	budgets := map[int]int{0: 10000}
+	budgets := map[GPUKey]int{{Index: 0}: 10000}
 	allowed := allowPairs("X", "S", "S#1", "T") // open under either lookup, as above
 
 	surplus := instanceProc("S", 1, 4000)
 	surplus.Surplus = true
 	surplus.Role = "chat"
 	surplus.LastUsed = t3
-	oldT := RunningProc{SpecID: "T", Spec: "T", Role: "chat", LastUsed: t0, GPUs: map[int]int{0: 4000}}
+	oldT := RunningProc{SpecID: "T", Spec: "T", Role: "chat", LastUsed: t0, GPUs: map[GPUKey]int{{Index: 0}: 4000}}
 
 	snap := PolicySnapshot{Running: []RunningProc{oldT, surplus}, Budgets: budgets, Allowed: allowed}
 	assertDecision(t, "same role", Admit(snap, x), Decision{Evict: []string{"S#1"}})
@@ -231,10 +231,10 @@ func TestAdmitSurplusVictimsFirst(t *testing.T) {
 }
 
 func TestAdmitNoEvictRefusesInsteadOfEvicting(t *testing.T) {
-	idle := RunningProc{SpecID: "idle-t", Spec: "idle-t", LastUsed: t0, GPUs: map[int]int{0: 6000}}
+	idle := RunningProc{SpecID: "idle-t", Spec: "idle-t", LastUsed: t0, GPUs: map[GPUKey]int{{Index: 0}: 6000}}
 	snap := PolicySnapshot{
 		Running: []RunningProc{idle},
-		Budgets: map[int]int{0: 10000},
+		Budgets: map[GPUKey]int{{Index: 0}: 10000},
 		Allowed: allowPairs("S", "idle-t"),
 		NoEvict: true,
 	}
@@ -246,10 +246,10 @@ func TestAdmitNoEvictRefusesInsteadOfEvicting(t *testing.T) {
 }
 
 func TestAdmitNoEvictRefusesInsteadOfWaiting(t *testing.T) {
-	busy := RunningProc{SpecID: "T", Spec: "T", InFlight: 1, GPUs: map[int]int{0: 6000}}
+	busy := RunningProc{SpecID: "T", Spec: "T", InFlight: 1, GPUs: map[GPUKey]int{{Index: 0}: 6000}}
 	snap := PolicySnapshot{
 		Running: []RunningProc{busy},
-		Budgets: map[int]int{0: 10000},
+		Budgets: map[GPUKey]int{{Index: 0}: 10000},
 		Allowed: allowPairs("S", "T"),
 		NoEvict: true,
 	}
@@ -259,7 +259,7 @@ func TestAdmitNoEvictRefusesInsteadOfWaiting(t *testing.T) {
 func TestAdmitNoEvictOKWhenFree(t *testing.T) {
 	snap := PolicySnapshot{
 		Running: []RunningProc{instanceProc("S", 0, 4000)},
-		Budgets: map[int]int{0: 10000},
+		Budgets: map[GPUKey]int{{Index: 0}: 10000},
 		NoEvict: true,
 	}
 	got := Admit(snap, instanceSpec("S", 1, 4000))
@@ -273,7 +273,7 @@ func TestAdmitNoEvictOKWhenFree(t *testing.T) {
 // (whose wake flags must not leak) and the terminals -- is mapped, and the
 // Message keeps naming the underlying cause.
 func TestAdmitNoEvictRefusesEveryOtherAnswer(t *testing.T) {
-	known := RunningProc{SpecID: "known-k", Spec: "known-k", LastUsed: t0, GPUs: map[int]int{0: 3000}}
+	known := RunningProc{SpecID: "known-k", Spec: "known-k", LastUsed: t0, GPUs: map[GPUKey]int{{Index: 0}: 3000}}
 	unknownCand := Spec{ID: "S#3", InstanceOf: "S", Instance: 3, GPUs: []SpecGPU{{Index: 0, VRAMMB: 0}}}
 	cases := []struct {
 		name          string
@@ -307,8 +307,8 @@ func TestAdmitNoEvictRefusesEveryOtherAnswer(t *testing.T) {
 		{
 			name: "eviction grace wait",
 			snap: PolicySnapshot{
-				Running: []RunningProc{{SpecID: "known-k", Spec: "known-k", LastUsed: t3, GPUs: map[int]int{0: 6000}}},
-				Budgets: map[int]int{0: 10000}, Allowed: allowPairs("S", "known-k"),
+				Running: []RunningProc{{SpecID: "known-k", Spec: "known-k", LastUsed: t3, GPUs: map[GPUKey]int{{Index: 0}: 6000}}},
+				Budgets: map[GPUKey]int{{Index: 0}: 10000}, Allowed: allowPairs("S", "known-k"),
 				Now: t3.Add(time.Second), EvictionGrace: time.Minute,
 			},
 			spec:          instanceSpec("S", 3, 6000),
@@ -317,7 +317,7 @@ func TestAdmitNoEvictRefusesEveryOtherAnswer(t *testing.T) {
 		{
 			name: "pinned unknown-VRAM occupant",
 			snap: PolicySnapshot{
-				Running: []RunningProc{{SpecID: "P", Spec: "P", Pinned: true, GPUs: map[int]int{0: 0}}},
+				Running: []RunningProc{{SpecID: "P", Spec: "P", Pinned: true, GPUs: map[GPUKey]int{{Index: 0}: 0}}},
 				Allowed: allowPairs("S", "P"),
 			},
 			spec:          instanceSpec("S", 3, 1000),
@@ -325,7 +325,7 @@ func TestAdmitNoEvictRefusesEveryOtherAnswer(t *testing.T) {
 		},
 		{
 			name:          "own demand over budget",
-			snap:          PolicySnapshot{Budgets: map[int]int{0: 1000}},
+			snap:          PolicySnapshot{Budgets: map[GPUKey]int{{Index: 0}: 1000}},
 			spec:          instanceSpec("S", 3, 2000),
 			wantInMessage: "exceeds budget",
 		},
@@ -361,7 +361,7 @@ func TestAdmitInstancesCountTowardMaxProcesses(t *testing.T) {
 // a second instance fits beside the first, a third does not.
 func TestAdmitSiblingVRAMSummed(t *testing.T) {
 	s0 := instanceProc("S", 0, 4000) // measured
-	snap := PolicySnapshot{Running: []RunningProc{s0}, Budgets: map[int]int{0: 10000}, NoEvict: true}
+	snap := PolicySnapshot{Running: []RunningProc{s0}, Budgets: map[GPUKey]int{{Index: 0}: 10000}, NoEvict: true}
 	assertDecision(t, "S#1 beside S", Admit(snap, instanceSpec("S", 1, 4000)), Decision{OK: true, Evict: []string{}})
 
 	snap.Running = append(snap.Running, instanceProc("S", 1, 4000))
@@ -377,9 +377,9 @@ func TestAdmitSiblingVRAMSummed(t *testing.T) {
 // unload happened to run. LastUsed is set so the oldest-first drain order alone
 // would put the lower index first; the expected lists pin the override.
 func TestAdmitEvictsSiblingsHighestIndexFirst(t *testing.T) {
-	sBusy := RunningProc{SpecID: "S", Spec: "S", InFlight: 1, GPUs: map[int]int{0: 3000}, RAMMB: 3000}
-	s1 := RunningProc{SpecID: "S#1", Spec: "S", Instance: 1, Surplus: true, LastUsed: t0, GPUs: map[int]int{0: 3000}, RAMMB: 3000}
-	s2 := RunningProc{SpecID: "S#2", Spec: "S", Instance: 2, Surplus: true, LastUsed: t1, GPUs: map[int]int{0: 3000}, RAMMB: 3000}
+	sBusy := RunningProc{SpecID: "S", Spec: "S", InFlight: 1, GPUs: map[GPUKey]int{{Index: 0}: 3000}, RAMMB: 3000}
+	s1 := RunningProc{SpecID: "S#1", Spec: "S", Instance: 1, Surplus: true, LastUsed: t0, GPUs: map[GPUKey]int{{Index: 0}: 3000}, RAMMB: 3000}
+	s2 := RunningProc{SpecID: "S#2", Spec: "S", Instance: 2, Surplus: true, LastUsed: t1, GPUs: map[GPUKey]int{{Index: 0}: 3000}, RAMMB: 3000}
 	sIdle := RunningProc{SpecID: "S", Spec: "S", LastUsed: t0}
 	s1Idle := RunningProc{SpecID: "S#1", Spec: "S", Instance: 1, Surplus: true, LastUsed: t1}
 	s2Idle := RunningProc{SpecID: "S#2", Spec: "S", Instance: 2, Surplus: true, LastUsed: t2}
@@ -393,7 +393,7 @@ func TestAdmitEvictsSiblingsHighestIndexFirst(t *testing.T) {
 		{
 			name: "per-GPU VRAM",
 			snap: PolicySnapshot{
-				Running: []RunningProc{sBusy, s1, s2}, Budgets: map[int]int{0: 10000}, Allowed: allowPairs("X", "S"),
+				Running: []RunningProc{sBusy, s1, s2}, Budgets: map[GPUKey]int{{Index: 0}: 10000}, Allowed: allowPairs("X", "S"),
 			},
 			spec: Spec{ID: "X", GPUs: []SpecGPU{{Index: 0, VRAMMB: 7000}}},
 			want: []string{"S#2", "S#1"},

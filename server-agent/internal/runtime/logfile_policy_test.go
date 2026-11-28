@@ -205,7 +205,7 @@ func TestResolveLogFile(t *testing.T) {
 			}
 			p := LocalPolicy{AllowedLogDirs: tc.entries}
 			lf := LogFile{Name: "e", Path: tc.path}
-			got, err := p.resolveLogFile(tc.spec, lf, 8080, GPUVendorNone, nil, cfgDir)
+			got, err := p.resolveLogFile(tc.spec, lf, 8080, GPUTopology{}, cfgDir)
 			if tc.wantOpen == "" {
 				if err == nil {
 					t.Fatalf("resolveLogFile(%q) = %+v, want a refusal", tc.path, got)
@@ -274,7 +274,7 @@ func assertLogFileRefusal(t *testing.T, err error, entries []string, candidate s
 func openTarget(t *testing.T, cfgDir string, entries []string, path string) logFileTarget {
 	t.Helper()
 	p := LocalPolicy{AllowedLogDirs: entries}
-	target, err := p.resolveLogFile(nativeLogSpec("s1"), LogFile{Name: "e", Path: path}, 8080, GPUVendorNone, nil, cfgDir)
+	target, err := p.resolveLogFile(nativeLogSpec("s1"), LogFile{Name: "e", Path: path}, 8080, GPUTopology{}, cfgDir)
 	if err != nil {
 		t.Fatalf("resolveLogFile(%q): %v", path, err)
 	}

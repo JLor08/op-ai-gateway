@@ -428,6 +428,34 @@ var Features = []Feature{
 	//
 	// Since is 0.26.0: agent.Features gains an entry, so the rule is a MINOR bump.
 	{Name: FeatureRuntimeLogFiles, Since: "0.26.0"},
+	// gpu_vendor_identity: this agent identifies each GPU's vendor (NVIDIA,
+	// AMD or Apple) and acts on it. It reports `vendor` on every GPU
+	// (telemetry, hardware report, runtime samples), accepts `vendor` on spec
+	// GPUs and GPU budgets (empty = the host's legacy vendor, the first
+	// detected of NVIDIA, AMD, Apple), measures per-process VRAM per vendor
+	// (NVIDIA compute-apps and AMD DRM fdinfo), reports each GPU's
+	// vram_measurable and Vulkan ordinal, and decides device backend and
+	// visibility per spec, including GGML_VK_VISIBLE_DEVICES.
+	//
+	// The GATEWAY gates its vendor-aware saves on this flag: it persists a
+	// spec's or budget's vendor only when the connected agent declared the
+	// name, so a gateway never relies on vendor handling an agent does not
+	// have.
+	//
+	// Since is 0.27.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block). This is the branch's single bump.
+	{Name: FeatureGPUVendorIdentity, Since: "0.27.0"},
+	// rpc_cluster_same_host: this agent tells a loopback-bound RPC member's
+	// own readiness probe apart from a same-host head, using a two-poll
+	// debounce, so a cluster member may run on the head's own server.
+	//
+	// The GATEWAY gates the same-host cluster save on this flag: it accepts a
+	// member bound to loopback on the head's host only when the connected
+	// agent declared the name.
+	//
+	// Since is 0.27.0: agent.Features gains an entry, so the rule is a MINOR
+	// bump (see agent.go's Version block). This is the branch's single bump.
+	{Name: FeatureRPCClusterSameHost, Since: "0.27.0"},
 }
 
 // FeatureRuntimeInstances names the runtime_instances feature (see its registry
@@ -461,6 +489,14 @@ const FeatureRuntimeProcessTreeJob = "runtime_process_tree_job"
 // FeatureRuntimeLogFiles names the runtime_log_files feature (see its registry
 // entry above): declared log files tailed into streams of their own.
 const FeatureRuntimeLogFiles = "runtime_log_files"
+
+// FeatureGPUVendorIdentity names the gpu_vendor_identity feature (see its
+// registry entry above): vendor-aware GPU identity, placement and measurement.
+const FeatureGPUVendorIdentity = "gpu_vendor_identity"
+
+// FeatureRPCClusterSameHost names the rpc_cluster_same_host feature (see its
+// registry entry above): a loopback RPC member told apart from a same-host head.
+const FeatureRPCClusterSameHost = "rpc_cluster_same_host"
 
 // FeatureNames returns every feature name in Features, in registry order.
 func FeatureNames() []string {

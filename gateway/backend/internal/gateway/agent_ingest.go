@@ -141,8 +141,11 @@ type agentTelemetryRequest struct {
 // only place a reader can learn HOW OLD a measurement is, since the stored
 // row carries no timestamp (see RuntimeStatusDTO.GPUs/MeasuredAt).
 type agentRuntimeGPUSample struct {
-	Index          int `json:"index"`
-	VRAMMeasuredMB int `json:"vram_measured_mb"`
+	Index int `json:"index"`
+	// Vendor names the GPU's vendor ("nvidia", "amd", "apple"); empty from an
+	// agent without gpu_vendor_identity. Sanitized on ingest.
+	Vendor         string `json:"vendor,omitempty"`
+	VRAMMeasuredMB int    `json:"vram_measured_mb"`
 }
 
 // agentRuntimeError is one managed process's last failure, as reported inside
@@ -694,7 +697,11 @@ func runtimeStatusDTOsFromSamples(samples []agentRuntimeSample, receivedAt time.
 			if gpu.VRAMMeasuredMB <= 0 {
 				continue
 			}
-			dto.GPUs = append(dto.GPUs, RuntimeGPUStatusDTO(gpu))
+			dto.GPUs = append(dto.GPUs, RuntimeGPUStatusDTO{
+				Index:          gpu.Index,
+				Vendor:         sanitizeGPUVendor(gpu.Vendor),
+				VRAMMeasuredMB: gpu.VRAMMeasuredMB,
+			})
 		}
 		if len(dto.GPUs) > 0 {
 			dto.MeasuredAt = receivedAt
@@ -777,9 +784,11 @@ const maxRuntimeGPUsPerSample = 64
 // telemetry sample (foldInstanceRows): what the spec-level columns the ingest
 // writes back are compared with and written from.
 type foldedSpec struct {
-	// MaxGPU is the largest measured VRAM per GPU index over the spec's rows
-	// (only measured, > 0, figures; nil when no row measured any).
-	MaxGPU map[int]int
+	// MaxGPU is the largest measured VRAM per GPU over the spec's rows, keyed
+	// by (vendor, index) with a vendor-less GPU resolved to the server's
+	// legacy vendor (resolvedGPUKey): only measured, > 0, figures; nil when no
+	// row measured any.
+	MaxGPU map[routing.GPUKey]int
 	// MaxRAM is the largest measured host RAM over the spec's rows, 0 when no
 	// row measured any.
 	MaxRAM int
@@ -814,7 +823,12 @@ type foldedSpec struct {
 // expected to be capped at maxRuntimeSamplesPerSample by the caller; each
 // row's GPUs are capped here at maxRuntimeGPUsPerSample, so one row cannot
 // drive an unbounded number of per-GPU writes.
-func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
+//
+// The GPUs fold per (vendor, index): a mixed NVIDIA + AMD host has an index 0
+// of each vendor, two cards with one index. A GPU reported without a vendor
+// (an agent without gpu_vendor_identity) is the server's legacy vendor's
+// (legacyVendor, AIServer.GPULegacyVendor) -- see resolvedGPUKey.
+func foldInstanceRows(rows []RuntimeStatusDTO, legacyVendor string) map[string]foldedSpec {
 	out := make(map[string]foldedSpec, len(rows))
 	for _, row := range rows {
 		specID := strings.TrimSpace(row.SpecID)
@@ -831,9 +845,10 @@ func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
 				continue
 			}
 			if f.MaxGPU == nil {
-				f.MaxGPU = make(map[int]int, len(gpus))
+				f.MaxGPU = make(map[routing.GPUKey]int, len(gpus))
 			}
-			f.MaxGPU[g.Index] = max(f.MaxGPU[g.Index], g.VRAMMeasuredMB)
+			key := resolvedGPUKey(g.Vendor, g.Index, legacyVendor)
+			f.MaxGPU[key] = max(f.MaxGPU[key], g.VRAMMeasuredMB)
 		}
 		f.MaxRAM = max(f.MaxRAM, row.RAMMeasuredMB)
 		f.MaxStartupMS = max(f.MaxStartupMS, row.StartupMS)
@@ -847,6 +862,36 @@ func foldInstanceRows(rows []RuntimeStatusDTO) map[string]foldedSpec {
 		out[specID] = f
 	}
 	return out
+}
+
+// resolvedGPUKey is the key of a GPU a frame or a sample reports. An empty
+// vendor -- what an agent without gpu_vendor_identity sends -- stands for the
+// server's stored legacy vendor (AIServer.GPULegacyVendor): the vendor the
+// backfill rewrote the server's empty-vendor rows to, and the vendor that
+// agent treats as the host's only one. With none stored (the server was never
+// backfilled) the key keeps the empty vendor, as the rows still do.
+func resolvedGPUKey(vendor string, index int, legacyVendor string) routing.GPUKey {
+	if vendor == "" {
+		vendor = legacyVendor
+	}
+	return routing.GPUKey{Vendor: vendor, Index: index}
+}
+
+// storedGPURowKey is the key of the stored row a folded measurement for key
+// lands on: the row with that very key, else -- for the legacy vendor -- the
+// row with the empty vendor and key's index, which stands for the legacy
+// vendor too (a row saved without a vendor after the backfill, as a portal
+// save for an agent without gpu_vendor_identity writes it). Otherwise key
+// itself, and the write finds no row. stored nil (unreadable) is key.
+func storedGPURowKey(stored map[routing.GPUKey]int, key routing.GPUKey, legacyVendor string) routing.GPUKey {
+	if _, ok := stored[key]; ok || legacyVendor == "" || key.Vendor != legacyVendor {
+		return key
+	}
+	empty := routing.GPUKey{Index: key.Index}
+	if _, ok := stored[empty]; ok {
+		return empty
+	}
+	return key
 }
 
 // primaryRowIndexes picks, per spec id, the index of the row that speaks for
@@ -968,6 +1013,12 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 // maxRuntimeGPUsPerSample before any store call, bounding the worst case
 // regardless of how many distinct ids a hostile/buggy sample names.
 //
+// Each measurement is keyed by (vendor, index) (foldInstanceRows), so NVIDIA 0
+// and AMD 0 of a mixed host land on their own rows; a vendor-less one was
+// resolved to legacyVendor, the server's stored legacy vendor, and a
+// measurement of the legacy vendor also reaches an empty-vendor row
+// (storedGPURowKey).
+//
 // AN UNCHANGED MEASUREMENT IS NOT REWRITTEN, and that is a cost fix rather
 // than a tidiness one. Telemetry arrives once per second and every sample is
 // a FULL SNAPSHOT, so a spec whose measurement is merely stable -- the normal
@@ -998,7 +1049,7 @@ func (s *Server) resolveRuntimeSpecOwned(ctx context.Context, serverID, specID, 
 // unconditionally", never to "skip the write": staleness must not be able to
 // suppress a real measurement. Called only AFTER every store write in
 // ingestTelemetrySample has succeeded.
-func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, folded map[string]foldedSpec) {
+func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID, legacyVendor string, folded map[string]foldedSpec) {
 	if s.Routes == nil {
 		return
 	}
@@ -1009,36 +1060,57 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID string, fold
 		if _, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, "vram"); !ok {
 			continue
 		}
-		stored := s.storedMeasuredVRAM(ctx, serverID, specID)
-		for index, measured := range f.MaxGPU {
-			if was, known := stored[index]; known && was == measured {
-				continue // already on file, byte for byte
-			}
-			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, index, measured); err != nil {
-				// Tolerates ErrNotFound (a GPU row deleted out from under an
-				// in-flight sample) the same as any other failure here: log
-				// and move on, never reject the sample.
-				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu_index", index, "err", err)
-			}
+		s.writeBackSpecVRAM(ctx, serverID, legacyVendor, specID, f.MaxGPU)
+	}
+}
+
+// writeBackSpecVRAM is writeBackRuntimeVRAM for one owned spec: each GPU's
+// measurement is written to the spec's row for it unless the stored value
+// says the write is not needed (vramWriteNeeded).
+func (s *Server) writeBackSpecVRAM(ctx context.Context, serverID, legacyVendor, specID string, maxGPU map[routing.GPUKey]int) {
+	stored := s.storedMeasuredVRAM(ctx, serverID, specID)
+	for key, measured := range maxGPU {
+		row := storedGPURowKey(stored, key, legacyVendor)
+		if !vramWriteNeeded(stored, row, measured) {
+			continue
+		}
+		if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, row, measured); err != nil {
+			// Tolerates ErrNotFound (a GPU row deleted out from under an
+			// in-flight sample) the same as any other failure here: log
+			// and move on, never reject the sample.
+			slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu", row.String(), "err", err)
 		}
 	}
 }
 
+// vramWriteNeeded reports whether measured must be written to row. Unknown
+// stored values (nil: the read failed) always write. A row the spec does not
+// have -- the window before the legacy-vendor backfill, or a card the spec
+// never declared -- never does: the UPDATE could not match, on every frame.
+// A row already holding measured is on file, byte for byte.
+func vramWriteNeeded(stored map[routing.GPUKey]int, row routing.GPUKey, measured int) bool {
+	if stored == nil {
+		return true
+	}
+	was, known := stored[row]
+	return known && was != measured
+}
+
 // storedMeasuredVRAM reads specID's currently-stored measured value per GPU
-// index, for writeBackRuntimeVRAM's change detection. A read failure returns
+// row key (vendor, index), for writeBackRuntimeVRAM's change detection. A read failure returns
 // nil, which the caller reads as "nothing known" and therefore writes
 // unconditionally -- the safe direction: a missed comparison costs one
 // redundant UPDATE, whereas a wrongly-assumed match would silently drop a
 // real measurement.
-func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string) map[int]int {
+func (s *Server) storedMeasuredVRAM(ctx context.Context, serverID, specID string) map[routing.GPUKey]int {
 	gpus, err := s.Routes.RuntimeSpecGPUs(ctx, specID)
 	if err != nil {
 		slog.Debug("runtime vram write-back: current gpu rows unreadable, writing unconditionally", "server_id", serverID, "spec_id", specID, "err", err)
 		return nil
 	}
-	out := make(map[int]int, len(gpus))
+	out := make(map[routing.GPUKey]int, len(gpus))
 	for _, g := range gpus {
-		out[g.GPUIndex] = g.VRAMMeasuredMB
+		out[g.Key()] = g.VRAMMeasuredMB
 	}
 	return out
 }
@@ -1992,7 +2064,11 @@ type agentNetReport struct {
 }
 
 type agentGPUReport struct {
-	Index         int     `json:"index"`
+	Index int `json:"index"`
+	// Vendor and PCIBusID are additive: an agent without gpu_vendor_identity
+	// omits them and they decode empty.
+	Vendor        string  `json:"vendor"`
+	PCIBusID      string  `json:"pci_bus_id"`
 	Name          string  `json:"name"`
 	UUID          string  `json:"uuid"`
 	UtilPct       float64 `json:"util_pct"`
@@ -2019,6 +2095,14 @@ type agentSystemReport struct {
 	Mainboard    agentMainboard  `json:"mainboard"`
 	BIOS         agentBIOS       `json:"bios"`
 	GPUs         []agentGPUInfo  `json:"gpus"`
+	// VulkanDeviceCount is how many Vulkan devices the agent's probe saw; 0
+	// when unknown or not probed.
+	VulkanDeviceCount int `json:"vulkan_device_count,omitempty"`
+	// GPULegacyVendor is the vendor the agent's runtime gives a GPU without
+	// one (nvidia, amd, apple; "" = not reported or invalid). It comes from
+	// the agent's detection, so it is right even when a timed-out collector
+	// left a vendor out of GPUs; the legacy-vendor backfill uses it as is.
+	GPULegacyVendor string `json:"gpu_legacy_vendor,omitempty"`
 }
 
 type agentCPUInfo struct {
@@ -2064,8 +2148,17 @@ type agentGPUInfo struct {
 	// empty. Display and disambiguation, not identity -- the portal shows it
 	// to tell 4x/8x identical cards apart, and GPU identity is the index (see
 	// the agent's sample.GPU.PCIBusID). The only logic reading it is the
-	// portal's gpuLooksNVIDIA, as an NVIDIA fallback behind an AMD name check.
+	// portal's gpuLooksNVIDIA for a report without Vendor, as an NVIDIA
+	// fallback behind an AMD name check.
 	PCIBusID string `json:"pci_bus_id,omitempty"`
+	// Vendor is "nvidia", "amd" or "apple"; empty when the agent does not
+	// report it (or reports something else).
+	Vendor string `json:"vendor,omitempty"`
+	// VRAMMeasurable lists the runtime backends ("cuda", "rocm", "vulkan")
+	// that can measure this GPU's VRAM.
+	VRAMMeasurable []string `json:"vram_measurable,omitempty"`
+	// VulkanOrdinal is the GPU's Vulkan device ordinal; nil when unknown.
+	VulkanOrdinal *int `json:"vulkan_ordinal,omitempty"`
 }
 
 // errAgentSystemReportInvalid: the system-report payload failed to parse (POST ->
@@ -2273,6 +2366,7 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	hadInstances := s.AgentFeatures.Has(serverID, runtimeInstancesFeature)
 	hadRPCCluster := s.AgentFeatures.Has(serverID, rpcClusterFeature)
 	hadExecWSL := s.AgentFeatures.Has(serverID, RuntimeExecWSLFeature)
+	hadGPUVendors := s.AgentFeatures.Has(serverID, portal.AgentFeatureGPUVendorIdentity)
 	if capsReadable {
 		s.AgentFeatures.Set(serverID, caps)
 	} else {
@@ -2291,8 +2385,12 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// pushes nothing: it holds the document. runtime_exec_wsl is the same kind
 	// of input: a wsl spec is withheld from an agent without it and held while
 	// the declaration is unknown, so a change of it moves the document too.
+	// gpu_vendor_identity as well: the GPU rows carry their vendor, and a
+	// foreign vendor's rows go out at all, only for an agent that declares it
+	// (portal pushedGPUVendor).
 	if capsReadable && (!knewFeatures || slices.Contains(caps, runtimeInstancesFeature) != hadInstances ||
-		slices.Contains(caps, RuntimeExecWSLFeature) != hadExecWSL) {
+		slices.Contains(caps, RuntimeExecWSLFeature) != hadExecWSL ||
+		slices.Contains(caps, portal.AgentFeatureGPUVendorIdentity) != hadGPUVendors) {
 		s.PushRuntimeConfig(serverID)
 	}
 	// A cluster is pushed only while every agent of it declares rpc_cluster
@@ -2337,14 +2435,15 @@ func (s *Server) ingestTelemetrySample(ctx context.Context, serverID string, req
 	// records -- see clusterUsage.observe. A member spec has no runtime spec
 	// row, so the per-spec write-backs below never see its measurement. Never
 	// rejects the sample.
-	s.clusterUsage.observe(ctx, serverID, capped)
+	s.clusterUsage.observe(ctx, serverID, server.GPULegacyVendor, capped)
 	// One fold of the sample's rows per spec (foldInstanceRows), which every
 	// write-back below reads, over at most maxRuntimeSamplesPerSample rows.
-	folded := foldInstanceRows(capped)
+	// A vendor-less GPU in it is the server's legacy vendor's (resolvedGPUKey).
+	folded := foldInstanceRows(capped, server.GPULegacyVendor)
 	// Best-effort write-back of each spec's measured VRAM onto its launch
 	// spec -- see writeBackRuntimeVRAM. Never rejects the sample; a failure
 	// here is logged and dropped.
-	s.writeBackRuntimeVRAM(ctx, serverID, folded)
+	s.writeBackRuntimeVRAM(ctx, serverID, server.GPULegacyVendor, folded)
 	// Best-effort write-back of each spec's measured host RAM and startup onto
 	// its launch spec -- see writeBackRuntimeRAM and writeBackRuntimeStartup,
 	// which share one ownership resolution per spec. A no-op for an agent that
@@ -2519,6 +2618,33 @@ func nonNegI64(v int64) int64 {
 	return v
 }
 
+// sanitizeGPUVendor lower-cases and trims an agent-reported GPU vendor and
+// keeps it only when it is one of the known wire values; anything else is the
+// legacy empty vendor.
+func sanitizeGPUVendor(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" || !routing.ValidGPUVendor(v) {
+		return ""
+	}
+	return v
+}
+
+// sanitizeVRAMMeasurable keeps only the known backend names, de-duplicated
+// and sorted; nil when none survive.
+func sanitizeVRAMMeasurable(in []string) []string {
+	var out []string
+	for _, b := range in {
+		switch b {
+		case "cuda", "rocm", "vulkan":
+			if !slices.Contains(out, b) {
+				out = append(out, b)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // sanitizeSystemReport clamps negatives, caps slice sizes + string lengths, forces a
 // non-nil GPUs slice, and re-marshals to a canonical JSON blob (stable Go field
 // order). It returns the canonical bytes + the effective collected_at (the report's
@@ -2567,9 +2693,17 @@ func sanitizeSystemReport(r *agentSystemReport, now time.Time) ([]byte, time.Tim
 		r.GPUs[i].UUID = clampHardwareString(r.GPUs[i].UUID)
 		r.GPUs[i].DriverVersion = clampHardwareString(r.GPUs[i].DriverVersion)
 		r.GPUs[i].PCIBusID = clampHardwareString(r.GPUs[i].PCIBusID)
+		r.GPUs[i].Vendor = sanitizeGPUVendor(r.GPUs[i].Vendor)
+		r.GPUs[i].VRAMMeasurable = sanitizeVRAMMeasurable(r.GPUs[i].VRAMMeasurable)
+		if o := r.GPUs[i].VulkanOrdinal; o != nil && *o < 0 {
+			r.GPUs[i].VulkanOrdinal = nil
+		}
 		r.GPUs[i].Index = nonNegI(r.GPUs[i].Index)
 		r.GPUs[i].MemoryTotalBytes = nonNegI64(r.GPUs[i].MemoryTotalBytes)
 	}
+
+	r.VulkanDeviceCount = nonNegI(r.VulkanDeviceCount)
+	r.GPULegacyVendor = sanitizeGPUVendor(r.GPULegacyVendor)
 
 	collectedAt := r.CollectedAt
 	if collectedAt.IsZero() {
@@ -2595,7 +2729,8 @@ func (s *Server) ingestSystemReport(ctx context.Context, serverID string, raw js
 	}
 	now := time.Now().UTC()
 	canonical, collectedAt := sanitizeSystemReport(&req, now)
-	if _, err := s.Routes.AIServerByID(ctx, serverID); err != nil {
+	server, err := s.Routes.AIServerByID(ctx, serverID)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			slog.Warn("agent system report rejected: unknown server", "server_id", serverID)
 			return errAgentUnknownServer
@@ -2608,8 +2743,71 @@ func (s *Server) ingestSystemReport(ctx context.Context, serverID string, raw js
 		slog.Error("agent system report: upsert failed", "server_id", serverID, "err", err)
 		return &storeTelemetryError{code: "agent.system_report_failed", message: "system report upsert failed", cause: err}
 	}
+	s.backfillGPUVendorFromReport(ctx, serverID, legacyVendorFromReport(&req, server.GPULegacyVendor), req.GPUs)
 	slog.Debug("agent system report stored", "server_id", serverID, "gpus", len(req.GPUs))
 	return nil
+}
+
+// legacyVendorFromReport picks the legacy vendor a sanitized hardware report
+// stands for. The agent's own gpu_legacy_vendor wins as is: it comes from the
+// agent's detection, while GPUs can miss a vendor whose collector timed out.
+// Without it (an older agent) the report's first of nvidia, amd, apple is
+// used, but never one below stored in that order, so a partial report cannot
+// move the stored vendor down. "" when the report names no vendor at all.
+func legacyVendorFromReport(r *agentSystemReport, stored string) string {
+	if r.GPULegacyVendor != "" {
+		return r.GPULegacyVendor
+	}
+	vendors := reportGPUVendors(r.GPUs)
+	if len(vendors) == 0 {
+		return ""
+	}
+	return routing.LegacyGPUVendor(append(vendors, stored))
+}
+
+// reportGPUVendors lists the distinct non-empty vendors of gpus, in order.
+func reportGPUVendors(gpus []agentGPUInfo) []string {
+	var vendors []string
+	for _, g := range gpus {
+		if g.Vendor != "" && !slices.Contains(vendors, g.Vendor) {
+			vendors = append(vendors, g.Vendor)
+		}
+	}
+	return vendors
+}
+
+// backfillGPUVendorFromReport makes the server's legacy empty GPU vendor
+// explicit as legacy (legacyVendorFromReport), and a report whose GPUs carry
+// more than one vendor raises the review note. legacy "" (an agent without
+// gpu_vendor_identity) calls nothing and never clears what is stored. The
+// store persists the legacy vendor on every call and rewrites whatever
+// empty-vendor rows the server has at that moment: the first report rewrites
+// the legacy rows, a later one only a row saved empty since (say, while the
+// agent's feature declaration was unknown), so a repeated report usually
+// costs one transaction and no push.
+// Best-effort: a failure is logged, never fails the report it rode in on.
+//
+// When rows were rewritten the server's runtime document changes (its specs
+// and budgets), and so can its cluster heads' (the member GPU rows on this
+// server feed a head's document): the server is pushed itself, and
+// NotifyClustersOfServer pushes every server sharing a cluster with it.
+func (s *Server) backfillGPUVendorFromReport(ctx context.Context, serverID, legacy string, gpus []agentGPUInfo) {
+	if legacy == "" {
+		return
+	}
+	rewritten, err := s.Routes.BackfillServerGPUVendor(ctx, serverID, legacy, len(reportGPUVendors(gpus)) > 1)
+	if err != nil {
+		slog.Warn("agent system report: gpu vendor backfill failed", "server_id", serverID, "err", err)
+		return
+	}
+	if rewritten == 0 {
+		return
+	}
+	slog.Info("agent system report: legacy gpu vendor made explicit", "server_id", serverID, "rows", rewritten)
+	s.PushRuntimeConfig(serverID)
+	if s.Portal != nil {
+		s.Portal.NotifyClustersOfServer(ctx, serverID)
+	}
 }
 
 // agentSystemReportErrRows is writeAgentSystemReportError's one
@@ -2772,7 +2970,9 @@ func telemetrySampleFromRequest(req agentTelemetryRequest, now time.Time) (routi
 			return routing.TelemetrySample{}, fmt.Errorf("gpu memory counters must be non-negative")
 		}
 		sample.GPUs = append(sample.GPUs, routing.GPUSample{
+			Vendor:        sanitizeGPUVendor(g.Vendor),
 			Index:         g.Index,
+			PCIBusID:      clampHardwareString(g.PCIBusID),
 			Name:          strings.TrimSpace(g.Name),
 			UUID:          strings.TrimSpace(g.UUID),
 			UtilPct:       g.UtilPct,

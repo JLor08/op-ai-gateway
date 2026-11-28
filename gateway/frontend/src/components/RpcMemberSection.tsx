@@ -24,12 +24,15 @@ import EditIcon from '@mui/icons-material/Edit';
 import type {
   AdminGroupCandidate,
   DeviceBackend,
+  GpuVendor,
+  HardwareGPU,
   PortalServer,
   PutRPCMemberSpecRequest,
   RPCMemberSpec,
   RuntimeStatus,
   UpdateServerRequest,
 } from '../api';
+import { gpuKey, gpuNameLabel, hostGpuVendor, resolvedGpuKey } from '../api';
 import type { PortalApi, Translation } from './shared/types';
 import { formatPortalError } from './shared/format';
 import { useResource } from './shared/useResource';
@@ -69,7 +72,11 @@ function isAbsolutePath(p: string): boolean {
   return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
 }
 
-type GpuRow = { rowKey: number; index: string; vramMb: string };
+// A GPU row of the editor. vendor is the card's vendor (#434: indexes restart
+// per vendor, so a card is (vendor, index)); '' is a row that names none,
+// which the gateway reads as the server's legacy vendor. A typed index keeps
+// the row's vendor; picking a reported card sets both.
+type GpuRow = { rowKey: number; vendor: GpuVendor; index: string; vramMb: string };
 
 type EditorState = {
   // '' while creating.
@@ -112,6 +119,7 @@ function editorFor(spec: RPCMemberSpec): EditorState {
     envText: formatEnvText(spec.env),
     gpuRows: spec.gpus.map((g) => ({
       rowKey: nextRowKey(),
+      vendor: g.vendor ?? '',
       index: String(g.index),
       vramMb: g.vram_estimate_mb ? String(g.vram_estimate_mb) : '',
     })),
@@ -138,9 +146,13 @@ function nonNegativeInt(text: string): number | null {
 
 type Errors = { binary?: string; args?: string; env?: string; gpus?: string; ram?: string };
 
+// legacyVendor is the server's stored legacy vendor: the gateway reads a row
+// without a vendor as that vendor's card, so two rows naming one card that
+// way collide here exactly as they do there.
 function buildBody(
   ed: EditorState,
   t: Translation,
+  legacyVendor: GpuVendor,
 ): { body: PutRPCMemberSpecRequest } | { errors: Errors } {
   const errors: Errors = {};
   if (!isAbsolutePath(ed.binary.trim())) errors.binary = t.errorBinaryPathInvalid;
@@ -149,18 +161,20 @@ function buildBody(
   const parsedEnv = parseEnvText(ed.envText, t);
   if (parsedEnv.error) errors.env = parsedEnv.error;
   const gpus: PutRPCMemberSpecRequest['gpus'] = [];
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   for (const r of ed.gpuRows) {
     const index = nonNegativeInt(r.index);
     const vram = nonNegativeInt(r.vramMb);
-    if (r.index.trim() === '' || index === null || vram === null || seen.has(index)) {
+    const card = index === null ? '' : gpuKey(r.vendor || legacyVendor, index);
+    if (r.index.trim() === '' || index === null || vram === null || seen.has(card)) {
       errors.gpus = t.errorRuntimeSpecGpuInvalid;
       break;
     }
-    seen.add(index);
+    seen.add(card);
     // A member spec stores no measurement (member usage lives on the head's
-    // membership rows), and the gateway ignores the field on write.
-    gpus.push({ index, vram_estimate_mb: vram, vram_measured_mb: 0 });
+    // membership rows), and the gateway ignores the field on write. A row
+    // without a vendor goes back with the empty vendor it came with.
+    gpus.push({ vendor: r.vendor, index, vram_estimate_mb: vram, vram_measured_mb: 0 });
   }
   const ram = nonNegativeInt(ed.ramMb);
   if (ram === null) errors.ram = t.errorRuntimeSpecGpuInvalid;
@@ -183,16 +197,24 @@ function buildBody(
 // max(live measurement, operator estimate), summed over the member's GPUs.
 // A member without a stored spec (an automatic one) has only the live
 // measurement. The spec carries no stored measurement: what a member used is
-// kept per head on the membership rows, not on the spec.
-function effectiveVramMb(row: RuntimeStatus, spec: RPCMemberSpec | undefined): number {
-  const live = new Map((row.gpus ?? []).map((g) => [g.index, g.vram_measured_mb]));
+// kept per head on the membership rows, not on the spec. A GPU is its
+// (vendor, index) (#434), an empty vendor on either side read as hostVendor
+// (hostGpuVendor), so NVIDIA 0 and AMD 0 are two cards.
+function effectiveVramMb(
+  row: RuntimeStatus,
+  spec: RPCMemberSpec | undefined,
+  hostVendor: GpuVendor,
+): number {
+  const card = (g: { vendor?: GpuVendor; index: number }) =>
+    resolvedGpuKey(g.vendor, g.index, hostVendor);
+  const live = new Map((row.gpus ?? []).map((g) => [card(g), g.vram_measured_mb]));
   if (!spec) return [...live.values()].reduce((a, b) => a + b, 0);
-  const specIdx = new Set(spec.gpus.map((g) => g.index));
+  const specCards = new Set(spec.gpus.map(card));
   let sum = 0;
   for (const g of spec.gpus) {
-    sum += Math.max(live.get(g.index) ?? 0, g.vram_estimate_mb);
+    sum += Math.max(live.get(card(g)) ?? 0, g.vram_estimate_mb);
   }
-  for (const [idx, mb] of live) if (!specIdx.has(idx)) sum += mb;
+  for (const [key, mb] of live) if (!specCards.has(key)) sum += mb;
   return sum;
 }
 
@@ -259,6 +281,7 @@ function mbValue(mb: number): string {
 // hidden by default.
 function memberStatusColumns(
   specById: ReadonlyMap<string, RPCMemberSpec>,
+  hostVendor: GpuVendor,
   t: Translation,
 ): ListColumn<RuntimeStatus>[] {
   return [
@@ -299,8 +322,8 @@ function memberStatusColumns(
     {
       id: 'vram',
       label: t.rpcStatusVram,
-      value: (row) => mbValue(effectiveVramMb(row, specById.get(row.spec_id))),
-      render: (row) => mbOrDash(effectiveVramMb(row, specById.get(row.spec_id))),
+      value: (row) => mbValue(effectiveVramMb(row, specById.get(row.spec_id), hostVendor)),
+      render: (row) => mbOrDash(effectiveVramMb(row, specById.get(row.spec_id), hostVendor)),
       numeric: true,
       searchable: false,
     },
@@ -380,6 +403,7 @@ export function RpcMemberSection({
   api,
   server,
   statusRows,
+  hardwareGpus = [],
   onServerSaved,
 }: Readonly<{
   t: Translation;
@@ -397,6 +421,10 @@ export function RpcMemberSection({
   // The server's live runtime status, from the parent's status stream: one
   // stream per server, not one per section.
   statusRows: readonly RuntimeStatus[];
+  // The GPUs of the server's hardware report (the parent reads it once): the
+  // member spec editor's card picker offers them (#434), and they tell what a
+  // GPU without a vendor stands for. Empty without a report.
+  hardwareGpus?: readonly HardwareGPU[];
   // Receives the server returned by a settings save, so a parent that keeps
   // the tab's state across switches can feed it back as `server`.
   onServerSaved?: (server: PortalServer) => void;
@@ -481,6 +509,30 @@ export function RpcMemberSection({
     t,
   );
   const specs = useMemo(() => specsData?.data ?? [], [specsData]);
+  // What a GPU without a vendor stands for here (#434): the stored legacy
+  // vendor, else the report's only vendor. Rows are matched with reported
+  // cards and live frames by resolvedGpuKey with it.
+  const hostVendor = hostGpuVendor(server.gpu_legacy_vendor, [...hardwareGpus]);
+  const cardKey = (g: { vendor?: GpuVendor; index: number }) =>
+    resolvedGpuKey(g.vendor, g.index, hostVendor);
+  // The reported cards row idx may be switched to: every one but those a
+  // sibling row holds (the save refuses a card twice).
+  function gpuOptionsFor(rows: GpuRow[], idx: number): HardwareGPU[] {
+    const taken = new Set(
+      rows
+        .filter((_, i) => i !== idx)
+        .map((r) => cardKey({ vendor: r.vendor, index: Number(r.index) })),
+    );
+    return hardwareGpus.filter((g) => !taken.has(cardKey(g)));
+  }
+  // The picker's value: the reported card the row names, else the
+  // placeholder (an index the report does not list keeps its field).
+  function gpuSelectValue(rows: GpuRow[], idx: number): string {
+    const r = rows[idx];
+    const own = cardKey({ vendor: r.vendor, index: Number(r.index) });
+    const card = gpuOptionsFor(rows, idx).find((g) => cardKey(g) === own);
+    return card ? gpuKey(card.vendor, card.index) : '';
+  }
   const serverBinaries = useServerBinaries(api, server.id);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [errors, setErrors] = useState<Errors>({});
@@ -495,14 +547,37 @@ export function RpcMemberSection({
       e ? { ...e, gpuRows: e.gpuRows.map((r, i) => (i === idx ? { ...r, ...patch } : r)) } : e,
     );
   }
+  // A new row names the first reported card no row holds (#434: with its
+  // vendor), else the next free index without a vendor.
   function addGpu() {
     setEditor((e) => {
       if (!e) return e;
+      const held = new Set(
+        e.gpuRows.map((r) => cardKey({ vendor: r.vendor, index: Number(r.index) })),
+      );
+      const free = hardwareGpus.find((g) => !held.has(cardKey(g)));
+      if (free) {
+        return {
+          ...e,
+          gpuRows: [
+            ...e.gpuRows,
+            {
+              rowKey: nextRowKey(),
+              vendor: free.vendor ?? '',
+              index: String(free.index),
+              vramMb: '',
+            },
+          ],
+        };
+      }
       const used = e.gpuRows.map((r) => Number(r.index)).filter((n) => Number.isFinite(n));
       const next = used.length === 0 ? 0 : Math.max(...used) + 1;
       return {
         ...e,
-        gpuRows: [...e.gpuRows, { rowKey: nextRowKey(), index: String(next), vramMb: '' }],
+        gpuRows: [
+          ...e.gpuRows,
+          { rowKey: nextRowKey(), vendor: '', index: String(next), vramMb: '' },
+        ],
       };
     });
   }
@@ -519,7 +594,7 @@ export function RpcMemberSection({
 
   async function saveSpec() {
     if (!editor) return;
-    const built = buildBody(editor, t);
+    const built = buildBody(editor, t, server.gpu_legacy_vendor ?? '');
     if ('errors' in built) {
       setErrors(built.errors);
       return;
@@ -576,7 +651,10 @@ export function RpcMemberSection({
     [statusRows],
   );
   const specById = useMemo(() => new Map(specs.map((s) => [s.id, s])), [specs]);
-  const memberColumns = useMemo(() => memberStatusColumns(specById, t), [specById, t]);
+  const memberColumns = useMemo(
+    () => memberStatusColumns(specById, hostVendor, t),
+    [specById, hostVendor, t],
+  );
 
   return (
     <Box sx={{ display: 'grid', gap: 3 }}>
@@ -758,6 +836,31 @@ export function RpcMemberSection({
                   >
                     <ArrowDownwardIcon fontSize="small" />
                   </IconButton>
+                  {/* Picks a reported card by name and sets the row's vendor
+                      and index (#434); the index field stays for a card the
+                      report does not list. */}
+                  {hardwareGpus.length > 0 && (
+                    <SelectField
+                      id={`rpc-member-gpu-pick-${row.rowKey}`}
+                      label={`${t.rpcMemberGpuRow(idx + 1)}: ${t.runtimeSpecGpuPick}`}
+                      value={gpuSelectValue(editor.gpuRows, idx)}
+                      onChange={(e) => {
+                        const card = gpuOptionsFor(editor.gpuRows, idx).find(
+                          (g) => gpuKey(g.vendor, g.index) === e.target.value,
+                        );
+                        if (!card) return;
+                        patchGpu(idx, { vendor: card.vendor ?? '', index: String(card.index) });
+                      }}
+                      sx={{ maxWidth: 320 }}
+                    >
+                      <option value="">{t.runtimeSpecGpuPickPlaceholder}</option>
+                      {gpuOptionsFor(editor.gpuRows, idx).map((g) => (
+                        <option key={gpuKey(g.vendor, g.index)} value={gpuKey(g.vendor, g.index)}>
+                          {gpuNameLabel(g)}
+                        </option>
+                      ))}
+                    </SelectField>
+                  )}
                   <Field
                     id={`rpc-member-gpu-index-${row.rowKey}`}
                     label={t.runtimeSpecGpuIndex}

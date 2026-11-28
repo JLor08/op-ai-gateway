@@ -7,6 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"op-ai-gateway/internal/routing"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -95,4 +99,166 @@ func TestIngestTelemetrySampleErrorMapping(t *testing.T) {
 			t.Fatal("agent presence not reported")
 		}
 	})
+}
+
+// gpuReportBody is a system report whose GPUs carry the given vendors, in order
+// ("" omits the field, as an agent without gpu_vendor_identity does).
+func gpuReportBody(vendors ...string) json.RawMessage {
+	gpus := make([]string, 0, len(vendors))
+	for i, v := range vendors {
+		g := fmt.Sprintf(`{"index":%d,"name":"G%d","memory_total_bytes":1000`, i, i)
+		if v != "" {
+			g += fmt.Sprintf(`,"vendor":%q`, v)
+		}
+		gpus = append(gpus, g+"}")
+	}
+	return json.RawMessage(`{"agent_version":"0.27.0","gpus":[` + strings.Join(gpus, ",") + `]}`)
+}
+
+func specGPUVendors(t *testing.T, srv *Server, specID string) []string {
+	t.Helper()
+	gpus, err := srv.Routes.RuntimeSpecGPUs(context.Background(), specID)
+	if err != nil {
+		t.Fatalf("RuntimeSpecGPUs: %v", err)
+	}
+	out := make([]string, 0, len(gpus))
+	for _, g := range gpus {
+		out = append(out, g.GPUVendor)
+	}
+	return out
+}
+
+func TestHardwareReportBackfillsLegacyVendorAndRepeatIsQuiet(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	spy := &clusterNotifySpy{API: srv.Portal}
+	srv.Portal = spy
+	seedRuntimeIngestSpec(t, srv, "rspec_backfill")
+
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("amd", "nvidia")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := specGPUVendors(t, srv, "rspec_backfill"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("spec GPU vendors = %v, want [nvidia] (the legacy vendor of an nvidia+amd host)", got)
+	}
+	server, err := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if err != nil {
+		t.Fatalf("AIServerByID: %v", err)
+	}
+	if server.GPULegacyVendor != "nvidia" || !server.GPUVendorNote {
+		t.Fatalf("server legacy vendor %q note %v, want nvidia true", server.GPULegacyVendor, server.GPUVendorNote)
+	}
+	if got := spy.take(); !slices.Equal(got, []string{"mock-host-qwen"}) {
+		t.Fatalf("cluster notifications after the backfill = %v, want one for the server", got)
+	}
+
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("amd", "nvidia")); err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	if got := spy.take(); len(got) != 0 {
+		t.Fatalf("the repeated report notified %v, want nothing", got)
+	}
+}
+
+// withLegacyVendor adds the agent's own gpu_legacy_vendor to a gpuReportBody.
+func withLegacyVendor(body json.RawMessage, vendor string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{"gpu_legacy_vendor":%q,`, vendor) + string(body[1:]))
+}
+
+// A NVIDIA+AMD host whose nvidia-smi timed out sends an AMD-only report; the
+// agent still names nvidia as its legacy vendor, and that is what the gateway
+// stores and rewrites the empty rows to.
+func TestPartialReportUsesAgentLegacyVendor(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_partial")
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", withLegacyVendor(gpuReportBody("amd"), " NVIDIA ")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := specGPUVendors(t, srv, "rspec_partial"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("spec GPU vendors = %v, want [nvidia] (the agent's legacy vendor)", got)
+	}
+	server, _ := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if server.GPULegacyVendor != "nvidia" {
+		t.Fatalf("server legacy vendor %q, want nvidia", server.GPULegacyVendor)
+	}
+}
+
+// A report without gpu_legacy_vendor never moves the stored legacy vendor
+// down the nvidia > amd > apple precedence: an AMD-only report after a stored
+// nvidia keeps nvidia, and a later empty row is rewritten to nvidia.
+func TestReportWithoutLegacyFieldNeverDowngrades(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_first")
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("nvidia", "amd")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	// An empty-vendor row written after the first backfill.
+	if err := srv.Routes.SetRuntimeSpecGPUs(ctx, "rspec_first", []routing.RuntimeSpecGPU{
+		{SpecID: "rspec_first", GPUIndex: 1, VRAMEstimateMB: 1000},
+	}); err != nil {
+		t.Fatalf("set spec gpus: %v", err)
+	}
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("amd")); err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	server, _ := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if server.GPULegacyVendor != "nvidia" {
+		t.Fatalf("server legacy vendor %q, want nvidia kept", server.GPULegacyVendor)
+	}
+	if got := specGPUVendors(t, srv, "rspec_first"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("later spec GPU vendors = %v, want [nvidia]", got)
+	}
+}
+
+func TestHardwareReportFromOldAgentBackfillsNothing(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_old")
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("", "")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := specGPUVendors(t, srv, "rspec_old"); len(got) != 1 || got[0] != "" {
+		t.Fatalf("spec GPU vendors = %v, want the legacy empty vendor kept", got)
+	}
+	server, _ := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if server.GPULegacyVendor != "" || server.GPUVendorNote {
+		t.Fatalf("server legacy vendor %q note %v, want untouched", server.GPULegacyVendor, server.GPUVendorNote)
+	}
+}
+
+func TestSingleVendorReportSetsNoNote(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_single")
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("nvidia", "nvidia")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if got := specGPUVendors(t, srv, "rspec_single"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("spec GPU vendors = %v, want [nvidia]", got)
+	}
+	server, _ := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if server.GPULegacyVendor != "nvidia" || server.GPUVendorNote {
+		t.Fatalf("server legacy vendor %q note %v, want nvidia false", server.GPULegacyVendor, server.GPUVendorNote)
+	}
+}
+
+func TestVendorlessReportKeepsStoredLegacyVendor(t *testing.T) {
+	ctx := context.Background()
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_keep")
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("nvidia")); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	if err := srv.ingestSystemReport(ctx, "mock-host-qwen", gpuReportBody("")); err != nil {
+		t.Fatalf("vendor-less ingest: %v", err)
+	}
+	server, _ := srv.Routes.AIServerByID(ctx, "mock-host-qwen")
+	if server.GPULegacyVendor != "nvidia" {
+		t.Fatalf("legacy vendor = %q after a vendor-less report, want nvidia kept", server.GPULegacyVendor)
+	}
+	if got := specGPUVendors(t, srv, "rspec_keep"); len(got) != 1 || got[0] != "nvidia" {
+		t.Fatalf("spec GPU vendors = %v, want [nvidia] untouched", got)
+	}
 }

@@ -1267,7 +1267,7 @@ func (o *clusterOrchestrator) startMember(runCtx, mctx context.Context, m portal
 		o.setMember(head, m.Position, clusterMemberFailed, cause)
 		return &clusterError{Code: codeClusterStartFailed, Cause: cause, Position: m.Position}
 	}
-	if plan.Transport == clusterTransportDirect && headDown {
+	if memberTransport(plan.Transport, m) == clusterTransportDirect && headDown {
 		if r, ok := o.row(m.Server.ID, m.SpecID); ok && r.RPC != nil && r.RPC.HeldBy != "" {
 			// A direct member that lists a connection while its head is not
 			// running holds a dead one, which would refuse the head's next.
@@ -1283,6 +1283,16 @@ func (o *clusterOrchestrator) startMember(runCtx, mctx context.Context, m portal
 	}
 	o.setMember(head, m.Position, clusterMemberReady, "")
 	return nil
+}
+
+// memberTransport is m's own transport: the plan member's (a member on the
+// head's server runs direct inside a relay cluster too), else clusterTransport,
+// the cluster's.
+func memberTransport(clusterTransport string, m portal.ClusterPlanMember) string {
+	if m.Transport != "" {
+		return m.Transport
+	}
+	return clusterTransport
 }
 
 // clusterMemberTarget is the agent target of m's agent router: its server's

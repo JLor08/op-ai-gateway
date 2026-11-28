@@ -1769,6 +1769,13 @@ type ServerDTO struct {
 	// AgentPresenceTimeoutSeconds is the per-server override (seconds) for "the
 	// agent is delivering values"; 0 = follow the system-wide default.
 	AgentPresenceTimeoutSeconds int `json:"agent_presence_timeout_seconds"`
+	// GPULegacyVendor is the vendor an empty GPU vendor stands for on this
+	// server (set by the backfill from the first vendor-reporting hardware
+	// report); empty until one arrived. GPUVendorNote is the review note a
+	// backfill on a mixed-vendor host raised, until an operator dismisses it
+	// (DismissServerGPUVendorNote).
+	GPULegacyVendor string `json:"gpu_legacy_vendor,omitempty"`
+	GPUVendorNote   bool   `json:"gpu_vendor_note,omitempty"`
 	// RuntimeMaxProcesses / ManagedRuntimeOnly (Task 6, migration 66) mirror
 	// routing.AIServer's fields of the same name: how many agent-managed
 	// runtime processes (server_agent applications) may run concurrently on
@@ -5193,6 +5200,8 @@ func (s *Service) serverDTOWith(ctx context.Context, principal auth.Token, serve
 		ClockOffsetMS:               s.agentClockOffsetMS(server.ID),
 		TLSProxyState:               s.tlsProxyState(server, values, settingsOK),
 		AgentPresenceTimeoutSeconds: server.AgentPresenceTimeoutSeconds,
+		GPULegacyVendor:             server.GPULegacyVendor,
+		GPUVendorNote:               server.GPUVendorNote,
 		RuntimeMaxProcesses:         server.RuntimeMaxProcesses,
 		ManagedRuntimeOnly:          server.ManagedRuntimeOnly,
 		EstimatedWatts:              server.EstimatedWatts,

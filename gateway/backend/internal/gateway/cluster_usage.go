@@ -58,8 +58,11 @@ import (
 // on telemetry. A run nobody ended (the gateway was down when the head
 // stopped) is replaced by the next one, which replaces nothing of it.
 //
-// The same samples keep the session records (rpc_sessions): the hold of a
-// member by its head opens one, the end of the hold closes it. A restarted
+// The same samples keep the session records (rpc_sessions), one per head and
+// member server: the hold of a member by its head opens one, the end of the
+// last hold of the head's members on that server closes it. The member usage
+// itself is per member: by the head and the member's position, since a head
+// may have several members on one server. A restarted
 // gateway knows nothing of the sessions it left open, so the first sample of
 // each member server it receives syncs them with the store: a session still
 // held is adopted, any other open session of the server is closed -- also
@@ -183,8 +186,10 @@ func runIdentity(t time.Time) time.Time { return t.UTC().Truncate(time.Milliseco
 // on serverID. A frame without member rows costs nothing, unless the
 // server's sessions are not synced yet or it has a session open.
 // Best-effort like every write-back of the ingest: a failure is logged,
-// never returned.
-func (u *clusterUsage) observe(ctx context.Context, serverID string, rows []RuntimeStatusDTO) {
+// never returned. legacyVendor is serverID's stored legacy GPU vendor
+// (AIServer.GPULegacyVendor), which a vendor-less GPU stands for
+// (resolvedGPUKey).
+func (u *clusterUsage) observe(ctx context.Context, serverID, legacyVendor string, rows []RuntimeStatusDTO) {
 	if u == nil || u.store == nil || !u.relevant(serverID, rows) {
 		return
 	}
@@ -201,12 +206,14 @@ func (u *clusterUsage) observe(ctx context.Context, serverID string, rows []Runt
 			byID[r.SpecID] = r
 		}
 	}
+	// held is per head: the session record is the server's, held while any
+	// member of the head on serverID is.
 	held := make(map[string]bool, len(memberships))
 	for _, m := range memberships {
-		row, ok := u.heldRow(ctx, serverID, m, byID)
-		held[m.HeadSpecID] = ok
+		row, ok := u.heldRow(ctx, serverID, m, memberships, byID)
+		held[m.HeadSpecID] = held[m.HeadSpecID] || ok
 		if ok {
-			u.raise(ctx, m, row)
+			u.raise(ctx, m, row, legacyVendor)
 		}
 	}
 	u.syncSessions(ctx, serverID, held, u.now())
@@ -233,13 +240,15 @@ func (u *clusterUsage) relevant(serverID string, rows []RuntimeStatusDTO) bool {
 }
 
 // heldRow returns m's row in the frame of serverID and whether it counts: the
-// row reports the hold of m's head, and serverID owns the member. An
+// row reports the hold of m's head, and serverID owns the member. m's agent
+// spec id is numbered among memberships, serverID's membership rows, which
+// hold every member of m's head on serverID (portal.MemberAgentSpecID). An
 // automatic member is serverID's by its membership row (the reverse index
 // read it for serverID) and its agent spec id, which names the server; a
 // manual member must also be a spec of serverID's own, since the membership
 // row only records where the spec was when it was chosen.
-func (u *clusterUsage) heldRow(ctx context.Context, serverID string, m routing.ClusterMember, rows map[string]RuntimeStatusDTO) (RuntimeStatusDTO, bool) {
-	row, ok := rows[portal.MemberAgentSpecID(m)]
+func (u *clusterUsage) heldRow(ctx context.Context, serverID string, m routing.ClusterMember, memberships []routing.ClusterMember, rows map[string]RuntimeStatusDTO) (RuntimeStatusDTO, bool) {
+	row, ok := rows[portal.MemberAgentSpecID(m, memberships)]
 	if !ok || row.RPC == nil || row.RPC.HeldBy != m.HeadSpecID {
 		return row, false
 	}
@@ -261,25 +270,26 @@ func (u *clusterUsage) heldRow(ctx context.Context, serverID string, m routing.C
 	return row, true
 }
 
-// member reads the membership row of serverID under head and its GPU rows;
-// ok false when there is none.
-func (u *clusterUsage) member(ctx context.Context, head, serverID string) (routing.ClusterMember, []routing.ClusterMemberGPU, bool, error) {
+// member reads the membership row of head at position and its GPU rows; ok
+// false when there is none. A head may have several members on one server,
+// so a member is its position, never its server.
+func (u *clusterUsage) member(ctx context.Context, head string, position int) (routing.ClusterMember, []routing.ClusterMemberGPU, bool, error) {
 	members, gpus, err := u.store.ClusterMembers(ctx, head)
 	if err != nil {
 		return routing.ClusterMember{}, nil, false, err
 	}
-	i := slices.IndexFunc(members, func(m routing.ClusterMember) bool { return m.ServerID == serverID })
+	i := slices.IndexFunc(members, func(m routing.ClusterMember) bool { return m.Position == position })
 	if i < 0 {
 		return routing.ClusterMember{}, nil, false, nil
 	}
-	return members[i], gpusOf(gpus, serverID), true, nil
+	return members[i], gpusOf(gpus, position), true, nil
 }
 
-// gpusOf returns the GPU rows of serverID's member.
-func gpusOf(gpus []routing.ClusterMemberGPU, serverID string) []routing.ClusterMemberGPU {
+// gpusOf returns the GPU rows of the member at position.
+func gpusOf(gpus []routing.ClusterMemberGPU, position int) []routing.ClusterMemberGPU {
 	var out []routing.ClusterMemberGPU
 	for _, g := range gpus {
-		if g.ServerID == serverID {
+		if g.MemberPosition == position {
 			out = append(out, g)
 		}
 	}
@@ -291,23 +301,26 @@ func gpusOf(gpus []routing.ClusterMemberGPU, serverID string) []routing.ClusterM
 // measurement of 0 is unknown and changes nothing. A GPU the membership does
 // not list is ignored. Outside a run nothing counts. An unchanged row is not
 // written, so a stable member costs one read per sample; the write applies
-// only while the row is still in the run it read.
-func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row RuntimeStatusDTO) {
-	vram := measuredVRAM(row)
+// only while the row is still in the run it read. legacyVendor is the member
+// server's stored legacy GPU vendor (see raiseMeasured).
+func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row RuntimeStatusDTO, legacyVendor string) {
+	vram := measuredVRAM(row, legacyVendor)
 	if row.RAMMeasuredMB <= 0 && len(vram) == 0 {
 		return
 	}
 	unlock := u.locks.lock(headLockKey(m.HeadSpecID))
 	defer unlock()
-	cur, gpus, ok, err := u.member(ctx, m.HeadSpecID, m.ServerID)
+	cur, gpus, ok, err := u.member(ctx, m.HeadSpecID, m.Position)
 	if err != nil {
-		slog.Debug("cluster member usage: reading the membership failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+		slog.Debug("cluster member usage: reading the membership failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "err", err)
 		return
 	}
-	if !ok || cur.RunStartedAt.IsZero() {
+	// The member at m's position must still be m's: a membership rewrite
+	// in between may have put another server there.
+	if !ok || cur.ServerID != m.ServerID || cur.RunStartedAt.IsZero() {
 		return
 	}
-	peak, stored := raiseMeasured(&cur, gpus, row.RAMMeasuredMB, vram)
+	peak, stored := raiseMeasured(&cur, gpus, legacyVendor, row.RAMMeasuredMB, vram)
 	if !peak && !stored {
 		return
 	}
@@ -315,18 +328,20 @@ func (u *clusterUsage) raise(ctx context.Context, m routing.ClusterMember, row R
 		cur.MeasuredAt = u.now()
 	}
 	if _, err := u.store.UpdateClusterMemberUsage(ctx, cur, gpus); err != nil {
-		slog.Debug("cluster member usage: write failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+		slog.Debug("cluster member usage: write failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "server_id", m.ServerID, "err", err)
 	}
 }
 
-// measuredVRAM is row's measured VRAM per GPU index, its largest reading of
-// each GPU among the first maxRuntimeGPUsPerSample; a reading of 0 is unknown
-// and left out.
-func measuredVRAM(row RuntimeStatusDTO) map[int]int {
-	vram := make(map[int]int, len(row.GPUs))
+// measuredVRAM is row's measured VRAM per GPU (vendor, index), its largest
+// reading of each GPU among the first maxRuntimeGPUsPerSample; a reading of 0
+// is unknown and left out. A GPU without a vendor is legacyVendor's
+// (resolvedGPUKey).
+func measuredVRAM(row RuntimeStatusDTO, legacyVendor string) map[routing.GPUKey]int {
+	vram := make(map[routing.GPUKey]int, len(row.GPUs))
 	for _, g := range row.GPUs[:min(len(row.GPUs), maxRuntimeGPUsPerSample)] {
 		if g.VRAMMeasuredMB > 0 {
-			vram[g.Index] = max(vram[g.Index], g.VRAMMeasuredMB)
+			key := resolvedGPUKey(g.Vendor, g.Index, legacyVendor)
+			vram[key] = max(vram[key], g.VRAMMeasuredMB)
 		}
 	}
 	return vram
@@ -334,8 +349,10 @@ func measuredVRAM(row RuntimeStatusDTO) map[int]int {
 
 // raiseMeasured raises cur's and gpus' run peaks and stored values, each only
 // upwards, to ram (0: unknown) and the per-GPU vram, and reports whether a
-// run peak rose and whether a stored value rose.
-func raiseMeasured(cur *routing.ClusterMember, gpus []routing.ClusterMemberGPU, ram int, vram map[int]int) (peak, stored bool) {
+// run peak rose and whether a stored value rose. A member GPU row is matched
+// by its (vendor, index), an empty vendor standing for legacyVendor as it
+// does in vram (resolvedGPUKey).
+func raiseMeasured(cur *routing.ClusterMember, gpus []routing.ClusterMemberGPU, legacyVendor string, ram int, vram map[routing.GPUKey]int) (peak, stored bool) {
 	if ram > 0 {
 		if ram > cur.RunPeakRAMMB {
 			cur.RunPeakRAMMB, peak = ram, true
@@ -345,7 +362,7 @@ func raiseMeasured(cur *routing.ClusterMember, gpus []routing.ClusterMemberGPU, 
 		}
 	}
 	for i := range gpus {
-		v := vram[gpus[i].GPUIndex]
+		v := vram[resolvedGPUKey(gpus[i].GPUVendor, gpus[i].GPUIndex, legacyVendor)]
 		if v > gpus[i].RunPeakVRAMMB {
 			gpus[i].RunPeakVRAMMB, peak = v, true
 		}
@@ -415,7 +432,7 @@ func (u *clusterUsage) runEnded(ctx context.Context, head string, run time.Time,
 		if !m.RunStartedAt.Equal(run) {
 			continue
 		}
-		if u.endMemberRun(ctx, m, gpusOf(gpus, m.ServerID), formed, now) && !slices.Contains(pushes, m.ServerID) {
+		if u.endMemberRun(ctx, m, gpusOf(gpus, m.Position), formed, now) && !slices.Contains(pushes, m.ServerID) {
 			pushes = append(pushes, m.ServerID)
 		}
 	}
@@ -438,13 +455,13 @@ func (u *clusterUsage) endMemberRun(ctx context.Context, m routing.ClusterMember
 		applied, err := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
 		if err != nil || !applied {
 			if err != nil {
-				slog.Warn("cluster member usage: replacing by the run's peak failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+				slog.Warn("cluster member usage: replacing by the run's peak failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "server_id", m.ServerID, "err", err)
 			}
 			return false
 		}
 	}
-	if _, err := u.store.EndClusterMemberRun(ctx, m.HeadSpecID, m.ServerID, m.RunStartedAt); err != nil {
-		slog.Warn("cluster member usage: recording a run's end failed", "head_spec_id", m.HeadSpecID, "server_id", m.ServerID, "err", err)
+	if _, err := u.store.EndClusterMemberRun(ctx, m.HeadSpecID, m.Position, m.RunStartedAt); err != nil {
+		slog.Warn("cluster member usage: recording a run's end failed", "head_spec_id", m.HeadSpecID, "position", m.Position, "server_id", m.ServerID, "err", err)
 	}
 	return changed
 }
@@ -485,35 +502,18 @@ func replaceByRunPeak(m *routing.ClusterMember, gpus []routing.ClusterMemberGPU,
 	return changed
 }
 
-// reset clears the stored usage of serverID's member of head -- the stored
-// values, their stale mark and the current run's peaks; the run itself stays
-// open -- and pushes the member server's document, whose demand that
-// changes. store.ErrNotFound when serverID is no member of head.
-func (u *clusterUsage) reset(ctx context.Context, head, serverID string) error {
+// reset clears the stored usage of head's member at position on serverID --
+// the stored values, their stale mark and the current run's peaks; the run
+// itself stays open -- and pushes serverID's document, whose demand that
+// changes. store.ErrNotFound when head has no member at position, or the
+// member there is not on serverID (the server the reset was authorized for:
+// a membership rewrite since may have put another server's member there).
+func (u *clusterUsage) reset(ctx context.Context, head string, position int, serverID string) error {
 	if u == nil || u.store == nil {
 		return errClusterUsageUnavailable
 	}
 	unlock := u.locks.lock(headLockKey(head))
-	err := errClusterUsageContended
-	for range clusterUsageWriteAttempts {
-		m, gpus, ok, rerr := u.member(ctx, head, serverID)
-		if rerr == nil && !ok {
-			rerr = store.ErrNotFound
-		}
-		if rerr != nil {
-			err = rerr
-			break
-		}
-		m.RAMMeasuredMB, m.MeasuredAt, m.Stale, m.RunPeakRAMMB = 0, time.Time{}, false, 0
-		for i := range gpus {
-			gpus[i].VRAMMeasuredMB, gpus[i].RunPeakVRAMMB = 0, 0
-		}
-		applied, werr := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
-		if werr != nil || applied {
-			err = werr
-			break
-		}
-	}
+	err := u.resetLocked(ctx, head, position, serverID)
 	unlock()
 	if err != nil {
 		return err
@@ -522,6 +522,36 @@ func (u *clusterUsage) reset(ctx context.Context, head, serverID string) error {
 		u.push(serverID)
 	}
 	return nil
+}
+
+// resetLocked is reset's write under the head's lock: it re-reads the member
+// and writes it cleared until a write applies, at most
+// clusterUsageWriteAttempts times (errClusterUsageContended when none did).
+func (u *clusterUsage) resetLocked(ctx context.Context, head string, position int, serverID string) error {
+	for range clusterUsageWriteAttempts {
+		m, gpus, ok, err := u.member(ctx, head, position)
+		if err == nil && (!ok || m.ServerID != serverID) {
+			err = store.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		clearMemberUsage(&m, gpus)
+		applied, err := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
+		if err != nil || applied {
+			return err
+		}
+	}
+	return errClusterUsageContended
+}
+
+// clearMemberUsage clears m's stored usage, its stale mark and the current
+// run's peaks, and those of its GPU rows; the run itself stays open.
+func clearMemberUsage(m *routing.ClusterMember, gpus []routing.ClusterMemberGPU) {
+	m.RAMMeasuredMB, m.MeasuredAt, m.Stale, m.RunPeakRAMMB = 0, time.Time{}, false, 0
+	for i := range gpus {
+		gpus[i].VRAMMeasuredMB, gpus[i].RunPeakVRAMMB = 0, 0
+	}
 }
 
 // syncSessions keeps the session records of serverID's memberships after a

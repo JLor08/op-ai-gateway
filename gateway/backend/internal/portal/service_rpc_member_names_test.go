@@ -20,7 +20,7 @@ func TestRPCMemberDisplayNamesAutomaticAndRename(t *testing.T) {
 	f := newClusterFixture(t)
 	efyga := f.member("efyga")
 	head := f.mustPut(clusterHeadRequest(autoMember(efyga.ID)))
-	id := automaticMemberAgentSpecID(head.ID, efyga.ID)
+	id := automaticMemberAgentSpecID(head.ID, efyga.ID, 1)
 
 	names, err := f.svc.RPCMemberDisplayNames(f.ctx, ownerToken(), efyga.ID, []string{id, "spec_model"})
 	if err != nil {
@@ -86,12 +86,15 @@ func TestRPCMemberDisplayNamesWithoutAMembershipRow(t *testing.T) {
 	if err := f.routes.SetClusterMembers(f.ctx, head.ID, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	ids := []string{automaticMemberAgentSpecID(head.ID, efyga.ID), automaticMemberAgentSpecID("rspec_gone", efyga.ID)}
+	ids := []string{
+		automaticMemberAgentSpecID(head.ID, efyga.ID, 1), automaticMemberAgentSpecID("rspec_gone", efyga.ID, 1),
+		automaticMemberAgentSpecID(head.ID, efyga.ID, 2),
+	}
 	names, err := f.svc.RPCMemberDisplayNames(f.ctx, ownerToken(), efyga.ID, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]RPCMemberName{ids[0]: headed("big", "Head"), ids[1]: {DisplayName: "RPC (—)"}}
+	want := map[string]RPCMemberName{ids[0]: headed("big", "Head"), ids[1]: {DisplayName: "RPC (—)"}, ids[2]: headed("big", "Head")}
 	if !maps.Equal(names, want) {
 		t.Fatalf("names = %v, want %v", names, want)
 	}
@@ -106,7 +109,7 @@ func TestRPCMemberDisplayNamesHideAHeadTheReaderMayNotSee(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := automaticMemberAgentSpecID(head.ID, foreign.ID)
+	id := automaticMemberAgentSpecID(head.ID, foreign.ID, 1)
 
 	names, err := f.svc.RPCMemberDisplayNames(f.ctx, otherToken(), foreign.ID, []string{id})
 	if err != nil {
@@ -154,9 +157,9 @@ func TestRPCMemberDisplayNamesReadEachHeadOnce(t *testing.T) {
 	}
 	freeA, freeB := f.manualSpec(efyga.ID), f.manualSpec(efyga.ID)
 	ids := []string{
-		automaticMemberAgentSpecID(head.ID, efyga.ID),
-		automaticMemberAgentSpecID(other, efyga.ID),
-		automaticMemberAgentSpecID(head.ID, efyga.ID),
+		automaticMemberAgentSpecID(head.ID, efyga.ID, 1),
+		automaticMemberAgentSpecID(other, efyga.ID, 1),
+		automaticMemberAgentSpecID(head.ID, efyga.ID, 1),
 		freeA.ID,
 		freeB.ID,
 	}
@@ -171,5 +174,23 @@ func TestRPCMemberDisplayNamesReadEachHeadOnce(t *testing.T) {
 	}
 	if m, h, s := counting.memberships.Load(), counting.heads.Load(), counting.manual.Load(); m != 1 || h != 2 || s != 1 {
 		t.Fatalf("store reads: memberships %d, heads %d, manual specs %d; want 1, 2 and 1", m, h, s)
+	}
+}
+
+// Two members of one head on one server both name the head: the second by
+// its numbered id.
+func TestRPCMemberDisplayNamesTwoMembersOnOneServer(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.sameHostAgent(a.ID)
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(a.ID, 1)))
+	ids := []string{automaticMemberAgentSpecID(head.ID, a.ID, 1), automaticMemberAgentSpecID(head.ID, a.ID, 2)}
+	names, err := f.svc.RPCMemberDisplayNames(f.ctx, ownerToken(), a.ID, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]RPCMemberName{ids[0]: headed("big", "Head"), ids[1]: headed("big", "Head")}
+	if !maps.Equal(names, want) {
+		t.Fatalf("names = %v, want %v", names, want)
 	}
 }

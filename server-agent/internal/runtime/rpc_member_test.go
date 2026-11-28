@@ -37,7 +37,11 @@ func memberSpec(id, head string, args ...string) Spec {
 func TestMemberArgsDirectGPU(t *testing.T) {
 	spec := memberSpec("rpcm_a", "rspec_h", "-t", "8")
 	spec.GPUs = []SpecGPU{{Index: 3}, {Index: 2}}
-	got, err := memberArgs(spec, 0, "CUDA")
+	plan, err := memberOwner(memberNVHost).memberDevicePlan(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := memberArgs(spec, 0, plan.Names)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +52,7 @@ func TestMemberArgsDirectGPU(t *testing.T) {
 }
 
 func TestMemberArgsCPUMember(t *testing.T) {
-	got, err := memberArgs(memberSpec("rpcm_a", "rspec_h"), 0, "")
+	got, err := memberArgs(memberSpec("rpcm_a", "rspec_h"), 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +65,7 @@ func TestMemberArgsCPUMember(t *testing.T) {
 func TestMemberArgsCacheSwitch(t *testing.T) {
 	spec := memberSpec("rpcm_a", "rspec_h")
 	spec.RPC.CacheEnabled = true
-	got, err := memberArgs(spec, 0, "")
+	got, err := memberArgs(spec, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +77,7 @@ func TestMemberArgsCacheSwitch(t *testing.T) {
 func TestMemberArgsRelayBindsLoopback(t *testing.T) {
 	spec := memberSpec("rpcm_a", "rspec_h")
 	spec.RPC.Transport = "relay"
-	got, err := memberArgs(spec, 51234, "")
+	got, err := memberArgs(spec, 51234, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,11 +87,11 @@ func TestMemberArgsRelayBindsLoopback(t *testing.T) {
 	}
 }
 
-func TestMemberArgsGPUWithoutBackendPrefixFails(t *testing.T) {
+func TestMemberArgsGPUWithoutDeviceNamesFails(t *testing.T) {
 	spec := memberSpec("rpcm_a", "rspec_h")
 	spec.GPUs = []SpecGPU{{Index: 0}}
-	if _, err := memberArgs(spec, 0, ""); err == nil {
-		t.Fatal("a GPU member with no backend prefix must be refused")
+	if _, err := memberArgs(spec, 0, nil); err == nil {
+		t.Fatal("a GPU member with no device names must be refused, never run on CPU")
 	}
 }
 
@@ -95,7 +99,7 @@ func TestMemberRefusesReservedFlags(t *testing.T) {
 	for _, flag := range []string{"-H", "--host", "-p", "--port", "-d", "--device", "-c", "--cache", "--port=1", "--device=CPU", "-p=2"} {
 		t.Run(flag, func(t *testing.T) {
 			spec := memberSpec("rpcm_a", "rspec_h", "-t", "8", flag, "x")
-			if _, err := memberArgs(spec, 0, ""); !errors.Is(err, errMemberFlagReserved) {
+			if _, err := memberArgs(spec, 0, nil); !errors.Is(err, errMemberFlagReserved) {
 				t.Fatalf("memberArgs err = %v, want errMemberFlagReserved", err)
 			}
 			if err := (LocalPolicy{AllowedBinaries: []string{stubchildPath}}).Permit(spec); !errors.Is(err, errMemberFlagReserved) {
@@ -133,7 +137,7 @@ func TestMemberEnvModeRefused(t *testing.T) {
 
 func TestMemberEnv(t *testing.T) {
 	spec := memberSpec("rpcm_a", "rspec_h")
-	env := memberEnv(spec, "/var/cache")
+	env := memberEnv(spec, "/var/cache", devicePlan{})
 	if !slices.Contains(env, "GGML_RPC_NO_RDMA=1") {
 		t.Fatalf("env = %v, want GGML_RPC_NO_RDMA=1", env)
 	}
@@ -150,7 +154,7 @@ func TestMemberCacheDirPerHead(t *testing.T) {
 		spec := memberSpec("rpcm_a", head)
 		spec.RPC.CacheEnabled = true
 		want := "LLAMA_CACHE=" + filepath.Join(root, "rpc", head)
-		if env := memberEnv(spec, root); !slices.Contains(env, want) {
+		if env := memberEnv(spec, root, devicePlan{}); !slices.Contains(env, want) {
 			t.Fatalf("env = %v, want %s", env, want)
 		}
 	}
@@ -163,14 +167,14 @@ func TestMemberCacheDirPerHead(t *testing.T) {
 
 func TestHeadGetsNoComm(t *testing.T) {
 	spec := clusterHeadSpec()
-	_, env, err := ExpandPlaceholders(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, "")
+	_, env, err := ExpandPlaceholders(spec, 1, GPUTopology{}, func(string) string { return "" }, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(env, "GGML_RPC_NO_COMM=1") {
 		t.Fatalf("env = %v, want GGML_RPC_NO_COMM=1 on a head", env)
 	}
-	_, env, _ = ExpandPlaceholders(Spec{}, 1, GPUVendorNone, nil, func(string) string { return "" }, "")
+	_, env, _ = ExpandPlaceholders(Spec{}, 1, GPUTopology{}, func(string) string { return "" }, "")
 	if slices.Contains(env, "GGML_RPC_NO_COMM=1") {
 		t.Fatalf("env = %v, a plain model spec must not get GGML_RPC_NO_COMM", env)
 	}
@@ -873,5 +877,193 @@ func TestMemberStartedMarkerReportsTheExecutedCommand(t *testing.T) {
 	}
 	if v, ok := envValue(cmd.Env, "LLAMA_CACHE"); !ok || v != filepath.Join(root, "rpc", "rspec_h") {
 		t.Errorf("env LLAMA_CACHE = %q (present=%v), want the head's cache directory", v, ok)
+	}
+}
+
+// memberOwner is an owner on a host with topo: its vendors and, pushed as the
+// latest hardware figures, its Vulkan device mapping.
+func memberOwner(topo GPUTopology) *owner {
+	m := &Manager{}
+	m.hostInfo.Store(&HostInfo{Vulkan: topo.Vulkan})
+	return &owner{m: m, gpuVendor: topo.Legacy, gpuVendors: topo.Vendors}
+}
+
+var (
+	memberNVHost    = GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA}}
+	memberMixedHost = GPUTopology{Legacy: GPUVendorNVIDIA, Vendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}, Vulkan: VulkanMap{
+		Ordinals:    map[GPUKey]int{{GPUVendorNVIDIA, 0}: 0, {GPUVendorNVIDIA, 1}: 1, {GPUVendorAMD, 0}: 3, {GPUVendorAMD, 1}: 2},
+		DeviceCount: 4,
+	}}
+)
+
+// memberLaunch is the member's agent-owned arguments and environment on topo.
+func memberLaunch(t *testing.T, spec Spec, topo GPUTopology) (args, env []string) {
+	t.Helper()
+	plan, err := memberOwner(topo).memberDevicePlan(spec)
+	if err != nil {
+		t.Fatalf("memberDevicePlan: %v", err)
+	}
+	args, err = memberArgs(spec, 0, plan.Names)
+	if err != nil {
+		t.Fatalf("memberArgs: %v", err)
+	}
+	return args, memberEnv(spec, "/var/cache", plan)
+}
+
+func deviceArg(args []string) string {
+	for i, a := range args[:len(args)-1] {
+		if a == "-d" {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func hasVisibilityVar(env []string) bool {
+	for _, e := range env {
+		name, _, _ := strings.Cut(e, "=")
+		if slices.Contains(visibleDevicesOwnedVars, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMemberArgsCUDAOnMixedHost(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 1, Vendor: GPUVendorNVIDIA}}
+	spec.DeviceBackend = "auto"
+	args, env := memberLaunch(t, spec, memberMixedHost)
+	if got := deviceArg(args); got != "CUDA1" {
+		t.Fatalf("-d = %q, want CUDA1 (args %v)", got, args)
+	}
+	if hasVisibilityVar(env) {
+		t.Fatalf("env = %v, want no visibility variable", env)
+	}
+}
+
+func TestMemberAMDOnMixedHostGetsROCm(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 1, Vendor: GPUVendorAMD}, {Index: 0, Vendor: GPUVendorAMD}}
+	args, env := memberLaunch(t, spec, memberMixedHost)
+	if got := deviceArg(args); got != "ROCm1,ROCm0" {
+		t.Fatalf("-d = %q, want ROCm1,ROCm0", got)
+	}
+	if hasVisibilityVar(env) {
+		t.Fatalf("env = %v, want no visibility variable", env)
+	}
+}
+
+func TestMemberVulkanOnMixedHostInjects(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}, {Index: 1, Vendor: GPUVendorAMD}}
+	spec.DeviceBackend = "vulkan"
+	args, env := memberLaunch(t, spec, memberMixedHost)
+	if got := deviceArg(args); got != "Vulkan0,Vulkan1" {
+		t.Fatalf("-d = %q, want Vulkan0,Vulkan1", got)
+	}
+	if !slices.Contains(env, "GGML_VK_VISIBLE_DEVICES=0,2") {
+		t.Fatalf("env = %v, want GGML_VK_VISIBLE_DEVICES=0,2", env)
+	}
+	if spec.SetVisibleDevices {
+		t.Fatal("the member's own spec must stay without set_visible_devices")
+	}
+}
+
+func TestMemberAutoSpanningVendorsOnMixedHostInjectsVulkan(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorAMD}, {Index: 1, Vendor: GPUVendorNVIDIA}}
+	args, env := memberLaunch(t, spec, memberMixedHost)
+	if got := deviceArg(args); got != "Vulkan0,Vulkan1" {
+		t.Fatalf("-d = %q, want Vulkan0,Vulkan1", got)
+	}
+	if !slices.Contains(env, "GGML_VK_VISIBLE_DEVICES=3,1") {
+		t.Fatalf("env = %v, want GGML_VK_VISIBLE_DEVICES=3,1", env)
+	}
+}
+
+func TestMemberVulkanOnMixedHostWithoutMappingRefused(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorAMD}}
+	spec.DeviceBackend = "vulkan"
+	noVK := memberMixedHost
+	noVK.Vulkan = VulkanMap{}
+	_, err := memberOwner(noVK).memberDevicePlan(spec)
+	var pe *GPUPlanError
+	if !errors.As(err, &pe) || pe.Code != codeVulkanMappingUnavailable {
+		t.Fatalf("err = %v, want %s", err, codeVulkanMappingUnavailable)
+	}
+}
+
+func TestMemberVulkanOnSingleVendorHostUnchanged(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 3}, {Index: 2}}
+	spec.DeviceBackend = "vulkan"
+	topo := memberNVHost
+	topo.Vulkan = VulkanMap{Ordinals: map[GPUKey]int{{GPUVendorNVIDIA, 2}: 0, {GPUVendorNVIDIA, 3}: 1}, DeviceCount: 4}
+	args, env := memberLaunch(t, spec, topo)
+	if got := deviceArg(args); got != "Vulkan3,Vulkan2" {
+		t.Fatalf("-d = %q, want Vulkan3,Vulkan2 (the declared host indices)", got)
+	}
+	if hasVisibilityVar(env) {
+		t.Fatalf("env = %v, want no visibility variable", env)
+	}
+}
+
+func TestMemberMismatchRefused(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}}
+	spec.DeviceBackend = "rocm"
+	_, err := memberOwner(memberNVHost).memberDevicePlan(spec)
+	var pe *GPUPlanError
+	if !errors.As(err, &pe) || pe.Code != codeGPUVendorBackendMismatch {
+		t.Fatalf("err = %v, want %s", err, codeGPUVendorBackendMismatch)
+	}
+}
+
+func TestMemberMismatchYieldsCodedNotPermitted(t *testing.T) {
+	shrinkTimings(t)
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: func(string) string { return "" }, GPUVendor: GPUVendorNVIDIA})
+	t.Cleanup(m.Close)
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}}
+	spec.DeviceBackend = "rocm"
+	spec.RPC.BindIP = "127.0.0.1"
+	spec.RPC.Port = freeTCPPort(t)
+	spec.AdminState = "force_running"
+	m.Apply(Config{Specs: []Spec{spec}})
+	waitUntil(t, 5*time.Second, "member not_permitted", func() bool {
+		s := statusFor(m, "rpcm_a")
+		return s != nil && s.State == StateNotPermitted && s.LastError != nil
+	})
+	if code := statusFor(m, "rpcm_a").LastError.Code; code != codeGPUVendorBackendMismatch {
+		t.Fatalf("code = %q, want %s", code, codeGPUVendorBackendMismatch)
+	}
+}
+
+func TestMemberDevicePlanDoesNotMutateSpec(t *testing.T) {
+	spec := Spec{GPUs: []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}}, DeviceBackend: "vulkan"}
+	if _, err := memberOwner(memberMixedHost).memberDevicePlan(spec); err != nil && !errors.As(err, new(*GPUPlanError)) {
+		t.Fatal(err)
+	}
+	if spec.SetVisibleDevices || spec.VisibleDevicesMode != "" {
+		t.Fatal("memberDevicePlan mutated the member spec")
+	}
+}
+
+func TestMemberWithoutGPUsPlansCPU(t *testing.T) {
+	plan, err := memberOwner(GPUTopology{}).memberDevicePlan(memberSpec("rpcm_a", "rspec_h"))
+	if err != nil || len(plan.Names) != 0 || plan.VisVar != "" {
+		t.Fatalf("plan = %+v, err = %v, want an empty plan (CPU)", plan, err)
+	}
+}
+
+func TestMemberEnvHandSetInjectedVariableRefused(t *testing.T) {
+	spec := memberSpec("rpcm_a", "rspec_h")
+	spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorAMD}}
+	spec.DeviceBackend = "vulkan"
+	spec.Env = map[string]string{"GGML_VK_VISIBLE_DEVICES": "1"}
+	if _, _, err := memberOwner(memberMixedHost).prepareMember(spec, expandedSpec{}); err == nil || !strings.Contains(err.Error(), "GGML_VK_VISIBLE_DEVICES") {
+		t.Fatalf("err = %v, want a refusal naming GGML_VK_VISIBLE_DEVICES", err)
 	}
 }

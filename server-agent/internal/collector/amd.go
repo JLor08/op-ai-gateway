@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // rocmArgs is the argument list the collector passes to rocm-smi to obtain a
@@ -32,7 +33,10 @@ var rocmArgs = []string{
 }
 
 // amdCollector reports AMD GPUs via the rocm-smi CLI in JSON mode.
-type amdCollector struct{}
+type amdCollector struct {
+	// kfdRoot overrides the KFD sysfs directory in tests; zero means kfdRoot.
+	kfdRoot string
+}
 
 // NewAMD returns an AMD GPUCollector backed by rocm-smi.
 func NewAMD() GPUCollector { return &amdCollector{} }
@@ -53,7 +57,74 @@ func (c *amdCollector) Collect(ctx context.Context) ([]sample.GPU, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseRocmJSON(out)
+	gpus, err := parseRocmJSON(out)
+	if err != nil {
+		return nil, err
+	}
+	root := c.kfdRoot
+	if root == "" {
+		root = kfdRoot
+	}
+	ranks, err := kfdPCIRanks(root)
+	if err != nil {
+		ranks = nil
+	}
+	return joinAMDIndex(gpus, ranks), nil
+}
+
+// amdIndex holds the PCI→rank map of the last complete join; nil means no
+// usable join (read by the fdinfo measurer through currentAMDIndex).
+var amdIndex atomic.Pointer[map[pciAddr]int]
+
+// applyKFDRanks numbers the GPUs by KFD rank, joined on the PCI address. It is
+// all-or-nothing: if any GPU's PCIBusID is missing, unparseable or absent from
+// ranks, the input is returned unchanged with false (a partial renumbering
+// could collide with the remaining card indices).
+func applyKFDRanks(gpus []sample.GPU, ranks map[pciAddr]int) ([]sample.GPU, bool) {
+	idx := make([]int, len(gpus))
+	for i, g := range gpus {
+		addr, ok := parsePCIAddr(g.PCIBusID)
+		if !ok {
+			return gpus, false
+		}
+		rank, ok := ranks[addr]
+		if !ok {
+			return gpus, false
+		}
+		idx[i] = rank
+	}
+	out := make([]sample.GPU, len(gpus))
+	copy(out, gpus)
+	for i := range out {
+		out[i].Index = idx[i]
+	}
+	return out, true
+}
+
+// joinAMDIndex applies the KFD ranks and publishes them when the join was
+// complete, or unpublishes them otherwise (including a nil ranks map from an
+// unreadable topology).
+func joinAMDIndex(gpus []sample.GPU, ranks map[pciAddr]int) []sample.GPU {
+	if ranks == nil {
+		amdIndex.Store(nil)
+		return gpus
+	}
+	out, ok := applyKFDRanks(gpus, ranks)
+	if ok {
+		amdIndex.Store(&ranks)
+	} else {
+		amdIndex.Store(nil)
+	}
+	return out
+}
+
+// currentAMDIndex returns the published PCI→rank map, or nil when the last
+// collection had no complete join.
+func currentAMDIndex() map[pciAddr]int {
+	if p := amdIndex.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // parseRocmJSON parses `rocm-smi … --json` output into GPUs. The object is keyed
@@ -92,7 +163,8 @@ func parseRocmJSON(data []byte) ([]sample.GPU, error) {
 			continue
 		}
 		gpus = append(gpus, sample.GPU{
-			Index: cardIndex(k),
+			Vendor: VendorAMD,
+			Index:  cardIndex(k),
 			Name: firstNonEmpty(
 				rocmString(fields["Device Name"]),
 				rocmString(fields["Card Series"]),

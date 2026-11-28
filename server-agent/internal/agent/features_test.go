@@ -615,8 +615,8 @@ func TestFeaturesDeclareRuntimeStop(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_stop") {
 		t.Fatal("FeatureNames() does not carry runtime_stop, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.26.1" {
-		t.Fatalf("Version = %q, want 0.26.1; runtime_stop keeps Since 0.17.0", Version)
+	if Version != "0.27.0" {
+		t.Fatalf("Version = %q, want 0.27.0; runtime_stop keeps Since 0.17.0", Version)
 	}
 }
 
@@ -639,8 +639,8 @@ func TestFeaturesDeclareRPCCluster(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "rpc_cluster") {
 		t.Fatal("FeatureNames() does not carry rpc_cluster")
 	}
-	if Version != "0.26.1" {
-		t.Fatalf("Version = %q, want 0.26.1; rpc_cluster keeps Since 0.18.0", Version)
+	if Version != "0.27.0" {
+		t.Fatalf("Version = %q, want 0.27.0; rpc_cluster keeps Since 0.18.0", Version)
 	}
 }
 
@@ -696,8 +696,8 @@ func TestFeaturesDeclareRealtimeProxy(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "realtime_proxy") {
 		t.Fatal("FeatureNames() does not carry realtime_proxy, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.26.1" {
-		t.Fatalf("Version = %q, want 0.26.1; realtime_proxy keeps Since 0.20.0", Version)
+	if Version != "0.27.0" {
+		t.Fatalf("Version = %q, want 0.27.0; realtime_proxy keeps Since 0.20.0", Version)
 	}
 }
 
@@ -725,8 +725,8 @@ func TestFeaturesDeclareStrataFlags(t *testing.T) {
 			t.Fatalf("FeatureNames() does not carry %s", name)
 		}
 	}
-	if Version != "0.26.1" {
-		t.Fatalf("Version = %q, want 0.26.1", Version)
+	if Version != "0.27.0" {
+		t.Fatalf("Version = %q, want 0.27.0", Version)
 	}
 }
 
@@ -758,7 +758,38 @@ func TestAgentFeaturesDeclaresRuntimeLogFiles(t *testing.T) {
 	if !slices.Contains(FeatureNames(), "runtime_log_files") {
 		t.Fatal("FeatureNames() does not carry runtime_log_files, so it never reaches the gateway in capabilities.features")
 	}
-	if Version != "0.26.1" {
-		t.Fatalf("Version = %q, want 0.26.1", Version)
+	if Version != "0.27.0" {
+		t.Fatalf("Version = %q, want 0.27.0", Version)
+	}
+}
+
+// TestMixedVendorFeaturesAreDeclared pins the two mixed NVIDIA+AMD GPU flags
+// by exact wire NAME and the version they ship in. The gateway negotiates on
+// these literals before it saves vendor-aware specs or RPC cluster members
+// bound to loopback, and nothing in this module gates on them, so a rename
+// here would break that negotiation silently.
+func TestMixedVendorFeaturesAreDeclared(t *testing.T) {
+	for _, name := range []string{FeatureGPUVendorIdentity, FeatureRPCClusterSameHost} {
+		if !slices.Contains(FeatureNames(), name) {
+			t.Fatalf("FeatureNames() does not carry %q", name)
+		}
+		found := false
+		for _, f := range Features {
+			if f.Name == name {
+				found = true
+				if f.Since != "0.27.0" {
+					t.Fatalf("feature %q Since = %q, want 0.27.0 (the branch's single bump)", name, f.Since)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("Features does not declare %q", name)
+		}
+	}
+	if FeatureGPUVendorIdentity != "gpu_vendor_identity" {
+		t.Fatalf("FeatureGPUVendorIdentity = %q, want gpu_vendor_identity", FeatureGPUVendorIdentity)
+	}
+	if FeatureRPCClusterSameHost != "rpc_cluster_same_host" {
+		t.Fatalf("FeatureRPCClusterSameHost = %q, want rpc_cluster_same_host", FeatureRPCClusterSameHost)
 	}
 }

@@ -437,9 +437,9 @@ type countingMeasuredWriteStore struct {
 	updateCalls atomic.Int32
 }
 
-func (c *countingMeasuredWriteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex, measuredMB int) error {
+func (c *countingMeasuredWriteStore) UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, key routing.GPUKey, measuredMB int) error {
 	c.updateCalls.Add(1)
-	return c.MemoryStore.UpdateRuntimeSpecGPUMeasured(ctx, specID, gpuIndex, measuredMB)
+	return c.MemoryStore.UpdateRuntimeSpecGPUMeasured(ctx, specID, key, measuredMB)
 }
 
 // TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsUnchangedValue is F2's
@@ -923,7 +923,7 @@ func TestIngestTelemetrySampleRuntimeStatusRAMIsNotAVRAMWatermark(t *testing.T) 
 	if len(snap[0].GPUs) != 0 || !snap[0].MeasuredAt.IsZero() {
 		t.Fatalf("status gpus = %#v measured_at = %v, want neither for a RAM-only frame", snap[0].GPUs, snap[0].MeasuredAt)
 	}
-	if got := vramMeasuredFromFrame(snap, "rspec_live_ram_only"); len(got) != 0 {
+	if got := vramMeasuredFromFrame(snap, "rspec_live_ram_only", ""); len(got) != 0 {
 		t.Fatalf("vramMeasuredFromFrame = %#v, want nothing from a RAM-only frame", got)
 	}
 }
@@ -3836,5 +3836,31 @@ func TestClampRuntimeLogFileTailsKeepsTheEndAndDropsDuplicates(t *testing.T) {
 	tail := clampRuntimeLogFileTails([]RuntimeLogFileTailDTO{{Name: "m", Tail: multi}})[0].Tail
 	if !utf8.ValidString(tail) || len(tail) > maxRuntimeStderrTail || len(tail) < maxRuntimeStderrTail-3 {
 		t.Fatalf("tail valid=%v len=%d, want valid UTF-8 within 3 bytes of the cap", utf8.ValidString(tail), len(tail))
+	}
+}
+
+// TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsRowsTheSpecLacks: when the
+// spec's stored rows are known and the frame's resolved key is not among them
+// -- the window before the legacy-vendor backfill (an explicit vendor against
+// a row still stored with the empty one) or a card the spec never declared --
+// no UPDATE is issued: it could not match, on every frame.
+func TestIngestTelemetrySampleRuntimeVRAMWriteBackSkipsRowsTheSpecLacks(t *testing.T) {
+	srv := NewTestServer()
+	seedRuntimeIngestSpec(t, srv, "rspec_lacks")
+	counting := &countingMeasuredWriteStore{MemoryStore: srv.Routes.(*routing.MemoryStore)}
+	srv.Routes = counting
+
+	for _, gpus := range []string{
+		`[{"index":0,"vendor":"nvidia","vram_measured_mb":21234}]`, // row still stored with the empty vendor
+		`[{"index":3,"vram_measured_mb":21234}]`,                   // index the spec never declared
+	} {
+		body := `{"host":{"cpu_util_pct":1},"runtimes":[{"spec_id":"rspec_lacks","state":"running","gpus":` + gpus + `}]}`
+		req, raw := ingestReq(t, body)
+		if err := srv.ingestTelemetrySample(context.Background(), "mock-host-qwen", req, raw); err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+	}
+	if got := counting.updateCalls.Load(); got != 0 {
+		t.Fatalf("UpdateRuntimeSpecGPUMeasured calls = %d for rows the spec lacks, want 0", got)
 	}
 }

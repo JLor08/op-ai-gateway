@@ -4,8 +4,9 @@
 package gateway
 
 import (
+	"cmp"
 	"op-ai-gateway/internal/routing"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -55,20 +56,70 @@ func vramStabilityTolerance(totalBytes int64) int64 {
 	return tol
 }
 
-// vramGPUByIndex indexes one telemetry sample's GPU rows by their HOST index
-// -- the same index space the spec's GPU rows, the per-GPU budgets and the
-// agent's measurer all use. A repeated index keeps the first row: the sample
-// is a snapshot of distinct cards, and a duplicate is malformed input rather
-// than an update.
-func vramGPUByIndex(sample routing.TelemetrySample) map[int]routing.GPUSample {
-	out := make(map[int]routing.GPUSample, len(sample.GPUs))
+// vramGPUByKey indexes one telemetry sample's GPU rows by their GPU key
+// (vendor, index) -- the same key the spec's GPU rows, the per-GPU budgets and
+// the agent's measurer all use. A mixed NVIDIA + AMD host reports an index 0
+// of each vendor, so the index alone would drop a card. A repeated key keeps
+// the first row: the sample is a snapshot of distinct cards, and a duplicate
+// is malformed input rather than an update.
+//
+// The sample's vendors are taken as they are: a run resolves a vendor-less
+// sample to the server's legacy vendor before it reads it
+// (vramResolveSampleVendors).
+func vramGPUByKey(sample routing.TelemetrySample) map[routing.GPUKey]routing.GPUSample {
+	out := make(map[routing.GPUKey]routing.GPUSample, len(sample.GPUs))
 	for _, gpu := range sample.GPUs {
-		if _, seen := out[gpu.Index]; seen {
+		key := routing.GPUKey{Vendor: gpu.Vendor, Index: gpu.Index}
+		if _, seen := out[key]; seen {
 			continue
 		}
-		out[gpu.Index] = gpu
+		out[key] = gpu
 	}
 	return out
+}
+
+// vramResolveSampleVendors returns sample with every GPU that carries no
+// vendor -- an agent without gpu_vendor_identity reports none -- given the
+// server's stored legacy vendor (resolvedGPUKey), so the run reads the cards
+// by the keys the spec's rows carry. sample itself is shared with every other
+// reader of the live ring and is never modified: the GPUs are copied when one
+// changes. An empty legacyVendor (never backfilled) changes nothing.
+func vramResolveSampleVendors(sample routing.TelemetrySample, legacyVendor string) routing.TelemetrySample {
+	if legacyVendor == "" || !slices.ContainsFunc(sample.GPUs, func(g routing.GPUSample) bool { return g.Vendor == "" }) {
+		return sample
+	}
+	gpus := slices.Clone(sample.GPUs)
+	for i := range gpus {
+		if gpus[i].Vendor == "" {
+			gpus[i].Vendor = legacyVendor
+		}
+	}
+	sample.GPUs = gpus
+	return sample
+}
+
+// vramResolveSpecGPUVendors is vramResolveSampleVendors for the spec's GPU
+// rows: a row without a vendor stands for the server's legacy vendor, which is
+// the card the agent runs it on. rows is not modified.
+func vramResolveSpecGPUVendors(rows []routing.RuntimeSpecGPU, legacyVendor string) []routing.RuntimeSpecGPU {
+	if legacyVendor == "" || !slices.ContainsFunc(rows, func(r routing.RuntimeSpecGPU) bool { return r.GPUVendor == "" }) {
+		return rows
+	}
+	out := slices.Clone(rows)
+	for i := range out {
+		if out[i].GPUVendor == "" {
+			out[i].GPUVendor = legacyVendor
+		}
+	}
+	return out
+}
+
+// sortGPUKeys orders keys by vendor, then index: the one stable order every
+// list of GPU keys in a VRAM report is given.
+func sortGPUKeys(keys []routing.GPUKey) {
+	slices.SortFunc(keys, func(a, b routing.GPUKey) int {
+		return cmp.Or(cmp.Compare(a.Vendor, b.Vendor), cmp.Compare(a.Index, b.Index))
+	})
 }
 
 // vramWindowStable reports whether every watched card held still across the
@@ -85,16 +136,16 @@ func vramGPUByIndex(sample routing.TelemetrySample) map[int]routing.GPUSample {
 // Every card is judged on ITS OWN tolerance, which is why the span and the
 // comparison are one step per card rather than a shared bound: see
 // vramCardToleranceMB for what a shared bound discards.
-func vramWindowStable(window []routing.TelemetrySample, watched []int) bool {
+func vramWindowStable(window []routing.TelemetrySample, watched []routing.GPUKey) bool {
 	if len(window) < vramStabilityWindow || len(watched) == 0 {
 		return false
 	}
-	byIndex := make([]map[int]routing.GPUSample, 0, len(window))
+	byKey := make([]map[routing.GPUKey]routing.GPUSample, 0, len(window))
 	for _, sample := range window {
-		byIndex = append(byIndex, vramGPUByIndex(sample))
+		byKey = append(byKey, vramGPUByKey(sample))
 	}
-	for _, index := range watched {
-		lo, hi, total, complete := vramCardSpan(byIndex, index)
+	for _, key := range watched {
+		lo, hi, total, complete := vramCardSpan(byKey, key)
 		if !complete || hi-lo > vramStabilityTolerance(total) {
 			return false
 		}
@@ -114,10 +165,10 @@ func vramWindowStable(window []routing.TelemetrySample, watched []int) bool {
 // (a 0) cannot shrink the tolerance the caller then applies -- which is the
 // same direction vramStabilityTolerance takes for an unknown total, and the
 // only one that does not turn a missing field into a stricter gate.
-func vramCardSpan(byIndex []map[int]routing.GPUSample, index int) (lo, hi, total int64, complete bool) {
+func vramCardSpan(byKey []map[routing.GPUKey]routing.GPUSample, key routing.GPUKey) (lo, hi, total int64, complete bool) {
 	first := true
-	for _, snapshot := range byIndex {
-		gpu, ok := snapshot[index]
+	for _, snapshot := range byKey {
+		gpu, ok := snapshot[key]
 		if !ok {
 			return 0, 0, 0, false
 		}
@@ -190,40 +241,42 @@ func vramFingerprintOf(gpu routing.GPUSample) (fingerprint, kind string) {
 	}
 }
 
-// vramWatchedIndexes decides which cards a run reads, and whether a number
+// vramWatchedKeys decides which cards a run reads, and whether a number
 // measured on them has anywhere to be applied.
 //
-// The spec's DECLARED GPU rows are the index set admission actually uses, so
+// The spec's DECLARED GPU rows are the key set admission actually uses, so
 // a number measured there lands on a row the operator can act on
 // (attributable). A spec that declares NO rows has no such row anywhere: the
 // run then watches every card the sample carries and marks the result
 // unattributable, because there is nothing to attribute it to -- not because
 // the number is worth less.
 //
-// Returns ascending, de-duplicated indexes. An empty result is what makes a
-// GPU-less host inconclusive rather than zero: there is nothing to difference.
-func vramWatchedIndexes(specGPUs []routing.RuntimeSpecGPU, sample routing.TelemetrySample) (indexes []int, attributable bool) {
-	seen := map[int]struct{}{}
+// Returns de-duplicated keys in sortGPUKeys order. An empty result is what
+// makes a GPU-less host inconclusive rather than zero: there is nothing to
+// difference. Both inputs are taken with their vendors as they are; the run
+// resolves vendor-less ones to the legacy vendor first
+// (vramResolveSpecGPUVendors, vramResolveSampleVendors).
+func vramWatchedKeys(specGPUs []routing.RuntimeSpecGPU, sample routing.TelemetrySample) (keys []routing.GPUKey, attributable bool) {
+	seen := map[routing.GPUKey]struct{}{}
+	add := func(key routing.GPUKey) {
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
 	if len(specGPUs) > 0 {
 		for _, row := range specGPUs {
-			if _, dup := seen[row.GPUIndex]; dup {
-				continue
-			}
-			seen[row.GPUIndex] = struct{}{}
-			indexes = append(indexes, row.GPUIndex)
+			add(row.Key())
 		}
-		sort.Ints(indexes)
-		return indexes, true
+		sortGPUKeys(keys)
+		return keys, true
 	}
 	for _, gpu := range sample.GPUs {
-		if _, dup := seen[gpu.Index]; dup {
-			continue
-		}
-		seen[gpu.Index] = struct{}{}
-		indexes = append(indexes, gpu.Index)
+		add(routing.GPUKey{Vendor: gpu.Vendor, Index: gpu.Index})
 	}
-	sort.Ints(indexes)
-	return indexes, false
+	sortGPUKeys(keys)
+	return keys, false
 }
 
 // vramFloorMB is the floor the HEADLINE delta must clear to be a measurement
@@ -232,11 +285,11 @@ func vramWatchedIndexes(specGPUs []routing.RuntimeSpecGPU, sample routing.Teleme
 // and 0 means UNKNOWN everywhere else in this feature, so it must mean it
 // here too. With nothing watched the floor is the absolute one, so a sub-floor
 // number can never pass by default.
-func vramFloorMB(watched []int, sample routing.TelemetrySample) int {
-	byIndex := vramGPUByIndex(sample)
+func vramFloorMB(watched []routing.GPUKey, sample routing.TelemetrySample) int {
+	byKey := vramGPUByKey(sample)
 	floor := vramStabilityFloorBytes
-	for _, index := range watched {
-		if tol := vramStabilityTolerance(byIndex[index].MemTotalBytes); tol > floor {
+	for _, key := range watched {
+		if tol := vramStabilityTolerance(byKey[key].MemTotalBytes); tol > floor {
 			floor = tol
 		}
 	}

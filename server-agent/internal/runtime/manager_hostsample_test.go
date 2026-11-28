@@ -215,7 +215,7 @@ func TestHostSampleRefreshOnlyReevaluatesRAMWaiters(t *testing.T) {
 			HostRAMReserveMB: 2000,
 		})
 		t.Cleanup(m.Close)
-		m.SetMeasurer(func(pids []int) map[int]map[int]int {
+		m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 			admissions.Add(1)
 			return nil
 		})

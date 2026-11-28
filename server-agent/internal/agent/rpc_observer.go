@@ -89,6 +89,9 @@ type observedMember struct {
 	breaches breachLog
 	// headSeen is when each listed head connection was first seen.
 	headSeen map[connTuple]time.Time
+	// prevHead is the head connections the previous poll listed; only a
+	// loopback-only member uses it (see debounceLoopback).
+	prevHead map[connTuple]bool
 	// releasedAt is the last gateway release the observer has applied, and
 	// released the head connections it ended: they hold no more, however
 	// long they stay listed (a head that lost power leaves its socket
@@ -228,6 +231,7 @@ func (o *rpcObserver) memberLocked(st runtimectl.Status) *observedMember {
 		// A new process has none of the old one's connections, and a release
 		// that came before it ended none of its own.
 		m.headSeen, m.released, m.releasedAt = map[connTuple]time.Time{}, map[connTuple]bool{}, st.RPCReleasedAt
+		m.prevHead = nil
 	}
 	return m
 }
@@ -269,6 +273,30 @@ func (m *observedMember) applyReleaseLocked(conns []connTuple, releasedAt, now t
 	return holding, withdraw
 }
 
+// loopbackOnly reports whether every head address is loopback: a member on the
+// head's own server, where the agent's readiness probe connects from the same
+// address as the head and is indistinguishable from it by address alone.
+func loopbackOnly(headIPs []netip.Addr) bool {
+	return len(headIPs) > 0 && !slices.ContainsFunc(headIPs, func(a netip.Addr) bool { return !a.IsLoopback() })
+}
+
+// debounceLoopback returns the head connections that the previous poll also
+// listed and remembers the current ones. The readiness probe is a short-lived
+// connection that never survives two polls, the head's is long-lived. Only the
+// latest poll's tuples are kept, so the state stays bounded.
+func (m *observedMember) debounceLoopback(conns []connTuple) []connTuple {
+	var stable []connTuple
+	cur := make(map[connTuple]bool, len(conns))
+	for _, c := range conns {
+		cur[c] = true
+		if m.prevHead[c] {
+			stable = append(stable, c)
+		}
+	}
+	m.prevHead = cur
+	return stable
+}
+
 // poll lists one member's connections and applies the result.
 func (o *rpcObserver) poll(ctx context.Context, st runtimectl.Status) {
 	rpc := st.RPCMember
@@ -294,7 +322,8 @@ func (o *rpcObserver) poll(ctx context.Context, st runtimectl.Status) {
 	o.mu.Unlock()
 
 	bind, _ := netip.ParseAddr(rpc.BindIP)
-	obs := classifyConns(conns, netip.AddrPortFrom(bind, uint16(rpc.Port)), o.headIPs(st.SpecID, rpc), o.ownAddrs(), rpc.HeadSpecID)
+	headIPs := o.headIPs(st.SpecID, rpc)
+	obs := classifyConns(conns, netip.AddrPortFrom(bind, uint16(rpc.Port)), headIPs, o.ownAddrs(), rpc.HeadSpecID)
 
 	now := o.now()
 	var holder string
@@ -306,6 +335,12 @@ func (o *rpcObserver) poll(ctx context.Context, st runtimectl.Status) {
 		peers[i] = ip.String()
 	}
 	m.breaches.note(now, peers...)
+	if loopbackOnly(headIPs) {
+		obs.HeadConns = m.debounceLoopback(obs.HeadConns)
+		if len(obs.HeadConns) == 0 {
+			obs.HeldBy = ""
+		}
+	}
 	holding, withdraw := m.applyReleaseLocked(obs.HeadConns, st.RPCReleasedAt, now)
 	if len(holding) == 0 {
 		obs.HeldBy = ""

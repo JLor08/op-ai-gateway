@@ -446,6 +446,11 @@ func TestAgentRuntimeConfigNeverPartialEndpoints(t *testing.T) {
 		f, a, b, head := setup(t)
 		members, gpus, _ := f.routes.ClusterMembers(f.ctx, head.ID)
 		members[1].Position = 2
+		for i := range gpus {
+			if gpus[i].MemberPosition == 1 {
+				gpus[i].MemberPosition = 2 // a GPU row follows its member
+			}
+		}
 		if err := f.routes.SetClusterMembers(f.ctx, head.ID, members, gpus); err != nil {
 			t.Fatal(err)
 		}
@@ -955,5 +960,384 @@ func TestAgentRuntimeConfigDerivesProtocolOnlyMember(t *testing.T) {
 	ms, ok := specByID(f.config(a.ID), automaticMemberSpecID(head.ID, a.ID))
 	if !ok || ms.Binary != tarballRPC {
 		t.Fatalf("member spec = %+v ok=%v, want binary %s", ms, ok, tarballRPC)
+	}
+}
+
+// TestServerMemoryCeilingsKeyedByVendor: each card's ceiling is its own
+// budget, else its own memory, by (vendor, index); a vendor-less budget is
+// the legacy vendor's card.
+func TestServerMemoryCeilingsKeyedByVendor(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.hardware(a.ID, mixedHostReport(`["rocm"]`))
+	if err := f.routes.SetServerGPUBudgets(f.ctx, a.ID, []routing.ServerGPUBudget{{ServerID: a.ID, GPUVendor: "nvidia", GPUIndex: 0, BudgetMB: 10000, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := f.svc.serverMemoryCeilings(f.ctx, a.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[routing.GPUKey{Vendor: "nvidia", Index: 0}] != 10000 || got[routing.GPUKey{Vendor: "amd", Index: 0}] != 16384 || len(got) != 2 {
+		t.Fatalf("ceilings = %v, want nvidia 0: 10000, amd 0: 16384", got)
+	}
+
+	if _, err := f.routes.BackfillServerGPUVendor(f.ctx, a.ID, "amd", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.routes.SetServerGPUBudgets(f.ctx, a.ID, []routing.ServerGPUBudget{{ServerID: a.ID, GPUIndex: 0, BudgetMB: 9000, CreatedAt: clusterTestNow, UpdatedAt: clusterTestNow}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err = f.svc.serverMemoryCeilings(f.ctx, a.ID, "amd"); err != nil {
+		t.Fatal(err)
+	}
+	if got[routing.GPUKey{Vendor: "amd", Index: 0}] != 9000 || got[routing.GPUKey{Vendor: "nvidia", Index: 0}] != 11264 || len(got) != 2 {
+		t.Fatalf("ceilings with a vendor-less budget, legacy amd = %v", got)
+	}
+}
+
+// addClusterAgent adds serverID to the fixture's agents as one declaring
+// rpc_cluster, with a server_agent application, without resetting the
+// declarations made so far (clusterAgents starts them over).
+func (f *clusterFixture) addClusterAgent(serverID string) {
+	f.t.Helper()
+	f.svc.agentFeatures.(fakeAgentFeatures)[serverID] = []string{"runtime_manager", AgentFeatureRPCCluster}
+	seedServerAgentApplication(f.t, f.routes, serverID, clusterTestNow)
+}
+
+// memberPorts are the stored ports of headID's members in member order.
+func (f *clusterFixture) memberPorts(headID string) []int {
+	f.t.Helper()
+	rows, _, err := f.routes.ClusterMembers(f.ctx, headID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	ports := make([]int, len(rows))
+	for i, r := range rows {
+		ports[i] = r.Port
+	}
+	return ports
+}
+
+// TestSameHostMemberUsesLoopback: a member on the head's own server is dialed
+// and bound on 127.0.0.1, always direct, and knows its head as 127.0.0.1,
+// whatever the cluster's network and transport; a member on another server
+// keeps its mesh address. A cluster whose members all run on the head's
+// server needs neither NetBird on that server nor the direct mesh
+// preconditions.
+func TestSameHostMemberUsesLoopback(t *testing.T) {
+	f := newClusterFixture(t)
+	b := f.member("B")
+	f.sameHostAgent(f.head.ID)
+	f.addClusterAgent(b.ID)
+	f.netbirdReady(f.head.ID, "100.64.0.2")
+	f.netbirdReady(b.ID, "100.64.0.5")
+	f.directMeshPolicies()
+	req := clusterHeadRequest(autoMember(f.head.ID, 1), autoMember(b.ID, 0))
+	req.ClusterNetwork, req.RPCTransport = "mesh", "direct"
+	head := f.mustPut(req)
+	ports := f.memberPorts(head.ID)
+
+	headDoc := f.config(f.head.ID)
+	hs, ok := specByID(headDoc, head.ID)
+	if !ok || hs.Cluster == nil {
+		t.Fatalf("head spec = %+v ok=%v, want a cluster block (reason %q)", hs, ok, f.withheldReason())
+	}
+	wantEP := []AgentClusterEndpointDTO{
+		{Address: fmt.Sprintf("127.0.0.1:%d", ports[0]), DeviceCount: 1},
+		{Address: fmt.Sprintf("100.64.0.5:%d", ports[1]), DeviceCount: 1},
+	}
+	if !slices.Equal(hs.Cluster.Endpoints, wantEP) || hs.Cluster.Network != "mesh" || hs.Cluster.Transport != "direct" {
+		t.Fatalf("cluster = %+v, want endpoints %+v mesh/direct", hs.Cluster, wantEP)
+	}
+	local, ok := specByID(headDoc, automaticMemberSpecID(head.ID, f.head.ID))
+	if !ok {
+		t.Fatalf("head document specs = %+v, want the same-host member", headDoc.Specs)
+	}
+	wantLocal := AgentRPCMemberDTO{HeadSpecID: head.ID, Transport: "direct", BindIP: "127.0.0.1", Port: ports[0], HeadIPs: []string{"127.0.0.1"}}
+	if local.RPC == nil || !rpcMemberEqual(*local.RPC, wantLocal) {
+		t.Fatalf("same-host member rpc = %+v, want %+v", local.RPC, wantLocal)
+	}
+	remote, ok := specByID(f.config(b.ID), automaticMemberSpecID(head.ID, b.ID))
+	wantRemote := AgentRPCMemberDTO{HeadSpecID: head.ID, Transport: "direct", BindIP: "100.64.0.5", Port: ports[1], HeadIPs: []string{"100.64.0.2"}}
+	if !ok || remote.RPC == nil || !rpcMemberEqual(*remote.RPC, wantRemote) {
+		t.Fatalf("remote member rpc = %+v ok=%v, want %+v", remote.RPC, ok, wantRemote)
+	}
+	plan, err := f.svc.ClusterPlan(f.ctx, head.ID)
+	if err != nil || plan.WithheldReason != "" || len(plan.Members) != 2 ||
+		plan.Members[0].Address != "127.0.0.1" || plan.Members[1].Address != "100.64.0.5" ||
+		plan.Members[0].Transport != "direct" || plan.Members[1].Transport != "direct" ||
+		!slices.Equal(plan.HeadIdentity, []string{"100.64.0.2"}) {
+		t.Fatalf("plan = %+v err=%v", plan, err)
+	}
+
+	// In a relay cluster the same-host member still runs direct on
+	// loopback; the remote member is relayed.
+	req.RPCTransport = "relay"
+	f.mustPut(req)
+	local, _ = specByID(f.config(f.head.ID), automaticMemberSpecID(head.ID, f.head.ID))
+	remote, _ = specByID(f.config(b.ID), automaticMemberSpecID(head.ID, b.ID))
+	if local.RPC == nil || local.RPC.Transport != "direct" || local.RPC.BindIP != "127.0.0.1" ||
+		remote.RPC == nil || remote.RPC.Transport != "relay" {
+		t.Fatalf("relay cluster: same-host rpc = %+v, remote rpc = %+v", local.RPC, remote.RPC)
+	}
+	if plan, err = f.svc.ClusterPlan(f.ctx, head.ID); err != nil || plan.Transport != "relay" || len(plan.Members) != 2 ||
+		plan.Members[0].Transport != "direct" || plan.Members[1].Transport != "relay" {
+		t.Fatalf("relay plan = %+v err=%v, want member transports direct, relay", plan, err)
+	}
+
+	// Only same-host members: NetBird off on the head's server and the
+	// Default policy seen enabled withhold nothing.
+	only := clusterHeadRequest(autoMember(f.head.ID, 1))
+	only.ClusterNetwork, only.RPCTransport = "mesh", "direct"
+	f.mustPut(only)
+	f.updateServer(f.head.ID, func(s *routing.AIServer) { s.NetbirdEnabled, s.NetbirdIP = false, "" })
+	if err := f.settings.SetSystemSetting(f.ctx, netbirdDefaultPolicyStateKey, `{"state":"enabled"}`, clusterTestNow); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.withheldReason(); got != "" {
+		t.Fatalf("same-host cluster withheld: %q", got)
+	}
+	hs, ok = specByID(f.config(f.head.ID), head.ID)
+	if !ok || hs.Cluster == nil || len(hs.Cluster.Endpoints) != 1 || !strings.HasPrefix(hs.Cluster.Endpoints[0].Address, "127.0.0.1:") {
+		t.Fatalf("same-host head = %+v ok=%v", hs.Cluster, ok)
+	}
+	// A save with NetBird still off on the head's server is not refused
+	// either: nothing of the cluster leaves the host.
+	only.IdleTimeoutSeconds = 900
+	f.mustPut(only)
+}
+
+// TestSameHostClusterNeedsNoLANAck: a direct lan cluster whose members all
+// run on the head's server exposes nothing on the LAN, so it saves and is
+// pushed without the exposure acknowledgement; a remote member still needs
+// it.
+func TestSameHostClusterNeedsNoLANAck(t *testing.T) {
+	f := newClusterFixture(t)
+	b := f.member("B")
+	f.sameHostAgent(f.head.ID)
+	f.addClusterAgent(b.ID)
+	req := clusterHeadRequest(autoMember(f.head.ID, 1))
+	req.RPCTransport = "direct"
+	f.mustPut(req)
+	if got := f.withheldReason(); got != "" {
+		t.Fatalf("same-host lan cluster withheld: %q", got)
+	}
+	req.IdleTimeoutSeconds = 900 // an unchanged membership takes the keep path
+	f.mustPut(req)
+	mixed := clusterHeadRequest(autoMember(f.head.ID, 1), autoMember(b.ID, 0))
+	mixed.RPCTransport = "direct"
+	if _, err := f.put(ownerToken(), mixed); !errors.Is(err, ErrClusterLANAckRequired) {
+		t.Fatalf("remote direct lan member without the acknowledgement: err = %v, want ErrClusterLANAckRequired", err)
+	}
+}
+
+// TestAgentRuntimeConfigTwoMembersOnOneServer: two members of one head on one
+// server each get their own spec (the second with an _m2 id), port, GPUs and
+// endpoint, in the member server's document, the head's cluster block and
+// the cluster plan.
+func TestAgentRuntimeConfigTwoMembersOnOneServer(t *testing.T) {
+	f := newClusterFixture(t)
+	a := f.member("A")
+	f.sameHostAgent(a.ID)
+	head := f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(a.ID, 1)))
+	ports := f.memberPorts(head.ID)
+	ids := []string{automaticMemberSpecID(head.ID, a.ID), automaticMemberSpecID(head.ID, a.ID) + "_m2"}
+
+	memberDoc := f.config(a.ID)
+	specs := rpcServerSpecs(memberDoc)
+	if len(specs) != 2 {
+		t.Fatalf("member document rpc specs = %+v, want two", specs)
+	}
+	for i, id := range ids {
+		ms, ok := specByID(memberDoc, id)
+		if !ok || ms.RPC == nil || ms.RPC.Port != ports[i] || len(ms.GPUs) != 1 || ms.GPUs[0].Index != i {
+			t.Fatalf("member %d (%s) = %+v ok=%v, want port %d and GPU %d", i, id, ms, ok, ports[i], i)
+		}
+	}
+	hs, ok := specByID(f.config(f.head.ID), head.ID)
+	wantEP := []AgentClusterEndpointDTO{
+		{Address: fmt.Sprintf("A.example.test:%d", ports[0]), DeviceCount: 1},
+		{Address: fmt.Sprintf("A.example.test:%d", ports[1]), DeviceCount: 1},
+	}
+	if !ok || hs.Cluster == nil || !slices.Equal(hs.Cluster.Endpoints, wantEP) {
+		t.Fatalf("head cluster = %+v ok=%v, want endpoints %+v", hs.Cluster, ok, wantEP)
+	}
+	plan, err := f.svc.ClusterPlan(f.ctx, head.ID)
+	if err != nil || len(plan.Members) != 2 || plan.Members[0].SpecID != ids[0] || plan.Members[1].SpecID != ids[1] ||
+		plan.Members[0].Position != 0 || plan.Members[1].Position != 1 {
+		t.Fatalf("plan = %+v err=%v", plan, err)
+	}
+}
+
+// TestResyncedManualMemberKeepsBackfilledGPU: a manual member's GPU rows
+// stored without a vendor and the spec's rows naming the server's legacy
+// vendor (a backfill) are one card each, so the measured values stay and no
+// run ends; another member of the head on the same server keeps its rows.
+func TestResyncedManualMemberKeepsBackfilledGPU(t *testing.T) {
+	started := clusterTestNow
+	used := routing.ClusterMember{HeadSpecID: "rts_h", Position: 1, ServerID: "srv_a", MemberSpecID: "rpcm_x", RunStartedAt: started, RAMMeasuredMB: 500}
+	read := []routing.ClusterMember{
+		{HeadSpecID: "rts_h", Position: 0, ServerID: "srv_a", RunStartedAt: started, RAMMeasuredMB: 400},
+		used,
+	}
+	gpus := []routing.ClusterMemberGPU{
+		{HeadSpecID: "rts_h", MemberPosition: 0, ServerID: "srv_a", GPUIndex: 0, VRAMMeasuredMB: 1000, RunPeakVRAMMB: 1100},
+		{HeadSpecID: "rts_h", MemberPosition: 1, ServerID: "srv_a", GPUIndex: 1, VRAMMeasuredMB: 3000, RunPeakVRAMMB: 3100},
+	}
+	rows := []routing.RPCMemberSpecGPU{{GPUVendor: "nvidia", GPUIndex: 1}}
+	members, next := resyncedManualMember(used, rows, read, gpus, "nvidia")
+	if members[0].RunStartedAt.IsZero() || members[1].RunStartedAt.IsZero() || members[1].Stale {
+		t.Fatalf("members = %+v: a backfilled vendor ended the runs", members)
+	}
+	want := []routing.ClusterMemberGPU{
+		gpus[0],
+		{HeadSpecID: "rts_h", MemberPosition: 1, ServerID: "srv_a", GPUVendor: "nvidia", GPUIndex: 1, VRAMMeasuredMB: 3000, RunPeakVRAMMB: 3100},
+	}
+	if !slices.Equal(next, want) {
+		t.Fatalf("gpu rows = %+v, want %+v", next, want)
+	}
+	// Another vendor at that index is another card: the distribution changed,
+	// every run ends and only the resynced member's kept values go stale.
+	members, next = resyncedManualMember(used, []routing.RPCMemberSpecGPU{{GPUVendor: "amd", GPUIndex: 1}}, read, gpus, "nvidia")
+	if !members[0].RunStartedAt.IsZero() || !members[1].Stale || members[0].Stale || next[1].VRAMMeasuredMB != 0 {
+		t.Fatalf("another card: members = %+v gpus = %+v", members, next)
+	}
+}
+
+// TestSameHostClusterWithheldForDowngradedAgent: the derivation re-checks
+// rpc_cluster_same_host. A server that runs a member on the head's server, or
+// two members of one head, whose agent is known to lack the flag (downgraded
+// after the save) withholds the cluster as too old, and its document carries
+// no member spec of it.
+func TestSameHostClusterWithheldForDowngradedAgent(t *testing.T) {
+	t.Run("member on the head's server", func(t *testing.T) {
+		f := newClusterFixture(t)
+		f.sameHostAgent(f.head.ID)
+		head := f.mustPut(clusterHeadRequest(autoMember(f.head.ID, 1)))
+		if got := f.withheldReason(); got != "" {
+			t.Fatalf("flagged: withheld %q", got)
+		}
+		if _, ok := specByID(f.config(f.head.ID), automaticMemberSpecID(head.ID, f.head.ID)); !ok {
+			t.Fatal("flagged: the same-host member is not pushed")
+		}
+		f.svc.agentFeatures.(fakeAgentFeatures)[f.head.ID] = []string{"runtime_manager", AgentFeatureRPCCluster, AgentFeatureGPUVendorIdentity}
+		if got := f.withheldReason(); got != ClusterWithheldAgentTooOld {
+			t.Fatalf("unflagged: reason = %q, want %s", got, ClusterWithheldAgentTooOld)
+		}
+		doc := f.config(f.head.ID)
+		if got := rpcServerSpecs(doc); len(got) != 0 {
+			t.Fatalf("unflagged: member specs pushed %+v", got)
+		}
+		if hs, ok := specByID(doc, head.ID); ok && hs.Cluster != nil {
+			t.Fatalf("unflagged: head pushed with its cluster %+v", hs.Cluster)
+		}
+	})
+	t.Run("two members on one server", func(t *testing.T) {
+		f := newClusterFixture(t)
+		a := f.member("A")
+		f.sameHostAgent(a.ID)
+		f.mustPut(clusterHeadRequest(autoMember(a.ID, 0), autoMember(a.ID, 1)))
+		if got := f.withheldReason(); got != "" {
+			t.Fatalf("flagged: withheld %q", got)
+		}
+		f.svc.agentFeatures.(fakeAgentFeatures)[a.ID] = []string{"runtime_manager", AgentFeatureRPCCluster}
+		if got := f.withheldReason(); got != ClusterWithheldAgentTooOld {
+			t.Fatalf("unflagged: reason = %q, want %s", got, ClusterWithheldAgentTooOld)
+		}
+		if got := rpcServerSpecs(f.config(a.ID)); len(got) != 0 {
+			t.Fatalf("unflagged: member specs pushed %+v", got)
+		}
+		// One member per server needs no flag.
+		f.mustPut(clusterHeadRequest(autoMember(a.ID, 0)))
+		if got := f.withheldReason(); got != "" {
+			t.Fatalf("single member on an unflagged server: withheld %q", got)
+		}
+	})
+}
+
+// crossVendorMemberFixture is a flagged, mixed NVIDIA+AMD member server whose
+// legacy vendor is nvidia.
+func crossVendorMemberFixture(t *testing.T) (*clusterFixture, ServerDTO) {
+	t.Helper()
+	f := newClusterFixture(t)
+	a := f.member("A")
+	features := f.clusterAgents(a.ID)
+	features[a.ID] = append(features[a.ID], AgentFeatureGPUVendorIdentity)
+	f.hostOS(a.ID, "linux")
+	f.hardware(a.ID, mixedHostReport(`["rocm","vulkan"]`))
+	if _, err := f.routes.BackfillServerGPUVendor(f.ctx, a.ID, routing.GPUVendorNVIDIA, false); err != nil {
+		t.Fatal(err)
+	}
+	return f, a
+}
+
+func vulkanMember(serverID string, gpus ...routing.GPUKey) ClusterMemberDTO {
+	m := ClusterMemberDTO{ServerID: serverID, DeviceBackend: "vulkan", GPUs: []ClusterMemberGPUDTO{}}
+	for _, g := range gpus {
+		m.GPUs = append(m.GPUs, ClusterMemberGPUDTO{Vendor: g.Vendor, Index: g.Index, VRAMEstimateMB: 8000})
+	}
+	return m
+}
+
+// A Vulkan member over NVIDIA 0 and AMD 0 exposes two devices: the head's
+// endpoint counts distinct GPU keys, not distinct indices.
+func TestClusterEndpointCountsGPUKeysAcrossVendors(t *testing.T) {
+	f, a := crossVendorMemberFixture(t)
+	head := f.mustPut(clusterHeadRequest(vulkanMember(a.ID,
+		routing.GPUKey{Vendor: routing.GPUVendorNVIDIA, Index: 0}, routing.GPUKey{Vendor: routing.GPUVendorAMD, Index: 0})))
+	hs, ok := specByID(f.config(f.head.ID), head.ID)
+	if !ok || hs.Cluster == nil {
+		t.Fatalf("head withheld: %q", f.withheldReason())
+	}
+	if got := hs.Cluster.Endpoints[0].DeviceCount; got != 2 {
+		t.Fatalf("device count = %d, want 2 (NVIDIA 0 and AMD 0)", got)
+	}
+}
+
+// Moving a member from NVIDIA 0 to AMD 0 changes the head's generation.
+func TestClusterGenerationFollowsMemberGPUVendor(t *testing.T) {
+	f, a := crossVendorMemberFixture(t)
+	generation := func(key routing.GPUKey) string {
+		t.Helper()
+		head := f.mustPut(clusterHeadRequest(vulkanMember(a.ID, key)))
+		hs, ok := specByID(f.config(f.head.ID), head.ID)
+		if !ok || hs.Cluster == nil {
+			t.Fatalf("head withheld: %q", f.withheldReason())
+		}
+		return hs.Cluster.Generation
+	}
+	nvidia := generation(routing.GPUKey{Vendor: routing.GPUVendorNVIDIA, Index: 0})
+	if amd := generation(routing.GPUKey{Vendor: routing.GPUVendorAMD, Index: 0}); amd == nvidia {
+		t.Fatal("generation unchanged by moving the member from NVIDIA 0 to AMD 0")
+	}
+}
+
+// A member whose GPUs are all of its server's legacy vendor keeps the
+// generation part it had before vendors existed, byte for byte, so an
+// existing cluster's head does not relaunch on the upgrade.
+func TestMemberGenerationPartWithoutCrossVendorKeysIsUnchanged(t *testing.T) {
+	part := memberGenerationPart{
+		Kind: memberModeAutomatic, ID: "m", Server: "s", Binary: "/rpc", Args: []string{"-t", "4"}, Env: map[string]string{},
+		DeviceBackend: "cuda", Version: "1", Commit: "c", Build: "b", DeviceCount: 2, GPUs: []int{0, 1},
+		Transport: "direct", Network: "lan", Bind: "0.0.0.0", Port: 50052,
+		GPUKeys: crossVendorGPUKeys([]AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Index: 1}}, "nvidia"),
+	}
+	raw, err := json.Marshal(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"kind":"automatic","id":"m","server":"s","binary":"/rpc","args":["-t","4"],"env":{},"cache_enabled":false,"device_backend":"cuda","version":"1","commit":"c","build":"b","device_count":2,"gpus":[0,1],"transport":"direct","network":"lan","bind":"0.0.0.0","port":50052}`
+	if string(raw) != want {
+		t.Fatalf("generation part = %s\nwant %s", raw, want)
+	}
+	if got := crossVendorGPUKeys([]AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Vendor: "amd", Index: 0}}, "nvidia"); !slices.Equal(got, []string{"amd:0"}) {
+		t.Fatalf("cross-vendor keys = %v, want [amd:0]", got)
+	}
+	// Before the server's first backfill (legacy vendor unknown) no key is
+	// cross-vendor: otherwise the generation would change once at the
+	// backfill, which makes the explicit vendor equal to the legacy one, and
+	// relaunch the head for nothing.
+	if got := crossVendorGPUKeys([]AgentRuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Index: 1}}, ""); got != nil {
+		t.Fatalf("cross-vendor keys without a legacy vendor = %v, want nil", got)
 	}
 }

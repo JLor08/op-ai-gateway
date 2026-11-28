@@ -26,6 +26,16 @@ type SystemReport struct {
 	Mainboard    Mainboard  `json:"mainboard"`
 	BIOS         BIOS       `json:"bios"`
 	GPUs         []GPUInfo  `json:"gpus"`
+	// VulkanDeviceCount is the number of Vulkan devices the host exposes,
+	// CPU devices such as llvmpipe included; 0 means unknown or none.
+	// collector.CollectHardware fills it from vulkaninfo on a host with GPUs.
+	VulkanDeviceCount int `json:"vulkan_device_count,omitempty"`
+	// GPULegacyVendor is the vendor (nvidia, amd, apple) this agent's runtime
+	// gives a GPU without one: the first GPU tool it detected at startup, in
+	// the order nvidia, amd, apple. Empty on a host without a GPU tool. It
+	// comes from detection, not from GPUs, so a report that misses a vendor
+	// (a timed-out collector) still names the right one.
+	GPULegacyVendor string `json:"gpu_legacy_vendor,omitempty"`
 }
 
 // CPUInfo is the CPU section (from gopsutil cpu.Info + cpu.Counts).
@@ -68,6 +78,7 @@ type BIOS struct {
 // GPUInfo is one GPU's static inventory (mapped from a GPU collector's sample.GPU).
 type GPUInfo struct {
 	Index            int    `json:"index"`
+	Vendor           string `json:"vendor,omitempty"`
 	Name             string `json:"name"`
 	UUID             string `json:"uuid,omitempty"`
 	DriverVersion    string `json:"driver_version,omitempty"`
@@ -76,6 +87,14 @@ type GPUInfo struct {
 	// Apple) -- see sample.GPU.PCIBusID for what it is for and, more
 	// importantly, what it is not.
 	PCIBusID string `json:"pci_bus_id,omitempty"`
+	// VRAMMeasurable lists the APIs (cuda, rocm, vulkan) whose per-process
+	// VRAM measurement works for this card. collector.CollectHardware fills
+	// it per vendor from the VRAM measurer's Measurable.
+	VRAMMeasurable []string `json:"vram_measurable,omitempty"`
+	// VulkanOrdinal is the card's Vulkan device ordinal; nil when unknown
+	// (0 is a valid ordinal, hence the pointer). collector.CollectHardware
+	// fills it from vulkaninfo, matched to the card by PCI address.
+	VulkanOrdinal *int `json:"vulkan_ordinal,omitempty"`
 }
 
 // Normalize forces non-nil slices so the payload always decodes on the gateway.

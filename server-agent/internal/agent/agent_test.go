@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1175,7 +1176,7 @@ func TestCollectOnceRuntimePopulatesRuntimesAndOverridesLoadedModels(t *testing.
 			Port:         9001,
 			InFlight:     2,
 			Restarts:     1,
-			MeasuredVRAM: map[int]int{1: 8000, 0: 21234},
+			MeasuredVRAM: map[runtimectl.GPUKey]int{{Index: 1}: 8000, {Index: 0}: 21234},
 		},
 		{
 			SpecID: "rspec_b",
@@ -1253,7 +1254,7 @@ func TestRuntimeStatusCarriesMeasuredRAM(t *testing.T) {
 			State:         runtimectl.StateRunning,
 			Since:         since,
 			PID:           111,
-			MeasuredVRAM:  map[int]int{0: 21234},
+			MeasuredVRAM:  map[runtimectl.GPUKey]int{{Index: 0}: 21234},
 			MeasuredRAMMB: 1500,
 		},
 		{
@@ -5251,7 +5252,7 @@ func TestCollectOncePushesHostInfoToTheRuntimeOwner(t *testing.T) {
 
 	a.collectOnce(context.Background())
 
-	want := runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000, 2: 12288}, MemAvailableMB: 32000}
+	want := runtimectl.HostInfo{GPUTotalsMB: map[runtimectl.GPUKey]int{{Index: 0}: 24000, {Index: 2}: 12288}, MemAvailableMB: 32000}
 	if got := sink.last(t); !reflect.DeepEqual(got, want) {
 		t.Errorf("pushed HostInfo = %+v, want %+v", got, want)
 	}
@@ -5274,7 +5275,7 @@ func TestCollectOnceKeepsLastKnownGPUTotalsWhenAGPUReadFails(t *testing.T) {
 	})
 
 	a.collectOnce(context.Background())
-	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 8000}); !reflect.DeepEqual(got, want) {
+	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[runtimectl.GPUKey]int{{Index: 0}: 24000}, MemAvailableMB: 8000}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("first push = %+v, want %+v", got, want)
 	}
 
@@ -5282,14 +5283,14 @@ func TestCollectOnceKeepsLastKnownGPUTotalsWhenAGPUReadFails(t *testing.T) {
 	gpu.gpus, gpu.err = nil, errors.New("nvidia-smi timed out")
 	host.h = &sample.Host{MemAvailableBytes: 6000 * mib}
 	a.collectOnce(context.Background())
-	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 6000}); !reflect.DeepEqual(got, want) {
+	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[runtimectl.GPUKey]int{{Index: 0}: 24000}, MemAvailableMB: 6000}); !reflect.DeepEqual(got, want) {
 		t.Errorf("push after a failed GPU read = %+v, want %+v (last-known totals kept, live RAM updated)", got, want)
 	}
 
 	// The host read fails too: RAM reads as unknown (0), never as the stale 6000.
 	host.h, host.err = nil, errors.New("read failed")
 	a.collectOnce(context.Background())
-	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 0}); !reflect.DeepEqual(got, want) {
+	if got, want := sink.last(t), (runtimectl.HostInfo{GPUTotalsMB: map[runtimectl.GPUKey]int{{Index: 0}: 24000}, MemAvailableMB: 0}); !reflect.DeepEqual(got, want) {
 		t.Errorf("push after a failed host read = %+v, want %+v (available RAM unknown, not carried forward)", got, want)
 	}
 }
@@ -5372,7 +5373,7 @@ func TestRunPushesDeviceTotalsBeforeTheBootRuntimeSync(t *testing.T) {
 	if len(drv.pushed) == 0 {
 		t.Fatal("no HostInfo had been pushed when the boot runtime sync began -- pinned/force_running specs would be admitted against no detected budgets")
 	}
-	want := runtimectl.HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12288}, MemAvailableMB: 0}
+	want := runtimectl.HostInfo{GPUTotalsMB: map[runtimectl.GPUKey]int{{Index: 0}: 24000, {Index: 1}: 12288}, MemAvailableMB: 0}
 	if got := drv.pushed[0]; !reflect.DeepEqual(got, want) {
 		t.Errorf("first HostInfo push = %+v, want the boot seed %+v (device totals from the hardware inventory, RAM unknown)", got, want)
 	}
@@ -5564,5 +5565,125 @@ func TestCollectOnceSGLangTypesSkipProps(t *testing.T) {
 		if n := atomic.LoadInt32(&propsHits); n != 0 {
 			t.Errorf("/props hits after %s = %d, want 0", typ, n)
 		}
+	}
+}
+
+// TestPublishHostInfoKeepsBothVendorsTotals is #434 point 4: on a host with an
+// NVIDIA and an AMD card, both numbered 0, the two totals are two entries.
+// Keyed by the bare index, the second overwrote the first, and the AMD card's
+// total became NVIDIA 0's detected budget.
+func TestPublishHostInfoKeepsBothVendorsTotals(t *testing.T) {
+	const mib = 1024 * 1024
+	sink := &fakeHostInfoSink{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: &capturePoster{}, HostInfo: sink})
+	a.publishHostInfo(&sample.Sample{GPUs: []sample.GPU{
+		{Vendor: "nvidia", Index: 0, MemTotalBytes: 11 * 1024 * mib},
+		{Vendor: "amd", Index: 0, MemTotalBytes: 16 * 1024 * mib},
+	}})
+	want := map[runtimectl.GPUKey]int{
+		{Vendor: runtimectl.GPUVendorNVIDIA, Index: 0}: 11264,
+		{Vendor: runtimectl.GPUVendorAMD, Index: 0}:    16384,
+	}
+	if got := sink.last(t).GPUTotalsMB; !reflect.DeepEqual(got, want) {
+		t.Errorf("GPUTotalsMB = %v, want %v", got, want)
+	}
+}
+
+// TestRuntimeGPUSamplesCarryVendor: a runtime row's measured VRAM goes on the
+// wire with each GPU's vendor, sorted by (vendor, index) so the order is
+// stable.
+func TestRuntimeGPUSamplesCarryVendor(t *testing.T) {
+	poster := &capturePoster{}
+	drv := newFakeRuntimeDriver()
+	drv.setActive(true)
+	drv.setStatuses([]runtimectl.Status{{
+		SpecID: "rspec_a",
+		Model:  "m",
+		State:  runtimectl.StateRunning,
+		MeasuredVRAM: map[runtimectl.GPUKey]int{
+			{Vendor: runtimectl.GPUVendorNVIDIA, Index: 0}: 7874,
+			{Vendor: runtimectl.GPUVendorAMD, Index: 1}:    3323,
+		},
+	}})
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{Poster: poster, RuntimeDriver: drv})
+	a.collectOnce(context.Background())
+
+	got := poster.first()
+	if got == nil || len(got.Runtimes) != 1 {
+		t.Fatalf("posted sample = %+v, want one runtime row", got)
+	}
+	want := []sample.RuntimeGPUSample{
+		{Vendor: "amd", Index: 1, VRAMMeasuredMB: 3323},
+		{Vendor: "nvidia", Index: 0, VRAMMeasuredMB: 7874},
+	}
+	if !reflect.DeepEqual(got.Runtimes[0].GPUs, want) {
+		t.Errorf("Runtimes[0].GPUs = %+v, want %+v", got.Runtimes[0].GPUs, want)
+	}
+}
+
+// init keeps every agent test off the host's real vulkaninfo: the inventory
+// sees "no vulkaninfo" unless a test installs its own probe.
+func init() {
+	hardwareVulkanProbe = func(context.Context) ([]collector.VulkanDevice, bool) { return nil, false }
+}
+
+func TestHardwareOptionsUseConfigMeasurability(t *testing.T) {
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
+		VRAMMeasurable: func() map[string][]string { return map[string][]string{"amd": {"rocm"}} },
+	})
+	if got := a.hardwareOptions().VRAMMeasurable()["amd"]; !slices.Equal(got, []string{"rocm"}) {
+		t.Fatal(got)
+	}
+}
+
+func TestHardwareOptionsCarryLegacyVendor(t *testing.T) {
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{GPULegacyVendor: "nvidia"})
+	if got := a.hardwareOptions().GPULegacyVendor; got != "nvidia" {
+		t.Fatal(got)
+	}
+}
+
+func TestSeedHostInfoCarriesVulkanMap(t *testing.T) {
+	sink := &fakeHostInfoSink{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{HostInfo: sink})
+	zero, one := 0, 1
+	a.seedHostInfo(&sample.SystemReport{
+		VulkanDeviceCount: 3,
+		GPUs: []sample.GPUInfo{
+			{Index: 0, Vendor: "amd", VulkanOrdinal: &zero},
+			{Index: 1, Vendor: "amd", VulkanOrdinal: &one},
+			{Index: 0, Vendor: "nvidia"},
+		},
+	})
+	want := runtimectl.VulkanMap{
+		Ordinals:    map[runtimectl.GPUKey]int{{Vendor: runtimectl.ParseGPUVendor("amd"), Index: 0}: 0, {Vendor: runtimectl.ParseGPUVendor("amd"), Index: 1}: 1},
+		DeviceCount: 3,
+	}
+	if got := sink.last(t).Vulkan; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Vulkan = %+v, want %+v", got, want)
+	}
+}
+
+// TestHostInfoCarriesVulkanFromBootAndEveryCycle pins that the later collectOnce
+// push still carries the map the boot seed stored.
+func TestHostInfoCarriesVulkanFromBootAndEveryCycle(t *testing.T) {
+	const mib = 1024 * 1024
+	zero := 0
+	sink := &fakeHostInfoSink{}
+	a := NewFromDeps(config.Config{Interval: time.Hour}, Deps{
+		Host:     fakeHost{h: &sample.Host{MemTotalBytes: 64000 * mib, MemAvailableBytes: 8000 * mib}},
+		GPUs:     []collector.GPUCollector{fakeGPU{gpus: []sample.GPU{{Index: 0, Vendor: "amd", PCIBusID: "0000:02:00.0", MemTotalBytes: 24000 * mib}}}},
+		Poster:   &capturePoster{},
+		HostInfo: sink,
+	})
+	hw := sample.SystemReport{VulkanDeviceCount: 2, GPUs: []sample.GPUInfo{{Index: 0, Vendor: "amd", VulkanOrdinal: &zero, MemoryTotalBytes: 24000 * mib}}}
+	want := runtimectl.VulkanMap{Ordinals: map[runtimectl.GPUKey]int{{Vendor: runtimectl.ParseGPUVendor("amd"), Index: 0}: zero}, DeviceCount: 2}
+	a.seedHostInfo(&hw)
+	if got := sink.last(t).Vulkan; !reflect.DeepEqual(got, want) {
+		t.Fatalf("boot seed Vulkan = %+v, want %+v", got, want)
+	}
+	a.collectOnce(context.Background())
+	if got := sink.last(t).Vulkan; !reflect.DeepEqual(got, want) {
+		t.Fatalf("collectOnce Vulkan = %+v, want %+v", got, want)
 	}
 }

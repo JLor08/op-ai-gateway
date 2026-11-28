@@ -81,6 +81,11 @@ const (
 	rpcTransportDirect  = "direct"
 	rpcTransportRelay   = "relay"
 	deviceBackendAuto   = "auto"
+	deviceBackendCUDA   = "cuda"
+	deviceBackendROCm   = "rocm"
+	deviceBackendVulkan = "vulkan"
+	deviceBackendMetal  = "metal"
+	deviceBackendSYCL   = "sycl"
 )
 
 // RPC port range a member server's member processes are allocated from. It
@@ -107,12 +112,14 @@ const (
 	NetbirdDefaultPolicyUnknown  = "unknown"
 )
 
-// ClusterMemberGPUDTO is one GPU of a cluster member: its host index, the
-// operator's VRAM estimate and the measured VRAM (read-only).
+// ClusterMemberGPUDTO is one GPU of a cluster member: its vendor and
+// vendor-local host index (the GPU key; "" vendor is the host's only
+// vendor), the operator's VRAM estimate and the measured VRAM (read-only).
 type ClusterMemberGPUDTO struct {
-	Index          int `json:"index"`
-	VRAMEstimateMB int `json:"vram_estimate_mb"`
-	VRAMMeasuredMB int `json:"vram_measured_mb"`
+	Vendor         string `json:"vendor"`
+	Index          int    `json:"index"`
+	VRAMEstimateMB int    `json:"vram_estimate_mb"`
+	VRAMMeasuredMB int    `json:"vram_measured_mb"`
 }
 
 // ClusterMemberDTO is one member of a cluster head, in member order. On a
@@ -283,12 +290,15 @@ type clusterEntry struct {
 	manual bool
 	// visible: the caller manages the entry's server. Only an unchanged
 	// membership (validateClusterHead) can hold an entry that is not.
-	visible  bool
-	req      ClusterMemberDTO
-	server   routing.AIServer
-	spec     routing.RPCMemberSpec
-	gpus     []int
-	estimate map[int]int
+	visible bool
+	req     ClusterMemberDTO
+	server  routing.AIServer
+	spec    routing.RPCMemberSpec
+	// gpus is the member's GPU selection in device order and estimate the
+	// operator's VRAM estimate per GPU, both by GPU key.
+	gpus     []routing.GPUKey
+	estimate map[routing.GPUKey]int
+	position int
 }
 
 // specID is the manual member spec the entry uses, "" for an automatic one.
@@ -320,16 +330,22 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 //     a device list llama-server parses after the RPC servers, at least one
 //     member, not replicable, an explicit startup timeout.
 //  3. the member list: each entry's settings, one entry per server, no
-//     member on the head's own server. An entry without a server id keeps
-//     the stored member at its position (the read view hides members on
-//     servers the caller may not manage). When the membership, the member
-//     mode, the network, the transport and the head binary are all as
-//     stored, steps 4 to 8 are skipped: such a write changes no member
+//     member on the head's own server -- both allowed on a server whose
+//     agent declares rpc_cluster_same_host (agentRunsSameHostClusters). An
+//     entry without a server id keeps the stored member at its position (the
+//     read view hides members on servers the caller may not manage). The
+//     flag is read from the agent's last declaration, so after a gateway
+//     restart a head with a member on its own server, or with two members
+//     on one server, is refused (cluster_member_on_head_server,
+//     cluster_member_server_twice) until that server's agent reconnects;
+//     that is no regression of the stored head. When the membership, the
+//     member mode, the network, the transport and the head binary are all
+//     as stored, steps 4 to 8 are skipped: such a write changes no member
 //     server's document, so the head's own rights suffice and a member the
-//     caller cannot see does not lock it out of its head. The binary belongs
-//     to that list because it decides which member builds are compatible
-//     (step 6 and 7); a switch, even to the same build at another path, runs
-//     every member check.
+//     caller cannot see does not lock it out of its head. The binary
+//     belongs to that list because it decides which member builds are
+//     compatible (step 6 and 7); a switch, even to the same build at another
+//     path, runs every member check.
 //  4. rights: the caller manages every member server the write keeps or
 //     adds (a member it drops needs no rights: removal only frees the host),
 //     and every member consents to the head (its member spec's
@@ -352,12 +368,15 @@ func (e clusterEntry) refusal(sentinel error, format string, args ...any) error 
 //  8. network (mesh: NetBird with tracking group and mesh IP everywhere; lan:
 //     a LAN address everywhere), then transport (direct mesh: the NetBird
 //     policy preconditions; direct lan: the exposure acknowledgement).
-//  9. member GPUs: an explicit budget for Apple GPUs, an estimate for known
-//     non-NVIDIA GPUs of an automatic member, and --tensor-split on the head
-//     for any member with known non-NVIDIA GPUs. These rules also hold for a
-//     member the caller cannot see (a head edit such as dropping
-//     --tensor-split would otherwise leave an invalid head stored); the
-//     refusal then carries no detail about that member.
+//  9. member GPUs: each vendor normalized under the member server's rules
+//     (normalizeGPUVendor), an explicit budget for Apple GPUs, an estimate
+//     for known non-NVIDIA GPUs of an automatic member, and --tensor-split
+//     on the head for any member with known non-NVIDIA GPUs. These rules
+//     also hold for a member the caller cannot see (a head edit such as
+//     dropping --tensor-split would otherwise leave an invalid head stored);
+//     the refusal then carries no detail about that member. The one
+//     exception is a vendor the member's agent cannot read: a member the
+//     caller cannot see is kept as stored, not refused for it.
 func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app routing.Application, req PutRuntimeSpecRequest, f runtimeSpecFields, prior runtimeSpecPrior) (clusterPlan, error) {
 	plan := clusterPlan{
 		enabled: req.ClusterEnabled, memberMode: f.memberMode, network: f.clusterNetwork, transport: f.rpcTransport,
@@ -382,7 +401,7 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	if err := validateClusterHeadDocument(req, f, scan); err != nil {
 		return clusterPlan{}, err
 	}
-	entries, err := clusterEntries(req.ClusterMembers, f.memberMode, app.ServerID, prevMembers, prevGPUs)
+	entries, err := clusterEntries(req.ClusterMembers, f.memberMode, app.ServerID, s.agentRunsSameHostClusters, prevMembers, prevGPUs)
 	if err != nil {
 		return clusterPlan{}, err
 	}
@@ -392,6 +411,12 @@ func (s *Service) validateClusterHead(ctx context.Context, p auth.Token, app rou
 	}
 	w := clusterHeadWrite{p: p, req: req, f: f, prior: prior, entries: entries, headServer: headServer}
 	if err := s.checkClusterMembershipOrKeep(ctx, w, prevMembers, prevGPUs, &plan); err != nil {
+		return clusterPlan{}, err
+	}
+	if err := s.normalizeClusterMemberGPUVendors(entries, prevGPUs); err != nil {
+		return clusterPlan{}, err
+	}
+	if err := checkClusterMemberBackends(entries, prevMembers, prevGPUs); err != nil {
 		return clusterPlan{}, err
 	}
 	if err := s.checkClusterMemberGPUs(ctx, entries, scan); err != nil {
@@ -444,7 +469,14 @@ func clusterSettingsUnchanged(prior runtimeSpecPrior, f runtimeSpecFields) bool 
 // for a write that keeps the stored cluster settings and membership, only
 // loads the stored entries and checks the head's own acknowledgement.
 func (s *Service) checkClusterMembershipOrKeep(ctx context.Context, w clusterHeadWrite, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU, plan *clusterPlan) error {
-	unchanged := clusterSettingsUnchanged(w.prior, w.f) && membershipUnchanged(w.entries, prevMembers, prevGPUs)
+	unchanged := clusterSettingsUnchanged(w.prior, w.f)
+	if unchanged {
+		legacy, err := s.memberLegacyVendors(ctx, w.entries)
+		if err != nil {
+			return err
+		}
+		unchanged = membershipUnchanged(w.entries, prevMembers, prevGPUs, legacy)
+	}
 	if unchanged {
 		// A manual member whose spec is gone runs the full checks instead,
 		// which refuse it: kept as stored it would turn into an automatic
@@ -458,8 +490,10 @@ func (s *Service) checkClusterMembershipOrKeep(ctx context.Context, w clusterHea
 		return s.checkClusterMembership(ctx, w, plan)
 	}
 	// The acknowledgement is the head's own setting: withdrawing it from a
-	// direct lan cluster is refused like a missing one.
-	if plan.transport == rpcTransportDirect && plan.network == clusterNetworkLAN && !w.req.LANExposureAck {
+	// direct lan cluster is refused like a missing one -- unless every member
+	// runs on the head's server, on loopback, which exposes nothing.
+	if plan.transport == rpcTransportDirect && plan.network == clusterNetworkLAN && !w.req.LANExposureAck &&
+		entriesHaveRemoteMember(w.headServer.ID, w.entries) {
 		return ErrClusterLANAckRequired
 	}
 	return nil
@@ -516,41 +550,53 @@ func validateClusterHeadArgs(scan clusterArgScan) error {
 }
 
 // clusterEntries is step 3 of validateClusterHead: each entry's settings,
-// one entry per server and none on the head's server. Settings the member
-// mode does not use are dropped (a manual member's settings live on its
-// spec; an automatic member has no spec).
-func clusterEntries(members []ClusterMemberDTO, mode, headServerID string, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) ([]clusterEntry, error) {
+// one entry per server and none on the head's server -- unless that
+// server's agent runs same-host cluster members (sameHost, the agent's
+// rpc_cluster_same_host): such a server may carry the head and members, and
+// several members. Settings the member mode does not use are dropped (a
+// manual member's settings live on its spec; an automatic member has no
+// spec). An entry without a server id keeps the stored member at its
+// position.
+func clusterEntries(members []ClusterMemberDTO, mode, headServerID string, sameHost func(serverID string) bool, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) ([]clusterEntry, error) {
 	entries := make([]clusterEntry, 0, len(members))
 	seen := map[string]bool{}
 	for i, m := range members {
 		m.ServerID = strings.TrimSpace(m.ServerID)
 		m.MemberSpecID = strings.TrimSpace(m.MemberSpecID)
-		if m.ServerID == "" && i < len(prevMembers) {
-			m = storedMemberDTO(prevMembers[i], prevGPUs)
+		if prev, ok := storedMemberAt(prevMembers, i); m.ServerID == "" && ok {
+			m = storedMemberDTO(prev, prevGPUs)
 		}
 		e, err := newClusterEntry(m, mode)
 		if err != nil {
 			return nil, err
 		}
-		if seen[m.ServerID] {
+		if seen[m.ServerID] && !sameHost(m.ServerID) {
 			return nil, ErrClusterMemberServerTwice
 		}
 		seen[m.ServerID] = true
+		e.position = i
 		entries = append(entries, e)
 	}
-	for _, e := range entries {
-		if e.req.ServerID == headServerID {
-			return nil, ErrClusterMemberOnHeadServer
-		}
+	if seen[headServerID] && !sameHost(headServerID) {
+		return nil, ErrClusterMemberOnHeadServer
 	}
 	return entries, nil
+}
+
+// storedMemberAt is the stored member at position, if there is one.
+func storedMemberAt(prevMembers []routing.ClusterMember, position int) (routing.ClusterMember, bool) {
+	i := slices.IndexFunc(prevMembers, func(m routing.ClusterMember) bool { return m.Position == position })
+	if i < 0 {
+		return routing.ClusterMember{}, false
+	}
+	return prevMembers[i], true
 }
 
 // newClusterEntry builds one requested member's entry in mode: an automatic
 // member's settings are validated and its GPU selection read; a manual
 // member's own settings live on its spec and are dropped.
 func newClusterEntry(m ClusterMemberDTO, mode string) (clusterEntry, error) {
-	e := clusterEntry{manual: mode == memberModeManual, req: m, estimate: map[int]int{}}
+	e := clusterEntry{manual: mode == memberModeManual, req: m, estimate: map[routing.GPUKey]int{}}
 	if mode != memberModeAutomatic {
 		e.req.Threads, e.req.CacheEnabled, e.req.DeviceBackend, e.req.RAMEstimateMB, e.req.GPUs = 0, false, deviceBackendAuto, 0, nil
 		return e, nil
@@ -560,9 +606,10 @@ func newClusterEntry(m ClusterMemberDTO, mode string) (clusterEntry, error) {
 	}
 	gpus := make([]RuntimeSpecGPUDTO, 0, len(m.GPUs))
 	for _, g := range m.GPUs {
-		gpus = append(gpus, RuntimeSpecGPUDTO{Index: g.Index, VRAMEstimateMB: g.VRAMEstimateMB})
-		e.gpus = append(e.gpus, g.Index)
-		e.estimate[g.Index] = g.VRAMEstimateMB
+		gpus = append(gpus, RuntimeSpecGPUDTO{Vendor: g.Vendor, Index: g.Index, VRAMEstimateMB: g.VRAMEstimateMB})
+		key := routing.GPUKey{Vendor: g.Vendor, Index: g.Index}
+		e.gpus = append(e.gpus, key)
+		e.estimate[key] = g.VRAMEstimateMB
 	}
 	if err := validateRuntimeSpecGPUs(gpus); err != nil {
 		return clusterEntry{}, err
@@ -575,34 +622,36 @@ func newClusterEntry(m ClusterMemberDTO, mode string) (clusterEntry, error) {
 	return e, nil
 }
 
-// storedMemberDTO is the request entry that keeps a stored member as it is.
+// storedMemberDTO is the request entry that keeps a stored member as it is,
+// with the GPU rows of the member at its position.
 func storedMemberDTO(row routing.ClusterMember, gpus []routing.ClusterMemberGPU) ClusterMemberDTO {
 	m := ClusterMemberDTO{
 		ServerID: row.ServerID, MemberSpecID: row.MemberSpecID, Threads: row.Threads, CacheEnabled: row.CacheEnabled,
 		DeviceBackend: row.DeviceBackend, RAMEstimateMB: row.RAMEstimateMB, GPUs: []ClusterMemberGPUDTO{},
 	}
 	for _, g := range gpus {
-		if g.ServerID == row.ServerID {
-			m.GPUs = append(m.GPUs, ClusterMemberGPUDTO{Index: g.GPUIndex, VRAMEstimateMB: g.VRAMEstimateMB})
+		if g.MemberPosition == row.Position {
+			m.GPUs = append(m.GPUs, ClusterMemberGPUDTO{Vendor: g.GPUVendor, Index: g.GPUIndex, VRAMEstimateMB: g.VRAMEstimateMB})
 		}
 	}
 	return m
 }
 
 // membershipUnchanged reports whether entries are the stored membership:
-// the same servers in the same order with the same member spec, and for an
+// at every position the same server with the same member spec, and for an
 // automatic member the same settings and GPU selection with the same
-// estimates.
-func membershipUnchanged(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) bool {
+// estimates. legacy is each member server's legacy GPU vendor
+// (AIServer.GPULegacyVendor), by server id.
+func membershipUnchanged(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU, legacy map[string]string) bool {
 	if len(entries) != len(prevMembers) {
 		return false
 	}
-	for i, e := range entries {
-		prev := prevMembers[i]
-		if e.req.ServerID != prev.ServerID || e.req.MemberSpecID != prev.MemberSpecID {
+	for _, e := range entries {
+		prev, ok := storedMemberAt(prevMembers, e.position)
+		if !ok || e.req.ServerID != prev.ServerID || e.req.MemberSpecID != prev.MemberSpecID {
 			return false
 		}
-		if !e.manual && !automaticMemberUnchanged(e, prev, prevGPUs) {
+		if !e.manual && !automaticMemberUnchanged(e, prev, prevGPUs, legacy[prev.ServerID]) {
 			return false
 		}
 	}
@@ -611,18 +660,51 @@ func membershipUnchanged(entries []clusterEntry, prevMembers []routing.ClusterMe
 
 // automaticMemberUnchanged reports whether an automatic entry keeps the
 // stored member's settings and its GPU selection with the same estimates.
-func automaticMemberUnchanged(e clusterEntry, prev routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) bool {
+// GPU keys compare as the save stores them: the vendor lower-cased, an empty
+// vendor read as the member server's legacy vendor legacy -- a re-sent
+// "NVIDIA", or a vendor a backfill gave the stored rows, changes nothing.
+func automaticMemberUnchanged(e clusterEntry, prev routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU, legacy string) bool {
 	stored := storedMemberDTO(prev, prevGPUs)
 	if e.req.Threads != prev.Threads || e.req.CacheEnabled != prev.CacheEnabled || e.req.RAMEstimateMB != prev.RAMEstimateMB ||
 		e.req.DeviceBackend != normalizeDeviceBackend(prev.DeviceBackend) || len(e.gpus) != len(stored.GPUs) {
 		return false
 	}
 	for j, g := range stored.GPUs {
-		if e.gpus[j] != g.Index || e.estimate[g.Index] != g.VRAMEstimateMB {
+		requested := e.gpus[j]
+		if comparableGPUKey(requested, legacy) != comparableGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy) ||
+			e.estimate[requested] != g.VRAMEstimateMB {
 			return false
 		}
 	}
 	return true
+}
+
+// comparableGPUKey is key with its vendor trimmed and lower-cased and an
+// empty vendor read as legacy: the card two spellings of one GPU name.
+func comparableGPUKey(key routing.GPUKey, legacy string) routing.GPUKey {
+	key.Vendor = strings.ToLower(strings.TrimSpace(key.Vendor))
+	return resolveLegacyGPUKey(key, legacy)
+}
+
+// memberLegacyVendors reads the legacy GPU vendor of every entry's server,
+// by server id. A server that is gone is left out: the stored entries'
+// load refuses it.
+func (s *Service) memberLegacyVendors(ctx context.Context, entries []clusterEntry) (map[string]string, error) {
+	out := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if _, done := out[e.req.ServerID]; done || e.req.ServerID == "" {
+			continue
+		}
+		server, err := s.routes.AIServerByID(ctx, e.req.ServerID)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			continue
+		case err != nil:
+			return nil, err
+		}
+		out[e.req.ServerID] = server.GPULegacyVendor
+	}
+	return out, nil
 }
 
 // loadStoredClusterEntries fills the entries of an unchanged membership
@@ -664,8 +746,9 @@ func (s *Service) loadEntrySpec(ctx context.Context, e *clusterEntry, spec routi
 	}
 	e.spec, e.gpus = spec, nil
 	for _, g := range gpuRows {
-		e.gpus = append(e.gpus, g.GPUIndex)
-		e.estimate[g.GPUIndex] = g.VRAMEstimateMB
+		key := routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}
+		e.gpus = append(e.gpus, key)
+		e.estimate[key] = g.VRAMEstimateMB
 	}
 	return nil
 }
@@ -977,7 +1060,10 @@ func (s *Service) defaultRPCTransport(ctx context.Context, network string) (stri
 }
 
 // checkClusterNetwork is step 8 of validateClusterHead; it returns the
-// network and transport the write stores, defaults resolved.
+// network and transport the write stores, defaults resolved. A member on the
+// head's server runs on loopback (sameHostMember): it needs nothing of the
+// network, and a cluster whose members all do needs nothing of the head's
+// network or of the transport either.
 func (s *Service) checkClusterNetwork(ctx context.Context, headServer routing.AIServer, entries []clusterEntry, network, transport string, lanAck bool) (string, string, error) {
 	servers := []routing.AIServer{headServer}
 	for _, e := range entries {
@@ -986,7 +1072,11 @@ func (s *Service) checkClusterNetwork(ctx context.Context, headServer routing.AI
 	if network == "" {
 		network = defaultClusterNetwork(servers)
 	}
+	remote := entriesHaveRemoteMember(headServer.ID, entries)
 	for _, srv := range servers {
+		if srv.ID == headServer.ID && !remote {
+			continue
+		}
 		if err := checkServerInNetwork(srv, network); err != nil {
 			return "", "", err
 		}
@@ -997,10 +1087,19 @@ func (s *Service) checkClusterNetwork(ctx context.Context, headServer routing.AI
 			return "", "", err
 		}
 	}
+	if !remote {
+		return network, transport, nil
+	}
 	if err := s.checkClusterTransport(ctx, network, transport, lanAck); err != nil {
 		return "", "", err
 	}
 	return network, transport, nil
+}
+
+// entriesHaveRemoteMember reports whether a member of entries runs on another
+// server than the head's headServerID, i.e. is reached over the network.
+func entriesHaveRemoteMember(headServerID string, entries []clusterEntry) bool {
+	return slices.ContainsFunc(entries, func(e clusterEntry) bool { return e.req.ServerID != headServerID })
 }
 
 // checkServerInNetwork requires what network needs of one server: NetBird
@@ -1038,71 +1137,240 @@ func (s *Service) checkClusterTransport(ctx context.Context, network, transport 
 
 // hostGPU is what a server's hardware report says about one GPU.
 type hostGPU struct {
+	// vendor is the report's vendor ("nvidia", "amd", "apple"); "" in the
+	// report of an agent without gpu_vendor_identity, whose card nvidia and
+	// apple then read from its name.
+	vendor string
 	nvidia bool
 	apple  bool
 	// kfdHost: a Linux host on which every listed GPU is AMD, so the agent's
-	// KFD measurer is the one installed (ADR-113).
+	// KFD measurer is the one installed (ADR-113). Only read for a card
+	// without hasMeasurable.
 	kfdHost bool
 	totalMB int
+	// measurable lists the backends whose per-process VRAM the agent measures
+	// on this card (the report's vram_measurable); hasMeasurable: the report
+	// states it, which every report that names the card's vendor does -- the
+	// list is omitted on the wire when empty, which there means none.
+	measurable    []string
+	hasMeasurable bool
 }
 
-// serverHostGPUs reads serverID's hardware report by GPU index. A server
-// without a (readable) report answers an empty map: its vendors are unknown,
-// and no vendor-dependent rule applies to it. The host's OS family is the
-// runtime.GOOS in its last telemetry sample: the report's own os field is the
-// platform string ("ubuntu 24.04"), which names no family. Without telemetry
-// the family is unknown, so no Linux-only exemption applies.
-func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[int]hostGPU, error) {
-	out := map[int]hostGPU{}
+// serverHostGPUs reads serverID's hardware report by GPU key (the report's
+// vendor, index); a vendor-less report of an older agent keys ("", index)
+// and keeps the name heuristic for its vendors. A server without a
+// (readable) report answers an empty map: its vendors are unknown, and no
+// vendor-dependent rule applies to it. A caller looks a stored GPU key up
+// with lookupGPUKey under the server's legacy vendor, so the empty vendor
+// and the legacy vendor name one card. The host's OS family is the
+// runtime.GOOS in its last telemetry sample: the report's own os field is
+// the platform string ("ubuntu 24.04"), which names no family. Without
+// telemetry the family is unknown, so no Linux-only exemption applies.
+func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[routing.GPUKey]hostGPU, error) {
+	out := map[routing.GPUKey]hostGPU{}
 	hw, ok, err := s.routes.ServerHardwareByServer(ctx, serverID)
 	if err != nil || !ok {
 		return out, err
 	}
 	var report struct {
-		GPUs []struct {
-			Index            int    `json:"index"`
-			Name             string `json:"name"`
-			PCIBusID         string `json:"pci_bus_id"`
-			MemoryTotalBytes int64  `json:"memory_total_bytes"`
-		} `json:"gpus"`
+		GPUs []reportedGPU `json:"gpus"`
 	}
 	if json.Unmarshal([]byte(hw.ReportJSON), &report) != nil {
 		return out, nil
 	}
-	goos := ""
-	telemetry, hasTelemetry, err := s.routes.TelemetryByServer(ctx, serverID)
+	goos, err := s.serverGOOS(ctx, serverID)
 	if err != nil {
 		return nil, err
 	}
-	if hasTelemetry {
-		goos = telemetry.OS
-	}
+	vendors := reportedGPUVendors(report.GPUs)
 	kfdHost := goos == "linux" && len(report.GPUs) > 0
-	for _, g := range report.GPUs {
-		kfdHost = kfdHost && gpuLooksAMD(g.Name)
+	for i, g := range report.GPUs {
+		kfdHost = kfdHost && gpuLooksAMD(vendors[i], g.Name)
 	}
-	for _, g := range report.GPUs {
-		apple := goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")
-		out[g.Index] = hostGPU{
-			nvidia:  !apple && gpuLooksNVIDIA(g.Name, g.PCIBusID),
-			apple:   apple,
-			kfdHost: kfdHost,
-			totalMB: int(g.MemoryTotalBytes / (1024 * 1024)),
-		}
+	for i, g := range report.GPUs {
+		out[routing.GPUKey{Vendor: vendors[i], Index: g.Index}] = newHostGPU(g, vendors[i], goos, kfdHost)
 	}
 	return out, nil
 }
 
+// reportedGPU is one GPU of a server's hardware report, as serverHostGPUs
+// reads it.
+type reportedGPU struct {
+	Index            int      `json:"index"`
+	Name             string   `json:"name"`
+	PCIBusID         string   `json:"pci_bus_id"`
+	Vendor           string   `json:"vendor"`
+	MemoryTotalBytes int64    `json:"memory_total_bytes"`
+	VRAMMeasurable   []string `json:"vram_measurable"`
+}
+
+// serverGOOS is the runtime.GOOS of serverID's last telemetry sample, "" when
+// it has none (the family is unknown).
+func (s *Service) serverGOOS(ctx context.Context, serverID string) (string, error) {
+	telemetry, hasTelemetry, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil || !hasTelemetry {
+		return "", err
+	}
+	return telemetry.OS, nil
+}
+
+// reportedGPUVendors is each reported GPU's vendor, normalized; "" for a GPU
+// whose report names no valid vendor (an agent without gpu_vendor_identity).
+func reportedGPUVendors(gpus []reportedGPU) []string {
+	vendors := make([]string, len(gpus))
+	for i, g := range gpus {
+		if v := strings.ToLower(strings.TrimSpace(g.Vendor)); routing.ValidGPUVendor(v) {
+			vendors[i] = v
+		}
+	}
+	return vendors
+}
+
+// newHostGPU is the hostGPU of reported card g with its normalized vendor on
+// a host of family goos. A vendor-less report reads Apple from the host family
+// or the card's name, and NVIDIA from the name or PCI id (gpuLooksNVIDIA).
+func newHostGPU(g reportedGPU, vendor, goos string, kfdHost bool) hostGPU {
+	apple := vendor == routing.GPUVendorApple ||
+		(vendor == "" && (goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")))
+	return hostGPU{
+		vendor:        vendor,
+		nvidia:        !apple && gpuLooksNVIDIA(vendor, g.Name, g.PCIBusID),
+		apple:         apple,
+		kfdHost:       kfdHost,
+		totalMB:       int(g.MemoryTotalBytes / (1024 * 1024)),
+		measurable:    g.VRAMMeasurable,
+		hasMeasurable: vendor != "" || len(g.VRAMMeasurable) > 0,
+	}
+}
+
+// hostIsMixed reports whether host (serverHostGPUs) lists both NVIDIA and
+// AMD GPUs by their reported vendor: the host on which the Vulkan loader's
+// device order is not the declared one (the agent's GPUTopology.Mixed).
+func hostIsMixed(host map[routing.GPUKey]hostGPU) bool {
+	var nvidia, amd bool
+	for k := range host {
+		nvidia = nvidia || k.Vendor == routing.GPUVendorNVIDIA
+		amd = amd || k.Vendor == routing.GPUVendorAMD
+	}
+	return nvidia && amd
+}
+
+// normalizeClusterMemberGPUVendors normalizes the vendor of every GPU an
+// automatic entry selects under its member server's rules
+// (normalizeGPUVendor), the start of step 9 of validateClusterHead: it needs
+// the entry's server, which steps 4 to 8 resolved and authorized. A manual
+// entry's GPUs are its spec's rows, normalized when the spec was saved. An
+// entry the caller cannot see is the stored member kept as it is, so it is
+// not refused for an agent that lacks gpu_vendor_identity since: the caller
+// could neither see nor change why. A visible member's GPU that the head
+// already has stored for that member server (prevGPUs) is re-saved as it is
+// (gpuVendorRules.normalizeAt), so a head override after a downgrade saves.
+func (s *Service) normalizeClusterMemberGPUVendors(entries []clusterEntry, prevGPUs []routing.ClusterMemberGPU) error {
+	for i := range entries {
+		e := &entries[i]
+		if e.manual {
+			continue
+		}
+		storedKeys := storedMemberGPUKeys(prevGPUs, func(g routing.ClusterMemberGPU) bool { return g.ServerID == e.server.ID })
+		rules := s.gpuVendorRulesWith(e.server.ID, e.server.GPULegacyVendor).withStored(storedKeys)
+		if !e.visible {
+			rules.known = false
+		}
+		if err := e.normalizeGPUVendors(rules); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// storedMemberGPUKeys is the GPU keys of the stored member GPU rows match
+// selects, in stored order.
+func storedMemberGPUKeys(prevGPUs []routing.ClusterMemberGPU, match func(routing.ClusterMemberGPU) bool) []routing.GPUKey {
+	var keys []routing.GPUKey
+	for _, g := range prevGPUs {
+		if match(g) {
+			keys = append(keys, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
+		}
+	}
+	return keys
+}
+
+// normalizeGPUVendors replaces e's GPU keys and their estimates with their
+// vendor normalized under rules, refusing a GPU rules cannot normalize and
+// two keys naming the same card (ErrRuntimeSpecGPUInvalid).
+func (e *clusterEntry) normalizeGPUVendors(rules gpuVendorRules) error {
+	gpus := make([]routing.GPUKey, 0, len(e.gpus))
+	estimate := make(map[routing.GPUKey]int, len(e.gpus))
+	seen := make(map[routing.GPUKey]struct{}, len(e.gpus))
+	for _, k := range e.gpus {
+		vendor, err := rules.normalizeAt(k.Vendor, k.Index)
+		if err != nil {
+			return err
+		}
+		normalized := routing.GPUKey{Vendor: vendor, Index: k.Index}
+		if _, dup := seen[rules.resolve(normalized)]; dup {
+			return ErrRuntimeSpecGPUInvalid
+		}
+		seen[rules.resolve(normalized)] = struct{}{}
+		gpus = append(gpus, normalized)
+		estimate[normalized] = e.estimate[k]
+	}
+	e.gpus, e.estimate = gpus, estimate
+	return nil
+}
+
+// checkClusterMemberBackends refuses an automatic member whose device
+// backend cannot drive one of its GPUs (specDeviceRefusal, without the
+// Vulkan visibility rule: the agent pins a member's devices itself), right
+// after the vendors are normalized. A manual member's backend and GPUs were
+// checked when its spec was saved, and an entry the caller cannot see is
+// kept as it is. A member that leaves the stored automatic member at its
+// position on the same server with the same backend and GPUs is not refused
+// (refusalUnlessUnchanged): a head override re-sends it.
+func checkClusterMemberBackends(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) error {
+	for i, e := range entries {
+		if e.manual || !e.visible {
+			continue
+		}
+		legacy := e.server.GPULegacyVendor
+		refusal := specDeviceRefusal(e.req.DeviceBackend, e.gpus, legacy, false, false)
+		if refusal == nil {
+			continue
+		}
+		stored := storedAutomaticMemberInputs(prevMembers, prevGPUs, i, e.server.ID, legacy)
+		if err := refusalUnlessUnchanged(refusal, newDevicePlanInputs(e.req.DeviceBackend, e.gpus, legacy, false), stored); err != nil {
+			return e.refusal(err, "the device backend of the member on server %q cannot drive its GPUs", e.server.Name)
+		}
+	}
+	return nil
+}
+
+// storedAutomaticMemberInputs is the device-plan inputs of the stored
+// automatic member at position on serverID, nil when there is none.
+func storedAutomaticMemberInputs(prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU, position int, serverID, legacy string) *devicePlanInputs {
+	j := slices.IndexFunc(prevMembers, func(m routing.ClusterMember) bool {
+		return m.Position == position && m.ServerID == serverID && m.MemberSpecID == ""
+	})
+	if j < 0 {
+		return nil
+	}
+	keys := storedMemberGPUKeys(prevGPUs, func(g routing.ClusterMemberGPU) bool {
+		return g.MemberPosition == position && g.ServerID == serverID
+	})
+	in := newDevicePlanInputs(prevMembers[j].DeviceBackend, keys, legacy, false)
+	return &in
+}
+
 // checkClusterMemberGPUs is step 9 of validateClusterHead. An Apple GPU gets
 // no auto-detected budget on its agent, so a member on one needs the
-// operator's. A known non-NVIDIA GPU is not measured per process, so an
-// automatic member needs the operator's estimate for it and the head needs
-// --tensor-split, since the member's real share may stay invisible to its
-// agent. The exception is a measurable GPU (memberGPUMeasurable: AMD on
-// Linux under the ROCm or auto backend, read from KFD, ADR-113), which needs
-// neither.
+// operator's. A known non-NVIDIA GPU whose VRAM the agent cannot measure for
+// the member's resolved backend (gpuMeasurable) is not measured per process,
+// so an automatic member needs the operator's estimate for it and the head
+// needs --tensor-split, since the member's real share may stay invisible to
+// its agent. Each GPU key is looked up on its own server's report, the empty
+// vendor read as that server's legacy vendor.
 func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterEntry, scan clusterArgScan) error {
-	hosts := make([]map[int]hostGPU, len(entries))
+	hosts := make([]map[routing.GPUKey]hostGPU, len(entries))
 	for i, e := range entries {
 		var err error
 		if hosts[i], err = s.serverHostGPUs(ctx, e.server.ID); err != nil {
@@ -1114,13 +1382,20 @@ func (s *Service) checkClusterMemberGPUs(ctx context.Context, entries []clusterE
 			return err
 		}
 	}
+	unmeasured := func(i int, e clusterEntry) func(routing.GPUKey) bool {
+		backend := entryResolvedBackend(e)
+		return func(k routing.GPUKey) bool {
+			return unmeasuredNonNVIDIA(hosts[i], k, e.server.GPULegacyVendor, backend)
+		}
+	}
 	for i, e := range entries {
-		if !e.manual && slices.ContainsFunc(e.gpus, func(idx int) bool { return unmeasuredNonNVIDIA(hosts[i], idx, e) && e.estimate[idx] == 0 }) {
+		isUnmeasured := unmeasured(i, e)
+		if !e.manual && slices.ContainsFunc(e.gpus, func(k routing.GPUKey) bool { return isUnmeasured(k) && e.estimate[k] == 0 }) {
 			return ErrRPCMemberVRAMEstimateRequired
 		}
 	}
 	for i, e := range entries {
-		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, func(idx int) bool { return unmeasuredNonNVIDIA(hosts[i], idx, e) }) {
+		if !scan.tensorSplit && slices.ContainsFunc(e.gpus, unmeasured(i, e)) {
 			return e.refusal(ErrClusterTensorSplitRequired, "server %q has GPUs whose VRAM the agent cannot measure", e.server.Name)
 		}
 	}
@@ -1136,77 +1411,96 @@ func entryDeviceBackend(e clusterEntry) string {
 	return e.req.DeviceBackend
 }
 
-// unmeasuredNonNVIDIA reports whether the report lists GPU idx of entry e as
-// a non-NVIDIA card whose VRAM the agent cannot measure.
-func unmeasuredNonNVIDIA(host map[int]hostGPU, idx int, e clusterEntry) bool {
-	return knownNonNVIDIA(host, idx) && !memberGPUMeasurable(host[idx], entryDeviceBackend(e))
+// entryResolvedBackend is entryDeviceBackend resolved for the vendors of the
+// entry's GPUs (resolveSpecBackend), what the agent runs the member with.
+func entryResolvedBackend(e clusterEntry) string {
+	backend, _ := resolveSpecBackend(entryDeviceBackend(e), specGPUVendors(e.gpus, e.server.GPULegacyVendor))
+	return backend
 }
 
-// memberGPUMeasurable reports whether the agent measures g's per-process VRAM
-// for a member with the given device backend: g sits on a Linux host with only
-// AMD GPUs (kfdHost) and the backend is rocm, or auto/"" (which the agent
-// resolves to ROCm on such a host). A member that runs with the ROCm device
-// prefix is a HIP process, which the KFD measurer sees; a non-HIP binary fails
-// with device_backend_mismatch instead.
-func memberGPUMeasurable(g hostGPU, backend string) bool {
+// unmeasuredNonNVIDIA reports whether host's report lists the card key names
+// (lookupGPUKey under legacy) as a non-NVIDIA card whose VRAM the agent
+// cannot measure for a member with resolved backend backend.
+func unmeasuredNonNVIDIA(host map[routing.GPUKey]hostGPU, key routing.GPUKey, legacy, backend string) bool {
+	g, known := lookupGPUKey(host, key, legacy)
+	return known && !g.nvidia && !gpuMeasurable(g, backend)
+}
+
+// gpuMeasurable reports whether the agent measures g's per-process VRAM for
+// a member whose device backend resolves to backend (resolveSpecBackend).
+// A report that states the card's measurable backends decides by that list.
+// One that does not (an older agent's) keeps the KFD rule: g sits on a Linux
+// host with only AMD GPUs (kfdHost) and the backend is rocm, or auto (which
+// the agent resolves to ROCm on such a host). A member that runs with the
+// ROCm device prefix is a HIP process, which the KFD measurer sees; a
+// non-HIP binary fails with device_backend_mismatch instead.
+func gpuMeasurable(g hostGPU, backend string) bool {
+	if g.hasMeasurable {
+		return slices.Contains(g.measurable, backend)
+	}
 	if !g.kfdHost {
 		return false
 	}
-	switch normalizeDeviceBackend(backend) {
-	case "rocm", deviceBackendAuto:
+	switch backend {
+	case deviceBackendROCm, deviceBackendAuto:
 		return true
 	}
 	return false
 }
 
-// knownNonNVIDIA reports whether the hardware report lists GPU idx and it is
-// not an NVIDIA card.
-func knownNonNVIDIA(host map[int]hostGPU, idx int) bool {
-	g, known := host[idx]
-	return known && !g.nvidia
-}
-
 // checkAppleMemberBudgets requires an operator GPU budget for every Apple GPU
-// an entry selects.
-func (s *Service) checkAppleMemberBudgets(ctx context.Context, e clusterEntry, host map[int]hostGPU) error {
-	if !slices.ContainsFunc(e.gpus, func(idx int) bool { return host[idx].apple }) {
+// an entry selects: a budget of the same card, the empty vendor read as the
+// server's legacy vendor on both sides.
+func (s *Service) checkAppleMemberBudgets(ctx context.Context, e clusterEntry, host map[routing.GPUKey]hostGPU) error {
+	legacy := e.server.GPULegacyVendor
+	isApple := func(k routing.GPUKey) bool {
+		g, _ := lookupGPUKey(host, k, legacy)
+		return g.apple
+	}
+	if !slices.ContainsFunc(e.gpus, isApple) {
 		return nil
 	}
 	budgets, err := s.routes.ServerGPUBudgets(ctx, e.server.ID)
 	if err != nil {
 		return err
 	}
-	for _, idx := range e.gpus {
-		if host[idx].apple && !slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool { return b.GPUIndex == idx && b.BudgetMB > 0 }) {
-			return e.refusal(ErrClusterMemberBudgetRequired, "GPU %d of server %q needs a GPU budget", idx, e.server.Name)
+	for _, k := range e.gpus {
+		card := resolveLegacyGPUKey(k, legacy)
+		if isApple(k) && !slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool {
+			return resolveLegacyGPUKey(routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}, legacy) == card && b.BudgetMB > 0
+		}) {
+			return e.refusal(ErrClusterMemberBudgetRequired, "%s of server %q needs a GPU budget", routing.GPUKey{Vendor: routing.GPUVendorApple, Index: k.Index}, e.server.Name)
 		}
 	}
 	return nil
 }
 
-// planClusterRows builds the membership rows of a valid head write. A member
-// that stays on its server (same server, and in manual mode the same spec)
-// keeps its measured values per kept GPU index; a member on a server with a
-// row before keeps that row's port, any other gets a new one. When the write
-// changes the distribution of the model over the devices -- members added,
-// removed or reordered, a member's GPU selection, or the head's args, env or
-// GPU rows -- the kept values become a stale floor until the next formed run
+// planClusterRows builds the membership rows of a valid head write. Each
+// entry continues the stored row matchStoredRows pairs it with: a member that
+// stays on its server (same server, and in manual mode the same spec) keeps
+// its measured values per kept GPU; a member paired with a row keeps that
+// row's port, any other gets a new one. When the write changes the
+// distribution of the model over the devices -- members added, removed or
+// reordered, a member's GPU selection, or the head's args, env or GPU rows
+// -- the kept values become a stale floor until the next formed run
 // replaces them.
 func (s *Service) planClusterRows(ctx context.Context, plan *clusterPlan, w clusterHeadWrite, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) error {
-	stored := indexStoredMembership(prevMembers, prevGPUs)
+	stored := indexStoredMembership(w.entries, prevMembers, prevGPUs)
 	changed, err := s.clusterDistributionChanged(ctx, w, prevMembers, stored.gpuOrder)
 	if err != nil {
 		return err
 	}
 	plan.writeMembers = true
+	planned := map[string][]int{}
 	for i, e := range w.entries {
-		row, gpus, allocated, err := s.planMemberRow(ctx, i, e, stored, changed)
+		row, gpus, allocated, err := s.planMemberRow(ctx, i, e, stored, changed, planned[e.server.ID])
 		if err != nil {
 			return err
 		}
 		if allocated {
 			plan.allocated = append(plan.allocated, i)
 		}
+		planned[e.server.ID] = append(planned[e.server.ID], row.Port)
 		plan.gpus = append(plan.gpus, gpus...)
 		plan.members = append(plan.members, row)
 		plan.memberServers = appendUnique(plan.memberServers, e.server.ID)
@@ -1214,54 +1508,110 @@ func (s *Service) planClusterRows(ctx context.Context, plan *clusterPlan, w clus
 	return nil
 }
 
-// storedMembership is a head's stored membership indexed for planning:
-// the rows by server, each server's GPU indices in device order, and the GPU
-// rows by server and index.
+// storedMembership is a head's stored membership indexed for planning: the
+// stored row each entry continues (matchStoredRows), by entry position, and
+// each stored member's GPU keys in device order and GPU rows by GPU key, by
+// the member's position.
 type storedMembership struct {
-	byServer map[string]routing.ClusterMember
-	gpuOrder map[string][]int
-	gpuByKey map[string]map[int]routing.ClusterMemberGPU
+	paired   map[int]routing.ClusterMember
+	gpuOrder map[int][]routing.GPUKey
+	gpuByKey map[int]map[routing.GPUKey]routing.ClusterMemberGPU
 }
 
-func indexStoredMembership(prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) storedMembership {
+func indexStoredMembership(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU) storedMembership {
 	out := storedMembership{
-		byServer: map[string]routing.ClusterMember{},
-		gpuOrder: map[string][]int{},
-		gpuByKey: map[string]map[int]routing.ClusterMemberGPU{},
-	}
-	for _, m := range prevMembers {
-		out.byServer[m.ServerID] = m
+		gpuOrder: map[int][]routing.GPUKey{},
+		gpuByKey: map[int]map[routing.GPUKey]routing.ClusterMemberGPU{},
 	}
 	for _, g := range prevGPUs {
-		out.gpuOrder[g.ServerID] = append(out.gpuOrder[g.ServerID], g.GPUIndex)
-		if out.gpuByKey[g.ServerID] == nil {
-			out.gpuByKey[g.ServerID] = map[int]routing.ClusterMemberGPU{}
+		key := routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}
+		out.gpuOrder[g.MemberPosition] = append(out.gpuOrder[g.MemberPosition], key)
+		if out.gpuByKey[g.MemberPosition] == nil {
+			out.gpuByKey[g.MemberPosition] = map[routing.GPUKey]routing.ClusterMemberGPU{}
 		}
-		out.gpuByKey[g.ServerID][g.GPUIndex] = g
+		out.gpuByKey[g.MemberPosition][key] = g
 	}
+	out.paired = matchStoredRows(entries, prevMembers, out.gpuOrder)
 	return out
 }
 
+// matchStoredRows pairs entries with the stored rows they continue, each row
+// with at most one entry, by entry position. An automatic member is first
+// paired by the GPUs it runs on: the row on the same server with the same
+// GPU selection (gpuOrder, by member position; sameGPUSelection under the
+// server's legacy vendor), the one at its own position first -- so when one
+// of two automatic members on a server is dropped, or the two are swapped,
+// each keeps its own port and measured values. Then every entry is paired
+// with the row at its own position on the same server with the same member
+// spec, then with the first unpaired row on the same server with the same
+// spec (a reordered member), then with the first unpaired row on the same
+// server (whose port the entry keeps). With one member per server this is
+// the pairing by server.
+func matchStoredRows(entries []clusterEntry, prevMembers []routing.ClusterMember, gpuOrder map[int][]routing.GPUKey) map[int]routing.ClusterMember {
+	p := storedRowPairing{
+		entries: entries,
+		prev:    prevMembers,
+		taken:   make([]bool, len(prevMembers)),
+		out:     make(map[int]routing.ClusterMember, len(entries)),
+	}
+	sameSpec := func(e clusterEntry, m routing.ClusterMember) bool { return m.MemberSpecID == e.specID() }
+	sameGPUs := func(e clusterEntry, m routing.ClusterMember) bool {
+		return !e.manual && m.MemberSpecID == "" && sameGPUSelection(gpuOrder[m.Position], e.gpus, e.server.GPULegacyVendor)
+	}
+	p.pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameGPUs(e, m) })
+	p.pair(sameGPUs)
+	p.pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameSpec(e, m) })
+	p.pair(sameSpec)
+	p.pair(func(clusterEntry, routing.ClusterMember) bool { return true })
+	return p.out
+}
+
+// storedRowPairing is matchStoredRows' state: the stored rows already taken
+// and the pairing so far, by entry position.
+type storedRowPairing struct {
+	entries []clusterEntry
+	prev    []routing.ClusterMember
+	taken   []bool
+	out     map[int]routing.ClusterMember
+}
+
+// pair pairs every still unpaired entry with the first untaken stored row on
+// the entry's server that match accepts.
+func (p *storedRowPairing) pair(match func(e clusterEntry, m routing.ClusterMember) bool) {
+	for _, e := range p.entries {
+		if _, done := p.out[e.position]; done {
+			continue
+		}
+		for j, m := range p.prev {
+			if !p.taken[j] && m.ServerID == e.server.ID && match(e, m) {
+				p.taken[j], p.out[e.position] = true, m
+				break
+			}
+		}
+	}
+}
+
 // planMemberRow builds the membership row and GPU rows of the entry at
-// position i; allocated reports a port allocated by this write (a server
-// without a row before, or one without a port).
+// position i; allocated reports a port allocated by this write (an entry
+// paired with no stored row, or with one without a port). planned are the
+// ports this write already gives other members on the entry's server.
 //
 // A change of the distribution keeps the measured values as a stale floor
 // and ends the member's current run: a run that began on the old split must
 // never replace them (its peak describes that split) nor clear the stale
 // mark. The gateway's usage writes are bound to the run they read, so the
 // reset also refuses any write of a value read before this save.
-func (s *Service) planMemberRow(ctx context.Context, i int, e clusterEntry, stored storedMembership, changed bool) (row routing.ClusterMember, gpus []routing.ClusterMemberGPU, allocated bool, err error) {
+func (s *Service) planMemberRow(ctx context.Context, i int, e clusterEntry, stored storedMembership, changed bool, planned []int) (row routing.ClusterMember, gpus []routing.ClusterMemberGPU, allocated bool, err error) {
 	row = routing.ClusterMember{
 		Position: i, ServerID: e.server.ID, MemberSpecID: e.specID(),
 		Threads: e.req.Threads, CacheEnabled: e.req.CacheEnabled, DeviceBackend: e.req.DeviceBackend, RAMEstimateMB: e.req.RAMEstimateMB,
 	}
-	prev, hadRow := stored.byServer[e.server.ID]
+	prev, hadRow := stored.paired[i]
 	kept := hadRow && prev.MemberSpecID == e.specID()
 	if hadRow && prev.Port != 0 {
 		row.Port = prev.Port
 	} else {
-		if row.Port, err = s.allocateRPCPort(ctx, e.server.ID); err != nil {
+		if row.Port, err = s.allocateRPCPort(ctx, e.server.ID, planned...); err != nil {
 			return routing.ClusterMember{}, nil, false, err
 		}
 		allocated = true
@@ -1274,7 +1624,14 @@ func (s *Service) planMemberRow(ctx context.Context, i int, e clusterEntry, stor
 		}
 		measured = prev.RAMMeasuredMB > 0
 	}
-	gpus, gpusMeasured := memberGPURows(e, stored.gpuByKey[e.server.ID], kept, changed)
+	var prevGPUs map[routing.GPUKey]routing.ClusterMemberGPU
+	if hadRow {
+		prevGPUs = stored.gpuByKey[prev.Position]
+	}
+	gpus, gpusMeasured := memberGPURows(e, prevGPUs, kept, changed)
+	for j := range gpus {
+		gpus[j].MemberPosition = i // a GPU row belongs to the member at its position
+	}
 	if changed && (measured || gpusMeasured) {
 		row.Stale = true
 	}
@@ -1283,16 +1640,17 @@ func (s *Service) planMemberRow(ctx context.Context, i int, e clusterEntry, stor
 
 // memberGPURows builds an entry's GPU rows in device order. A kept member
 // carries each kept GPU's measured value (and, without a change of the
-// distribution, its run peak) from prevGPUs; measured reports whether any
-// carried value is known.
-func memberGPURows(e clusterEntry, prevGPUs map[int]routing.ClusterMemberGPU, kept, changed bool) (gpus []routing.ClusterMemberGPU, measured bool) {
-	for pos, idx := range e.gpus {
-		g := routing.ClusterMemberGPU{ServerID: e.server.ID, GPUIndex: idx, Position: pos}
+// distribution, its run peak) from prevGPUs, matched by GPU key (an empty
+// vendor and the member server's legacy vendor at one index are one card);
+// measured reports whether any carried value is known.
+func memberGPURows(e clusterEntry, prevGPUs map[routing.GPUKey]routing.ClusterMemberGPU, kept, changed bool) (gpus []routing.ClusterMemberGPU, measured bool) {
+	for pos, key := range e.gpus {
+		g := routing.ClusterMemberGPU{ServerID: e.server.ID, GPUVendor: key.Vendor, GPUIndex: key.Index, Position: pos}
 		if !e.manual {
 			// A manual member's estimates live on its spec.
-			g.VRAMEstimateMB = e.estimate[idx]
+			g.VRAMEstimateMB = e.estimate[key]
 		}
-		if prevGPU, ok := prevGPUs[idx]; kept && ok {
+		if prevGPU, ok := lookupGPUKey(prevGPUs, key, e.server.GPULegacyVendor); kept && ok {
 			g.VRAMMeasuredMB = prevGPU.VRAMMeasuredMB
 			if !changed {
 				g.RunPeakVRAMMB = prevGPU.RunPeakVRAMMB
@@ -1307,7 +1665,7 @@ func memberGPURows(e clusterEntry, prevGPUs map[int]routing.ClusterMemberGPU, ke
 // clusterDistributionChanged reports whether a head write changes how the
 // model is split over the devices (see planClusterRows): the members, their
 // order, specs or GPU selections, or the head's args, env or GPU rows.
-func (s *Service) clusterDistributionChanged(ctx context.Context, w clusterHeadWrite, prevMembers []routing.ClusterMember, prevGPUOrder map[string][]int) (bool, error) {
+func (s *Service) clusterDistributionChanged(ctx context.Context, w clusterHeadWrite, prevMembers []routing.ClusterMember, prevGPUOrder map[int][]routing.GPUKey) (bool, error) {
 	if membersMoved(w.entries, prevMembers, prevGPUOrder) {
 		return true, nil
 	}
@@ -1324,8 +1682,10 @@ func (s *Service) clusterDistributionChanged(ctx context.Context, w clusterHeadW
 	if len(headGPUs) != len(w.req.GPUs) {
 		return true, nil
 	}
+	legacy := w.headServer.GPULegacyVendor
 	for i, g := range headGPUs {
-		if g.GPUIndex != w.req.GPUs[i].Index {
+		requested := routing.GPUKey{Vendor: w.req.GPUs[i].Vendor, Index: w.req.GPUs[i].Index}
+		if resolveLegacyGPUKey(g.Key(), legacy) != resolveLegacyGPUKey(requested, legacy) {
 			return true, nil
 		}
 	}
@@ -1333,17 +1693,30 @@ func (s *Service) clusterDistributionChanged(ctx context.Context, w clusterHeadW
 }
 
 // membersMoved reports whether entries differ from the stored members in
-// count, order, server, spec or GPU selection.
-func membersMoved(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUOrder map[string][]int) bool {
+// count or, at any position, in server, spec or GPU selection
+// (prevGPUOrder, by member position). GPU keys are compared with an empty
+// vendor read as the member server's legacy vendor: a backfill that gave the
+// stored rows their vendor moves nothing.
+func membersMoved(entries []clusterEntry, prevMembers []routing.ClusterMember, prevGPUOrder map[int][]routing.GPUKey) bool {
 	if len(prevMembers) != len(entries) {
 		return true
 	}
-	for i, e := range entries {
-		if prevMembers[i].ServerID != e.server.ID || prevMembers[i].MemberSpecID != e.specID() || !slices.Equal(prevGPUOrder[e.server.ID], e.gpus) {
+	for _, e := range entries {
+		prev, ok := storedMemberAt(prevMembers, e.position)
+		if !ok || prev.ServerID != e.server.ID || prev.MemberSpecID != e.specID() ||
+			!sameGPUSelection(prevGPUOrder[e.position], e.gpus, e.server.GPULegacyVendor) {
 			return true
 		}
 	}
 	return false
+}
+
+// sameGPUSelection reports whether a and b name the same GPUs in the same
+// order on a server whose legacy vendor is legacy.
+func sameGPUSelection(a, b []routing.GPUKey, legacy string) bool {
+	return slices.EqualFunc(a, b, func(x, y routing.GPUKey) bool {
+		return resolveLegacyGPUKey(x, legacy) == resolveLegacyGPUKey(y, legacy)
+	})
 }
 
 func appendUnique(ids []string, id string) []string {
@@ -1411,7 +1784,14 @@ func (s *Service) reallocateAfterConflict(ctx context.Context, headSpecID string
 		return ErrClusterPortExhausted
 	}
 	for _, i := range plan.allocated {
-		port, err := s.allocateRPCPort(ctx, plan.members[i].ServerID)
+		serverID := plan.members[i].ServerID
+		var planned []int
+		for j, m := range plan.members {
+			if j != i && m.ServerID == serverID {
+				planned = append(planned, m.Port)
+			}
+		}
+		port, err := s.allocateRPCPort(ctx, serverID, planned...)
 		if err != nil {
 			return err
 		}
@@ -1500,10 +1880,15 @@ func (s *Service) rpcMemberPortTaken(ctx context.Context, serverID string, port 
 // allocateRPCPort returns the lowest port in the RPC range that nothing on
 // serverID uses: an application's port or TLS proxy port (the server_agent
 // application's port is the agent's router_listen), a fixed listen_port of
-// one of the server's runtime specs, or another cluster member's port on the
-// server. ErrClusterPortExhausted when the range is full.
-func (s *Service) allocateRPCPort(ctx context.Context, serverID string) (int, error) {
+// one of the server's runtime specs, another cluster member's port on the
+// server, or one of planned -- the ports the caller's write already gives
+// other members on the server. ErrClusterPortExhausted when the range is
+// full.
+func (s *Service) allocateRPCPort(ctx context.Context, serverID string, planned ...int) (int, error) {
 	taken := map[int]bool{}
+	for _, port := range planned {
+		taken[port] = true
+	}
 	apps, err := s.routes.ApplicationsByServer(ctx, serverID)
 	if err != nil {
 		return 0, err
@@ -1604,17 +1989,20 @@ func (m clusterMemberState) gpuParts() []ClusterMemberGPUDTO {
 	if m.row.MemberSpecID == "" {
 		out := make([]ClusterMemberGPUDTO, 0, len(m.gpuRows))
 		for _, g := range m.gpuRows {
-			out = append(out, ClusterMemberGPUDTO{Index: g.GPUIndex, VRAMEstimateMB: g.VRAMEstimateMB, VRAMMeasuredMB: g.VRAMMeasuredMB})
+			out = append(out, ClusterMemberGPUDTO{Vendor: g.GPUVendor, Index: g.GPUIndex, VRAMEstimateMB: g.VRAMEstimateMB, VRAMMeasuredMB: g.VRAMMeasuredMB})
 		}
 		return out
 	}
-	measured := map[int]int{}
+	measured := map[routing.GPUKey]int{}
 	for _, g := range m.gpuRows {
-		measured[g.GPUIndex] = g.VRAMMeasuredMB
+		measured[routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}] = g.VRAMMeasuredMB
 	}
 	out := make([]ClusterMemberGPUDTO, 0, len(m.specGPUs))
 	for _, g := range m.specGPUs {
-		out = append(out, ClusterMemberGPUDTO{Index: g.GPUIndex, VRAMEstimateMB: g.VRAMEstimateMB, VRAMMeasuredMB: measured[g.GPUIndex]})
+		out = append(out, ClusterMemberGPUDTO{
+			Vendor: g.GPUVendor, Index: g.GPUIndex, VRAMEstimateMB: g.VRAMEstimateMB,
+			VRAMMeasuredMB: measured[routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex}],
+		})
 	}
 	return out
 }
@@ -1654,7 +2042,7 @@ func (s *Service) loadClusterMembers(ctx context.Context, headSpecID string) ([]
 func (s *Service) loadClusterMember(ctx context.Context, row routing.ClusterMember, gpus []routing.ClusterMemberGPU) (clusterMemberState, error) {
 	st := clusterMemberState{row: row}
 	for _, g := range gpus {
-		if g.ServerID == row.ServerID {
+		if g.MemberPosition == row.Position {
 			st.gpuRows = append(st.gpuRows, g)
 		}
 	}
@@ -1837,7 +2225,7 @@ func (s *Service) peaksAboveBudget(ctx context.Context, members []clusterMemberS
 		if !measured {
 			continue
 		}
-		gpuCeilings, ramCeiling, err := s.serverMemoryCeilings(ctx, m.server.ID)
+		gpuCeilings, ramCeiling, err := s.serverMemoryCeilings(ctx, m.server.ID, m.server.GPULegacyVendor)
 		if err != nil {
 			return nil, err
 		}
@@ -1849,7 +2237,7 @@ func (s *Service) peaksAboveBudget(ctx context.Context, members []clusterMemberS
 // memberPeaksAboveBudget names one member's stored peaks above its host's
 // ceilings, RAM first, then its GPUs in device order; a member the reader
 // may not see keeps only its position.
-func memberPeaksAboveBudget(m clusterMemberState, parts []ClusterMemberGPUDTO, gpuCeilings map[int]int, ramCeiling int) []ClusterPeakAboveBudgetDTO {
+func memberPeaksAboveBudget(m clusterMemberState, parts []ClusterMemberGPUDTO, gpuCeilings map[routing.GPUKey]int, ramCeiling int) []ClusterPeakAboveBudgetDTO {
 	var found []ClusterPeakAboveBudgetDTO
 	if ramCeiling > 0 && m.row.RAMMeasuredMB > ramCeiling {
 		found = append(found, ClusterPeakAboveBudgetDTO{
@@ -1857,10 +2245,11 @@ func memberPeaksAboveBudget(m clusterMemberState, parts []ClusterMemberGPUDTO, g
 		})
 	}
 	for _, g := range parts {
-		if c := gpuCeilings[g.Index]; c > 0 && g.VRAMMeasuredMB > c {
+		key := resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, m.server.GPULegacyVendor)
+		if c := gpuCeilings[key]; c > 0 && g.VRAMMeasuredMB > c {
 			index := g.Index
 			found = append(found, ClusterPeakAboveBudgetDTO{
-				Position: m.row.Position, Resource: ClusterPeakResourceVRAM, GPUIndex: &index, StoredMB: g.VRAMMeasuredMB, CeilingMB: c,
+				Position: m.row.Position, Resource: ClusterPeakResourceVRAM, GPUVendor: key.Vendor, GPUIndex: &index, StoredMB: g.VRAMMeasuredMB, CeilingMB: c,
 			})
 		}
 	}
@@ -1892,7 +2281,7 @@ func (s *Service) clusterWarnings(ctx context.Context, headServerID string, dto 
 		if !m.visible {
 			continue
 		}
-		if err := s.memberWarnings(ctx, dto.ID, m, scan, add); err != nil {
+		if err := s.memberWarnings(ctx, dto.ID, m, members, scan, add); err != nil {
 			return nil, err
 		}
 		unknown, err := s.manualMemberVersionUnknown(ctx, m, head, headListed)
@@ -1961,26 +2350,27 @@ func (s *Service) manualMemberVersionUnknown(ctx context.Context, m clusterMembe
 // member on a host with other work and no estimate before its first
 // measurement, an operator budget below a member GPU's total without
 // --tensor-split (the split ignores budgets), and GPUs another spec or
-// member on that server also uses.
-func (s *Service) memberWarnings(ctx context.Context, headSpecID string, m clusterMemberState, scan clusterArgScan, add func(string)) error {
+// member on that server also uses -- the head's own spec and the head's
+// other members (members, every member of the head) included.
+func (s *Service) memberWarnings(ctx context.Context, headSpecID string, m clusterMemberState, members []clusterMemberState, scan clusterArgScan, add func(string)) error {
 	parts := m.gpuParts()
 	if len(parts) == 0 && !scan.tensorSplit {
 		add(ClusterWarnCPUMemberWithoutTensorSplit)
 	}
-	others, err := s.otherGPUUses(ctx, headSpecID, m)
+	others, err := s.otherGPUUses(ctx, headSpecID, m, members)
 	if err != nil {
 		return err
 	}
 	if others.shared && m.row.MeasuredAt.IsZero() && memberEstimateMissing(m, parts) {
 		add(ClusterWarnSharedHostWithoutEstimate)
 	}
-	if slices.ContainsFunc(parts, func(g ClusterMemberGPUDTO) bool { return others.gpus[g.Index] }) {
+	if slices.ContainsFunc(parts, func(g ClusterMemberGPUDTO) bool { return others.uses(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}) }) {
 		add(ClusterWarnGPUOverlap)
 	}
 	if scan.tensorSplit || len(parts) == 0 {
 		return nil
 	}
-	below, err := s.budgetBelowDevice(ctx, m.server.ID, parts)
+	below, err := s.budgetBelowDevice(ctx, m.server.ID, m.server.GPULegacyVendor, parts)
 	if err != nil {
 		return err
 	}
@@ -2000,8 +2390,10 @@ func memberEstimateMissing(m clusterMemberState, parts []ClusterMemberGPUDTO) bo
 }
 
 // budgetBelowDevice reports whether an operator GPU budget on serverID is
-// below the total memory of one of the member's GPUs.
-func (s *Service) budgetBelowDevice(ctx context.Context, serverID string, parts []ClusterMemberGPUDTO) (bool, error) {
+// below the total memory of one of the member's GPUs: the budget and the
+// card of the member GPU's own (vendor, index), the empty vendor read as
+// the server's legacy vendor legacy on every side.
+func (s *Service) budgetBelowDevice(ctx context.Context, serverID, legacy string, parts []ClusterMemberGPUDTO) (bool, error) {
 	budgets, err := s.routes.ServerGPUBudgets(ctx, serverID)
 	if err != nil {
 		return false, err
@@ -2011,8 +2403,14 @@ func (s *Service) budgetBelowDevice(ctx context.Context, serverID string, parts 
 		return false, err
 	}
 	for _, g := range parts {
+		card := resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy)
+		device, known := lookupGPUKey(hosts, card, legacy)
+		if !known {
+			continue
+		}
 		if slices.ContainsFunc(budgets, func(b routing.ServerGPUBudget) bool {
-			return b.GPUIndex == g.Index && b.BudgetMB > 0 && hosts[g.Index].totalMB > b.BudgetMB
+			return resolveLegacyGPUKey(routing.GPUKey{Vendor: b.GPUVendor, Index: b.GPUIndex}, legacy) == card &&
+				b.BudgetMB > 0 && device.totalMB > b.BudgetMB
 		}) {
 			return true, nil
 		}
@@ -2021,19 +2419,37 @@ func (s *Service) budgetBelowDevice(ctx context.Context, serverID string, parts 
 }
 
 // gpuUses is what else runs on a member's server: whether anything does
-// (shared) and which GPU indices it uses.
+// (shared) and which cards it uses, by GPU key (comparableGPUKey under the
+// server's legacy vendor, so NVIDIA 0 and AMD 0 are two cards and an empty
+// vendor is the legacy vendor's card).
 type gpuUses struct {
 	shared bool
-	gpus   map[int]bool
+	legacy string
+	gpus   map[routing.GPUKey]bool
 }
 
+func (u *gpuUses) add(key routing.GPUKey) { u.gpus[comparableGPUKey(key, u.legacy)] = true }
+
+func (u gpuUses) uses(key routing.GPUKey) bool { return u.gpus[comparableGPUKey(key, u.legacy)] }
+
 // otherGPUUses collects the other work on m's server: the runtime specs of
-// its server_agent applications, the members other heads have there, and
-// the other manual member specs on it.
-func (s *Service) otherGPUUses(ctx context.Context, headSpecID string, m clusterMemberState) (gpuUses, error) {
-	uses := gpuUses{gpus: map[int]bool{}}
+// its server_agent applications (on the head's own server the head among
+// them), the head's other members there (members, every member of the
+// head), the members other heads have there, and the other manual member
+// specs on it.
+func (s *Service) otherGPUUses(ctx context.Context, headSpecID string, m clusterMemberState, members []clusterMemberState) (gpuUses, error) {
+	uses := gpuUses{legacy: m.server.GPULegacyVendor, gpus: map[routing.GPUKey]bool{}}
 	if err := s.addRuntimeSpecGPUUses(ctx, m.server.ID, &uses); err != nil {
 		return uses, err
+	}
+	for _, other := range members {
+		if other.row.Position == m.row.Position || other.row.ServerID != m.row.ServerID {
+			continue
+		}
+		uses.shared = true
+		for _, g := range other.gpuParts() {
+			uses.add(routing.GPUKey{Vendor: g.Vendor, Index: g.Index})
+		}
 	}
 	if err := s.addOtherMembershipGPUUses(ctx, headSpecID, m.server.ID, &uses); err != nil {
 		return uses, err
@@ -2066,7 +2482,7 @@ func (s *Service) addRuntimeSpecGPUUses(ctx context.Context, serverID string, us
 				return err
 			}
 			for _, g := range rows {
-				uses.gpus[g.GPUIndex] = true
+				uses.add(g.Key())
 			}
 		}
 	}
@@ -2091,7 +2507,7 @@ func (s *Service) addOtherMembershipGPUUses(ctx context.Context, headSpecID, ser
 		}
 		for _, g := range gpus {
 			if g.ServerID == serverID {
-				uses.gpus[g.GPUIndex] = true
+				uses.add(routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
 			}
 		}
 	}
@@ -2115,7 +2531,7 @@ func (s *Service) addOtherMemberSpecGPUUses(ctx context.Context, m clusterMember
 			return err
 		}
 		for _, g := range rows {
-			uses.gpus[g.GPUIndex] = true
+			uses.add(routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
 		}
 	}
 	return nil
@@ -2123,7 +2539,8 @@ func (s *Service) addOtherMemberSpecGPUUses(ctx context.Context, m clusterMember
 
 // ClusterCandidates lists the servers the head on headMappingID may add as
 // members in mode ("automatic" when empty): servers other than the head's
-// that the caller manages and whose consent admits the head (for every
+// (the head's own too when its agent declares rpc_cluster_same_host) that
+// the caller manages and whose consent admits the head (for every
 // caller, system scope included; an empty consent list means the member
 // server's own admin groups). In automatic mode a server must offer RPC
 // membership; it is Compatible when it has a ggml-rpc-server the head binary
@@ -2197,8 +2614,10 @@ func (s *Service) listClusterCandidates(ctx context.Context, p auth.Token, headS
 	return list, nil
 }
 
-// clusterCandidatesFor builds the candidate entries of every server other
-// than the head's that the caller manages, sorted by server name.
+// clusterCandidatesFor builds the candidate entries of every server the
+// caller manages other than the head's -- the head's own included when its
+// agent runs same-host cluster members (agentRunsSameHostClusters) --
+// sorted by server name.
 func (s *Service) clusterCandidatesFor(ctx context.Context, p auth.Token, headServerID, mode string, head candidateHead) ([]ClusterCandidateDTO, error) {
 	servers, err := s.routes.AIServers(ctx)
 	if err != nil {
@@ -2206,7 +2625,7 @@ func (s *Service) clusterCandidatesFor(ctx context.Context, p auth.Token, headSe
 	}
 	out := []ClusterCandidateDTO{}
 	for _, srv := range servers {
-		if srv.ID == headServerID || !s.callerManagesServer(ctx, p, srv.ID) {
+		if (srv.ID == headServerID && !s.agentRunsSameHostClusters(srv.ID)) || !s.callerManagesServer(ctx, p, srv.ID) {
 			continue
 		}
 		c, ok, err := s.clusterCandidate(ctx, p, srv, mode, head)

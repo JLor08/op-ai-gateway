@@ -27,8 +27,8 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
 			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
 			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups,
-			lan_source, lan_interface_id, lan_interfaces
-		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			lan_source, lan_interface_id, lan_interfaces, gpu_legacy_vendor, gpu_vendor_note
+		) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		host.ID,
 		host.Name,
 		host.Domain,
@@ -69,6 +69,8 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 		host.LANSource,
 		host.LANInterfaceID,
 		host.LANInterfaces,
+		host.GPULegacyVendor,
+		host.GPUVendorNote,
 	)
 	if err != nil {
 		if s.dl.isUniqueViolation(err) {
@@ -80,8 +82,9 @@ func (s *SQLiteStore) CreateAIServer(ctx context.Context, host routing.AIServer)
 }
 
 // UpdateAIServer writes the server row from host, except netbird_ip (only the
-// NetBird state writes set it) and lan_interfaces (only
-// UpdateServerLANInterfaces sets it); see routing.ServerStore.
+// NetBird state writes set it), lan_interfaces (only
+// UpdateServerLANInterfaces sets it) and gpu_legacy_vendor / gpu_vendor_note
+// (only the GPU-vendor backfill writers set them); see routing.ServerStore.
 func (s *SQLiteStore) UpdateAIServer(ctx context.Context, host routing.AIServer) error {
 	result, err := s.exec(ctx, `
 		update ai_servers
@@ -149,7 +152,7 @@ func (s *SQLiteStore) AIServerByID(ctx context.Context, id string) (routing.AISe
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
 			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
 			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups,
-			lan_source, lan_interface_id, lan_interfaces
+			lan_source, lan_interface_id, lan_interfaces, gpu_legacy_vendor, gpu_vendor_note
 		from ai_servers
 		where id = ?`, id)
 	return scanAIServer(row)
@@ -165,7 +168,7 @@ func (s *SQLiteStore) AIServers(ctx context.Context) ([]routing.AIServer, error)
 			estimated_watts, idle_watts, price_per_kwh, pue, price_unit, system_group_id,
 			certificate_override, https_switch_override, runtime_max_processes, managed_runtime_only,
 			netbird_ip, lan_address, lan_bind_only, rpc_member_enabled, rpc_allowed_head_groups,
-			lan_source, lan_interface_id, lan_interfaces
+			lan_source, lan_interface_id, lan_interfaces, gpu_legacy_vendor, gpu_vendor_note
 		from ai_servers
 		order by id`)
 	if err != nil {
@@ -448,7 +451,7 @@ func (s *SQLiteStore) ServersByOwner(ctx context.Context, userID string) ([]rout
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
 			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only,
 			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups,
-			s.lan_source, s.lan_interface_id, s.lan_interfaces
+			s.lan_source, s.lan_interface_id, s.lan_interfaces, s.gpu_legacy_vendor, s.gpu_vendor_note
 		from ai_servers s
 		join server_owners o on o.server_id = s.id
 		where o.user_id = ?
@@ -573,7 +576,7 @@ func (s *SQLiteStore) ServersByAdminGroups(ctx context.Context, groupIDs []strin
 			s.estimated_watts, s.idle_watts, s.price_per_kwh, s.pue, s.price_unit, s.system_group_id,
 			s.certificate_override, s.https_switch_override, s.runtime_max_processes, s.managed_runtime_only,
 			s.netbird_ip, s.lan_address, s.lan_bind_only, s.rpc_member_enabled, s.rpc_allowed_head_groups,
-			s.lan_source, s.lan_interface_id, s.lan_interfaces
+			s.lan_source, s.lan_interface_id, s.lan_interfaces, s.gpu_legacy_vendor, s.gpu_vendor_note
 		from ai_servers s
 		join server_admin_groups g on g.server_id = s.id
 		where g.group_id in (`+strings.Join(placeholders, ",")+`)
@@ -832,7 +835,7 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 	var host routing.AIServer
 	var lastSeenAt sql.NullTime
 	var netbirdEnabled, netbirdConnected, netbirdPeerManaged, netbirdAllowPing, netbirdPingExclude, managedRuntimeOnly int64
-	var lanBindOnly, rpcMemberEnabled int64
+	var lanBindOnly, rpcMemberEnabled, gpuVendorNote int64
 	err := row.Scan(
 		&host.ID,
 		&host.Name,
@@ -874,6 +877,8 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 		&host.LANSource,
 		&host.LANInterfaceID,
 		&host.LANInterfaces,
+		&host.GPULegacyVendor,
+		&gpuVendorNote,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return routing.AIServer{}, ErrNotFound
@@ -892,6 +897,7 @@ func scanAIServer(row rowScanner) (routing.AIServer, error) {
 	host.ManagedRuntimeOnly = managedRuntimeOnly != 0
 	host.LANBindOnly = lanBindOnly != 0
 	host.RPCMemberEnabled = rpcMemberEnabled != 0
+	host.GPUVendorNote = gpuVendorNote != 0
 	return host, nil
 }
 

@@ -223,7 +223,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 		res.Error = err.Error()
 		return
 	}
-	watched, attributable := vramWatchedIndexes(specGPUs, plan.baseline)
+	watched, attributable := vramWatchedKeys(vramResolveSpecGPUVendors(specGPUs, plan.legacyVendor), plan.baseline)
 	if len(watched) == 0 {
 		// The GPU-less case, reached only if the cards vanished between the
 		// precondition and here. Nothing to difference is inconclusive, never
@@ -233,7 +233,7 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	}
 
 	// (4) The baseline window.
-	baseline, sawSample, stable := s.vramStableWindow(ctx, serverID, watched)
+	baseline, sawSample, stable := s.vramStableWindow(ctx, serverID, plan.legacyVendor, watched)
 	if vramWindowStop(ctx, sawSample, stable, vramInconclusiveBaselineUnstable, report, &res) {
 		return
 	}
@@ -271,12 +271,12 @@ func (s *Server) runVRAMProbe(ctx context.Context, run *benchmarkRun, serverID s
 	}
 
 	// (7) The post-load window.
-	after, sawSample, stable := s.vramStableWindow(ctx, serverID, watched)
+	after, sawSample, stable := s.vramStableWindow(ctx, serverID, plan.legacyVendor, watched)
 	if vramWindowStop(ctx, sawSample, stable, vramInconclusivePostLoadUnstable, report, &res) {
 		return
 	}
 
-	measured := s.vramAwaitMeasured(ctx, serverID, plan.targetSpecID)
+	measured := s.vramAwaitMeasured(ctx, serverID, plan.targetSpecID, plan.legacyVendor)
 
 	// (8) Isolation again, at the END -- the windows only ever constrained
 	// movement inside themselves.
@@ -593,7 +593,7 @@ func (s *Server) vramRecheckIsolation(serverID string, plan vramRunPlanned, repo
 // this feature, so a sub-floor figure must not be shown as though it were a
 // measurement. A disagreement KEEPS them -- unlike below_floor there is
 // something to show, and the two numbers are the evidence for the reason.
-func vramFinalizeGPUs(watched []int, attributable bool, plan vramRunPlanned, baseline, after routing.TelemetrySample, measured map[int]int) (gpus []VRAMGPUItem, warnings []string, inconclusive string) {
+func vramFinalizeGPUs(watched []routing.GPUKey, attributable bool, plan vramRunPlanned, baseline, after routing.TelemetrySample, measured map[routing.GPUKey]int) (gpus []VRAMGPUItem, warnings []string, inconclusive string) {
 	items := vramReportItems(watched, attributable, plan, baseline, after, measured)
 	if undeclared := vramUndeclaredAllocations(watched, baseline, after, measured); len(undeclared) > 0 {
 		// A card the spec does not declare that nonetheless allocated: the
@@ -670,7 +670,7 @@ func vramWithout(ids []string, drop string) []string {
 // legitimately differ, and a host without a per-process measurer only ever
 // has the delta.
 //
-// EVERY index handed in is reported, unfiltered: the headline gate is applied
+// EVERY GPU handed in is reported, unfiltered: the headline gate is applied
 // to the SUM of these deltas, so dropping a card here would decide the floor
 // question before the sum that the floor is meant to judge. Trimming the quiet
 // unattributable cards back out is vramVisibleItems' job, and it runs AFTER
@@ -682,22 +682,23 @@ func vramWithout(ids []string, drop string) []string {
 // if the cards were renumbered in between -- the exact event a fingerprint
 // exists to detect -- the item pairs the OLD card's uuid with the NEW card's
 // figure, which is worse than recording no identity at all.
-func vramReportItems(watched []int, attributable bool, plan vramRunPlanned, baseline, after routing.TelemetrySample, measured map[int]int) []VRAMGPUItem {
-	beforeByIndex := vramGPUByIndex(baseline)
-	afterByIndex := vramGPUByIndex(after)
+func vramReportItems(watched []routing.GPUKey, attributable bool, plan vramRunPlanned, baseline, after routing.TelemetrySample, measured map[routing.GPUKey]int) []VRAMGPUItem {
+	beforeByKey := vramGPUByKey(baseline)
+	afterByKey := vramGPUByKey(after)
 
 	items := make([]VRAMGPUItem, 0, len(watched))
-	for _, index := range watched {
-		delta := vramDeltaMB(beforeByIndex[index].MemUsedBytes, afterByIndex[index].MemUsedBytes)
-		fingerprint, kind := vramFingerprintOf(afterByIndex[index])
+	for _, key := range watched {
+		delta := vramDeltaMB(beforeByKey[key].MemUsedBytes, afterByKey[key].MemUsedBytes)
+		fingerprint, kind := vramFingerprintOf(afterByKey[key])
 		items = append(items, VRAMGPUItem{
-			Index:           index,
+			Vendor:          key.Vendor,
+			Index:           key.Index,
 			Fingerprint:     fingerprint,
 			FingerprintKind: kind,
 			UnifiedMemory:   plan.unifiedMemory,
-			BaselineUsedMB:  vramUsedMB(beforeByIndex[index].MemUsedBytes),
+			BaselineUsedMB:  vramUsedMB(beforeByKey[key].MemUsedBytes),
 			DeltaMB:         delta,
-			MeasuredMB:      measured[index],
+			MeasuredMB:      measured[key],
 			Attributable:    attributable,
 		})
 	}
@@ -722,7 +723,11 @@ func vramReportItems(watched []int, attributable bool, plan vramRunPlanned, base
 // sawSample distinguishes the two failures the operator must act on
 // differently: samples that STOPPED arriving (the agent went away mid-run)
 // versus samples that arrived but never held still (a neighbour moving).
-func (s *Server) vramStableWindow(ctx context.Context, serverID string, watched []int) (sample routing.TelemetrySample, sawSample, stable bool) {
+//
+// Each sample's vendor-less GPUs are resolved to legacyVendor before it joins
+// the window (vramResolveSampleVendors), so the returned sample reads by the
+// same keys as watched.
+func (s *Server) vramStableWindow(ctx context.Context, serverID, legacyVendor string, watched []routing.GPUKey) (sample routing.TelemetrySample, sawSample, stable bool) {
 	if !sleepCtx(ctx, vramPhaseSettle) {
 		return routing.TelemetrySample{}, false, false
 	}
@@ -743,7 +748,7 @@ func (s *Server) vramStableWindow(ctx context.Context, serverID string, watched 
 				return routing.TelemetrySample{}, sawSample, false
 			}
 			sawSample = true
-			window = append(window, fresh)
+			window = append(window, vramResolveSampleVendors(fresh, legacyVendor))
 			if len(window) > vramStabilityWindow {
 				window = window[len(window)-vramStabilityWindow:]
 			}
@@ -758,7 +763,7 @@ func (s *Server) vramStableWindow(ctx context.Context, serverID string, watched 
 // for the target spec, read off the live status stream.
 //
 // IT CANNOT COME FROM THE STORE. The stored row is
-// {SpecID, GPUIndex, VRAMEstimateMB, VRAMMeasuredMB} with no timestamp, and
+// {SpecID, GPUVendor, GPUIndex, VRAMEstimateMB, VRAMMeasuredMB} with no timestamp, and
 // the telemetry write-back deliberately skips an UNCHANGED value -- so
 // polling the store for "a positive value appears" reads an arbitrarily old
 // number as this run's result, while requiring the value to CHANGE fails in
@@ -773,17 +778,20 @@ func (s *Server) vramStableWindow(ctx context.Context, serverID string, watched 
 // strategy (a) reports nothing rather than something stale.
 //
 // IT RETURNS THE AGENT'S WHOLE PER-CARD MAP, unfiltered by the watched set.
-// Filtering it to the spec's declared indexes discarded exactly the reading
+// Filtering it to the spec's declared GPUs discarded exactly the reading
 // that mattered most: `set_visible_devices` defaults to false, so a model can
 // allocate on a card its spec does not declare, and the agent's measurement on
 // that card is the strongest available evidence of it -- while dropping it made
 // the remaining half agree with the declared-card delta and so reinforced
-// confidence in half a number. The caller decides which indexes have a row to
+// confidence in half a number. The caller decides which GPUs have a row to
 // be applied to; that is not this function's question.
 //
 // This function owns only the WAIT -- the post-load subscription, the bound and
 // the cancellation. What one frame contributes is vramMeasuredFromFrame.
-func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string) map[int]int {
+//
+// The map is keyed by (vendor, index), a vendor-less GPU resolved to
+// legacyVendor, the server's stored legacy vendor (resolvedGPUKey).
+func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID, legacyVendor string) map[routing.GPUKey]int {
 	_, frames, unsub := s.RuntimeStatus.subscribe(serverID)
 	defer unsub()
 
@@ -799,7 +807,7 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string)
 			if !open {
 				return nil
 			}
-			if measured := vramMeasuredFromFrame(frame, specID); measured != nil {
+			if measured := vramMeasuredFromFrame(frame, specID, legacyVendor); measured != nil {
 				return measured
 			}
 		}
@@ -826,17 +834,20 @@ func (s *Server) vramAwaitMeasured(ctx context.Context, serverID, specID string)
 // nothing and the scan moves on: an all-zero measurement is indistinguishable
 // from no measurement, and returning it would let strategy (a) claim a reading
 // on a host that has no per-process measurer at all.
-func vramMeasuredFromFrame(frame []RuntimeStatusDTO, specID string) map[int]int {
+//
+// A card is keyed by (vendor, index); one reported without a vendor (an agent
+// without gpu_vendor_identity) is legacyVendor's (resolvedGPUKey).
+func vramMeasuredFromFrame(frame []RuntimeStatusDTO, specID, legacyVendor string) map[routing.GPUKey]int {
 	for _, status := range frame {
 		if status.SpecID != specID || status.Instance != 0 || status.MeasuredAt.IsZero() {
 			continue
 		}
-		out := map[int]int{}
+		out := map[routing.GPUKey]int{}
 		for _, gpu := range status.GPUs {
 			if gpu.VRAMMeasuredMB <= 0 {
 				continue
 			}
-			out[gpu.Index] = gpu.VRAMMeasuredMB
+			out[resolvedGPUKey(gpu.Vendor, gpu.Index, legacyVendor)] = gpu.VRAMMeasuredMB
 		}
 		if len(out) > 0 {
 			return out

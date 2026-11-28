@@ -76,7 +76,7 @@ func TestConformanceSetClusterMembersIf(t *testing.T) {
 			{HeadSpecID: head, Position: 0, ServerID: "srv_c1", Port: 26001},
 			{HeadSpecID: head, Position: 1, ServerID: "srv_c2", Port: 26001},
 		}
-		gpus := []routing.ClusterMemberGPU{{HeadSpecID: head, ServerID: "srv_c1", GPUIndex: 0}}
+		gpus := []routing.ClusterMemberGPU{{HeadSpecID: head, MemberPosition: 0, ServerID: "srv_c1", GPUIndex: 0}}
 		if applied, err := s.SetClusterMembersIf(ctx, "rspec_nope", nil, nil, members, gpus); !errors.Is(err, ErrNotFound) || applied {
 			t.Fatalf("unknown head: applied=%v err=%v, want ErrNotFound", applied, err)
 		}

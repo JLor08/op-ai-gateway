@@ -63,3 +63,17 @@ func TestParseIoregGPUTolerant(t *testing.T) {
 		t.Errorf("UtilPct = %v, want 0 (key absent)", gpus[0].UtilPct)
 	}
 }
+
+func TestAppleCollectorSetsVendor(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "ioreg-ioaccelerator.txt"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	gpus, err := parseIoregGPU(data)
+	if err != nil || len(gpus) != 1 {
+		t.Fatalf("parseIoregGPU: %v (%d gpus)", err, len(gpus))
+	}
+	if gpus[0].Vendor != VendorApple {
+		t.Fatalf("vendor = %q, want %q", gpus[0].Vendor, VendorApple)
+	}
+}

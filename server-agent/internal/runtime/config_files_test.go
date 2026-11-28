@@ -59,7 +59,7 @@ func TestExpandConfigFileContentResolvesNonSecretTokens(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := expandConfigFileContent(tc.in, spec, 8123, GPUVendorNVIDIA, nil, refuseGetenv(t), base)
+			got, err := expandConfigFileContent(tc.in, spec, 8123, GPUTopology{Legacy: GPUVendorNVIDIA}, refuseGetenv(t), base)
 			if err != nil {
 				t.Fatalf("expandConfigFileContent(%q) error = %v, want %q", tc.in, err, tc.want)
 			}
@@ -90,7 +90,7 @@ func TestConfigFileContentRejectsSecrets(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := expandConfigFileContent(tc.in, spec, 8123, GPUVendorNone, nil, refuseGetenv(t), "base")
+			got, err := expandConfigFileContent(tc.in, spec, 8123, GPUTopology{}, refuseGetenv(t), "base")
 			if err == nil {
 				t.Fatalf("expandConfigFileContent(%q) = %q, want an error: secrets must never be written to a file", tc.in, got)
 			}
@@ -127,7 +127,7 @@ func TestConfigFileContentMalformedPlaceholders(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got, err := expandConfigFileContent(tc.in, tc.spec, 1, GPUVendorNone, nil, refuseGetenv(t), "base"); err == nil {
+			if got, err := expandConfigFileContent(tc.in, tc.spec, 1, GPUTopology{}, refuseGetenv(t), "base"); err == nil {
 				t.Fatalf("expandConfigFileContent(%q) = %q, want an error", tc.in, got)
 			}
 		})
@@ -140,7 +140,7 @@ func TestWriteSpecConfigFilesExpandsAndWrites(t *testing.T) {
 		ConfigFile{Name: "server.json", Content: `{"id":"${MODEL}","port":${PORT}}`},
 		ConfigFile{Name: "models.ini", Content: "dir=${CONFIG_DIR}\n"},
 	)
-	if err := writeSpecConfigFiles(spec, 9001, GPUVendorNone, nil, refuseGetenv(t), base); err != nil {
+	if err := writeSpecConfigFiles(spec, 9001, GPUTopology{}, refuseGetenv(t), base); err != nil {
 		t.Fatalf("writeSpecConfigFiles: %v", err)
 	}
 
@@ -180,11 +180,11 @@ func TestWriteSpecConfigFilesExpandsAndWrites(t *testing.T) {
 func TestWriteSpecConfigFilesReplacesExistingContent(t *testing.T) {
 	base := t.TempDir()
 	spec := configFileSpec("spec-a", ConfigFile{Name: "server.json", Content: "v1"})
-	if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err != nil {
+	if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, base); err != nil {
 		t.Fatal(err)
 	}
 	spec.ConfigFiles[0].Content = "v2"
-	if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err != nil {
+	if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, base); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(filepath.Join(base, "spec-a", "server.json"))
@@ -201,7 +201,7 @@ func TestTwoSpecsSameFilenameNoCollision(t *testing.T) {
 	a := configFileSpec("spec-a", ConfigFile{Name: "server.json", Content: "from-a"})
 	b := configFileSpec("spec-b", ConfigFile{Name: "server.json", Content: "from-b"})
 	for _, s := range []Spec{a, b} {
-		if err := writeSpecConfigFiles(s, 1, GPUVendorNone, nil, nil, base); err != nil {
+		if err := writeSpecConfigFiles(s, 1, GPUTopology{}, nil, base); err != nil {
 			t.Fatalf("writeSpecConfigFiles(%s): %v", s.ID, err)
 		}
 	}
@@ -223,10 +223,10 @@ func TestTwoSpecsSameFilenameNoCollision(t *testing.T) {
 func TestWriteSpecConfigFilesWithoutFilesTouchesNothing(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "never-created")
 	for _, dir := range []string{base, ""} {
-		if err := writeSpecConfigFiles(configFileSpec("spec-a"), 1, GPUVendorNone, nil, nil, dir); err != nil {
+		if err := writeSpecConfigFiles(configFileSpec("spec-a"), 1, GPUTopology{}, nil, dir); err != nil {
 			t.Errorf("no config files, base %q: error = %v, want nil", dir, err)
 		}
-		if _, err := planSpecConfigFiles(configFileSpec("spec-a"), 0, GPUVendorNone, nil, nil, dir); err != nil {
+		if _, err := planSpecConfigFiles(configFileSpec("spec-a"), 0, GPUTopology{}, nil, dir); err != nil {
 			t.Errorf("no config files, base %q: plan error = %v, want nil", dir, err)
 		}
 	}
@@ -237,7 +237,7 @@ func TestWriteSpecConfigFilesWithoutFilesTouchesNothing(t *testing.T) {
 
 func TestWriteSpecConfigFilesRefusesAnUnconfiguredBase(t *testing.T) {
 	spec := configFileSpec("spec-a", ConfigFile{Name: "server.json", Content: "x"})
-	if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, ""); err == nil {
+	if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, ""); err == nil {
 		t.Fatal("empty base directory: error = nil, want a refusal (an empty base would write relative to the working directory)")
 	}
 	if _, err := os.Stat("spec-a"); !os.IsNotExist(err) {
@@ -264,10 +264,10 @@ func TestWriteSpecConfigFilesContainsPathEscape(t *testing.T) {
 			root := t.TempDir()
 			base := filepath.Join(root, "base")
 			spec := configFileSpec(id, ConfigFile{Name: "server.json", Content: "pwned"})
-			if _, err := planSpecConfigFiles(spec, 0, GPUVendorNone, nil, nil, base); err == nil {
+			if _, err := planSpecConfigFiles(spec, 0, GPUTopology{}, nil, base); err == nil {
 				t.Errorf("planSpecConfigFiles(id %q) = nil, want a containment refusal", id)
 			}
-			if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err == nil {
+			if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, base); err == nil {
 				t.Errorf("writeSpecConfigFiles(id %q) = nil, want a containment refusal", id)
 			}
 			var found []string
@@ -305,10 +305,10 @@ func TestWriteSpecConfigFilesRefusesOSUnsafeNames(t *testing.T) {
 				ConfigFile{Name: "fine.json", Content: "ok"},
 				ConfigFile{Name: name, Content: "bad"},
 			)
-			if _, err := planSpecConfigFiles(spec, 0, GPUVendorNone, nil, nil, base); err == nil {
+			if _, err := planSpecConfigFiles(spec, 0, GPUTopology{}, nil, base); err == nil {
 				t.Errorf("planSpecConfigFiles accepted name %q", name)
 			}
-			if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err == nil {
+			if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, base); err == nil {
 				t.Errorf("writeSpecConfigFiles accepted name %q", name)
 			}
 			if entries, _ := os.ReadDir(base); len(entries) != 0 {
@@ -325,7 +325,7 @@ func TestWriteSpecConfigFilesRefusesOSUnsafeNames(t *testing.T) {
 		t.Run("good="+name, func(t *testing.T) {
 			base := t.TempDir()
 			spec := configFileSpec("spec-a", ConfigFile{Name: name, Content: "ok"})
-			if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err != nil {
+			if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, base); err != nil {
 				t.Errorf("name %q was refused: %v", name, err)
 			}
 		})
@@ -340,7 +340,7 @@ func TestWriteSpecConfigFilesSecretContentWritesNothing(t *testing.T) {
 		ConfigFile{Name: "first.json", Content: "fine"},
 		ConfigFile{Name: "second.json", Content: "${API_TOKEN}"},
 	)
-	if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err == nil {
+	if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, base); err == nil {
 		t.Fatal("secret content: error = nil, want a refusal")
 	}
 	if entries, _ := os.ReadDir(base); len(entries) != 0 {
@@ -359,10 +359,10 @@ func TestWriteSpecConfigFilesFilesystemFailure(t *testing.T) {
 	}
 	spec := configFileSpec("spec-a", ConfigFile{Name: "server.json", Content: "x"})
 	base := filepath.Join(blocker, "configs")
-	if _, err := planSpecConfigFiles(spec, 0, GPUVendorNone, nil, nil, base); err != nil {
+	if _, err := planSpecConfigFiles(spec, 0, GPUTopology{}, nil, base); err != nil {
 		t.Fatalf("planSpecConfigFiles must not touch the filesystem, got %v", err)
 	}
-	if err := writeSpecConfigFiles(spec, 1, GPUVendorNone, nil, nil, base); err == nil {
+	if err := writeSpecConfigFiles(spec, 1, GPUTopology{}, nil, base); err == nil {
 		t.Fatal("write under a regular file: error = nil, want the filesystem error")
 	}
 }
@@ -378,7 +378,7 @@ func useSlashesInContent(t *testing.T, v bool) {
 func TestConfigDirInContentUsesSlashesOnWindows(t *testing.T) {
 	useSlashesInContent(t, true)
 	spec := Spec{ID: "strata"}
-	got, err := expandConfigFileContent(`{"log":"${CONFIG_DIR}/engine.log"}`, spec, 1, GPUVendorNone, nil, nil, `C:\agent\cfg`)
+	got, err := expandConfigFileContent(`{"log":"${CONFIG_DIR}/engine.log"}`, spec, 1, GPUTopology{}, nil, `C:\agent\cfg`)
 	if err != nil {
 		t.Fatalf("expandConfigFileContent: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestConfigDirInContentUsesSlashesOnWindows(t *testing.T) {
 
 func TestConfigDirInContentKeepsNativeWhenSeamOff(t *testing.T) {
 	useSlashesInContent(t, false)
-	got, err := expandConfigFileContent(`${CONFIG_DIR}`, Spec{ID: "strata"}, 1, GPUVendorNone, nil, nil, `C:\agent\cfg`)
+	got, err := expandConfigFileContent(`${CONFIG_DIR}`, Spec{ID: "strata"}, 1, GPUTopology{}, nil, `C:\agent\cfg`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,7 +404,7 @@ func TestConfigDirInContentKeepsNativeWhenSeamOff(t *testing.T) {
 func TestConfigDirInArgsKeepsNativeForm(t *testing.T) {
 	useSlashesInContent(t, true)
 	spec := Spec{ID: "strata", Args: []string{"--config", "${CONFIG_DIR}"}}
-	ex, err := expandSpec(spec, 1, GPUVendorNone, nil, func(string) string { return "" }, `C:\agent\cfg`)
+	ex, err := expandSpec(spec, 1, GPUTopology{}, func(string) string { return "" }, `C:\agent\cfg`)
 	if err != nil {
 		t.Fatalf("expandSpec: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestConfigDirInArgsKeepsNativeForm(t *testing.T) {
 
 func TestConfigDirInLogFilePathKeepsNativeForm(t *testing.T) {
 	useSlashesInContent(t, true)
-	got, err := expandNonSecretText(`${CONFIG_DIR}/engine.log`, surfaceLogFilePath, Spec{ID: "strata"}, 1, GPUVendorNone, nil, `C:\agent\cfg`)
+	got, err := expandNonSecretText(`${CONFIG_DIR}/engine.log`, surfaceLogFilePath, Spec{ID: "strata"}, 1, GPUTopology{}, `C:\agent\cfg`)
 	if err != nil {
 		t.Fatal(err)
 	}

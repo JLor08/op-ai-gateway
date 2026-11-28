@@ -372,6 +372,8 @@ export function ServerList({
     | 'serverAdminGroupCandidates'
     | 'serverAvailability'
     | 'serverHardware'
+    // #434: the runtime screen's legacy GPU vendor note.
+    | 'dismissGpuVendorNote'
     | 'serverPerfHistory'
     | 'serverResourceGroups'
     | 'servers'
@@ -755,6 +757,19 @@ export function ServerList({
     setEditAdminGroupIds(server.admin_groups.map((g) => g.id));
     setEditSystemGroupId('');
     setMode({ kind: 'edit', server });
+  }
+
+  // Reads the server rows again after a sub-view changed a server behind the
+  // list's back (#434: the runtime screen's GPU vendor note dismissal); the
+  // sub-views read their server from these rows. A failed read keeps the
+  // last-known rows, like the list poll.
+  function refreshServers() {
+    api
+      .servers()
+      .then((res) => setServers(res.data))
+      .catch(() => {
+        /* non-blocking -- the next list poll reads them again */
+      });
   }
 
   // Shared onSaved callback for ServerEnergyPanel / ServerNetbirdLinkPanel /
@@ -1152,6 +1167,7 @@ export function ServerList({
         api={api}
         server={server}
         onModelsChanged={onModelsChanged}
+        onServerRefresh={refreshServers}
         trail={[{ label: t.servers, onClick: () => setMode('list') }]}
       />
     );
@@ -1212,7 +1228,13 @@ export function ServerList({
           backLabel={t.back}
           items={[{ label: t.servers, onClick: () => setMode('list') }, { label: server.name }]}
         />
-        <HardwareSection key={`hw-${server.id}`} t={t} api={api} server={server} />
+        <HardwareSection
+          key={`hw-${server.id}`}
+          t={t}
+          api={api}
+          server={server}
+          onServerRefresh={refreshServers}
+        />
       </>
     );
   }

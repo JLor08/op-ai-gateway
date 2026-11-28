@@ -403,7 +403,7 @@ func TestSetBenchmarkRuntimeSpecAdminStateNeverWritesTheVRAMFields(t *testing.T)
 	// An agent measurement lands first, through the one writer that owns it.
 	routes := svc.routes
 	for _, index := range []int{0, 1} {
-		if err := routes.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, index, 21000+index); err != nil {
+		if err := routes.UpdateRuntimeSpecGPUMeasured(ctx, spec.ID, routing.GPUKey{Index: index}, 21000+index); err != nil {
 			t.Fatalf("UpdateRuntimeSpecGPUMeasured(%d): %v", index, err)
 		}
 	}

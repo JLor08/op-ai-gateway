@@ -53,7 +53,7 @@ describe('ClusterTotalCell', () => {
       [
         member({
           server_name: 'Beta',
-          gpus: [{ index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+          gpus: [{ vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
         }),
       ],
       false,
@@ -68,7 +68,7 @@ describe('ClusterTotalCell', () => {
     const spec = head([
       member({
         server_name: 'GpuBox',
-        gpus: [{ index: 0, vram_estimate_mb: 16000, vram_measured_mb: 0 }],
+        gpus: [{ vendor: '', index: 0, vram_estimate_mb: 16000, vram_measured_mb: 0 }],
       }),
       member({ position: 1, server_name: 'CpuBox' }),
       member({ position: 2, server_id: '', server_name: '', visible: false }),

@@ -64,10 +64,11 @@ func TestWindowsMeasurerArmNeverSelectsComputeApps(t *testing.T) {
 // TestNonWindowsMeasurerArmKeepsComputeApps is the other half: every platform
 // that is not Windows must keep compute-apps as its first choice, so the
 // non-Windows arm delegates to the per-platform fallback and both fallbacks
-// call NewNvidiaComputeApps. Only the Linux fallback may add the KFD measurer
-// (KFD is a Linux kernel interface). The PDH measurer cannot even build there
-// (pdh.dll, gdi32.dll), so naming it would be a compile error -- but a compile
-// error only on the platforms that are not the one being edited.
+// call NewNvidiaComputeApps. Only the Linux fallback may add the AMD measurers
+// (DRM fdinfo and KFD are Linux kernel interfaces). The PDH measurer cannot
+// even build there (pdh.dll, gdi32.dll), so naming it would be a compile error
+// -- but a compile error only on the platforms that are not the one being
+// edited.
 func TestNonWindowsMeasurerArmKeepsComputeApps(t *testing.T) {
 	if !referencedIdents(t, "measurer_other.go")["fallbackVRAMMeasurer"] {
 		t.Error("measurer_other.go does not call fallbackVRAMMeasurer -- the non-Windows arm must go through the per-platform fallback")
@@ -82,8 +83,16 @@ func TestNonWindowsMeasurerArmKeepsComputeApps(t *testing.T) {
 			t.Errorf("%s does not call NewNvidiaComputeApps -- every non-Windows platform must keep the measurer it has today", file)
 		}
 	}
-	if !referencedIdents(t, "measurer_fallback_linux.go")["NewKFDMeasurer"] {
-		t.Error("measurer_fallback_linux.go does not call NewKFDMeasurer -- AMD Linux hosts would measure nothing")
+	linux := referencedIdents(t, "measurer_fallback_linux.go")
+	if !linux["NewKFDMeasurer"] {
+		t.Error("measurer_fallback_linux.go does not call NewKFDMeasurer -- AMD Linux hosts on a kernel without fdinfo VRAM would measure nothing")
+	}
+	// The AMD wiring: the fdinfo self-probe picks the source, and the AMD
+	// index comes from the collector's published PCI join and nothing else.
+	for _, id := range []string{"probeDRMFdinfo", "fdinfoMeasurer", "currentAMDIndex", "linuxVRAMMeasurer"} {
+		if !linux[id] {
+			t.Errorf("measurer_fallback_linux.go does not reference %s -- the Linux AMD measurer is wired around the fdinfo probe and the collector's join", id)
+		}
 	}
 	if referencedIdents(t, "measurer_fallback_other.go")["NewKFDMeasurer"] {
 		t.Error("measurer_fallback_other.go references NewKFDMeasurer, which exists only on Linux")
@@ -92,9 +101,9 @@ func TestNonWindowsMeasurerArmKeepsComputeApps(t *testing.T) {
 
 // TestNewVRAMMeasurerNilWithoutNvidiaSMI holds on every platform and for both
 // arms wherever no GPU source exists: without nvidia-smi (and, on Linux,
-// without KFD) there is no way to attribute a measurement to a GPU index at
-// all, so the constructor must return nil rather than a measurer that fails
-// every call. Measurement is a hardware capability, not a negotiated feature
+// without KFD or an amdgpu render node) there is no way to attribute a
+// measurement to a GPU index at all, so the constructor must return a nil
+// Measure rather than a measurer that fails every call. Measurement is a hardware capability, not a negotiated feature
 // (design doc §5) -- SetMeasurer(nil) is NewManager's own default and leaves
 // the operator's estimates standing.
 func TestNewVRAMMeasurerNilWithoutNvidiaSMI(t *testing.T) {
@@ -104,7 +113,10 @@ func TestNewVRAMMeasurerNilWithoutNvidiaSMI(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(kfdRoot, "proc")); err == nil {
 		t.Skip("KFD sysfs is present on this host; the Linux fallback may measure from it")
 	}
-	if f := NewVRAMMeasurer(); f != nil {
-		t.Fatal("NewVRAMMeasurer() = non-nil without nvidia-smi on PATH or KFD sysfs, want nil")
+	if _, err := os.Stat("/dev/dri"); err == nil {
+		t.Skip("DRM devices are present on this host; the Linux fallback may measure from amdgpu fdinfo")
+	}
+	if f := NewVRAMMeasurer(); f.Measure != nil {
+		t.Fatal("NewVRAMMeasurer().Measure = non-nil without nvidia-smi on PATH or KFD sysfs, want nil")
 	}
 }

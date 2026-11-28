@@ -6,7 +6,7 @@
 package collector
 
 // NewVRAMMeasurer selects the per-process, per-GPU VRAM measurer for Windows:
-// the PDH one, or none at all.
+// the PDH one, or none at all (a nil Measure).
 //
 // The compute-apps measurer is deliberately NOT an option here, and not merely
 // because it would report nothing useful. Under the WDDM driver model the OS,
@@ -25,7 +25,9 @@ package collector
 // than a measured 0: no measurer means the manager falls back to each spec's
 // operator-entered VRAM estimate, while a measured 0 overrides it.
 // newNvidiaPDHMeasurer already returns nil when the host cannot support the
-// PDH path, which makes this the whole selector.
-func NewVRAMMeasurer() func(pids []int) map[int]map[int]int {
-	return newNvidiaPDHMeasurer()
+// PDH path, which makes this the whole selector. PDH counts WDDM per-process
+// dedicated memory independent of the API, so it covers CUDA and Vulkan; its
+// answers are keyed nvidia. Windows has no AMD measurer.
+func NewVRAMMeasurer() VRAMMeasurer {
+	return nvidiaVRAMMeasurer(newNvidiaPDHMeasurer())
 }

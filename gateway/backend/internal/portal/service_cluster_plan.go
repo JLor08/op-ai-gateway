@@ -37,8 +37,10 @@ type ClusterPlan struct {
 // ClusterPlanMember is one member of a ClusterPlan: its position in the
 // member order, its server and that server's server_agent application (the
 // agent router the member routes are sent to), the agent spec id of its
-// rpc_server spec, that spec's startup timeout and the address the head
-// dials it at (the host of its entry in the head's endpoint list).
+// rpc_server spec, that spec's startup timeout, the address the head dials
+// it at (the host of its entry in the head's endpoint list) and its own
+// transport -- the cluster's, except "direct" for a member on the head's
+// server, which runs on loopback inside a relay cluster too.
 type ClusterPlanMember struct {
 	Position              int
 	Server                routing.AIServer
@@ -46,6 +48,7 @@ type ClusterPlanMember struct {
 	SpecID                string
 	StartupTimeoutSeconds int
 	Address               string
+	Transport             string
 }
 
 // ClusterPlan returns headSpecID's plan, built from the same derivation the
@@ -103,14 +106,16 @@ func (s *Service) ClusterPlan(ctx context.Context, headSpecID string) (ClusterPl
 }
 
 // clusterPlanMember is the plan entry of one membership row of a derivable
-// cluster d, or the reason it can no longer be planned: its member spec is
-// not in the derivation or its server is gone (member missing), or the
-// server lost its server_agent application (member unmanaged).
+// cluster d, or the reason it can no longer be planned: the derivation has
+// no member at its position on its server or its server is gone (member
+// missing), or the server lost its server_agent application (member
+// unmanaged).
 func (s *Service) clusterPlanMember(ctx context.Context, row routing.ClusterMember, d clusterDerivation) (ClusterPlanMember, string, error) {
-	spec, ok := d.members[row.ServerID]
-	if !ok {
+	if row.Position < 0 || row.Position >= len(d.members) || d.members[row.Position].serverID != row.ServerID {
 		return ClusterPlanMember{}, ClusterWithheldMemberMissing, nil
 	}
+	derived := d.members[row.Position]
+	spec := derived.spec
 	srv, err := s.routes.AIServerByID(ctx, row.ServerID)
 	if err != nil {
 		if ignoreNotFound(err) == nil {
@@ -127,7 +132,8 @@ func (s *Service) clusterPlanMember(ctx context.Context, row routing.ClusterMemb
 	}
 	return ClusterPlanMember{
 		Position: row.Position, Server: srv, Application: app,
-		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds, Address: d.addresses[row.ServerID],
+		SpecID: spec.ID, StartupTimeoutSeconds: spec.StartupTimeoutSeconds, Address: derived.address,
+		Transport: spec.RPC.Transport,
 	}, "", nil
 }
 
@@ -349,12 +355,14 @@ const (
 )
 
 // ClusterPeakAboveBudgetDTO is one stored member peak above its ceiling: the
-// member's position, the resource, the GPU's host index for VRAM, the stored
-// value and the ceiling it exceeds. A member on a server the reader may not
+// member's position, the resource, the GPU for VRAM (its vendor -- the host's
+// legacy vendor for a vendor-less row, empty when that is unknown too -- and
+// its index), the stored value and the ceiling it exceeds. A member on a server the reader may not
 // manage shows only its position: the figures are facts about that server.
 type ClusterPeakAboveBudgetDTO struct {
 	Position  int    `json:"position"`
 	Resource  string `json:"resource,omitempty"`
+	GPUVendor string `json:"gpu_vendor,omitempty"`
 	GPUIndex  *int   `json:"gpu_index,omitempty"`
 	StoredMB  int    `json:"stored_mb,omitempty"`
 	CeilingMB int    `json:"ceiling_mb,omitempty"`

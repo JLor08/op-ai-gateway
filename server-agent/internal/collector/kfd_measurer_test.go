@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -264,4 +265,27 @@ func TestKFDMeasurerBrokenRootIsNil(t *testing.T) {
 	if got := m.measure([]int{kfdTestPID4B}); got != nil {
 		t.Fatalf("measure on a tree without proc = %v, want nil", got)
 	}
+}
+
+func readTestdata(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// writeKFDTopology materialises a "== <node>" block file (bare gpu_id line,
+// then the properties lines) under root/topology/nodes/<n>/{gpu_id,properties}.
+func writeKFDTopology(t *testing.T, text string) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, block := range strings.Split(text, "== ")[1:] {
+		lines := strings.Split(strings.TrimRight(block, "\n"), "\n")
+		node := strings.TrimSpace(lines[0])
+		writeKFDFile(t, filepath.Join(root, "topology", "nodes", node, "gpu_id"), strings.TrimSpace(lines[1])+"\n")
+		writeKFDFile(t, filepath.Join(root, "topology", "nodes", node, "properties"), strings.Join(lines[2:], "\n")+"\n")
+	}
+	return root
 }

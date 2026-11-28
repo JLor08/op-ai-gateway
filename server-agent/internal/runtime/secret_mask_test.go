@@ -18,7 +18,7 @@ func maskerFor(t *testing.T, spec Spec, env map[string]string) *secretMasker {
 	if spec.Binary == "" {
 		spec.Binary = "/opt/llama/llama-server"
 	}
-	ex, err := expandSpec(spec, 8081, GPUVendorNone, nil, func(k string) string { return env[k] }, "")
+	ex, err := expandSpec(spec, 8081, GPUTopology{}, func(k string) string { return env[k] }, "")
 	if err != nil {
 		t.Fatalf("expandSpec: %v", err)
 	}

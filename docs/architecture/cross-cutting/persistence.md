@@ -161,19 +161,43 @@ the full list). `(*SQLStore).Migrate(ctx)`:
    transaction, then commits. A failure at any point rolls the transaction
    back — the database is left at exactly its last successfully-applied
    version, never half-migrated.
-5. A migration may instead set `rawUp` — an escape hatch for the one case
-   (`migration40`, the `service_accounts` SQLite rebuild) that needs to
-   toggle SQLite's `foreign_keys` pragma *outside* any transaction (SQLite
-   treats that toggle as a silent no-op once `BEGIN` has run) on the same
-   physical connection that then performs the table rebuild. `rawUp` manages
-   its own transaction and records its own `schema_migrations` row so the
-   DDL and the bookkeeping still commit atomically.
+5. A migration may instead set `rawUp` — an escape hatch for the case
+   that needs to toggle SQLite's `foreign_keys` pragma *outside* any
+   transaction (SQLite treats that toggle as a silent no-op once `BEGIN` has
+   run) on the same physical connection that then performs the table rebuild.
+   `rawUp` manages its own transaction and records its own
+   `schema_migrations` row so the DDL and the bookkeeping still commit
+   atomically. Two migrations use it:
+   - `migration40`, the `service_accounts` SQLite rebuild.
+   - `migration119RawUp` (`gpu_vendor_keys`, [ADR-122](../09-architecture-decisions.md#adr-122--mixed-vendor-gpu-hosts-vendor-index-identity-drm-fdinfo-measurement-per-spec-visibility-vulkan-ordinal-mapping-same-host-rpc-members)),
+     which puts `gpu_vendor` into four GPU tables' primary keys and keys
+     `rpc_cluster_members` by `(head_spec_id, position)`. SQLite cannot change
+     a primary or foreign key in place, so it rebuilds the five tables
+     (`create <t>_new`, copy, drop, rename; the members before their GPU rows,
+     whose copy reads each member's position), and the drop of
+     `rpc_cluster_members` would otherwise cascade into its GPU rows. Before
+     the commit it runs `pragma foreign_key_check(<table>)` **scoped to each
+     rebuilt table**, so a pre-existing violation elsewhere in the database,
+     which the rebuild neither caused nor can fix, does not abort the upgrade.
+     On Postgres the same migration runs in one ordinary transaction and swaps
+     the constraints in place: it looks each old constraint up in
+     `pg_constraint` **by its type and exact column list** and drops it by the
+     name recorded there (never a guessed `<table>_pkey` name, which a
+     database created by an older baseline or by hand need not carry); no
+     match is an error, because the schema is then not the one the migration
+     was written for.
+
+   Both restore `foreign_keys=ON` in a deferred call that runs under
+   `context.WithoutCancel`: a migration aborted by a cancelled context must
+   still not hand a pooled connection back with foreign keys off (migration
+   40 got the same restore when 119 was written; its schema change is
+   untouched).
 
 Rules that keep this safe over time:
 
 - **Forward-only, append-only.** New entries are appended with the next
   version number; an already-shipped migration is never edited or reordered.
-- **Only-pending.** A fresh install runs all 118 migrations in order, same as
+- **Only-pending.** A fresh install runs all 119 migrations in order, same as
   an upgrade from any earlier version — there is no separate "fresh schema"
   path that could drift from the migration history. `baselineUp` (version 1)
   is a frozen v1 snapshot; every table introduced later (`user_groups`,
@@ -612,8 +636,8 @@ consequence of each.
 `nil` where SQL returns a conflict — a behavioural divergence between two
 supported drivers. Five were closed on the runtime tables: a runtime-spec id
 reused across mappings, an exact-duplicate co-residency pair within one
-`SetCoResidencyRules` call, duplicate GPU indexes in `SetRuntimeSpecGPUs` and in
-`SetServerGPUBudgets`, and a second `server_agent` application on one server. A
+`SetCoResidencyRules` call, duplicate GPU keys (vendor, index; NVIDIA 0 and AMD 0 are
+not duplicates) in `SetRuntimeSpecGPUs` and in `SetServerGPUBudgets`, and a second `server_agent` application on one server. A
 related decision, pinned so nobody "fixes" it: a **reversed** co-residency pair
 `(b, a)` stays a distinct row in *both* backends — canonical ordering is
 portal-level validation, not store-level canonicalization.

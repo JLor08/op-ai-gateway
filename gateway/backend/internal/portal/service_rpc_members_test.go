@@ -407,9 +407,102 @@ func TestGPULooksNVIDIA(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := gpuLooksNVIDIA(tc.gpu, tc.busID); got != tc.want {
-				t.Fatalf("gpuLooksNVIDIA(%q, %q) = %v, want %v", tc.gpu, tc.busID, got, tc.want)
+			if got := gpuLooksNVIDIA("", tc.gpu, tc.busID); got != tc.want {
+				t.Fatalf("gpuLooksNVIDIA(\"\", %q, %q) = %v, want %v", tc.gpu, tc.busID, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestMemberMeasurabilityFromReport: a reported vram_measurable list decides
+// whether a member GPU needs an estimate, for the member's resolved backend;
+// a report without vendors keeps today's kfdHost rule.
+func TestMemberMeasurabilityFromReport(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, report, backend string
+		gpu                   RuntimeSpecGPUDTO
+		refused               bool
+	}{
+		{"amd rocm+vulkan, vulkan member", mixedHostReport(`["rocm","vulkan"]`), "vulkan", RuntimeSpecGPUDTO{Vendor: "amd"}, false},
+		{"amd rocm only, vulkan member", mixedHostReport(`["rocm"]`), "vulkan", RuntimeSpecGPUDTO{Vendor: "amd"}, true},
+		{"amd rocm only, auto member", mixedHostReport(`["rocm"]`), "auto", RuntimeSpecGPUDTO{Vendor: "amd"}, false},
+		{"nvidia, vulkan member", mixedHostReport(`["rocm"]`), "vulkan", RuntimeSpecGPUDTO{Vendor: "nvidia"}, false},
+		{"vendor-reporting amd listing nothing", `{"gpus":[{"index":0,"name":"AMD Radeon RX 7900 XT","vendor":"amd"}]}`, "rocm", RuntimeSpecGPUDTO{Vendor: "amd"}, true},
+		{"vendor-less all-amd linux report", `{"gpus":[{"index":0,"name":"AMD Radeon RX 7900 XT"}]}`, "rocm", RuntimeSpecGPUDTO{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, routeStore := newServerTestService(t, rpcMemberTestNow)
+			server := createTestServer(t, svc, "M", "m.example.test")
+			svc.agentFeatures = fakeAgentFeatures{server.ID: {"runtime_manager", AgentFeatureGPUVendorIdentity}}
+			if err := routeStore.UpsertServerHardware(ctx, routing.ServerHardware{ServerID: server.ID, CollectedAt: rpcMemberTestNow, UpdatedAt: rpcMemberTestNow, ReportJSON: tc.report}); err != nil {
+				t.Fatal(err)
+			}
+			if err := routeStore.UpsertTelemetry(ctx, routing.ServerTelemetry{ServerID: server.ID, ReportedAt: rpcMemberTestNow, OS: "linux", UpdatedAt: rpcMemberTestNow}); err != nil {
+				t.Fatal(err)
+			}
+			req := validRPCMemberRequest()
+			req.DeviceBackend = tc.backend
+			req.GPUs = []RuntimeSpecGPUDTO{tc.gpu}
+			_, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", req)
+			if tc.refused != errors.Is(err, ErrRPCMemberVRAMEstimateRequired) || (!tc.refused && err != nil) {
+				t.Fatalf("err = %v, refused want %v", err, tc.refused)
+			}
+		})
+	}
+}
+
+// TestPutRPCMemberSpecRefusesVendorBackendMismatch: a manual member spec
+// whose backend cannot drive one of its GPUs is refused; a Vulkan member
+// across both vendors of a mixed host is not (members are exempt from the
+// visible-devices rule).
+func TestPutRPCMemberSpecRefusesVendorBackendMismatch(t *testing.T) {
+	ctx := context.Background()
+	svc, routeStore := newServerTestService(t, rpcMemberTestNow)
+	server := createTestServer(t, svc, "M", "m.example.test")
+	svc.agentFeatures = fakeAgentFeatures{server.ID: {"runtime_manager", AgentFeatureGPUVendorIdentity}}
+	if err := routeStore.UpsertServerHardware(ctx, routing.ServerHardware{ServerID: server.ID, CollectedAt: rpcMemberTestNow, UpdatedAt: rpcMemberTestNow, ReportJSON: mixedHostReport(`["rocm","vulkan"]`)}); err != nil {
+		t.Fatal(err)
+	}
+	req := validRPCMemberRequest()
+	req.GPUs = []RuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}, {Vendor: "amd", Index: 0}}
+	for backend, want := range map[string]error{"cuda": ErrRuntimeSpecGPUVendorBackendMismatch, "rocm": ErrRuntimeSpecGPUVendorBackendMismatch, "sycl": ErrRuntimeSpecGPUVendorBackendMismatch, "vulkan": nil, "auto": nil} {
+		req.DeviceBackend = backend
+		if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", req); !errors.Is(err, want) || (want == nil && err != nil) {
+			t.Errorf("%s: err = %v, want %v", backend, err, want)
+		}
+	}
+
+	// Stored before the backfill named its vendor-less GPU AMD: a re-save
+	// as it is saves, a new spec like it does not.
+	if err := routeStore.UpsertServerHardware(ctx, routing.ServerHardware{ServerID: server.ID, CollectedAt: rpcMemberTestNow, UpdatedAt: rpcMemberTestNow, ReportJSON: `{"gpus":[]}`}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := validRPCMemberRequest()
+	legacy.DeviceBackend = "cuda"
+	legacy.GPUs = []RuntimeSpecGPUDTO{{Index: 0}}
+	stored, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := routeStore.BackfillServerGPUVendor(ctx, server.ID, "amd", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, stored.ID, legacy); err != nil {
+		t.Fatalf("re-save of a stored mismatched spec: %v", err)
+	}
+	editedGPUs := legacy
+	editedGPUs.GPUs = []RuntimeSpecGPUDTO{{Index: 0}, {Vendor: "amd", Index: 1}}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, stored.ID, editedGPUs); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("gpu edit of a stored mismatched spec: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+	editedBackend := legacy
+	editedBackend.DeviceBackend = "rocm"
+	editedBackend.GPUs = []RuntimeSpecGPUDTO{{Vendor: "nvidia", Index: 0}}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, stored.ID, editedBackend); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("backend edit of a stored mismatched spec: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
+	}
+	if _, err := svc.PutRPCMemberSpec(ctx, ownerToken(), server.ID, "", legacy); !errors.Is(err, ErrRuntimeSpecGPUVendorBackendMismatch) {
+		t.Fatalf("new spec like it: err = %v, want ErrRuntimeSpecGPUVendorBackendMismatch", err)
 	}
 }

@@ -16,7 +16,7 @@ const body: PutRPCMemberSpecRequest = {
   binary: '/opt/llama/rpc-server',
   args: ['-t', '8'],
   env: {},
-  gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+  gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
   cache_enabled: false,
   device_backend: 'auto',
   ram_estimate_mb: 0,

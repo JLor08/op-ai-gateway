@@ -287,13 +287,25 @@ type AIServer struct {
 	// opaque JSON array of user-group ids whose cluster heads may use this
 	// server as a member. "[]" = none.
 	RPCAllowedHeadGroups string
-	Provider             string
-	Endpoint             string
-	Status               string
-	HealthStatus         string
-	LastSeenAt           *time.Time
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
+	// GPULegacyVendor is the vendor the empty GPU vendor stands for on this
+	// server (migration 119, #434): set by every GPU-vendor backfill from the
+	// first vendor-reporting hardware report (LegacyGPUVendor), and kept when
+	// a later report carries no vendors, so a downgraded agent does not change
+	// it. "" = never backfilled. Written by CreateAIServer and the backfill
+	// writers, never by UpdateAIServer. Routing never reads it.
+	GPULegacyVendor string
+	// GPUVendorNote marks a server whose backfill rewrote legacy GPU rows on
+	// a report listing more than one vendor, so the portal shows an
+	// informational note until the operator dismisses it (migration 119).
+	// Written like GPULegacyVendor. Routing never reads it.
+	GPUVendorNote bool
+	Provider      string
+	Endpoint      string
+	Status        string
+	HealthStatus  string
+	LastSeenAt    *time.Time
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 const (
@@ -806,8 +818,16 @@ type AudioCapacityHistory struct {
 	Curve               []AudioLevel `json:"audio_curve"`
 }
 
+// GPUSample is one GPU of a telemetry sample, persisted only inside the
+// sample's JSON (no column of its own), so a sample stored before a field
+// existed decodes it empty. Vendor is the GPU's vendor (GPUVendorNVIDIA,
+// GPUVendorAMD, GPUVendorApple; "" from an agent that reports none) and Index
+// its vendor-local index, so (Vendor, Index) is its GPUKey; PCIBusID is its
+// PCI address as the agent reported it ("" when unknown).
 type GPUSample struct {
+	Vendor        string
 	Index         int
+	PCIBusID      string
 	Name          string
 	UUID          string
 	UtilPct       float64
@@ -1410,12 +1430,14 @@ const (
 // lives in NetbirdStateStore; agent tokens live in AgentTokenStore.
 type ServerStore interface {
 	CreateAIServer(ctx context.Context, host AIServer) error
-	// UpdateAIServer writes the server row from host, except netbird_ip and
-	// lan_interfaces: the mesh address is written only by the NetBird state
-	// writes below (UpdateServerNetbirdState, UpdateServerNetbirdLink,
-	// ClearServerNetbirdIP) and the reported interface list only by
-	// UpdateServerLANInterfaces, so a full-row write from a stale read cannot
-	// bring an old value back.
+	// UpdateAIServer writes the server row from host, except netbird_ip,
+	// lan_interfaces, gpu_legacy_vendor and gpu_vendor_note: the mesh address
+	// is written only by the NetBird state writes below
+	// (UpdateServerNetbirdState, UpdateServerNetbirdLink,
+	// ClearServerNetbirdIP), the reported interface list only by
+	// UpdateServerLANInterfaces and the two GPU-vendor fields only by the
+	// GPU-vendor backfill writers, so a full-row write from a stale read
+	// cannot bring an old value back.
 	UpdateAIServer(ctx context.Context, host AIServer) error
 	// UpdateServerLastSeen writes only last_seen_at and updated_at, the agent
 	// telemetry heartbeat, so a sample cannot write back a row it read before
@@ -3258,13 +3280,15 @@ type RuntimeSpec struct {
 const MaxInstanceIndex = 63
 
 // RuntimeSpecGPU is one per-GPU VRAM demand row for a RuntimeSpec
-// (agent_runtime_spec_gpus, migration 65), keyed by (SpecID, GPUIndex).
+// (agent_runtime_spec_gpus, migration 65), keyed by (SpecID, GPUVendor,
+// GPUIndex) since migration 119: GPUVendor "" is the host's only vendor.
 // VRAMEstimateMB is operator-owned (the portal writes it); VRAMMeasuredMB is
 // agent-owned and written ONLY by UpdateRuntimeSpecGPUMeasured — the two
 // never clobber each other.
 type RuntimeSpecGPU struct {
-	SpecID   string
-	GPUIndex int
+	SpecID    string
+	GPUVendor string
+	GPUIndex  int
 	// Position is the operator-chosen order of this GPU within its spec
 	// (0-based, dense per spec). It is the sole ordering contract: both stores
 	// read the rows `order by position`, and the DTO/wire layers keep the
@@ -3276,6 +3300,9 @@ type RuntimeSpecGPU struct {
 	VRAMEstimateMB int
 	VRAMMeasuredMB int
 }
+
+// Key is the GPU the row is about.
+func (g RuntimeSpecGPU) Key() GPUKey { return GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex} }
 
 // CoResidencyRule is one EXPLICIT co-residency setting for a pair of model
 // mappings on the same AI server (agent_coresidency_rules, migration 65 plus
@@ -3352,7 +3379,7 @@ func (m CoResidencyMode) Valid() bool {
 
 // ServerGPUBudget is a per-GPU VRAM budget for co-residency admission math
 // (ai_server_gpu_budgets, migration 66, Task 3), keyed by (ServerID,
-// GPUIndex): how much VRAM (MB) the operator has allotted to agent-managed
+// GPUVendor, GPUIndex): how much VRAM (MB) the operator has allotted to agent-managed
 // runtimes on that GPU. BudgetMB 0 means "no budget for this GPU" =
 // unconstrained (also true for a GPU with no row at all) — which is why
 // SetServerGPUBudgets accepts 0 and rejects only negatives. This meaning is
@@ -3373,7 +3400,10 @@ func (m CoResidencyMode) Valid() bool {
 // later compared against live telemetry to WARN that a card was renumbered —
 // they never block anything; the store just persists them.
 type ServerGPUBudget struct {
-	ServerID     string
+	ServerID string
+	// GPUVendor is the budget's GPU vendor ("" = the host's only vendor); the
+	// row is keyed by (ServerID, GPUVendor, GPUIndex) since migration 119.
+	GPUVendor    string
 	GPUIndex     int
 	BudgetMB     int
 	ExpectedUUID string
@@ -3491,12 +3521,15 @@ type RuntimeStore interface {
 	// (ErrNotFound otherwise).
 	SetRuntimeSpecGPUs(ctx context.Context, specID string, gpus []RuntimeSpecGPU) error
 	// RuntimeSpecGPUs lists specID's per-GPU VRAM rows, ordered by position
-	// (the operator order). Always non-nil, empty when none.
+	// (the operator order), then vendor and index. Always non-nil, empty
+	// when none.
 	RuntimeSpecGPUs(ctx context.Context, specID string) ([]RuntimeSpecGPU, error)
-	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement; ErrNotFound
-	// when the (spec,gpu) row does not exist. Callers pass a strictly positive
-	// measurement: a zero is "unknown" and is dropped before it reaches the store.
-	UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, gpuIndex int, measuredMB int) error
+	// UpdateRuntimeSpecGPUMeasured writes back one agent measurement to the
+	// row of exactly (specID, key.Vendor, key.Index); ErrNotFound when that
+	// row does not exist (an empty vendor matches only the empty-vendor row).
+	// Callers pass a strictly positive measurement: a zero is "unknown" and is
+	// dropped before it reaches the store.
+	UpdateRuntimeSpecGPUMeasured(ctx context.Context, specID string, key GPUKey, measuredMB int) error
 	// UpdateRuntimeSpecRAMMeasured writes back the agent's measured host RAM
 	// for the spec, touching only RAMMeasuredMB (RAMEstimateMB, operator-owned,
 	// is never written here); ErrNotFound when the spec does not exist. Spec-
@@ -3543,8 +3576,27 @@ type RuntimeStore interface {
 	// transaction before the delete).
 	SetServerGPUBudgets(ctx context.Context, serverID string, budgets []ServerGPUBudget) error
 	// ServerGPUBudgets lists serverID's per-GPU VRAM budgets, ordered by GPU
-	// index. Always non-nil, empty when none.
+	// vendor, then index. Always non-nil, empty when none.
 	ServerGPUBudgets(ctx context.Context, serverID string) ([]ServerGPUBudget, error)
+	// BackfillServerGPUVendor makes the legacy empty GPU vendor of serverID
+	// explicit: in one transaction it rewrites gpu_vendor "" to vendor in
+	// the GPU rows of the server's runtime specs (spec -> mapping ->
+	// application -> server), its GPU budgets, the GPU rows of the manual
+	// member specs on it and the cluster member GPU rows on it. Where a row
+	// with vendor already carries the same key the empty one is deleted
+	// instead (the explicit row wins and keeps its values). rewritten counts
+	// the rows rewritten or deleted.
+	//
+	// On every call it sets the server's GPULegacyVendor to vendor (also when
+	// rewritten is 0); when rewritten > 0 and noteMixed it also raises
+	// GPUVendorNote. vendor must be a non-empty valid vendor, else an error is
+	// returned and nothing is written; an unknown serverID is ErrNotFound. Every
+	// call rewrites the empty rows present at that moment; once none is left it
+	// rewrites 0 and leaves the note as it is.
+	BackfillServerGPUVendor(ctx context.Context, serverID, vendor string, noteMixed bool) (rewritten int, err error)
+	// ClearServerGPUVendorNote lowers GPUVendorNote and keeps
+	// GPULegacyVendor. An unknown serverID is ErrNotFound.
+	ClearServerGPUVendorNote(ctx context.Context, serverID string) error
 	// UpsertServerRuntimeReport stores the latest file-mode runtime report
 	// for its server (1:1, upsert-overwrite — mirrors UpsertServerHardware).
 	// An unknown ServerID is ErrNotFound (FK violation).
@@ -3800,17 +3852,20 @@ type RPCMemberSpec struct {
 }
 
 // RPCMemberSpecGPU is one GPU a manual member serves, keyed by (SpecID,
-// GPUIndex).
+// GPUVendor, GPUIndex); GPUVendor "" is the host's only vendor.
 type RPCMemberSpecGPU struct {
 	SpecID         string
+	GPUVendor      string
 	GPUIndex       int
 	Position       int
 	VRAMEstimateMB int
 }
 
 // ClusterMember is one member of a cluster head's membership
-// (rpc_cluster_members), keyed by (HeadSpecID, ServerID) and ordered by
-// Position. MemberSpecID names the manual member spec; "" is an automatic
+// (rpc_cluster_members), keyed and ordered by (HeadSpecID, Position) since
+// migration 119: one server may serve a head more than once (one member per
+// GPU vendor of a mixed host), so the server no longer names a member.
+// MemberSpecID names the manual member spec; "" is an automatic
 // member, whose settings (Threads, CacheEnabled, DeviceBackend, RAMEstimateMB)
 // and Port live here instead. The measured and run-peak fields are usage the
 // agent reported for this head; the zero time means "not yet".
@@ -3833,11 +3888,15 @@ type ClusterMember struct {
 }
 
 // ClusterMemberGPU is one GPU of a membership row (rpc_cluster_member_gpus),
-// keyed by (HeadSpecID, ServerID, GPUIndex); it disappears with its membership
-// row.
+// keyed by (HeadSpecID, MemberPosition, GPUVendor, GPUIndex); it belongs to
+// the member at MemberPosition and disappears with it. ServerID is that
+// member's server, kept and written alongside (a writer must pass the same
+// server as the member's, see SetClusterMembers).
 type ClusterMemberGPU struct {
 	HeadSpecID     string
+	MemberPosition int
 	ServerID       string
+	GPUVendor      string
 	GPUIndex       int
 	Position       int
 	VRAMEstimateMB int
@@ -3870,35 +3929,40 @@ type RPCClusterStore interface {
 	// it does not exist.
 	DeleteRPCMemberSpec(ctx context.Context, id string) error
 	// SetRPCMemberSpecGPUs atomically replaces specID's GPU rows. An unknown
-	// spec is ErrNotFound, a duplicate GPUIndex ErrConflict.
+	// spec is ErrNotFound, a duplicate (GPUVendor, GPUIndex) ErrConflict.
 	SetRPCMemberSpecGPUs(ctx context.Context, specID string, gpus []RPCMemberSpecGPU) error
 	// RPCMemberSpecGPUs lists specID's GPU rows ordered by position, then
-	// index. Always non-nil.
+	// vendor and index. Always non-nil.
 	RPCMemberSpecGPUs(ctx context.Context, specID string) ([]RPCMemberSpecGPU, error)
 	// ReplaceRPCMemberSpec is UpsertRPCMemberSpec and SetRPCMemberSpecGPUs
 	// in one transaction: the spec and exactly gpus as its GPU rows are
 	// stored together, or nothing is. An unknown ServerID is ErrNotFound, a
-	// duplicate GPUIndex ErrConflict.
+	// duplicate (GPUVendor, GPUIndex) ErrConflict.
 	ReplaceRPCMemberSpec(ctx context.Context, s RPCMemberSpec, gpus []RPCMemberSpecGPU) error
 	// SetClusterMembers atomically replaces every membership row (and its GPU
-	// rows) of headSpecID. Carrying measured fields over per (server,
-	// gpu_index) is the caller's job. An unknown head or member server is
-	// ErrNotFound; a duplicate position, a duplicate server, or a manual
-	// member spec already used by another membership row is ErrConflict.
+	// rows) of headSpecID. Carrying measured fields over per (member, vendor,
+	// index) is the caller's job. Each GPU row names its member by
+	// MemberPosition and carries that member's ServerID; a GPU row without a
+	// member of that position and server in members, an unknown head or an
+	// unknown member server is ErrNotFound. A duplicate position, a duplicate
+	// (member position, vendor, index), or a manual member spec already used
+	// by another membership row is ErrConflict. One server may hold several
+	// members of a head.
 	SetClusterMembers(ctx context.Context, headSpecID string, members []ClusterMember, gpus []ClusterMemberGPU) error
 	// SetClusterMembersIf is SetClusterMembers, but only while the stored
 	// rows still carry what the caller read them as: exactly the membership
-	// rows of expect (by server) with the same RAMMeasuredMB, Stale,
+	// rows of expect (by position) with the same RAMMeasuredMB, Stale,
 	// RunPeakRAMMB, RunHeadInstance and RunStartedAt, and exactly the GPU
-	// rows of expectGPUs (by server and index) with the same VRAMMeasuredMB
-	// and RunPeakVRAMMB. A usage write, a run begun or ended, or any other
+	// rows of expectGPUs (by member position, vendor and index) with the same
+	// VRAMMeasuredMB and RunPeakVRAMMB. A usage write, a run begun or ended, or any other
 	// rewrite since then makes it store nothing and report applied false, so
 	// a caller that carries measured values over never writes back an older
 	// read of them. MeasuredAt is not compared: it only moves with the
 	// values. Errors are SetClusterMembers'.
 	SetClusterMembersIf(ctx context.Context, headSpecID string, expect []ClusterMember, expectGPUs []ClusterMemberGPU, members []ClusterMember, gpus []ClusterMemberGPU) (applied bool, err error)
 	// ClusterMembers returns headSpecID's membership ordered by position and
-	// its GPU rows ordered by server, position, index. Both always non-nil.
+	// its GPU rows ordered by member position, position, vendor, index. Both
+	// always non-nil.
 	ClusterMembers(ctx context.Context, headSpecID string) ([]ClusterMember, []ClusterMemberGPU, error)
 	// ClusterMembershipsByServer is the reverse index: every membership row
 	// whose member is serverID, ordered by head spec ID. Always non-nil.
@@ -3907,9 +3971,10 @@ type RPCClusterStore interface {
 	// member spec; ok is false when none does.
 	ClusterMemberBySpec(ctx context.Context, memberSpecID string) (ClusterMember, bool, error)
 	// UpdateClusterMemberUsage writes the measured fields (RAMMeasuredMB,
-	// MeasuredAt, Stale, RunPeakRAMMB) of the existing membership row m and
-	// the measured fields (VRAMMeasuredMB, RunPeakVRAMMB) of each given GPU
-	// row, but only while the stored row is still in the run the caller read:
+	// MeasuredAt, Stale, RunPeakRAMMB) of the existing membership row m
+	// (addressed by m.HeadSpecID and m.Position) and the measured fields
+	// (VRAMMeasuredMB, RunPeakVRAMMB) of each given GPU row of that member
+	// (addressed by m.Position, GPUVendor and GPUIndex), but only while the stored row is still in the run the caller read:
 	// its run_started_at equals m.RunStartedAt (the zero time matches no run).
 	// It never writes the run identity (RunStartedAt, RunHeadInstance). A
 	// membership rewrite in between that reset the run -- a change of the
@@ -3922,11 +3987,11 @@ type RPCClusterStore interface {
 	// new run (RunStartedAt = startedAt, RunHeadInstance = headInstance) and
 	// clears the run peaks of the rows and their GPU rows.
 	BeginClusterMemberRun(ctx context.Context, headSpecID string, startedAt time.Time, headInstance int) error
-	// EndClusterMemberRun clears the run of serverID's membership row of
-	// headSpecID (RunStartedAt, RunHeadInstance and the run peaks of the row
+	// EndClusterMemberRun clears the run of headSpecID's membership row at
+	// position (RunStartedAt, RunHeadInstance and the run peaks of the row
 	// and its GPU rows) when the row is in the run that started at
 	// startedAt; ended reports whether it was. A missing row is ErrNotFound.
-	EndClusterMemberRun(ctx context.Context, headSpecID, serverID string, startedAt time.Time) (ended bool, err error)
+	EndClusterMemberRun(ctx context.Context, headSpecID string, position int, startedAt time.Time) (ended bool, err error)
 	// OpenRPCSession appends an open session.
 	OpenRPCSession(ctx context.Context, s RPCSession) error
 	// CloseRPCSessions sets Until on every open session of (headSpecID,

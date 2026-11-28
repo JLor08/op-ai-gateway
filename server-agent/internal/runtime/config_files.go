@@ -62,14 +62,14 @@ type plannedConfigFile struct {
 // valid token). Every other "${...}" -- a server's own templating -- passes
 // through literally, as in Args/Env, and so does all non-placeholder text.
 //
-// vendor and vendors feed the generic device tokens (the device backend and
-// whether the child's devices are renumbered), exactly as in expandSpec. The
-// getenv parameter is accepted so the signature mirrors expandSpec's, but it is
-// never used: the agent's environment must never be read for a file -- a
-// ${AGENT_ENV:NAME} is refused without looking the variable up. An error names
-// the offending token's text, never any value.
-func expandConfigFileContent(content string, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, _ func(string) string, configFilesDir string) (string, error) {
-	return expandNonSecretText(content, surfaceConfigFileContent, spec, port, vendor, vendors, configFilesDir)
+// topo feeds the per-spec device plan the device tokens render (the device
+// backend and whether the child's devices are renumbered), exactly as in
+// expandSpec. The getenv parameter is accepted so the signature mirrors
+// expandSpec's, but it is never used: the agent's environment must never be
+// read for a file -- a ${AGENT_ENV:NAME} is refused without looking the
+// variable up. An error names the offending token's text, never any value.
+func expandConfigFileContent(content string, spec Spec, port int, topo GPUTopology, _ func(string) string, configFilesDir string) (string, error) {
+	return expandNonSecretText(content, surfaceConfigFileContent, spec, port, topo, configFilesDir)
 }
 
 // contentPathsUseSlashes makes ${CONFIG_DIR} resolve with forward slashes in
@@ -106,13 +106,12 @@ func (s nonSecretSurface) String() string {
 // what names the surface in the errors, so a refusal says where the token was
 // found. The agent
 // environment is never read.
-func expandNonSecretText(text string, what nonSecretSurface, spec Spec, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (string, error) {
+func expandNonSecretText(text string, what nonSecretSurface, spec Spec, port int, topo GPUTopology, configFilesDir string) (string, error) {
 	matches := placeholderPattern.FindAllStringIndex(text, -1)
 	if len(matches) == 0 {
 		return text, nil
 	}
-	gpuIDs := hostGPUIDs(spec)
-	dev := newDeviceContext(spec, vendor, vendors)
+	dev := newSpecDevices(spec, topo)
 
 	var b strings.Builder
 	copied := 0
@@ -122,7 +121,7 @@ func expandNonSecretText(text string, what nonSecretSurface, spec Spec, port int
 		match := text[m[0]:m[1]]
 		inner := match[2 : len(match)-1] // strip "${" and "}"
 
-		v, handled, err := resolveNonSecretToken(inner, spec, port, gpuIDs, configFilesDir, dev)
+		v, handled, err := resolveNonSecretToken(inner, spec, port, configFilesDir, dev)
 		if err != nil {
 			return "", err
 		}
@@ -205,7 +204,7 @@ func secretTokenRefusalReason(what nonSecretSurface, agentEnv bool) string {
 //     operator planted under their own config directory is theirs to explain);
 //   - each file name is acceptable at the write boundary (checkConfigFileName);
 //   - each file's content expands (expandConfigFileContent).
-func planSpecConfigFiles(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) ([]plannedConfigFile, error) {
+func planSpecConfigFiles(spec Spec, port int, topo GPUTopology, getenv func(string) string, configFilesDir string) ([]plannedConfigFile, error) {
 	if len(spec.ConfigFiles) == 0 {
 		return nil, nil
 	}
@@ -233,7 +232,7 @@ func planSpecConfigFiles(spec Spec, port int, vendor GPUVendor, vendors GPUVendo
 		if filepath.Dir(path) != specDir {
 			return nil, fmt.Errorf("runtime: spec %q config file %q resolves to %s, outside its directory %s", spec.ID, f.Name, path, specDir)
 		}
-		content, err := expandConfigFileContent(f.Content, spec, port, vendor, vendors, getenv, configFilesDir)
+		content, err := expandConfigFileContent(f.Content, spec, port, topo, getenv, configFilesDir)
 		if err != nil {
 			return nil, fmt.Errorf("runtime: spec %q config file %q: %w", spec.ID, f.Name, err)
 		}
@@ -256,8 +255,8 @@ func planSpecConfigFiles(spec Spec, port int, vendor GPUVendor, vendors GPUVendo
 //
 // Stale files are not pruned: a file dropped from config_files stays on disk
 // until the per-spec directory is removed by hand.
-func writeSpecConfigFiles(spec Spec, port int, vendor GPUVendor, vendors GPUVendors, getenv func(string) string, configFilesDir string) error {
-	files, err := planSpecConfigFiles(spec, port, vendor, vendors, getenv, configFilesDir)
+func writeSpecConfigFiles(spec Spec, port int, topo GPUTopology, getenv func(string) string, configFilesDir string) error {
+	files, err := planSpecConfigFiles(spec, port, topo, getenv, configFilesDir)
 	if err != nil {
 		return err
 	}

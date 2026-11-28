@@ -715,6 +715,9 @@ func TestEveryVendorAccountServiceMethodIsClassified(t *testing.T) {
 		"UpdateVendorAccountGroup":     "group",
 		"DeleteVendorAccountGroup":     "group",
 		"SetVendorAccountGroupMembers": "group",
+		// A GPU vendor (nvidia/amd/apple), not a vendor account: the server's
+		// legacy-vendor review note, touching no account.
+		"DismissServerGPUVendorNote": "gpu_vendor",
 	}
 
 	typ := reflect.TypeFor[*Service]()

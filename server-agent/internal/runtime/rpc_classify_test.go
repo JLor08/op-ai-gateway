@@ -364,3 +364,13 @@ func TestHeadFailedToConnectRestsWithCode(t *testing.T) {
 		return s != nil && s.State == StateStartFailed && s.LastError != nil && s.LastError.Code == "runtime.cluster_member_unreachable"
 	})
 }
+
+func TestExpectedMemberDevicesCountsKeys(t *testing.T) {
+	spec := Spec{GPUs: []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}, {Index: 0, Vendor: GPUVendorAMD}, {Index: 0, Vendor: GPUVendorNVIDIA}}}
+	if got := expectedMemberDevices(spec); got != 2 {
+		t.Fatalf("expectedMemberDevices = %d, want 2 (NVIDIA 0 and AMD 0 are two cards)", got)
+	}
+	if got := expectedMemberDevices(Spec{}); got != 1 {
+		t.Fatalf("expectedMemberDevices without GPUs = %d, want 1 (the CPU device)", got)
+	}
+}

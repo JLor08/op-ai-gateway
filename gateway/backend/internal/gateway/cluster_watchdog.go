@@ -725,10 +725,19 @@ func (w *clusterWatchdog) checkMembers(v watchView, serverID string, prev, next 
 		w.suspectLoss(v.head, here, prev, next, seq, hr.PID)
 		return
 	}
-	if v.plan.Transport != clusterTransportDirect || !reported || (present && stateOccupied(hr.State)) {
+	if !reported || (present && stateOccupied(hr.State)) {
 		return
 	}
-	w.endDeadHolds(v, serverID, here, next, seq, hr.PID, headSilent)
+	// Only a direct member can hold a dead connection: over a relay the
+	// session ends with the head. A member on the head's server runs direct
+	// inside a relay cluster too (memberTransport).
+	direct := slices.DeleteFunc(slices.Clone(here), func(m portal.ClusterPlanMember) bool {
+		return memberTransport(v.plan.Transport, m) != clusterTransportDirect
+	})
+	if len(direct) == 0 {
+		return
+	}
+	w.endDeadHolds(v, serverID, direct, next, seq, hr.PID, headSilent)
 }
 
 // membersOn is the members among members on serverID.
@@ -1095,12 +1104,13 @@ func (o *clusterOrchestrator) forceStopMembers(ctx context.Context, head string,
 }
 
 // freeMembers ends the claims of head's members once the head is down: a
-// direct member whose telemetry still shows the head's hold may hold a dead
+// direct member (by its own transport, memberTransport; transport is the
+// cluster's) whose telemetry still shows the head's hold may hold a dead
 // connection, so it is stopped, forced; every other member is released.
 func (o *clusterOrchestrator) freeMembers(ctx context.Context, head, transport string, members []portal.ClusterPlanMember, agents clusterAgentClient) {
 	var dead, rest []portal.ClusterPlanMember
 	for _, m := range members {
-		if r, ok := o.row(m.Server.ID, m.SpecID); transport == clusterTransportDirect && ok && r.RPC != nil && r.RPC.HeldBy == head {
+		if r, ok := o.row(m.Server.ID, m.SpecID); memberTransport(transport, m) == clusterTransportDirect && ok && r.RPC != nil && r.RPC.HeldBy == head {
 			dead = append(dead, m)
 		} else {
 			rest = append(rest, m)
@@ -1166,7 +1176,7 @@ func (w *clusterWatchdog) checkBlocked(serverID string, next []RuntimeStatusDTO)
 
 // memberHeadCandidates lists the heads the member spec on serverID may serve:
 // the head it reports holding it, the heads whose last plan lists it, and the
-// head an automatic member's id names (rpca_<head>_<server>). They are only
+// head an automatic member's id names (portal.AutomaticMemberHead). They are only
 // candidates: removeForBlockedStart keeps one only when its plan lists the
 // member on serverID.
 func (o *clusterOrchestrator) memberHeadCandidates(serverID, member string, next []RuntimeStatusDTO) []string {
@@ -1184,10 +1194,8 @@ func (o *clusterOrchestrator) memberHeadCandidates(serverID, member string, next
 			add(v.head)
 		}
 	}
-	if rest, ok := strings.CutPrefix(member, "rpca_"); ok {
-		if head, ok := strings.CutSuffix(rest, "_"+serverID); ok {
-			add(head)
-		}
+	if head, ok := portal.AutomaticMemberHead(member, serverID); ok {
+		add(head)
 	}
 	return heads
 }

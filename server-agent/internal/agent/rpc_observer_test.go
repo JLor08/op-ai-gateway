@@ -439,3 +439,64 @@ func TestObserverReleaseSparesLaterConnections(t *testing.T) {
 		t.Fatalf("hold = %s, want a connection opened after the release to hold", got)
 	}
 }
+
+func loopbackMember() runtimectl.Status {
+	st := directMember()
+	st.RPCMember.BindIP = "127.0.0.1"
+	st.RPCMember.HeadIPs = []string{"127.0.0.1"}
+	return st
+}
+
+func loopConn(port uint16) collector.Conn {
+	return collector.Conn{
+		Local:  netip.MustParseAddrPort("127.0.0.1:47001"),
+		Remote: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port),
+	}
+}
+
+func TestLoopbackMemberHoldNeedsTwoPolls(t *testing.T) {
+	f := newObsFixture(t, loopbackMember())
+	f.set(loopConn(40000))
+	f.obs.pollAll(context.Background())
+	if got := f.holds.last(); got != "<none>" {
+		t.Fatalf("after one poll hold = %s", got)
+	}
+	f.obs.pollAll(context.Background())
+	if got := f.holds.last(); got != "rpcm_a=rspec_h" {
+		t.Fatalf("after two polls hold = %s", got)
+	}
+}
+
+func TestLoopbackMemberProbeNeverHolds(t *testing.T) {
+	f := newObsFixture(t, loopbackMember())
+	f.set(loopConn(40001))
+	f.obs.pollAll(context.Background())
+	f.set()
+	f.obs.pollAll(context.Background())
+	f.set(loopConn(40002))
+	f.obs.pollAll(context.Background())
+	if got := f.holds.last(); got != "<none>" {
+		t.Fatalf("probe held: %s", got)
+	}
+	if n := len(f.obs.members["rpcm_a"].prevHead); n != 1 {
+		t.Fatalf("prevHead not bounded to the latest poll: %d", n)
+	}
+}
+
+// The loopback debounce is the loopback-only member's alone: a remote member
+// holds on the first poll even when each poll lists its head on a different
+// source port (a loopback member's would never hold,
+// TestLoopbackMemberProbeNeverHolds), and it keeps no previous-poll set.
+func TestRemoteMemberHoldUnchanged(t *testing.T) {
+	f := newObsFixture(t, directMember())
+	for i, port := range []uint16{5000, 5001} {
+		f.set(connFrom(obsHead, port))
+		f.obs.pollAll(context.Background())
+		if got := f.holds.last(); got != "rpcm_a=rspec_h" {
+			t.Fatalf("poll %d: hold = %s", i+1, got)
+		}
+	}
+	if prev := f.obs.members["rpcm_a"].prevHead; prev != nil {
+		t.Fatalf("a remote member tracks the previous poll's head connections: %v", prev)
+	}
+}

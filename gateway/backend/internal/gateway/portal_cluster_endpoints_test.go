@@ -176,3 +176,22 @@ func TestHandlePortalClusterCandidates(t *testing.T) {
 		t.Fatalf("cluster put = %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+// The member estimate refusal states the rule the portal applies: a GPU the
+// agent measures for the member's backend (its report's vram_measurable) needs
+// no estimate, on any host, not only AMD on Linux.
+func TestMemberVRAMEstimateMessageNamesVRAMMeasurable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writePortalRuntimeSpecError(rec, portal.ErrRPCMemberVRAMEstimateRequired)
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body.Error.Message, "vram_measurable") || strings.Contains(body.Error.Message, "AMD on Linux") {
+		t.Fatalf("message = %q, want the vram_measurable rule", body.Error.Message)
+	}
+}

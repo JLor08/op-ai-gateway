@@ -33,7 +33,7 @@ const vmwpPID = 7777
 // the finder it installs name no worker at all.
 type vmVRAMScript struct {
 	mu       sync.Mutex
-	vm       map[int]int
+	vm       map[GPUKey]int
 	asked    [][]int
 	gate     chan struct{}
 	noWorker bool
@@ -54,7 +54,7 @@ func (s *vmVRAMScript) find() []int {
 	return []int{vmwpPID}
 }
 
-func (s *vmVRAMScript) set(vm map[int]int) {
+func (s *vmVRAMScript) set(vm map[GPUKey]int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.vm = vm
@@ -67,7 +67,7 @@ func (s *vmVRAMScript) hold() chan struct{} {
 	return s.gate
 }
 
-func (s *vmVRAMScript) measure(pids []int) map[int]map[int]int {
+func (s *vmVRAMScript) measure(pids []int) map[int]map[GPUKey]int {
 	s.mu.Lock()
 	s.asked = append(s.asked, slices.Clone(pids))
 	vm, gate := maps.Clone(s.vm), s.gate
@@ -79,7 +79,7 @@ func (s *vmVRAMScript) measure(pids []int) map[int]map[int]int {
 	if !slices.Contains(pids, vmwpPID) || len(vm) == 0 {
 		return nil
 	}
-	return map[int]map[int]int{vmwpPID: vm}
+	return map[int]map[GPUKey]int{vmwpPID: vm}
 }
 
 // askedFor returns the recorded calls whose pid list holds pid.
@@ -193,17 +193,17 @@ func stopHandDriven(t *testing.T, o *owner) {
 }
 
 func TestSumVMVRAM(t *testing.T) {
-	byPID := map[int]map[int]int{
-		10:  {0: 12318},
-		11:  {0: 7432, 1: 22},
-		500: {0: 9999}, // a managed native process: not the VM's
+	byPID := map[int]map[GPUKey]int{
+		10:  {{Index: 0}: 12318},
+		11:  {{Index: 0}: 7432, {Index: 1}: 22},
+		500: {{Index: 0}: 9999}, // a managed native process: not the VM's
 	}
-	if got, want := sumVMVRAM(byPID, []int{10, 11}), map[int]int{0: 19750, 1: 22}; !maps.Equal(got, want) {
+	if got, want := sumVMVRAM(byPID, []int{10, 11}), map[GPUKey]int{{Index: 0}: 19750, {Index: 1}: 22}; !maps.Equal(got, want) {
 		t.Errorf("sumVMVRAM = %v, want %v", got, want)
 	}
 	// A worker named twice is summed once; one the measurer said nothing about
 	// adds nothing; a non-positive figure is no figure.
-	if got, want := sumVMVRAM(map[int]map[int]int{10: {0: 100, 1: 0}}, []int{10, 10, 12}), map[int]int{0: 100}; !maps.Equal(got, want) {
+	if got, want := sumVMVRAM(map[int]map[GPUKey]int{10: {{Index: 0}: 100, {Index: 1}: 0}}, []int{10, 10, 12}), map[GPUKey]int{{Index: 0}: 100}; !maps.Equal(got, want) {
 		t.Errorf("sumVMVRAM with a repeated, a silent and a zero entry = %v, want %v", got, want)
 	}
 	if got := sumVMVRAM(nil, []int{10}); len(got) != 0 {
@@ -214,14 +214,14 @@ func TestSumVMVRAM(t *testing.T) {
 func TestWSLDelta(t *testing.T) {
 	for _, tc := range []struct {
 		name                    string
-		after, baseline, credit map[int]int
-		want                    map[int]int
+		after, baseline, credit map[GPUKey]int
+		want                    map[GPUKey]int
 	}{
-		{"growth", map[int]int{0: 19772}, map[int]int{0: 12340}, map[int]int{}, map[int]int{0: 7432}},
-		{"an attributed exit added back", map[int]int{0: 7454}, map[int]int{0: 12340}, map[int]int{0: 12318}, map[int]int{0: 7432}},
-		{"a shrink is dropped", map[int]int{0: 100, 1: 900}, map[int]int{0: 500, 1: 400}, nil, map[int]int{1: 500}},
-		{"a gpu only after", map[int]int{2: 3000}, nil, nil, map[int]int{2: 3000}},
-		{"no change", map[int]int{0: 22}, map[int]int{0: 22}, nil, nil},
+		{"growth", map[GPUKey]int{{Index: 0}: 19772}, map[GPUKey]int{{Index: 0}: 12340}, map[GPUKey]int{}, map[GPUKey]int{{Index: 0}: 7432}},
+		{"an attributed exit added back", map[GPUKey]int{{Index: 0}: 7454}, map[GPUKey]int{{Index: 0}: 12340}, map[GPUKey]int{{Index: 0}: 12318}, map[GPUKey]int{{Index: 0}: 7432}},
+		{"a shrink is dropped", map[GPUKey]int{{Index: 0}: 100, {Index: 1}: 900}, map[GPUKey]int{{Index: 0}: 500, {Index: 1}: 400}, nil, map[GPUKey]int{{Index: 1}: 500}},
+		{"a gpu only after", map[GPUKey]int{{Index: 2}: 3000}, nil, nil, map[GPUKey]int{{Index: 2}: 3000}},
+		{"no change", map[GPUKey]int{{Index: 0}: 22}, map[GPUKey]int{{Index: 0}: 22}, nil, nil},
 	} {
 		if got := wslDelta(tc.after, tc.baseline, tc.credit); !maps.Equal(got, tc.want) {
 			t.Errorf("%s: wslDelta = %v, want %v", tc.name, got, tc.want)
@@ -270,7 +270,7 @@ func TestWSLStartDeltaAttributesVMGrowth(t *testing.T) {
 	s.Args = stubArgs(300*time.Millisecond, 0, 0, "")
 	s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
 	o := newWSLExecOwner(t, f, s)
-	vm := &vmVRAMScript{vm: map[int]int{0: 22}}
+	vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 22}}
 	vm.install(o.m)
 	st := o.specs["S"]
 
@@ -283,20 +283,20 @@ func TestWSLStartDeltaAttributesVMGrowth(t *testing.T) {
 	if w == nil || w.proc != proc {
 		t.Fatalf("window = %+v, want one open for S's generation", w)
 	}
-	if !maps.Equal(w.baseline, map[int]int{0: 22}) {
+	if !maps.Equal(w.baseline, map[GPUKey]int{{Index: 0}: 22}) {
 		t.Errorf("baseline = %v, want the VM's figure before the exec {0:22}", w.baseline)
 	}
 
 	// A measurement goes out while S is still loading, and is still out when
 	// S's first probe passes: the measurement that probe asks for waits.
-	vm.set(map[int]int{0: 5000})
+	vm.set(map[GPUKey]int{{Index: 0}: 5000})
 	gate := vm.hold()
 	o.dispatchMeasurement()
 	pumpOwner(t, o, "S's first passing probe", func() bool { return proc.everHealthy })
 	if !o.remeasure {
 		t.Fatal("the probe's measurement was not deferred behind the outstanding one")
 	}
-	vm.set(map[int]int{0: 12340})
+	vm.set(map[GPUKey]int{{Index: 0}: 12340})
 	close(gate)
 	handleNextMeasurement(t, o)
 	if o.wslWindow == nil {
@@ -304,10 +304,10 @@ func TestWSLStartDeltaAttributesVMGrowth(t *testing.T) {
 	}
 	pumpOwner(t, o, "the window closes", func() bool { return o.wslWindow == nil })
 
-	if want := map[int]int{0: 12318}; !maps.Equal(st.measuredVRAM, want) || !maps.Equal(o.wslAttrib[proc], want) {
+	if want := map[GPUKey]int{{Index: 0}: 12318}; !maps.Equal(st.measuredVRAM, want) || !maps.Equal(o.wslAttrib[proc], want) {
 		t.Errorf("S measured %v, attributed %v, want %v", st.measuredVRAM, o.wslAttrib[proc], want)
 	}
-	if got := o.snapshotStatus()[0].MeasuredVRAM; !maps.Equal(got, map[int]int{0: 12318}) {
+	if got := o.snapshotStatus()[0].MeasuredVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 12318}) {
 		t.Errorf("Status.MeasuredVRAM = %v, want {0:12318}", got)
 	}
 	if !st.vramBootstrapDone {
@@ -338,13 +338,13 @@ func TestWSLExitDuringWindowCorrectsDelta(t *testing.T) {
 	a := liveWSL(wslVRAMSpec("A", 6000), 300, StateRunning)
 	b := liveWSL(wslVRAMSpec("B", 6000), 301, StateStarting)
 	o := wslVRAMOwner(vm, a, b)
-	o.wslAttrib = map[*runningProc]map[int]int{a.proc: {0: 12318}}
-	a.measuredVRAM = map[int]int{0: 12318}
-	o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[int]int{0: 12340}}
+	o.wslAttrib = map[*runningProc]map[GPUKey]int{a.proc: {GPUKey{Index: 0}: 12318}}
+	a.measuredVRAM = map[GPUKey]int{{Index: 0}: 12318}
+	o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[GPUKey]int{{Index: 0}: 12340}}
 
 	a.state, a.intentionalStop = StateDraining, true
 	o.onProcExited(a, nil)
-	if o.wslWindow == nil || o.wslWindow.void || !maps.Equal(o.wslWindow.exitedCredit, map[int]int{0: 12318}) {
+	if o.wslWindow == nil || o.wslWindow.void || !maps.Equal(o.wslWindow.exitedCredit, map[GPUKey]int{{Index: 0}: 12318}) {
 		t.Fatalf("window after A's exit = %+v, want it open with A's attribution as credit", o.wslWindow)
 	}
 	if _, ok := o.wslAttrib[a.proc]; ok {
@@ -352,12 +352,12 @@ func TestWSLExitDuringWindowCorrectsDelta(t *testing.T) {
 	}
 
 	b.proc.everHealthy, b.state = true, StateRunning
-	vm.set(map[int]int{0: 7454})
+	vm.set(map[GPUKey]int{{Index: 0}: 7454})
 	measureNow(t, o)
 	if o.wslWindow != nil {
 		t.Fatal("the window is still open after B's settling measurement")
 	}
-	if want := map[int]int{0: 7432}; !maps.Equal(b.measuredVRAM, want) || !maps.Equal(o.wslAttrib[b.proc], want) {
+	if want := map[GPUKey]int{{Index: 0}: 7432}; !maps.Equal(b.measuredVRAM, want) || !maps.Equal(o.wslAttrib[b.proc], want) {
 		t.Errorf("B measured %v, attributed %v, want %v", b.measuredVRAM, o.wslAttrib[b.proc], want)
 	}
 }
@@ -374,7 +374,7 @@ func TestWSLExitOfUnattributedProcVoidsWindow(t *testing.T) {
 	n := liveWSL(Spec{ID: "N", UpstreamModel: "n", RAMMB: 100, GPUs: []SpecGPU{{Index: 0, VRAMMB: 500}}}, 302, StateRunning)
 	n.proc.wslUnit, n.proc.wslDistro = "", ""
 	o := wslVRAMOwner(vm, a, b, n)
-	o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[int]int{0: 12340}}
+	o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[GPUKey]int{{Index: 0}: 12340}}
 
 	n.state, n.intentionalStop = StateDraining, true
 	o.onProcExited(n, nil)
@@ -389,7 +389,7 @@ func TestWSLExitOfUnattributedProcVoidsWindow(t *testing.T) {
 	}
 
 	b.proc.everHealthy, b.state = true, StateRunning
-	vm.set(map[int]int{0: 7454})
+	vm.set(map[GPUKey]int{{Index: 0}: 7454})
 	measureNow(t, o)
 	if o.wslWindow != nil {
 		t.Fatal("a void window is still open after its settling measurement")
@@ -397,14 +397,14 @@ func TestWSLExitOfUnattributedProcVoidsWindow(t *testing.T) {
 	if _, ok := o.wslAttrib[b.proc]; ok || b.measuredVRAM != nil {
 		t.Errorf("B got an attribution from a void window: %v / %v", o.wslAttrib[b.proc], b.measuredVRAM)
 	}
-	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 7454}) {
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 7454}) {
 		t.Errorf("UnattributedVRAM = %v, want B's share in the remainder {0:7454}", got)
 	}
 
 	t.Run("the window's own exit closes it without an attribution", func(t *testing.T) {
 		c := liveWSL(wslVRAMSpec("C", 6000), 303, StateStarting)
 		o.specs["C"] = c
-		o.wslWindow = &wslStartWindow{proc: c.proc, baseline: map[int]int{}}
+		o.wslWindow = &wslStartWindow{proc: c.proc, baseline: map[GPUKey]int{}}
 		o.onProcExited(c, errors.New("exit status 1"))
 		cancelTimer(o.m, &c.backoffTimer)
 		if o.wslWindow != nil {
@@ -423,16 +423,16 @@ func TestWSLExitOfUnattributedProcVoidsWindow(t *testing.T) {
 // from the reading taken at admission, and in rule 3's sum -- and is never a
 // victim and never a reason to refuse a demand that fits its budget alone.
 func TestRemainderChargedAsUnattributedVRAM(t *testing.T) {
-	vm := &vmVRAMScript{vm: map[int]int{0: 20000}}
+	vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 20000}}
 	s := liveWSL(wslVRAMSpec("S", 6000), 300, StateRunning)
 	o := wslVRAMOwner(vm, s)
-	o.wslAttrib = map[*runningProc]map[int]int{s.proc: {0: 12000}}
+	o.wslAttrib = map[*runningProc]map[GPUKey]int{s.proc: {GPUKey{Index: 0}: 12000}}
 
 	snap := o.buildSnapshot()
-	if !maps.Equal(snap.UnattributedVRAM, map[int]int{0: 8000}) {
+	if !maps.Equal(snap.UnattributedVRAM, map[GPUKey]int{{Index: 0}: 8000}) {
 		t.Errorf("UnattributedVRAM = %v, want {0:8000}", snap.UnattributedVRAM)
 	}
-	if got := runningRow(t, snap, "S").GPUs; !maps.Equal(got, map[int]int{0: 12000}) {
+	if got := runningRow(t, snap, "S").GPUs; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 12000}) {
 		t.Errorf("S charged %v, want max(attribution, demand) = {0:12000}", got)
 	}
 	if snap.WSLStartInFlight {
@@ -443,13 +443,13 @@ func TestRemainderChargedAsUnattributedVRAM(t *testing.T) {
 	}
 
 	t.Run("an attribution on a gpu the instance is not charged on stays in the remainder", func(t *testing.T) {
-		o.wslAttrib[s.proc] = map[int]int{0: 12000, 1: 500}
-		vm.set(map[int]int{0: 20000, 1: 900})
-		if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 8000, 1: 900}) {
+		o.wslAttrib[s.proc] = map[GPUKey]int{{Index: 0}: 12000, {Index: 1}: 500}
+		vm.set(map[GPUKey]int{{Index: 0}: 20000, {Index: 1}: 900})
+		if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 900}) {
 			t.Errorf("UnattributedVRAM = %v, want {0:8000 1:900}: S is charged nothing on GPU 1", got)
 		}
-		o.wslAttrib[s.proc] = map[int]int{0: 12000}
-		vm.set(map[int]int{0: 20000})
+		o.wslAttrib[s.proc] = map[GPUKey]int{{Index: 0}: 12000}
+		vm.set(map[GPUKey]int{{Index: 0}: 20000})
 	})
 
 	t.Run("an open window is in the snapshot", func(t *testing.T) {
@@ -475,9 +475,9 @@ func TestRemainderChargedAsUnattributedVRAM(t *testing.T) {
 
 	cand := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 0, VRAMMB: 6000}}}
 	psnap := PolicySnapshot{
-		Running:          []RunningProc{{SpecID: "S", GPUs: map[int]int{0: 12000}, LastUsed: t0, WSL: true}},
-		Budgets:          map[int]int{0: 24000},
-		UnattributedVRAM: map[int]int{0: 8000},
+		Running:          []RunningProc{{SpecID: "S", GPUs: map[GPUKey]int{{Index: 0}: 12000}, LastUsed: t0, WSL: true}},
+		Budgets:          map[GPUKey]int{{Index: 0}: 24000},
+		UnattributedVRAM: map[GPUKey]int{{Index: 0}: 8000},
 		Allowed:          allowPairs("cand", "S"),
 	}
 	// 12000 + 8000 + 6000 = 26000 > 24000: S goes, never the remainder, and
@@ -492,14 +492,14 @@ func TestRemainderChargedAsUnattributedVRAM(t *testing.T) {
 	assertDecision(t, "without a remainder", Admit(none, cand), Decision{OK: true, Evict: []string{}})
 	// The remainder alone leaves no room: a wait, never a refusal of a demand
 	// that fits its budget by itself.
-	alone := PolicySnapshot{Budgets: map[int]int{0: 24000}, UnattributedVRAM: map[int]int{0: 20000}}
+	alone := PolicySnapshot{Budgets: map[GPUKey]int{{Index: 0}: 24000}, UnattributedVRAM: map[GPUKey]int{{Index: 0}: 20000}}
 	assertDecision(t, "remainder alone", Admit(alone, cand), Decision{Wait: true, Evict: []string{}})
 	if _, refused := ownDemandRefusal(alone, cand); refused {
 		t.Error("ownDemandRefusal refused a demand that fits its budget alone")
 	}
 	// A gpu the candidate does not touch is not charged.
 	other := Spec{ID: "cand", GPUs: []SpecGPU{{Index: 1, VRAMMB: 6000}}}
-	alone.Budgets[1] = 6000
+	alone.Budgets[GPUKey{Index: 1}] = 6000
 	assertDecision(t, "remainder on another gpu", Admit(alone, other), Decision{OK: true, Evict: []string{}})
 }
 
@@ -515,7 +515,7 @@ func TestVRAMBootstrapNotGrantedWithoutVMFinder(t *testing.T) {
 	nst := &specState{spec: ns, state: StateStopped}
 	o := &owner{m: &Manager{}, specs: map[string]*specState{"S": wst, "N": nst}}
 
-	o.m.SetMeasurer(func([]int) map[int]map[int]int { return nil })
+	o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int { return nil })
 	if o.vramBootstrapEligible(wst) {
 		t.Error("wsl spec granted the VRAM bootstrap with no VM worker finder")
 	}
@@ -536,8 +536,8 @@ func TestVRAMBootstrapNotGrantedWithoutVMFinder(t *testing.T) {
 // on GPU 0, for every live unit the fake recorded, the figure perSpec gives
 // its spec -- the VM's figure grows as a workload starts and shrinks as it
 // stops, as on a real host.
-func liveUnitVRAM(f *fakeWSL, perSpec map[string]int) func([]int) map[int]map[int]int {
-	return func(pids []int) map[int]map[int]int {
+func liveUnitVRAM(f *fakeWSL, perSpec map[string]int) func([]int) map[int]map[GPUKey]int {
+	return func(pids []int) map[int]map[GPUKey]int {
 		if !slices.Contains(pids, vmwpPID) {
 			return nil
 		}
@@ -562,7 +562,7 @@ func liveUnitVRAM(f *fakeWSL, perSpec map[string]int) func([]int) map[int]map[in
 		if total == 0 {
 			return nil
 		}
-		return map[int]map[int]int{vmwpPID: {0: total}}
+		return map[int]map[GPUKey]int{vmwpPID: {{Index: 0}: total}}
 	}
 }
 
@@ -614,11 +614,11 @@ func TestWSLSecondStartWaitsForSettle(t *testing.T) {
 		}
 		r.release()
 	}
-	if got := statusFor(m, "A").MeasuredVRAM; !maps.Equal(got, map[int]int{0: 5000}) {
+	if got := statusFor(m, "A").MeasuredVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 5000}) {
 		t.Errorf("A measured %v, want its own growth {0:5000}", got)
 	}
 	waitUntil(t, 5*time.Second, "B's window closes with its own growth", func() bool {
-		return maps.Equal(statusFor(m, "B").MeasuredVRAM, map[int]int{0: 3000})
+		return maps.Equal(statusFor(m, "B").MeasuredVRAM, map[GPUKey]int{{Index: 0}: 3000})
 	})
 	if st := statusFor(m, "A"); st.State != StateRunning {
 		t.Errorf("A is %s, want it untouched by B's start", st.State)
@@ -630,12 +630,12 @@ func TestWSLSecondStartWaitsForSettle(t *testing.T) {
 
 // otherLiveWSL adds a live wsl generation O beside the hand-driven exec
 // owner's specs, with no real process behind it, and opens the pair.
-func otherLiveWSL(o *owner, attrib map[int]int) *specState {
+func otherLiveWSL(o *owner, attrib map[GPUKey]int) *specState {
 	other := liveWSL(wslVRAMSpec("O", 1000), 4242, StateRunning)
 	o.specs["O"] = other
 	o.allowedPairs = allowPairs("S", "O")
 	if attrib != nil {
-		o.wslAttrib = map[*runningProc]map[int]int{other.proc: attrib}
+		o.wslAttrib = map[*runningProc]map[GPUKey]int{other.proc: attrib}
 	}
 	return other
 }
@@ -656,7 +656,7 @@ func TestWSLWindowVoidOnUnreadableBaseline(t *testing.T) {
 		s.Pinned = true
 		s.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}}
 		o := newWSLExecOwner(t, f, s)
-		vm := &vmVRAMScript{vm: map[int]int{0: 5000}}
+		vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 5000}}
 		vm.install(o.m)
 		setup(o, vm)
 		o.admitAndStart("S")
@@ -679,7 +679,7 @@ func TestWSLWindowVoidOnUnreadableBaseline(t *testing.T) {
 	})
 	t.Run("nothing held while a live wsl process is attributed", func(t *testing.T) {
 		w := start(t, func(o *owner, vm *vmVRAMScript) {
-			otherLiveWSL(o, map[int]int{0: 5000})
+			otherLiveWSL(o, map[GPUKey]int{{Index: 0}: 5000})
 			vm.set(nil)
 		})
 		if !w.void {
@@ -702,13 +702,13 @@ func TestWSLWindowVoidOnUnreadableBaseline(t *testing.T) {
 // instead of voiding that window.
 func TestWSLSettleVoidOnUnreadableReading(t *testing.T) {
 	for name, tc := range map[string]struct {
-		baseline map[int]int
-		reading  map[int]int
+		baseline map[GPUKey]int
+		reading  map[GPUKey]int
 		noWorker bool
 	}{
-		"nothing held after a baseline that held something": {baseline: map[int]int{0: 12340}, reading: nil},
+		"nothing held after a baseline that held something": {baseline: map[GPUKey]int{{Index: 0}: 12340}, reading: nil},
 		"nothing held after an empty baseline":              {baseline: nil, reading: nil},
-		"no worker at the settle":                           {baseline: nil, reading: map[int]int{0: 5000}, noWorker: true},
+		"no worker at the settle":                           {baseline: nil, reading: map[GPUKey]int{{Index: 0}: 5000}, noWorker: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			vm := &vmVRAMScript{vm: tc.reading}
@@ -732,27 +732,27 @@ func TestWSLSettleVoidOnUnreadableReading(t *testing.T) {
 // failed read never shows the VM's unattributed VRAM as free; nor does a
 // failed reading on the beat replace the last good one.
 func TestWSLAdmissionFallsBackToLastGoodVMReading(t *testing.T) {
-	vm := &vmVRAMScript{vm: map[int]int{0: 20000}}
+	vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 20000}}
 	s := liveWSL(wslVRAMSpec("S", 6000), 300, StateRunning)
 	o := wslVRAMOwner(vm, s)
-	o.wslAttrib = map[*runningProc]map[int]int{s.proc: {0: 12000}}
-	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 8000}) {
+	o.wslAttrib = map[*runningProc]map[GPUKey]int{s.proc: {GPUKey{Index: 0}: 12000}}
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 8000}) {
 		t.Fatalf("good reading: UnattributedVRAM = %v, want {0:8000}", got)
 	}
 
 	vm.set(nil) // nothing held, while S is attributed 12000
-	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 8000}) {
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 8000}) {
 		t.Errorf("failed reading: UnattributedVRAM = %v, want the last good {0:8000}", got)
 	}
 	measureNow(t, o) // the beat reads the same failure
 	vm.setNoWorker(true)
-	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 8000}) {
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 8000}) {
 		t.Errorf("no worker: UnattributedVRAM = %v, want the last good {0:8000}", got)
 	}
 
 	vm.setNoWorker(false)
-	vm.set(map[int]int{0: 15000})
-	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 3000}) {
+	vm.set(map[GPUKey]int{{Index: 0}: 15000})
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 3000}) {
 		t.Errorf("good reading again: UnattributedVRAM = %v, want {0:3000}", got)
 	}
 }
@@ -780,8 +780,8 @@ func TestWSLWindowCloseStartsForceRunningWaiter(t *testing.T) {
 	waitForState(t, m, "A", StateRunning)
 	waitForState(t, m, "B", StateRunning)
 	waitUntil(t, 5*time.Second, "both windows close with their own growth", func() bool {
-		return maps.Equal(statusFor(m, "A").MeasuredVRAM, map[int]int{0: 5000}) &&
-			maps.Equal(statusFor(m, "B").MeasuredVRAM, map[int]int{0: 3000})
+		return maps.Equal(statusFor(m, "A").MeasuredVRAM, map[GPUKey]int{{Index: 0}: 5000}) &&
+			maps.Equal(statusFor(m, "B").MeasuredVRAM, map[GPUKey]int{{Index: 0}: 3000})
 	})
 }
 
@@ -806,7 +806,7 @@ func TestWSLWindowCloseNeverEvictsForAForceRunningWaiter(t *testing.T) {
 	m.Apply(Config{ETag: "v1", Specs: []Spec{a, b}, MaxProcesses: 1, Coresident: coresidentAllPairs("A", "B")})
 
 	waitUntil(t, 5*time.Second, "A's window closes", func() bool {
-		return maps.Equal(statusFor(m, "A").MeasuredVRAM, map[int]int{0: 5000})
+		return maps.Equal(statusFor(m, "A").MeasuredVRAM, map[GPUKey]int{{Index: 0}: 5000})
 	})
 	time.Sleep(200 * time.Millisecond) // several beats and wakes
 	if st := statusFor(m, "A"); st.State != StateRunning {
@@ -828,7 +828,7 @@ func TestWSLCPUOnlyStartIsNotSerialized(t *testing.T) {
 		s := wslTestSpec(f, "S", "m")
 		s.Pinned = true
 		o := newWSLExecOwner(t, f, s)
-		vm := &vmVRAMScript{vm: map[int]int{0: 22}}
+		vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 22}}
 		vm.install(o.m)
 		o.admitAndStart("S")
 		proc := o.specs["S"].proc
@@ -859,8 +859,8 @@ func TestWSLCPUOnlyStartIsNotSerialized(t *testing.T) {
 		c := liveWSL(wslCandidate("C", 1000), 300, StateRunning)
 		b := liveWSL(wslVRAMSpec("B", 6000), 301, StateStarting)
 		o := wslVRAMOwner(vm, c, b)
-		o.wslAttrib = map[*runningProc]map[int]int{c.proc: nil}
-		o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[int]int{0: 100}}
+		o.wslAttrib = map[*runningProc]map[GPUKey]int{c.proc: nil}
+		o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[GPUKey]int{{Index: 0}: 100}}
 		c.state, c.intentionalStop = StateDraining, true
 		o.onProcExited(c, nil)
 		if w := o.wslWindow; w == nil || w.void || len(w.exitedCredit) != 0 {
@@ -876,13 +876,13 @@ func TestWSLAttributionOnlyOnDeclaredGPUs(t *testing.T) {
 	vm := &vmVRAMScript{}
 	b := liveWSL(wslVRAMSpec("B", 6000), 301, StateRunning)
 	o := wslVRAMOwner(vm, b)
-	o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[int]int{0: 100, 1: 100}}
-	vm.set(map[int]int{0: 7100, 1: 2100})
+	o.wslWindow = &wslStartWindow{proc: b.proc, baseline: map[GPUKey]int{{Index: 0}: 100, {Index: 1}: 100}}
+	vm.set(map[GPUKey]int{{Index: 0}: 7100, {Index: 1}: 2100})
 	measureNow(t, o)
-	if want := map[int]int{0: 7000}; !maps.Equal(o.wslAttrib[b.proc], want) || !maps.Equal(b.measuredVRAM, want) {
+	if want := map[GPUKey]int{{Index: 0}: 7000}; !maps.Equal(o.wslAttrib[b.proc], want) || !maps.Equal(b.measuredVRAM, want) {
 		t.Errorf("B attributed %v, measured %v, want only the declared GPU %v", o.wslAttrib[b.proc], b.measuredVRAM, want)
 	}
-	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 100, 1: 2100}) {
+	if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 100, {Index: 1}: 2100}) {
 		t.Errorf("UnattributedVRAM = %v, want GPU 1's growth in it {0:100 1:2100}", got)
 	}
 }
@@ -903,11 +903,11 @@ func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
 	// so the last good reading is {0:12022}.
 	period1 := func(t *testing.T) (*owner, *vmVRAMScript, *specState) {
 		t.Helper()
-		vm := &vmVRAMScript{vm: map[int]int{0: 12022}}
+		vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 12022}}
 		g := liveWSL(wslVRAMSpec("G", 12000), 300, StateRunning)
 		o := wslVRAMOwner(vm, g)
-		o.wslAttrib = map[*runningProc]map[int]int{g.proc: {0: 12000}}
-		if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[int]int{0: 22}) {
+		o.wslAttrib = map[*runningProc]map[GPUKey]int{g.proc: {GPUKey{Index: 0}: 12000}}
+		if got := o.buildSnapshot().UnattributedVRAM; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 22}) {
 			t.Fatalf("period 1: remainder %v, want {0:22}", got)
 		}
 		t.Cleanup(func() {
@@ -926,7 +926,7 @@ func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
 		o.wslAttrib[c.proc] = nil
 		vm.setNoWorker(true)
 		if got := o.buildSnapshot().UnattributedVRAM; got != nil {
-			t.Errorf("period 2, VM booting: UnattributedVRAM = %v, want nil: the booting VM holds nothing, and %v was an earlier period's", got, map[int]int{0: 12022})
+			t.Errorf("period 2, VM booting: UnattributedVRAM = %v, want nil: the booting VM holds nothing, and %v was an earlier period's", got, map[GPUKey]int{{Index: 0}: 12022})
 		}
 	}
 
@@ -934,7 +934,7 @@ func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
 		o, vm, g := period1(t)
 		o.noteWSLExit(g.proc)
 		g.proc = nil
-		vm.set(map[int]int{0: 22})
+		vm.set(map[GPUKey]int{{Index: 0}: 22})
 		if got := o.buildSnapshot().UnattributedVRAM; got != nil {
 			t.Fatalf("between periods: remainder %v, want nil", got)
 		}
@@ -945,7 +945,7 @@ func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
 		o, vm, g := period1(t)
 		g.state, g.intentionalStop = StateDraining, true
 		o.onProcExited(g, nil)
-		vm.set(map[int]int{0: 22})
+		vm.set(map[GPUKey]int{{Index: 0}: 22})
 		period2(t, o, vm)
 	})
 
@@ -957,7 +957,7 @@ func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
 		o.onProcExited(g, nil)
 		close(gate)
 		handleNextMeasurement(t, o)
-		vm.set(map[int]int{0: 22})
+		vm.set(map[GPUKey]int{{Index: 0}: 22})
 		period2(t, o, vm)
 	})
 }
@@ -974,21 +974,21 @@ func TestWSLVMReadingDoesNotOutliveItsPeriod(t *testing.T) {
 func TestWSLOpenWindowIsNotCountedTwice(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
-		baseline, vm  map[int]int
-		credit        map[int]int
+		baseline, vm  map[GPUKey]int
+		credit        map[GPUKey]int
 		void          bool
-		wantRemainder map[int]int
+		wantRemainder map[GPUKey]int
 	}{
-		{name: "growth equal to the demand", vm: map[int]int{0: 12000}},
-		{name: "growth below the demand", vm: map[int]int{0: 5000}},
-		{name: "growth above the demand", vm: map[int]int{0: 15000}, wantRemainder: map[int]int{0: 3000}},
-		{name: "on top of a baseline", baseline: map[int]int{0: 22}, vm: map[int]int{0: 12022}, wantRemainder: map[int]int{0: 22}},
+		{name: "growth equal to the demand", vm: map[GPUKey]int{{Index: 0}: 12000}},
+		{name: "growth below the demand", vm: map[GPUKey]int{{Index: 0}: 5000}},
+		{name: "growth above the demand", vm: map[GPUKey]int{{Index: 0}: 15000}, wantRemainder: map[GPUKey]int{{Index: 0}: 3000}},
+		{name: "on top of a baseline", baseline: map[GPUKey]int{{Index: 0}: 22}, vm: map[GPUKey]int{{Index: 0}: 12022}, wantRemainder: map[GPUKey]int{{Index: 0}: 22}},
 		{
-			name: "an attributed exit's credit", baseline: map[int]int{0: 7454}, vm: map[int]int{0: 12022},
-			credit: map[int]int{0: 7432}, wantRemainder: map[int]int{0: 22},
+			name: "an attributed exit's credit", baseline: map[GPUKey]int{{Index: 0}: 7454}, vm: map[GPUKey]int{{Index: 0}: 12022},
+			credit: map[GPUKey]int{{Index: 0}: 7432}, wantRemainder: map[GPUKey]int{{Index: 0}: 22},
 		},
-		{name: "growth on a gpu it does not declare", vm: map[int]int{0: 12000, 1: 900}, wantRemainder: map[int]int{1: 900}},
-		{name: "a void window", vm: map[int]int{0: 12000}, void: true, wantRemainder: map[int]int{0: 12000}},
+		{name: "growth on a gpu it does not declare", vm: map[GPUKey]int{{Index: 0}: 12000, {Index: 1}: 900}, wantRemainder: map[GPUKey]int{{Index: 1}: 900}},
+		{name: "a void window", vm: map[GPUKey]int{{Index: 0}: 12000}, void: true, wantRemainder: map[GPUKey]int{{Index: 0}: 12000}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			vm := &vmVRAMScript{vm: tc.vm}
@@ -997,7 +997,7 @@ func TestWSLOpenWindowIsNotCountedTwice(t *testing.T) {
 			o := wslVRAMOwner(vm, w)
 			o.wslWindow = &wslStartWindow{proc: w.proc, baseline: tc.baseline, exitedCredit: tc.credit, void: tc.void}
 			snap := o.buildSnapshot()
-			if got := runningRow(t, snap, "W").GPUs; !maps.Equal(got, map[int]int{0: 12000}) {
+			if got := runningRow(t, snap, "W").GPUs; !maps.Equal(got, map[GPUKey]int{{Index: 0}: 12000}) {
 				t.Errorf("W charged %v, want its demand {0:12000}", got)
 			}
 			if !maps.Equal(snap.UnattributedVRAM, tc.wantRemainder) {
@@ -1005,7 +1005,7 @@ func TestWSLOpenWindowIsNotCountedTwice(t *testing.T) {
 			}
 			for g, held := range tc.vm {
 				if seen := runningRow(t, snap, "W").GPUs[g] + snap.UnattributedVRAM[g]; seen < held {
-					t.Errorf("GPU %d: admission sees %d, the VM holds %d", g, seen, held)
+					t.Errorf("GPU %v: admission sees %d, the VM holds %d", g, seen, held)
 				}
 			}
 		})
@@ -1018,7 +1018,7 @@ func TestWSLOpenWindowIsNotCountedTwice(t *testing.T) {
 // twice a native candidate that fits beside it (12000 + 6000 of 24000) would
 // evict it, with the eviction grace at 0.
 func TestWSLOpenWindowDoesNotEvictForANativeCandidate(t *testing.T) {
-	vm := &vmVRAMScript{vm: map[int]int{0: 12000}}
+	vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 12000}}
 	w := liveWSL(wslVRAMSpec("W", 12000), 300, StateRunning)
 	o := wslVRAMOwner(vm, w)
 	o.wslWindow = &wslStartWindow{proc: w.proc}
@@ -1059,7 +1059,7 @@ func TestWSLSettleWakesANativeWaiter(t *testing.T) {
 	defer cancel()
 	nDone := ensureAsync(ctx, m, "n")
 	waitUntil(t, 8*time.Second, "W's window settles", func() bool {
-		return maps.Equal(statusFor(m, "W").MeasuredVRAM, map[int]int{0: 12000})
+		return maps.Equal(statusFor(m, "W").MeasuredVRAM, map[GPUKey]int{{Index: 0}: 12000})
 	})
 	select {
 	case got := <-nDone:
@@ -1089,7 +1089,7 @@ func TestWSLSettleReasksABlockedNativeRequest(t *testing.T) {
 	n.GPUs = []SpecGPU{{Index: 0, VRAMMB: 6000}}
 	n.AdmissionWaitTimeoutSeconds = 0
 	o := newWSLExecOwner(t, f, n)
-	vm := &vmVRAMScript{vm: map[int]int{0: 12000}}
+	vm := &vmVRAMScript{vm: map[GPUKey]int{{Index: 0}: 12000}}
 	vm.install(o.m)
 	wSpec := wslVRAMSpec("W", 0) // declares GPU 0, demand unknown
 	w := liveWSL(wSpec, 4242, StateRunning)
@@ -1106,7 +1106,7 @@ func TestWSLSettleReasksABlockedNativeRequest(t *testing.T) {
 		t.Fatalf("N started beside a busy unknown-demand occupant: %s", nst.state)
 	}
 	measureNow(t, o) // W's settle: {0:12000}
-	if o.wslWindow != nil || !maps.Equal(w.measuredVRAM, map[int]int{0: 12000}) {
+	if o.wslWindow != nil || !maps.Equal(w.measuredVRAM, map[GPUKey]int{{Index: 0}: 12000}) {
 		t.Fatalf("window %+v, W measured %v: want it settled at {0:12000}", o.wslWindow, w.measuredVRAM)
 	}
 	if nst.proc == nil {

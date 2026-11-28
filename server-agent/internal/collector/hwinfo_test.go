@@ -6,6 +6,7 @@ package collector
 import (
 	"context"
 	"op-ai-server-agent/internal/sample"
+	"slices"
 	"testing"
 )
 
@@ -19,7 +20,7 @@ func (fakeGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
 }
 
 func TestCollectHardware(t *testing.T) {
-	r := CollectHardware(context.Background(), []GPUCollector{fakeGPUCollector{}}, "9.9.9", HardwareOptions{})
+	r := CollectHardware(context.Background(), []GPUCollector{fakeGPUCollector{}}, "9.9.9", HardwareOptions{Vulkan: noVulkan})
 	if r.AgentVersion != "9.9.9" {
 		t.Fatalf("agent_version = %q", r.AgentVersion)
 	}
@@ -65,6 +66,93 @@ func TestHelperMemoryModulesNeeded(t *testing.T) {
 		helperGOOS, helperGeteuid = tc.goos, func() int { return tc.euid }
 		if got := HelperMemoryModulesNeeded(tc.report, HardwareOptions{HelperSocket: tc.socket}); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// fixedGPUCollector returns the GPUs it was given.
+type fixedGPUCollector struct{ gpus []sample.GPU }
+
+func (fixedGPUCollector) Name() string    { return "fixed" }
+func (fixedGPUCollector) Available() bool { return true }
+func (f fixedGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
+	return f.gpus, nil
+}
+
+func TestCollectHardwareCopiesVendor(t *testing.T) {
+	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", HardwareOptions{Vulkan: noVulkan})
+	if len(r.GPUs) != 1 || r.GPUs[0].Vendor != VendorAMD || r.GPUs[0].PCIBusID != "0000:02:00.0" {
+		t.Fatalf("%+v", r.GPUs)
+	}
+}
+
+func noVulkan(context.Context) ([]VulkanDevice, bool) { return nil, false }
+
+type erroringGPUCollector struct{}
+
+func (erroringGPUCollector) Name() string    { return "nvidia-smi" }
+func (erroringGPUCollector) Available() bool { return true }
+func (erroringGPUCollector) Collect(context.Context) ([]sample.GPU, error) {
+	return nil, context.DeadlineExceeded
+}
+
+// A collector that times out drops its GPUs from the report, but the legacy
+// vendor is the runtime's own (from the detection), so a partial AMD-only
+// report from a NVIDIA+AMD host still names nvidia.
+func TestCollectHardwareReportsRuntimeLegacyVendor(t *testing.T) {
+	amd := fixedGPUCollector{gpus: []sample.GPU{{Index: 0, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	opts := HardwareOptions{Vulkan: noVulkan, GPULegacyVendor: VendorNVIDIA}
+	r := CollectHardware(context.Background(), []GPUCollector{erroringGPUCollector{}, amd}, "x", opts)
+	if len(r.GPUs) != 1 || r.GPUs[0].Vendor != VendorAMD || r.GPULegacyVendor != VendorNVIDIA {
+		t.Fatalf("gpus=%+v legacy=%q", r.GPUs, r.GPULegacyVendor)
+	}
+}
+
+func vulkanFromFixture(t *testing.T, name string) func(context.Context) ([]VulkanDevice, bool) {
+	return func(context.Context) ([]VulkanDevice, bool) {
+		return parseVulkaninfo([]byte(readTestdata(t, name))), true
+	}
+}
+
+func TestCollectHardwareFillsMeasurabilityAndVulkanOrdinal(t *testing.T) {
+	opts := HardwareOptions{
+		VRAMMeasurable: func() map[string][]string { return map[string][]string{"amd": {"rocm", "vulkan"}} },
+		Vulkan:         vulkanFromFixture(t, "vulkaninfo-amd-2gpu.txt"),
+	}
+	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
+	g := r.GPUs[0]
+	if g.VulkanOrdinal == nil || *g.VulkanOrdinal != 1 || !slices.Equal(g.VRAMMeasurable, []string{"rocm", "vulkan"}) || r.VulkanDeviceCount != 3 {
+		t.Fatalf("%+v count=%d", g, r.VulkanDeviceCount)
+	}
+}
+
+func TestCollectHardwareWithoutVulkaninfo(t *testing.T) {
+	opts := HardwareOptions{
+		Vulkan:         noVulkan,
+		VRAMMeasurable: func() map[string][]string { return map[string][]string{"nvidia": {"cuda"}} },
+	}
+	c := fixedGPUCollector{gpus: []sample.GPU{{Index: 1, Vendor: VendorAMD, PCIBusID: "0000:02:00.0"}}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
+	if g := r.GPUs[0]; g.VulkanOrdinal != nil || g.VRAMMeasurable != nil || r.VulkanDeviceCount != 0 {
+		t.Fatalf("%+v count=%d", g, r.VulkanDeviceCount)
+	}
+}
+
+func TestCollectHardwareNVIDIAVulkanCount(t *testing.T) {
+	opts := HardwareOptions{Vulkan: vulkanFromFixture(t, "vulkaninfo-nvidia-2gpu.txt")}
+	c := fixedGPUCollector{gpus: []sample.GPU{
+		{Index: 0, Vendor: VendorNVIDIA, PCIBusID: "0000:01:00.0"},
+		{Index: 1, Vendor: VendorNVIDIA, PCIBusID: "0000:02:00.0"},
+	}}
+	r := CollectHardware(context.Background(), []GPUCollector{c}, "x", opts)
+	if r.VulkanDeviceCount != 2 {
+		t.Fatalf("count = %d", r.VulkanDeviceCount)
+	}
+	for i, g := range r.GPUs {
+		if g.VulkanOrdinal == nil || *g.VulkanOrdinal != i {
+			t.Fatalf("gpu %d: %+v", i, g)
 		}
 	}
 }

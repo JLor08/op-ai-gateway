@@ -2784,6 +2784,32 @@ const de = {
     'Ein llama.cpp-RPC-Cluster nutzt ein Mitglied auf diesem Server. Den Cluster stoppen (zuerst den Head) und die Messung erneut starten.',
   errorRuntimeDeviceBackendMismatch:
     'Das gewählte Geräte-Backend passt nicht zu den GPUs dieses Servers.',
+  errorRuntimeGPUVendorBackendMismatch:
+    'Das gewählte Geräte-Backend passt nicht zu den GPU-Herstellern dieses Servers.',
+  errorRuntimeVulkanMappingUnavailable:
+    'Die gewählten GPUs lassen sich auf diesem Server keinen Vulkan-Geräten zuordnen.',
+  errorRuntimeVulkanVisibleDevicesRequired:
+    'Für Vulkan auf einem Server mit mehreren GPU-Herstellern muss die Umgebungsvariable GGML_VK_VISIBLE_DEVICES gesetzt sein.',
+  errorGPUVendorBackendMismatch:
+    'Das gewählte Geräte-Backend passt nicht zu den Herstellern der gewählten GPUs.',
+  errorVulkanVisibleDevicesRequired:
+    'Für Vulkan auf einem Server mit mehreren GPU-Herstellern muss GGML_VK_VISIBLE_DEVICES gesetzt sein.',
+  errorGPUVendorInvalid: 'Der GPU-Hersteller ist ungültig (erlaubt: nvidia, amd, apple).',
+  errorGPUVendorUnsupported:
+    'Dieser Server unterstützt GPU-Hersteller in der Konfiguration noch nicht.',
+  errorClusterMemberAmbiguous:
+    'Das Cluster-Mitglied ist nicht eindeutig; die Position des Mitglieds muss angegeben werden.',
+  runtimeBackendResolvesTo: (backend: string) => `auto → ${backend}`,
+  runtimeBackendMismatchHint:
+    'Dieses Backend passt nicht zu den Herstellern der gewählten GPUs und wird beim Start abgelehnt.',
+  hardwareGpuVendor: 'Hersteller',
+  hardwareVulkanOrdinal: 'Vulkan-Gerät',
+  hardwareVramMeasurable: 'VRAM messbar über',
+  gpuLegacyMappedNote: (vendor: string) =>
+    `Bestehende GPU-Einträge dieses Servers wurden dem Hersteller ${vendor} zugeordnet.`,
+  gpuLegacyMappedDismiss: 'Verstanden',
+  clusterMemberSameServerNote:
+    'Dieses Mitglied läuft auf dem Server des Heads und wird deshalb über die Loopback-Adresse (127.0.0.1) angesprochen.',
   errorRuntimeRpcDeviceCountMismatch:
     'Der RPC-Server meldet eine andere Anzahl Geräte als konfiguriert.',
   errorRuntimeRpcUnsupportedBuild: 'Dieses Binary wurde ohne RPC-Unterstützung gebaut.',
@@ -6990,6 +7016,31 @@ const en: PortalMessages = {
   errorBenchmarkVramClusterMemberHeld:
     'A llama.cpp RPC cluster uses a member on this server. Stop that cluster (head first) and run the measurement again.',
   errorRuntimeDeviceBackendMismatch: "The chosen device backend does not match this server's GPUs.",
+  errorRuntimeGPUVendorBackendMismatch:
+    "The chosen device backend does not match this server's GPU vendors.",
+  errorRuntimeVulkanMappingUnavailable:
+    'The chosen GPUs cannot be mapped to Vulkan devices on this server.',
+  errorRuntimeVulkanVisibleDevicesRequired:
+    'Vulkan on a server with several GPU vendors needs the GGML_VK_VISIBLE_DEVICES environment variable.',
+  errorGPUVendorBackendMismatch:
+    'The chosen device backend does not match the vendors of the selected GPUs.',
+  errorVulkanVisibleDevicesRequired:
+    'Vulkan on a server with several GPU vendors needs GGML_VK_VISIBLE_DEVICES to be set.',
+  errorGPUVendorInvalid: 'The GPU vendor is invalid (allowed: nvidia, amd, apple).',
+  errorGPUVendorUnsupported: 'This server does not support GPU vendors in the configuration yet.',
+  errorClusterMemberAmbiguous:
+    'The cluster member is ambiguous; the member position must be given.',
+  runtimeBackendResolvesTo: (backend: string) => `auto → ${backend}`,
+  runtimeBackendMismatchHint:
+    'This backend does not fit the vendors of the selected GPUs and is refused at start.',
+  hardwareGpuVendor: 'Vendor',
+  hardwareVulkanOrdinal: 'Vulkan device',
+  hardwareVramMeasurable: 'VRAM measurable via',
+  gpuLegacyMappedNote: (vendor: string) =>
+    `Existing GPU entries of this server were assigned to the vendor ${vendor}.`,
+  gpuLegacyMappedDismiss: 'Got it',
+  clusterMemberSameServerNote:
+    "This member runs on the head's server and is therefore addressed over the loopback address (127.0.0.1).",
   errorRuntimeRpcDeviceCountMismatch:
     'The RPC server reports a different number of devices than configured.',
   errorRuntimeRpcUnsupportedBuild: 'This binary was built without RPC support.',

@@ -15,7 +15,9 @@ import (
 // NewKFDMeasurer returns the KFD sysfs per-process VRAM measurer, or nil when
 // the host has no KFD GPU to measure (no amdgpu compute driver, or only CPU
 // topology nodes). Nil leaves the operator's VRAM estimates standing, exactly
-// as on any host without a measurer.
+// as on any host without a measurer. It is the AMD fallback: NewVRAMMeasurer
+// uses it only when the DRM fdinfo self-probe fails (probeDRMFdinfo), and
+// never adds it to fdinfo values.
 func NewKFDMeasurer() func(pids []int) map[int]map[int]int {
 	ordinals, err := kfdGPUOrdinals(kfdRoot)
 	if err != nil || len(ordinals) == 0 {

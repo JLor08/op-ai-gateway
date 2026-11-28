@@ -114,12 +114,14 @@ func memberBind(spec Spec, childPort int) (host string, port int, err error) {
 }
 
 // memberArgs is the member's command line: the operator's arguments followed by
-// the agent-owned -d (local devices named with the backend prefix, or CPU when
-// the spec has no GPUs), -H, -p and, when the cache is on, -c. childPort is the
-// loopback port a relay member's child binds; direct members ignore it. A
-// member never runs in visibility-variable mode, so device names carry the
-// declared host indices.
-func memberArgs(spec Spec, childPort int, prefix string) ([]string, error) {
+// the agent-owned -d (names, the member's device plan, joined; CPU when the
+// spec has no GPUs), -H, -p and, when the cache is on, -c. childPort is the
+// loopback port a relay member's child binds; direct members ignore it. The
+// names carry the declared host indices, with one exception: a Vulkan member on
+// a host with NVIDIA and AMD GPUs runs with GGML_VK_VISIBLE_DEVICES injected
+// (memberDevicePlan), and its names are the renumbered Vulkan0.. of that
+// filtered list.
+func memberArgs(spec Spec, childPort int, names []string) ([]string, error) {
 	if memberFlagReserved(spec.Args) {
 		return nil, errMemberFlagReserved
 	}
@@ -128,11 +130,11 @@ func memberArgs(spec Spec, childPort int, prefix string) ([]string, error) {
 		return nil, err
 	}
 	devices := "CPU"
-	if len(gpuIndices(spec)) > 0 {
-		if prefix == "" {
-			return nil, errors.New("runtime: an rpc_server member with GPUs needs a device backend")
+	if len(spec.GPUs) > 0 {
+		if len(names) == 0 {
+			return nil, errors.New("runtime: an rpc_server member with GPUs needs its device names")
 		}
-		devices = strings.Join(localDeviceNames(spec, prefix, false), ",")
+		devices = strings.Join(names, ",")
 	}
 	args := make([]string, 0, len(spec.Args)+7)
 	args = append(args, spec.Args...)
@@ -166,13 +168,17 @@ func validMemberHeadID(headID string) error {
 
 // memberEnv is the environment the agent adds to a member's launch: RDMA is
 // switched off (the transport is plain TCP, and an RDMA probe stalls the
-// start), and, with the cache on, the per-head cache directory.
-func memberEnv(spec Spec, cacheRoot string) []string {
+// start), with the cache on the per-head cache directory, and the visibility
+// variable of the member's device plan when it injects one.
+func memberEnv(spec Spec, cacheRoot string, plan devicePlan) []string {
 	env := []string{"GGML_RPC_NO_RDMA=1"}
 	if spec.RPC != nil && spec.RPC.CacheEnabled {
 		if dir, err := memberCacheDir(cacheRoot, spec.RPC.HeadSpecID); err == nil {
 			env = append(env, "LLAMA_CACHE="+dir)
 		}
+	}
+	if plan.VisVar != "" {
+		env = append(env, plan.VisVar+"="+plan.VisValue)
 	}
 	return env
 }
@@ -216,13 +222,23 @@ func memberIdleTimeout(spec Spec) time.Duration {
 // operator's) and environment (memberEnv), so the command the start reports
 // is exactly the one it executes. The operator's entries keep their secret
 // spans; the agent's carry none, since a device list, a bind address, a port
-// and a cache path are no secrets. A returned error is a verdict the spec can
-// never launch as written (not_permitted); the cache directory is created
-// here, before anything is exec'd.
+// and a cache path are no secrets (nor is a list of Vulkan ordinals). A
+// returned error is a verdict the spec can never launch as written
+// (not_permitted), and a device plan refusal keeps its *GPUPlanError so the
+// start records its stable code. A spec env entry that hand-sets the variable
+// the plan injects is refused: the agent's device list is numbered against its
+// own value. The cache directory is created here, before anything is exec'd.
 func (o *owner) prepareMember(spec Spec, ex expandedSpec) (out expandedSpec, port int, err error) {
-	prefix, err := o.memberDevicePrefix(spec)
+	plan, err := o.memberDevicePlan(spec)
 	if err != nil {
 		return expandedSpec{}, 0, err
+	}
+	if plan.VisVar != "" {
+		for k := range spec.Env {
+			if strings.EqualFold(k, plan.VisVar) {
+				return expandedSpec{}, 0, fmt.Errorf("runtime: spec env %q conflicts with the agent's device plan: this member's devices are pinned through %s, which the agent sets itself -- remove the env entry", k, plan.VisVar)
+			}
+		}
 	}
 	if spec.RPC.Transport == "relay" {
 		if port, err = grabEphemeralPort(); err != nil {
@@ -231,7 +247,7 @@ func (o *owner) prepareMember(spec Spec, ex expandedSpec) (out expandedSpec, por
 	}
 	withArgs := spec
 	withArgs.Args = ex.args
-	args, err := memberArgs(withArgs, port, prefix)
+	args, err := memberArgs(withArgs, port, plan.Names)
 	if err != nil {
 		return expandedSpec{}, 0, err
 	}
@@ -243,7 +259,7 @@ func (o *owner) prepareMember(spec Spec, ex expandedSpec) (out expandedSpec, por
 			return expandedSpec{}, 0, err
 		}
 	}
-	return withAgentEntries(ex, args[len(ex.args):], memberEnv(spec, o.configFilesDir)), port, nil
+	return withAgentEntries(ex, args[len(ex.args):], memberEnv(spec, o.configFilesDir, plan)), port, nil
 }
 
 // withAgentEntries returns ex with args and env appended: entries the agent
@@ -259,18 +275,36 @@ func withAgentEntries(ex expandedSpec, args, env []string) expandedSpec {
 	return out
 }
 
-// memberDevicePrefix is the backend prefix of the member's -d device names,
-// "" for a member without GPUs (it runs on CPU).
-func (o *owner) memberDevicePrefix(spec Spec) (string, error) {
-	if len(gpuIndices(spec)) == 0 {
-		return "", nil
+// memberDevicePlan is the member's device decision: its -d names and the
+// visibility variable, if any, the agent injects. A member without GPUs gets
+// the empty plan (it runs on CPU). The backend resolves from the vendors of the
+// member's own GPUs (resolveDevicePrefix), and a backend that cannot drive one
+// of them is refused with its stable code.
+//
+// A member never runs in visibility-variable mode on its own (permitMember),
+// so the plan is made for a copy of the spec whose set_visible_devices is on,
+// in env mode, exactly when it is a Vulkan member on a host with NVIDIA and AMD
+// GPUs: there ggml numbers the devices of its filtered list, not the loader's
+// order, so the member is pinned through GGML_VK_VISIBLE_DEVICES. Every other
+// member keeps its declared host indices and gets no variable. The member's
+// own spec is never modified.
+func (o *owner) memberDevicePlan(spec Spec) (devicePlan, error) {
+	if len(spec.GPUs) == 0 {
+		return devicePlan{}, nil
 	}
-	vendors := newDeviceContext(spec, o.gpuVendor, o.gpuVendors).vendors
-	prefix, err := ResolveDeviceBackend(spec, vendors)
+	topo := o.topology().forSpec(spec)
+	prefix, err := resolveDevicePrefix(spec, topo)
 	if err != nil {
-		return "", fmt.Errorf("runtime: %w", err)
+		return devicePlan{}, fmt.Errorf("runtime: %w", err)
 	}
-	return prefix, nil
+	planned := spec
+	planned.SetVisibleDevices = topo.Mixed() && prefix == backendVulkan
+	planned.VisibleDevicesMode = VisibleDevicesModeEnv
+	plan, err := planDevices(planned, topo)
+	if err != nil {
+		return devicePlan{}, fmt.Errorf("runtime: %w", err)
+	}
+	return plan, nil
 }
 
 // prepareMemberCache creates the cache-enabled member's per-head cache
@@ -626,7 +660,7 @@ func permitMember(spec Spec) error {
 		return errMemberFlagReserved
 	}
 	if spec.SetVisibleDevices && spec.VisibleDevicesMode != VisibleDevicesModeArgs {
-		return errors.New("runtime: set_visible_devices in env mode is not supported on rpc_server specs: the agent names the member's devices by their host indices")
+		return errors.New("runtime: set_visible_devices in env mode is not supported on rpc_server specs: the agent decides the member's device list and any visibility variable itself")
 	}
 	if spec.RPC.CacheEnabled {
 		return validMemberHeadID(spec.RPC.HeadSpecID)

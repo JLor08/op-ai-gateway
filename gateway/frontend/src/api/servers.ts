@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 OnPrem AI Gateway contributors
 
-import { type Fetcher, PortalApiError, buildQueryString, request, subscribeSSE } from './transport';
+import {
+  type Fetcher,
+  PortalApiError,
+  buildQueryString,
+  request,
+  requestNoContent,
+  subscribeSSE,
+} from './transport';
 import type { AdminGroupCandidate } from './groups';
+import type { GpuVendor } from './gpus';
 
 export type ServerOwner = {
   id: string;
@@ -82,6 +90,10 @@ export type PortalServer = {
   admin_groups: { id: string; name: string }[];
   system_group_id: string;
   system_group_name: string;
+  // The vendor the legacy (vendorless) GPU rows of this server were mapped to,
+  // and whether the operator still has to acknowledge that mapping.
+  gpu_legacy_vendor?: GpuVendor;
+  gpu_vendor_note?: boolean;
   // Per-server certificate-management opt-in/opt-out override (certificates
   // feature): "" (follow cert_server_scope), "include" (opt in — meaningful
   // in "selected" scope), or "exclude" (opt out — meaningful in "all"
@@ -330,6 +342,7 @@ export type ServerResourceGroup = { id: string; name: string; member: boolean };
 // byte-for-byte.
 export type PerfGPU = {
   index: number;
+  vendor?: GpuVendor;
   name: string;
   uuid: string;
   util_pct: number;
@@ -409,11 +422,16 @@ export type HardwareBIOS = { vendor: string; version: string };
 // identity -- GPU rows, budgets and admission all key on `index`.
 export type HardwareGPU = {
   index: number;
+  vendor?: GpuVendor;
   name: string;
   uuid?: string;
   driver_version?: string;
   memory_total_bytes: number;
   pci_bus_id?: string;
+  // Backends that can measure this GPU's VRAM on the host; absent on an older agent.
+  vram_measurable?: ('cuda' | 'rocm' | 'vulkan')[];
+  // The GPU's ordinal in the Vulkan device list; absent when unknown.
+  vulkan_ordinal?: number;
 };
 export type HardwareReport = {
   collected_at: string;
@@ -427,6 +445,8 @@ export type HardwareReport = {
   mainboard: HardwareMainboard;
   bios: HardwareBIOS;
   gpus: HardwareGPU[];
+  // Number of devices the host's Vulkan loader lists; absent when not probed.
+  vulkan_device_count?: number;
 };
 // `report` is `| null` as well as optional for the same reason as
 // RuntimeReport.report (api/runtime.ts): `report,omitempty` on a
@@ -579,6 +599,7 @@ export type CapacityReportDTO = {
 // "verified"), and "" means no identifying field was available at all.
 export type VRAMGPUItemDTO = {
   index: number;
+  vendor?: GpuVendor;
   fingerprint?: string;
   fingerprint_kind?: string;
   unified_memory?: boolean;
@@ -808,6 +829,13 @@ export function serversApi(fetcher: Fetcher) {
         {
           method: 'POST',
         },
+      ),
+    // Acknowledges the note that legacy GPU rows were mapped to a vendor (204).
+    dismissGpuVendorNote: (serverId: string) =>
+      requestNoContent(
+        fetcher,
+        `/api/portal/servers/${encodeURIComponent(serverId)}/gpu-vendor-note/dismiss`,
+        { method: 'POST' },
       ),
     revokeAgentToken: (serverId: string) =>
       request<{ ok: boolean }>(

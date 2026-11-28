@@ -28,9 +28,10 @@ var (
 	ErrRPCMemberDeviceBackendInvalid = errors.New("runtime_spec.device_backend_invalid")
 	// ErrRPCMemberVRAMEstimateRequired rejects a GPU row without a VRAM
 	// estimate when its VRAM cannot be measured: the report lists the GPU as
-	// non-NVIDIA, except AMD on a Linux host with only AMD GPUs under the
-	// ROCm or auto device backend (measured from KFD, ADR-113). Admission
-	// needs the operator's number for every other non-NVIDIA GPU.
+	// non-NVIDIA and its vram_measurable does not name the member's resolved
+	// backend (gpuMeasurable); a report without that list keeps the KFD rule
+	// (AMD on a Linux host with only AMD GPUs, ROCm or auto backend, ADR-113).
+	// Admission needs the operator's number for every other non-NVIDIA GPU.
 	ErrRPCMemberVRAMEstimateRequired = errors.New("runtime_spec.member_vram_estimate_required")
 	// ErrRPCMemberInUse rejects disabling or deleting a member spec that a
 	// cluster head still references.
@@ -147,11 +148,42 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 	if err != nil {
 		return "", false, err
 	}
+	// The GPU vendors are normalized after the request checks, the newest
+	// refusals of the request; a (vendor, index) the stored spec already has
+	// is re-saved as it is (gpuVendorRules.normalizeAt).
+	var storedKeys []routing.GPUKey
+	if prior.ID != "" {
+		rows, err := s.routes.RPCMemberSpecGPUs(ctx, prior.ID)
+		if err != nil {
+			return "", false, err
+		}
+		for _, r := range rows {
+			storedKeys = append(storedKeys, routing.GPUKey{Vendor: r.GPUVendor, Index: r.GPUIndex})
+		}
+	}
+	vendors := s.gpuVendorRulesWith(server.ID, server.GPULegacyVendor).withStored(storedKeys)
+	if req.GPUs, err = vendors.normalizeSpecGPUVendors(req.GPUs); err != nil {
+		return "", false, err
+	}
+	// A backend that cannot drive one of the GPUs is refused unless the
+	// write leaves the stored spec's backend and GPUs as they are
+	// (refusalUnlessUnchanged); a member is exempt from the Vulkan
+	// visibility rule, the agent pins its devices itself.
+	var stored *devicePlanInputs
+	if prior.ID != "" {
+		in := newDevicePlanInputs(prior.DeviceBackend, storedKeys, vendors.legacy, false)
+		stored = &in
+	}
+	keys := specGPUKeys(req.GPUs)
+	if err := refusalUnlessUnchanged(specDeviceRefusal(backend, keys, vendors.legacy, false, false),
+		newDevicePlanInputs(backend, keys, vendors.legacy, false), stored); err != nil {
+		return "", false, err
+	}
 	groups, err := s.rpcMemberHeadGroups(ctx, server.ID, req.AllowedHeadGroups, prior)
 	if err != nil {
 		return "", false, err
 	}
-	if err := s.requireRPCMemberVRAMEstimates(ctx, server.ID, req.GPUs, backend); err != nil {
+	if err := s.requireRPCMemberVRAMEstimates(ctx, server.ID, vendors.legacy, req.GPUs, backend); err != nil {
 		return "", false, err
 	}
 	enabled := req.Enabled == nil || *req.Enabled
@@ -184,7 +216,7 @@ func (s *Service) writeRPCMemberSpec(ctx context.Context, p auth.Token, server r
 	}
 	gpuRows := make([]routing.RPCMemberSpecGPU, len(req.GPUs))
 	for i, g := range req.GPUs {
-		gpuRows[i] = routing.RPCMemberSpecGPU{SpecID: row.ID, GPUIndex: g.Index, Position: i, VRAMEstimateMB: g.VRAMEstimateMB}
+		gpuRows[i] = routing.RPCMemberSpecGPU{SpecID: row.ID, GPUVendor: g.Vendor, GPUIndex: g.Index, Position: i, VRAMEstimateMB: g.VRAMEstimateMB}
 	}
 	if err := s.routes.ReplaceRPCMemberSpec(ctx, row, gpuRows); err != nil {
 		return "", false, err
@@ -351,10 +383,12 @@ func (s *Service) rpcMemberHeadGroups(ctx context.Context, serverID string, requ
 
 // requireRPCMemberVRAMEstimates enforces the estimate for every declared GPU
 // that has none, is known to be non-NVIDIA and whose VRAM the agent cannot
-// measure (memberGPUMeasurable with the spec's device backend). A GPU whose
-// vendor cannot be determined (no hardware report, an unreadable one, or an
-// index the report does not list) keeps the estimate optional.
-func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID string, gpus []RuntimeSpecGPUDTO, backend string) error {
+// measure for the spec's resolved device backend (gpuMeasurable). A GPU
+// whose vendor cannot be determined (no hardware report, an unreadable one,
+// or a card the report does not list) keeps the estimate optional. Each GPU
+// is looked up by its key, the empty vendor read as the server's legacy
+// vendor legacy.
+func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID, legacy string, gpus []RuntimeSpecGPUDTO, backend string) error {
 	if !slices.ContainsFunc(gpus, func(g RuntimeSpecGPUDTO) bool { return g.VRAMEstimateMB == 0 }) {
 		return nil
 	}
@@ -362,29 +396,47 @@ func (s *Service) requireRPCMemberVRAMEstimates(ctx context.Context, serverID st
 	if err != nil {
 		return err
 	}
+	resolved, _ := resolveSpecBackend(backend, specGPUVendors(specGPUKeys(gpus), legacy))
 	if slices.ContainsFunc(gpus, func(g RuntimeSpecGPUDTO) bool {
-		return g.VRAMEstimateMB == 0 && knownNonNVIDIA(host, g.Index) && !memberGPUMeasurable(host[g.Index], backend)
+		return g.VRAMEstimateMB == 0 && unmeasuredNonNVIDIA(host, routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, legacy, resolved)
 	}) {
 		return ErrRPCMemberVRAMEstimateRequired
 	}
 	return nil
 }
 
-// gpuLooksAMD recognises an AMD card by its name keywords ("amd", "radeon",
-// "instinct"), case-insensitively.
-func gpuLooksAMD(name string) bool {
+// specGPUKeys are the GPU keys of gpus in order.
+func specGPUKeys(gpus []RuntimeSpecGPUDTO) []routing.GPUKey {
+	keys := make([]routing.GPUKey, len(gpus))
+	for i, g := range gpus {
+		keys[i] = routing.GPUKey{Vendor: g.Vendor, Index: g.Index}
+	}
+	return keys
+}
+
+// gpuLooksAMD recognises an AMD card: by its reported vendor when the report
+// has one, else (an older agent's vendor-less report) by its name keywords
+// ("amd", "radeon", "instinct"), case-insensitively.
+func gpuLooksAMD(vendor, name string) bool {
+	if v := strings.ToLower(strings.TrimSpace(vendor)); v != "" {
+		return v == routing.GPUVendorAMD
+	}
 	n := strings.ToLower(name)
 	return strings.Contains(n, "amd") || strings.Contains(n, "radeon") || strings.Contains(n, "instinct")
 }
 
-// gpuLooksNVIDIA recognises an NVIDIA card in a hardware report, which has no
-// vendor field. Both the NVIDIA and the AMD collector fill pci_bus_id, so a
-// name that marks the card as AMD (gpuLooksAMD) is checked first and always
-// means not NVIDIA. Otherwise an NVIDIA name keyword or a non-empty bus id
-// means NVIDIA; the bus id stays the fallback for NVIDIA names that carry no
-// keyword (an "H100 PCIe", say).
-func gpuLooksNVIDIA(name, pciBusID string) bool {
-	if gpuLooksAMD(name) {
+// gpuLooksNVIDIA recognises an NVIDIA card in a hardware report: by its
+// reported vendor when the report has one. An older agent's report has no
+// vendor, so the name decides: both the NVIDIA and the AMD collector fill
+// pci_bus_id, so a name that marks the card as AMD (gpuLooksAMD) is checked
+// first and always means not NVIDIA. Otherwise an NVIDIA name keyword or a
+// non-empty bus id means NVIDIA; the bus id stays the fallback for NVIDIA
+// names that carry no keyword (an "H100 PCIe", say).
+func gpuLooksNVIDIA(vendor, name, pciBusID string) bool {
+	if v := strings.ToLower(strings.TrimSpace(vendor)); v != "" {
+		return v == routing.GPUVendorNVIDIA
+	}
+	if gpuLooksAMD("", name) {
 		return false
 	}
 	n := strings.ToLower(name)
@@ -506,7 +558,7 @@ func (s *Service) rpcMemberSpecDTO(ctx context.Context, p auth.Token, spec routi
 	}
 	gpus := make([]RuntimeSpecGPUDTO, 0, len(rows))
 	for _, r := range rows {
-		gpus = append(gpus, RuntimeSpecGPUDTO{Index: r.GPUIndex, VRAMEstimateMB: r.VRAMEstimateMB})
+		gpus = append(gpus, RuntimeSpecGPUDTO{Vendor: r.GPUVendor, Index: r.GPUIndex, VRAMEstimateMB: r.VRAMEstimateMB})
 	}
 	backend := spec.DeviceBackend
 	if backend == "" {

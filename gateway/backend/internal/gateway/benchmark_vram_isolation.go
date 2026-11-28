@@ -222,10 +222,17 @@ type vramRunPlanned struct {
 	// drains.
 	ensure   bool
 	warnings []string
-	// baseline is the latest GPU-bearing sample the preconditions read. It
-	// decides which cards are watched and supplies each card's fingerprint;
-	// the actual baseline numbers come from a fresh stable window.
+	// baseline is the latest GPU-bearing sample the preconditions read, its
+	// vendor-less GPUs resolved to legacyVendor. It decides which cards are
+	// watched and supplies each card's fingerprint; the actual baseline
+	// numbers come from a fresh stable window.
 	baseline routing.TelemetrySample
+	// legacyVendor is the server's stored legacy GPU vendor
+	// (AIServer.GPULegacyVendor, read with the target): the vendor a GPU
+	// without one stands for, in the spec's rows, the telemetry samples and
+	// the agent's status frames alike (resolvedGPUKey). Every key the run
+	// reads is resolved with it, so all three name a card the same way.
+	legacyVendor string
 	// unifiedMemory marks a host whose per-GPU figures are unified SYSTEM
 	// memory rather than dedicated VRAM.
 	unifiedMemory bool
@@ -366,7 +373,9 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 	if vramClusterMemberClaimed(s.RuntimeStatus.statusRows(serverID), time.Now()) {
 		return vramRunPlanned{}, &vramRefusal{code: codeBenchmarkVRAMClusterMemberHeld, msg: msgBenchmarkVRAMClusterMemberHeld}
 	}
-	planned := vramRunPlanned{baseline: baseline, specIDs: specIDs, targetSpecID: targetSpec.ID}
+	legacyVendor := tgt.server.GPULegacyVendor
+	baseline = vramResolveSampleVendors(baseline, legacyVendor)
+	planned := vramRunPlanned{baseline: baseline, specIDs: specIDs, targetSpecID: targetSpec.ID, legacyVendor: legacyVendor}
 	// P1 again, by the other route: an agent-managed application whose target
 	// mapping has no ENABLED spec has no agent-managed process to measure --
 	// the agent's router has nothing to route to, so the load would fail
@@ -381,11 +390,11 @@ func (s *Server) vramRunPlan(ctx context.Context, tgt benchmarkTarget) (vramRunP
 		return vramRunPlanned{}, err
 	}
 
-	// P5: a declared GPU index this host does not report can never hold still,
+	// P5: a declared GPU this host does not report can never hold still,
 	// so every stability window would burn its bound and the run would report
 	// baseline_unstable -- after draining the fleet, and with a next action
 	// that can never work. See codeBenchmarkVRAMDeclaredGPUMissing.
-	if err := s.vramDeclaredGPUMissing(ctx, planned.targetSpecID, baseline); err != nil {
+	if err := s.vramDeclaredGPUMissing(ctx, planned.targetSpecID, legacyVendor, baseline); err != nil {
 		return vramRunPlanned{}, err
 	}
 

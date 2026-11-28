@@ -54,6 +54,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -230,7 +231,7 @@ var (
 
 // measurerFunc mirrors SetMeasurer's function parameter, named so it can be
 // held behind an atomic.Pointer.
-type measurerFunc func(pids []int) map[int]map[int]int
+type measurerFunc func(pids []int) map[int]map[GPUKey]int
 
 // ramMeasurerFunc mirrors SetRAMMeasurer's function parameter, named so it can
 // be held behind an atomic.Pointer. It is deliberately not measurerFunc: host
@@ -253,10 +254,11 @@ type ManagerOptions struct {
 	Getenv func(string) string
 	// GPUVendor is the GPU stack this HOST actually has, discovered locally
 	// by main.go from collector.DetectGPUCollectors() -- never a
-	// gateway-supplied value. It selects the environment variable a
-	// SetVisibleDevices spec gets (VisibleDevicesVar); its zero value,
-	// GPUVendorNone, is the correct answer for a CPU-only host and makes
-	// that option a no-op rather than an error.
+	// gateway-supplied value. It is the legacy vendor: the one a spec GPU
+	// with an empty vendor stands for (resolveLegacyGPUVendors) and the one
+	// the per-spec device plan falls back to (GPUTopology.Legacy); its zero
+	// value, GPUVendorNone, is the correct answer for a CPU-only host and
+	// makes set_visible_devices a no-op rather than an error.
 	GPUVendor GPUVendor
 
 	// GPUVendors is the full detected vendor set (see GPUVendors). Optional;
@@ -809,10 +811,11 @@ func (m *Manager) Transitions() <-chan struct{} {
 // (main.go wires this to collector.NewVRAMMeasurer, which picks a
 // platform-appropriate one: PDH + D3DKMT on Windows, where nvidia-smi's
 // per-process query returns [N/A] under WDDM, and nvidia-smi
-// --query-compute-apps elsewhere, with AMD KFD sysfs as the Linux fallback).
+// --query-compute-apps elsewhere, and on Linux an AMD measurer beside it --
+// DRM fdinfo, with KFD sysfs as the fallback -- keyed by vendor).
 // f may be nil to go back to estimates only, which is also NewManager's
 // default -- measurement is a hardware capability, not a negotiated protocol
-// feature, so every Apple, CPU-only, AMD-on-Windows and non-KFD AMD host
+// feature, so every Apple, CPU-only, AMD-on-Windows and unmeasurable AMD host
 // simply never installs one and is entirely unaffected by everything below.
 //
 // f is called from TWO places, and it must be safe for concurrent use because
@@ -839,7 +842,10 @@ func (m *Manager) Transitions() <-chan struct{} {
 // performance-counter provider is a broken host, and the alternative is a
 // goroutine handing an abandoned buffer to the kernel), not overlooked -- but
 // do not read "the shipped measurer is deadline-bounded" off this comment.
-func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[int]int) {
+// The Linux AMD measurers are in-process reads of procfs and sysfs files
+// (one /proc scan plus the fdinfo of each managed group's DRM fds, or the KFD
+// sysfs tree), likewise under no deadline and likewise cheap.
+func (m *Manager) SetMeasurer(f func(pids []int) map[int]map[GPUKey]int) {
 	if f == nil {
 		m.measurer.Store(nil)
 		return
@@ -905,19 +911,32 @@ func (m *Manager) SetWSLVMPIDs(f func() []int) {
 // HostInfo is the latest hardware sample as far as admission is concerned: the
 // figures the owner cannot get from a managed process's own measurement.
 //
-// GPUTotalsMB maps a GPU index (the same index spec.GPUs and GPUBudget use) to
-// that device's total memory in MB, as the GPU collector last reported it. An
-// index the collector did not report, or reported as 0, is simply absent --
-// there is nothing detected for it, which is never the same as "a device with
-// no memory".
+// GPUTotalsMB maps a GPU key (the same vendor and index spec.GPUs and
+// GPUBudget use) to that device's total memory in MB, as the GPU collector
+// last reported it. A GPU the collector did not report, or reported as 0, is
+// simply absent -- there is nothing detected for it, which is never the same
+// as "a device with no memory".
 //
 // MemAvailableMB is the host RAM obtainable right now (the sample's
 // MemAvailable, not total-minus-used), in MB. 0 means "no reading": either no
 // sample has arrived yet or the read failed, and a consumer must treat it as
 // unknown rather than as an exhausted host.
+//
+// Vulkan is the host's Vulkan device mapping (see VulkanMap); its zero value
+// is "unknown".
 type HostInfo struct {
-	GPUTotalsMB    map[int]int
+	GPUTotalsMB    map[GPUKey]int
 	MemAvailableMB int
+	Vulkan         VulkanMap
+}
+
+// VulkanMap is how the host's Vulkan devices line up with its GPUs: Ordinals
+// maps a GPU's key to its Vulkan device ordinal, and DeviceCount is the number
+// of Vulkan devices the host exposes. A GPU absent from Ordinals has no known
+// ordinal; a DeviceCount of 0 is unknown or none.
+type VulkanMap struct {
+	Ordinals    map[GPUKey]int
+	DeviceCount int
 }
 
 // SetHostInfo records the newest hardware figures for the owner's next
@@ -927,9 +946,10 @@ type HostInfo struct {
 // number, never poll hardware or shell out. Each call replaces the previous one
 // wholesale.
 //
-// The manager keeps its own copy of the GPUTotalsMB map. The caller is a
-// different goroutine from the owner that reads it, so retaining the caller's
-// map would let a caller that goes on to reuse or edit it race that read.
+// The manager keeps its own copy of the GPUTotalsMB and Vulkan.Ordinals maps.
+// The caller is a different goroutine from the owner that reads them, so
+// retaining the caller's maps would let a caller that goes on to reuse or edit
+// them race that read.
 //
 // Storing is not the whole job. The host-RAM pool is built from the live
 // MemAvailable, so the sample that follows a victim's exit is the one that
@@ -941,12 +961,12 @@ type HostInfo struct {
 // owner.wakeOnHostSample). It never blocks this caller, and costs the owner
 // nothing when no such start is waiting.
 func (m *Manager) SetHostInfo(hi HostInfo) {
-	cp := HostInfo{MemAvailableMB: hi.MemAvailableMB}
+	cp := HostInfo{MemAvailableMB: hi.MemAvailableMB, Vulkan: VulkanMap{DeviceCount: hi.Vulkan.DeviceCount}}
 	if len(hi.GPUTotalsMB) > 0 {
-		cp.GPUTotalsMB = make(map[int]int, len(hi.GPUTotalsMB))
-		for i, mb := range hi.GPUTotalsMB {
-			cp.GPUTotalsMB[i] = mb
-		}
+		cp.GPUTotalsMB = maps.Clone(hi.GPUTotalsMB)
+	}
+	if len(hi.Vulkan.Ordinals) > 0 {
+		cp.Vulkan.Ordinals = maps.Clone(hi.Vulkan.Ordinals)
 	}
 	m.hostInfo.Store(&cp)
 	m.hostSeq.Add(1)
@@ -954,6 +974,61 @@ func (m *Manager) SetHostInfo(hi HostInfo) {
 	case m.hostWake <- struct{}{}:
 	default: // a wake is already pending; it will see this value too
 	}
+}
+
+// topology is the host's GPU topology for the per-spec device plan: the legacy
+// vendor, the host's vendors, and the Vulkan device mapping of the latest
+// hardware report. The vendors are those of the GPUs the agent reported
+// (reportedGPUVendors), as the portal sees them, so an NVIDIA-only box that
+// merely has rocm-smi installed is not "mixed"; only before any GPU was
+// reported do the detected ones stand in (the legacy one alone when only it
+// was given).
+func (o *owner) topology() GPUTopology {
+	hi := o.hostInfo()
+	vendors := reportedGPUVendors(hi)
+	if len(vendors) == 0 {
+		vendors = o.gpuVendors
+	}
+	if len(vendors) == 0 && o.gpuVendor != GPUVendorNone {
+		vendors = GPUVendors{o.gpuVendor}
+	}
+	return GPUTopology{Legacy: o.gpuVendor, Vendors: vendors, Vulkan: hi.Vulkan}
+}
+
+// gpuVendorPrecedence is the order vendors are listed in: the legacy-vendor
+// precedence of detection (nvidia, amd, apple).
+var gpuVendorPrecedence = GPUVendors{GPUVendorNVIDIA, GPUVendorAMD, GPUVendorApple}
+
+// reportedGPUVendors lists, in gpuVendorPrecedence order, the vendors of the
+// GPUs in hi: its last-known GPU totals and its Vulkan map. Nil when hi names
+// no GPU of a recognised vendor.
+func reportedGPUVendors(hi HostInfo) GPUVendors {
+	present := make(map[GPUVendor]bool, len(gpuVendorPrecedence))
+	for k := range hi.GPUTotalsMB {
+		present[k.Vendor] = true
+	}
+	for k := range hi.Vulkan.Ordinals {
+		present[k.Vendor] = true
+	}
+	var out GPUVendors
+	for _, v := range gpuVendorPrecedence {
+		if present[v] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// refuseExpansion records a start that placeholder expansion (or the member
+// preparation after it) refused: not_permitted, carrying the stable code of a
+// per-spec device plan refusal (*GPUPlanError) when that is the cause.
+func (o *owner) refuseExpansion(st *specState, err error) {
+	var pe *GPUPlanError
+	if errors.As(err, &pe) {
+		o.setNotPermittedCode(st, err.Error(), pe.Code)
+		return
+	}
+	o.setNotPermitted(st, err.Error())
 }
 
 // hostInfo returns the latest pushed hardware figures, or the zero HostInfo
@@ -1211,7 +1286,7 @@ type measureTarget struct {
 // a health probe -- and nil otherwise.
 type cmdMeasured struct {
 	targets   []measureTarget
-	byPID     map[int]map[int]int
+	byPID     map[int]map[GPUKey]int
 	ramByPID  map[int]int
 	ramByUnit map[string]int
 	wslVM     *wslVMInfo
@@ -1463,7 +1538,7 @@ type specState struct {
 	// every Status(), the agent kept attaching `gpus` to every telemetry
 	// sample, and the gateway kept writing the same value back once per
 	// second per (spec, gpu) forever -- on a server doing nothing at all.
-	measuredVRAM map[int]int
+	measuredVRAM map[GPUKey]int
 
 	// measuredRAM is the last real resident host-RAM measurement (MB) of THIS
 	// SPEC'S CURRENT PROCESS, from the recurring measurement beat
@@ -1494,7 +1569,7 @@ type specState struct {
 	// read. Cleared by onProcExited with the measurements themselves, for the
 	// same reason. readyVRAM may share its map with measuredVRAM; nothing
 	// writes through either.
-	readyVRAM map[int]int
+	readyVRAM map[GPUKey]int
 	readyRAM  int
 
 	// vramBootstrapDone is the DURABLE guard on the one-shot VRAM bootstrap
@@ -1638,8 +1713,9 @@ type owner struct {
 	// owner goroutine and never written after construction.
 	gpuVendor GPUVendor
 	// gpuVendors is every vendor the host's GPU detection found, in precedence
-	// order. Only the generic device tokens' "auto" backend reads it; the
-	// single gpuVendor above keeps driving visibility and budgets.
+	// order. With gpuVendor and the pushed Vulkan mapping it is the host's
+	// GPUTopology (topology), from which the per-spec device plan decides
+	// each spec's visibility variable and device names.
 	gpuVendors GPUVendors
 	// specsFromLocalFile is ManagerOptions.SpecsFromLocalFile -- fixed for
 	// the process lifetime, so a plain field like gpuVendor above. Its only
@@ -1710,7 +1786,7 @@ type owner struct {
 	// measurement carries the count it was dispatched under
 	// (cmdMeasured.vmPeriod), and one that lands in a later period does not
 	// record its reading here.
-	vmVRAM   map[int]int
+	vmVRAM   map[GPUKey]int
 	vmPeriod uint64
 	// wslAttrib is each wsl generation's attributed VRAM (per GPU, MB): the
 	// VM's growth across its start, recorded when its window closes
@@ -1719,7 +1795,7 @@ type owner struct {
 	// the VM by nothing -- and one without is not: its window was void, it
 	// started with nothing to measure it, or its window is still open. What
 	// the VM holds beyond these figures is the unattributed remainder.
-	wslAttrib map[*runningProc]map[int]int
+	wslAttrib map[*runningProc]map[GPUKey]int
 	// wslWindow is the open wsl start window, nil when none is: wsl starts are
 	// serialized through it (PolicySnapshot.WSLStartInFlight), so the VM's
 	// growth across one start is that start's alone. See wslStartWindow.
@@ -1957,6 +2033,11 @@ func (o *owner) handle(cmd command) {
 // document a Source parses; this covers a Config handed to Apply directly, so
 // no spec ID in the owner's table ever collides with an instance key.
 func (o *owner) applyConfig(cfg Config) {
+	// First, before anything compares or stores the document: an empty GPU
+	// vendor (a gateway from before the field) means this host's legacy vendor,
+	// so the stored spec is the one an upgraded gateway's backfill pushes, and
+	// reconcileSpec sees no change -- no relaunch on upgrade (#434).
+	cfg = resolveLegacyGPUVendors(cfg, o.gpuVendor)
 	cfg.Specs = withoutReservedSpecIDs(cfg.Specs)
 	// The ETag names the document, and the multi-instance opt-in, the
 	// log_files declarations and the cluster specs are parts of it this agent
@@ -2443,8 +2524,9 @@ func sameLaunchShape(a, b Spec) bool {
 			rpc.HeadDomain = ""
 			s.RPC = &rpc
 		}
-		// GPUs' launch-relevant part is the ordered/deduped INDEX list
-		// (gpuIndices -> hostGPUIDs/deviceList/the visibility variable);
+		// GPUs' launch-relevant part is the ordered/deduped (vendor, index)
+		// KEY list (specDevices -> the device plan, hostGPUIDs/deviceList and
+		// the visibility variable);
 		// SpecGPU.VRAMMB is the admission DEMAND, consumed only by the policy
 		// arithmetic and the measurement snapshot, never baked into the child.
 		// Zero it so a pure vram_mb edit is metadata (binds at the next start,
@@ -3234,7 +3316,7 @@ func (o *owner) chargeSpec(st *specState) Spec {
 	vram, ram := o.siblingPeak(st)
 	for idx, mb := range st.readyVRAM {
 		if vram == nil {
-			vram = make(map[int]int, len(st.readyVRAM))
+			vram = make(map[GPUKey]int, len(st.readyVRAM))
 		}
 		vram[idx] = mb // its own ready figure supersedes the inherited one
 	}
@@ -3248,11 +3330,11 @@ func (o *owner) chargeSpec(st *specState) Spec {
 // and the host-RAM demand raised to ram -- never lowered: the pushed demand is a
 // floor. The GPU list is copied before it is written, because it is shared with
 // the pushed config; vram is only read.
-func raisedDemand(spec Spec, vram map[int]int, ram int) Spec {
+func raisedDemand(spec Spec, vram map[GPUKey]int, ram int) Spec {
 	if len(vram) > 0 && len(spec.GPUs) > 0 {
 		gpus := make([]SpecGPU, len(spec.GPUs))
 		for i, g := range spec.GPUs {
-			if v := vram[g.Index]; v > g.VRAMMB {
+			if v := vram[g.Key()]; v > g.VRAMMB {
 				g.VRAMMB = v
 			}
 			gpus[i] = g
@@ -3272,7 +3354,7 @@ func raisedDemand(spec Spec, vram map[int]int, ram int) Spec {
 // fraction, where it is meant to wait for a measured running sibling. A ready
 // reading describes its sibling's CURRENT process (cleared on exit), so only
 // siblings with a process count, and st's own figures never do.
-func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
+func (o *owner) siblingPeak(st *specState) (vram map[GPUKey]int, ram int) {
 	base := specBase(st.spec)
 	for _, sib := range o.specs {
 		if sib == st || sib.proc == nil || specBase(sib.spec) != base {
@@ -3283,7 +3365,7 @@ func (o *owner) siblingPeak(st *specState) (vram map[int]int, ram int) {
 				continue
 			}
 			if vram == nil {
-				vram = make(map[int]int, len(sib.readyVRAM))
+				vram = make(map[GPUKey]int, len(sib.readyVRAM))
 			}
 			vram[idx] = mb
 		}
@@ -3780,11 +3862,12 @@ func (o *owner) wakeSiblingsWaitingFor(st *specState) {
 // TestManagerStatusStaysResponsiveWhileAMeasurementIsInFlight.
 //
 // NO MEASURER INSTALLED IS THE FIRST CHECK, and it is the one that matters
-// most: every Apple unified-memory, CPU-only, AMD-on-Windows and non-KFD AMD
-// deployment lands here (collector.NewVRAMMeasurer returns nil when the host
-// cannot support the platform's measurer at all -- nvidia-smi off PATH and no
-// /sys/class/kfd/kfd/proc on Linux, and on Windows also a missing
-// pdh.dll/gdi32.dll export -- and nil is also NewManager's default). Those
+// most: every Apple unified-memory, CPU-only, AMD-on-Windows and unmeasurable
+// AMD deployment lands here (collector.NewVRAMMeasurer has a nil Measure when
+// the host cannot support the platform's measurer at all -- nvidia-smi off
+// PATH and neither amdgpu DRM fdinfo nor /sys/class/kfd/kfd/proc on Linux,
+// and on Windows also a missing pdh.dll/gdi32.dll export -- and nil is also
+// NewManager's default). Those
 // hosts take the first branch, spawn nothing, allocate nothing, and behave
 // exactly as they did before this function existed. "No measurer" now means
 // neither of the two: the host-RAM measurer (SetRAMMeasurer) rides this same
@@ -4080,14 +4163,14 @@ func (o *owner) measurementTargets() (targets []measureTarget, declaresGPU bool)
 // the gateway's is: a multi-GPU spec can have one index answered and another
 // not, and throwing away a real number because a sibling index came back
 // unknown would be its own bug.
-func realMeasurement(byGPU map[int]int) map[int]int {
-	var out map[int]int
+func realMeasurement(byGPU map[GPUKey]int) map[GPUKey]int {
+	var out map[GPUKey]int
 	for idx, mb := range byGPU {
 		if mb <= 0 {
 			continue
 		}
 		if out == nil {
-			out = make(map[int]int, len(byGPU))
+			out = make(map[GPUKey]int, len(byGPU))
 		}
 		out[idx] = mb
 	}
@@ -4355,7 +4438,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// whose first reading fails -- a CPU-only wsl generation whose VM is still
 	// booting has no worker yet -- falls back to nothing, which is what a booting
 	// VM holds, never to an earlier period's figure.
-	var measured map[int]map[int]int
+	var measured map[int]map[GPUKey]int
 	var vmPIDs []int
 	vmRead := false
 	if mp := o.m.measurer.Load(); mp != nil {
@@ -4367,7 +4450,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 		}
 		measured = (*mp)(ask)
 	}
-	var vmVRAM map[int]int
+	var vmVRAM map[GPUKey]int
 	if vmRead {
 		vmVRAM = sumVMVRAM(measured, vmPIDs)
 		if o.vmReadingFailed(vmPIDs, vmVRAM) {
@@ -4405,13 +4488,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	ramBoundMB := 0
 	// attributedMB is, per GPU, the WSL VM's VRAM the wsl generations' charges
 	// account for; the rest of the VM's figure is the unattributed remainder.
-	var attributedMB map[int]int
+	var attributedMB map[GPUKey]int
 	// Two passes over the live processes. The first records this call's
 	// measurements; the second charges every process. They are separate
 	// because an instance's demand inherits its siblings' ready measurements
 	// (chargeSpec, #340): charging in the same pass would let map order decide
 	// whether a sibling's figure is this call's or the previous beat's.
-	fresh := make(map[string]map[int]int, len(o.specs))
+	fresh := make(map[string]map[GPUKey]int, len(o.specs))
 	for id, st := range o.specs {
 		// A wsl generation has no pid reading (see above): its live figure is
 		// its attribution, read in the second pass.
@@ -4469,13 +4552,13 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			// figure: the VM's growth across its start (wsl_vram.go).
 			byGPU = o.wslAttrib[st.proc]
 		}
-		gpus := make(map[int]int, len(demand.GPUs))
+		gpus := make(map[GPUKey]int, len(demand.GPUs))
 		for _, g := range demand.GPUs {
 			charge := g.VRAMMB
-			if v, ok := byGPU[g.Index]; ok && v > charge {
+			if v, ok := byGPU[g.Key()]; ok && v > charge {
 				charge = v
 			}
-			gpus[g.Index] = charge
+			gpus[g.Key()] = charge
 		}
 		if wsl {
 			// What the VM holds that this generation's charge accounts for:
@@ -4493,7 +4576,7 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 			for g, mb := range counted {
 				if _, ok := gpus[g]; ok {
 					if attributedMB == nil {
-						attributedMB = make(map[int]int, len(byGPU))
+						attributedMB = make(map[GPUKey]int, len(byGPU))
 					}
 					attributedMB[g] += mb
 				}
@@ -4569,9 +4652,9 @@ func (o *owner) buildSnapshot() PolicySnapshot {
 	// device totals (fillDetectedBudgets), which is what makes VRAM accounting
 	// default-on. That is a different thing from filtering: it adds a value,
 	// it never removes or reinterprets a row.
-	budgets := make(map[int]int, len(o.cfg.GPUBudgets))
+	budgets := make(map[GPUKey]int, len(o.cfg.GPUBudgets))
 	for _, b := range o.cfg.GPUBudgets {
-		budgets[b.Index] = b.BudgetMB
+		budgets[b.Key()] = b.BudgetMB
 	}
 	o.fillDetectedBudgets(budgets, hi)
 
@@ -4752,16 +4835,15 @@ func (o *owner) pendingRAMFreedMB() int {
 // An Apple GPU is skipped entirely: it has no dedicated VRAM, and the
 // "total" its collector reports is the system memory the GPU has allocated at
 // that instant, which moves with load and is not a ceiling. Budgeting against
-// it would refuse a spec larger than whatever is allocated right now.
-func (o *owner) fillDetectedBudgets(budgets map[int]int, hi HostInfo) {
-	if o.gpuVendor == GPUVendorApple {
-		return
-	}
-	for idx, total := range hi.GPUTotalsMB {
-		if total <= 0 || budgets[idx] > 0 {
+// it would refuse a spec larger than whatever is allocated right now. The skip
+// is per GPU (its key's vendor), not per host, so a card of another vendor on
+// the same host still gets its detected budget.
+func (o *owner) fillDetectedBudgets(budgets map[GPUKey]int, hi HostInfo) {
+	for key, total := range hi.GPUTotalsMB {
+		if key.Vendor == GPUVendorApple || total <= 0 || budgets[key] > 0 {
 			continue
 		}
-		budgets[idx] = max(1, total-o.vramHeadroomMB)
+		budgets[key] = max(1, total-o.vramHeadroomMB)
 	}
 }
 
@@ -4783,8 +4865,13 @@ func (o *owner) startProcess(st *specState) {
 	// substitutes a decimal string for ${PORT}), so this dry run with a
 	// placeholder port is a faithful pre-check; the real port is
 	// substituted in the second call below once one is available.
-	if _, _, err := ExpandPlaceholders(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
-		o.setNotPermitted(st, err.Error())
+	// One topology for the whole launch, so the dry runs and the real
+	// expansion below decide the same device plan even if a hardware report
+	// lands in between. A plan refusal carries its stable code
+	// (refuseExpansion).
+	topo := o.topology()
+	if _, _, err := ExpandPlaceholders(spec, 0, topo, o.getenv, o.configFilesDir); err != nil {
+		o.refuseExpansion(st, err)
 		return
 	}
 	// The config_files half of the same dry run (#257): a secret or malformed
@@ -4794,8 +4881,8 @@ func (o *owner) startProcess(st *specState) {
 	// rate-limited -- and before a port is acquired or anything is written. The
 	// checks are port-independent for the same reason the one above is. Only the
 	// filesystem writes, further down, are start failures.
-	if _, err := planSpecConfigFiles(spec, 0, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
-		o.setNotPermitted(st, err.Error())
+	if _, err := planSpecConfigFiles(spec, 0, topo, o.getenv, o.configFilesDir); err != nil {
+		o.refuseExpansion(st, err)
 		return
 	}
 
@@ -4812,12 +4899,12 @@ func (o *owner) startProcess(st *specState) {
 		port = p
 	}
 
-	ex, err := expandSpec(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir)
+	ex, err := expandSpec(spec, port, topo, o.getenv, o.configFilesDir)
 	if err != nil {
 		// Already validated above (that dry run used port 0); reaching
 		// here would mean ExpandPlaceholders' result depends on the port
 		// value, which it does not. Defensive only.
-		o.setNotPermitted(st, err.Error())
+		o.refuseExpansion(st, err)
 		return
 	}
 
@@ -4828,7 +4915,7 @@ func (o *owner) startProcess(st *specState) {
 	// full disk, failed rename) -- a start failure that backs off and retries,
 	// the same shape as the ephemeral-port failure above, and NOT a
 	// not_permitted verdict, which would claim the config can never work.
-	if err := writeSpecConfigFiles(spec, port, o.gpuVendor, o.gpuVendors, o.getenv, o.configFilesDir); err != nil {
+	if err := writeSpecConfigFiles(spec, port, topo, o.getenv, o.configFilesDir); err != nil {
 		o.setState(st, StateStartFailed)
 		o.recordFailure(st, err.Error(), 0, "")
 		o.failPending(st, ErrStartFailed)
@@ -4843,7 +4930,7 @@ func (o *owner) startProcess(st *specState) {
 		// ex grows by those entries, so what is reported below is what runs.
 		var err error
 		if ex, port, err = o.prepareMember(spec, ex); err != nil {
-			o.setNotPermitted(st, err.Error())
+			o.refuseExpansion(st, err)
 			return
 		}
 	}
@@ -4880,7 +4967,7 @@ func (o *owner) startProcess(st *specState) {
 	// or a stale name) a few early bytes of this generation can still reach
 	// the predecessor's stream (see endPredecessorGraces). A log file never
 	// fails the start (see prepareLogFiles).
-	logTargets, logRefused, logStale := prepareLogFiles(spec, o.policy, port, o.gpuVendor, o.gpuVendors, o.configFilesDir)
+	logTargets, logRefused, logStale := prepareLogFiles(spec, o.policy, port, topo, o.configFilesDir)
 	endPredecessorGraces(st, logTargets)
 
 	// One writer for BOTH streams: the requirement is stdout AND stderr, and
@@ -4948,7 +5035,7 @@ func (o *owner) startProcess(st *specState) {
 	// baseline. Only for a spec that declares a GPU, and only where that figure
 	// can be read at all (vramMeasurable); the window itself opens once the
 	// exec has succeeded (beginWSLVRAM), so a failed exec leaves none behind.
-	var vmBaseline map[int]int
+	var vmBaseline map[GPUKey]int
 	vramWindow, baselineOK := false, false
 	if spec.IsWSL() && wslDeclaresGPU(spec) && o.vramMeasurable(spec) {
 		vramWindow = true
@@ -6444,7 +6531,7 @@ func (o *owner) snapshotStatus() []Status {
 			// returned -- that map is shared with every Status() caller
 			// and, once a real measurer exists (Task 18), may be reused
 			// by its next call.
-			cp := make(map[int]int, len(st.measuredVRAM))
+			cp := make(map[GPUKey]int, len(st.measuredVRAM))
 			for k, v := range st.measuredVRAM {
 				cp[k] = v
 			}

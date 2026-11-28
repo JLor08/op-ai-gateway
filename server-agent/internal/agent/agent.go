@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"net/http"
 	"op-ai-server-agent/internal/certinstall"
 	"op-ai-server-agent/internal/collector"
@@ -521,7 +522,17 @@ import (
 // (in file mode it waited for the document's next etag), and a drain while
 // runtime_manager is inactive restarts the once-per-transition Warn for
 // withheld cluster specs. No agent.Features entry is added.
-const Version = "0.26.1"
+//
+// 0.26.1 -> 0.27.0 is the single bump for mixed NVIDIA+AMD hosts. MINOR: the
+// agent reports a `vendor` (nvidia, amd, apple) on every GPU it describes --
+// telemetry, hardware report and runtime GPU samples -- plus the optional
+// hardware fields vram_measurable, vulkan_ordinal and vulkan_device_count, so
+// GPU indices that collide across vendors can be told apart (#434). The branch
+// adds the feature flags gpu_vendor_identity and rpc_cluster_same_host, both
+// with Since 0.27.0. The gateway reads the new fields when present and an old
+// agent simply sends none. This is the ONE bump for the whole branch; later
+// commits on it do not bump again.
+const Version = "0.27.0"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -693,6 +704,10 @@ type runtimeWaker interface {
 type runtimeTransitionsWaker interface {
 	Transitions() <-chan struct{}
 }
+
+// hardwareVulkanProbe overrides the hardware inventory's vulkaninfo probe
+// (nil = the real one); tests set it so no test runs the host's vulkaninfo.
+var hardwareVulkanProbe func(context.Context) ([]collector.VulkanDevice, bool)
 
 // runtimeLogWaker is the optional interface a poster may additionally
 // implement to deliver the gateway's runtime_log_config command (T3): the
@@ -897,6 +912,9 @@ type Agent struct {
 	hw      *sample.SystemReport
 	// hwOpts carries the settings the hardware inventory depends on.
 	hwOpts collector.HardwareOptions
+	// vulkan is the Vulkan mapping from the hardware inventory (seedHostInfo);
+	// every pushHostInfo carries it. SetHostInfo deep-copies it.
+	vulkan runtimectl.VulkanMap
 	// fetchMemoryModules asks the privileged helper for the memory modules;
 	// nil without a helper socket. Run uses it to fill a.hw when the helper
 	// was not ready at startup. a.hw is touched only on Run's goroutine, so
@@ -952,7 +970,8 @@ type Agent struct {
 	// hostInfo is the optional receiver of each cycle's device totals and
 	// available RAM (see hostInfoSink); nil = nothing is published.
 	hostInfo hostInfoSink
-	// gpuTotalsMB is the last-known total memory per GPU index (MB). It is
+	// gpuTotalsMB is the last-known total memory per GPU (MB), keyed by vendor
+	// and index: on a mixed host NVIDIA 0 and AMD 0 are two cards. It is
 	// seeded from the hardware inventory at the top of Run (seedHostInfo) and
 	// refreshed by publishHostInfo, and is touched only from Run's own
 	// goroutine (collectOnce runs there) -- the same access pattern as
@@ -960,7 +979,7 @@ type Agent struct {
 	// a device's total is static hardware: one cycle whose GPU collector failed
 	// must not erase it (see publishHostInfo). nil until the first GPU total is
 	// seen.
-	gpuTotalsMB map[int]int
+	gpuTotalsMB map[runtimectl.GPUKey]int
 	// runtimeWake is the optional wake channel derived from the poster (see
 	// runtimeWaker); nil when the poster does not support it (the POST
 	// transport, or a test poster). A nil channel in a select case simply
@@ -1103,6 +1122,13 @@ type Deps struct {
 	// TrustSync: assign only a proven-non-nil value (main.go's
 	// *runtimectl.Manager always is); nil publishes nothing.
 	HostInfo hostInfoSink
+	// VRAMMeasurable reports which per-process VRAM sources work per vendor
+	// (the measurer's Measurable); it feeds the hardware report. Nil = none.
+	VRAMMeasurable func() map[string][]string
+	// GPULegacyVendor is the runtime's legacy GPU vendor (main.go's
+	// runtimeGPUVendor); the hardware report carries it as
+	// gpu_legacy_vendor. "" = no GPU tool detected.
+	GPULegacyVendor string
 	// GatewayFeatures carries the same typed-nil caveat as TrustSync: assign
 	// only a proven-non-nil value (main.go's *runtimectl.FeaturesClient
 	// always is), never a possibly-nil concrete pointer.
@@ -1178,7 +1204,7 @@ func NewFromDeps(cfg config.Config, d Deps) *Agent {
 		netifCollector:  d.Interfaces,
 		ifaces:          newInterfaceInventory(),
 		binaries:        newBinaryInventory(cfg.RuntimeAllowedBinaries, wslProbeConfig{Exe: cfg.RuntimeWSLExe, User: cfg.RuntimeWSLUser}),
-		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket},
+		hwOpts:          collector.HardwareOptions{HelperSocket: cfg.HelperSocket, VRAMMeasurable: d.VRAMMeasurable, Vulkan: hardwareVulkanProbe, GPULegacyVendor: d.GPULegacyVendor},
 	}
 	if cfg.HelperSocket != "" {
 		helper := collector.NewHelperHTTPClient(cfg.HelperSocket)
@@ -1281,7 +1307,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.binaries != nil {
 		go a.binaries.run(ctx)
 	}
-	hw := collectHardware(ctx, a.gpus, a.hwOpts)
+	hw := collectHardware(ctx, a.gpus, a.hardwareOptions())
 	a.hw = &hw
 	// Push the device totals BEFORE anything below triggers the runtime sync,
 	// so the pinned/force_running specs it admits at boot already see their
@@ -1706,6 +1732,9 @@ func (a *Agent) seedCertReport() {
 	a.certReport = a.certSync.Report()
 	a.certReportMu.Unlock()
 }
+
+// hardwareOptions is the option set the hardware inventory is collected with.
+func (a *Agent) hardwareOptions() collector.HardwareOptions { return a.hwOpts }
 
 // collectHardware gathers the static inventory once, bounded by hardwareCollectBudget.
 func collectHardware(ctx context.Context, gpus []collector.GPUCollector, opts collector.HardwareOptions) sample.SystemReport {
@@ -2547,7 +2576,7 @@ func (a *Agent) publishHostInfo(s *sample.Sample) {
 		return
 	}
 	for _, g := range s.GPUs {
-		a.noteGPUTotal(g.Index, g.MemTotalBytes)
+		a.noteGPUTotal(gpuKeyOf(g.Vendor, g.Index), g.MemTotalBytes)
 	}
 	var availableBytes int64
 	if s.Host != nil {
@@ -2578,24 +2607,51 @@ func (a *Agent) seedHostInfo(hw *sample.SystemReport) {
 		return
 	}
 	for _, g := range hw.GPUs {
-		a.noteGPUTotal(g.Index, g.MemoryTotalBytes)
+		a.noteGPUTotal(gpuKeyOf(g.Vendor, g.Index), g.MemoryTotalBytes)
 	}
+	a.vulkan = vulkanMapFromReport(hw)
 	a.pushHostInfo(0)
+}
+
+// vulkanMapFromReport is the runtime's view of the report's Vulkan mapping:
+// each GPU with a known ordinal, keyed like every runtime GPU map, plus the
+// total Vulkan device count (which includes CPU devices).
+func vulkanMapFromReport(hw *sample.SystemReport) runtimectl.VulkanMap {
+	m := runtimectl.VulkanMap{DeviceCount: hw.VulkanDeviceCount}
+	for _, g := range hw.GPUs {
+		if g.VulkanOrdinal == nil {
+			continue
+		}
+		if m.Ordinals == nil {
+			m.Ordinals = make(map[runtimectl.GPUKey]int)
+		}
+		m.Ordinals[gpuKeyOf(g.Vendor, g.Index)] = *g.VulkanOrdinal
+	}
+	return m
+}
+
+// gpuKeyOf is the runtime's key for a GPU a collector reported: its vendor
+// (the wire value, parsed by runtimectl.ParseGPUVendor; an unknown or empty
+// one is GPUVendorNone) and its index.
+func gpuKeyOf(vendor string, index int) runtimectl.GPUKey {
+	return runtimectl.GPUKey{Vendor: runtimectl.ParseGPUVendor(vendor), Index: index}
 }
 
 // noteGPUTotal records a GPU's total memory (bytes in, MB stored, truncating)
 // as its last-known total, ignoring a total that is not positive -- an N/A
 // field parses to 0, which is "no reading", never "a device with no memory".
-func (a *Agent) noteGPUTotal(index int, totalBytes int64) {
+// Keyed by vendor and index, so two vendors' card 0 never overwrite each
+// other (#434).
+func (a *Agent) noteGPUTotal(key runtimectl.GPUKey, totalBytes int64) {
 	const bytesPerMB = 1024 * 1024
 	mb := int(totalBytes / bytesPerMB)
 	if mb <= 0 {
 		return
 	}
 	if a.gpuTotalsMB == nil {
-		a.gpuTotalsMB = make(map[int]int)
+		a.gpuTotalsMB = make(map[runtimectl.GPUKey]int)
 	}
-	a.gpuTotalsMB[index] = mb
+	a.gpuTotalsMB[key] = mb
 }
 
 // pushHostInfo hands the sink the last-known GPU totals plus the given
@@ -2606,11 +2662,9 @@ func (a *Agent) pushHostInfo(availableBytes int64) {
 	if len(a.gpuTotalsMB) > 0 {
 		// A copy, so the sink (and the owner behind it) never shares the
 		// map this loop keeps editing.
-		hi.GPUTotalsMB = make(map[int]int, len(a.gpuTotalsMB))
-		for i, mb := range a.gpuTotalsMB {
-			hi.GPUTotalsMB[i] = mb
-		}
+		hi.GPUTotalsMB = maps.Clone(a.gpuTotalsMB)
 	}
+	hi.Vulkan = a.vulkan
 	a.hostInfo.SetHostInfo(hi)
 }
 
@@ -2768,13 +2822,19 @@ func (a *Agent) collectOnce(ctx context.Context) {
 				}
 				if len(st.MeasuredVRAM) > 0 {
 					gpus := make([]sample.RuntimeGPUSample, 0, len(st.MeasuredVRAM))
-					for idx, mb := range st.MeasuredVRAM {
-						gpus = append(gpus, sample.RuntimeGPUSample{Index: idx, VRAMMeasuredMB: mb})
+					for k, mb := range st.MeasuredVRAM {
+						gpus = append(gpus, sample.RuntimeGPUSample{Vendor: string(k.Vendor), Index: k.Index, VRAMMeasuredMB: mb})
 					}
-					// map iteration order is unspecified; sort by index so
-					// the wire order is deterministic (easier to diff/read,
-					// and avoids flaky-looking test assertions downstream).
-					sort.Slice(gpus, func(i, j int) bool { return gpus[i].Index < gpus[j].Index })
+					// map iteration order is unspecified; sort by (vendor,
+					// index) so the wire order is deterministic (easier to
+					// diff/read, and avoids flaky-looking test assertions
+					// downstream).
+					sort.Slice(gpus, func(i, j int) bool {
+						if gpus[i].Vendor != gpus[j].Vendor {
+							return gpus[i].Vendor < gpus[j].Vendor
+						}
+						return gpus[i].Index < gpus[j].Index
+					})
 					rs.GPUs = gpus
 				}
 				// Spec-level, so it does not ride gpus[]. 0 is the unknown

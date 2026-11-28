@@ -893,6 +893,65 @@ func TestBlockedAdmissionForceStopsADeadDirectHold(t *testing.T) {
 	}
 }
 
+// loopbackRelayFixture is a formed relay cluster of two members whose member
+// 0 runs on the head's server: on loopback, direct (its plan member's
+// transport), while member 1 is relayed.
+func loopbackRelayFixture(t *testing.T) *orchFixture {
+	t.Helper()
+	f := newOrchFixture(t, 2, "relay", "lan")
+	f.portal.plan.Members[0].Transport = "direct"
+	f.portal.plan.Members[1].Transport = "relay"
+	f.formed()
+	return f
+}
+
+// TestBlockedAdmissionForceStopsADeadLoopbackHoldInARelayCluster pins the
+// member transport in the removal for a local start: a relay cluster's
+// member on the head's server runs direct, so its dead hold is ended by a
+// forced stop, while the relayed member is released.
+func TestBlockedAdmissionForceStopsADeadLoopbackHoldInARelayCluster(t *testing.T) {
+	f := loopbackRelayFixture(t)
+	f.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
+	f.settle()
+
+	before := len(f.agent.recorded())
+	f.frame(orchMemberServer(0), blockedFrame(0)...)
+	f.settle()
+	calls := f.agent.recorded()[before:]
+	if !slices.Contains(calls, "member:stop:"+orchMemberSpec(0)+":force") {
+		t.Fatalf("calls = %q, want the loopback member's dead hold force-stopped", calls)
+	}
+	if f.agent.count("member:stop:"+orchMemberSpec(1)) != 0 || !slices.Equal(releases(calls), []string{"member:release:" + orchMemberSpec(1)}) {
+		t.Fatalf("calls = %q, want the relayed member released, not stopped", calls)
+	}
+}
+
+// TestDeadLoopbackHoldInARelayClusterIsForceStopped pins the member transport
+// in the watchdog's release of dead holds: once the head of a relay cluster
+// reports stopped, its member on the head's server (direct, on loopback)
+// that still reports the hold once the exit's release had its time is
+// force-stopped; the relayed member, whose session ended with the head, is
+// not.
+func TestDeadLoopbackHoldInARelayClusterIsForceStopped(t *testing.T) {
+	f := loopbackRelayFixture(t)
+	f.frame(orchHeadServer, RuntimeStatusDTO{SpecID: orchHead, Model: orchHeadModel, State: agentSpecStateStopped})
+	f.settle()
+	f.advance(f.o.t.releaseRetry + time.Second)
+
+	before := len(f.agent.recorded())
+	f.frame(orchMemberServer(1), watchMemberRow(1, orchHead, 11))
+	f.settle()
+	f.frame(orchMemberServer(0), watchMemberRow(0, orchHead, 10))
+	f.settle()
+	calls := f.agent.recorded()[before:]
+	if !slices.Contains(calls, "member:stop:"+orchMemberSpec(0)+":force") {
+		t.Fatalf("calls = %q, want the loopback member's dead hold force-stopped", calls)
+	}
+	if f.agent.count("member:stop:"+orchMemberSpec(1)) != 0 {
+		t.Fatalf("calls = %q, want the relayed member left alone", calls)
+	}
+}
+
 // silentHeadStep advances the clock by step and feeds a frame of member 0
 // held by the head, and with head a frame of the head's server showing the
 // head running; it settles after each frame, so frames never coalesce.

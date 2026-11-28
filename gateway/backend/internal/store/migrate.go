@@ -151,6 +151,7 @@ var migrations = []migration{
 	{version: 116, name: "server_lan_interfaces", up: migration116Up},
 	{version: 117, name: "server_binaries_rpc_protocol", up: migration117Up},
 	{version: 118, name: "runtime_spec_log_files", up: migration118Up},
+	{version: 119, name: "gpu_vendor_keys", rawUp: migration119RawUp},
 }
 
 // Migrate creates the schema_migrations tracking table then applies, in a
@@ -1889,7 +1890,10 @@ func migration40RawUp(ctx context.Context, s *SQLStore, version int, name string
 	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
 		return fmt.Errorf("disable foreign_keys for migration %d: %w", version, err)
 	}
-	defer func() { _, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys=ON") }()
+	// The restore must run even when ctx is already cancelled (a migration
+	// aborted by a cancelled ctx): a pooled connection left with foreign keys
+	// off would silently skip referential integrity for whoever gets it next.
+	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA foreign_keys=ON") }()
 
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -4983,4 +4987,367 @@ func migration116Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 // dialects.
 func migration117Up(ctx context.Context, tx *sql.Tx, dl dialect) error {
 	return addColumnIfMissing(ctx, tx, dl, "server_binaries", "rpc_protocol text not null default ''")
+}
+
+// migration119RawUp puts the GPU vendor into every GPU key and keys RPC
+// cluster members by position (#434, mixed NVIDIA + AMD hosts):
+//
+//   - agent_runtime_spec_gpus, ai_server_gpu_budgets, rpc_member_spec_gpus and
+//     rpc_cluster_member_gpus gain gpu_vendor (text, not null, default the
+//     empty string), and it joins their primary keys between the owner and
+//     gpu_index, so ('nvidia', 0) and ('amd', 0) are two rows. Existing rows
+//     keep the empty vendor, which means the host's only vendor until the
+//     gateway backfills them.
+//   - rpc_cluster_members is keyed by (head_spec_id, position) instead of
+//     (head_spec_id, server_id), so one server may serve a head twice (one
+//     member per vendor); the (head_spec_id, server_id) uniqueness is gone.
+//   - rpc_cluster_member_gpus gains member_position, backfilled from the
+//     member row of the same (head_spec_id, server_id) -- unique until now --
+//     and references its member by (head_spec_id, member_position) on delete
+//     cascade; server_id stays as a plain column.
+//   - ai_servers gains gpu_legacy_vendor (the vendor the empty one stands for,
+//     set by every backfill) and gpu_vendor_note (0/1: a backfill rewrote rows
+//     on a host that reports more than one vendor, cleared when dismissed).
+//
+// It is a rawUp for the same reason as migration40RawUp: SQLite cannot change
+// a primary key or a foreign key in place, so it rebuilds the five tables,
+// and the rebuild's DROP TABLE of rpc_cluster_members would otherwise fire
+// the cascade into rpc_cluster_member_gpus (and every drop is checked against
+// foreign keys) -- so foreign keys are switched off OUTSIDE the transaction,
+// on the dedicated connection that runs it, and switched back on before that
+// connection returns to the pool. `pragma foreign_key_check` proves the
+// rebuilt tables consistent before the commit. Postgres swaps the constraints
+// in place, found by their columns in pg_constraint (never a guessed name).
+// Either way the change and its schema_migrations row commit together.
+func migration119RawUp(ctx context.Context, s *SQLStore, version int, name string) error {
+	if s.dl.name() != "sqlite" {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration %d: %w", version, err)
+		}
+		if err := migration119UpPostgres(ctx, tx, s.dl); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		return recordRawMigration(ctx, tx, s.dl, version, name)
+	}
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection for migration %d: %w", version, err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=OFF"); err != nil {
+		return fmt.Errorf("disable foreign_keys for migration %d: %w", version, err)
+	}
+	// The restore must run even when ctx is already cancelled (a migration
+	// aborted by a cancelled ctx): a pooled connection left with foreign keys
+	// off would silently skip referential integrity for whoever gets it next.
+	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA foreign_keys=ON") }()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin migration %d: %w", version, err)
+	}
+	if err := migration119UpSQLite(ctx, tx, s.dl); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return recordRawMigration(ctx, tx, s.dl, version, name)
+}
+
+// recordRawMigration stamps a rawUp migration in schema_migrations inside its
+// own transaction and commits both, rolling back when the stamp fails.
+func recordRawMigration(ctx context.Context, tx *sql.Tx, dl dialect, version int, name string) error {
+	if _, err := tx.ExecContext(ctx, dl.rebind(
+		`insert into schema_migrations (version, name, applied_at) values (?, ?, ?)`),
+		version, name, time.Now().UTC()); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("record migration %d: %w", version, err)
+	}
+	return tx.Commit()
+}
+
+// migration119ServerColumns are the two ai_servers columns, added the same
+// way on both dialects.
+var migration119ServerColumns = []string{
+	"gpu_legacy_vendor text not null default ''",
+	"gpu_vendor_note integer not null default 0",
+}
+
+// migration119MemberIndexes are rpc_cluster_members' indexes (migrations 104
+// and 106), which SQLite drops with the old table.
+var migration119MemberIndexes = []string{
+	`create index if not exists idx_rpc_cluster_members_server on rpc_cluster_members(server_id)`,
+	`create unique index if not exists idx_rpc_cluster_members_member_spec
+		on rpc_cluster_members(member_spec_id) where member_spec_id <> ''`,
+	`create unique index if not exists idx_rpc_cluster_members_server_port
+		on rpc_cluster_members(server_id, port) where port <> 0`,
+}
+
+// migration119UpSQLite rebuilds the five tables (create <t>_new, copy, drop,
+// rename) in the column order Postgres reaches with `add column` (new columns
+// last), recreates rpc_cluster_members' indexes and checks the foreign keys of
+// the rebuilt tables.
+// The members are rebuilt before their GPU rows, whose copy reads each
+// member's position by (head_spec_id, server_id); a GPU row without a member
+// (impossible while foreign keys were enforced) fails the not-null
+// member_position and with it the migration.
+func migration119UpSQLite(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range migration119ServerColumns {
+		if err := addColumnIfMissing(ctx, tx, dl, "ai_servers", col); err != nil {
+			return err
+		}
+	}
+	ts := dl.timestampType()
+	rebuilds := []struct {
+		table, create, insert string
+	}{
+		{
+			table: "agent_runtime_spec_gpus",
+			create: `create table agent_runtime_spec_gpus_new (
+				spec_id text not null references agent_runtime_specs(id) on delete cascade,
+				gpu_index integer not null,
+				vram_estimate_mb integer not null default 0,
+				vram_measured_mb integer not null default 0,
+				position integer not null default 0,
+				gpu_vendor text not null default '',
+				primary key (spec_id, gpu_vendor, gpu_index)
+			)`,
+			insert: `insert into agent_runtime_spec_gpus_new
+				(spec_id, gpu_index, vram_estimate_mb, vram_measured_mb, position, gpu_vendor)
+				select spec_id, gpu_index, vram_estimate_mb, vram_measured_mb, position, ''
+				from agent_runtime_spec_gpus`,
+		},
+		{
+			table: "ai_server_gpu_budgets",
+			create: `create table ai_server_gpu_budgets_new (
+				server_id text not null references ai_servers(id) on delete cascade,
+				gpu_index integer not null,
+				budget_mb integer not null default 0,
+				expected_uuid text not null default '',
+				expected_name text not null default '',
+				created_at ` + ts + ` not null, updated_at ` + ts + ` not null,
+				gpu_vendor text not null default '',
+				primary key (server_id, gpu_vendor, gpu_index)
+			)`,
+			insert: `insert into ai_server_gpu_budgets_new
+				(server_id, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at, gpu_vendor)
+				select server_id, gpu_index, budget_mb, expected_uuid, expected_name, created_at, updated_at, ''
+				from ai_server_gpu_budgets`,
+		},
+		{
+			table: "rpc_member_spec_gpus",
+			create: `create table rpc_member_spec_gpus_new (
+				spec_id text not null references rpc_member_specs(id) on delete cascade,
+				gpu_index integer not null,
+				position integer not null default 0,
+				vram_estimate_mb integer not null default 0,
+				gpu_vendor text not null default '',
+				primary key (spec_id, gpu_vendor, gpu_index)
+			)`,
+			insert: `insert into rpc_member_spec_gpus_new (spec_id, gpu_index, position, vram_estimate_mb, gpu_vendor)
+				select spec_id, gpu_index, position, vram_estimate_mb, '' from rpc_member_spec_gpus`,
+		},
+		{
+			table: "rpc_cluster_members",
+			create: `create table rpc_cluster_members_new (
+				head_spec_id text not null references agent_runtime_specs(id) on delete cascade,
+				position integer not null,
+				server_id text not null references ai_servers(id) on delete cascade,
+				member_spec_id text not null default '',
+				threads integer not null default 0,
+				cache_enabled integer not null default 0,
+				device_backend text not null default 'auto',
+				ram_estimate_mb integer not null default 0,
+				port integer not null default 0,
+				ram_measured_mb integer not null default 0,
+				measured_at ` + ts + `,
+				stale integer not null default 0,
+				run_peak_ram_mb integer not null default 0,
+				run_head_instance integer not null default 0,
+				run_started_at ` + ts + `,
+				primary key (head_spec_id, position)
+			)`,
+			insert: `insert into rpc_cluster_members_new (head_spec_id, position, server_id, member_spec_id, threads,
+				cache_enabled, device_backend, ram_estimate_mb, port, ram_measured_mb, measured_at, stale,
+				run_peak_ram_mb, run_head_instance, run_started_at)
+				select head_spec_id, position, server_id, member_spec_id, threads,
+				cache_enabled, device_backend, ram_estimate_mb, port, ram_measured_mb, measured_at, stale,
+				run_peak_ram_mb, run_head_instance, run_started_at
+				from rpc_cluster_members`,
+		},
+		{
+			table: "rpc_cluster_member_gpus",
+			create: `create table rpc_cluster_member_gpus_new (
+				head_spec_id text not null,
+				server_id text not null,
+				gpu_index integer not null,
+				position integer not null default 0,
+				vram_estimate_mb integer not null default 0,
+				vram_measured_mb integer not null default 0,
+				run_peak_vram_mb integer not null default 0,
+				gpu_vendor text not null default '',
+				member_position integer not null default 0,
+				primary key (head_spec_id, member_position, gpu_vendor, gpu_index),
+				foreign key (head_spec_id, member_position)
+					references rpc_cluster_members(head_spec_id, position) on delete cascade
+			)`,
+			insert: `insert into rpc_cluster_member_gpus_new (head_spec_id, server_id, gpu_index, position,
+				vram_estimate_mb, vram_measured_mb, run_peak_vram_mb, gpu_vendor, member_position)
+				select g.head_spec_id, g.server_id, g.gpu_index, g.position,
+				g.vram_estimate_mb, g.vram_measured_mb, g.run_peak_vram_mb, '',
+				(select m.position from rpc_cluster_members m
+					where m.head_spec_id = g.head_spec_id and m.server_id = g.server_id)
+				from rpc_cluster_member_gpus g`,
+		},
+	}
+	for _, r := range rebuilds {
+		for _, stmt := range []string{
+			r.create,
+			r.insert,
+			`drop table ` + r.table,
+			`alter table ` + r.table + `_new rename to ` + r.table,
+		} {
+			if err := execTx(ctx, tx, dl, stmt); err != nil {
+				return fmt.Errorf("rebuild %s: %w", r.table, err)
+			}
+		}
+	}
+	for _, stmt := range migration119MemberIndexes {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	for _, r := range rebuilds {
+		if err := sqliteForeignKeyCheck(ctx, tx, r.table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sqliteForeignKeyCheck fails when `pragma foreign_key_check(table)` reports
+// any row, naming the first violation: a rebuild done with foreign keys off
+// must leave none behind in the tables it rebuilt. It is scoped to table so a
+// pre-existing violation elsewhere in the database (one the rebuild did not
+// cause and cannot fix) does not abort the migration. The rebuilt tables are
+// checked as children; the only one that is also a parent,
+// rpc_cluster_members, is covered by checking its child
+// rpc_cluster_member_gpus.
+func sqliteForeignKeyCheck(ctx context.Context, tx *sql.Tx, table string) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check(`+table+`)`)
+	if err != nil {
+		return fmt.Errorf("foreign_key_check(%s): %w", table, err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var child, parent string
+		var rowid sql.NullInt64
+		var fkid int
+		if err := rows.Scan(&child, &rowid, &parent, &fkid); err != nil {
+			return fmt.Errorf("scan foreign_key_check(%s): %w", table, err)
+		}
+		return fmt.Errorf("foreign_key_check: %s row %d violates its foreign key to %s", child, rowid.Int64, parent)
+	}
+	return rows.Err()
+}
+
+// migration119UpPostgres adds the columns, backfills member_position and then
+// swaps the keys in place: the member GPU rows' foreign key goes first (it
+// depends on the members' old primary key), every old key is dropped by the
+// name pg_constraint gives for its exact columns, and the new keys are added.
+// rpc_cluster_members' indexes are untouched by the swap, so they need no
+// recreation here.
+func migration119UpPostgres(ctx context.Context, tx *sql.Tx, dl dialect) error {
+	for _, col := range migration119ServerColumns {
+		if err := addColumnIfMissing(ctx, tx, dl, "ai_servers", col); err != nil {
+			return err
+		}
+	}
+	for _, table := range []string{"agent_runtime_spec_gpus", "ai_server_gpu_budgets", "rpc_member_spec_gpus", "rpc_cluster_member_gpus"} {
+		if err := addColumnIfMissing(ctx, tx, dl, table, "gpu_vendor text not null default ''"); err != nil {
+			return err
+		}
+	}
+	if err := addColumnIfMissing(ctx, tx, dl, "rpc_cluster_member_gpus", "member_position integer not null default 0"); err != nil {
+		return err
+	}
+	if err := execTx(ctx, tx, dl, `update rpc_cluster_member_gpus set member_position = (
+		select m.position from rpc_cluster_members m
+		where m.head_spec_id = rpc_cluster_member_gpus.head_spec_id and m.server_id = rpc_cluster_member_gpus.server_id)`); err != nil {
+		return fmt.Errorf("backfill member_position: %w", err)
+	}
+	drops := []struct {
+		table, contype string
+		cols           []string
+	}{
+		{"rpc_cluster_member_gpus", "f", []string{"head_spec_id", "server_id"}},
+		{"rpc_cluster_member_gpus", "p", []string{"head_spec_id", "server_id", "gpu_index"}},
+		{"rpc_cluster_members", "p", []string{"head_spec_id", "server_id"}},
+		{"rpc_cluster_members", "u", []string{"head_spec_id", "position"}},
+		{"agent_runtime_spec_gpus", "p", []string{"spec_id", "gpu_index"}},
+		{"ai_server_gpu_budgets", "p", []string{"server_id", "gpu_index"}},
+		{"rpc_member_spec_gpus", "p", []string{"spec_id", "gpu_index"}},
+	}
+	for _, d := range drops {
+		if err := pgDropConstraintOn(ctx, tx, d.table, d.contype, d.cols); err != nil {
+			return err
+		}
+	}
+	for _, stmt := range []string{
+		`alter table rpc_cluster_members add primary key (head_spec_id, position)`,
+		`alter table rpc_cluster_member_gpus add primary key (head_spec_id, member_position, gpu_vendor, gpu_index)`,
+		`alter table rpc_cluster_member_gpus add foreign key (head_spec_id, member_position)
+			references rpc_cluster_members(head_spec_id, position) on delete cascade`,
+		`alter table agent_runtime_spec_gpus add primary key (spec_id, gpu_vendor, gpu_index)`,
+		`alter table ai_server_gpu_budgets add primary key (server_id, gpu_vendor, gpu_index)`,
+		`alter table rpc_member_spec_gpus add primary key (spec_id, gpu_vendor, gpu_index)`,
+	} {
+		if err := execTx(ctx, tx, dl, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pgDropConstraintOn drops table's one constraint of contype ('p', 'u', 'f')
+// over exactly cols, in that order, by the name pg_constraint records for it.
+// No such constraint is an error: the schema is not the one this migration
+// was written for.
+func pgDropConstraintOn(ctx context.Context, tx *sql.Tx, table, contype string, cols []string) error {
+	rows, err := tx.QueryContext(ctx, `
+		select c.conname, string_agg(a.attname::text, ',' order by k.ord)
+		from pg_constraint c
+		cross join lateral unnest(c.conkey) with ordinality as k(attnum, ord)
+		join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+		where c.conrelid = $1::text::regclass and c.contype = $2
+		group by c.conname`, table, contype)
+	if err != nil {
+		return fmt.Errorf("look up %s constraints on %s: %w", contype, table, err)
+	}
+	want := strings.Join(cols, ",")
+	var found string
+	var seen []string
+	for rows.Next() {
+		var conname, conCols string
+		if err := rows.Scan(&conname, &conCols); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan %s constraints on %s: %w", contype, table, err)
+		}
+		seen = append(seen, conname+"("+conCols+")")
+		if conCols == want {
+			found = conname
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate %s constraints on %s: %w", contype, table, err)
+	}
+	_ = rows.Close()
+	if found == "" {
+		return fmt.Errorf("%s has no %s constraint on (%s); found %v", table, contype, want, seen)
+	}
+	_, err = tx.ExecContext(ctx, `alter table `+table+` drop constraint "`+strings.ReplaceAll(found, `"`, `""`)+`"`)
+	return err
 }

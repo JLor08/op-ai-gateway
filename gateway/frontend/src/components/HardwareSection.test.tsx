@@ -15,7 +15,10 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
   const server = { id: 'srv-1', name: 'GPU-Box' } as unknown as PortalServer;
 
   function makeApi(resp: HardwareResponse) {
-    return { serverHardware: vi.fn(async () => resp) };
+    return {
+      serverHardware: vi.fn(async () => resp),
+      dismissGpuVendorNote: vi.fn(async () => undefined),
+    };
   }
 
   function renderSection(api: ReturnType<typeof makeApi>) {
@@ -80,6 +83,62 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(screen.getByTestId('agent-clock-offset')).toHaveTextContent('+120 ms');
     });
 
+    function withGpus(gpus: NonNullable<HardwareResponse['report']>['gpus']): HardwareResponse {
+      return { ...populated, report: { ...populated.report!, gpus } };
+    }
+
+    it('renders vendor and Vulkan ordinal', async () => {
+      renderSection(
+        makeApi(
+          withGpus([
+            {
+              index: 1,
+              vendor: 'amd',
+              name: 'RX 7900',
+              memory_total_bytes: 25757220864,
+              vulkan_ordinal: 2,
+              vram_measurable: ['rocm', 'vulkan'],
+            },
+          ]),
+        ),
+      );
+      expect(await screen.findByText(/AMD 1/)).toBeInTheDocument();
+      expect(screen.getByText('Vulkan #2')).toBeInTheDocument();
+      expect(screen.getByText('rocm, vulkan')).toBeInTheDocument();
+      expect(screen.getByRole('columnheader', { name: t.hardwareGpuVendor })).toBeInTheDocument();
+    });
+
+    it('renders without the new fields (old agent)', async () => {
+      renderSection(makeApi(populated));
+      expect(await screen.findByText(/GPU 0/)).toBeInTheDocument();
+      expect(screen.queryByText(/Vulkan #/)).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('columnheader', { name: t.hardwareGpuVendor }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(t.hardwareVulkanOrdinal)).not.toBeInTheDocument();
+      expect(screen.queryByText(t.hardwareVramMeasurable)).not.toBeInTheDocument();
+    });
+
+    it('shows the legacy note and refreshes the server after a dismissal', async () => {
+      const api = makeApi(populated);
+      const onServerRefresh = vi.fn();
+      render(
+        <HardwareSection
+          t={t}
+          api={api}
+          server={{ ...server, gpu_vendor_note: true, gpu_legacy_vendor: 'nvidia' } as PortalServer}
+          onServerRefresh={onServerRefresh}
+        />,
+      );
+      expect(await screen.findByText(t.gpuLegacyMappedNote('NVIDIA'))).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: t.gpuLegacyMappedDismiss }));
+      await waitFor(() => expect(api.dismissGpuVendorNote).toHaveBeenCalledWith('srv-1'));
+      await waitFor(() => expect(onServerRefresh).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(screen.queryByText(t.gpuLegacyMappedNote('NVIDIA'))).not.toBeInTheDocument(),
+      );
+    });
+
     it('shows an empty state when no report is available', async () => {
       const api = makeApi({ available: false });
       renderSection(api);
@@ -93,7 +152,10 @@ describe('HardwareSection agent clock offset', () => {
   const t = messages.de;
 
   function renderWithOffset(clock_offset_ms: number | null | undefined) {
-    const api = { serverHardware: vi.fn(async () => populatedReport()) };
+    const api = {
+      serverHardware: vi.fn(async () => populatedReport()),
+      dismissGpuVendorNote: vi.fn(async () => undefined),
+    };
     return render(
       <HardwareSection
         t={t}

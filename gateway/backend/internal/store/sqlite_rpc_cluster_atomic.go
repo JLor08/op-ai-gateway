@@ -66,7 +66,7 @@ func (s *SQLiteStore) SetClusterMembersIf(ctx context.Context, headSpecID string
 // carry exactly the measured and run fields of expect and expectGPUs.
 func (s *SQLiteStore) clusterMembersAsRead(ctx context.Context, tx *sql.Tx, headSpecID string, expect []routing.ClusterMember, expectGPUs []routing.ClusterMemberGPU) (bool, error) {
 	for _, e := range expect {
-		where, args := inRun(headSpecID, e.ServerID, e.RunStartedAt)
+		where, args := inRun(headSpecID, e.Position, e.RunStartedAt)
 		res, err := s.execOn(ctx, tx, `
 			update rpc_cluster_members set port = port
 			where ram_measured_mb = ? and stale = ? and run_peak_ram_mb = ? and run_head_instance = ? and `+where,
@@ -81,8 +81,9 @@ func (s *SQLiteStore) clusterMembersAsRead(ctx context.Context, tx *sql.Tx, head
 	for _, g := range expectGPUs {
 		res, err := s.execOn(ctx, tx, `
 			update rpc_cluster_member_gpus set position = position
-			where head_spec_id = ? and server_id = ? and gpu_index = ? and vram_measured_mb = ? and run_peak_vram_mb = ?`,
-			headSpecID, g.ServerID, g.GPUIndex, g.VRAMMeasuredMB, g.RunPeakVRAMMB)
+			where head_spec_id = ? and member_position = ? and gpu_vendor = ? and gpu_index = ?
+				and vram_measured_mb = ? and run_peak_vram_mb = ?`,
+			headSpecID, g.MemberPosition, g.GPUVendor, g.GPUIndex, g.VRAMMeasuredMB, g.RunPeakVRAMMB)
 		if err != nil {
 			return false, fmt.Errorf("compare cluster member gpu: %w", err)
 		}

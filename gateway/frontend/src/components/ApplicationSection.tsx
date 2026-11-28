@@ -152,6 +152,7 @@ export function ApplicationSection({
   api,
   server,
   onModelsChanged,
+  onServerRefresh,
   trail = [],
 }: Readonly<{
   t: Translation;
@@ -207,9 +208,14 @@ export function ApplicationSection({
     // Task 21 (matrix + server limits): forwarded the same way.
     | 'updateServer'
     | 'serverHardware'
+    // #434: the runtime screen's legacy GPU vendor note.
+    | 'dismissGpuVendorNote'
   >;
   server: PortalServer;
   onModelsChanged?: () => void;
+  // Asks the parent to read the server again after a sub-view changed it
+  // (forwarded to RuntimeAdminSection, #434).
+  onServerRefresh?: () => void;
   trail?: BreadcrumbItem[];
 }>) {
   const {
@@ -715,6 +721,7 @@ export function ApplicationSection({
           server={server}
           application={app}
           trail={[...trail, { label: server.name, onClick: () => setMode('list') }]}
+          onServerRefresh={onServerRefresh}
         />
       );
     }

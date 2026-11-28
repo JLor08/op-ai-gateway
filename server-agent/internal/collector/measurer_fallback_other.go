@@ -5,9 +5,10 @@
 
 package collector
 
-// fallbackVRAMMeasurer is the choice behind NewVRAMMeasurer on every platform
-// that is neither Windows nor Linux: nvidia-smi compute-apps, or nil. KFD is a
-// Linux kernel interface, so there is no second source here.
-func fallbackVRAMMeasurer() func(pids []int) map[int]map[int]int {
-	return NewNvidiaComputeApps()
+// fallbackVRAMMeasurer is the measurer behind NewVRAMMeasurer on every
+// platform that is neither Windows nor Linux: nvidia-smi compute-apps keyed
+// nvidia, or none. DRM fdinfo and KFD are Linux kernel interfaces, so there is
+// no AMD source here.
+func fallbackVRAMMeasurer() VRAMMeasurer {
+	return nvidiaVRAMMeasurer(NewNvidiaComputeApps())
 }

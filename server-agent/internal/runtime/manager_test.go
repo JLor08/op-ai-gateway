@@ -1378,7 +1378,7 @@ func TestManagerPendingVRAMUnknownRateLimitsReEvaluation(t *testing.T) {
 	m := newTestManager(t, allowlistPolicy())
 
 	var measurerCalls atomic.Int64
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		measurerCalls.Add(1)
 		return nil
 	})
@@ -2283,7 +2283,7 @@ func TestManagerHealthyGenerationDrainedAfterItsOwnExitIsStillACrash(t *testing.
 	// so a t.Fatal anywhere below still frees the owner before Close waits on
 	// it. Without this, one failing assertion would hang the test binary.
 	t.Cleanup(releaseOwner)
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		enteredOnce.Do(func() { close(entered) })
 		<-release
 		return nil
@@ -2599,10 +2599,10 @@ func TestManagerClearsMeasuredVRAMWhenTheProcessExits(t *testing.T) {
 	shrinkTimings(t)
 	m := newTestManager(t, allowlistPolicy())
 
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		out := make(map[int]map[int]int, len(pids))
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
-			out[p] = map[int]int{0: 7777}
+			out[p] = map[GPUKey]int{{Index: 0}: 7777}
 		}
 		return out
 	})
@@ -2679,11 +2679,11 @@ func TestManagerMeasuresARunningSpecWithoutAFurtherAdmission(t *testing.T) {
 	// Never blocks: this test is about whether the measurer is ASKED about a
 	// live child at all, not about what that costs.
 	var measuredPIDs sync.Map // pid -> struct{}
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		out := make(map[int]map[int]int, len(pids))
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
 			measuredPIDs.Store(p, struct{}{})
-			out[p] = map[int]int{0: 4242}
+			out[p] = map[GPUKey]int{{Index: 0}: 4242}
 		}
 		return out
 	})
@@ -2712,7 +2712,7 @@ func TestManagerMeasuresARunningSpecWithoutAFurtherAdmission(t *testing.T) {
 	if _, ok := measuredPIDs.Load(st.PID); !ok {
 		t.Fatalf("the measurer was never asked about spec-a's own child pid %d -- BUG F1: the pid list handed to the measurer never contains a live managed process", st.PID)
 	}
-	if got := st.MeasuredVRAM[0]; got != 4242 {
+	if got := st.MeasuredVRAM[GPUKey{Index: 0}]; got != 4242 {
 		t.Fatalf("Status()[spec-a].MeasuredVRAM[0] = %d, want 4242 (the measurer's own answer for this child)", got)
 	}
 }
@@ -2748,7 +2748,7 @@ func TestManagerStatusStaysResponsiveWhileAMeasurementIsInFlight(t *testing.T) {
 	// so a t.Fatal anywhere below frees the measurer before Close waits on the
 	// goroutine running it. Without this one failing assertion hangs the binary.
 	t.Cleanup(releaseMeasurer)
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		if len(pids) == 0 {
 			return nil // admission's own call; see the doc above
 		}
@@ -2865,10 +2865,10 @@ func TestRAMMeasurementReachesStatus(t *testing.T) {
 		}
 		return out
 	})
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		out := make(map[int]map[int]int, len(pids))
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
-			out[p] = map[int]int{0: 4242}
+			out[p] = map[GPUKey]int{{Index: 0}: 4242}
 		}
 		return out
 	})
@@ -2893,7 +2893,7 @@ func TestRAMMeasurementReachesStatus(t *testing.T) {
 	if st.MeasuredRAMMB != 1500 {
 		t.Fatalf("Status()[spec-a].MeasuredRAMMB = %d, want 1500 (the measurer's own answer for this child)", st.MeasuredRAMMB)
 	}
-	if got := st.MeasuredVRAM[0]; got != 4242 {
+	if got := st.MeasuredVRAM[GPUKey{Index: 0}]; got != 4242 {
 		t.Fatalf("Status()[spec-a].MeasuredVRAM[0] = %d, want 4242 -- the RAM answer must ride beside the VRAM one, not replace it", got)
 	}
 }
@@ -3106,7 +3106,7 @@ func TestRAMMeasuredForASpecWithoutGPUs(t *testing.T) {
 	// spec being admitted has no process yet); only a NON-empty list can be the
 	// recurring beat this test is about.
 	var vramBeats atomic.Int64
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
 		if len(pids) > 0 {
 			vramBeats.Add(1)
 		}
@@ -3453,6 +3453,97 @@ func TestManagerVisibleDevicesRefusalIsNotPermitted(t *testing.T) {
 	}
 }
 
+// TestStartRefusalCarriesGPUPlanCode: a spec the per-spec device plan refuses
+// (#434) is not_permitted with the plan's stable code in last_error, so the
+// gateway can map it to its own message; a Vulkan spec on the same mixed host
+// starts once the hardware report has mapped its cards, and its child sees the
+// injected GGML_VK_VISIBLE_DEVICES (the owner's topology reads the pushed
+// HostInfo.Vulkan).
+func TestStartRefusalCarriesGPUPlanCode(t *testing.T) {
+	skipOnWindows(t)
+	nvAMD := []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA, VRAMMB: 1}, {Index: 0, Vendor: GPUVendorAMD, VRAMMB: 1}}
+	newMixed := func(t *testing.T) *Manager {
+		m := NewManager(ManagerOptions{
+			Policy:     allowlistPolicy(),
+			Getenv:     func(string) string { return "" },
+			GPUVendor:  GPUVendorNVIDIA,
+			GPUVendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD},
+		})
+		t.Cleanup(m.Close)
+		return m
+	}
+	nvOnly := []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA, VRAMMB: 1}}
+	cases := []struct {
+		name     string
+		gpus     []SpecGPU
+		backend  string
+		inject   bool
+		extra    []string
+		wantCode string
+	}{
+		{"cuda on both vendors", nvAMD, "cuda", true, nil, codeGPUVendorBackendMismatch},
+		{"vulkan before the cards are mapped", nvAMD, "vulkan", true, nil, codeVulkanMappingUnavailable},
+		// On a mixed host a plan refusal refuses the model
+		// spec even when neither the variable nor a device token uses it.
+		{"cuda on both vendors, no tokens, no injection", nvAMD, "cuda", false, nil, codeGPUVendorBackendMismatch},
+		// On a mixed host a Vulkan token never renders a host
+		// index; without injected GGML_VK_VISIBLE_DEVICES it is refused.
+		{"vulkan token on an nvidia-only auto spec", nvOnly, "", false, []string{"--device", "${VULKAN_DEVICES}"}, codeVulkanVisibleDevicesRequired},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkTimings(t)
+			spec := baseSpec("spec-a", "model-a")
+			spec.Args = append(spec.Args, tc.extra...)
+			spec.GPUs = tc.gpus
+			spec.DeviceBackend = tc.backend
+			spec.SetVisibleDevices = tc.inject
+			m := newMixed(t)
+			m.Apply(Config{Specs: []Spec{spec}})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, _, err := m.EnsureRunning(ctx, "model-a"); !errors.Is(err, ErrNotPermitted) {
+				t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted", err)
+			}
+			st := statusFor(m, "spec-a")
+			if st == nil || st.State != StateNotPermitted {
+				t.Fatalf("Status()[spec-a] = %+v, want not_permitted", st)
+			}
+			if st.LastError == nil || st.LastError.Code != tc.wantCode {
+				t.Errorf("LastError = %+v, want code %s", st.LastError, tc.wantCode)
+			}
+		})
+	}
+
+	t.Run("vulkan with mapped cards starts", func(t *testing.T) {
+		shrinkTimings(t)
+		envLog := filepath.Join(t.TempDir(), "env")
+		spec := baseSpec("spec-a", "model-a")
+		spec.Args = visibleDevicesStubArgs(envLog, "GGML_VK_VISIBLE_DEVICES")
+		spec.GPUs = nvAMD
+		spec.DeviceBackend = "vulkan"
+		spec.SetVisibleDevices = true
+		m := newMixed(t)
+		m.SetHostInfo(HostInfo{Vulkan: VulkanMap{
+			Ordinals:    map[GPUKey]int{{GPUVendorNVIDIA, 0}: 1, {GPUVendorAMD, 0}: 0},
+			DeviceCount: 2,
+		}})
+		m.Apply(Config{Specs: []Spec{spec}})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, "model-a")
+		if err != nil {
+			t.Fatalf("EnsureRunning: %v", err)
+		}
+		defer release()
+		if got, want := readEnvLog(t, envLog), "set:1,0"; got != want {
+			t.Errorf("child read GGML_VK_VISIBLE_DEVICES as %q, want %q", got, want)
+		}
+	})
+}
+
 // newSnapshotOwner assembles an owner just far enough to call buildSnapshot:
 // one spec, one live generation, no goroutine and no child process.
 // buildSnapshot reads only owner state (o.specs, o.cfg, o.allowedPairs) plus
@@ -3460,7 +3551,7 @@ func TestManagerVisibleDevicesRefusalIsNotPermitted(t *testing.T) {
 // one does on its own goroutine -- and going through it directly is the only
 // way to READ the charged number at all: it is consumed by Admit inside
 // admitAndStart and never reported anywhere.
-func newSnapshotOwner(spec Spec, pid int, measurer func(pids []int) map[int]map[int]int) (*owner, *specState) {
+func newSnapshotOwner(spec Spec, pid int, measurer func(pids []int) map[int]map[GPUKey]int) (*owner, *specState) {
 	m := &Manager{}
 	m.SetMeasurer(measurer)
 	st := &specState{
@@ -3477,7 +3568,7 @@ func newSnapshotOwner(spec Spec, pid int, measurer func(pids []int) map[int]map[
 
 // gpusChargedFor returns the effective per-GPU VRAM a snapshot charges to
 // specID -- the number Admit sums against each GPU budget (policy.go rule 3).
-func gpusChargedFor(t *testing.T, snap PolicySnapshot, specID string) map[int]int {
+func gpusChargedFor(t *testing.T, snap PolicySnapshot, specID string) map[GPUKey]int {
 	t.Helper()
 	for _, r := range snap.Running {
 		if r.SpecID == specID {
@@ -3608,38 +3699,38 @@ func TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate(t *tes
 	cases := []struct {
 		name string
 		// measured is what the installed measurer answers for this pid.
-		measured map[int]int
+		measured map[GPUKey]int
 		// wantCharged is what admission must be charged per GPU index.
-		wantCharged map[int]int
+		wantCharged map[GPUKey]int
 		// wantReported is what st.measuredVRAM must hold afterwards -- the
 		// telemetry/portal side of the same value. nil = nothing stored.
-		wantReported map[int]int
+		wantReported map[GPUKey]int
 	}{
 		{
 			name:         "a zero is unknown, not free",
-			measured:     map[int]int{0: 0, 1: 0},
-			wantCharged:  map[int]int{0: estimate0, 1: estimate1},
+			measured:     map[GPUKey]int{{Index: 0}: 0, {Index: 1}: 0},
+			wantCharged:  map[GPUKey]int{{Index: 0}: estimate0, {Index: 1}: estimate1},
 			wantReported: nil,
 		},
 		{
 			name:         "a real measurement still wins over the estimate",
-			measured:     map[int]int{0: 8000, 1: 9000},
-			wantCharged:  map[int]int{0: 8000, 1: 9000},
-			wantReported: map[int]int{0: 8000, 1: 9000},
+			measured:     map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 9000},
+			wantCharged:  map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 9000},
+			wantReported: map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 9000},
 		},
 		{
 			name:         "per GPU index, not per pid",
-			measured:     map[int]int{0: 8000, 1: 0},
-			wantCharged:  map[int]int{0: 8000, 1: estimate1},
-			wantReported: map[int]int{0: 8000},
+			measured:     map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 0},
+			wantCharged:  map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: estimate1},
+			wantReported: map[GPUKey]int{{Index: 0}: 8000},
 		},
 		{
 			// A measurer converting an unsigned byte counter to MB is
 			// exactly where a negative can appear, and the house rule the
 			// gateway applies is <= 0, not == 0.
 			name:         "a negative measurement is not a credit either",
-			measured:     map[int]int{0: -1, 1: -4096},
-			wantCharged:  map[int]int{0: estimate0, 1: estimate1},
+			measured:     map[GPUKey]int{{Index: 0}: -1, {Index: 1}: -4096},
+			wantCharged:  map[GPUKey]int{{Index: 0}: estimate0, {Index: 1}: estimate1},
 			wantReported: nil,
 		},
 	}
@@ -3647,8 +3738,8 @@ func TestBuildSnapshotNeverLetsANonPositiveMeasurementOverrideTheEstimate(t *tes
 		t.Run(tc.name, func(t *testing.T) {
 			spec := baseSpec("spec-a", "model-a")
 			spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: estimate0}, {Index: 1, VRAMMB: estimate1}}
-			o, st := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
-				return map[int]map[int]int{pid: tc.measured}
+			o, st := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[GPUKey]int {
+				return map[int]map[GPUKey]int{pid: tc.measured}
 			})
 
 			snap := o.buildSnapshot()
@@ -3690,41 +3781,41 @@ func TestBuildSnapshotEffectiveVRAMIsMax(t *testing.T) {
 		name string
 		// measured is what the installed measurer answers for this pid; nil
 		// means the measurer has no row for the pid at all.
-		measured map[int]int
+		measured map[GPUKey]int
 		// wantCharged is what admission must be charged per GPU index.
-		wantCharged map[int]int
+		wantCharged map[GPUKey]int
 		// wantReported is what st.measuredVRAM must hold: the raw real
 		// readings, never the floored charge. nil = nothing stored.
-		wantReported map[int]int
+		wantReported map[GPUKey]int
 	}{
 		{
 			name:         "live above the demand raises it",
-			measured:     map[int]int{0: 9000},
-			wantCharged:  map[int]int{0: 9000},
-			wantReported: map[int]int{0: 9000},
+			measured:     map[GPUKey]int{{Index: 0}: 9000},
+			wantCharged:  map[GPUKey]int{{Index: 0}: 9000},
+			wantReported: map[GPUKey]int{{Index: 0}: 9000},
 		},
 		{
 			name:         "live below the demand is floored at the demand",
-			measured:     map[int]int{0: 7000},
-			wantCharged:  map[int]int{0: demand},
-			wantReported: map[int]int{0: 7000},
+			measured:     map[GPUKey]int{{Index: 0}: 7000},
+			wantCharged:  map[GPUKey]int{{Index: 0}: demand},
+			wantReported: map[GPUKey]int{{Index: 0}: 7000},
 		},
 		{
 			name:         "live equal to the demand charges the demand",
-			measured:     map[int]int{0: demand},
-			wantCharged:  map[int]int{0: demand},
-			wantReported: map[int]int{0: demand},
+			measured:     map[GPUKey]int{{Index: 0}: demand},
+			wantCharged:  map[GPUKey]int{{Index: 0}: demand},
+			wantReported: map[GPUKey]int{{Index: 0}: demand},
 		},
 		{
 			name:         "live absent charges the demand",
 			measured:     nil,
-			wantCharged:  map[int]int{0: demand},
+			wantCharged:  map[GPUKey]int{{Index: 0}: demand},
 			wantReported: nil,
 		},
 		{
 			name:         "live zero is unknown and charges the demand",
-			measured:     map[int]int{0: 0},
-			wantCharged:  map[int]int{0: demand},
+			measured:     map[GPUKey]int{{Index: 0}: 0},
+			wantCharged:  map[GPUKey]int{{Index: 0}: demand},
 			wantReported: nil,
 		},
 	}
@@ -3732,11 +3823,11 @@ func TestBuildSnapshotEffectiveVRAMIsMax(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := baseSpec("spec-a", "model-a")
 			spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: demand}}
-			o, st := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
+			o, st := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[GPUKey]int {
 				if tc.measured == nil {
-					return map[int]map[int]int{}
+					return map[int]map[GPUKey]int{}
 				}
-				return map[int]map[int]int{pid: tc.measured}
+				return map[int]map[GPUKey]int{pid: tc.measured}
 			})
 
 			snap := o.buildSnapshot()
@@ -3755,13 +3846,13 @@ func TestBuildSnapshotEffectiveVRAMIsMax(t *testing.T) {
 	t.Run("applied per GPU index", func(t *testing.T) {
 		spec := baseSpec("spec-a", "model-a")
 		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: demand}, {Index: 1, VRAMMB: demand}}
-		o, _ := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[int]int {
-			return map[int]map[int]int{pid: {0: 9000, 1: 7000}}
+		o, _ := newSnapshotOwner(spec, pid, func(pids []int) map[int]map[GPUKey]int {
+			return map[int]map[GPUKey]int{pid: {{Index: 0}: 9000, {Index: 1}: 7000}}
 		})
 
 		snap := o.buildSnapshot()
 
-		want := map[int]int{0: 9000, 1: demand}
+		want := map[GPUKey]int{{Index: 0}: 9000, {Index: 1}: demand}
 		if got := gpusChargedFor(t, snap, "spec-a"); !reflect.DeepEqual(got, want) {
 			t.Errorf("admission is charged %v, want %v -- max() is decided per GPU index, never per pid", got, want)
 		}
@@ -3785,33 +3876,33 @@ func TestApplyMeasurementNeverStoresANonPositiveMeasurement(t *testing.T) {
 	const pid = 4242
 	cases := []struct {
 		name     string
-		previous map[int]int
-		measured map[int]int
-		want     map[int]int
+		previous map[GPUKey]int
+		measured map[GPUKey]int
+		want     map[GPUKey]int
 	}{
 		{
 			name:     "zeros do not become a measurement",
 			previous: nil,
-			measured: map[int]int{0: 0},
+			measured: map[GPUKey]int{{Index: 0}: 0},
 			want:     nil,
 		},
 		{
 			name:     "zeros do not erase a previous real measurement",
-			previous: map[int]int{0: 8000},
-			measured: map[int]int{0: 0},
-			want:     map[int]int{0: 8000},
+			previous: map[GPUKey]int{{Index: 0}: 8000},
+			measured: map[GPUKey]int{{Index: 0}: 0},
+			want:     map[GPUKey]int{{Index: 0}: 8000},
 		},
 		{
 			name:     "a real measurement is still stored",
 			previous: nil,
-			measured: map[int]int{0: 8000},
-			want:     map[int]int{0: 8000},
+			measured: map[GPUKey]int{{Index: 0}: 8000},
+			want:     map[GPUKey]int{{Index: 0}: 8000},
 		},
 		{
 			name:     "only the answered index is stored",
 			previous: nil,
-			measured: map[int]int{0: 8000, 1: 0},
-			want:     map[int]int{0: 8000},
+			measured: map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 0},
+			want:     map[GPUKey]int{{Index: 0}: 8000},
 		},
 	}
 	for _, tc := range cases {
@@ -3823,7 +3914,7 @@ func TestApplyMeasurementNeverStoresANonPositiveMeasurement(t *testing.T) {
 
 			o.applyMeasurement(cmdMeasured{
 				targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
-				byPID:   map[int]map[int]int{pid: tc.measured},
+				byPID:   map[int]map[GPUKey]int{pid: tc.measured},
 			})
 
 			if !reflect.DeepEqual(st.measuredVRAM, tc.want) {
@@ -3856,10 +3947,10 @@ func TestManagerZeroMeasurementDoesNotDefeatTheGPUBudget(t *testing.T) {
 	m := newTestManager(t, allowlistPolicy())
 
 	// Exactly what naInt("[N/A]") produces for every managed pid on Windows.
-	m.SetMeasurer(func(pids []int) map[int]map[int]int {
-		out := make(map[int]map[int]int, len(pids))
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
 		for _, p := range pids {
-			out[p] = map[int]int{0: 0}
+			out[p] = map[GPUKey]int{{Index: 0}: 0}
 		}
 		return out
 	})
@@ -4265,7 +4356,7 @@ func TestSetHostInfoVisibleInSnapshot(t *testing.T) {
 		t.Fatalf("hostInfo() before any SetHostInfo = %+v, want the zero HostInfo (no detected GPUs, MemAvailableMB 0 = unknown)", got)
 	}
 
-	pushed := HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 32000}
+	pushed := HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000}, MemAvailableMB: 32000}
 	o.m.SetHostInfo(pushed)
 	if got := o.hostInfo(); !reflect.DeepEqual(got, pushed) {
 		t.Fatalf("hostInfo() after SetHostInfo(%+v) = %+v, want the pushed value", pushed, got)
@@ -4274,14 +4365,14 @@ func TestSetHostInfoVisibleInSnapshot(t *testing.T) {
 	_ = o.buildSnapshot()
 
 	// The caller mutating its own map afterwards must not reach the owner.
-	pushed.GPUTotalsMB[0] = 1
-	pushed.GPUTotalsMB[7] = 99
-	if got := o.hostInfo().GPUTotalsMB; !reflect.DeepEqual(got, map[int]int{0: 24000}) {
+	pushed.GPUTotalsMB[GPUKey{Index: 0}] = 1
+	pushed.GPUTotalsMB[GPUKey{Index: 7}] = 99
+	if got := o.hostInfo().GPUTotalsMB; !reflect.DeepEqual(got, map[GPUKey]int{{Index: 0}: 24000}) {
 		t.Errorf("hostInfo().GPUTotalsMB = %v after the caller mutated the map it pushed, want {0: 24000} -- SetHostInfo must copy, the collect loop and the owner are different goroutines", got)
 	}
 
 	// The newest push replaces the old one: both fields, wholesale.
-	next := HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}, MemAvailableMB: 1500}
+	next := HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000, {Index: 1}: 12000}, MemAvailableMB: 1500}
 	o.m.SetHostInfo(next)
 	if got := o.hostInfo(); !reflect.DeepEqual(got, next) {
 		t.Errorf("hostInfo() after a second SetHostInfo = %+v, want %+v (the latest sample wins)", got, next)
@@ -4292,7 +4383,7 @@ func TestSetHostInfoVisibleInSnapshot(t *testing.T) {
 // as its operator config, hi as the latest hardware sample (nil = none pushed
 // yet) and headroomMB as its VRAM headroom knob, and returns the Budgets map
 // Admit will decide on.
-func snapshotBudgets(t *testing.T, cfgBudgets []GPUBudget, hi *HostInfo, headroomMB int) map[int]int {
+func snapshotBudgets(t *testing.T, cfgBudgets []GPUBudget, hi *HostInfo, headroomMB int) map[GPUKey]int {
 	t.Helper()
 	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
 	o.cfg.GPUBudgets = cfgBudgets
@@ -4308,8 +4399,8 @@ func snapshotBudgets(t *testing.T, cfgBudgets []GPUBudget, hi *HostInfo, headroo
 // budget equal to its detected total -- so VRAM admission is enforced where it
 // used to be effectively off (an absent budget is "unconstrained").
 func TestBudgetsAutoDetectedFromGPUTotals(t *testing.T) {
-	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}}, 0)
-	if want := map[int]int{0: 24000, 1: 12000}; !reflect.DeepEqual(got, want) {
+	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000, {Index: 1}: 12000}}, 0)
+	if want := map[GPUKey]int{{Index: 0}: 24000, {Index: 1}: 12000}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Budgets = %v, want %v (detected total, one per sampled GPU)", got, want)
 	}
 }
@@ -4320,8 +4411,8 @@ func TestBudgetsAutoDetectedFromGPUTotals(t *testing.T) {
 func TestExplicitGPUBudgetOverridesDetected(t *testing.T) {
 	got := snapshotBudgets(t,
 		[]GPUBudget{{Index: 0, BudgetMB: 8000}},
-		&HostInfo{GPUTotalsMB: map[int]int{0: 24000, 1: 12000}}, 0)
-	if want := map[int]int{0: 8000, 1: 12000}; !reflect.DeepEqual(got, want) {
+		&HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000, {Index: 1}: 12000}}, 0)
+	if want := map[GPUKey]int{{Index: 0}: 8000, {Index: 1}: 12000}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Budgets = %v, want %v (operator's 8000 wins on GPU 0, detected 12000 stands on GPU 1)", got, want)
 	}
 }
@@ -4332,8 +4423,8 @@ func TestExplicitGPUBudgetOverridesDetected(t *testing.T) {
 func TestOperatorBudgetAboveDetectedStillWins(t *testing.T) {
 	got := snapshotBudgets(t,
 		[]GPUBudget{{Index: 0, BudgetMB: 30000}},
-		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 0)
-	if want := map[int]int{0: 30000}; !reflect.DeepEqual(got, want) {
+		&HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000}}, 0)
+	if want := map[GPUKey]int{{Index: 0}: 30000}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Budgets = %v, want %v", got, want)
 	}
 }
@@ -4346,8 +4437,8 @@ func TestOperatorBudgetAboveDetectedStillWins(t *testing.T) {
 func TestNonPositiveOperatorBudgetFallsThroughToDetected(t *testing.T) {
 	got := snapshotBudgets(t,
 		[]GPUBudget{{Index: 0, BudgetMB: 0}, {Index: 1, BudgetMB: 0}},
-		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 0)
-	if want := map[int]int{0: 24000, 1: 0}; !reflect.DeepEqual(got, want) {
+		&HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000}}, 0)
+	if want := map[GPUKey]int{{Index: 0}: 24000, {Index: 1}: 0}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Budgets = %v, want %v (GPU 0: 0 row replaced by the detected total; GPU 1: nothing detected, the 0 row is copied verbatim)", got, want)
 	}
 }
@@ -4356,8 +4447,8 @@ func TestNonPositiveOperatorBudgetFallsThroughToDetected(t *testing.T) {
 // AUTO budget, so the card keeps room for the driver, display and other
 // tenants.
 func TestVRAMHeadroomSubtracted(t *testing.T) {
-	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 1024)
-	if want := map[int]int{0: 22976}; !reflect.DeepEqual(got, want) {
+	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000}}, 1024)
+	if want := map[GPUKey]int{{Index: 0}: 22976}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Budgets = %v, want %v (24000 detected - 1024 headroom)", got, want)
 	}
 }
@@ -4368,8 +4459,8 @@ func TestVRAMHeadroomSubtracted(t *testing.T) {
 func TestVRAMHeadroomDoesNotTouchAnExplicitBudget(t *testing.T) {
 	got := snapshotBudgets(t,
 		[]GPUBudget{{Index: 0, BudgetMB: 8000}},
-		&HostInfo{GPUTotalsMB: map[int]int{0: 24000}}, 1024)
-	if want := map[int]int{0: 8000}; !reflect.DeepEqual(got, want) {
+		&HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000}}, 1024)
+	if want := map[GPUKey]int{{Index: 0}: 8000}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Budgets = %v, want %v", got, want)
 	}
 }
@@ -4380,8 +4471,8 @@ func TestVRAMHeadroomDoesNotTouchAnExplicitBudget(t *testing.T) {
 // 1 MB so Admit refuses any spec with a known VRAM demand on that GPU.
 func TestVRAMHeadroomAtOrAboveTheDeviceReservesTheWholeGPU(t *testing.T) {
 	for _, headroom := range []int{8000, 9000} {
-		got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[int]int{0: 8000}}, headroom)
-		if want := map[int]int{0: 1}; !reflect.DeepEqual(got, want) {
+		got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 8000}}, headroom)
+		if want := map[GPUKey]int{{Index: 0}: 1}; !reflect.DeepEqual(got, want) {
 			t.Errorf("headroom %d on an 8000 MB GPU: Budgets = %v, want %v (never 0: that would read as unconstrained)", headroom, got, want)
 		}
 	}
@@ -4395,8 +4486,8 @@ func TestNoGPUSampleLeavesBudgetsEmpty(t *testing.T) {
 	for name, hi := range map[string]*HostInfo{
 		"no sample pushed yet": nil,
 		"nil totals map":       {MemAvailableMB: 8000},
-		"empty totals map":     {GPUTotalsMB: map[int]int{}},
-		"a zero total":         {GPUTotalsMB: map[int]int{0: 0}},
+		"empty totals map":     {GPUTotalsMB: map[GPUKey]int{}},
+		"a zero total":         {GPUTotalsMB: map[GPUKey]int{{Index: 0}: 0}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := snapshotBudgets(t, nil, hi, 1024); len(got) != 0 {
@@ -4415,12 +4506,12 @@ func TestNoGPUSampleLeavesBudgetsEmpty(t *testing.T) {
 func TestUnifiedMemoryGPUIsNotAutoBudgeted(t *testing.T) {
 	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
 	o.gpuVendor = GPUVendorApple
-	o.m.SetHostInfo(HostInfo{GPUTotalsMB: map[int]int{0: 14000}})
+	o.m.SetHostInfo(HostInfo{GPUTotalsMB: map[GPUKey]int{{Vendor: GPUVendorApple, Index: 0}: 14000}})
 	if got := o.buildSnapshot().Budgets; len(got) != 0 {
 		t.Errorf("Budgets = %v on an Apple host, want empty", got)
 	}
-	o.cfg.GPUBudgets = []GPUBudget{{Index: 0, BudgetMB: 20000}}
-	if got, want := o.buildSnapshot().Budgets, map[int]int{0: 20000}; !reflect.DeepEqual(got, want) {
+	o.cfg.GPUBudgets = []GPUBudget{{Vendor: GPUVendorApple, Index: 0, BudgetMB: 20000}}
+	if got, want := o.buildSnapshot().Budgets, map[GPUKey]int{{Vendor: GPUVendorApple, Index: 0}: 20000}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Budgets = %v on an Apple host with an operator budget, want %v", got, want)
 	}
 }
@@ -4454,7 +4545,7 @@ func TestManagerEnforcesAutoDetectedBudget(t *testing.T) {
 		}
 		return err
 	}
-	device := &HostInfo{GPUTotalsMB: map[int]int{0: 8000}}
+	device := &HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 8000}}
 
 	t.Run("a spec larger than the detected device is refused", func(t *testing.T) {
 		if err := ensure(t, ManagerOptions{}, device, 12000); !errors.Is(err, ErrNotPermitted) {
@@ -4477,6 +4568,61 @@ func TestManagerEnforcesAutoDetectedBudget(t *testing.T) {
 			t.Fatalf("EnsureRunning(6000 MB, 4000 MB headroom on an 8000 MB GPU) = %v, want ErrNotPermitted", err)
 		}
 	})
+}
+
+// TestManagerBindsProductionGPUKeys drives the key shape main.go installs
+// end to end: an NVIDIA host (ManagerOptions.GPUVendor), a vendor-less spec
+// (legacy wire data), hardware totals keyed {nvidia, 0} and a measurer that
+// answers {nvidia, 0}. Both must land on the spec's GPU: the detected total
+// refuses a spec above it, and a live measurement above the spec's estimate is
+// what admission charges. A spec GPU that resolved to a different key ({"",
+// 0}) would leave the GPU unconstrained and the measurement unread, and both
+// halves below would pass the wrong way.
+func TestManagerBindsProductionGPUKeys(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	nvidia0 := GPUKey{Vendor: GPUVendorNVIDIA, Index: 0}
+	m := NewManager(ManagerOptions{Policy: allowlistPolicy(), Getenv: func(string) string { return "" }, GPUVendor: GPUVendorNVIDIA})
+	t.Cleanup(m.Close)
+	m.SetHostInfo(HostInfo{GPUTotalsMB: map[GPUKey]int{nvidia0: 8000}})
+	m.SetMeasurer(func(pids []int) map[int]map[GPUKey]int {
+		out := make(map[int]map[GPUKey]int, len(pids))
+		for _, p := range pids {
+			out[p] = map[GPUKey]int{nvidia0: 7000}
+		}
+		return out
+	})
+
+	big := baseSpec("spec-big", "model-big")
+	big.GPUs = []SpecGPU{{Index: 0, VRAMMB: 12000}}
+	resident := baseSpec("spec-a", "model-a")
+	resident.Pinned = true
+	resident.GPUs = []SpecGPU{{Index: 0, VRAMMB: 1000}} // measured at 7000
+	candidate := baseSpec("spec-b", "model-b")
+	candidate.GPUs = []SpecGPU{{Index: 0, VRAMMB: 2000}} // fits next to the estimate, not the measurement
+	candidate.AdmissionWaitTimeoutSeconds = 1
+	m.Apply(Config{Specs: []Spec{big, resident, candidate}, Coresident: [][2]string{{"spec-a", "spec-b"}}})
+
+	ensure := func(model string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, release, err := m.EnsureRunning(ctx, model)
+		if err == nil {
+			release()
+		}
+		return err
+	}
+	if err := ensure("model-big"); !errors.Is(err, ErrNotPermitted) {
+		t.Fatalf("EnsureRunning(12000 MB on an {nvidia,0} total of 8000) = %v, want ErrNotPermitted -- the detected total did not bind to the vendor-less spec", err)
+	}
+
+	waitUntil(t, 5*time.Second, "spec-a carries its {nvidia,0} measurement", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning && st.MeasuredVRAM[nvidia0] == 7000
+	})
+	if err := ensure("model-b"); err == nil {
+		t.Fatal("EnsureRunning(2000 MB next to a pinned spec measured at 7000 on 8000) = nil -- the {nvidia,0} measurement was not charged, admission used the 1000 MB estimate")
+	}
 }
 
 // snapshotHostRAMBudget builds a snapshot on an owner holding hi as its latest
@@ -4538,7 +4684,7 @@ func TestSnapshotHostRAMBudgetFromLiveAvailable(t *testing.T) {
 func TestSnapshotHostRAMBudgetWithoutASampleIsUnconstrained(t *testing.T) {
 	for name, hi := range map[string]*HostInfo{
 		"no sample pushed yet":     nil,
-		"a sample with no RAM":     {GPUTotalsMB: map[int]int{0: 24000}},
+		"a sample with no RAM":     {GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000}},
 		"an explicit zero reading": {MemAvailableMB: 0},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -4724,8 +4870,8 @@ func TestSnapshotHostRAMBudgetAddsBackWhatManagedProcessesHold(t *testing.T) {
 // pair of ONE of them, never half of each.
 func TestBuildSnapshotReadsHostInfoOnce(t *testing.T) {
 	const reserve = 1000
-	a := HostInfo{GPUTotalsMB: map[int]int{0: 8000}, MemAvailableMB: 11000}
-	b := HostInfo{GPUTotalsMB: map[int]int{0: 24000}, MemAvailableMB: 31000}
+	a := HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 8000}, MemAvailableMB: 11000}
+	b := HostInfo{GPUTotalsMB: map[GPUKey]int{{Index: 0}: 24000}, MemAvailableMB: 31000}
 	o, _ := newSnapshotOwner(baseSpec("spec-a", "model-a"), 4242, nil)
 	o.hostRAMReserveMB = reserve
 	o.m.SetHostInfo(a)
@@ -4755,7 +4901,7 @@ func TestBuildSnapshotReadsHostInfoOnce(t *testing.T) {
 
 	for i := 0; i < 20000; i++ {
 		snap := o.buildSnapshot()
-		vram, ram := snap.Budgets[0], snap.HostRAMBudgetMB
+		vram, ram := snap.Budgets[GPUKey{Index: 0}], snap.HostRAMBudgetMB
 		fromA := vram == 8000 && ram == 11000-reserve
 		fromB := vram == 24000 && ram == 31000-reserve
 		if !fromA && !fromB {
@@ -5091,7 +5237,7 @@ func TestVRAMBootstrapEligibility(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			o := &owner{m: &Manager{}}
 			if tc.measurer {
-				o.m.SetMeasurer(func([]int) map[int]map[int]int { return nil })
+				o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int { return nil })
 			}
 			if got := o.vramBootstrapEligible(tc.st); got != tc.want {
 				t.Errorf("vramBootstrapEligible = %v, want %v", got, tc.want)
@@ -5115,7 +5261,7 @@ func TestVRAMBootstrapMarkerSetWhenMeasured(t *testing.T) {
 		o, st := newSnapshotOwner(spec, pid, nil)
 		o.applyMeasurement(cmdMeasured{
 			targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
-			byPID:   map[int]map[int]int{pid: {0: 7000}},
+			byPID:   map[int]map[GPUKey]int{pid: {{Index: 0}: 7000}},
 		})
 		if !st.vramBootstrapDone {
 			t.Error("a real VRAM measurement must resolve the bootstrap (set vramBootstrapDone)")
@@ -5128,7 +5274,7 @@ func TestVRAMBootstrapMarkerSetWhenMeasured(t *testing.T) {
 		o, st := newSnapshotOwner(spec, pid, nil)
 		o.applyMeasurement(cmdMeasured{
 			targets: []measureTarget{{specID: spec.ID, proc: st.proc, pid: pid}},
-			byPID:   map[int]map[int]int{pid: {0: 0}}, // not a measurement (realMeasurement drops it)
+			byPID:   map[int]map[GPUKey]int{pid: {{Index: 0}: 0}}, // not a measurement (realMeasurement drops it)
 		})
 		if st.vramBootstrapDone {
 			t.Error("a measured 0 is not a measurement and must not resolve the bootstrap")
@@ -5138,7 +5284,7 @@ func TestVRAMBootstrapMarkerSetWhenMeasured(t *testing.T) {
 	t.Run("buildSnapshot marks a measured live occupant", func(t *testing.T) {
 		spec := baseSpec("spec-a", "model-a")
 		spec.GPUs = []SpecGPU{{Index: 0, VRAMMB: 0}}
-		measurer := func([]int) map[int]map[int]int { return map[int]map[int]int{pid: {0: 7000}} }
+		measurer := func([]int) map[int]map[GPUKey]int { return map[int]map[GPUKey]int{pid: {{Index: 0}: 7000}} }
 		o, st := newSnapshotOwner(spec, pid, measurer)
 		_ = o.buildSnapshot()
 		if !st.vramBootstrapDone {
@@ -5166,7 +5312,7 @@ func TestVRAMBootstrapMarkerSurvivesProcessExit(t *testing.T) {
 		spec:              spec,
 		state:             StateDraining,
 		intentionalStop:   true, // a clean stop, so onProcExited rests it at Stopped
-		measuredVRAM:      map[int]int{0: 7000},
+		measuredVRAM:      map[GPUKey]int{{Index: 0}: 7000},
 		measuredRAM:       5000,
 		vramBootstrapDone: true, // the shot was spent (or a measurement had landed)
 		proc:              &runningProc{specID: spec.ID, pid: 4242, log: logs.newProc(spec.ID), exited: make(chan struct{})},
@@ -5208,7 +5354,7 @@ func TestVRAMBootstrapOneShotBurnsMarkerThenWaits(t *testing.T) {
 	// A measurer must be installed for the bootstrap to be eligible at all: the
 	// one-shot exists to capture a measurement, so it never fires where none can
 	// be taken. Its return value is irrelevant here (no candidate pid is live).
-	o.m.SetMeasurer(func([]int) map[int]map[int]int { return nil })
+	o.m.SetMeasurer(func([]int) map[int]map[GPUKey]int { return nil })
 	candSt := &specState{spec: cand, state: StateStopped}
 	// The victim is already Draining, so admitAndStart's beginDrain is a no-op --
 	// the test needs no live child or SIGTERM, only a row in the running set.
@@ -5248,4 +5394,115 @@ func contains(list []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// TestApplyConfigVendorBackfillDoesNotRelaunch is the upgrade guarantee of
+// #434: a gateway from before the vendor field pushes spec GPUs without one,
+// the upgraded gateway later pushes the same spec with the host's legacy
+// vendor filled in. The manager's own relaunch decision (reconcileSpec) must
+// see no change, so the running process is neither drained nor exec'd again.
+// Counted from the child side, the stub's invocation log.
+func TestApplyConfigVendorBackfillDoesNotRelaunch(t *testing.T) {
+	skipOnWindows(t)
+	shrinkTimings(t)
+	m := NewManager(ManagerOptions{
+		Policy:    allowlistPolicy(),
+		Getenv:    func(string) string { return "" },
+		GPUVendor: GPUVendorNVIDIA, // the host's legacy vendor
+	})
+	t.Cleanup(m.Close)
+
+	invocationLog := filepath.Join(t.TempDir(), "invocations.log")
+	spec := baseSpec("spec-a", "model-a")
+	spec.Args = stubArgs(0, 0, 0, invocationLog)
+	spec.Pinned = true
+	spec.GPUs = []SpecGPU{{Index: 0}} // as pushed by a gateway before the upgrade
+	m.Apply(Config{Specs: []Spec{spec}})
+	waitUntil(t, 3*time.Second, "pinned spec-a running", func() bool {
+		st := statusFor(m, "spec-a")
+		return st != nil && st.State == StateRunning
+	})
+	pid := statusFor(m, "spec-a").PID
+
+	backfilled := spec
+	backfilled.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}} // the same spec after the gateway's backfill
+	m.Apply(Config{Specs: []Spec{backfilled}})
+	// A relaunch would drain the idle child at once and exec a new one; give
+	// it the time to show.
+	time.Sleep(300 * time.Millisecond)
+
+	st := statusFor(m, "spec-a")
+	if n := countInvocations(t, invocationLog); n != 1 || st == nil || st.State != StateRunning || st.PID != pid {
+		t.Fatalf("an upgrade that only adds the legacy vendor relaunched: invocations %d (want 1), status %+v (want running, pid %d)", n, st, pid)
+	}
+}
+
+// TestFillDetectedBudgetsSkipsAppleKeysOnly: an Apple GPU's "total" is not a
+// ceiling (see fillDetectedBudgets), so it gets no detected budget -- but that
+// is a property of the Apple GPU, not of the host: an NVIDIA card on the same
+// host keeps its detected budget.
+func TestFillDetectedBudgetsSkipsAppleKeysOnly(t *testing.T) {
+	nv0 := GPUKey{Vendor: GPUVendorNVIDIA, Index: 0}
+	apple0 := GPUKey{Vendor: GPUVendorApple, Index: 0}
+	got := snapshotBudgets(t, nil, &HostInfo{GPUTotalsMB: map[GPUKey]int{nv0: 11264, apple0: 65536}}, 1024)
+	if want := map[GPUKey]int{nv0: 11264 - 1024}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Budgets = %v, want %v (detected NVIDIA budget, none for the Apple GPU)", got, want)
+	}
+}
+
+// TestPartialReadingKeepsSpecVendorsMixed: a first reading that missed a
+// vendor (a cold nvidia-smi left only AMD in the totals and the Vulkan map)
+// must not make a real NVIDIA+AMD host look single-vendor for a spec that
+// names an NVIDIA card: the spec's own GPU keys prove that vendor, so a
+// Vulkan spec on nvidia:0 is refused rather than guessed.
+func TestPartialReadingKeepsSpecVendorsMixed(t *testing.T) {
+	skipOnWindows(t)
+	amdOnly := HostInfo{
+		GPUTotalsMB: map[GPUKey]int{{GPUVendorAMD, 0}: 16000},
+		Vulkan:      VulkanMap{Ordinals: map[GPUKey]int{{GPUVendorAMD, 0}: 0}, DeviceCount: 2},
+	}
+	for _, tc := range []struct {
+		name     string
+		inject   bool
+		wantCode string
+	}{
+		{"env injection", true, codeVulkanMappingUnavailable},
+		{"no injection", false, codeVulkanVisibleDevicesRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shrinkTimings(t)
+			m := NewManager(ManagerOptions{
+				Policy:     allowlistPolicy(),
+				Getenv:     func(string) string { return "" },
+				GPUVendor:  GPUVendorNVIDIA,
+				GPUVendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD},
+			})
+			t.Cleanup(m.Close)
+			m.SetHostInfo(amdOnly)
+			spec := baseSpec("spec-a", "model-a")
+			spec.GPUs = []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA, VRAMMB: 1}}
+			spec.DeviceBackend = "vulkan"
+			spec.SetVisibleDevices = tc.inject
+			m.Apply(Config{Specs: []Spec{spec}})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, _, err := m.EnsureRunning(ctx, "model-a"); !errors.Is(err, ErrNotPermitted) {
+				t.Fatalf("EnsureRunning error = %v, want ErrNotPermitted", err)
+			}
+			if st := statusFor(m, "spec-a"); st == nil || st.LastError == nil || st.LastError.Code != tc.wantCode {
+				t.Fatalf("Status()[spec-a] = %+v, want last_error code %s", st, tc.wantCode)
+			}
+		})
+	}
+
+	// A Vulkan RPC member on nvidia:0 is pinned through the Vulkan map as on
+	// a mixed host, so the missing ordinal refuses it too.
+	o := &owner{m: &Manager{}, gpuVendor: GPUVendorNVIDIA, gpuVendors: GPUVendors{GPUVendorNVIDIA, GPUVendorAMD}}
+	o.m.SetHostInfo(amdOnly)
+	member := Spec{Kind: SpecKindRPCServer, DeviceBackend: "vulkan", GPUs: []SpecGPU{{Index: 0, Vendor: GPUVendorNVIDIA}}}
+	var pe *GPUPlanError
+	if _, err := o.memberDevicePlan(member); !errors.As(err, &pe) || pe.Code != codeVulkanMappingUnavailable {
+		t.Fatalf("member plan err = %v, want %s", err, codeVulkanMappingUnavailable)
+	}
 }

@@ -40,6 +40,7 @@ func resolveServerPerfWindow(token string) time.Duration {
 
 // perfGPUDTO is one GPU's slice of a telemetry point.
 type perfGPUDTO struct {
+	Vendor        string  `json:"vendor,omitempty"`
 	Index         int     `json:"index"`
 	Name          string  `json:"name"`
 	UUID          string  `json:"uuid"`
@@ -111,6 +112,7 @@ func perfPointFromSample(sample routing.TelemetrySample) perfPointDTO {
 	gpus := make([]perfGPUDTO, 0, len(sample.GPUs))
 	for _, g := range sample.GPUs {
 		gpus = append(gpus, perfGPUDTO{
+			Vendor:        g.Vendor,
 			Index:         g.Index,
 			Name:          g.Name,
 			UUID:          g.UUID,

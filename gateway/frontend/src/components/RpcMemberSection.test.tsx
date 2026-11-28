@@ -10,6 +10,7 @@ import { PortalApiError } from '../api/transport';
 import { messages } from '../i18n';
 import type {
   AdminGroupCandidate,
+  HardwareGPU,
   PortalServer,
   RPCMemberSpec,
   RuntimeStatus,
@@ -37,7 +38,7 @@ function spec(over: Partial<RPCMemberSpec> = {}): RPCMemberSpec {
     binary: '/opt/llama/rpc-server',
     args: ['-t', '8'],
     env: { FOO: 'bar' },
-    gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+    gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
     cache_enabled: false,
     device_backend: 'auto',
     ram_estimate_mb: 0,
@@ -74,6 +75,7 @@ function setup(
     binaries?: ServerBinary[];
     groupCandidates?: AdminGroupCandidate[];
     groupCandidatesError?: unknown;
+    hardwareGpus?: HardwareGPU[];
   } = {},
 ) {
   const api = {
@@ -98,7 +100,13 @@ function setup(
   const rows = opts.rows ?? [];
   const view = render(
     <ToastProvider>
-      <RpcMemberSection t={t} api={api} server={opts.server ?? server} statusRows={rows} />
+      <RpcMemberSection
+        t={t}
+        api={api}
+        server={opts.server ?? server}
+        statusRows={rows}
+        hardwareGpus={opts.hardwareGpus}
+      />
     </ToastProvider>,
   );
   return Object.assign(api, {
@@ -190,7 +198,7 @@ describe('RpcMemberSection manual member specs', () => {
         binary: '/opt/llama/rpc-server',
         args: ['-t', '8'],
         env: { FOO: 'bar' },
-        gpus: [{ index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
+        gpus: [{ vendor: '', index: 1, vram_estimate_mb: 8000, vram_measured_mb: 0 }],
         cache_enabled: true,
         device_backend: 'auto',
         ram_estimate_mb: 4096,
@@ -204,8 +212,8 @@ describe('RpcMemberSection manual member specs', () => {
       specs: [
         spec({
           gpus: [
-            { index: 0, vram_estimate_mb: 1, vram_measured_mb: 0 },
-            { index: 1, vram_estimate_mb: 2, vram_measured_mb: 0 },
+            { vendor: '', index: 0, vram_estimate_mb: 1, vram_measured_mb: 0 },
+            { vendor: '', index: 1, vram_estimate_mb: 2, vram_measured_mb: 0 },
           ],
         }),
       ],
@@ -451,7 +459,9 @@ describe('RpcMemberSection member status', () => {
 
   it('shows effective VRAM as max(measured, estimate) and the state badges', async () => {
     setup({
-      specs: [spec({ gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }] })],
+      specs: [
+        spec({ gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }] }),
+      ],
       rows: [
         memberRow({
           gpus: [{ index: 0, vram_measured_mb: 9000 }],
@@ -612,11 +622,131 @@ describe('RpcMemberSection settings state', () => {
     expect(screen.getByLabelText(`${t.rpcMemberGpuRow(1)}: ${t.runtimeSpecGpuIndex}`)).toBe(index);
     fireEvent.click(screen.getByRole('button', { name: t.save }));
     await waitFor(() => expect(api.updateRPCMemberSpec).toHaveBeenCalled());
+    // A row without a vendor goes back with the empty vendor it came with.
     expect(api.updateRPCMemberSpec.mock.calls[0][2].gpus[0]).toEqual({
+      vendor: '',
       index: 2,
       vram_estimate_mb: 8000,
       vram_measured_mb: 0,
     });
+  });
+});
+
+// #434: a member spec GPU is its (vendor, index); indexes restart per vendor.
+describe('RpcMemberSection vendor-qualified GPUs', () => {
+  const mixed: HardwareGPU[] = [
+    { index: 0, vendor: 'nvidia', name: 'RTX 4090', memory_total_bytes: 24 * 1024 ** 3 },
+    { index: 0, vendor: 'amd', name: 'RX 6800', memory_total_bytes: 16 * 1024 ** 3 },
+  ];
+
+  function pickGpu(row: number, option: string) {
+    fireEvent.mouseDown(
+      screen.getByRole('combobox', { name: `${t.rpcMemberGpuRow(row)}: ${t.runtimeSpecGpuPick}` }),
+    );
+    fireEvent.click(within(screen.getByRole('listbox')).getByRole('option', { name: option }));
+  }
+
+  it('rpc member editor saves vendor-qualified GPUs', async () => {
+    const api = setup({ hardwareGpus: mixed });
+    fireEvent.click(await screen.findByRole('button', { name: t.rpcMemberAdd }));
+    fireEvent.change(screen.getByLabelText(t.rpcMemberBinary), {
+      target: { value: '/opt/llama/rpc-server' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    pickGpu(1, 'NVIDIA 0 · RTX 4090');
+    // Row 2 is offered only the card row 1 does not hold: AMD 0 is another card.
+    fireEvent.mouseDown(
+      screen.getByRole('combobox', { name: `${t.rpcMemberGpuRow(2)}: ${t.runtimeSpecGpuPick}` }),
+    );
+    expect(
+      within(screen.getByRole('listbox'))
+        .getAllByRole('option')
+        .map((o) => o.textContent),
+    ).toEqual([t.runtimeSpecGpuPickPlaceholder, 'AMD 0 · RX 6800']);
+    fireEvent.click(
+      within(screen.getByRole('listbox')).getByRole('option', { name: 'AMD 0 · RX 6800' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(api.createRPCMemberSpec).toHaveBeenCalledTimes(1));
+    expect(api.createRPCMemberSpec.mock.calls[0][1].gpus).toEqual([
+      { vendor: 'nvidia', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+      { vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+    ]);
+  });
+
+  it('starts a new GPU row on the first reported card no row holds', async () => {
+    setup({ hardwareGpus: mixed });
+    fireEvent.click(await screen.findByRole('button', { name: t.rpcMemberAdd }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    fireEvent.click(screen.getByRole('button', { name: t.runtimeSpecGpuAdd }));
+    const pickers = screen.getAllByRole('combobox', { name: new RegExp(t.runtimeSpecGpuPick) });
+    expect(pickers.map((p) => p.textContent)).toEqual(['NVIDIA 0 · RTX 4090', 'AMD 0 · RX 6800']);
+  });
+
+  it('shows a stored row without a vendor as the server legacy vendor card', async () => {
+    setup({
+      hardwareGpus: mixed,
+      server: { ...server, gpu_legacy_vendor: 'amd' } as PortalServer,
+      specs: [spec({ gpus: [{ vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }] })],
+    });
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
+    );
+    expect(
+      screen.getByRole('combobox', { name: `${t.rpcMemberGpuRow(1)}: ${t.runtimeSpecGpuPick}` })
+        .textContent,
+    ).toBe('AMD 0 · RX 6800');
+  });
+
+  it('refuses the same card twice, a vendorless row read as the legacy vendor', async () => {
+    const api = setup({
+      server: { ...server, gpu_legacy_vendor: 'nvidia' } as PortalServer,
+      specs: [
+        spec({
+          gpus: [
+            { vendor: '', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+            { vendor: 'nvidia', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+          ],
+        }),
+      ],
+    });
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    expect(await screen.findByText(t.errorRuntimeSpecGpuInvalid)).toBeInTheDocument();
+    expect(api.updateRPCMemberSpec).not.toHaveBeenCalled();
+  });
+
+  it('accepts the same index of two vendors', async () => {
+    const api = setup({
+      specs: [
+        spec({
+          gpus: [
+            { vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+            { vendor: 'nvidia', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+          ],
+        }),
+      ],
+    });
+    fireEvent.click(
+      await screen.findByRole('button', { name: `${t.runtimeSpecEditAction}: rpcm_1` }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.save }));
+    await waitFor(() => expect(api.updateRPCMemberSpec).toHaveBeenCalledTimes(1));
+  });
+
+  it('sums the live VRAM of another vendor card at the same index', async () => {
+    setup({
+      specs: [
+        spec({ gpus: [{ vendor: 'amd', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 }] }),
+      ],
+      rows: [memberRow({ gpus: [{ vendor: 'nvidia', index: 0, vram_measured_mb: 9000 }] })],
+    });
+    const row = await memberTableRow('rpcm_1');
+    // AMD 0's estimate and NVIDIA 0's measurement are two cards: 8000 + 9000.
+    expect(within(row).getByText('17000 MB')).toBeTruthy();
   });
 });
 

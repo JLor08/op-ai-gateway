@@ -12,6 +12,7 @@ import (
 	"op-ai-server-agent/internal/sample"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,6 +31,17 @@ type HardwareOptions struct {
 	// HelperSocket is the privileged helper's Unix socket ("" = no helper). An
 	// unprivileged Linux agent reads its memory modules from there.
 	HelperSocket string
+	// VRAMMeasurable reports, per GPU vendor wire value, the sources that can
+	// measure per-process VRAM (cuda/rocm/vulkan). Nil = nothing measurable.
+	// Evaluated on every CollectHardware, after the GPU collectors ran.
+	VRAMMeasurable func() map[string][]string
+	// Vulkan lists the Vulkan devices (ok=false: no vulkaninfo); nil =
+	// collectVulkan, which runs the host's vulkaninfo. A hook so tests are
+	// independent of the host's Vulkan tooling.
+	Vulkan func(context.Context) ([]VulkanDevice, bool)
+	// GPULegacyVendor is the runtime's legacy GPU vendor (nvidia, amd,
+	// apple or ""), copied into the report's gpu_legacy_vendor unchanged.
+	GPULegacyVendor string
 }
 
 // HelperMemoryModulesNeeded reports whether r lacks the memory modules that
@@ -50,6 +62,9 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 		OS:           runtime.GOOS,
 		Arch:         runtime.GOARCH,
 		GPUs:         []sample.GPUInfo{},
+		// The runtime's legacy vendor, not one derived from the GPUs below:
+		// a collector that errors drops its GPUs from this report.
+		GPULegacyVendor: opts.GPULegacyVendor,
 	}
 
 	if infos, err := cpu.InfoWithContext(ctx); err == nil && len(infos) > 0 {
@@ -97,14 +112,42 @@ func CollectHardware(ctx context.Context, gpuCollectors []GPUCollector, agentVer
 		for _, gp := range gpus {
 			r.GPUs = append(r.GPUs, sample.GPUInfo{
 				Index:            gp.Index,
+				Vendor:           gp.Vendor,
 				Name:             gp.Name,
 				UUID:             gp.UUID,
 				DriverVersion:    gp.DriverVersion,
 				MemoryTotalBytes: gp.MemTotalBytes,
-				// Empty for every collector but NVIDIA, and that is the
+				// NVIDIA and AMD fill it; Apple has none, and that is the
 				// intended degradation -- see sample.GPU.PCIBusID.
 				PCIBusID: gp.PCIBusID,
 			})
+		}
+	}
+
+	var measurable map[string][]string
+	if opts.VRAMMeasurable != nil {
+		measurable = opts.VRAMMeasurable()
+	}
+	vulkanFn := opts.Vulkan
+	if vulkanFn == nil {
+		vulkanFn = collectVulkan
+	}
+	var ordinals map[pciAddr]int
+	if len(r.GPUs) > 0 {
+		if devs, ok := vulkanFn(ctx); ok {
+			r.VulkanDeviceCount = vulkanDeviceCount(devs)
+			ordinals = vulkanOrdinalsByPCI(devs)
+		}
+	}
+	for i := range r.GPUs {
+		g := &r.GPUs[i]
+		if v := measurable[g.Vendor]; len(v) > 0 {
+			g.VRAMMeasurable = slices.Clone(v)
+		}
+		if addr, ok := parsePCIAddr(g.PCIBusID); ok {
+			if o, ok := ordinals[addr]; ok {
+				g.VulkanOrdinal = &o
+			}
 		}
 	}
 

@@ -110,8 +110,9 @@ func (c *RuntimeClusterStatusDTO) clone() *RuntimeClusterStatusDTO {
 // UNKNOWN throughout the runtime feature, and the store write-back drops it on
 // the same rule.
 type RuntimeGPUStatusDTO struct {
-	Index          int `json:"index"`
-	VRAMMeasuredMB int `json:"vram_measured_mb"`
+	Index          int    `json:"index"`
+	Vendor         string `json:"vendor,omitempty"`
+	VRAMMeasuredMB int    `json:"vram_measured_mb"`
 }
 
 // RuntimeStatusDTO is one agent-managed model process's live state, as

@@ -12,6 +12,7 @@
 
 import { type Fetcher, buildQueryString, request, subscribeSSE } from './transport';
 import type { DecisionsMode, EndpointMode, SystemOneMode } from './models';
+import type { GpuVendor } from './gpus';
 import type { RPCMemberSpec } from './rpcMembers';
 
 // One per-GPU VRAM demand row on a runtime spec. vram_estimate_mb is
@@ -21,6 +22,11 @@ import type { RPCMemberSpec } from './rpcMembers';
 // ignored server-side (see PutRuntimeSpecRequest below).
 export interface RuntimeSpecGPU {
   index: number;
+  // The card's vendor (#434): indexes restart per vendor, so a card is
+  // (vendor, index). '' is a row that names no vendor (written before vendors
+  // existed); the gateway reads it as the server's legacy vendor. The gateway
+  // always sends the field, and the editors send it back as they hold it.
+  vendor: GpuVendor;
   vram_estimate_mb: number;
   vram_measured_mb: number;
 }
@@ -34,6 +40,8 @@ export type RpcTransport = 'direct' | 'relay';
 // operator's VRAM estimate (written) and the measured VRAM (read-only).
 export interface ClusterMemberGPU {
   index: number;
+  // RuntimeSpecGPU's vendor rule: '' names the member server's legacy vendor.
+  vendor: GpuVendor;
   vram_estimate_mb: number;
   vram_measured_mb: number;
 }
@@ -106,6 +114,7 @@ export interface ClusterBreach {
 export interface ClusterPeakAboveBudget {
   position: number;
   resource?: 'vram' | 'ram';
+  gpu_vendor?: GpuVendor;
   gpu_index?: number;
   stored_mb?: number;
   ceiling_mb?: number;
@@ -560,6 +569,8 @@ export interface CoResidency {
 // telemetry -- never client-writable, on create or on later PUTs.
 export interface GPUBudget {
   index: number;
+  // RuntimeSpecGPU's vendor rule: '' names the server's legacy vendor.
+  vendor: GpuVendor;
   budget_mb: number;
   expected_uuid: string;
   expected_name: string;
@@ -612,6 +623,7 @@ export interface RuntimeClusterStatus {
 // unknown throughout the runtime feature and is dropped on ingest.
 export interface RuntimeGPUStatus {
   index: number;
+  vendor?: GpuVendor;
   vram_measured_mb: number;
 }
 
@@ -962,14 +974,17 @@ export function runtimeApi(fetcher: Fetcher) {
         fetcher,
         `/api/portal/applications/${encodeURIComponent(applicationId)}/runtime/cluster-candidates${buildQueryString({ mode, binary: headBinary })}`,
       ),
-    // Clears the stored usage of the member on serverId of the cluster head on
-    // this mapping -- the way out of a stored peak above the member's budget,
-    // which its next start would be refused for -- and answers the head's
-    // spec as it reads afterwards.
-    resetClusterMemberUsage: (mappingId: string, serverId: string) =>
+    // Clears the stored usage of the member at position on serverId of the
+    // cluster head on this mapping -- the way out of a stored peak above the
+    // member's budget, which its next start would be refused for -- and
+    // answers the head's spec as it reads afterwards. A head may have several
+    // members on one server (#434), so the position is always sent (without
+    // it the gateway answers runtime_spec.cluster_member_ambiguous for such a
+    // server).
+    resetClusterMemberUsage: (mappingId: string, serverId: string, position: number) =>
       request<RuntimeSpec>(
         fetcher,
-        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-members/${encodeURIComponent(serverId)}/reset-usage`,
+        `/api/portal/mappings/${encodeURIComponent(mappingId)}/runtime/cluster-members/${encodeURIComponent(serverId)}/reset-usage${buildQueryString({ position })}`,
         { method: 'POST' },
       ),
     runtimeCoresidency: (appId: string) =>

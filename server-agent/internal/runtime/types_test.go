@@ -635,7 +635,7 @@ func TestStatusMarshalJSONNeverEmitsNullMeasuredVRAM(t *testing.T) {
 		t.Errorf("raw = %s, must never contain null", raw)
 	}
 
-	populated := Status{SpecID: "s2", State: StateRunning, MeasuredVRAM: map[int]int{0: 21234, 1: 8000}}
+	populated := Status{SpecID: "s2", State: StateRunning, MeasuredVRAM: map[GPUKey]int{{Vendor: GPUVendorNVIDIA, Index: 0}: 21234, {Vendor: GPUVendorNVIDIA, Index: 1}: 8000}}
 	raw2, err := json.Marshal(populated)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -648,8 +648,8 @@ func TestStatusMarshalJSONNeverEmitsNullMeasuredVRAM(t *testing.T) {
 	if err := json.Unmarshal(decoded["measured_vram"], &vram); err != nil {
 		t.Fatalf("unmarshal measured_vram: %v", err)
 	}
-	if vram["0"] != 21234 || vram["1"] != 8000 || len(vram) != 2 {
-		t.Errorf("measured_vram = %v, want {0:21234 1:8000}", vram)
+	if vram["nvidia:0"] != 21234 || vram["nvidia:1"] != 8000 || len(vram) != 2 {
+		t.Errorf("measured_vram = %v, want {nvidia:0:21234 nvidia:1:8000}", vram)
 	}
 }
 
@@ -691,7 +691,7 @@ func TestStatusMarshalJSONAppliesToCollections(t *testing.T) {
 	// Manager.Status()'s own shape.
 	rawSlice, err := json.Marshal([]Status{
 		{SpecID: "s1", State: StateRunning},
-		{SpecID: "s2", State: StateStopped, MeasuredVRAM: map[int]int{0: 4096}},
+		{SpecID: "s2", State: StateStopped, MeasuredVRAM: map[GPUKey]int{{Index: 0}: 4096}},
 	})
 	if err != nil {
 		t.Fatalf("marshal []Status: %v", err)

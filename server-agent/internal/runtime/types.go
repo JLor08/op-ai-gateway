@@ -34,8 +34,13 @@ import (
 
 // SpecGPU is one GPU a Spec's process is launched to use.
 type SpecGPU struct {
-	Index  int `json:"index"`
-	VRAMMB int `json:"vram_mb"` // 0 = unknown demand, never a real zero-cost claim
+	// Vendor names which vendor's card Index counts in (#434): NVIDIA 0 and
+	// AMD 0 are two different cards on a mixed host. Empty is the legacy "the
+	// host's only vendor" of a gateway from before the field, resolved to the
+	// host's legacy vendor on Apply (resolveLegacyGPUVendors).
+	Vendor GPUVendor `json:"vendor,omitempty"`
+	Index  int       `json:"index"`
+	VRAMMB int       `json:"vram_mb"` // 0 = unknown demand, never a real zero-cost claim
 }
 
 // ConfigFile is one operator-supplied file the agent materialises for a spec
@@ -362,8 +367,11 @@ const (
 
 // GPUBudget is one per-GPU VRAM budget row.
 type GPUBudget struct {
-	Index    int `json:"index"`
-	BudgetMB int `json:"budget_mb"`
+	// Vendor is SpecGPU.Vendor's twin: which vendor's card Index counts in,
+	// empty = the host's legacy vendor.
+	Vendor   GPUVendor `json:"vendor,omitempty"`
+	Index    int       `json:"index"`
+	BudgetMB int       `json:"budget_mb"`
 }
 
 // Config is the runtime-config document served by
@@ -1055,14 +1063,14 @@ type Status struct {
 	// Model is the row's INSTANCE ADDRESS (InstanceAddress): the spec's upstream
 	// model name for instance 0, "m#k" for instance k >= 1 -- the name that
 	// reaches that very process through the router.
-	Model        string      `json:"model"`
-	State        State       `json:"state"`
-	Since        time.Time   `json:"since"`
-	PID          int         `json:"pid,omitempty"`
-	Port         int         `json:"port,omitempty"`
-	InFlight     int         `json:"in_flight"`
-	Restarts     int         `json:"restarts"`
-	MeasuredVRAM map[int]int `json:"measured_vram"` // gpu index -> MB, when measured
+	Model        string         `json:"model"`
+	State        State          `json:"state"`
+	Since        time.Time      `json:"since"`
+	PID          int            `json:"pid,omitempty"`
+	Port         int            `json:"port,omitempty"`
+	InFlight     int            `json:"in_flight"`
+	Restarts     int            `json:"restarts"`
+	MeasuredVRAM map[GPUKey]int `json:"measured_vram"` // gpu key -> MB, when measured; keys marshal as "vendor:index"
 	// MeasuredRAMMB is the row's current process's resident host RAM in MB, as
 	// the recurring RAM measurement last observed it; 0 means unknown (never
 	// measured, no RAM measurer, or the process has exited) and is never "needs
@@ -1164,7 +1172,7 @@ type statusAlias Status
 func (s Status) MarshalJSON() ([]byte, error) {
 	a := statusAlias(s)
 	if a.MeasuredVRAM == nil {
-		a.MeasuredVRAM = map[int]int{}
+		a.MeasuredVRAM = map[GPUKey]int{}
 	}
 	return json.Marshal(a)
 }

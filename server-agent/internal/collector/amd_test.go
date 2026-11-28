@@ -156,3 +156,19 @@ func TestParseRocmJSONCapturesDriverVersion(t *testing.T) {
 		t.Fatalf("driver_version = %q, want 6.2.4", gpus[0].DriverVersion)
 	}
 }
+
+func TestParseRocmJSONSetsVendor(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "rocm-smi.json"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	gpus, err := parseRocmJSON(data)
+	if err != nil || len(gpus) == 0 {
+		t.Fatalf("parseRocmJSON: %v (%d gpus)", err, len(gpus))
+	}
+	for _, g := range gpus {
+		if g.Vendor != VendorAMD {
+			t.Fatalf("vendor = %q, want %q", g.Vendor, VendorAMD)
+		}
+	}
+}

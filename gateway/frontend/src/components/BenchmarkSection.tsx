@@ -36,6 +36,7 @@ import {
 } from './shared/audioMetrics';
 import { pollBenchmarkStatus } from './shared/benchmark';
 import { formatPortalError } from './shared/format';
+import { gpuDisplayName, gpuKey } from '../api';
 import {
   vramFingerprintLabelKey,
   vramInconclusiveLabelKey,
@@ -251,8 +252,9 @@ function VramReportView({
             </TableHead>
             <TableBody>
               {gpus.map((gpu) => (
-                <TableRow key={gpu.index}>
-                  <TableCell>{gpu.index}</TableCell>
+                // (vendor, index) is the card: indexes restart per vendor (#434).
+                <TableRow key={gpuKey(gpu.vendor, gpu.index)}>
+                  <TableCell>{gpuDisplayName(gpu.vendor, gpu.index)}</TableCell>
                   <TableCell align="right">{vramMb(gpu.baseline_used_mb)}</TableCell>
                   <TableCell align="right">{vramMb(gpu.delta_mb)}</TableCell>
                   <TableCell align="right">{vramMb(gpu.measured_mb)}</TableCell>

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"op-ai-gateway/internal/portal"
 	"op-ai-gateway/internal/routing"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -1276,4 +1277,159 @@ func TestHandlePortalMappingRuntimeSpecPutBothDecisionModesInvalid(t *testing.T)
 	if strings.Contains(msg, "runtime_spec.decisions_passthrough_unsupported") || strings.Contains(msg, "runtime_spec.systemone_translate_unsupported") {
 		t.Fatalf("message = %q repeats the raw sentinel text", msg)
 	}
+}
+
+// TestVendorErrorsAreMappedInEveryTable: each save that normalizes GPU
+// vendors (the runtime spec and its cluster members, the GPU budgets through
+// the server mapper, the RPC member spec through its concatenated table)
+// answers the vendor and device-plan refusals with their 400 and code,
+// never the 500 fallback.
+func TestVendorErrorsAreMappedInEveryTable(t *testing.T) {
+	tables := map[string][]errRow{
+		"runtime spec": portalRuntimeSpecErrors,
+		"server":       portalServerErrRows,
+		"rpc member":   portalRPCMemberErrors,
+	}
+	codes := map[error]string{
+		portal.ErrRuntimeSpecGPUVendorInvalid:     "runtime_spec.gpu_vendor_invalid",
+		portal.ErrRuntimeSpecGPUVendorUnsupported: "runtime_spec.gpu_vendor_unsupported",
+		// The device-plan refusals (#434 F5) of the same saves.
+		portal.ErrRuntimeSpecGPUVendorBackendMismatch:     "runtime_spec.gpu_vendor_backend_mismatch",
+		portal.ErrRuntimeSpecVulkanVisibleDevicesRequired: "runtime_spec.vulkan_visible_devices_required",
+	}
+	for name, tbl := range tables {
+		for err, code := range codes {
+			rec := httptest.NewRecorder()
+			writeMappedError(rec, err, tbl, http.StatusInternalServerError, "x", "x")
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"`+code+`"`) {
+				t.Fatalf("%s: %v -> %d %s, want 400 %s", name, err, rec.Code, rec.Body.String(), code)
+			}
+		}
+	}
+}
+
+// resetUsageBase is the reset-usage path prefix of the usage cluster's head
+// (seedUsageCluster).
+const resetUsageBase = "/api/portal/mappings/map_usage_head/runtime/cluster-members/"
+
+// seedMemberUsage gives the member of head at position stored and run-peak
+// RAM and VRAM (every GPU row of it) inside the head's current run.
+func seedMemberUsage(t *testing.T, s routing.Store, head string, position, ramMB, vramMB int) {
+	t.Helper()
+	m, gpus := memberAt(t, s, head, position)
+	m.RAMMeasuredMB, m.RunPeakRAMMB = ramMB, ramMB
+	for i := range gpus {
+		gpus[i].VRAMMeasuredMB, gpus[i].RunPeakVRAMMB = vramMB, vramMB
+	}
+	if applied, err := s.UpdateClusterMemberUsage(context.Background(), m, gpus); err != nil || !applied {
+		t.Fatalf("seed usage at %d: applied=%v err=%v", position, applied, err)
+	}
+}
+
+// wantMemberUsage fails unless the member of head at position stores ramMB
+// of RAM and vramMB on each of its GPUs, as both stored and run-peak values.
+func wantMemberUsage(t *testing.T, s routing.Store, head string, position, ramMB, vramMB int) {
+	t.Helper()
+	m, gpus := memberAt(t, s, head, position)
+	if m.RAMMeasuredMB != ramMB || m.RunPeakRAMMB != ramMB {
+		t.Fatalf("member %d = %+v, want RAM %d", position, m, ramMB)
+	}
+	for _, g := range gpus {
+		if g.VRAMMeasuredMB != vramMB || g.RunPeakVRAMMB != vramMB {
+			t.Fatalf("member %d gpu = %+v, want VRAM %d", position, g, vramMB)
+		}
+	}
+}
+
+// TestResetUsageAmbiguousWithoutPosition pins the reset of one of two members
+// of a head on one server: without a position the server names no single
+// member (409 cluster_member_ambiguous, nothing reset), with ?position= only
+// that member is reset and its server pushed.
+func TestResetUsageAmbiguousWithoutPosition(t *testing.T) {
+	srv := NewTestServer()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	seedUsageCluster(t, srv.Routes, now)
+	seedSameServerMembers(t, srv.Routes)
+	if err := srv.Routes.BeginClusterMemberRun(context.Background(), usageHead, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	seedMemberUsage(t, srv.Routes, usageHead, 0, 1000, 5000)
+	seedMemberUsage(t, srv.Routes, usageHead, 1, 2000, 7000)
+	var pushed []string
+	srv.clusterUsage.push = func(id string) { pushed = append(pushed, id) }
+
+	rec := rpcMemberDo(t, srv, http.MethodPost, resetUsageBase+usageGPUServer+"/reset-usage", "")
+	if rec.Code != http.StatusConflict || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_ambiguous" {
+		t.Fatalf("no position = %d %s, want 409 cluster_member_ambiguous", rec.Code, rec.Body.String())
+	}
+	wantMemberUsage(t, srv.Routes, usageHead, 0, 1000, 5000)
+	wantMemberUsage(t, srv.Routes, usageHead, 1, 2000, 7000)
+
+	rec = rpcMemberDo(t, srv, http.MethodPost, resetUsageBase+usageGPUServer+"/reset-usage?position=1", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("position 1 = %d %s", rec.Code, rec.Body.String())
+	}
+	wantMemberUsage(t, srv.Routes, usageHead, 0, 1000, 5000)
+	wantMemberUsage(t, srv.Routes, usageHead, 1, 0, 0)
+	if !slices.Equal(pushed, []string{usageGPUServer}) {
+		t.Fatalf("pushed %v, want the member server", pushed)
+	}
+
+	// A position whose member is on another server, or no member at all.
+	for _, q := range []string{"?position=0", "?position=7"} {
+		rec = rpcMemberDo(t, srv, http.MethodPost, resetUsageBase+usageCPUServer+"/reset-usage"+q, "")
+		if rec.Code != http.StatusNotFound || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_not_found" {
+			t.Fatalf("%s on another server = %d %s, want 404 cluster_member_not_found", q, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestResetUsageSingleMemberWithoutPositionUnchanged pins the reset as it was
+// before a head could have several members on one server: the server's one
+// member is reset without a position, whatever its position.
+func TestResetUsageSingleMemberWithoutPositionUnchanged(t *testing.T) {
+	srv := NewTestServer()
+	ctx := context.Background()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	seedUsageCluster(t, srv.Routes, now)
+	members := []routing.ClusterMember{}
+	for pos := range 3 {
+		members = append(members, routing.ClusterMember{HeadSpecID: usageHead, Position: pos, ServerID: usageCPUServer, Port: 47001 + pos})
+	}
+	members = append(members, routing.ClusterMember{HeadSpecID: usageHead, Position: 3, ServerID: usageGPUServer, Port: 47001})
+	if err := srv.Routes.SetClusterMembers(ctx, usageHead, members, []routing.ClusterMemberGPU{
+		{HeadSpecID: usageHead, MemberPosition: 3, ServerID: usageGPUServer, GPUIndex: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Routes.BeginClusterMemberRun(ctx, usageHead, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	seedMemberUsage(t, srv.Routes, usageHead, 3, 4000, 9000)
+
+	rec := rpcMemberDo(t, srv, http.MethodPost, resetUsageBase+usageGPUServer+"/reset-usage", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset = %d %s", rec.Code, rec.Body.String())
+	}
+	wantMemberUsage(t, srv.Routes, usageHead, 3, 0, 0)
+}
+
+// TestResetUsageMalformedPositionIs404 pins a position that is no
+// non-negative integer: it names no member, so the answer is the member's
+// not-found, and nothing is reset.
+func TestResetUsageMalformedPositionIs404(t *testing.T) {
+	srv := NewTestServer()
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	seedUsageCluster(t, srv.Routes, now)
+	if err := srv.Routes.BeginClusterMemberRun(context.Background(), usageHead, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	seedMemberUsage(t, srv.Routes, usageHead, 0, 1000, 5000)
+	for _, q := range []string{"?position=abc", "?position=-1", "?position=", "?position=1.5"} {
+		rec := rpcMemberDo(t, srv, http.MethodPost, resetUsageBase+usageGPUServer+"/reset-usage"+q, "")
+		if rec.Code != http.StatusNotFound || rpcMemberErrCode(t, rec) != "runtime_spec.cluster_member_not_found" {
+			t.Fatalf("%s = %d %s, want 404 cluster_member_not_found", q, rec.Code, rec.Body.String())
+		}
+	}
+	wantMemberUsage(t, srv.Routes, usageHead, 0, 1000, 5000)
 }

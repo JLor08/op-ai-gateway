@@ -326,6 +326,7 @@ function baseServerListApi(): ServerListApi {
     applicationClusterCandidates: vi.fn(async () => ({ data: [] })),
     resetClusterMemberUsage: vi.fn(async () => ({}) as never),
     deleteServer: vi.fn(async () => ({ ok: true })),
+    dismissGpuVendorNote: vi.fn(async () => undefined),
     downloadAgentBinary: vi.fn(async () => new Blob()),
     generateAgentToken: vi.fn(async () => ({
       secret: '',

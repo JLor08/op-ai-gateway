@@ -115,7 +115,7 @@ function setup(
     headHasGpus?: boolean;
     headBinaryVersion?: string;
     server?: PortalServer;
-    resetMemberUsage?: (serverId: string) => Promise<RuntimeSpec>;
+    resetMemberUsage?: (serverId: string, position: number) => Promise<RuntimeSpec>;
     headBinary?: string;
     // The listing per head binary the request names; others answer `candidates`.
     candidatesByBinary?: Record<string, ClusterCandidateList>;
@@ -548,7 +548,12 @@ describe('ClusterHeadEditor head binary change', () => {
 });
 
 describe('ClusterHeadEditor member GPU names', () => {
-  const gpu = (index: number) => ({ index, vram_estimate_mb: 0, vram_measured_mb: 0 });
+  const gpu = (index: number) => ({
+    vendor: '' as const,
+    index,
+    vram_estimate_mb: 0,
+    vram_measured_mb: 0,
+  });
 
   it('names an automatic member GPU as the picker did', async () => {
     setup({
@@ -718,8 +723,8 @@ describe('ClusterHeadEditor manual members', () => {
             memberSpec('rpcm_2', {
               binary: '/opt/b2/ggml-rpc-server',
               gpus: [
-                { index: 3, vram_estimate_mb: 0, vram_measured_mb: 0 },
-                { index: 1, vram_estimate_mb: 0, vram_measured_mb: 0 },
+                { vendor: '', index: 3, vram_estimate_mb: 0, vram_measured_mb: 0 },
+                { vendor: '', index: 1, vram_estimate_mb: 0, vram_measured_mb: 0 },
               ],
             }),
           ],
@@ -993,7 +998,7 @@ describe('ClusterHeadEditor member usage reset', () => {
     ram_estimate_mb: 1000,
     ram_measured_mb: 70000,
     measured_at: '2026-01-01T09:00:00Z',
-    gpus: [{ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
+    gpus: [{ vendor: '', index: 0, vram_estimate_mb: 8000, vram_measured_mb: 9000 }],
   });
   const unmeasured = member({ position: 1, server_id: 'srv_b', server_name: 'Beta' });
   const storedHead = {
@@ -1051,7 +1056,7 @@ describe('ClusterHeadEditor member usage reset', () => {
     expect(screen.getByText(t.clusterMemberResetUsageBody)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
 
-    await waitFor(() => expect(reset).toHaveBeenCalledWith('srv_a'));
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('srv_a', 0));
     await waitFor(() =>
       expect(screen.queryByText(`${t.clusterMemberMeasured} 70000 MB`)).not.toBeInTheDocument(),
     );
@@ -1059,7 +1064,12 @@ describe('ClusterHeadEditor member usage reset', () => {
     const alpha = latest.value.members.find((m) => m.server_id === 'srv_a')!;
     expect(alpha.threads).toBe(12);
     expect(alpha.ram_measured_mb).toBe(0);
-    expect(alpha.gpus[0]).toEqual({ index: 0, vram_estimate_mb: 8000, vram_measured_mb: 0 });
+    expect(alpha.gpus[0]).toEqual({
+      vendor: '',
+      index: 0,
+      vram_estimate_mb: 8000,
+      vram_measured_mb: 0,
+    });
   });
 
   it('does nothing when the confirmation is cancelled', async () => {
@@ -1093,6 +1103,290 @@ describe('ClusterHeadEditor member usage reset', () => {
     expect(await screen.findByTestId('cluster-reset-error')).toHaveTextContent(
       t.errorClusterMemberNotFound,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #434: a member may run on the head's own server, one server may serve a head
+// more than once, and a member GPU is its (vendor, index).
+// ---------------------------------------------------------------------------
+
+function vendorHardware(cards: { vendor: 'nvidia' | 'amd'; index: number }[]): HardwareResponse {
+  const hw = hardware([]);
+  hw.report!.gpus = cards.map(({ vendor, index }) => ({
+    index,
+    vendor,
+    name: vendor === 'nvidia' ? `RTX ${index}` : `RX ${index}`,
+    memory_total_bytes: 24 * 1024 ** 3,
+  }));
+  return hw;
+}
+
+describe('ClusterHeadEditor same-host members', () => {
+  const sameHead = { ...headServer, id: 'srv_a', name: 'Alpha' } as PortalServer;
+
+  it('offers the head server and the same server twice as members', async () => {
+    setup({
+      server: sameHead,
+      initial: state({
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', position: 0 }),
+          member({ server_id: 'srv_a', server_name: 'Alpha', position: 1 }),
+          member({ server_id: 'srv_b', server_name: 'Beta', position: 2 }),
+        ]),
+      }),
+      // The gateway lists the head's own server only for an agent that runs
+      // same-host members (rpc_cluster_same_host).
+      candidates: [
+        { server_id: 'srv_a', server_name: 'Alpha', compatible: true, rpc_binary: '/b' },
+        { server_id: 'srv_b', server_name: 'Beta', compatible: true, rpc_binary: '/b' },
+      ],
+    });
+    const rows = screen.getAllByTestId('cluster-member-row');
+    expect(screen.getAllByText(t.clusterMemberSameServerNote)).toHaveLength(2);
+    expect(within(rows[0]).getByText(t.clusterMemberSameServerNote)).toBeInTheDocument();
+    expect(within(rows[2]).queryByText(t.clusterMemberSameServerNote)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    fireEvent.mouseDown(await screen.findByRole('combobox', { name: t.clusterMemberServer }));
+    const listbox = screen.getByRole('listbox');
+    expect(within(listbox).getByRole('option', { name: 'Alpha' })).toBeInTheDocument();
+    expect(within(listbox).getByRole('option', { name: 'Beta' })).toBeInTheDocument();
+  });
+
+  it('adds the head server as a member a third time and sends every position', async () => {
+    const { latest } = setup({
+      server: sameHead,
+      initial: state({
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', position: 0 }),
+          member({ server_id: 'srv_a', server_name: 'Alpha', position: 1 }),
+        ]),
+      }),
+      candidates: [
+        { server_id: 'srv_a', server_name: 'Alpha', compatible: true, rpc_binary: '/b' },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
+    expect(
+      clusterBodyFields(latest.value).cluster_members?.map((m) => [m.server_id, m.position]),
+    ).toEqual([
+      ['srv_a', 0],
+      ['srv_a', 1],
+      ['srv_a', 2],
+    ]);
+    expect(screen.getAllByText(t.clusterMemberSameServerNote)).toHaveLength(3);
+  });
+
+  it('offers a manual server again for a member spec it has free, not for the one in use', async () => {
+    const { latest } = setup({
+      initial: state({
+        memberMode: 'manual',
+        members: clusterRows([
+          member({ server_id: 'srv_a', server_name: 'Alpha', member_spec_id: 'rpcm_1' }),
+        ]),
+      }),
+      candidates: [
+        {
+          server_id: 'srv_a',
+          server_name: 'Alpha',
+          member_specs: [memberSpec('rpcm_1'), memberSpec('rpcm_2')],
+        },
+        { server_id: 'srv_b', server_name: 'Beta', member_specs: [memberSpec('rpcm_3')] },
+      ],
+    });
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    // rpcm_1 already serves this head: the free rpcm_2 is the only choice.
+    expect(screen.queryByText(t.clusterMemberSpecPick)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
+    expect(latest.value.members.map((m) => [m.server_id, m.member_spec_id])).toEqual([
+      ['srv_a', 'rpcm_1'],
+      ['srv_a', 'rpcm_2'],
+    ]);
+
+    // Every spec of Alpha is in use now: only Beta is left on offer.
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    fireEvent.mouseDown(await screen.findByRole('combobox', { name: t.clusterMemberServer }));
+    const listbox = screen.getByRole('listbox');
+    expect(within(listbox).queryByRole('option', { name: 'Alpha' })).not.toBeInTheDocument();
+    expect(within(listbox).getByRole('option', { name: 'Beta' })).toBeInTheDocument();
+  });
+
+  it('stores member GPUs with their vendor', async () => {
+    const { latest } = setup({
+      initial: state({
+        members: clusterRows([member({ server_id: 'srv_a', server_name: 'Alpha' })]),
+      }),
+      hardwareByServer: {
+        srv_a: vendorHardware([
+          { vendor: 'nvidia', index: 0 },
+          { vendor: 'amd', index: 0 },
+          { vendor: 'amd', index: 1 },
+        ]),
+      },
+    });
+    const gpuLabel = `${t.clusterMemberGpuAdd}: Alpha`;
+    await screen.findByRole('combobox', { name: gpuLabel });
+    pick(gpuLabel, 'AMD 1 · RX 1');
+    // NVIDIA 0 and AMD 0 are two cards: taking one leaves the other on offer.
+    pick(gpuLabel, 'AMD 0 · RX 0');
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: gpuLabel }));
+    expect(
+      within(screen.getByRole('listbox'))
+        .getAllByRole('option')
+        .map((o) => o.textContent),
+    ).toEqual(['—', 'NVIDIA 0 · RTX 0']);
+    fireEvent.click(
+      within(screen.getByRole('listbox')).getByRole('option', { name: 'NVIDIA 0 · RTX 0' }),
+    );
+
+    expect(clusterBodyFields(latest.value).cluster_members?.[0].gpus).toEqual([
+      { vendor: 'amd', index: 1, vram_estimate_mb: 0, vram_measured_mb: 0 },
+      { vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+      { vendor: 'nvidia', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 },
+    ]);
+    const row = screen.getByTestId('cluster-member-row');
+    expect(within(row).getByText('AMD 0 · RX 0')).toBeInTheDocument();
+    expect(within(row).getByText('NVIDIA 0 · RTX 0')).toBeInTheDocument();
+
+    // The estimate and the removal act on the one card, not on its index.
+    fireEvent.change(screen.getByLabelText(`Alpha NVIDIA 0: ${t.rpcMemberGpuVram}`), {
+      target: { value: '4000' },
+    });
+    fireEvent.click(
+      within(row).getByRole('button', { name: `${t.clusterMemberGpuRemove}: Alpha AMD 0` }),
+    );
+    expect(latest.value.members[0].gpus).toEqual([
+      { vendor: 'amd', index: 1, vram_estimate_mb: 0, vram_measured_mb: 0 },
+      { vendor: 'nvidia', index: 0, vram_estimate_mb: 4000, vram_measured_mb: 0 },
+    ]);
+  });
+
+  it('reads a vendorless member GPU as the report only vendor', async () => {
+    setup({
+      initial: state({
+        members: clusterRows([
+          member({
+            server_id: 'srv_a',
+            server_name: 'Alpha',
+            gpus: [{ vendor: '', index: 1, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+          }),
+        ]),
+      }),
+      hardwareByServer: {
+        srv_a: vendorHardware([
+          { vendor: 'nvidia', index: 0 },
+          { vendor: 'nvidia', index: 1 },
+        ]),
+      },
+    });
+    const row = screen.getByTestId('cluster-member-row');
+    expect(await within(row).findByText('NVIDIA 1 · RTX 1')).toBeInTheDocument();
+    // The stored row holds the card: the picker offers only the other one.
+    fireEvent.mouseDown(screen.getByRole('combobox', { name: `${t.clusterMemberGpuAdd}: Alpha` }));
+    expect(
+      within(screen.getByRole('listbox'))
+        .getAllByRole('option')
+        .map((o) => o.textContent),
+    ).toEqual(['—', 'NVIDIA 0 · RTX 0']);
+  });
+
+  it('resets the usage of the second member on a server by position', async () => {
+    const first = member({
+      position: 0,
+      server_name: 'Alpha',
+      ram_measured_mb: 1000,
+      measured_at: '2026-01-01T09:00:00Z',
+    });
+    const second = member({
+      position: 1,
+      server_name: 'Alpha',
+      ram_measured_mb: 2000,
+      measured_at: '2026-01-01T09:00:00Z',
+      gpus: [{ vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 3000 }],
+    });
+    const storedHead = {
+      cluster_enabled: true,
+      cluster_members: [first, second],
+    } as Partial<RuntimeSpec>;
+    const answer = {
+      ...storedHead,
+      cluster_members: [
+        first,
+        {
+          ...second,
+          ram_measured_mb: 0,
+          measured_at: undefined,
+          gpus: [{ vendor: 'amd', index: 0, vram_estimate_mb: 0, vram_measured_mb: 0 }],
+        },
+      ],
+    } as RuntimeSpec;
+    const reset = vi.fn(async () => answer);
+    const { latest } = setup({
+      initial: clusterStateFromSpec(storedHead as RuntimeSpec),
+      stored: storedHead,
+      resetMemberUsage: reset,
+    });
+    const buttons = screen.getAllByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` });
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[1]);
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('srv_a', 1));
+    await waitFor(() => expect(latest.value.members[1].ram_measured_mb).toBe(0));
+    expect(latest.value.members[1].gpus[0].vram_measured_mb).toBe(0);
+    // The first member on the server keeps its usage.
+    expect(latest.value.members[0].ram_measured_mb).toBe(1000);
+  });
+
+  it('resets a reordered member by its stored position', async () => {
+    const first = member({ position: 0, server_name: 'Alpha', ram_measured_mb: 1000 });
+    const second = member({ position: 1, server_name: 'Alpha', ram_measured_mb: 2000 });
+    const storedHead = {
+      cluster_enabled: true,
+      cluster_members: [first, second],
+    } as Partial<RuntimeSpec>;
+    const reset = vi.fn(async () => storedHead as RuntimeSpec);
+    setup({
+      initial: clusterStateFromSpec(storedHead as RuntimeSpec),
+      stored: storedHead,
+      resetMemberUsage: reset,
+    });
+    // Unsaved: the stored second member is now shown first.
+    fireEvent.click(screen.getAllByRole('button', { name: `${t.modelGroupMoveDown}: Alpha` })[0]);
+    fireEvent.click(
+      screen.getAllByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` })[0],
+    );
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberResetUsageConfirm }));
+    await waitFor(() => expect(reset).toHaveBeenCalledWith('srv_a', 1));
+  });
+
+  it('offers no reset on a member added in the form', async () => {
+    const stored = member({ position: 0, server_name: 'Alpha', ram_measured_mb: 1000 });
+    const storedHead = { cluster_enabled: true, cluster_members: [stored] } as Partial<RuntimeSpec>;
+    setup({
+      initial: clusterStateFromSpec(storedHead as RuntimeSpec),
+      stored: storedHead,
+      resetMemberUsage: vi.fn(),
+      candidates: [
+        { server_id: 'srv_a', server_name: 'Alpha', compatible: true, rpc_binary: '/b' },
+      ],
+    });
+    // Remove the stored member and add its server anew: the new row is not the
+    // stored one, although it now sits at the stored member's position.
+    fireEvent.click(screen.getByRole('button', { name: `${t.clusterMemberRemove}: Alpha` }));
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAdd }));
+    await screen.findByRole('combobox', { name: t.clusterMemberServer });
+    pick(t.clusterMemberServer, 'Alpha');
+    fireEvent.click(screen.getByRole('button', { name: t.clusterMemberAddConfirm }));
+    expect(screen.getAllByTestId('cluster-member-row')).toHaveLength(1);
+    expect(
+      screen.queryByRole('button', { name: `${t.clusterMemberResetUsage}: Alpha` }),
+    ).not.toBeInTheDocument();
   });
 });
 
@@ -1152,13 +1446,17 @@ describe('clusterSaveError', () => {
     ).toBe('errorClusterStartupTimeoutRequired');
   });
 
-  it('refuses one server twice', () => {
+  // #434: whether a server may serve one head twice is its agent's
+  // (rpc_cluster_same_host), which only the gateway knows; it refuses the
+  // save for an agent without it.
+  it('leaves one server twice to the gateway', () => {
     const s = state({
-      members: clusterRows([member({ server_id: 'srv_a' }), member({ server_id: 'srv_a' })]),
+      members: clusterRows([
+        member({ server_id: 'srv_a', position: 0 }),
+        member({ server_id: 'srv_a', position: 1 }),
+      ]),
     });
-    expect(clusterSaveError(s, { ...base, args: ['--rpc', '${RPC_SERVERS}'], env: {} })).toBe(
-      'errorClusterMemberServerTwice',
-    );
+    expect(clusterSaveError(s, { ...base, args: ['--rpc', '${RPC_SERVERS}'], env: {} })).toBeNull();
   });
 
   it('refuses direct + LAN without the exposure confirmation', () => {
@@ -1192,7 +1490,7 @@ describe('clusterStateFromSpec / clusterBodyFields', () => {
         member({
           server_id: 'srv_a',
           member_spec_id: 'rpcm_1',
-          gpus: [{ index: 2, vram_estimate_mb: 1000, vram_measured_mb: 900 }],
+          gpus: [{ vendor: '', index: 2, vram_estimate_mb: 1000, vram_measured_mb: 900 }],
           port: 26001,
         }),
       ],

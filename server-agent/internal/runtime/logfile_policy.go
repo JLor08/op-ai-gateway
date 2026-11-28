@@ -105,9 +105,9 @@ var pseudoFSRoots = []string{"/proc", "/sys", "/dev"}
 const windowsNameReason = "names a reserved device name, a stream, or a name ending in a dot or space, which Windows does not open as written"
 
 // resolveLogFile is the lexical half of the policy for one declared log file
-// of spec (see the file comment). port, vendor, vendors and configFilesDir
-// feed the placeholder expansion exactly as for config-file content, so
-// ${CONFIG_DIR} names the same per-instance directory the child sees.
+// of spec (see the file comment). port, topo and configFilesDir feed the
+// placeholder expansion exactly as for config-file content, so ${CONFIG_DIR}
+// names the same per-instance directory the child sees.
 //
 // A native spec's path must be absolute after expansion and lie strictly
 // inside filepath.Join(abs(configFilesDir), spec.ID) or a native
@@ -123,8 +123,8 @@ const windowsNameReason = "names a reserved device name, a stream, or a name end
 // Every other distro path is refused, even under a matching wsl:// entry: the
 // symlink check through \\wsl.localhost is not verified yet, and until it is
 // such a path fails closed rather than skipping that check.
-func (p LocalPolicy) resolveLogFile(spec Spec, lf LogFile, port int, vendor GPUVendor, vendors GPUVendors, configFilesDir string) (logFileTarget, error) {
-	expanded, err := expandNonSecretText(lf.Path, surfaceLogFilePath, spec, port, vendor, vendors, configFilesDir)
+func (p LocalPolicy) resolveLogFile(spec Spec, lf LogFile, port int, topo GPUTopology, configFilesDir string) (logFileTarget, error) {
+	expanded, err := expandNonSecretText(lf.Path, surfaceLogFilePath, spec, port, topo, configFilesDir)
 	if err != nil {
 		slog.Warn("runtime: log file path does not expand", "spec", spec.ID, "log_file", lf.Name, "error", err)
 		return logFileTarget{}, fmt.Errorf("%w: spec %q log file %q: %w", errLogFileNotPermitted, spec.ID, lf.Name, err)

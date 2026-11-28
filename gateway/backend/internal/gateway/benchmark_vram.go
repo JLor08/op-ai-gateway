@@ -238,7 +238,7 @@ type VRAMReport struct {
 	// warning the operator never sees is not a warning, so they are reported
 	// rather than only logged.
 	Warnings []string `json:"warnings,omitempty"`
-	// GPUs is the per-GPU result, one item per watched index. ALWAYS non-nil:
+	// GPUs is the per-GPU result, one item per watched GPU. ALWAYS non-nil:
 	// there is no omitempty here, so a nil slice would reach a client as JSON
 	// null instead of [], and a portal reading it with a `?? []` fallback would
 	// render an eternally empty list with no error and no crash. Call
@@ -266,6 +266,10 @@ func (r *VRAMReport) normalizeGPUs() {
 // the agent's own measurer reports it. They may legitimately differ, and a
 // host without a per-process measurer only ever has the delta.
 type VRAMGPUItem struct {
+	// Vendor and Index are the GPU's key: its vendor ("nvidia", "amd",
+	// "apple"; empty for a host whose GPUs carry no vendor) and its
+	// vendor-local index. A mixed host has an index 0 of each vendor.
+	Vendor          string `json:"vendor,omitempty"`
 	Index           int    `json:"index"`
 	Fingerprint     string `json:"fingerprint,omitempty"`      // uuid, or name+total
 	FingerprintKind string `json:"fingerprint_kind,omitempty"` // "uuid" | "name_total" | "" (none available)
@@ -277,7 +281,7 @@ type VRAMGPUItem struct {
 	BaselineUsedMB int  `json:"baseline_used_mb"`
 	DeltaMB        int  `json:"delta_mb,omitempty"`    // strategy (b), used_after - used_before; 0 = none
 	MeasuredMB     int  `json:"measured_mb,omitempty"` // strategy (a), post-load frame only; 0 = none/unknown
-	// Attributable reports whether a spec GPU row exists for this index. False
+	// Attributable reports whether a spec GPU row exists for this GPU. False
 	// means the run watched every GPU because the spec declares none, so there
 	// is no row to apply the number to.
 	Attributable bool `json:"attributable"`
