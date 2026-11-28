@@ -513,26 +513,7 @@ func (u *clusterUsage) reset(ctx context.Context, head string, position int, ser
 		return errClusterUsageUnavailable
 	}
 	unlock := u.locks.lock(headLockKey(head))
-	err := errClusterUsageContended
-	for range clusterUsageWriteAttempts {
-		m, gpus, ok, rerr := u.member(ctx, head, position)
-		if rerr == nil && (!ok || m.ServerID != serverID) {
-			rerr = store.ErrNotFound
-		}
-		if rerr != nil {
-			err = rerr
-			break
-		}
-		m.RAMMeasuredMB, m.MeasuredAt, m.Stale, m.RunPeakRAMMB = 0, time.Time{}, false, 0
-		for i := range gpus {
-			gpus[i].VRAMMeasuredMB, gpus[i].RunPeakVRAMMB = 0, 0
-		}
-		applied, werr := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
-		if werr != nil || applied {
-			err = werr
-			break
-		}
-	}
+	err := u.resetLocked(ctx, head, position, serverID)
 	unlock()
 	if err != nil {
 		return err
@@ -541,6 +522,36 @@ func (u *clusterUsage) reset(ctx context.Context, head string, position int, ser
 		u.push(serverID)
 	}
 	return nil
+}
+
+// resetLocked is reset's write under the head's lock: it re-reads the member
+// and writes it cleared until a write applies, at most
+// clusterUsageWriteAttempts times (errClusterUsageContended when none did).
+func (u *clusterUsage) resetLocked(ctx context.Context, head string, position int, serverID string) error {
+	for range clusterUsageWriteAttempts {
+		m, gpus, ok, err := u.member(ctx, head, position)
+		if err == nil && (!ok || m.ServerID != serverID) {
+			err = store.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		clearMemberUsage(&m, gpus)
+		applied, err := u.store.UpdateClusterMemberUsage(ctx, m, gpus)
+		if err != nil || applied {
+			return err
+		}
+	}
+	return errClusterUsageContended
+}
+
+// clearMemberUsage clears m's stored usage, its stale mark and the current
+// run's peaks, and those of its GPU rows; the run itself stays open.
+func clearMemberUsage(m *routing.ClusterMember, gpus []routing.ClusterMemberGPU) {
+	m.RAMMeasuredMB, m.MeasuredAt, m.Stale, m.RunPeakRAMMB = 0, time.Time{}, false, 0
+	for i := range gpus {
+		gpus[i].VRAMMeasuredMB, gpus[i].RunPeakVRAMMB = 0, 0
+	}
 }
 
 // syncSessions keeps the session records of serverID's memberships after a

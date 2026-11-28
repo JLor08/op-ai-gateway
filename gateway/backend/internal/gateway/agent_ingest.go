@@ -1060,29 +1060,40 @@ func (s *Server) writeBackRuntimeVRAM(ctx context.Context, serverID, legacyVendo
 		if _, ok := s.resolveRuntimeSpecOwned(ctx, serverID, specID, "vram"); !ok {
 			continue
 		}
-		stored := s.storedMeasuredVRAM(ctx, serverID, specID)
-		for key, measured := range f.MaxGPU {
-			row := storedGPURowKey(stored, key, legacyVendor)
-			if stored != nil {
-				was, known := stored[row]
-				if !known {
-					// No such row on the spec -- the window before the
-					// legacy-vendor backfill, or a card the spec never
-					// declared: the UPDATE could not match, on every frame.
-					continue
-				}
-				if was == measured {
-					continue // already on file, byte for byte
-				}
-			}
-			if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, row, measured); err != nil {
-				// Tolerates ErrNotFound (a GPU row deleted out from under an
-				// in-flight sample) the same as any other failure here: log
-				// and move on, never reject the sample.
-				slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu", row.String(), "err", err)
-			}
+		s.writeBackSpecVRAM(ctx, serverID, legacyVendor, specID, f.MaxGPU)
+	}
+}
+
+// writeBackSpecVRAM is writeBackRuntimeVRAM for one owned spec: each GPU's
+// measurement is written to the spec's row for it unless the stored value
+// says the write is not needed (vramWriteNeeded).
+func (s *Server) writeBackSpecVRAM(ctx context.Context, serverID, legacyVendor, specID string, maxGPU map[routing.GPUKey]int) {
+	stored := s.storedMeasuredVRAM(ctx, serverID, specID)
+	for key, measured := range maxGPU {
+		row := storedGPURowKey(stored, key, legacyVendor)
+		if !vramWriteNeeded(stored, row, measured) {
+			continue
+		}
+		if err := s.Routes.UpdateRuntimeSpecGPUMeasured(ctx, specID, row, measured); err != nil {
+			// Tolerates ErrNotFound (a GPU row deleted out from under an
+			// in-flight sample) the same as any other failure here: log
+			// and move on, never reject the sample.
+			slog.Debug("runtime vram write-back failed", "server_id", serverID, "spec_id", specID, "gpu", row.String(), "err", err)
 		}
 	}
+}
+
+// vramWriteNeeded reports whether measured must be written to row. Unknown
+// stored values (nil: the read failed) always write. A row the spec does not
+// have -- the window before the legacy-vendor backfill, or a card the spec
+// never declared -- never does: the UPDATE could not match, on every frame.
+// A row already holding measured is on file, byte for byte.
+func vramWriteNeeded(stored map[routing.GPUKey]int, row routing.GPUKey, measured int) bool {
+	if stored == nil {
+		return true
+	}
+	was, known := stored[row]
+	return known && was != measured
 }
 
 // storedMeasuredVRAM reads specID's currently-stored measured value per GPU
