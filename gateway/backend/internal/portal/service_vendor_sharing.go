@@ -58,6 +58,13 @@ type SetVendorAccountShareUsageRequest struct {
 	Enabled *bool `json:"enabled"`
 }
 
+// SetVendorAccountDecisionEmulationRequest is the body of PUT
+// /api/portal/vendor-accounts/{id}/decision-emulation (#380). Enabled is a pointer so
+// a body without it is told apart from an explicit false.
+type SetVendorAccountDecisionEmulationRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
 // vendorShareLevelRank orders the share levels: none < shared < full. A level the
 // service does not know (a corrupt row) ranks with `none`: private, fail closed.
 func vendorShareLevelRank(level string) int {
@@ -140,6 +147,39 @@ func (s *Service) SetVendorAccountShareUsage(ctx context.Context, principal auth
 		return VendorAccountDTO{}, err
 	}
 	acc.ShareUsageWithMembers = *req.Enabled
+	return s.vendorAccountDTO(ctx, principal, acc)
+}
+
+// SetVendorAccountDecisionEmulation turns the owner's decision-emulation opt-in on or
+// off (#380). Same gate as SetVendorAccountShareUsage (owner only; a CM or member is
+// ErrVendorAccountForbidden, a stranger or unknown id ErrVendorAccountNotFound), and
+// only an OpenAI subscription account accepts it (ErrVendorAccountDecisionEmulationUnsupported).
+// The shape check follows the 404/403 gate and the missing-value check, so no answer
+// leaks an account to a caller who may not see it. Returns the management view.
+func (s *Service) SetVendorAccountDecisionEmulation(ctx context.Context, principal auth.Token, id string, req SetVendorAccountDecisionEmulationRequest) (VendorAccountDTO, error) {
+	if err := s.requireVendorAccountsEnabled(ctx); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	acc, err := s.loadVendorAccount(ctx, id)
+	if err != nil {
+		return VendorAccountDTO{}, err
+	}
+	if !isVendorAccountOwner(principal, acc) {
+		if err := s.authorizeVendorAccountOperate(ctx, principal, acc); err != nil {
+			return VendorAccountDTO{}, err
+		}
+		return VendorAccountDTO{}, ErrVendorAccountForbidden
+	}
+	if req.Enabled == nil {
+		return VendorAccountDTO{}, ErrVendorAccountDecisionEmulationEnabledRequired
+	}
+	if acc.Vendor != routing.VendorOpenAI || acc.AuthType != routing.VendorAuthSubscription {
+		return VendorAccountDTO{}, ErrVendorAccountDecisionEmulationUnsupported
+	}
+	if err := s.routes.UpdateVendorAccountDecisionEmulation(ctx, acc.ID, *req.Enabled); err != nil {
+		return VendorAccountDTO{}, err
+	}
+	acc.DecisionEmulation = *req.Enabled
 	return s.vendorAccountDTO(ctx, principal, acc)
 }
 

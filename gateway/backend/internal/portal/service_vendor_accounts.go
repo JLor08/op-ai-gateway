@@ -144,15 +144,19 @@ type VendorAccountDTO struct {
 	// ShareUsageWithMembers is the owner's opt-in (#407) to show the usage snapshot to
 	// members. The management views report the stored value; a member's view carries the
 	// account's actual value too (true whenever the opt-in is on; `usage` is then present only once a snapshot has been stored).
-	ShareUsageWithMembers bool          `json:"share_usage_with_members"`
-	CreatedAt             time.Time     `json:"created_at"`
-	UpdatedAt             time.Time     `json:"updated_at"`
-	ShareLevel            string        `json:"share_level"`
-	AdminGroups           []GroupRefDTO `json:"admin_groups"`
-	SystemGroupID         string        `json:"system_group_id"`
-	SystemGroupName       string        `json:"system_group_name"`
-	IsOwner               bool          `json:"is_owner"`
-	SharedBy              string        `json:"shared_by"`
+	ShareUsageWithMembers bool `json:"share_usage_with_members"`
+	// DecisionEmulation is the owner's opt-in (#380) to let tokens that opted in answer
+	// /v1/decisions through a chat model of this OpenAI subscription account. Only the
+	// management views carry it; a member's view leaves it false.
+	DecisionEmulation bool          `json:"decision_emulation"`
+	CreatedAt         time.Time     `json:"created_at"`
+	UpdatedAt         time.Time     `json:"updated_at"`
+	ShareLevel        string        `json:"share_level"`
+	AdminGroups       []GroupRefDTO `json:"admin_groups"`
+	SystemGroupID     string        `json:"system_group_id"`
+	SystemGroupName   string        `json:"system_group_name"`
+	IsOwner           bool          `json:"is_owner"`
+	SharedBy          string        `json:"shared_by"`
 }
 
 // VendorAccountListResponse is the {data:[...]} envelope of the list endpoint.
@@ -249,6 +253,7 @@ func (s *Service) vendorAccountDTO(ctx context.Context, principal auth.Token, ac
 		IsOwner:               owner,
 		SharedBy:              sharedBy,
 		ShareUsageWithMembers: acc.ShareUsageWithMembers,
+		DecisionEmulation:     acc.DecisionEmulation,
 	}, nil
 }
 

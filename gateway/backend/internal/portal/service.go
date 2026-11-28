@@ -230,11 +230,17 @@ var (
 	// ErrVendorAccountShareUsageEnabledRequired: a PUT .../share-usage body without
 	// `enabled` (a 400, answered after the 404/403 gate; nothing is written).
 	ErrVendorAccountShareUsageEnabledRequired = errors.New("vendor_account.share_usage_enabled_required")
-	ErrVendorAccountAdminGroupRequired        = errors.New("vendor_account.admin_group_required")
-	ErrVendorAccountAdminGroupInvalid         = errors.New("vendor_account.admin_group_invalid")
-	ErrVendorAccountAdminGroupParentMismatch  = errors.New("vendor_account.admin_group_parent_mismatch")
-	ErrVendorAccountRootMismatch              = errors.New("vendor_account.root_mismatch")
-	ErrVendorAccountNotShared                 = errors.New("vendor_account.not_shared")
+	// ErrVendorAccountDecisionEmulationEnabledRequired: a PUT .../decision-emulation
+	// body without `enabled` (a 400, answered after the 404/403 gate).
+	ErrVendorAccountDecisionEmulationEnabledRequired = errors.New("vendor_account.decision_emulation_enabled_required")
+	// ErrVendorAccountDecisionEmulationUnsupported: the account is not an OpenAI
+	// subscription account (a 409; nothing is written).
+	ErrVendorAccountDecisionEmulationUnsupported = errors.New("vendor_account.decision_emulation_unsupported")
+	ErrVendorAccountAdminGroupRequired           = errors.New("vendor_account.admin_group_required")
+	ErrVendorAccountAdminGroupInvalid            = errors.New("vendor_account.admin_group_invalid")
+	ErrVendorAccountAdminGroupParentMismatch     = errors.New("vendor_account.admin_group_parent_mismatch")
+	ErrVendorAccountRootMismatch                 = errors.New("vendor_account.root_mismatch")
+	ErrVendorAccountNotShared                    = errors.New("vendor_account.not_shared")
 
 	// Subscription connect (the OAuth code-paste flow and the token import).
 	// ErrVendorAccountNotSubscription: connect operates on an auth_type
@@ -1296,6 +1302,10 @@ type TokenDTO struct {
 	// default and ungated like ClaudeModelAliases; always emitted so a client
 	// reading a token and writing it back preserves it.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// DecisionsEmulation opts the token into /v1/decisions answered by an emulation
+	// on an opted-in OpenAI subscription chat model (#380). Plain opt-in flag, off by
+	// default and ungated; always emitted.
+	DecisionsEmulation bool `json:"decisions_emulation"`
 	// ClaudeCodeUsageDisplay reports that the token's secret carries the Claude
 	// Code shape, so Claude Code shows the usage limits. Always emitted. It
 	// changes only through rotation (RotateTokenRequest).
@@ -1396,6 +1406,9 @@ type CreateTokenRequest struct {
 	// DecisionsConfidenceNormalize opts the token into recomputed decision
 	// confidence (see TokenDTO). Off when omitted.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
+	// DecisionsEmulation opts the new token into the decision emulation (see
+	// TokenDTO). Off when omitted.
+	DecisionsEmulation bool `json:"decisions_emulation"`
 	// ClaudeCodeUsageDisplay gives the new token's secret the Claude Code shape
 	// (see claudeCodeTokenSecret). Off when omitted.
 	ClaudeCodeUsageDisplay bool `json:"claude_code_usage_display"`
@@ -1458,6 +1471,8 @@ type UpdateTokenRequest struct {
 	// DecisionsConfidenceNormalize: nil = keep the stored flag, a non-nil value
 	// replaces it.
 	DecisionsConfidenceNormalize *bool `json:"decisions_confidence_normalize,omitempty"`
+	// DecisionsEmulation: nil = keep the stored flag, a non-nil value replaces it.
+	DecisionsEmulation *bool `json:"decisions_emulation,omitempty"`
 	// ClaudeCodeUsageDisplay: nil or equal to the stored value = no-op; a
 	// different value is ErrTokenClaudeCodeUsageDisplayRequiresRotation (the
 	// secret has to change with it, see RotateTokenRequest).
@@ -2126,6 +2141,7 @@ func (s *Service) CreateToken(ctx context.Context, owner auth.Token, req CreateT
 		ClaudeModelAliases:           req.ClaudeModelAliases,
 		ClaudeEffortCompatibility:    req.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize: req.DecisionsConfidenceNormalize,
+		DecisionsEmulation:           req.DecisionsEmulation,
 		ClaudeCodeUsageDisplay:       req.ClaudeCodeUsageDisplay,
 		SendUsageLimits:              req.SendUsageLimits,
 		CodexModelSwitchPrompt:       req.CodexModelSwitchPrompt,
@@ -2246,6 +2262,9 @@ func (s *Service) UpdateToken(ctx context.Context, owner auth.Token, tokenID str
 	}
 	if req.DecisionsConfidenceNormalize != nil {
 		record.DecisionsConfidenceNormalize = *req.DecisionsConfidenceNormalize
+	}
+	if req.DecisionsEmulation != nil {
+		record.DecisionsEmulation = *req.DecisionsEmulation
 	}
 	if req.SendUsageLimits != nil {
 		record.SendUsageLimits = *req.SendUsageLimits
@@ -6118,6 +6137,7 @@ func (s *Service) tokenDTO(ctx context.Context, record store.TokenRecord) TokenD
 		ClaudeModelAliases:             record.ClaudeModelAliases,
 		ClaudeEffortCompatibility:      record.ClaudeEffortCompatibility,
 		DecisionsConfidenceNormalize:   record.DecisionsConfidenceNormalize,
+		DecisionsEmulation:             record.DecisionsEmulation,
 		ClaudeCodeUsageDisplay:         record.ClaudeCodeUsageDisplay,
 		SendUsageLimits:                record.SendUsageLimits,
 		CodexModelSwitchPrompt:         record.CodexModelSwitchPrompt,

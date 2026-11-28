@@ -45,6 +45,9 @@ const (
 	// codeVendorAccountShareUsageFailed is the uncategorized fallback of the owner's
 	// usage opt-in (PUT .../share-usage): a store failure.
 	codeVendorAccountShareUsageFailed = "vendor_account.share_usage_failed"
+	// codeVendorAccountDecisionEmulationFailed is the uncategorized fallback of the
+	// owner's decision-emulation opt-in (#380).
+	codeVendorAccountDecisionEmulationFailed = "vendor_account.decision_emulation_failed"
 
 	// codeVendorAccountAdminGroupsFailed is the uncategorized fallback of the
 	// management-group assignment (PUT .../admin-groups) and
@@ -219,6 +222,10 @@ func (s *Server) routeVendorAccountSubpath(w http.ResponseWriter, r *http.Reques
 		s.handlePortalVendorAccountShareUsage(w, r, token, parts[0])
 		return true
 	}
+	if len(parts) == 2 && parts[0] != "" && parts[1] == "decision-emulation" {
+		s.handlePortalVendorAccountDecisionEmulation(w, r, token, parts[0])
+		return true
+	}
 	if len(parts) == 2 && parts[0] != "" && parts[1] == "admin-groups" {
 		s.handlePortalVendorAccountAdminGroups(w, r, token, parts[0])
 		return true
@@ -342,6 +349,33 @@ func (s *Server) handlePortalVendorAccountShareUsage(w http.ResponseWriter, r *h
 	dto, err := s.Portal.SetVendorAccountShareUsage(r.Context(), token, id, req)
 	if err != nil {
 		writePortalVendorAccountError(w, err, codeVendorAccountShareUsageFailed)
+		return
+	}
+	writeJSON(w, http.StatusOK, dto)
+}
+
+// handlePortalVendorAccountDecisionEmulation (PUT .../decision-emulation) sets the
+// owner's opt-in (#380) to answer /v1/decisions through a chat model of an OpenAI
+// subscription account ({"enabled": bool}; a body without `enabled` is a 400
+// request.invalid_json, any other account kind a 409
+// vendor_account.decision_emulation_unsupported). The service decides who may: the
+// owner alone, like share-usage.
+func (s *Server) handlePortalVendorAccountDecisionEmulation(w http.ResponseWriter, r *http.Request, token auth.Token, id string) {
+	if !requireMethod(w, r, http.MethodPut) {
+		return
+	}
+	raw, ok := readRawJSON(w, r)
+	if !ok {
+		return
+	}
+	var req portal.SetVendorAccountDecisionEmulationRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, apierror.Response(codeRequestInvalidJSON, err.Error(), ""))
+		return
+	}
+	dto, err := s.Portal.SetVendorAccountDecisionEmulation(r.Context(), token, id, req)
+	if err != nil {
+		writePortalVendorAccountError(w, err, codeVendorAccountDecisionEmulationFailed)
 		return
 	}
 	writeJSON(w, http.StatusOK, dto)
@@ -718,6 +752,8 @@ var portalVendorAccountErrRows = []errRow{
 	// caller who may not see it (the level's own shape is account-independent).
 	{err: portal.ErrVendorAccountShareLevelInvalid, status: http.StatusBadRequest, code: "vendor_account.share_level_invalid", msg: "the share level must be none, shared or full"},
 	{err: portal.ErrVendorAccountShareUsageEnabledRequired, status: http.StatusBadRequest, code: codeRequestInvalidJSON, msg: "enabled is required"},
+	{err: portal.ErrVendorAccountDecisionEmulationEnabledRequired, status: http.StatusBadRequest, code: codeRequestInvalidJSON, msg: "enabled is required"},
+	{err: portal.ErrVendorAccountDecisionEmulationUnsupported, status: http.StatusConflict, code: "vendor_account.decision_emulation_unsupported", msg: "decision emulation is available only on an OpenAI subscription account"},
 	{err: portal.ErrVendorAccountShareLevelUnchanged, status: http.StatusBadRequest, code: "vendor_account.share_level_unchanged", msg: "the request does not change the share level in the direction asked for; use a higher level to raise or a lower one to lower"},
 	{err: portal.ErrVendorAccountSubscriptionShareCapped, status: http.StatusBadRequest, code: "vendor_account.subscription_share_capped", msg: "a subscription account can be shared at most at the shared level, never full"},
 	{err: portal.ErrVendorAccountAdminGroupRequired, status: http.StatusBadRequest, code: "vendor_account.admin_group_required", msg: "at least one management group is required to share an account"},

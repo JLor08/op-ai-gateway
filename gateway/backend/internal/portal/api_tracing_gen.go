@@ -2612,6 +2612,18 @@ func (_d *APIWithTracing) SetVendorAccountAdminGroups(ctx context.Context, t1 au
 	return _d.API.SetVendorAccountAdminGroups(ctx, t1, s1, sa1)
 }
 
+func (_d *APIWithTracing) SetVendorAccountDecisionEmulation(ctx context.Context, t1 auth.Token, s1 string, s2 SetVendorAccountDecisionEmulationRequest) (v1 VendorAccountDTO, err error) {
+	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetVendorAccountDecisionEmulation")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+	return _d.API.SetVendorAccountDecisionEmulation(ctx, t1, s1, s2)
+}
+
 func (_d *APIWithTracing) SetVendorAccountGroupMembers(ctx context.Context, t1 auth.Token, s1 string, sa1 []string) (v1 VendorAccountGroupDTO, err error) {
 	ctx, span := _APIWithTracingTracer.Start(ctx, "portal.Service.SetVendorAccountGroupMembers")
 	defer span.End()

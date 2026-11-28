@@ -137,3 +137,36 @@ func TestCreateVendorAccountSharesUsageByDefault(t *testing.T) {
 		t.Errorf("stored legacy opt-in = %v (err %v), want false", acc.ShareUsageWithMembers, err)
 	}
 }
+
+func decisionEmulationPath(id string) string {
+	return "/api/portal/vendor-accounts/" + id + "/decision-emulation"
+}
+
+// PUT .../decision-emulation (#380): owner-only, OpenAI subscription accounts only.
+func TestVendorAccountDecisionEmulationOverHTTP(t *testing.T) {
+	srv, _ := newVendorAccountTestServer(t, true)
+	sub := vaCreateSubscription(t, srv, vaOwnerSecret, "openai", "ChatGPT Plus")
+	path := decisionEmulationPath(sub.ID)
+
+	if rec := vaDo(t, srv, http.MethodGet, path, vaOwnerSecret, ""); rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPut {
+		t.Errorf("GET = %d (Allow %q), want 405 with Allow: PUT", rec.Code, rec.Header().Get("Allow"))
+	}
+	requireStatusCode(t, "missing enabled", vaDo(t, srv, http.MethodPut, path, vaOwnerSecret, `{}`), http.StatusBadRequest, codeRequestInvalidJSON)
+	requireStatusCode(t, "stranger", vaDo(t, srv, http.MethodPut, path, vaSystemSecret, `{"enabled":true}`), http.StatusNotFound, "vendor_account.not_found")
+
+	rec := vaDo(t, srv, http.MethodPut, path, vaOwnerSecret, `{"enabled":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner PUT = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if dto := vaDecode(t, rec); !dto.DecisionEmulation || dto.ID != sub.ID {
+		t.Errorf("dto = %+v, want decision_emulation true", dto)
+	}
+	if !strings.Contains(rec.Body.String(), `"decision_emulation":true`) {
+		t.Errorf("body lacks decision_emulation: %s", rec.Body.String())
+	}
+
+	key := vaCreate(t, srv, vaOwnerSecret, "plain key")
+	requireStatusCode(t, "api key account", vaDo(t, srv, http.MethodPut, decisionEmulationPath(key.ID), vaOwnerSecret, `{"enabled":true}`), http.StatusConflict, "vendor_account.decision_emulation_unsupported")
+	ant := vaCreateSubscription(t, srv, vaOwnerSecret, "anthropic", "Claude Max")
+	requireStatusCode(t, "anthropic subscription", vaDo(t, srv, http.MethodPut, decisionEmulationPath(ant.ID), vaOwnerSecret, `{"enabled":true}`), http.StatusConflict, "vendor_account.decision_emulation_unsupported")
+}
