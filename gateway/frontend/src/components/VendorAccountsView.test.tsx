@@ -41,6 +41,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     is_owner: true,
     shared_by: '',
     share_usage_with_members: false,
+    decision_emulation: false,
     ...overrides,
   };
 }
@@ -277,6 +278,12 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       ),
       setVendorAccountAdminGroups: vi.fn<PortalApi['setVendorAccountAdminGroups']>(async (id) =>
         makeVendorAccount({ id }),
+      ),
+      setVendorAccountDecisionEmulation: vi.fn<PortalApi['setVendorAccountDecisionEmulation']>(
+        async (id, enabled) => ({
+          ...(accounts.find((a) => a.id === id) ?? accounts[0]),
+          decision_emulation: enabled,
+        }),
       ),
       vendorAccountAdminGroupCandidates: vi.fn<PortalApi['vendorAccountAdminGroupCandidates']>(
         async () => [],

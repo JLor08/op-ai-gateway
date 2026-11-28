@@ -128,6 +128,7 @@ function makeVendorAccount(overrides: Partial<VendorAccount> = {}): VendorAccoun
     is_owner: true,
     shared_by: '',
     share_usage_with_members: false,
+    decision_emulation: false,
     ...overrides,
   };
 }
@@ -1171,6 +1172,20 @@ for (const locale of ['de', 'en'] as readonly Locale[]) {
       expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
         'svc_dcn',
         expect.objectContaining({ decisions_confidence_normalize: true }),
+      );
+    });
+
+    it('defaults decisions_emulation to off and sends it on a service token create', async () => {
+      const { fakeApi, createDialog } = await openCreateDialog('svc_de');
+      const box = () => createDialog.getByRole('checkbox', { name: t.tokenDecisionsEmulation });
+      expect(box()).not.toBeChecked();
+      expect(createDialog.getByText(t.tokenDecisionsEmulationHint)).toBeInTheDocument();
+      fireEvent.click(box());
+      fireEvent.click(createDialog.getByRole('button', { name: t.serviceTokenCreate }));
+      await waitFor(() => expect(fakeApi.createServiceToken).toHaveBeenCalled());
+      expect(fakeApi.createServiceToken).toHaveBeenCalledWith(
+        'svc_de',
+        expect.objectContaining({ decisions_emulation: true }),
       );
     });
 

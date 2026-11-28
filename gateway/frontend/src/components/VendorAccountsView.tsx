@@ -33,6 +33,7 @@ import { VendorAccountModels } from './VendorAccountModels';
 import { VendorAccountReadOnlyDetail } from './VendorAccountReadOnlyDetail';
 import { VendorAccountGroupsSection } from './VendorAccountGroupsSection';
 import { VendorAccountResourceGroupsSection } from './VendorAccountResourceGroupsSection';
+import { VendorAccountDecisionEmulationPanel } from './VendorAccountDecisionEmulationPanel';
 import { VendorAccountSharePanel, VendorAccountSharingOffPanel } from './VendorAccountSharePanel';
 import { VendorAccountUsageSection } from './VendorAccountUsagePanel';
 import { VendorConnectionTest } from './VendorConnectionTest';
@@ -164,6 +165,7 @@ export function VendorAccountsView({
     | 'refreshUsage'
     | 'setVendorAccountShareLevel'
     | 'setVendorAccountShareUsage'
+    | 'setVendorAccountDecisionEmulation'
     | 'setVendorAccountAdminGroups'
     | 'vendorAccountAdminGroupCandidates'
     | 'vendorAccountResourceGroups'
@@ -915,6 +917,19 @@ export function VendorAccountsView({
             </Box>
           </Box>
         </Panel>
+
+        {/* The owner's decision-emulation opt-in (#380); the panel renders only for the
+            owner of an OpenAI subscription account. */}
+        <Box sx={{ mt: 3 }}>
+          <VendorAccountDecisionEmulationPanel
+            key={`de-${account.id}`}
+            t={t}
+            api={api}
+            account={account}
+            disabled={busy}
+            onChanged={accountRefreshed}
+          />
+        </Box>
 
         {/* Sharing: the share level and the management groups, for the viewer who
             has anything to do or see there; while sharing is switched off, only the

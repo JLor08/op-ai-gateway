@@ -36,6 +36,9 @@ export type UsageEvent = {
   provider_path: string;
   provider_model: string;
   stream: boolean;
+  // True when a decision endpoint answered this request by emulation on a chat
+  // model (#380): the answer is an estimate, not a native decision model's.
+  decision_emulated?: boolean;
   token_name: string;
   server_name: string;
   // The vendor account (an external AI vendor such as OpenAI/Anthropic) that

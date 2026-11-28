@@ -102,6 +102,9 @@ export type PortalToken = {
   // and /v1/systemone report a confidence on a 0..1 scale whatever the
   // model's own scale is. Ungated: any token owner may set it.
   decisions_confidence_normalize?: boolean;
+  // Opt-in (#380): lets this token's decision requests be answered by emulation
+  // on an account whose owner allows it; the answers are marked emulated.
+  decisions_emulation?: boolean;
   // Opt-in Claude Code usage display (#407): the token secret is JWT-shaped so
   // Claude Code reads the gateway's rate-limit headers and shows the plan's
   // usage limits. Always emitted by the server on every token read.
@@ -149,6 +152,8 @@ export type CreateTokenRequest = {
   claude_effort_compatibility?: boolean;
   // Decision-confidence normalization (see PortalToken); omitted = off.
   decisions_confidence_normalize?: boolean;
+  // Decision emulation (see PortalToken); omitted = off.
+  decisions_emulation?: boolean;
   // Claude Code usage display (see PortalToken); omitted = off. Fixes the
   // secret's shape, so it changes only through rotation.
   claude_code_usage_display?: boolean;
@@ -193,6 +198,8 @@ export type UpdateTokenRequest = {
   // Decision-confidence normalization (see PortalToken). Omitted = keep the
   // current value.
   decisions_confidence_normalize?: boolean;
+  // Decision emulation (see PortalToken). Omitted = keep the current value.
+  decisions_emulation?: boolean;
   // Usage-limit switches (see PortalToken). Omitted = keep the current value.
   send_usage_limits?: boolean;
   codex_model_switch_prompt?: boolean;

@@ -158,6 +158,7 @@ export function ServiceTokensSection({
   // Opt-in Claude Code effort compatibility — see TokenList.
   const [tokenClaudeEffort, setTokenClaudeEffort] = useState(false);
   const [tokenDecisionsNormalize, setTokenDecisionsNormalize] = useState(false);
+  const [tokenDecisionsEmulation, setTokenDecisionsEmulation] = useState(false);
   // Usage-limit opt-ins (#420) — see TokenList. Create-only (no edit path, #421).
   const [tokenSendUsageLimits, setTokenSendUsageLimits] = useState(false);
   const [tokenCodexSwitchPrompt, setTokenCodexSwitchPrompt] = useState(false);
@@ -212,6 +213,7 @@ export function ServiceTokensSection({
     setTokenClaudeAliases(false);
     setTokenClaudeEffort(false);
     setTokenDecisionsNormalize(false);
+    setTokenDecisionsEmulation(false);
     setTokenSendUsageLimits(false);
     setTokenCodexSwitchPrompt(false);
     setTokenLogCommunication(false);
@@ -247,6 +249,7 @@ export function ServiceTokensSection({
         claude_model_aliases: tokenClaudeAliases,
         claude_effort_compatibility: tokenClaudeEffort,
         decisions_confidence_normalize: tokenDecisionsNormalize,
+        decisions_emulation: tokenDecisionsEmulation,
         send_usage_limits: tokenSendUsageLimits,
         codex_model_switch_prompt: tokenSendUsageLimits && tokenCodexSwitchPrompt,
         log_communication: tokenLogCommunication,
@@ -549,6 +552,20 @@ export function ServiceTokensSection({
               />
               <Typography variant="caption" color="text.secondary">
                 {t.tokenDecisionsConfidenceNormalizeHint}
+              </Typography>
+            </Box>
+            <Box sx={{ display: 'grid', gap: 1 }}>
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={tokenDecisionsEmulation}
+                    onChange={(e) => setTokenDecisionsEmulation(e.target.checked)}
+                  />
+                }
+                label={t.tokenDecisionsEmulation}
+              />
+              <Typography variant="caption" color="text.secondary">
+                {t.tokenDecisionsEmulationHint}
               </Typography>
             </Box>
             <Box sx={{ display: 'grid', gap: 1 }}>
