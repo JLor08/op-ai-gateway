@@ -1370,7 +1370,7 @@ func vendorAccountModelTarget(acc VendorAccount, m VendorAccountModel, token aut
 		if IsVendorDecisionModel(acc, m) {
 			return withVendorDecisionRoute(vendorAccountTarget(acc, m, req.Model, apiFlavor, req.APIFlavor)), true
 		}
-		if isVendorDecisionEmulationAccount(acc, token) && IsOpenAIDecisionModel(m.UpstreamModel) {
+		if IsVendorDecisionEmulationModel(acc, m, token) {
 			return withVendorDecisionEmulation(vendorSubscriptionOpenAITarget(acc, m, req.Model, apiFlavor, req.APIFlavor)), true
 		}
 		return Target{}, false

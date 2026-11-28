@@ -68,6 +68,17 @@ func isVendorDecisionEmulationAccount(acc VendorAccount, token auth.Token) bool 
 		acc.DecisionEmulation && token.DecisionsEmulation
 }
 
+// IsVendorDecisionEmulationModel reports whether model row m of vendor account
+// acc serves a decision request of token by emulation (#380): the account emulates
+// decisions for token (both opt-ins, isVendorDecisionEmulationAccount) and the
+// row's UPSTREAM model is an OpenAI Decisions model (IsOpenAIDecisionModel). It
+// is the one rule the resolver (vendorAccountModelTarget) and the portal
+// listings share, so a name is listed for the decision endpoints exactly when
+// this token would be routed to it.
+func IsVendorDecisionEmulationModel(acc VendorAccount, m VendorAccountModel, token auth.Token) bool {
+	return isVendorDecisionEmulationAccount(acc, token) && IsOpenAIDecisionModel(m.UpstreamModel)
+}
+
 // isVendorDecisionRequest reports whether req is a decision request the vendor
 // path may serve (ADR-100): a decision endpoint's flavor (coarse decisions,
 // which both /v1/decisions and /v1/systemone fold to) with exactly the derived

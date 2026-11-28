@@ -68,6 +68,15 @@ const (
 	// another instance (which the leg then follows), and only for such a request, so it
 	// never reaches a client outside the loopback.
 	servedInstanceHeaderName = "X-OP-Served-Instance"
+
+	// headerDecisionEmulated marks every answer to a decision request (POST
+	// /v1/decisions, POST /v1/systemone) whose route settled on emulate (#380):
+	// a chat model answered it through structured output, not a native
+	// decision model, so its probabilities are uncalibrated self-estimates.
+	// Its value is decisionEmulatedChat. It is set on success and error alike,
+	// once the route settled (relayDecisionEmulation).
+	headerDecisionEmulated = "X-OP-Decision-Emulated"
+	decisionEmulatedChat   = "chat"
 )
 
 // Auth error codes/messages reused by more than one handler below.

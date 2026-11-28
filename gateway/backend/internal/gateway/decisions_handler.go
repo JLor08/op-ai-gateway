@@ -139,6 +139,10 @@ func (s *Server) relayDecisions(w http.ResponseWriter, r *http.Request, token au
 	if target, ok = s.decisionsRoute(w, r, c, target); !ok {
 		return
 	}
+	if target.DecisionEmulated {
+		s.relayDecisionEmulation(w, r, c, target, raw, nil)
+		return
+	}
 	rel := nativeRelay{
 		token:    c.token,
 		target:   target,
@@ -170,8 +174,14 @@ func (s *Server) relayDecisions(w http.ResponseWriter, r *http.Request, token au
 // request (ADR-098): settleDecisionRoute with the target's effective decisions
 // mode and routing.EffectiveDecisionsRoute. On success the returned target
 // carries the route (translate or passthrough) as its DecisionsMode, which is
-// what upstreamPath and the usage row's provider_path read.
+// what upstreamPath and the usage row's provider_path read. An emulated target
+// (Target.DecisionEmulated, #380) takes the emulate route as it is, without
+// reading verdicts: it has no mapping and no native decision endpoint.
 func (s *Server) decisionsRoute(w http.ResponseWriter, r *http.Request, c decisionsCall, target routing.Target) (routing.Target, bool) {
+	if target.DecisionEmulated {
+		target.DecisionsMode = routing.EndpointModeEmulate
+		return target, true
+	}
 	route, ok := s.settleDecisionRoute(w, r, c, target, target.DecisionsMode, routing.EffectiveDecisionsRoute, codeDecisionsEndpointDisabled)
 	if !ok {
 		return routing.Target{}, false

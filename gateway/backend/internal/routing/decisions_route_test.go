@@ -121,3 +121,19 @@ func TestMappingServesDecisionEndpointSystemOneRoute(t *testing.T) {
 		}
 	}
 }
+
+// The emulate route value (#380) is set only on a vendor target the gateway
+// branches on before it reads verdicts; neither route function may treat it as
+// auto, so a stray emulate mode fails closed whatever the verdicts say.
+func TestEffectiveDecisionRoutesFailClosedOnEmulate(t *testing.T) {
+	for _, kind := range []string{"vllm", ProviderVendorOpenAISubscription, ProviderLlamaCPP} {
+		for _, verdicts := range [][2]bool{{false, false}, {true, false}, {false, true}, {true, true}} {
+			if route, ok := EffectiveDecisionsRoute(kind, EndpointModeEmulate, verdicts[0], verdicts[1]); route != "" || ok {
+				t.Fatalf("EffectiveDecisionsRoute(%s, emulate, %v) = (%q,%v), want (\"\",false)", kind, verdicts, route, ok)
+			}
+			if route, ok := EffectiveSystemOneRoute(kind, EndpointModeEmulate, verdicts[0], verdicts[1]); route != "" || ok {
+				t.Fatalf("EffectiveSystemOneRoute(%s, emulate, %v) = (%q,%v), want (\"\",false)", kind, verdicts, route, ok)
+			}
+		}
+	}
+}

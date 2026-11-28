@@ -273,7 +273,7 @@ func (s *Service) vendorModelFlavorSets(ctx context.Context, token auth.Token) (
 	out := make(map[string]map[string]struct{})
 	for _, am := range owned {
 		for _, m := range am.Models {
-			flavors := vendorModelServedFlavors(am.Account, m)
+			flavors := vendorModelServedFlavors(am.Account, m, token)
 			set := out[m.GatewayModel]
 			if set == nil {
 				set = make(map[string]struct{}, len(flavors))
@@ -323,14 +323,17 @@ func (s *Service) vendorDashboardRoutes(ctx context.Context, token auth.Token) [
 }
 
 // vendorModelServedFlavors is the flavors model m of account acc is listed
-// under: its account's dialects (vendorAccountServedFlavors), plus the
-// decisions flavor for a decision model (routing.IsVendorDecisionModel, served
-// by /v1/decisions via passthrough and by /v1/systemone via translate,
-// ADR-100). A chat request for a decision model routes as before, so its chat
-// dialects stay listed.
-func vendorModelServedFlavors(acc routing.VendorAccount, m routing.VendorAccountModel) []string {
+// under for token: its account's dialects (vendorAccountServedFlavors), plus
+// the decisions flavor for a decision model (routing.IsVendorDecisionModel,
+// served by /v1/decisions via passthrough and by /v1/systemone via translate,
+// ADR-100) and for a model the account emulates decisions on for this token
+// (routing.IsVendorDecisionEmulationModel, #380: both opt-ins, an OpenAI
+// subscription account, the decision model's upstream), which both decision
+// endpoints serve on the emulated route. A chat request for either routes as
+// before, so its chat dialects stay listed.
+func vendorModelServedFlavors(acc routing.VendorAccount, m routing.VendorAccountModel, token auth.Token) []string {
 	flavors := vendorAccountServedFlavors(acc)
-	if routing.IsVendorDecisionModel(acc, m) {
+	if routing.IsVendorDecisionModel(acc, m) || routing.IsVendorDecisionEmulationModel(acc, m, token) {
 		flavors = append(flavors, routing.APIFlavorDecisions)
 	}
 	return flavors

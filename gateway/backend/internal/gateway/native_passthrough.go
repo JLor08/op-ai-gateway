@@ -284,6 +284,11 @@ func upstreamPath(target routing.Target, apiFlavor string, endpoint sessionEndpo
 	// target (ADR-100). Translate calls the upstream's OpenAI /v1/decisions, any
 	// other route its own /v1/systemone; none of the provider fallbacks below
 	// applies (they would answer {prefix}/chat/completions).
+	// An emulated decision request (#380) is one buffered Responses call to the
+	// ChatGPT backend, whichever decision endpoint it arrived on.
+	if target.DecisionEmulated && (apiFlavor == apiFlavorSystemOne || apiFlavor == apiFlavorOpenAIDecisions) {
+		return "/responses"
+	}
 	if apiFlavor == apiFlavorSystemOne {
 		if target.SystemOneMode == routing.EndpointModeTranslate {
 			return "/v1/decisions"
