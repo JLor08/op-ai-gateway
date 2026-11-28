@@ -6263,6 +6263,9 @@ components:
         scopes, status, expires_at and last_used_model are not update fields
         and, like every unknown key, are ignored. The three unknown_model_*
         fields are validated together, against the values the update leaves.
+        A model-valued setting sent back unchanged (model_override,
+        model_override_map, the unknown_model_* trio as one unit) is not
+        validated again; a changed one is validated as on create.
       additionalProperties: true
       properties:
         name: { type: string, description: Trimmed; blank is a 400 service.validation_failed. }

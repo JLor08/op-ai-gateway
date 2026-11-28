@@ -315,3 +315,58 @@ func TestUpdateServiceTokenMemoryDriverKeepsServiceStateOnTheBearer(t *testing.T
 		t.Fatal("editing a disabled service's token re-activated its bearer")
 	}
 }
+
+// TestUpdateServiceTokenDoesNotRevalidateUnchangedValues: a service token is
+// edited by several principals, and its service's allowlist moves, so a stored
+// model-valued setting can be one the editor could not set today. Sending it
+// back UNCHANGED (the portal dialog writes the whole form back) must not turn an
+// unrelated edit into a 400; a CHANGED value is still validated as on create.
+func TestUpdateServiceTokenDoesNotRevalidateUnchangedValues(t *testing.T) {
+	ctx := context.Background()
+	svc, dir, _, _ := newServiceAccountsTestService(t, time.Now().UTC())
+	created := narrowServiceWithAllowlist(t, ctx, svc, "model-a")
+	tok := mintServiceToken(t, ctx, svc, created.ID, CreateServiceTokenRequest{Name: "S"})
+
+	// Plant values no editor could set now: an override target and a rule
+	// target that no longer exist, and a redirect fallback outside the allowlist.
+	staleRules := map[string]store.ModelOverrideRule{"alias": {To: "gone-model"}}
+	rec, err := dir.TokenByID(ctx, tok.Token.ID)
+	if err != nil {
+		t.Fatalf("TokenByID: %v", err)
+	}
+	rec.ModelOverride = "gone-model"
+	rec.ModelOverrideMap = store.EncodeModelOverrideRules(staleRules)
+	rec.UnknownModelRedirect, rec.UnknownModelRedirectBlocked, rec.UnknownModelFallback = true, true, "model-b"
+	if err := dir.UpdateTokenMetadata(ctx, rec); err != nil {
+		t.Fatalf("UpdateTokenMetadata: %v", err)
+	}
+
+	// The whole form written back with one real change succeeds and keeps them.
+	got, err := svc.UpdateServiceToken(ctx, svcFullToken(), created.ID, tok.Token.ID, UpdateServiceTokenRequest{
+		ModelOverride:               strPtr("gone-model"),
+		ModelOverrideMap:            &staleRules,
+		UnknownModelRedirect:        boolPtr(true),
+		UnknownModelRedirectBlocked: boolPtr(true),
+		UnknownModelFallback:        strPtr(" model-b "),
+		LogCommunication:            boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("write-back of unchanged values: %v", err)
+	}
+	if !got.LogCommunication || got.ModelOverride != "gone-model" || got.ModelOverrideMap["alias"].To != "gone-model" || got.UnknownModelFallback != "model-b" {
+		t.Fatalf("got = %+v, want the edit with the stored values kept", got)
+	}
+
+	// Each CHANGED value is validated again.
+	otherRules := map[string]store.ModelOverrideRule{"alias": {To: "also-gone"}}
+	for name, req := range map[string]UpdateServiceTokenRequest{
+		"override":      {ModelOverride: strPtr("also-gone")},
+		"rule target":   {ModelOverrideMap: &otherRules},
+		"fallback":      {UnknownModelFallback: strPtr("also-gone")},
+		"redirect trio": {UnknownModelRedirectBlocked: boolPtr(false)}, // keeps the stale fallback, now re-checked
+	} {
+		if _, err := svc.UpdateServiceToken(ctx, svcFullToken(), created.ID, tok.Token.ID, req); !errors.Is(err, ErrTokenModelOverrideInvalid) {
+			t.Fatalf("%s: err = %v, want ErrTokenModelOverrideInvalid for a changed value", name, err)
+		}
+	}
+}

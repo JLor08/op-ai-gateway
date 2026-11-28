@@ -3700,7 +3700,7 @@ const de = {
   errorTokenVendorAccessConflict:
     'Zwei Anbieter liefern denselben Modellnamen — vergib einen eigenen Prefix.',
   errorPortalPrincipalForbidden:
-    'Diese Einstellung darf nur über eine Portal-Sitzung oder mit einem Admin-Token geändert werden.',
+    'Für diese Änderung fehlt die Berechtigung. Manche Einstellungen lassen sich nur über eine Portal-Sitzung oder mit einem Admin-Token ändern.',
   activityEmpty: 'Keine Anfragen',
   activityStatsLabel: 'Statistik',
   activityTilesButton: 'Kacheln',
@@ -7892,7 +7892,7 @@ const en: PortalMessages = {
   errorTokenVendorAccessConflict:
     'Two providers serve the same model name — give one a distinct prefix.',
   errorPortalPrincipalForbidden:
-    'This setting can only be changed from a portal session or with an admin token.',
+    'You are not allowed to make this change. Some settings can only be changed from a portal session or with an admin token.',
   activityEmpty: 'No requests yet',
   activityStatsLabel: 'Statistics',
   activityTilesButton: 'Tiles',

@@ -953,14 +953,23 @@ func (s *Service) UpdateServiceToken(ctx context.Context, principal auth.Token, 
 		}
 		return callableSet
 	}
-	if req.ModelOverride != nil {
+	// A model-valued setting sent back UNCHANGED is not re-validated. Unlike a
+	// user token, a service token is edited by several principals (admins and
+	// delegates) whose callable sets differ, and the service's allowlist can move
+	// after a value was stored: re-validating a value the editor did not touch
+	// would turn a write-back of the whole dialog (an edit of "log communication"
+	// alone) into a 400 for a setting someone else made. A CHANGED value is
+	// validated exactly as on create. Routing re-checks every stored value per
+	// request either way, so skipping the check never widens what the token can
+	// reach.
+	if req.ModelOverride != nil && strings.TrimSpace(*req.ModelOverride) != record.ModelOverride {
 		override, err := validateModelOverride(callable(), *req.ModelOverride)
 		if err != nil {
 			return ServiceTokenDTO{}, err
 		}
 		record.ModelOverride = override
 	}
-	if req.ModelOverrideMap != nil {
+	if req.ModelOverrideMap != nil && store.EncodeModelOverrideRules(*req.ModelOverrideMap) != record.ModelOverrideMap {
 		overrideRules, err := validateModelOverrideRules(callable(), *req.ModelOverrideMap)
 		if err != nil {
 			return ServiceTokenDTO{}, err
@@ -981,21 +990,14 @@ func (s *Service) UpdateServiceToken(ctx context.Context, principal auth.Token, 
 			blocked = *req.UnknownModelRedirectBlocked
 		}
 		if req.UnknownModelFallback != nil {
-			fallback = *req.UnknownModelFallback
+			fallback = strings.TrimSpace(*req.UnknownModelFallback)
 		}
-		allowlist, err := s.routes.ServiceAllowedModels(ctx, svc.ID)
-		if err != nil {
-			return ServiceTokenDTO{}, err
+		// An unchanged trio is not re-validated (see above).
+		if on != record.UnknownModelRedirect || blocked != record.UnknownModelRedirectBlocked || fallback != record.UnknownModelFallback {
+			if err := s.applyServiceTokenRedirect(ctx, svc.ID, callable, &record, on, blocked, fallback); err != nil {
+				return ServiceTokenDTO{}, err
+			}
 		}
-		on, blocked, fallback, err = validateUnknownModelRedirect(
-			func() map[string]struct{} { return intersectAllowedModels(callable(), allowlist) },
-			on, blocked, fallback)
-		if err != nil {
-			return ServiceTokenDTO{}, err
-		}
-		record.UnknownModelRedirect = on
-		record.UnknownModelRedirectBlocked = blocked
-		record.UnknownModelFallback = fallback
 	}
 	// Reach is asked of the SERVICE the token acts as, never of the editor.
 	if req.VendorAccess != nil {
@@ -1036,6 +1038,27 @@ func (s *Service) UpdateServiceToken(ctx context.Context, principal auth.Token, 
 	// which join the service state per request.
 	s.mirrorServiceTokenState(ctx, svc.ID, svc.Status)
 	return serviceTokenDTO(record), nil
+}
+
+// applyServiceTokenRedirect validates the redirect trio as one unit, the
+// fallback checked against callable NARROWED BY THE SERVICE'S ALLOWLIST
+// (create's rule, see CreateServiceToken), and writes the normalized values
+// onto record.
+func (s *Service) applyServiceTokenRedirect(ctx context.Context, serviceID string, callable func() map[string]struct{}, record *store.TokenRecord, on, blocked bool, fallback string) error {
+	allowlist, err := s.routes.ServiceAllowedModels(ctx, serviceID)
+	if err != nil {
+		return err
+	}
+	on, blocked, fallback, err = validateUnknownModelRedirect(
+		func() map[string]struct{} { return intersectAllowedModels(callable(), allowlist) },
+		on, blocked, fallback)
+	if err != nil {
+		return err
+	}
+	record.UnknownModelRedirect = on
+	record.UnknownModelRedirectBlocked = blocked
+	record.UnknownModelFallback = fallback
+	return nil
 }
 
 // DeleteServiceToken removes tokenID, which MUST belong to serviceID (no

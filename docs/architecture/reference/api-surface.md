@@ -181,6 +181,21 @@ service.validation_failed`); the request is checked as a whole before anything
 is written. Malformed JSON is `400 request.invalid_json`; any other method on
 `{tid}` is `405` with `Allow: PATCH, DELETE`.
 
+A model-valued setting sent back **unchanged** is not validated again: the
+catch-all `model_override`, the `model_override_map` (compared by its stored
+encoding) and the three `unknown_model_*` fields as one unit (compared after the
+fallback is trimmed). Several principals edit a service token and the service's
+allowlist can change after a value was stored, so a value the current editor
+could not set today would otherwise turn every edit of the token, including a
+write-back of the whole portal dialog for one unrelated switch, into a `400`.
+Any **changed** value is validated as on create, and routing re-checks every
+stored value on each request, so the token can never reach more because of this.
+`vendor_access` is not covered by this rule: a present value is validated whole
+against the service's current reach, so a stored entry the service can no longer
+reach blocks a change to the list until it is removed (the portal dialog sends
+`vendor_access` only when the selection changed, and does not show an entry it
+cannot offer).
+
 Every model-valued field is validated on write and an unroutable name is
 rejected with `400 portal.token_model_override_invalid`. The set it is validated
 against is the **writing principal's** callable models — the owner for a user

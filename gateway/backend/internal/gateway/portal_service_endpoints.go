@@ -59,7 +59,7 @@ func (s *Server) handlePortalServices(w http.ResponseWriter, r *http.Request) {
 // handlePortalServiceItem dispatches every "/api/portal/services/{id}[/...]"
 // route (spec §7) after a single session-scope check: "/{id}" (single
 // service), "/{id}/tokens" (token collection), "/{id}/tokens/{tid}" (a single
-// token, delete-only), "/{id}/tokens/{tid}/rotate" (rotate, post-only),
+// token, PATCH/DELETE), "/{id}/tokens/{tid}/rotate" (rotate, post-only),
 // "/{id}/admin-groups" (linkage editor), and "/{id}/resource-groups[/{rgId}]"
 // (the service-side resource-group self-service).
 // Mirrors handlePortalServerItem/handlePortalTokenItem's path-parsing shape.
