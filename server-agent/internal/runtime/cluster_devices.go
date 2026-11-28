@@ -229,45 +229,69 @@ func (d specDevices) hostNames(prefix string) []string {
 func resolveClusterDeviceToken(inner string, spec Spec, dev specDevices) (value string, handled bool, err error) {
 	switch inner {
 	case "RPC_SERVERS":
-		if !spec.IsClusterHead() {
-			return "", true, fmt.Errorf("${RPC_SERVERS} is only valid on a cluster head")
-		}
-		addrs := make([]string, len(spec.Cluster.Endpoints))
-		for i, ep := range spec.Cluster.Endpoints {
-			addrs[i] = ep.Address
-		}
-		return strings.Join(addrs, ","), true, nil
+		value, err = resolveRPCServers(spec)
 	case "RPC_DEVICES":
-		if !spec.IsClusterHead() {
-			return "", true, fmt.Errorf("${RPC_DEVICES} is only valid on a cluster head")
-		}
-		names := rpcDeviceNames(spec)
-		if len(names) == 0 {
-			return "", true, fmt.Errorf("${RPC_DEVICES} cannot be resolved: the cluster endpoints declare no devices")
-		}
-		return strings.Join(names, ","), true, nil
+		value, err = resolveRPCDevices(spec)
 	case "DEVICES", "FIRST_LOCAL_DEVICE":
 		return resolveGenericDevices(inner, spec, dev)
 	case "CUDA_FIRST_DEVICE", "VULKAN_FIRST_DEVICE", "METAL_FIRST_DEVICE":
-		if len(dev.keys) == 0 {
-			return "", true, fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus", inner)
-		}
-		if inner == "VULKAN_FIRST_DEVICE" {
-			names, err := dev.vulkanNames(inner)
-			if err != nil {
-				return "", true, err
-			}
-			return names[0], true, nil
-		}
-		if err := dev.refuseSpanning(inner); err != nil {
-			return "", true, err
-		}
-		prefix := map[string]string{"CUDA_FIRST_DEVICE": backendCUDA, "METAL_FIRST_DEVICE": backendMetal}[inner]
-		// Explicit-backend tokens render like their ${*_DEVICES} siblings: the
-		// declared host index, never renumbered.
-		return dev.hostNames(prefix)[0], true, nil
+		value, err = resolveFirstBackendDevice(inner, dev)
+	default:
+		return "", false, nil
 	}
-	return "", false, nil
+	if err != nil {
+		return "", true, err
+	}
+	return value, true, nil
+}
+
+// resolveRPCServers resolves ${RPC_SERVERS}: a cluster head's member
+// endpoint addresses.
+func resolveRPCServers(spec Spec) (string, error) {
+	if !spec.IsClusterHead() {
+		return "", fmt.Errorf("${RPC_SERVERS} is only valid on a cluster head")
+	}
+	addrs := make([]string, len(spec.Cluster.Endpoints))
+	for i, ep := range spec.Cluster.Endpoints {
+		addrs[i] = ep.Address
+	}
+	return strings.Join(addrs, ","), nil
+}
+
+// resolveRPCDevices resolves ${RPC_DEVICES}: a cluster head's member device
+// names, refused when the endpoints declare none.
+func resolveRPCDevices(spec Spec) (string, error) {
+	if !spec.IsClusterHead() {
+		return "", fmt.Errorf("${RPC_DEVICES} is only valid on a cluster head")
+	}
+	names := rpcDeviceNames(spec)
+	if len(names) == 0 {
+		return "", fmt.Errorf("${RPC_DEVICES} cannot be resolved: the cluster endpoints declare no devices")
+	}
+	return strings.Join(names, ","), nil
+}
+
+// resolveFirstBackendDevice resolves ${CUDA_FIRST_DEVICE},
+// ${VULKAN_FIRST_DEVICE} and ${METAL_FIRST_DEVICE}: the first of the spec's
+// devices under that backend.
+func resolveFirstBackendDevice(inner string, dev specDevices) (string, error) {
+	if len(dev.keys) == 0 {
+		return "", fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus", inner)
+	}
+	if inner == "VULKAN_FIRST_DEVICE" {
+		names, err := dev.vulkanNames(inner)
+		if err != nil {
+			return "", err
+		}
+		return names[0], nil
+	}
+	if err := dev.refuseSpanning(inner); err != nil {
+		return "", err
+	}
+	prefix := map[string]string{"CUDA_FIRST_DEVICE": backendCUDA, "METAL_FIRST_DEVICE": backendMetal}[inner]
+	// Explicit-backend tokens render like their ${*_DEVICES} siblings: the
+	// declared host index, never renumbered.
+	return dev.hostNames(prefix)[0], nil
 }
 
 func resolveGenericDevices(inner string, spec Spec, dev specDevices) (string, bool, error) {

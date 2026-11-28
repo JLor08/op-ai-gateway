@@ -1109,100 +1109,109 @@ func resolveNonSecretToken(inner string, spec Spec, port int, configFilesDir str
 	if v, ok, derr := resolveClusterDeviceToken(inner, spec, dev); ok {
 		return v, true, derr
 	}
-	if inner == "PORT" {
+	// Every token below is an EXACT match only -- ${MODEL...} anything is NOT
+	// a near-miss. See ExpandPlaceholders' doc comment for why the ${PORT}
+	// prefix rule deliberately does not extend here.
+	switch inner {
+	case "PORT":
 		return strconv.Itoa(port), true, nil
-	}
-
-	// EXACT match only -- ${MODEL...} anything is NOT a near-miss.
-	// See ExpandPlaceholders' doc comment for why the ${PORT} prefix rule
-	// deliberately does not extend here.
-	if inner == "MODEL" {
-		if spec.UpstreamModel == "" {
-			return "", true, fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
+	case "MODEL":
+		value, err = resolveModelToken(spec)
+	case "HOST_GPU_IDS", "HOST_GPU_IDS_MAIN_LAST":
+		value, err = resolveHostGPUIDsToken(inner, dev)
+	case "CONFIG_DIR":
+		value, err = resolveConfigDirToken(spec, configFilesDir)
+	default:
+		backend, ok := deviceBackendByToken[inner]
+		if !ok {
+			return "", false, nil
 		}
-		return spec.UpstreamModel, true, nil
+		value, err = resolveDeviceListToken(inner, backend, dev)
 	}
-
-	// EXACT match only, same reasoning as ${MODEL} above. HOST, not
-	// child, indices -- the name says so because the digits do not.
-	if inner == "HOST_GPU_IDS" {
-		if len(dev.keys) == 0 {
-			return "", true, fmt.Errorf("${HOST_GPU_IDS} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
-		}
-		if err := dev.refuseSpanning(inner); err != nil {
-			return "", true, err
-		}
-		return hostGPUIDs(dev.keys), true, nil
+	if err != nil {
+		return "", true, err
 	}
+	return value, true, nil
+}
 
-	// EXACT match only, sibling of ${HOST_GPU_IDS}: the same host indices with
-	// the first declared (main) GPU moved last. Same empty-list refusal.
+// resolveModelToken resolves ${MODEL}: the spec's upstream model.
+func resolveModelToken(spec Spec) (string, error) {
+	if spec.UpstreamModel == "" {
+		return "", fmt.Errorf("${MODEL} cannot be resolved: this spec has no upstream_model (the owning mapping's app_model_name is empty)")
+	}
+	return spec.UpstreamModel, nil
+}
+
+// resolveHostGPUIDsToken resolves ${HOST_GPU_IDS} and its sibling
+// ${HOST_GPU_IDS_MAIN_LAST}: HOST, not child, indices -- the name says so
+// because the digits do not. The sibling lists the same host indices with the
+// first declared (main) GPU moved last. Both refuse an empty list.
+func resolveHostGPUIDsToken(inner string, dev specDevices) (string, error) {
+	if len(dev.keys) == 0 {
+		return "", fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device", inner)
+	}
+	if err := dev.refuseSpanning(inner); err != nil {
+		return "", err
+	}
 	if inner == "HOST_GPU_IDS_MAIN_LAST" {
-		if len(dev.keys) == 0 {
-			return "", true, fmt.Errorf("${HOST_GPU_IDS_MAIN_LAST} cannot be resolved: this spec declares no gpus, and an empty visible-devices value means NO device is visible, not every device")
-		}
-		if err := dev.refuseSpanning(inner); err != nil {
-			return "", true, err
-		}
-		return hostGPUIDsMainLast(dev.hostIndices()), true, nil
+		return hostGPUIDsMainLast(dev.hostIndices()), nil
 	}
+	return hostGPUIDs(dev.keys), nil
+}
 
-	// The three llama.cpp --device placeholders, exact-match siblings of
-	// ${HOST_GPU_IDS}: same ordered/deduped index list, backend-prefixed.
-	// Same empty-list refusal, on the same reasoning (an empty --device
-	// list selects NO device, not every device). One table-driven branch
-	// for the three, so the shared guard and message live once.
-	// ${VULKAN_DEVICES} names the renumbered Vulkan0.. devices where the
-	// agent injected GGML_VK_VISIBLE_DEVICES (specDevices.vulkanNames).
-	if backend, ok := deviceBackendByToken[inner]; ok {
-		if len(dev.keys) == 0 {
-			return "", true, fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device", inner)
-		}
-		if backend == backendVulkan {
-			names, verr := dev.vulkanNames(inner)
-			if verr != nil {
-				return "", true, verr
-			}
-			return strings.Join(names, ","), true, nil
-		}
-		if err := dev.refuseSpanning(inner); err != nil {
-			return "", true, err
-		}
-		return deviceList(dev.keys, backend), true, nil
+// resolveDeviceListToken resolves the three llama.cpp --device placeholders,
+// exact-match siblings of ${HOST_GPU_IDS}: same ordered/deduped index list,
+// backend-prefixed. Same empty-list refusal, on the same reasoning (an empty
+// --device list selects NO device, not every device). One table-driven
+// branch for the three, so the shared guard and message live once.
+// ${VULKAN_DEVICES} names the renumbered Vulkan0.. devices where the agent
+// injected GGML_VK_VISIBLE_DEVICES (specDevices.vulkanNames).
+func resolveDeviceListToken(inner, backend string, dev specDevices) (string, error) {
+	if len(dev.keys) == 0 {
+		return "", fmt.Errorf("${%s} cannot be resolved: this spec declares no gpus, and an empty device list selects NO device, not every device", inner)
 	}
-
-	// EXACT match only, like ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and
-	// friends are plausible pass-through tokens. The per-spec directory
-	// the agent provisions this spec's config_files into (#257):
-	// <config_files_dir>/<spec.ID> (the instance key for a further instance
-	// of a replicable spec, #340). NOT a secret -- it is an agent-chosen
-	// path the operator needs to read in the reported command -- so it
-	// records no secretSpan and is never masked, exactly like ${PORT}
-	// and ${MODEL}. No empty-value refusal: configFilesDir has a
-	// non-empty default at runtime, and spec.ID is the spec's identity,
-	// so the join is never a hole in a path.
-	if inner == "CONFIG_DIR" {
-		if spec.IsWSL() {
-			// The child runs inside the distro, so the agent-side Windows
-			// directory must be named by its /mnt/<drive> path. Joined with
-			// path, not filepath: the result is a POSIX path whatever the
-			// agent's host is. An untranslatable directory (UNC, or one whose
-			// .. climbs above its drive's root) is a placeholder error, which
-			// the dry run reports as not_permitted and a start as its
-			// last_error -- both travel to the gateway, so the error names the
-			// setting and not the agent-local path, which goes to the agent's
-			// own log (the rule every policy refusal follows, §3.1).
-			dir, derr := windowsPathToWSL(configFilesDir)
-			if derr != nil {
-				slog.Warn("runtime: config_files_dir does not map into a WSL distro", "spec", spec.ID, "error", derr)
-				return "", true, fmt.Errorf("${CONFIG_DIR} cannot be resolved for a wsl spec: the agent's config_files_dir does not map into a WSL distro (UNC paths and paths climbing above their drive's root cannot); see the agent log")
-			}
-			return path.Join(dir, spec.ID), true, nil
+	if backend == backendVulkan {
+		names, err := dev.vulkanNames(inner)
+		if err != nil {
+			return "", err
 		}
-		return filepath.Join(configFilesDir, spec.ID), true, nil
+		return strings.Join(names, ","), nil
 	}
+	if err := dev.refuseSpanning(inner); err != nil {
+		return "", err
+	}
+	return deviceList(dev.keys, backend), nil
+}
 
-	return "", false, nil
+// resolveConfigDirToken resolves ${CONFIG_DIR} (EXACT match only, like
+// ${MODEL}/${HOST_GPU_IDS}: ${CONFIG_DIR_X} and friends are plausible
+// pass-through tokens): the per-spec directory the agent provisions this
+// spec's config_files into (#257), <config_files_dir>/<spec.ID> (the instance
+// key for a further instance of a replicable spec, #340). NOT a secret -- it
+// is an agent-chosen path the operator needs to read in the reported command
+// -- so it records no secretSpan and is never masked, exactly like ${PORT}
+// and ${MODEL}. No empty-value refusal: configFilesDir has a non-empty
+// default at runtime, and spec.ID is the spec's identity, so the join is
+// never a hole in a path.
+func resolveConfigDirToken(spec Spec, configFilesDir string) (string, error) {
+	if !spec.IsWSL() {
+		return filepath.Join(configFilesDir, spec.ID), nil
+	}
+	// The child runs inside the distro, so the agent-side Windows directory
+	// must be named by its /mnt/<drive> path. Joined with path, not filepath:
+	// the result is a POSIX path whatever the agent's host is. An
+	// untranslatable directory (UNC, or one whose .. climbs above its drive's
+	// root) is a placeholder error, which the dry run reports as
+	// not_permitted and a start as its last_error -- both travel to the
+	// gateway, so the error names the setting and not the agent-local path,
+	// which goes to the agent's own log (the rule every policy refusal
+	// follows, §3.1).
+	dir, err := windowsPathToWSL(configFilesDir)
+	if err != nil {
+		slog.Warn("runtime: config_files_dir does not map into a WSL distro", "spec", spec.ID, "error", err)
+		return "", fmt.Errorf("${CONFIG_DIR} cannot be resolved for a wsl spec: the agent's config_files_dir does not map into a WSL distro (UNC paths and paths climbing above their drive's root cannot); see the agent log")
+	}
+	return path.Join(dir, spec.ID), nil
 }
 
 // placeholderExpander resolves the placeholders of one spec's args and env
