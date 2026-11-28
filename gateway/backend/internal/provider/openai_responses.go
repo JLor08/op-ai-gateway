@@ -306,6 +306,24 @@ type openaiResponsesRequest struct {
 	// from serializing an empty effort.
 	Reasoning       *openaiResponsesReasoning `json:"reasoning,omitempty"`
 	MaxOutputTokens int                       `json:"max_output_tokens,omitempty"`
+	// Text carries structured output (text.format json_schema), set only when the
+	// neutral request has an OutputSchema. The shape is the one Codex CLI's
+	// --output-schema sends. REVERSE-ENGINEERED / VERIFY-LIVE against the
+	// subscription backend.
+	Text *openaiResponsesText `json:"text,omitempty"`
+}
+
+// openaiResponsesText is the Responses `text` object; only its format is sent.
+type openaiResponsesText struct {
+	Format openaiResponsesTextFormat `json:"format"`
+}
+
+// openaiResponsesTextFormat is a json_schema text format.
+type openaiResponsesTextFormat struct {
+	Type   string         `json:"type"`
+	Name   string         `json:"name"`
+	Schema map[string]any `json:"schema"`
+	Strict bool           `json:"strict"`
 }
 
 // openaiResponsesInputItem is one `input` array item, discriminated by Type:
@@ -381,6 +399,14 @@ func openaiResponsesRequestBody(target routing.Target, req inference.Request) ([
 	}
 	if req.MaxTokens > 0 {
 		body.MaxOutputTokens = req.MaxTokens
+	}
+	if req.OutputSchema != nil {
+		body.Text = &openaiResponsesText{Format: openaiResponsesTextFormat{
+			Type:   "json_schema",
+			Name:   req.OutputSchema.Name,
+			Schema: req.OutputSchema.Schema,
+			Strict: req.OutputSchema.Strict,
+		}}
 	}
 	// Temperature and Stop are deliberately NOT forwarded: the ChatGPT backend
 	// rejects a Responses body carrying sampling overrides it does not accept for a

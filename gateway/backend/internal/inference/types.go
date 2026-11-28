@@ -194,6 +194,18 @@ const APIFlavorOpenAIResponses = "openai_responses"
 // Messages request (/v1/messages), the counterpart of APIFlavorOpenAIResponses.
 const APIFlavorAnthropicMessages = "anthropic_messages"
 
+// OutputSchema asks a provider client for structured output: the model must
+// answer with JSON that matches Schema. Name labels the schema for the
+// upstream, Strict asks for strict schema adherence. Only the OpenAI
+// subscription Responses client renders it (text.format json_schema); every
+// other provider client ignores it. Set only by the decision emulator
+// (compat.BuildDecisionEmulation, #380).
+type OutputSchema struct {
+	Name   string
+	Schema map[string]any
+	Strict bool
+}
+
 // PromptCacheDirective asks a provider that supports prompt caching (Anthropic
 // translate) to place cache_control breakpoints on this request. nil or
 // Enabled=false means no caching (today's behavior). Providers without caching
@@ -291,6 +303,10 @@ type Request struct {
 	// to place cache_control breakpoints. Internal only: set by the gateway, never
 	// parsed from or serialized to a client body.
 	PromptCache *PromptCacheDirective `json:"-"`
+	// OutputSchema, when set, asks for structured output (see OutputSchema).
+	// Internal only: set by the gateway's decision emulation, never parsed from
+	// or serialized to a client body.
+	OutputSchema *OutputSchema `json:"-"`
 	// ReasoningEffortViaTemplateKwargs, when true alongside a non-empty
 	// ReasoningEffort, directs the OpenAI-compatible provider to ALSO send the
 	// effort as chat_template_kwargs.reasoning_effort (the top-level

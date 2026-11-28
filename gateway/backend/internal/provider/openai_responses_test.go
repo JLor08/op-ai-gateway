@@ -584,6 +584,28 @@ func TestOpenAIResponsesRequestBodyHonorsExplicitReasoningEffort(t *testing.T) {
 	}
 }
 
+// An OutputSchema renders as the Responses structured-output block
+// text.format (the json_schema shape Codex CLI's --output-schema sends); a
+// request without one sends no text key at all.
+func TestOpenAIResponsesRequestBodyOutputSchema(t *testing.T) {
+	body, _ := decodeResponsesBody(t, inference.Request{
+		Messages: []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")},
+		OutputSchema: &inference.OutputSchema{
+			Name:   "decisions",
+			Schema: map[string]any{"type": "object"},
+			Strict: true,
+		},
+	})
+	assertJSON(t, "text", body["text"], `{"format":{"type":"json_schema","name":"decisions","schema":{"type":"object"},"strict":true}}`)
+
+	plain, raw := decodeResponsesBody(t, inference.Request{
+		Messages: []inference.Message{openaiResponsesTextMsg(inference.RoleUser, "hi")},
+	})
+	if _, present := plain["text"]; present {
+		t.Fatalf("text present without an OutputSchema, want it omitted: %s", raw)
+	}
+}
+
 // ---- non-2xx diagnosability ----
 
 func TestOpenAIResponsesClientErrorCarriesStatusAndBoundedUpstreamBody(t *testing.T) {
