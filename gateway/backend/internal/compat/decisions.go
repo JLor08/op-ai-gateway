@@ -115,12 +115,37 @@ type decisionsItem struct {
 	Content json.RawMessage `json:"content"`
 }
 
-// decisionsPiece is one element of the System One state: a text run or a JSON
-// value.
+// decisionsPiece is one element of the decoded input, in request order: a text
+// run, a JSON value, or an image URL (isImage).
 type decisionsPiece struct {
-	text   string
-	data   json.RawMessage
-	isJSON bool
+	text    string
+	data    json.RawMessage
+	isJSON  bool
+	image   string
+	isImage bool
+}
+
+// decisionsInputRules selects the input rules a caller applies. The zero value
+// is matrix A's (TranslateDecisionsRequest): an input_image needs a data: URL.
+type decisionsInputRules struct {
+	// remoteImages also accepts an http(s) image_url (the decision emulation:
+	// the vendor fetches it, the gateway does not).
+	remoteImages bool
+}
+
+// splitDecisionsImages separates the image pieces from the text and JSON
+// pieces, keeping each group's order.
+func splitDecisionsImages(pieces []decisionsPiece) ([]decisionsPiece, []string) {
+	var rest []decisionsPiece
+	var images []string
+	for _, p := range pieces {
+		if p.isImage {
+			images = append(images, p.image)
+		} else {
+			rest = append(rest, p)
+		}
+	}
+	return rest, images
 }
 
 // TranslateDecisionsRequest converts an OpenAI Decisions request body into a
@@ -133,13 +158,14 @@ func TranslateDecisionsRequest(raw []byte, upstreamModel string) ([]byte, Decisi
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, table, decisionsInputErr("the request body is not a valid decisions request")
 	}
-	pieces, images, derr := decodeDecisionsInput(in.Input)
+	decoded, derr := decodeDecisionsInput(in.Input, decisionsInputRules{})
 	if derr != nil {
 		return nil, table, derr
 	}
-	if len(pieces) == 0 && len(images) == 0 {
+	if len(decoded) == 0 {
 		return nil, table, decisionsInputErr("input carries no content")
 	}
+	pieces, images := splitDecisionsImages(decoded)
 	questions, tq, derr := buildSystemOneQuestions(in.Questions)
 	if derr != nil {
 		return nil, table, derr
@@ -168,101 +194,123 @@ func writeJSONValue(buf *bytes.Buffer, v any) {
 	buf.Write(b)
 }
 
-func decodeDecisionsInput(raw json.RawMessage) ([]decisionsPiece, []string, *DecisionsError) {
+func decodeDecisionsInput(raw json.RawMessage, rules decisionsInputRules) ([]decisionsPiece, *DecisionsError) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return nil, nil, decisionsInputErr("input must be a string or an array of message items")
+		return nil, decisionsInputErr("input must be a string or an array of message items")
 	}
 	switch trimmed[0] {
 	case '"':
 		var s string
 		if err := json.Unmarshal(trimmed, &s); err != nil {
-			return nil, nil, decisionsInputErr("input is not a valid string")
+			return nil, decisionsInputErr("input is not a valid string")
 		}
-		return []decisionsPiece{{text: s}}, nil, nil
+		return []decisionsPiece{{text: s}}, nil
 	case '[':
 		var items []json.RawMessage
 		if err := json.Unmarshal(trimmed, &items); err != nil {
-			return nil, nil, decisionsInputErr("input is not a valid array")
+			return nil, decisionsInputErr("input is not a valid array")
 		}
-		return decodeDecisionsItems(items)
+		return decodeDecisionsItems(items, rules)
 	default:
-		return nil, nil, decisionsInputErr("input must be a string or an array of message items")
+		return nil, decisionsInputErr("input must be a string or an array of message items")
 	}
 }
 
-func decodeDecisionsItems(items []json.RawMessage) ([]decisionsPiece, []string, *DecisionsError) {
+func decodeDecisionsItems(items []json.RawMessage, rules decisionsInputRules) ([]decisionsPiece, *DecisionsError) {
 	var pieces []decisionsPiece
-	var images []string
 	for _, rawItem := range items {
 		var item decisionsItem
 		if err := json.Unmarshal(rawItem, &item); err != nil {
-			return nil, nil, decisionsInputErr("an input item is not a valid object")
+			return nil, decisionsInputErr("an input item is not a valid object")
 		}
 		if item.Type != nil && *item.Type != "message" {
-			return nil, nil, decisionsInputErr("input items of type %q are not supported; only user messages are", *item.Type)
+			return nil, decisionsInputErr("input items of type %q are not supported; only user messages are", *item.Type)
 		}
 		if item.Role != "user" {
-			return nil, nil, decisionsInputErr("input messages with role %q are not supported; only user messages are", item.Role)
+			return nil, decisionsInputErr("input messages with role %q are not supported; only user messages are", item.Role)
 		}
-		p, im, derr := decodeDecisionsContent(item.Content)
+		p, derr := decodeDecisionsContent(item.Content, rules)
 		if derr != nil {
-			return nil, nil, derr
+			return nil, derr
 		}
 		pieces = append(pieces, p...)
-		images = append(images, im...)
 	}
-	return pieces, images, nil
+	return pieces, nil
 }
 
-func decodeDecisionsContent(raw json.RawMessage) ([]decisionsPiece, []string, *DecisionsError) {
+func decodeDecisionsContent(raw json.RawMessage, rules decisionsInputRules) ([]decisionsPiece, *DecisionsError) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return nil, nil, decisionsInputErr("a user message needs content")
+		return nil, decisionsInputErr("a user message needs content")
 	}
 	switch trimmed[0] {
 	case '"':
 		var s string
 		if err := json.Unmarshal(trimmed, &s); err != nil {
-			return nil, nil, decisionsInputErr("message content is not a valid string")
+			return nil, decisionsInputErr("message content is not a valid string")
 		}
-		return []decisionsPiece{{text: s}}, nil, nil
+		return []decisionsPiece{{text: s}}, nil
 	case '[':
 		var parts []decisionsPart
 		if err := json.Unmarshal(trimmed, &parts); err != nil {
-			return nil, nil, decisionsInputErr("message content parts are not valid")
+			return nil, decisionsInputErr("message content parts are not valid")
 		}
-		return decodeDecisionsParts(parts)
+		return decodeDecisionsParts(parts, rules)
 	default:
-		return nil, nil, decisionsInputErr("message content must be a string or an array of parts")
+		return nil, decisionsInputErr("message content must be a string or an array of parts")
 	}
 }
 
-func decodeDecisionsParts(parts []decisionsPart) ([]decisionsPiece, []string, *DecisionsError) {
+func decodeDecisionsParts(parts []decisionsPart, rules decisionsInputRules) ([]decisionsPiece, *DecisionsError) {
 	var pieces []decisionsPiece
-	var images []string
 	for _, p := range parts {
 		switch p.Type {
 		case "input_text":
 			if p.Text == nil {
-				return nil, nil, decisionsInputErr("an input_text part has no text")
+				return nil, decisionsInputErr("an input_text part has no text")
 			}
 			pieces = append(pieces, decisionsPiece{text: *p.Text})
 		case "input_json":
 			if len(bytes.TrimSpace(p.Data)) == 0 {
-				return nil, nil, decisionsInputErr("an input_json part needs data")
+				return nil, decisionsInputErr("an input_json part needs data")
 			}
 			pieces = append(pieces, decisionsPiece{data: p.Data, isJSON: true})
 		case "input_image":
-			if p.ImageURL == nil || !strings.HasPrefix(*p.ImageURL, "data:") {
-				return nil, nil, decisionsInputErr("only input_image parts with a data: image_url are supported; the gateway does not fetch images")
+			url, derr := decisionsImageURL(p.ImageURL, rules)
+			if derr != nil {
+				return nil, derr
 			}
-			images = append(images, *p.ImageURL)
+			pieces = append(pieces, decisionsPiece{image: url, isImage: true})
 		default:
-			return nil, nil, decisionsInputErr("input parts of type %q are not supported", p.Type)
+			return nil, decisionsInputErr("input parts of type %q are not supported", p.Type)
 		}
 	}
-	return pieces, images, nil
+	return pieces, nil
+}
+
+// decisionsImageURL checks an input_image URL against the rules: a data: URL
+// always, an http(s) URL only with remoteImages.
+func decisionsImageURL(u *string, rules decisionsInputRules) (string, *DecisionsError) {
+	if rules.remoteImages {
+		if u != nil && hasAnyPrefixFold(*u, "data:", "http://", "https://") {
+			return *u, nil
+		}
+		return "", decisionsInputErr("only input_image parts with a data:, http: or https: image_url are supported")
+	}
+	if u == nil || !strings.HasPrefix(*u, "data:") {
+		return "", decisionsInputErr("only input_image parts with a data: image_url are supported; the gateway does not fetch images")
+	}
+	return *u, nil
+}
+
+func hasAnyPrefixFold(s string, prefixes ...string) bool {
+	for _, p := range prefixes {
+		if len(s) >= len(p) && strings.EqualFold(s[:len(p)], p) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildDecisionsState renders the System One state: a string when only text is
@@ -308,26 +356,78 @@ type decisionsQuestionIn struct {
 	Levels       []json.RawMessage `json:"levels"`
 }
 
+// decisionsParsedQuestion is one OpenAI Decisions question after matrix A's
+// question rules: the original name (nil when absent or null), the type, the
+// joined instructions and, per type, the choices or levels in request order.
+type decisionsParsedQuestion struct {
+	name         *string
+	oaType       string
+	instructions string
+	choices      []decisionsParsedChoice
+	levels       []decisionsParsedLevel
+}
+
+type decisionsParsedChoice struct {
+	key         string          // the System One option name
+	value       json.RawMessage // typed original: a JSON string or boolean
+	description string
+}
+
+type decisionsParsedLevel struct {
+	label       string
+	description string
+}
+
+// decisionsQuestionRules selects the question rules a caller applies.
+type decisionsQuestionRules struct {
+	// refuseKeyCollisions refuses a string and a boolean choice value that map
+	// to the same System One option name (matrix A).
+	refuseKeyCollisions bool
+}
+
+// parseDecisionsQuestion applies matrix A's question rules to question i.
+func parseDecisionsQuestion(raw json.RawMessage, i int, rules decisionsQuestionRules) (decisionsParsedQuestion, *DecisionsError) {
+	var pq decisionsParsedQuestion
+	var q decisionsQuestionIn
+	if err := json.Unmarshal(raw, &q); err != nil {
+		return pq, decisionsQuestionErr("question %d is not a valid object", i)
+	}
+	name, derr := decodeQuestionName(q.Name, i)
+	if derr != nil {
+		return pq, derr
+	}
+	pq.name, pq.oaType = name, q.Type
+	if pq.instructions, derr = decodeQuestionInstructions(q.Instructions); derr != nil {
+		return pq, derr
+	}
+	switch q.Type {
+	case oaTypePredicate:
+	case oaTypeChoice:
+		pq.choices, derr = parseDecisionsChoices(q.Choices, i, rules)
+	case oaTypeScore:
+		pq.levels, derr = parseDecisionsLevels(q.Levels, i)
+	default:
+		derr = decisionsQuestionErr("question %d: unknown question type %q", i, q.Type)
+	}
+	if derr != nil {
+		return pq, derr
+	}
+	return pq, nil
+}
+
 func buildSystemOneQuestions(raws []json.RawMessage) ([]byte, []decisionsTableQuestion, *DecisionsError) {
 	var buf bytes.Buffer
 	buf.WriteByte('{')
 	used := make(map[string]bool, len(raws))
 	table := make([]decisionsTableQuestion, 0, len(raws))
 	for i, raw := range raws {
-		var q decisionsQuestionIn
-		if err := json.Unmarshal(raw, &q); err != nil {
-			return nil, nil, decisionsQuestionErr("question %d is not a valid object", i)
-		}
-		name, derr := decodeQuestionName(q.Name, i)
+		pq, derr := parseDecisionsQuestion(raw, i, decisionsQuestionRules{refuseKeyCollisions: true})
 		if derr != nil {
 			return nil, nil, derr
 		}
-		key := uniqueQuestionKey(name, i, used)
-		body, tq, derr := buildSystemOneQuestion(q, i)
-		if derr != nil {
-			return nil, nil, derr
-		}
-		tq.key, tq.name = key, name
+		key := uniqueQuestionKey(pq.name, i, used)
+		body, tq := buildSystemOneQuestion(pq)
+		tq.key, tq.name = key, pq.name
 		table = append(table, tq)
 		if i > 0 {
 			buf.WriteByte(',')
@@ -368,39 +468,31 @@ func uniqueQuestionKey(name *string, i int, used map[string]bool) string {
 	return key
 }
 
-func buildSystemOneQuestion(q decisionsQuestionIn, i int) ([]byte, decisionsTableQuestion, *DecisionsError) {
-	tq := decisionsTableQuestion{oaType: q.Type}
-	instructions, derr := decodeQuestionInstructions(q.Instructions)
-	if derr != nil {
-		return nil, tq, derr
-	}
+func buildSystemOneQuestion(pq decisionsParsedQuestion) ([]byte, decisionsTableQuestion) {
+	tq := decisionsTableQuestion{oaType: pq.oaType}
 	var buf bytes.Buffer
 	buf.WriteString(`{"type":`)
-	switch q.Type {
+	switch pq.oaType {
 	case oaTypePredicate:
 		writeJSONValue(&buf, s1TypeNoul)
-		writeInstructionsAndCriteria(&buf, instructions, nil)
+		writeInstructionsAndCriteria(&buf, pq.instructions, nil)
 	case oaTypeChoice:
-		criteria, choices, derr := buildChoiceCriteria(q.Choices, i)
-		if derr != nil {
-			return nil, tq, derr
+		tq.choices = make([]decisionsTableChoice, 0, len(pq.choices))
+		for _, c := range pq.choices {
+			tq.choices = append(tq.choices, decisionsTableChoice{key: c.key, value: c.value})
 		}
-		tq.choices = choices
 		writeJSONValue(&buf, s1TypeChoice)
-		writeInstructionsAndCriteria(&buf, instructions, criteria)
-	case oaTypeScore:
-		criteria, labels, derr := buildScoreCriteria(q.Levels, i)
-		if derr != nil {
-			return nil, tq, derr
+		writeInstructionsAndCriteria(&buf, pq.instructions, buildChoiceCriteria(pq.choices))
+	default: // oaTypeScore; parseDecisionsQuestion refused every other type
+		tq.levels = make([]string, 0, len(pq.levels))
+		for _, l := range pq.levels {
+			tq.levels = append(tq.levels, l.label)
 		}
-		tq.levels = labels
 		writeJSONValue(&buf, s1TypeScore)
-		writeInstructionsAndCriteria(&buf, instructions, criteria)
-	default:
-		return nil, tq, decisionsQuestionErr("question %d: unknown question type %q", i, q.Type)
+		writeInstructionsAndCriteria(&buf, pq.instructions, buildScoreCriteria(pq.levels))
 	}
 	buf.WriteByte('}')
-	return buf.Bytes(), tq, nil
+	return buf.Bytes(), tq
 }
 
 func writeInstructionsAndCriteria(buf *bytes.Buffer, instructions string, criteria []byte) {
@@ -453,48 +545,55 @@ type decisionsChoiceIn struct {
 	Description json.RawMessage `json:"description"`
 }
 
-// buildChoiceCriteria writes {key: description|null} in choice order and
-// returns the typed originals. A string "true" and a boolean true share the
-// key "true" and are refused as a collision.
-func buildChoiceCriteria(raws []json.RawMessage, qi int) ([]byte, []decisionsTableChoice, *DecisionsError) {
+// parseDecisionsChoices reads a choice question's choices in order. A string
+// "true" and a boolean true share the System One key "true"; with
+// refuseKeyCollisions that is refused.
+func parseDecisionsChoices(raws []json.RawMessage, qi int, rules decisionsQuestionRules) ([]decisionsParsedChoice, *DecisionsError) {
 	if len(raws) == 0 {
-		return nil, nil, decisionsQuestionErr("question %d: a choice question needs at least one choice", qi)
+		return nil, decisionsQuestionErr("question %d: a choice question needs at least one choice", qi)
 	}
-	var buf bytes.Buffer
-	buf.WriteByte('{')
 	seen := make(map[string]bool, len(raws))
-	choices := make([]decisionsTableChoice, 0, len(raws))
+	choices := make([]decisionsParsedChoice, 0, len(raws))
 	for ci, raw := range raws {
 		var c decisionsChoiceIn
 		if err := json.Unmarshal(raw, &c); err != nil {
-			return nil, nil, decisionsQuestionErr("question %d: choice %d is not an object", qi, ci)
+			return nil, decisionsQuestionErr("question %d: choice %d is not an object", qi, ci)
 		}
 		key, typed, derr := choiceKey(c.Value, qi, ci)
 		if derr != nil {
-			return nil, nil, derr
+			return nil, derr
 		}
 		desc, derr := choiceDescription(c.Description, qi, ci)
 		if derr != nil {
-			return nil, nil, derr
+			return nil, derr
 		}
-		if seen[key] {
-			return nil, nil, decisionsQuestionErr("question %d: choice values collide on the key %q (a string and a boolean map to the same System One name)", qi, key)
+		if rules.refuseKeyCollisions && seen[key] {
+			return nil, decisionsQuestionErr("question %d: choice values collide on the key %q (a string and a boolean map to the same System One name)", qi, key)
 		}
 		seen[key] = true
-		choices = append(choices, decisionsTableChoice{key: key, value: typed})
+		choices = append(choices, decisionsParsedChoice{key: key, value: typed, description: desc})
+	}
+	return choices, nil
+}
+
+// buildChoiceCriteria writes {key: description|null} in choice order.
+func buildChoiceCriteria(choices []decisionsParsedChoice) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for ci, c := range choices {
 		if ci > 0 {
 			buf.WriteByte(',')
 		}
-		writeJSONValue(&buf, key)
+		writeJSONValue(&buf, c.key)
 		buf.WriteByte(':')
-		if desc == "" {
+		if c.description == "" {
 			buf.WriteString("null")
 		} else {
-			writeJSONValue(&buf, desc)
+			writeJSONValue(&buf, c.description)
 		}
 	}
 	buf.WriteByte('}')
-	return buf.Bytes(), choices, nil
+	return buf.Bytes()
 }
 
 // choiceDescription reads a choice's optional description: absent or null is
@@ -534,29 +633,40 @@ type decisionsLevelIn struct {
 	Description *string `json:"description"`
 }
 
-// buildScoreCriteria writes the ordered level list; a level with a description
-// is folded into "label: description". It returns the original labels.
-func buildScoreCriteria(raws []json.RawMessage, qi int) ([]byte, []string, *DecisionsError) {
+// parseDecisionsLevels reads a score question's levels in order.
+func parseDecisionsLevels(raws []json.RawMessage, qi int) ([]decisionsParsedLevel, *DecisionsError) {
 	if len(raws) == 0 {
-		return nil, nil, decisionsQuestionErr("question %d: a score question needs at least one level", qi)
+		return nil, decisionsQuestionErr("question %d: a score question needs at least one level", qi)
 	}
-	folded := make([]string, 0, len(raws))
-	labels := make([]string, 0, len(raws))
+	levels := make([]decisionsParsedLevel, 0, len(raws))
 	for li, raw := range raws {
 		var l decisionsLevelIn
 		if err := json.Unmarshal(raw, &l); err != nil || l.Label == nil {
-			return nil, nil, decisionsQuestionErr("question %d: level %d needs an object with a label", qi, li)
+			return nil, decisionsQuestionErr("question %d: level %d needs an object with a label", qi, li)
 		}
-		labels = append(labels, *l.Label)
-		if l.Description != nil && *l.Description != "" {
-			folded = append(folded, *l.Label+": "+*l.Description)
+		level := decisionsParsedLevel{label: *l.Label}
+		if l.Description != nil {
+			level.description = *l.Description
+		}
+		levels = append(levels, level)
+	}
+	return levels, nil
+}
+
+// buildScoreCriteria writes the ordered level list; a level with a description
+// is folded into "label: description".
+func buildScoreCriteria(levels []decisionsParsedLevel) []byte {
+	folded := make([]string, 0, len(levels))
+	for _, l := range levels {
+		if l.description != "" {
+			folded = append(folded, l.label+": "+l.description)
 		} else {
-			folded = append(folded, *l.Label)
+			folded = append(folded, l.label)
 		}
 	}
 	var buf bytes.Buffer
 	writeJSONValue(&buf, folded)
-	return buf.Bytes(), labels, nil
+	return buf.Bytes()
 }
 
 // ---------------------------------------------------------------------------
