@@ -649,7 +649,7 @@ application, defeating the point of a per-model override).
 → [Compatibility & Inference §6](cross-cutting/compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough),
 [Agent-Managed Model Runtime §7.1](cross-cutting/agent-runtime-manager.md#71-agent-versioning),
 [§11.5](cross-cutting/agent-runtime-manager.md#115-what-each-remaining-tab-shows),
-[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-120-migrations),
 [API Surface](reference/api-surface.md#api-variant-endpoint-modes-responses_mode--messages_mode).
 
 ## ADR-034 — GPU order is explicit; `set_visible_devices` gets an env or args mode
@@ -709,7 +709,7 @@ non-macOS agent.
 → [Agent-Managed Model Runtime §3.2](cross-cutting/agent-runtime-manager.md#32-placeholders-and-why-no-secret-enters-the-gateway),
 [§3.3](cross-cutting/agent-runtime-manager.md#33-set_visible_devices-turning-the-gpu-list-into-an-enforcement),
 [§7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
-[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-120-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-035 — The gateway owns the runtime-spec upstream token
@@ -878,7 +878,7 @@ Observability §8.2.6](cross-cutting/telemetry-usage-observability.md#826-option
 §3](cross-cutting/routing-and-model-selection.md#3-candidate-scoring),
 [Telemetry, Usage Analytics & Observability
 §8.3.2](cross-cutting/telemetry-usage-observability.md#832-shared-ingest-core),
-[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-120-migrations),
 [API Surface](reference/api-surface.md#agent-managed-model-runtime).
 
 ## ADR-037 — The runtime router grows a GET-only per-model `/props` passthrough; the gateway probes through it with the spec's token
@@ -1090,7 +1090,7 @@ except in where it writes and what it may overwrite.
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Agent-Managed Model Runtime
 §10](cross-cutting/agent-runtime-manager.md#10-runtime-status-volatile-and-a-full-snapshot-every-time),
-[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-120-migrations),
 [API Surface](reference/api-surface.md#models-servers-applications-mappings).
 
 ## ADR-039 — Per-model capabilities are child rows with ranked provenance, and the eleven columns are dropped
@@ -1305,7 +1305,7 @@ third `unknown` verdict value instead of row absence (it would put back the
 empty verdict every writer has to remember not to write, which is the bug
 class this shape removes).
 → [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-119-migrations),
+[§4](reference/data-model.md#4-migration-history-120-migrations),
 [Telemetry, Usage Analytics & Observability
 §8.4.3](cross-cutting/telemetry-usage-observability.md#843-running-connections-active-requests),
 [Routing & Model Selection
@@ -1531,7 +1531,7 @@ yield a plausible, wrong watt-hour figure — worse than no figure, because
 nothing downstream can tell it from a real one.
 
 **Decision: the measure is the PAIR `(billing_unit, billing_quantity)`.** Both
-columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-119-migrations)),
+columns arrive in the same migration ([v81](reference/data-model.md#4-migration-history-120-migrations)),
 because a quantity without its unit is the scalar this entry rejects and a unit
 without its quantity records nothing. The quantity is only ever read *through*
 the unit: whoever wants a number must first agree what it counts. The
@@ -1678,7 +1678,7 @@ modeled tier's non-token guard) until a coefficient declares that unit.
 [§8.4.4](cross-cutting/telemetry-usage-observability.md#844-energy-attribution),
 [§8.4.5](cross-cutting/telemetry-usage-observability.md#845-cost-and-currency),
 [Data Model §1](reference/data-model.md#1-current-tables-by-area),
-[§4](reference/data-model.md#4-migration-history-119-migrations),
+[§4](reference/data-model.md#4-migration-history-120-migrations),
 [Risks & Technical Debt
 §11.1](11-risks-and-technical-debt.md#111-operational-risks),
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances),
@@ -3649,7 +3649,7 @@ picker and dashboard of an owner's own accounts, with no token row to repair it 
 an "all except X" mode and a token-level prefix for self-hosted models (deferred, not
 needed for this need).
 → [External Vendor Accounts §11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
-[Data Model](reference/data-model.md#4-migration-history-119-migrations) (migration 85),
+[Data Model](reference/data-model.md#4-migration-history-120-migrations) (migration 85),
 [API Surface](reference/api-surface.md#token-vendor-access),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -3879,7 +3879,7 @@ in a column (a second source of truth that can disagree with the preset, and a
 migration per provider that changes its path).
 → [External Vendor Accounts §4.4](cross-cutting/external-vendor-accounts.md#44-openai-compatible-vendors),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
-[Data Model](reference/data-model.md#4-migration-history-119-migrations) (migration 86),
+[Data Model](reference/data-model.md#4-migration-history-120-migrations) (migration 86),
 [Risks & Technical Debt §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
 ## ADR-053 — Usage/credits for api-key vendor accounts: a per-preset usage strategy over the existing OAuth-only pull path
@@ -4911,7 +4911,7 @@ resolution.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-model-aliases-are-discovery-and-resolution-not-authorization),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-120-migrations),
 [HTTP API Surface](reference/api-surface.md#generated-claude-model-aliases).
 
 ## ADR-059 — Claude Code effort is delivered as a chat-template kwarg on both paths, for llama.cpp and vLLM, and is a management-only token setting
@@ -5037,7 +5037,7 @@ decisions with different authority.
 [Security, Authentication & Authorization
 §4](cross-cutting/security-auth-rbac.md#claude-code-effort-compatibility-is-a-management-only-setting),
 [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
-[Data Model §4](reference/data-model.md#4-migration-history-119-migrations),
+[Data Model §4](reference/data-model.md#4-migration-history-120-migrations),
 [HTTP API Surface](reference/api-surface.md#claude-code-effort-compatibility).
 
 ## ADR-060 — Shared vendor accounts: a tiered share level, a pure routing grant, authorization by level, and a per-account opt-in
@@ -5183,7 +5183,7 @@ opt-in and owner-credentialed).
 [§8](cross-cutting/external-vendor-accounts.md#8-authorization-by-share-level),
 [§11](cross-cutting/external-vendor-accounts.md#11-per-token-vendor-access),
 [Security §12](cross-cutting/security-auth-rbac.md#12-delegated--resource-scoped-authorization),
-[Data Model](reference/data-model.md#4-migration-history-119-migrations) (migrations 90 to 92),
+[Data Model](reference/data-model.md#4-migration-history-120-migrations) (migrations 90 to 92),
 [API Surface](reference/api-surface.md#vendor-accounts-anbieter),
 [Risks & Technical Debt §11.1](11-risks-and-technical-debt.md#111-operational-risks) and
 [§11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
@@ -7697,7 +7697,7 @@ a reference-only clone alone, and a preset clone's streamed calls bill `audio_se
 §7](cross-cutting/agent-runtime-manager.md#7-feature-negotiation),
 [Runtime View §6.1.1](06-runtime-view.md#611-speech-relay-post-v1audiospeech),
 [§6.5](06-runtime-view.md#65-model-selection-benchmark),
-[Data Model](reference/data-model.md#4-migration-history-119-migrations),
+[Data Model](reference/data-model.md#4-migration-history-120-migrations),
 [HTTP API Surface](reference/api-surface.md#1-inference--compatibility-endpoints),
 [Glossary](12-glossary.md),
 [Risks & Technical Debt
@@ -7920,7 +7920,7 @@ into several parts, each at most the per-part target and therefore under the per
   say) are dropped while the PCM samples stay byte-identical. **There is no schema
   change**: no ordering column, no message id, nothing for a migration to add, so the migration
   history stands as it was ([Data
-  Model](reference/data-model.md#4-migration-history-119-migrations)) and the store layer is
+  Model](reference/data-model.md#4-migration-history-120-migrations)) and the store layer is
   untouched.
 - **(b) The per-part target is derived from the per-blob cap, so a part can never trip the cap
   it is cut under.** `speechPartBytes` is `min(8 MiB, MaxChatBlobBytes / 2)` of PCM in whole
@@ -8061,7 +8061,7 @@ not-stored bubble. No migration and no ServerAgent bump, as here.
 §6.1.3](06-runtime-view.md#613-portal-speech-chat-turn-through-loopback-to-a-chat-blob),
 [Configuration & Environment
 Variables](reference/config-env.md#encrypted-payload-capture),
-[Data Model](reference/data-model.md#4-migration-history-119-migrations) (no migration),
+[Data Model](reference/data-model.md#4-migration-history-120-migrations) (no migration),
 [Risks & Technical Debt
 §11.4](11-risks-and-technical-debt.md#114-deliberate-design-acceptances).
 
@@ -8325,7 +8325,7 @@ behavior that is not retention-gated is (h): a user-cancelled speech run commits
 
 **Consequence:** a bounded, backward-compatible extension with no new moving part. **There is no
 migration and no ServerAgent version bump**: the setting and the marker ride the schema-free
-document ([Data Model](reference/data-model.md#4-migration-history-119-migrations)), the store
+document ([Data Model](reference/data-model.md#4-migration-history-120-migrations)), the store
 change is a parameter on an existing method, and the whole change is portal and gateway only (no
 new agent capability, no new billing unit, no new `OP_AI_GATEWAY_*` knob). A chat that sets
 nothing keeps its stored `settings` bytes and every row at rest unchanged, since the field is a
@@ -12197,7 +12197,7 @@ operator can read, never a guess. The contract was checked against openai-python
 → [Compatibility & Inference §3.10 and §6](cross-cutting/compatibility-and-inference.md#310-openai-decisions),
 [Routing & Model Selection §1 and §2.3](cross-cutting/routing-and-model-selection.md#1-data-model),
 [HTTP API Surface](reference/api-surface.md#decision-endpoint-modes-decisions_mode--systemone_mode),
-[Data Model §4](reference/data-model.md#4-migration-history-119-migrations).
+[Data Model §4](reference/data-model.md#4-migration-history-120-migrations).
 
 ## ADR-099 — vLLM Semantic Router: an Engine-mode application type and an agent-launched `vllm-srun` runtime spec type; the gateway warns on an unsupported api_version and never refuses (Phase 3 of #373)
 
@@ -12412,6 +12412,9 @@ carries none: `openai/codex` at `d2f76324`, `codex-rs/ext/guardian-v2/src/async_
   `/v1/models` omits them (`withOpenAIDecisionModelRows`), without counting them as discovered or letting them satisfy "lists nothing usable".
 - **(h) A ChatGPT subscription cannot reach the Decisions API, and this is not worked around.** The ChatGPT backend has no such endpoint and a ChatGPT login has no API key, so a
   subscription account is never a decision candidate. Emulating decision requests on a subscription's chat models is an opt-in follow-up, **#380**, and is not part of this.
+  **Amended by [ADR-123](#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380):**
+  with both opt-ins (the account's `decision_emulation` and the token's `decisions_emulation`) a subscription account answers both decision endpoints by
+  emulation on its chat model, marked as emulated; without them this rule stands.
 
 **Rejected:**
 
@@ -13667,7 +13670,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 
 **Decision.**
 
-- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-119-migrations))
+- **A per-user policy on the session principal.** `users.chat_vendor_provider_access` (`text not null default ''`, [migration 115](reference/data-model.md#4-migration-history-120-migrations))
   holds the same JSON as `api_tokens.vendor_provider_access` and goes through the same codec, validated like a token policy against the user's own
   reach. `''` means *unset* and resolves to `VendorAccess{All: true, IncludeGroups: true}` (`store.ChatSessionVendorAccess`), so every existing user keeps
   today's behavior with no backfill. An explicit save whose encoding would be `''` is stored as `{"all":false}`, so "no providers" never collapses into
@@ -13716,7 +13719,7 @@ a token with a server override, a prefix override or generated Claude aliases of
 - → [External Vendor Accounts §11.4](cross-cutting/external-vendor-accounts.md#114-who-is-restricted-api-tokens-and-the-owners-chat-session-policy),
   [Security, Auth & RBAC §5](cross-cutting/security-auth-rbac.md),
   [HTTP API surface](reference/api-surface.md),
-  [Data model](reference/data-model.md#4-migration-history-119-migrations).
+  [Data model](reference/data-model.md#4-migration-history-120-migrations).
 
 ## ADR-115 — VM CPU power via a host-attributed synthetic RAPL tree over virtiofs
 
@@ -14443,7 +14446,89 @@ members exist only for an agent with the second.
   index" are superseded by decisions 1 and 2.
 - → [Agent-Managed Model Runtime §3.3, §3.6, §3.7, §3.10, §5.1, §5.3](cross-cutting/agent-runtime-manager.md#310-mixed-vendor-gpu-hosts),
   [Telemetry §8.2.2, §8.2.5](cross-cutting/telemetry-usage-observability.md#825-static-hardware-inventory),
-  [Data Model](reference/data-model.md#4-migration-history-119-migrations) (migration 119),
+  [Data Model](reference/data-model.md#4-migration-history-120-migrations) (migration 119),
   [Persistence §3](cross-cutting/persistence.md#3-the-migration-runner),
   [HTTP API Surface](reference/api-surface.md#gpu-vendors-on-gpu-rows),
   [Risks](11-risks-and-technical-debt.md#111-operational-risks).
+
+## ADR-123 — Decision emulation on an OpenAI subscription's chat model: two opt-ins, one structured-output call, verbalized probabilities and an emulation mark (#380)
+
+**Context:** OpenAI's Decisions API needs an **API key** ([ADR-100](#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373) (h)):
+the ChatGPT backend (`chatgpt.com/backend-api/codex`) has no `/v1/decisions`, and a ChatGPT login carries no key. The Codex catalog of a
+subscription lists `gpt-6-luna`, but only as a Responses (chat) model. An operator who has only a subscription therefore had no way to send
+`POST /v1/decisions` or `POST /v1/systemone` for it, and #373 left emulation out on purpose: answering a decision with a chat completion changes
+what a decision means, so it may only happen where both sides have asked for it and where every answer says what it is. A chat model has no
+native decision read; the gateway has to ask the model for the numbers and turn its text into the endpoint's answer.
+
+**Decision — nine choices, taken together. Migration 120, no agent change.**
+
+- **(a) Two opt-ins, both required.** The vendor account's `decision_emulation` (owner-set, default off, only on an OpenAI subscription account:
+  `PUT /api/portal/vendor-accounts/{id}/decision-emulation`, `409 vendor_account.decision_emulation_unsupported` for any other account) **and**
+  the token's `decisions_emulation` (default off, ungated like `decisions_confidence_normalize`). Either off and the request behaves exactly as
+  before: the subscription account is no decision candidate, and the api-key path of ADR-100 is untouched.
+- **(b) Targets: OpenAI subscription accounts and the decision-model allowlist only.** `isVendorDecisionEmulationAccount(acc, token)` admits an
+  OpenAI subscription account with both opt-ins in `vendorAccountUsable` (before any model row is read, and before the OpenAI-subscription flavor
+  guard, since a decision request's coarse flavor is `decisions`); `routing.IsVendorDecisionEmulationModel(acc, m, token)` adds the row's
+  **upstream** model in `routing.IsOpenAIDecisionModel` (today `gpt-6-luna`). Any other row fails closed. The resolver and the portal listings
+  share that one predicate, so a name is listed on the decision endpoints exactly when the token would be routed to it.
+- **(c) The target carries a route value, never a stored mode.** `withVendorDecisionEmulation(vendorSubscriptionOpenAITarget(...))` adds `decisions`
+  to the flavors, sets `DecisionsMode = SystemOneMode = routing.EndpointModeEmulate` (`"emulate"`) and marks `Target.DecisionEmulated`;
+  `VendorDecisionModel` stays false. `emulate` is accepted by no mode validator, so no application or spec can store it, and
+  `EffectiveDecisionsRoute` / `EffectiveSystemOneRoute` return no route for it (fail closed, never `auto`). The handlers take the emulated route on
+  `DecisionEmulated` **before** any verdict is read.
+- **(d) Structured output with verbalized probabilities.** `compat.BuildDecisionEmulation` turns the OpenAI Decisions body into one neutral chat
+  request: a fixed system instruction, one user message with the input (text, `input_json` pretty-printed as text, images as image parts) and a
+  numbered question list, and a **strict JSON schema** (`inference.Request.OutputSchema`, `json:"-"`, set by the emulator only) that asks, per
+  question, for the probability of "yes" (predicate) or one probability per option or level (choice, score). The keys are positional (`q<i>`,
+  `o<j>`, `l<k>`), never the client's names. The subscription Responses client renders the schema as `text.format` `json_schema`. The gateway derives
+  every verdict from the numbers, never from a separate "chosen" field, so verdict and probabilities cannot disagree.
+- **(e) One batched call, reasoning effort `low`.** All questions go into one prompt and one schema, through the provider client's buffered
+  `Complete` with the subscription auth context, the payload capture and the timeout a chat call gets.
+- **(f) The probability rule, as shipped.** A predicate probability is clamped to [0, 1]. Choice and score values are **floored at 0 and
+  renormalized** to sum 1, with no upper clamp (they act as relative weights; clamping a weight of 3 at 1 would distort it); a sum of 0 is an
+  unusable answer. The verdict is the argmax (ties to the first option in request order), `confidence` the chosen normalized probability, and every
+  derived number is rounded to 12 decimals. The numbers are the model's **uncalibrated self-estimates**.
+- **(g) The mark is a header and a usage column, and no body field.** Every answer written once the route settled on `emulate`, success or error,
+  carries `X-OP-Decision-Emulated: chat`; every usage row of such a request carries `decision_emulated` (migration 120), shown as an *Emulated* chip
+  in Activity. The body keeps the exact client shape of each endpoint.
+- **(h) No vendor-group failover on the emulated route.** A group may route a decision request to an emulating member, but a provider error is
+  answered as the chat path answers it (`completionHTTPStatus`, `completionErrorCode`; the generic `provider.unavailable` becomes the endpoint's
+  `*.upstream_error`); a limit error does not move to the next member.
+- **(i) Account order decides between an api-key and an emulating account.** When an OpenAI api-key account (native, ADR-100) and an emulating
+  subscription account serve the same name, the resolver's existing account order picks, as for any name two accounts serve; there is no
+  preference for the native route.
+
+**Rejected:**
+
+- **Token logprobs.** Whether the Codex backend returns logprobs for `gpt-6-luna` is not known, and a logprob read needs one forced single-token answer
+  per question. Verbalized probabilities under a strict schema work without them.
+- **One call per question.** It multiplies the cost and the subscription's rate-limit spend by the number of questions, for no calibration gain.
+- **A body field marking the answer.** Strict SDK response models would reject it; the header and the usage row mark the answer without changing
+  its shape.
+- **Emulation by default** (on every subscription, or for every token). It would silently change what a decision means for clients that never
+  asked; both owner and token opt in.
+- **Other vendors and other models now.** The emulator drives the provider-neutral `inference.Request`, so widening it is a routing change, not an
+  emulator change; it waits until a vendor and a model are asked for.
+
+**Consequence:**
+
+- **Nothing changes without both opt-ins.** Migration 120 adds the three columns at `0`; no stored row turns on, and the api-key Decisions path,
+  the chat route for `gpt-6-luna` and every listing stay as they were for a token without the flag.
+- **A confidence threshold tuned on a native decision model does not carry over.** The thresholds still work mechanically, and
+  `decisions_confidence_normalize` still applies; a client tells the two kinds of answer apart by the header or the usage column.
+- **A subscription account serves it only when its Codex catalog lists `gpt-6-luna`.** The row is neither seeded nor added by discovery for a
+  subscription account (`withOpenAIDecisionModelRows` is api-key only), and the catalog hides models newer than the configured `client_version`.
+- **The subscription's Terms caveat grows.** Classification traffic through a consumer subscription adds to the existing ToS exposure of the
+  subscription path; the switch is owner-only and its help text says so.
+- **The usage row** is token-metered from the Responses usage (cached tokens included), on the serving account, `provider_path` `/responses`, cost 0;
+  `reasoning_tokens` in the answer's usage is always 0 (the neutral usage has no such field).
+- **Not verified live:** the Codex backend accepting `text.format` `json_schema` for `gpt-6-luna`, the shape of the answer text under it, and the
+  token accounting. The emulator was built against the Responses contract and the Codex client's own `--output-schema` request.
+- ADR-100 (h)'s "a subscription account is never a decision candidate" holds without the two opt-ins; with them this ADR amends it.
+
+→ [Compatibility & Inference §3.10 item 13](cross-cutting/compatibility-and-inference.md#310-openai-decisions) and §3.9 item 15,
+[External Vendor Accounts §4.2](cross-cutting/external-vendor-accounts.md#subscription-decision-emulation) and §10,
+[Data Model](reference/data-model.md#4-migration-history-120-migrations) (migration 120),
+[HTTP API Surface](reference/api-surface.md#decision-emulation),
+[Telemetry §8.4.1](cross-cutting/telemetry-usage-observability.md#841-the-usage-event),
+[Risks](11-risks-and-technical-debt.md#111-operational-risks).

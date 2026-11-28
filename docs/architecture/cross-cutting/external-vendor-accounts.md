@@ -552,7 +552,7 @@ matrix:
 | **OpenAI api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to OpenAI's `/v1/chat/completions`. **One exception:** an inbound `openai_responses` request (`POST /v1/responses`) has `ResponsesMode = passthrough` and is relayed to `https://api.openai.com/v1/responses` instead (§4.2; verbatim apart from the `model` rewrite and the [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Chat completions, every other `openai` flavor and the `anthropic` dialect stay translate. **A second exception, for the decision model only** ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): a decision request (`POST /v1/decisions`, `POST /v1/systemone`) for `gpt-6-luna` gets the `decisions` flavor added, `DecisionsMode = passthrough` and `SystemOneMode = translate`, and reaches `https://api.openai.com/v1/decisions` (§4.2, *Api-key Decisions*). Its chat dialects stay listed and unchanged: chat completions and the `anthropic` dialect stay translate, and a `/v1/responses` request for it stays the passthrough of the first exception. |
 | **Anthropic api-key** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, endpoint modes left zero (**translate**): whichever dialect the caller used is translated through the neutral model to Anthropic's `/v1/messages`. **One exception, the mirror image of the OpenAI one:** an inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough` and is relayed to `https://api.anthropic.com/v1/messages` instead (§4.1; verbatim apart from the `model` rewrite and the [provider-switch sanitizing](compatibility-and-inference.md#6-endpoint-modes-and-native-passthrough)). Chat completions and every `openai` flavor, including `openai_responses`, stay translate. The client's `anthropic-beta` is forwarded verbatim on that relay (§4.1). |
 | **Anthropic subscription** | the `openai` **and** `anthropic` dialects | `Target.APIFlavors = [openai, anthropic]`, always with the Claude-Code masquerade (`Masquerade = claude_code`) and the OAuth headers. **An inbound `anthropic_messages` request (`POST /v1/messages`) has `MessagesMode = passthrough`**: it is relayed to `https://api.anthropic.com/v1/messages` with the Claude-Code system block injected as the first `system` block, `Authorization: Bearer <oauth access token>`, and `anthropic-beta` = `oauth-2025-04-20` plus the client's own betas (§4.1). Every `openai_*` flavor stays translate (`MessagesMode` zero): the neutral request is rendered into `/v1/messages` with the masquerade block prepended. |
-| **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. |
+| **OpenAI subscription** | the `openai` dialect **only** | `Target.APIFlavors = [openai]`. The resolver's flavor guard **skips** an `anthropic`-dialect request to such an account, which then falls through to the standard path and ends `routing.no_model_route`. **One exception, opt-in on both sides** ([ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380)): with the account's `decision_emulation` and the token's `decisions_emulation`, a decision request for `gpt-6-luna` gets the `decisions` flavor added and both decision modes `emulate`, and is answered by the chat model through structured output (§4.2, *Subscription decision emulation*). |
 | **OpenAI-compatible api-key** (x.ai, OpenRouter, Kilo, Google, Custom) | the `openai` **and** `anthropic` dialects, **translate only** | `Target.APIFlavors = [openai, anthropic]`, both endpoint modes left zero: whichever dialect the caller used is translated through the neutral model to the provider's `{prefix}/chat/completions` on the account's own root (§4.4). **No exception**: Responses and Messages passthrough exist only for the native OpenAI and Anthropic accounts, so an inbound `openai_responses` or `anthropic_messages` request is translated like any other. |
 | **Google (native) api-key** (`google_native`) | the `openai` **and** `anthropic` dialects, **translate only** | `Target.Provider = vendor_gemini`, `APIFlavors = [openai, anthropic]`, both endpoint modes left zero: whichever dialect the caller used is translated through the neutral model to Gemini's `POST {root}/v1beta/models/{model}:generateContent` (`:streamGenerateContent?alt=sse` when streaming), authenticated with `x-goog-api-key` (§4.5). **No exception**, as for the OpenAI-compatible accounts: there is no passthrough yet (the inbound Gemini endpoint is #204). |
 
@@ -1139,9 +1139,9 @@ learns one more kind of request.
   endpoint, so a subscription account is never a candidate and the seed catalog gives it no decision model. This
   follows what OpenAI's own Codex client does: it calls `https://api.openai.com/v1/decisions` with an **API key
   only**, and a ChatGPT login carries no api key (`openai/codex` at `d2f76324`,
-  `codex-rs/ext/guardian-v2/src/async_scorer/decisions.rs` and `codex-rs/login/src/auth/manager.rs`). Serving
-  decision requests from a subscription account by emulating them on a chat model is a separate, opt-in
-  follow-up, issue #380, and is not part of this.
+  `codex-rs/ext/guardian-v2/src/async_scorer/decisions.rs` and `codex-rs/login/src/auth/manager.rs`). A
+  subscription account answers decision requests only by **emulation** on its chat model, when its owner and the
+  token both opted in (*Subscription decision emulation*, below); without both it is never a candidate.
 - **Upgrade note (live on upgrade).** No stored row changes, but the vendor decision route is live as soon as this
   version runs, for **every token that already has §11 access to an OpenAI api-key account carrying `gpt-6-luna`**,
   and that account is **billed** for what such a token sends. `gpt-6-luna` already passes the `gpt-*` chat heuristic,
@@ -1150,6 +1150,52 @@ learns one more kind of request.
 - **Not verified live** (§10): an OpenAI api-key account with `gpt-6-luna` through both endpoints, the official
   SDK against the vendor route, OpenAI's real error envelope on this endpoint, and whether the api-key
   `/v1/models` lists `gpt-6-luna` at all (the refresh keeps it either way, §6.3).
+
+#### Subscription decision emulation
+
+An OpenAI **subscription** account can answer both decision endpoints through its **chat model** when its owner and the
+calling token have both opted in ([ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380), issue #380; the endpoint behaviour is
+[Compatibility & Inference §3.10 item 13](compatibility-and-inference.md#310-openai-decisions) and §3.9 item 15). The answer is
+an **emulation**: one structured-output Responses call that asks `gpt-6-luna` to estimate a probability for every option, never a native
+decision read, and every answer says so.
+
+- **Two opt-ins.** The account's `decision_emulation` (migration 120, default off) is set by the **owner alone** through
+  `PUT /api/portal/vendor-accounts/{id}/decision-emulation` `{enabled}` (`SetVendorAccountDecisionEmulation`, the share-usage
+  endpoint's gate: a co-manager or member `403 vendor_account.forbidden`, a stranger `404`), only on an OpenAI subscription account
+  (`409 vendor_account.decision_emulation_unsupported` for any other), with its own narrow writer
+  (`UpdateVendorAccountDecisionEmulation`; neither `CreateVendorAccount` nor `UpdateVendorAccount` writes it, so a new account starts off).
+  It is not gated on the sharing switches; the management DTO carries `decision_emulation`, the member view reads `false`. The token's
+  `decisions_emulation` (migration 120, default off, **ungated**) is set on a portal token's create and update and on a service token's
+  create, and a run-as token carries it. The portal shows the account switch only to the owner of an OpenAI subscription account, with
+  help text naming the uncalibrated values and the Terms caveat (§10).
+- **Admission.** For a decision request `vendorAccountUsable` passes an OpenAI api-key account (*Api-key Decisions*) **or**
+  `isVendorDecisionEmulationAccount(acc, token)`: an OpenAI subscription account with `decision_emulation` asked by a token with
+  `decisions_emulation`. The check runs before any model row is read and before the OpenAI-subscription flavor guard (a decision request's
+  coarse flavor is `decisions`, never `openai`), so with either opt-in off the account is skipped as before. The active-account check, the
+  subscription switch (`vendor_subscriptions_enabled`), §11 per-token access and the prefix are unchanged.
+- **Which models.** `routing.IsVendorDecisionEmulationModel(acc, m, token)`: that account test plus the row's **upstream** model in
+  `routing.IsOpenAIDecisionModel` (today `gpt-6-luna`). Any other row fails closed. The resolver and the portal listings
+  (`vendorModelServedFlavors`, which feeds `/v1/models`' `decisions` flavor, `GET /v1/systemone/models`, the decision flags and the
+  preflight offering) share it, so the name is offered on the decision endpoints exactly to the tokens that would be routed to it.
+- **The row has to come from the Codex catalog.** A subscription account serves emulation only when its discovered catalog lists
+  `gpt-6-luna` (the live-confirmed Codex catalog does). The row is **neither seeded** (the subscription seed is `gpt-5` and `gpt-5-mini`, §10)
+  **nor added by discovery** (`withOpenAIDecisionModelRows` is api-key only, §6.3), and the catalog hides every model newer than the configured
+  `client_version` (§6.6), so a stale setting leaves the account with no candidate.
+- **The target.** `withVendorDecisionEmulation(vendorSubscriptionOpenAITarget(...))`: the ordinary subscription target (ChatGPT backend,
+  subscription auth) with `decisions` added to its `APIFlavors`, `DecisionsMode` and `SystemOneMode` both `routing.EndpointModeEmulate`
+  (`"emulate"`, a route value that nothing stores and no validator accepts), and `Target.DecisionEmulated`; `VendorDecisionModel` stays false.
+  A chat or Responses request for the same row builds the unchanged target, so `gpt-6-luna` stays a chat model of the account.
+- **Account order, not a preference.** When an api-key account (native passthrough) and an emulating subscription account both serve the name
+  for a token, the resolver's existing account order picks the first (`VendorAccountsForRouting`: own accounts, then shared ones, each in
+  id order, §4.6; a vendor account group before either, §12.2), as for any name two accounts serve; nothing prefers the native
+  route. A token that wants the native answer only leaves `decisions_emulation` off.
+- **Groups, without failover.** A vendor account group (§12) may route a decision request to an emulating member, but the emulated route does
+  not fail over: a limit error (429, 402) is answered as the chat path answers it, as `502 decisions.upstream_error`
+  (`systemone.upstream_error`) since it unwraps to `provider.unavailable`, and sets no cooldown (§12.4).
+- **Usage.** The row carries the serving `AccountID`, `provider_path` `/responses`, the Responses tokens (cached included), cost 0 and
+  `decision_emulated = true`; the response carries `X-OP-Decision-Emulated: chat`.
+- **Not verified live** (§10): the Codex backend accepting `text.format` `json_schema` for `gpt-6-luna`, the shape of the answer text under
+  it, and the token accounting.
 
 ### 4.3 Credential resolution at the edge
 
@@ -2210,7 +2256,7 @@ which applies to self-hosted models.
 
 | Surface | Vendor models of the accounts the caller can route to |
 |---|---|
-| `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models`, `/openai/api/v1/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). A **decision model** of an OpenAI api-key account (`gpt-6-luna`) keeps its chat dialects and is **also** listed under the `decisions` flavor (`vendorModelServedFlavors`), so `GET /v1/systemone/models` offers it and its `decision` and `decision_openai` flags are both true (`overlayVendorDecisionFlags`). When a self-hosted model shares the name, the vendor flags are ORed into the listing and into the redirect offering, so the listing and the unknown-model redirect agree; the redirect's vendor candidates are guarded to the decisions flavor with exactly `[any_decision]` (`addVendorDecisionCandidates`), the one request the resolver serves from a vendor account. A vendor-only model has no `context_size`, so `/v1/models` lists it without `context_length` and `/api/v1/models` with `max_context_length: 0`. |
+| `GET /v1/models`, `/openai/v1/models`, `/anthropic/v1/models`, `/api/v1/models`, `/openai/api/v1/models` | Listed under the prefixed name, per dialect the account serves (the served-flavor matrix of §4: the OpenAI subscription only under `openai`). A **decision model** of an OpenAI api-key account (`gpt-6-luna`) keeps its chat dialects and is **also** listed under the `decisions` flavor (`vendorModelServedFlavors`), so `GET /v1/systemone/models` offers it and its `decision` and `decision_openai` flags are both true (`overlayVendorDecisionFlags`). When a self-hosted model shares the name, the vendor flags are ORed into the listing and into the redirect offering, so the listing and the unknown-model redirect agree; the redirect's vendor candidates are guarded to the decisions flavor with exactly `[any_decision]` (`addVendorDecisionCandidates`), the one request the resolver serves from a vendor account. An OpenAI **subscription** account's `gpt-6-luna` is listed under `decisions` the same way, but only for a token with `decisions_emulation` on an account with `decision_emulation` (`routing.IsVendorDecisionEmulationModel`, §4.2, *Subscription decision emulation*). A vendor-only model has no `context_size`, so `/v1/models` lists it without `context_length` and `/api/v1/models` with `max_context_length: 0`. |
 | Portal chat picker and a regular user's **Models** page | Listed. |
 | **Dashboard "Live Model Routes"** (`GET /api/portal/dashboard`) | Listed, one row per model: the prefixed name, the vendor as provider, the account's name as host, status `active`. A vendor model has no server, so its row id is the account id plus the model; the portal keys rows by that id because two accounts may share a name and a model. |
 | **Admin Models management** (`ManageModels`, the admin view of the Models page) | **Not listed — deliberately.** It shows the system's real models, and a vendor model is one principal's own, not something an operator manages for the system. |
@@ -2663,6 +2709,15 @@ reasons are recorded deliberately, not in denial of them
   the shapes it knows); and whether the api-key `/v1/models` lists `gpt-6-luna` (which is why a refresh
   keeps the row, §6.3). The model id comes from the Codex catalog, which listed it (§6.1), and from
   OpenAI's own client calling the endpoint with an API key (§4.2).
+- **Decision emulation adds classification traffic to the subscription's Terms exposure**
+  ([ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380)). An opted-in subscription account answers `/v1/decisions` and `/v1/systemone` by asking its
+  chat model for probabilities (§4.2, *Subscription decision emulation*): more automated, non-interactive traffic through a consumer
+  subscription, on top of the exposure above. That is why the switch is **owner-only**, default off, needs the token's own opt-in too, and
+  carries a portal help text that says so; and every answer is marked (`X-OP-Decision-Emulated: chat`, the usage row's `decision_emulated`),
+  because its probabilities are the model's uncalibrated self-estimates, not a native decision read. **VERIFY-LIVE:** that the Codex backend
+  accepts `text: {format: {type: "json_schema", ...}}` for `gpt-6-luna` (the shape Codex CLI's `--output-schema` sends, reverse-engineered
+  and marked so in the Responses client); the shape of the answer text under it (the parser tolerates one code fence and nothing else); and
+  the token accounting (the Responses usage is recorded as reported; no reasoning-token count reaches the answer).
 - **Discovery needs a live credential and a high enough `client_version`.** An
   access token that is expired and cannot be renewed — no refresh token came with
   it, the vendor rejects the refresh token (the account then reads
@@ -2761,7 +2816,7 @@ deliberate, named choice**, because `all: true` never covers a shared account (�
 
 The policy is the token's `vendor_access` (wire) / `vendor_provider_access`
 (column, a JSON string on `api_tokens`, migration 85;
-[Data Model](../reference/data-model.md#4-migration-history-119-migrations)):
+[Data Model](../reference/data-model.md#4-migration-history-120-migrations)):
 
 ```json
 { "all": false,

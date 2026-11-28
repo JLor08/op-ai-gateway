@@ -1766,7 +1766,7 @@ capability-carrying request while a vendor model is matched by name and never by
 dropping the list would skip the gate **and** make a decision routable to a hosted vendor model of
 the same name. Since Phase 4 the exact list `[any_decision]` on the decisions flavor is the **one** list the
 vendor path admits, and for it only an OpenAI api-key account's decision model (`gpt-6-luna`) is considered
-(item 13); every other list, and a decisions-flavor request without it, stays off that path. For a `server_agent`
+(item 13), or, when the account and the token both opted in, an OpenAI subscription account's (the emulated route, item 15); every other list, and a decisions-flavor request without it, stays off that path. For a `server_agent`
 mapping the resolved runtime spec is the authority for its flavors
 (`resolveDecisionsTarget`, shared with `/v1/decisions`, applies `targetServesFlavor` after the resolve), so a spec that
 leaves `decisions` out is `404 routing.no_model_route`. `relaySystemOne` then settles the route (item 11) and hands the
@@ -1795,7 +1795,8 @@ over its `decision` and `decision_openai` verdicts and its effective `systemone_
 (the spec's mode for a `server_agent` mapping with a spec) returns a route that is not `disabled`
 (`decisionFlagsByName`, with `viewServesSystemOne`; `decision_openai` counts only on a
 `DecisionsPassthroughCapableKind`), so a model the gate or the mode would refuse is never
-offered. A decision model of an OpenAI api-key vendor account is listed too (item 13). The `decisions` flavor alone does not qualify a model here: in every listing it
+offered. A decision model of an OpenAI api-key vendor account is listed too (item 13), and so is an emulating subscription
+account's, for a token that opted in (item 15). The `decisions` flavor alone does not qualify a model here: in every listing it
 means "at least one decision endpoint is served" (§6), so a model whose only served
 decision endpoint is `/v1/decisions` keeps it and is still left out. Visibility **mirrors `GET /v1/models` exactly** (`Portal.Models`):
 unfiltered by a service token's own allowlist, because the allowlist restricts
@@ -1966,6 +1967,10 @@ for `EffectiveDecisionsRoute`; a blank mode behaves as `auto`):
 | `translate` | translate: the OpenAI Decisions body goes to the upstream's `/v1/decisions` | `decision_openai: yes` on a passthrough-capable kind | `404 routing.model_not_capable` |
 | `auto` (or blank) | **passthrough** when `decision: yes`, else **translate** when `decision_openai: yes` on a capable kind | either | `404 routing.model_not_capable` |
 
+A fifth value, `emulate` (`routing.EndpointModeEmulate`), is a **route value only**: the resolver sets it on the target of an
+emulated decision request (item 15) and nothing stores it, since no mode validator accepts it. `EffectiveSystemOneRoute` answers
+**no route** for it (fail closed, never `auto`); the handler takes the emulated route before it reads verdicts or calls the function.
+
 `routing.DecisionsPassthroughCapableKind` (false for `llama_cpp`, `vllm_sr` and `strata`, §3.10 item 11) is the
 "has an OpenAI `/v1/decisions`" test, so for those two kinds a `decision_openai` verdict is ignored (a stale or manual `yes`
 never sends a translated body to an upstream that cannot parse it). `translate` is therefore **refused at save** for them:
@@ -2057,7 +2062,8 @@ on this upstream`. A token with `decisions_confidence_normalize` has its confide
 (§3.10 item 8).
 
 **13. OpenAI api-key vendor accounts serve this endpoint ([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)).** A decision model of an OpenAI **api-key** vendor account
-(`routing.IsOpenAIDecisionModel`, a fixed allowlist, today `gpt-6-luna`; the ChatGPT subscription has no Decisions endpoint) is reachable by name
+(`routing.IsOpenAIDecisionModel`, a fixed allowlist, today `gpt-6-luna`; the ChatGPT subscription has no Decisions endpoint, its opt-in
+emulation is item 15) is reachable by name
 through both decision endpoints without an application, a mapping or a probe. The resolver's vendor path admits exactly the derived `[any_decision]` list
 on the decisions flavor and considers only those accounts and rows; the target carries `decisions` in its flavors, `DecisionsMode: passthrough` and
 `SystemOneMode: translate`, and its verdicts are **synthesized** (`decision: no`, `decision_openai: yes`, no store read, `decisionVerdicts`), so
@@ -2070,6 +2076,18 @@ authenticated with the account's sealed key as `Authorization: Bearer`. The usag
 public Decisions API reference and guide. **Not verified:** a real OpenAI api-key account with `gpt-6-luna` through both `/v1/decisions` and `/v1/systemone`; the official SDK
 against the vendor route; OpenAI's real error envelope on `/v1/decisions`; whether the api-key `/v1/models` lists `gpt-6-luna` (a refresh keeps the row either way); and
 the zero-based score index the response translation assumes for a `score` answer's `probabilities[].value`.
+
+**15. The emulated route on `/v1/systemone` ([ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380)).** A token with `decisions_emulation` routed to an OpenAI
+subscription account with `decision_emulation` for `gpt-6-luna` takes the emulated route of §3.10 item 13; on this endpoint
+`relaySystemOneEmulation` wraps it in matrix B. `systemOneRoute` sets `SystemOneMode` to `emulate` on a `Target.DecisionEmulated`
+target without reading verdicts; `compat.TranslateSystemOneRequest` turns the body into OpenAI Decisions (its refusals unchanged,
+`400 systemone.question_type_unsupported` / `systemone.field_unsupported`), the emulator builds and reads the call on that body, and
+`compat.TranslateOpenAIDecisionsResponse` turns the emulated answer back (item 12's response side; a predicate answer gets its computed
+`no` and `confidence`). The emulator's own input rules then apply to the translated body, so an image URL that is neither `data:` nor
+`http(s)` is refused with **`400 decisions.input_unsupported`**, a `decisions.*` code on this endpoint. An answer that cannot be read
+or translated back is `502 systemone.upstream_error`; a provider error keeps the chat path's status, and its generic
+`provider.unavailable` becomes `systemone.upstream_error`. Every answer once the route settled carries `X-OP-Decision-Emulated: chat`,
+and every row `decision_emulated`. `GET /v1/systemone/models` lists the model for an opted-in token only (item 5).
 
 ### 3.10 OpenAI Decisions
 
@@ -2103,7 +2121,8 @@ capability requirement is the **derived** `any_decision`
 (`decisionsInferenceShape`): satisfied when the mapping has `(decision, yes)` **or**
 `(decision_openai, yes)`; it is never a row name, and an operator row of that name is
 refused (`mapping.capability_reserved`, the refusal a reserved verdict draws). Like System One's list (§3.9 item 3), it is the **one** capability list the vendor-account path admits
-([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): an OpenAI api-key account's decision model answers it by passthrough (§3.9 item 13). For a `server_agent` candidate `any_decision` is all the pre-resolve gate knows: which
+([ADR-100](../09-architecture-decisions.md#adr-100--openai-vendor-decisions-the-decisions-api-on-api-key-accounts-a-system-one-translate-route-and-systemone_mode-auto-and-translate-phase-4-of-373)): an OpenAI api-key account's decision model answers it by passthrough (§3.9 item 13), and, with both opt-ins, an OpenAI subscription account's chat model answers it by
+emulation (item 13). For a `server_agent` candidate `any_decision` is all the pre-resolve gate knows: which
 route a request then needs depends on its runtime spec's mode, which is only known once a target is chosen;
 for an ordinary application the filter also requires the route under the application's own mode
 (item 3). A name no application that declares `decisions` offers is `404
@@ -2135,6 +2154,9 @@ places, because the mode and the verdicts are only known together after the reso
 | `translate` | translate | `decision: yes` | `404 routing.model_not_capable` |
 | `passthrough` | passthrough | `decision_openai: yes` | `404 routing.model_not_capable` |
 
+  `emulate` is a route value, not a mode (§3.9 item 11): only the target of an emulated request carries it (item 13), and
+  `EffectiveDecisionsRoute` answers no route for it, failing closed rather than falling back to `auto`.
+
   `systemone.endpoint_disabled` (`404`) is the System One twin, answered by
   `relaySystemOne` for a resolved `server_agent` target whose spec disables System One;
   for an ordinary application the disabled mode already removed it at candidacy. Every
@@ -2164,7 +2186,7 @@ places, because the mode and the verdicts are only known together after the reso
   **before** the resolve (the resolver's own routing errors) keeps an empty target.
 
   The route taken is visible on the usage row's `provider_path`: `/v1/systemone` for a
-  translate, `/v1/decisions` for a passthrough (`upstreamPath` answers the route the
+  translate, `/v1/decisions` for a passthrough, `/responses` for the emulated route of item 13 (`upstreamPath` answers the route the
   handler stored on its copy of the target's `DecisionsMode`). There is no usage column
   for the mode. A gone instance re-runs the whole path (`relayAgain`) as on the other
   native relays, the route and the translation included.
@@ -2339,6 +2361,60 @@ official OpenAI SDK against either route; those remain operator steps. The vllm-
 **not verified against a running instance:** an Engine-mode router end to end (discovery, health, the
 `/v1/systemone` relay and a `/v1/decisions` translate) and an agent-launched `vllm-srun`
 through both endpoints.
+
+**13. The emulated route: an OpenAI subscription's chat model answers ([ADR-123](../09-architecture-decisions.md#adr-123--decision-emulation-on-an-openai-subscriptions-chat-model-two-opt-ins-one-structured-output-call-verbalized-probabilities-and-an-emulation-mark-380), issue #380).** A ChatGPT subscription has no
+Decisions endpoint (§3.9 item 13), so an opted-in subscription account answers a decision request through its **chat model**, by
+structured output. Both opt-ins are needed: the vendor account's owner-set `decision_emulation` (OpenAI subscription accounts only) and the
+token's `decisions_emulation` (ungated, default off); either off and nothing here applies (the account is no decision candidate). The account
+side, admission and the model condition are [External Vendor Accounts §4.2](external-vendor-accounts.md#subscription-decision-emulation)
+(*Subscription decision emulation*); what the endpoint does:
+
+- **The route.** The target is `Target.DecisionEmulated` with both decision modes `emulate` (a route value, item 3). `decisionsRoute`
+  takes it as it is, without reading verdicts, and `relayDecisions` hands the client's body to `relayDecisionEmulation`
+  (`internal/gateway/decisions_emulation.go`); `/v1/systemone` goes through the same function after matrix B (§3.9 item 15).
+- **The request** (`compat.BuildDecisionEmulation(raw, upstreamModel)`, `internal/compat/decisions_emulation.go`, pure). Matrix A's input
+  and question rules and codes (item 5) apply, with two differences: an `input_image` with an `http://` or `https://` `image_url` is
+  **accepted** besides `data:` (the vendor fetches it, the gateway does not), and a request with **no questions** is refused
+  `400 decisions.question_invalid`. A refusal is a `400` with no provider call, recorded like the other translator refusals. The neutral
+  request has `Stream: false`, `ReasoningEffort: "low"`, a fixed system instruction (estimate a probability for every option, reply with
+  only the schema's JSON) and **one** user message: the input pieces in order (text as text, `input_json` pretty-printed as text, an image
+  as an image part), then a numbered question list naming each question's schema key, type, name, instructions and options (`o<j>`,
+  with the typed value and description) or levels (`l<k>`, with the label and description). All questions go into **one** call.
+- **The schema** (`inference.Request.OutputSchema`, `json:"-"`; only the emulator sets it, and only the subscription Responses client renders
+  it, as `text: {format: {type: "json_schema", name: "decisions", schema, strict: true}}`). `{answers: {q<i>: ...}}` with `q<i>` the
+  zero-based question index (a client's names can be anything, so they are not keys): a predicate `{yes: number}`, a choice
+  `{probabilities: {o<j>: number, ...}}`, a score `{probabilities: {l<k>: number, ...}}`. Every object is `additionalProperties: false` with
+  every property required.
+- **The call** is the provider client's buffered `Complete` (`completeProvider`), with the subscription auth context, the payload
+  capture sink a chat call gets (`completeCaptureContext`) and the target's timeout, and it is registered as an active request.
+- **The answer** (`compat.ParseDecisionEmulation(text, table, clientModel, usage)`). One surrounding code fence is tolerated; anything else
+  must be the JSON object. **Every verdict is derived from the numbers**: a predicate's `yes` is clamped to [0, 1] and is the
+  `probability`; a choice's or score's values must all be present, are **floored at 0 and renormalized** to sum 1 (no upper clamp; a sum of 0
+  is unusable), the argmax is the verdict (ties go to the first in request order) and `confidence` is its normalized probability; every derived
+  number is rounded to 12 decimals. The body is OpenAI's, in request order with the original `name` (absent or `null` comes back `null`, `""`
+  as `""`, as matrix A restores it): `{type:"predicate", name, probability}`, `{type:"choice", name, choice, confidence,
+  probabilities:[{value, probability}]}` with the **original typed** values, `{type:"score", name, score, confidence,
+  probabilities:[{value:i, label, probability}]}` with the zero-based level index; `model` is the client's name; `usage` is in the Responses
+  spelling (`input_tokens`, `input_tokens_details{cached_tokens, cache_write_tokens}`, `output_tokens`,
+  `output_tokens_details{reasoning_tokens}`, always `0` there, since the neutral usage has no such count, and `total_tokens`). A
+  token with `decisions_confidence_normalize` has the result normalized as on every other route (item 8). The probabilities are the
+  model's **uncalibrated self-estimates**: a threshold tuned on a native decision model does not carry over.
+- **Errors.** An answer that is not the schema's JSON, or misses a question or an option, is `502 decisions.upstream_error`
+  (`systemone.upstream_error` on `/v1/systemone`), recorded **with the tokens** the vendor reported (it answered and is paid). A provider
+  error is answered with the chat path's status (`completionHTTPStatus`) and code (`completionErrorCode`, `provider.timeout` say); only the
+  generic `provider.unavailable` becomes the endpoint's `*.upstream_error` with type `upstream_error`, while the row keeps the chat path's
+  code. There is **no vendor-group failover** on this route: a limit error from a group member is answered, not moved to the next member
+  ([External Vendor Accounts §12.4](external-vendor-accounts.md#124-failover-on-vendor-limit-errors)).
+- **The mark.** Every answer written once the route settled, success or error (a refusal of the emulator or of matrix B included), carries
+  **`X-OP-Decision-Emulated: chat`** (`markDecisionEmulated`); a request that never reaches the route (one without both opt-ins gets the
+  `404` it got before) carries none. There is **no body field**, so a strict SDK response model still parses the answer.
+- **Usage.** Token-metered from the Responses usage, cached tokens included (`recordUsage` splits them off), on the serving `AccountID`,
+  `provider_path` `/responses` (`upstreamPath`, either endpoint), cost 0, and `decision_emulated = true`, read off the target, so every row of an
+  emulated request carries it and no other row does ([Telemetry §8.4.1](telemetry-usage-observability.md#841-the-usage-event)).
+- **Listings.** The model is offered on the decision endpoints (the `decisions` flavor, `ModelDTO.Decision`, the preflight offering and
+  `GET /v1/systemone/models`) for an opted-in token only, through the same predicate the resolver uses (`routing.IsVendorDecisionEmulationModel`).
+- **Not verified live:** the Codex backend accepting `text.format` `json_schema` for `gpt-6-luna`, the shape of the answer text under it, and
+  the token accounting ([External Vendor Accounts §10](external-vendor-accounts.md#10-tos-experimental-status-and-verify-live)).
 
 ### 3.11 Realtime: the WebSocket relay
 
@@ -5754,8 +5830,8 @@ Every inference error response uses the gateway-wide envelope
 | `decisions.model_required` / `decisions.questions_required` / `decisions.stream_unsupported` | 400 | `validateDecisionsRequest` (§3.10): `model` absent, not a string or blank; `questions` absent, not an array or empty; `stream` present and neither `false` nor `null` |
 | `decisions.input_unsupported` / `decisions.question_invalid` | 400 | the translate route's request translation (§3.10 item 5) refused an `input` or an instruction it cannot express (a non-user role, an item type other than `message`, an image that is not a `data:` URL, any other part type) or a malformed question (unknown type, no choices or levels, a choice value that is not a non-empty string or boolean, a choice description that is not a string, colliding choice keys); an empty `input` array, or messages that carry no parts at all (empty `content` arrays), is refused `input carries no content` (not `input: ""`); nothing was sent upstream. Once a target is resolved, the refusal's usage row carries it (§3.9 item 11, *Refusal rows*) |
 | `decisions.endpoint_disabled` / `systemone.endpoint_disabled` | 404 | the resolved target's effective `decisions_mode` / `systemone_mode` is `disabled` (§6); only a `server_agent` spec reaches it, an ordinary application with the mode disabled is no candidate (`routing.no_model_route`) |
-| `decisions.upstream_error` | the upstream's status (translate, non-2xx), else 502 | the gateway's own envelope: a translated request's non-2xx System One answer (message naming the upstream status and message; a 501 adds guidance), or `502` for a decisions answer that is over the buffer bound, broken off or untranslatable (§3.10 items 6-7); a passthrough non-2xx is relayed verbatim instead |
-| `systemone.upstream_error` | 502; the upstream's status for a translated non-2xx | `/v1/systemone`: for a token that opted into confidence normalization, an answer over the buffer bound or broken off (§3.9 item 9); on the **translate** route, a 2xx OpenAI Decisions answer that cannot be expressed in System One (a wrong type, a missing answer, an unusable body: `502`) and a non-2xx upstream answer (the upstream's own status, the message naming it; a `501` adds guidance) (§3.9 item 12) |
+| `decisions.upstream_error` | the upstream's status (translate, non-2xx), else 502 | the gateway's own envelope: a translated request's non-2xx System One answer (message naming the upstream status and message; a 501 adds guidance), or `502` for a decisions answer that is over the buffer bound, broken off or untranslatable (§3.10 items 6-7); a passthrough non-2xx is relayed verbatim instead. On the **emulated** route, `502` for a chat answer that is not the schema's JSON (tokens recorded), and the replacement of a provider error's generic `provider.unavailable` (§3.10 item 13) |
+| `systemone.upstream_error` | 502; the upstream's status for a translated non-2xx | `/v1/systemone`: for a token that opted into confidence normalization, an answer over the buffer bound or broken off (§3.9 item 9); on the **translate** route, a 2xx OpenAI Decisions answer that cannot be expressed in System One (a wrong type, a missing answer, an unusable body: `502`) and a non-2xx upstream answer (the upstream's own status, the message naming it; a `501` adds guidance) (§3.9 item 12); on the **emulated** route, as `decisions.upstream_error` there (§3.9 item 15) |
 | `systemone.refused` | 422 | the translate route's OpenAI Decisions upstream refused one or more questions; the message names the keys. It is the one decision error whose `type` is `refusal` (the upstream answered and declined, which is not an upstream failure); the others keep `upstream_error`. It wins over a malformed sibling answer, and the row records the upstream's tokens (§3.9 item 12) |
 | `systemone.question_type_unsupported` / `systemone.field_unsupported` | 400 | the translate route's request translation (§3.9 item 12) refused a question `type` other than `noul`, `choice` and `score`, or a field or shape OpenAI Decisions cannot express (an unsupported top-level field, a missing or scalar `state`, a duplicate or `null` question, a bad `images` entry, malformed criteria); nothing was sent upstream |
 | `speech.model_required` / `speech.input_required` | 400 | the speech body failed `validateSpeechRequest` (§3.6): no `model`, or no non-empty string `input` |
