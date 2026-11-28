@@ -193,6 +193,32 @@ func (s *TokenStore) UpdateToken(token Token) {
 	}
 }
 
+// UpdateTokenKeepServiceState replaces the stored token that matches
+// token.ID like UpdateToken, but carries over the two fields a service
+// token's bearer gets from its SERVICE rather than from its own row: the
+// allowlist (AllowedModels) and the service's disabled state, folded into
+// Active (a service token is active only while both it and its service are).
+// It is the metadata-edit path for a service token in the memory driver: a
+// plain UpdateToken there would re-activate a disabled service's token and
+// drop its allowlist until the next service-state mirror, and doing the merge
+// under this one lock leaves no window in which a request sees the unmerged
+// bearer. A no-op if no token with that id is present.
+func (s *TokenStore) UpdateTokenKeepServiceState(token Token) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, existing := range s.tokens {
+		if existing.ID == token.ID {
+			token.Active = token.Active && existing.Active
+			token.Scopes = append([]string(nil), token.Scopes...)
+			token.ModelOverrideRules = cloneOverrideMap(token.ModelOverrideRules)
+			token.AllowedModels = cloneStrings(existing.AllowedModels)
+			token.VendorAccess = cloneVendorAccess(token.VendorAccess)
+			s.tokens[hash] = token
+			return
+		}
+	}
+}
+
 // RemoveToken deletes the stored token that matches id. It is a no-op if no
 // token with that ID is present.
 func (s *TokenStore) RemoveToken(id string) {

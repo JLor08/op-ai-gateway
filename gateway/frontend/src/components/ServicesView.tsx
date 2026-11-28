@@ -79,6 +79,7 @@ export function ServicesView({
     | 'services'
     | 'setServiceAdminGroups'
     | 'updateService'
+    | 'updateServiceToken'
     | 'vendorAccounts'
   >;
   models: ModelOption[];

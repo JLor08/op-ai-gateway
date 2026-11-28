@@ -536,7 +536,7 @@ func TestServicesEndpointsTokenRotateOnlyAllowsPost(t *testing.T) {
 	}
 }
 
-func TestServicesEndpointsTokenSingleOnlyAllowsDelete(t *testing.T) {
+func TestServicesEndpointsTokenSingleOnlyAllowsPatchAndDelete(t *testing.T) {
 	s := newServicesTestFixture(t)
 	id := createServiceWithDelegates(t, s)
 	createRec := httptest.NewRecorder()
@@ -554,8 +554,8 @@ func TestServicesEndpointsTokenSingleOnlyAllowsDelete(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405, body = %s", rec.Code, rec.Body.String())
 	}
-	if got := rec.Header().Get("Allow"); got != http.MethodDelete {
-		t.Fatalf("Allow header = %q, want %q", got, http.MethodDelete)
+	if want := http.MethodPatch + ", " + http.MethodDelete; rec.Header().Get("Allow") != want {
+		t.Fatalf("Allow header = %q, want %q", rec.Header().Get("Allow"), want)
 	}
 }
 
@@ -575,6 +575,7 @@ func TestServicesEndpointsAllRequireAuth(t *testing.T) {
 		{http.MethodPost, "/api/portal/services/" + id + "/tokens"},
 		{http.MethodPost, "/api/portal/services/" + id + "/tokens/tok_missing/rotate"},
 		{http.MethodDelete, "/api/portal/services/" + id + "/tokens/tok_missing"},
+		{http.MethodPatch, "/api/portal/services/" + id + "/tokens/tok_missing"},
 	}
 	for _, p := range paths {
 		req := httptest.NewRequest(p.method, p.path, nil) // no Authorization header

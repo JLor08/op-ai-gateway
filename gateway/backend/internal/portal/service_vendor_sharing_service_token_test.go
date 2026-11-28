@@ -16,8 +16,8 @@ import (
 // This file pins the vendor-account opt-in on SERVICE tokens (#183, spec 2026-10-15
 // sections 3 and 8). It is new plumbing: CreateServiceTokenRequest and ServiceTokenDTO
 // carry vendor_access, CreateServiceToken writes it, RotateServiceToken preserves it,
-// and it is CREATE-ONLY (a service token has no field-level update, so changing the
-// opt-in means recreating the token). A service token reaches a shared account only
+// and since #421 UpdateServiceToken replaces it with the same service-reach check. A
+// service token reaches a shared account only
 // when its SERVICE is provisioned into a containing resource group (the grant, not
 // changed here) and the token names the account; reach is asked of the service, never
 // of the admin who happens to be creating the token.
@@ -256,21 +256,59 @@ func TestServiceTokenVendorAccessWireShapeMirrorsTheUserToken(t *testing.T) {
 	}
 }
 
-// TestServiceTokenVendorAccessIsCreateOnly pins the model the spec states: a service
-// token has no field-level update, so its vendor opt-in changes only by recreating the
-// token. If an update method is ever added, the opt-in needs the same reach validation
-// on it, so this fails to force that decision to be made deliberately.
-func TestServiceTokenVendorAccessIsCreateOnly(t *testing.T) {
-	api := reflect.TypeOf((*API)(nil)).Elem()
-	for i := 0; i < api.NumMethod(); i++ {
-		name := api.Method(i).Name
-		if strings.Contains(name, "ServiceToken") && strings.HasPrefix(name, "Update") {
-			t.Errorf("API.%s exists: a service token's vendor opt-in is create-only, so an update path must validate it too", name)
-		}
+// TestServiceTokenVendorAccessUpdateIsValidatedAgainstTheService: since #421 a
+// service token's vendor opt-in is editable (UpdateServiceToken). The update runs
+// the same reach check as create, against the SERVICE identity, never the editing
+// admin: a reaching admin cannot lend reach to a token of an unprovisioned service,
+// and a plain admin can still name a shared account its service reaches. A non-nil
+// policy replaces the stored one wholesale and reaches the live bearer.
+func TestServiceTokenVendorAccessUpdateIsValidatedAgainstTheService(t *testing.T) {
+	e := newServiceTokenEnv(t)
+	r := e.liveResolver(e.svc)
+
+	other, err := e.tokens.CreateServiceToken(e.ctx, e.reachingAdmin, grantServiceOther, CreateServiceTokenRequest{Name: "other"})
+	if err != nil {
+		t.Fatalf("CreateServiceToken(other): %v", err)
 	}
-	// Nothing on the service-token request type besides create's own fields can carry
-	// a policy change: there is no update request type.
-	if _, found := reflect.TypeOf(CreateServiceTokenRequest{}).FieldByName("VendorAccess"); !found {
-		t.Error("CreateServiceTokenRequest has no VendorAccess field")
+	if _, err := e.tokens.UpdateServiceToken(e.ctx, e.reachingAdmin, grantServiceOther, other.Token.ID, UpdateServiceTokenRequest{
+		VendorAccess: namedServiceAccess(grantShared),
+	}); !errors.Is(err, ErrTokenVendorAccessInvalid) {
+		t.Fatalf("UpdateServiceToken(unprovisioned service, reaching admin) = %v, want ErrTokenVendorAccessInvalid", err)
+	}
+	if rec, err := e.dir.TokenByID(e.ctx, other.Token.ID); err != nil || rec.VendorProviderAccess != "" {
+		t.Fatalf("a refused update wrote the policy: %+v err=%v", rec, err)
+	}
+
+	created, err := e.tokens.CreateServiceToken(e.ctx, e.plainAdmin, grantServiceOK, CreateServiceTokenRequest{
+		Name: "editing", VendorAccess: namedServiceAccess(grantFull),
+	})
+	if err != nil {
+		t.Fatalf("CreateServiceToken: %v", err)
+	}
+	if _, err := e.tokens.UpdateServiceToken(e.ctx, e.plainAdmin, grantServiceOK, created.Token.ID, UpdateServiceTokenRequest{
+		VendorAccess: namedServiceAccess(grantShared, grantFull),
+	}); !errors.Is(err, ErrTokenVendorAccessConflict) {
+		t.Fatalf("colliding pair: err = %v, want ErrTokenVendorAccessConflict", err)
+	}
+	got, err := e.tokens.UpdateServiceToken(e.ctx, e.plainAdmin, grantServiceOK, created.Token.ID, UpdateServiceTokenRequest{
+		VendorAccess: namedServiceAccess(grantShared),
+	})
+	if err != nil {
+		t.Fatalf("UpdateServiceToken(provisioned service, plain admin): %v", err)
+	}
+	if got.VendorAccess == nil || len(got.VendorAccess.Accounts) != 1 || got.VendorAccess.Accounts[0].AccountID != grantShared {
+		t.Fatalf("update response policy = %+v, want only %s", got.VendorAccess, grantShared)
+	}
+	tok := e.lookup(t, created.Secret)
+	e.requireResolves("edited token, newly named shared account", r, tok, grantModel(grantShared), grantShared)
+	e.requireNoRoute("edited token, previously named account", r, tok, grantModel(grantFull))
+
+	// Absent keeps; an empty policy resets to the strict default.
+	if kept, err := e.tokens.UpdateServiceToken(e.ctx, e.plainAdmin, grantServiceOK, created.Token.ID, UpdateServiceTokenRequest{Name: strPtr("renamed")}); err != nil || !reflect.DeepEqual(kept.VendorAccess, got.VendorAccess) {
+		t.Fatalf("absent vendor_access = %+v err=%v, want %+v kept", kept.VendorAccess, err, got.VendorAccess)
+	}
+	reset, err := e.tokens.UpdateServiceToken(e.ctx, e.plainAdmin, grantServiceOK, created.Token.ID, UpdateServiceTokenRequest{VendorAccess: &VendorAccessDTO{}})
+	if err != nil || reset.VendorAccess != nil {
+		t.Fatalf("empty vendor_access = %+v err=%v, want the strict default (nil)", reset.VendorAccess, err)
 	}
 }

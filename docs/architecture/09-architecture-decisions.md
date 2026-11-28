@@ -3676,6 +3676,16 @@ holds as written: the interactive session (and the trusted loopback chat) carrie
 and may be narrowed, even to nothing, or may name a shared account. A run-as token still replaces
 that policy entirely, and a service token is as ADR-060 left it.
 
+**Amendment (2026-11-28, issue #421): a service token's policy is no longer create-only.**
+ADR-060 gave the service token the policy as create-only plumbing. A service token now has a
+field-level update, `PATCH /api/portal/services/{id}/tokens/{tid}` (`UpdateServiceToken`), with
+the user-token update's semantics: an absent `vendor_access` keeps the stored policy, a present
+one replaces it wholesale after the same advisory save-time check against the **service** as
+principal (never the editor), and a rotation still preserves it. Nothing else of this ADR or
+ADR-060 changes: routing is still the sole gate, and a service still reaches a shared account only
+through a direct provision. The same update edits every other per-token setting of a service
+token in place, so changing one no longer means recreating the token and redistributing a secret.
+
 ## ADR-051 — Anthropic translate prompt caching is flag-gated, decided at the gateway by a hybrid auto-switch, and placed by the provider
 **Context:** Anthropic caches a prompt prefix only where the request carries a
 `cache_control` breakpoint. The native `/v1/messages` passthrough already relays the
@@ -5135,7 +5145,8 @@ the key or hands a delegate the owner's token.
   never the admin saving it, and is **advisory**: routing re-evaluates the grant on every
   request and is the sole security gate. A **service token** gets the opt-in as new,
   **create-only** plumbing (`vendor_access` on the create request and DTO, preserved by a
-  rotation, changed only by recreating the token) and reaches a shared account only when
+  rotation, changed only by recreating the token; editable in place since issue #421, see the
+  [ADR-050 amendment](#adr-050--vendor-account-access-is-a-per-token-opt-in-enforced-in-listing-and-routing-through-one-prefix-helper)) and reaches a shared account only when
   the service is **directly provisioned** into a containing resource group, the way it
   reaches servers; a service-side resource-group self-service makes that provisioning
   visible and editable.
@@ -13307,10 +13318,16 @@ types of blocks, and the ServerAgent.
 - A token with `send_usage_limits` off observes nothing into the window caches, but a vendor response on it still purges a revoked entry of
   its principal from that account (`Forget`), after an entitlement check that only runs when such an entry exists. An opted-in sibling token
   therefore never keeps frozen windows beyond the observe-time limitation of ADR-106.
-- Service tokens cannot change a switch until #421; recreate the token.
+- Service tokens cannot change a switch until #421; recreate the token. (Resolved, see the amendment below.)
 - → [Claude Code usage-limit display](cross-cutting/compatibility-and-inference.md#93-claude-code-usage-limit-display),
   [Codex display of the gateway's own limits](cross-cutting/compatibility-and-inference.md#96-codex-display-of-the-gateways-own-limits),
   [token secret shape](cross-cutting/security-auth-rbac.md#claude-code-token-secret-shape).
+
+**Amendment (2026-11-28, issue #421): service tokens can change the switches in place.** The
+follow-up named above landed: `PATCH /api/portal/services/{id}/tokens/{tid}` edits a service
+token's `send_usage_limits` and `codex_model_switch_prompt` (and every other per-token setting)
+with the user-token update's semantics, ungated and without a rotation, so the "recreate the
+token" limit and the rejected "update route in the same change" no longer describe the system.
 
 ## ADR-111 — Strata: one type string for an application and a runtime spec, a main-last GPU placeholder and an opt-in Windows job-object process tree
 

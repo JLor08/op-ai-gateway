@@ -127,7 +127,7 @@ link table ([ADR-060](../09-architecture-decisions.md#adr-060--shared-vendor-acc
 Which of a principal's reachable accounts an API token may use is **not** stored on
 these tables: it is the token's own
 `api_tokens.vendor_provider_access` column (migration 85, above), for a user token
-and, create-only, for a service token. Neither are the
+and for a service token (writable on create and update for both). Neither are the
 switches that turn the feature, its subscription accounts, or its sharing off: the master flag
 `vendor_accounts_enabled`, the narrower `vendor_subscriptions_enabled` and the two
 sharing switches `vendor_account_sharing_enabled` and

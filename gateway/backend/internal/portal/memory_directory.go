@@ -315,7 +315,7 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 	existing.SendUsageLimits = token.SendUsageLimits
 	existing.CodexModelSwitchPrompt = token.CodexModelSwitchPrompt
 	m.tokens[token.ID] = existing
-	m.auth.UpdateToken(auth.Token{
+	bearer := auth.Token{
 		ID:                 existing.ID,
 		UserID:             existing.UserID,
 		Name:               existing.Name,
@@ -347,7 +347,15 @@ func (m *MemoryDirectory) UpdateTokenMetadata(ctx context.Context, token store.T
 		DecisionsConfidenceNormalize:   existing.DecisionsConfidenceNormalize,
 		SendUsageLimits:                existing.SendUsageLimits,
 		CodexModelSwitchPrompt:         existing.CodexModelSwitchPrompt,
-	})
+	}
+	// A service token's bearer also carries its service's disabled state and
+	// allowlist (SetServiceTokensState); an edit must not reset them, so it goes
+	// through the merging update. A user token is replaced as before.
+	if existing.Kind == store.TokenKindService {
+		m.auth.UpdateTokenKeepServiceState(bearer)
+	} else {
+		m.auth.UpdateToken(bearer)
+	}
 	return nil
 }
 

@@ -153,18 +153,19 @@ type ServiceTokenDTO struct {
 	UnknownModelRedirectBlocked bool   `json:"unknown_model_redirect_blocked,omitempty"`
 	UnknownModelFallback        string `json:"unknown_model_fallback,omitempty"`
 	// ClaudeModelAliases opts the token into the Claude-compatible model aliases,
-	// identical in meaning to TokenDTO's — see there. Settable on create only: a
-	// service token has no field-level update.
+	// identical in meaning to TokenDTO's — see there. Settable on create and on
+	// UpdateServiceToken (#421).
 	ClaudeModelAliases bool `json:"claude_model_aliases"`
 	// ClaudeEffortCompatibility opts the token into Claude Code effort
 	// compatibility, identical in meaning to TokenDTO's — see there. Settable on
-	// create only, like ClaudeModelAliases.
+	// create and on update, like ClaudeModelAliases, but a management setting on
+	// both (see principalMayManageTokenSetting).
 	ClaudeEffortCompatibility bool `json:"claude_effort_compatibility"`
 	// DecisionsConfidenceNormalize opts the token into recomputed /v1/decisions
-	// confidence (ADR-098), ungated like ClaudeModelAliases; create only.
+	// confidence (ADR-098), ungated like ClaudeModelAliases; create and update.
 	DecisionsConfidenceNormalize bool `json:"decisions_confidence_normalize"`
 	// SendUsageLimits and CodexModelSwitchPrompt are the usage-limit opt-ins
-	// (#420), identical in meaning to TokenDTO's; create only (#421).
+	// (#420), identical in meaning to TokenDTO's; create and update.
 	SendUsageLimits        bool `json:"send_usage_limits"`
 	CodexModelSwitchPrompt bool `json:"codex_model_switch_prompt"`
 	// VendorAccess is the token's vendor-account access policy, the same shape and
@@ -172,8 +173,8 @@ type ServiceTokenDTO struct {
 	// A service owns no vendor account, so the only accounts it can use are the ones
 	// SHARED with it (its service provisioned into a containing resource group) and
 	// it must NAME each (all:true covers nothing for a service). Settable on create
-	// only: a service token has no field-level update, so changing the opt-in means
-	// recreating the token; a rotation preserves it.
+	// and on UpdateServiceToken (#421), both validated for the SERVICE's reach; a
+	// rotation preserves it.
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
 }
 
@@ -212,8 +213,39 @@ type CreateServiceTokenRequest struct {
 	// named account must be reachable for THIS SERVICE (its service provisioned into
 	// a resource group that contains it), not for the admin or delegate creating the
 	// token: that advisory check is validateVendorAccess's, and routing re-checks on
-	// every request. It is create-only, see ServiceTokenDTO.
+	// every request. UpdateServiceToken can replace it later, see ServiceTokenDTO.
 	VendorAccess *VendorAccessDTO `json:"vendor_access,omitempty"`
+}
+
+// UpdateServiceTokenRequest is UpdateServiceToken's body (#421): exactly the
+// settings CreateServiceTokenRequest carries, each a pointer — nil keeps the
+// stored value, non-nil replaces it (UpdateTokenRequest's semantics). Not here,
+// on purpose: scopes (always the fixed [serviceLLMInvokeScope]), status (a
+// service token's liveness follows its service), expires_at (UpdateTokenRequest
+// has none either), last_used_model (written by the inference path alone) and
+// project / server override (not service-token concepts). Unknown JSON keys are
+// ignored, so a client writing a read DTO back cannot set any of them.
+type UpdateServiceTokenRequest struct {
+	Name             *string                             `json:"name,omitempty"`
+	ModelOverride    *string                             `json:"model_override,omitempty"`
+	ModelOverrideMap *map[string]store.ModelOverrideRule `json:"model_override_map,omitempty"`
+	LogCommunication *bool                               `json:"log_communication,omitempty"`
+	Secret           *bool                               `json:"secret,omitempty"`
+	// The unknown-model redirect trio is validated as ONE unit whenever any of
+	// the three is present, against the values the update leaves — see
+	// UpdateServiceToken.
+	UnknownModelRedirect        *bool   `json:"unknown_model_redirect,omitempty"`
+	UnknownModelRedirectBlocked *bool   `json:"unknown_model_redirect_blocked,omitempty"`
+	UnknownModelFallback        *string `json:"unknown_model_fallback,omitempty"`
+	// VendorAccess: nil keeps the stored policy; a non-nil value REPLACES it
+	// wholesale (an empty one resets to the strict default) after the same
+	// service-reach validation create runs.
+	VendorAccess                 *VendorAccessDTO `json:"vendor_access,omitempty"`
+	ClaudeModelAliases           *bool            `json:"claude_model_aliases,omitempty"`
+	ClaudeEffortCompatibility    *bool            `json:"claude_effort_compatibility,omitempty"`
+	DecisionsConfidenceNormalize *bool            `json:"decisions_confidence_normalize,omitempty"`
+	SendUsageLimits              *bool            `json:"send_usage_limits,omitempty"`
+	CodexModelSwitchPrompt       *bool            `json:"codex_model_switch_prompt,omitempty"`
 }
 
 // CreateServiceTokenResponse carries the plaintext secret ONCE (§6.5), exactly
@@ -857,8 +889,8 @@ func (s *Service) ListServiceTokens(ctx context.Context, principal auth.Token, s
 // settings), returning the fresh plaintext secret once — mirrors RotateToken. The
 // vendor-account opt-in is one of those settings and is PRESERVED: the rotation
 // writes only the secret columns (RotateTokenSecret), so the stored policy, the
-// bearer's policy and the returned DTO's all stay as created. (A service token's
-// opt-in is create-only; this is the one write that touches the row afterwards.)
+// bearer's policy and the returned DTO's all stay as they were. (Changing the
+// settings is UpdateServiceToken's job, never a rotation's.)
 // tokenID MUST belong to serviceID (no cross-service access): a token of a
 // DIFFERENT service (or an unknown id) is ErrTokenNotFound, matching
 // RotateToken's own not-found sentinel for the analogous user-token case.
@@ -883,6 +915,168 @@ func (s *Service) RotateServiceToken(ctx context.Context, principal auth.Token, 
 	return CreateServiceTokenResponse{Token: serviceTokenDTO(record), Secret: secret}, nil
 }
 
+// UpdateServiceToken edits tokenID's per-token options in place (#421) — same
+// id, same secret — under the *Tokens* object-gate (admin or ANY delegate),
+// mirroring UpdateToken's field-level semantics and CreateServiceToken's
+// validators. tokenID MUST belong to serviceID (ErrTokenNotFound otherwise, see
+// serviceTokenByID). The record is mutated in memory and persisted ONCE at the
+// end, so a refusal at any step writes nothing.
+func (s *Service) UpdateServiceToken(ctx context.Context, principal auth.Token, serviceID, tokenID string, req UpdateServiceTokenRequest) (ServiceTokenDTO, error) {
+	svc, err := s.authorizeServiceTokens(ctx, principal, serviceID)
+	if err != nil {
+		return ServiceTokenDTO{}, err
+	}
+	record, err := s.serviceTokenByID(ctx, serviceID, tokenID)
+	if err != nil {
+		return ServiceTokenDTO{}, err
+	}
+	// claude_effort_compatibility is a management setting: ANY value — on or
+	// off — from an inference-only bearer refuses the whole request (UpdateToken's
+	// rule; create gates only true, because there off is the default). After the
+	// object gate and the ownership check, so a stranger still gets not-found.
+	if req.ClaudeEffortCompatibility != nil && !principalMayManageTokenSetting(principal) {
+		return ServiceTokenDTO{}, ErrPrincipalForbidden
+	}
+	if req.Name != nil {
+		name := strings.TrimSpace(*req.Name)
+		if name == "" {
+			return ServiceTokenDTO{}, ErrServiceValidation
+		}
+		record.Name = name
+	}
+	if err := s.applyServiceTokenModelSettings(ctx, principal, svc.ID, &record, req); err != nil {
+		return ServiceTokenDTO{}, err
+	}
+	// Reach is asked of the SERVICE the token acts as, never of the editor.
+	if req.VendorAccess != nil {
+		if err := s.validateVendorAccess(ctx, serviceTokenPrincipal(svc.ID), req.VendorAccess); err != nil {
+			return ServiceTokenDTO{}, err
+		}
+		record.VendorProviderAccess = encodeVendorAccessDTO(req.VendorAccess)
+	}
+	applyServiceTokenFlags(&record, req)
+	record.UpdatedAt = s.clock().UTC()
+	if err := s.tokens.UpdateTokenMetadata(ctx, record); err != nil {
+		return ServiceTokenDTO{}, err
+	}
+	// Re-push the service's live state onto the memory driver's cached bearer
+	// (create does the same). Its UpdateTokenMetadata already keeps the bearer's
+	// allowlist and disabled state for a service token
+	// (auth.TokenStore.UpdateTokenKeepServiceState); this refresh also picks up
+	// a service state that changed since. A no-op for SQL drivers, which join
+	// the service state per request.
+	s.mirrorServiceTokenState(ctx, svc.ID, svc.Status)
+	return serviceTokenDTO(record), nil
+}
+
+// applyServiceTokenModelSettings validates and applies UpdateServiceToken's
+// model-valued settings: the catch-all override, the per-model override map
+// and the unknown-model redirect trio.
+func (s *Service) applyServiceTokenModelSettings(ctx context.Context, principal auth.Token, serviceID string, record *store.TokenRecord, req UpdateServiceTokenRequest) error {
+	// The callable set is built at most once, and only when a model-valued
+	// setting is touched (UpdateToken's pattern).
+	var callableSet map[string]struct{}
+	callable := func() map[string]struct{} {
+		if callableSet == nil {
+			callableSet = s.callableModelNames(ctx, principal)
+		}
+		return callableSet
+	}
+	// A model-valued setting sent back UNCHANGED is not re-validated. Unlike a
+	// user token, a service token is edited by several principals (admins and
+	// delegates) whose callable sets differ, and the service's allowlist can move
+	// after a value was stored: re-validating a value the editor did not touch
+	// would turn a write-back of the whole dialog (an edit of "log communication"
+	// alone) into a 400 for a setting someone else made. A CHANGED value is
+	// validated exactly as on create. Routing re-checks every stored value per
+	// request either way, so skipping the check never widens what the token can
+	// reach.
+	if req.ModelOverride != nil && strings.TrimSpace(*req.ModelOverride) != record.ModelOverride {
+		override, err := validateModelOverride(callable(), *req.ModelOverride)
+		if err != nil {
+			return err
+		}
+		record.ModelOverride = override
+	}
+	if req.ModelOverrideMap != nil && store.EncodeModelOverrideRules(*req.ModelOverrideMap) != record.ModelOverrideMap {
+		overrideRules, err := validateModelOverrideRules(callable(), *req.ModelOverrideMap)
+		if err != nil {
+			return err
+		}
+		record.ModelOverrideMap = store.EncodeModelOverrideRules(overrideRules)
+	}
+	// The redirect trio, validated as one unit against the values this update
+	// leaves, with the fallback checked against the principal's callable set
+	// NARROWED BY THE SERVICE'S ALLOWLIST — create's rule, see the comment in
+	// CreateServiceToken. Untouched, the stored values stay as they are.
+	// record.LastUsedModel is never assigned here.
+	on, blocked, fallback, touched := mergedServiceTokenRedirect(record, req)
+	// An unchanged trio is not re-validated (see above).
+	if touched && (on != record.UnknownModelRedirect || blocked != record.UnknownModelRedirectBlocked || fallback != record.UnknownModelFallback) {
+		return s.applyServiceTokenRedirect(ctx, serviceID, callable, record, on, blocked, fallback)
+	}
+	return nil
+}
+
+// mergedServiceTokenRedirect returns the redirect trio this update leaves —
+// each field from req when present, else the stored value, the fallback
+// trimmed — and whether req touches the trio at all.
+func mergedServiceTokenRedirect(record *store.TokenRecord, req UpdateServiceTokenRequest) (on, blocked bool, fallback string, touched bool) {
+	on, blocked, fallback = record.UnknownModelRedirect, record.UnknownModelRedirectBlocked, record.UnknownModelFallback
+	if req.UnknownModelRedirect != nil {
+		on, touched = *req.UnknownModelRedirect, true
+	}
+	if req.UnknownModelRedirectBlocked != nil {
+		blocked, touched = *req.UnknownModelRedirectBlocked, true
+	}
+	if req.UnknownModelFallback != nil {
+		fallback, touched = strings.TrimSpace(*req.UnknownModelFallback), true
+	}
+	return on, blocked, fallback, touched
+}
+
+// applyServiceTokenFlags applies UpdateServiceToken's plain boolean settings:
+// nil keeps the stored value, non-nil replaces it.
+func applyServiceTokenFlags(record *store.TokenRecord, req UpdateServiceTokenRequest) {
+	for _, f := range []struct {
+		dst *bool
+		src *bool
+	}{
+		{&record.LogCommunication, req.LogCommunication},
+		{&record.Secret, req.Secret},
+		{&record.ClaudeModelAliases, req.ClaudeModelAliases},
+		{&record.ClaudeEffortCompatibility, req.ClaudeEffortCompatibility},
+		{&record.DecisionsConfidenceNormalize, req.DecisionsConfidenceNormalize},
+		{&record.SendUsageLimits, req.SendUsageLimits},
+		{&record.CodexModelSwitchPrompt, req.CodexModelSwitchPrompt},
+	} {
+		if f.src != nil {
+			*f.dst = *f.src
+		}
+	}
+}
+
+// applyServiceTokenRedirect validates the redirect trio as one unit, the
+// fallback checked against callable NARROWED BY THE SERVICE'S ALLOWLIST
+// (create's rule, see CreateServiceToken), and writes the normalized values
+// onto record.
+func (s *Service) applyServiceTokenRedirect(ctx context.Context, serviceID string, callable func() map[string]struct{}, record *store.TokenRecord, on, blocked bool, fallback string) error {
+	allowlist, err := s.routes.ServiceAllowedModels(ctx, serviceID)
+	if err != nil {
+		return err
+	}
+	on, blocked, fallback, err = validateUnknownModelRedirect(
+		func() map[string]struct{} { return intersectAllowedModels(callable(), allowlist) },
+		on, blocked, fallback)
+	if err != nil {
+		return err
+	}
+	record.UnknownModelRedirect = on
+	record.UnknownModelRedirectBlocked = blocked
+	record.UnknownModelFallback = fallback
+	return nil
+}
+
 // DeleteServiceToken removes tokenID, which MUST belong to serviceID (no
 // cross-service access — see serviceTokenByID).
 func (s *Service) DeleteServiceToken(ctx context.Context, principal auth.Token, serviceID, tokenID string) error {
@@ -898,7 +1092,7 @@ func (s *Service) DeleteServiceToken(ctx context.Context, principal auth.Token, 
 
 // serviceTokenByID resolves tokenID and verifies it is a service-kind token
 // belonging to EXACTLY serviceID — the cross-service-access guard shared by
-// RotateServiceToken/DeleteServiceToken. Reuses ErrTokenNotFound (the
+// UpdateServiceToken/RotateServiceToken/DeleteServiceToken. Reuses ErrTokenNotFound (the
 // existing, already HTTP-mapped 404 sentinel for "no such token") rather than
 // introducing a new one: a service-scoped 404 for a token that either does
 // not exist, is not a service token, or belongs to ANOTHER service are all
