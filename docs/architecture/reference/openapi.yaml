@@ -3594,21 +3594,19 @@ paths:
       Service (service-account) collection. Per-service sub-paths (see
       api-surface.md): tokens, admin-groups, resource-groups (typed below). A
       service token takes the vendor-account opt-in vendor_access (the
-      TokenVendorAccess schema) on create only, naming the shared vendor
-      accounts the service can reach (it must be provisioned directly into a
-      resource group that contains them); there is no field-level update and a
+      TokenVendorAccess schema) on create (POST /api/portal/services/{id}/tokens)
+      and update (PATCH /api/portal/services/{id}/tokens/{tid}, issue #421),
+      naming the shared vendor accounts the service can reach (it must be
+      provisioned directly into a resource group that contains them); a
       rotation preserves it. A service token takes the same
-      claude_model_aliases flag as a user token, on create only
-      (POST /api/portal/services/{id}/tokens; there is no field-level update),
-      and reads it back on the token list. It takes claude_effort_compatibility
-      the same way, with the same management-only rule: creating a service
-      token with it true from an inference-only bearer is a 403
-      portal.principal_forbidden, while a portal session or an admin-scope
-      bearer may. It takes the opt-in decisions_confidence_normalize flag on
-      create only too, ungated. It takes send_usage_limits and
-      codex_model_switch_prompt (default false, ungated) on create only and
-      reads them back; changing one on an existing service token is not
-      possible until issue #421, so a token is recreated.
+      claude_model_aliases, claude_effort_compatibility,
+      decisions_confidence_normalize, send_usage_limits and
+      codex_model_switch_prompt flags as a user token, on create and update,
+      and reads them back on the token list. claude_effort_compatibility keeps
+      the management-only rule: creating a service token with it true, or
+      updating one with the field present at all, from an inference-only
+      bearer is a 403 portal.principal_forbidden, while a portal session or an
+      admin-scope bearer may.
     get:
       tags: [portal]
       summary: List services
@@ -3644,6 +3642,53 @@ paths:
       security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
       responses:
         '200': { $ref: '#/components/responses/OpaqueJSON' }
+  /api/portal/services/{id}/tokens/{tid}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string } }
+      - { name: tid, in: path, required: true, schema: { type: string } }
+    patch:
+      tags: [portal]
+      summary: Edit a service token's per-token options in place (issue #421)
+      description: >
+        Field-level update with the user-token PATCH semantics: every field is
+        optional, an absent field keeps the stored value, a present one
+        replaces it (vendor_access wholesale). Same id, same secret; the
+        response is the updated token, never a secret. Open to the callers of
+        the token create (an admin or any delegate of the service; anyone
+        else is a 404 service.not_found). A tid that is unknown, not a service
+        token, or a token of another service is a 404 service.token_not_found.
+        Every value is validated exactly as on create and every refusal has the
+        create path's status and code (400 service.validation_failed for a
+        blank name, 400 portal.token_model_override_invalid for an unroutable
+        override target or fallback - the fallback also against the service's
+        allowlist -, 400 portal.token_vendor_access_invalid /
+        portal.token_vendor_access_conflict, checked against the SERVICE's
+        reach). A present claude_effort_compatibility from an inference-only
+        bearer is a 403 portal.principal_forbidden. The request is checked as a
+        whole before anything is written. Malformed JSON is a 400
+        request.invalid_json; other methods are a 405 with Allow: PATCH, DELETE.
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateServiceTokenRequest' }
+      responses:
+        '200':
+          description: The updated service token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceToken' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [portal]
+      summary: Delete a service token
+      security: [{ sessionCookie: [], csrfHeader: [] }, { bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/OkTrue' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /api/portal/resource-groups:
     description: >
       Resource-group collection. Per-resource-group sub-paths (see
@@ -6181,11 +6226,68 @@ components:
                 format: date-time
                 description: A fixed placeholder; model mappings carry no creation time.
               original_model_id: { $ref: '#/components/schemas/OriginalModelId' }
+    ServiceToken:
+      type: object
+      description: >
+        A service (service-account) token's read shape: the user token's
+        per-token settings, a service_id instead of a user id, and never the
+        secret (only secret_prefix). scopes is always [llm:invoke]. Only the
+        fields the update touches are modeled here; see api-surface.md.
+      additionalProperties: true
+      properties:
+        id: { type: string }
+        service_id: { type: string }
+        name: { type: string }
+        secret_prefix: { type: string }
+        status: { type: string }
+        scopes: { type: array, items: { type: string } }
+        model_override: { type: string }
+        model_override_map: { type: object, additionalProperties: true }
+        log_communication: { type: boolean }
+        secret: { type: boolean }
+        last_used_model: { type: string, description: Read-only; written by the inference path alone. }
+        unknown_model_redirect: { type: boolean }
+        unknown_model_redirect_blocked: { type: boolean }
+        unknown_model_fallback: { type: string }
+        vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
+        claude_model_aliases: { type: boolean }
+        claude_effort_compatibility: { type: boolean }
+        decisions_confidence_normalize: { type: boolean }
+        send_usage_limits: { type: boolean }
+        codex_model_switch_prompt: { type: boolean }
+    UpdateServiceTokenRequest:
+      type: object
+      description: >
+        PATCH /api/portal/services/{id}/tokens/{tid}: exactly the create
+        body's settings, each optional (absent keeps, present replaces).
+        scopes, status, expires_at and last_used_model are not update fields
+        and, like every unknown key, are ignored. The three unknown_model_*
+        fields are validated together, against the values the update leaves.
+      additionalProperties: true
+      properties:
+        name: { type: string, description: Trimmed; blank is a 400 service.validation_failed. }
+        model_override: { type: string }
+        model_override_map: { type: object, additionalProperties: true }
+        log_communication: { type: boolean }
+        secret: { type: boolean }
+        unknown_model_redirect: { type: boolean }
+        unknown_model_redirect_blocked: { type: boolean }
+        unknown_model_fallback: { type: string }
+        vendor_access: { $ref: '#/components/schemas/TokenVendorAccess' }
+        claude_model_aliases: { type: boolean }
+        claude_effort_compatibility:
+          type: boolean
+          description: >
+            MANAGEMENT-ONLY: any present value from an inference-only bearer is
+            a 403 portal.principal_forbidden and nothing is written.
+        decisions_confidence_normalize: { type: boolean }
+        send_usage_limits: { type: boolean }
+        codex_model_switch_prompt: { type: boolean }
     TokenVendorAccess:
       type: object
       description: >
         An API token's vendor-account ("Anbieter") access policy, on a user
-        token (create and update) and, create-only, on a service token. Strict
+        token and on a service token (create and update on both). Strict
         opt-in: a token with no policy (field absent on a response, absent or
         null on create) has no vendor access. all=true lets the token use
         EVERY active account its principal OWNS (future accounts included)

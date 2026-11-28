@@ -268,7 +268,7 @@ Rules that keep this safe over time:
   `resolveBearer`, the memory directory, run-as). The migration backfills
   `send_usage_limits` from `claude_code_usage_display` (an idempotent `update ... where`),
   so a token that already shows the limits keeps showing them; service tokens set them on
-  create only. The migration-40 rebuild test re-applies both columns.
+  create and on their update (issue #421, the same `UpdateTokenMetadata` write). The migration-40 rebuild test re-applies both columns.
   Migration 107 (`application_decision_modes`) is the endpoint-mode migration 72's
   twin: two `text not null default ''` columns on both `applications` and
   `agent_runtime_specs`, each blank value then backfilled under a `where ... = ''` guard
