@@ -532,7 +532,15 @@ import (
 // with Since 0.27.0. The gateway reads the new fields when present and an old
 // agent simply sends none. This is the ONE bump for the whole branch; later
 // commits on it do not bump again.
-const Version = "0.27.0"
+//
+// 0.27.0 -> 0.27.1 is the single bump for the GPU inventory boot race. PATCH:
+// a GPU collector that fails during the hardware inventory is now logged, and
+// when telemetry sees GPUs (by vendor and index) the cached inventory lacks,
+// the agent re-collects the inventory and re-sends the system report (at most
+// gpuInventoryRetryMax times, one per gpuInventoryRetryInterval) instead of
+// leaving the report GPU-less until a restart. No agent.Features entry is
+// added.
+const Version = "0.27.1"
 
 // collectTimeout bounds each individual collector invocation so a wedged
 // external CLI (nvidia-smi/rocm-smi/ioreg) cannot block the single-goroutine
@@ -892,6 +900,23 @@ const memoryRetryTimeout = 2 * time.Second
 // no real 30 s waits.
 var memoryRetryInterval = defaultMemoryRetryInterval
 
+// defaultGPUInventoryRetryInterval spaces the hardware inventory re-collects
+// Run makes while telemetry sees GPUs the cached inventory lacks (amdgpu, for
+// one, can finish initializing its cards seconds after the agent collected
+// its startup inventory). Telemetry notices every second; a full inventory
+// collect is far heavier than a sample, so not more often than this.
+const defaultGPUInventoryRetryInterval = 10 * time.Second
+
+// gpuInventoryRetryMax bounds those re-collects over the agent's lifetime: a
+// GPU that telemetry reports but the inventory collect never does (both read
+// the same collector, so this needs a persistently failing inventory call)
+// costs at most this many collects, then one warning.
+const gpuInventoryRetryMax = 6
+
+// gpuInventoryRetryInterval is defaultGPUInventoryRetryInterval; a variable
+// so tests need no real 10 s waits.
+var gpuInventoryRetryInterval = defaultGPUInventoryRetryInterval
+
 // helperMemoryModulesNeeded decides whether Run retries the helper fetch; a
 // variable so tests can drive the retry on a host that is not unprivileged
 // Linux.
@@ -920,6 +945,15 @@ type Agent struct {
 	// was not ready at startup. a.hw is touched only on Run's goroutine, so
 	// the retry runs there too.
 	fetchMemoryModules func(context.Context) ([]sample.MemoryModule, error)
+	// telemetryGPUs are the GPUs (vendor+index) the last collectOnce saw;
+	// refreshInventoryForMissingGPUs compares them with a.hw. Run's
+	// goroutine only, like a.hw.
+	telemetryGPUs []runtimectl.GPUKey
+	// gpuRetries / gpuRetryLast / gpuRetryGaveUp are that re-collect's
+	// lifetime budget, rate limit, and one-time give-up warning.
+	gpuRetries     int
+	gpuRetryLast   time.Time
+	gpuRetryGaveUp bool
 
 	// certSync is the Phase 2 certificate installer/syncer; nil when the
 	// caller has none to offer (every pre-Phase-2 test construction in this
@@ -1370,6 +1404,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			a.collectOnce(ctx)
+			a.refreshInventoryForMissingGPUs(ctx)
 		case <-reportTicker.C:
 			a.sendSystemReport(ctx)
 			a.resendRuntimeReport(ctx)
@@ -1778,6 +1813,95 @@ func (a *Agent) retryMemoryModules(ctx context.Context) bool {
 	slog.Info("memory modules received from the helper", "modules", len(mods))
 	a.sendSystemReport(ctx)
 	return true
+}
+
+// refreshInventoryForMissingGPUs re-collects the hardware inventory when the
+// last telemetry sample saw GPUs (by vendor and index) the cached inventory
+// lacks, and re-sends the report when the fresh collect has them. The startup
+// inventory is collected once; without this a GPU whose driver was not ready
+// at that moment would be missing from the system report until the agent
+// restarts, while telemetry reports it every second.
+//
+// Bounded (gpuInventoryRetryMax collects per agent lifetime, at most one per
+// gpuInventoryRetryInterval) and a no-op once the inventory covers what
+// telemetry sees. Runs on Run's goroutine like the startup collect: a.hw is
+// owned there, and the GPU collectors are not called concurrently. A collect
+// takes about as long as the startup one (bounded by hardwareCollectBudget),
+// which delays the next telemetry tick by as much -- rare by construction.
+func (a *Agent) refreshInventoryForMissingGPUs(ctx context.Context) {
+	if a.hw == nil {
+		return
+	}
+	missing := gpusMissingFrom(a.hw, a.telemetryGPUs)
+	if len(missing) == 0 {
+		return
+	}
+	if a.gpuRetries >= gpuInventoryRetryMax {
+		if !a.gpuRetryGaveUp {
+			a.gpuRetryGaveUp = true
+			slog.Warn("hardware inventory still lacks GPUs that telemetry reports; giving up re-collecting",
+				"missing", gpuKeysLog(missing), "attempts", a.gpuRetries)
+		}
+		return
+	}
+	if !a.gpuRetryLast.IsZero() && time.Since(a.gpuRetryLast) < gpuInventoryRetryInterval {
+		return
+	}
+	a.gpuRetries++
+	a.gpuRetryLast = time.Now()
+	hw := collectHardware(ctx, a.gpus, a.hardwareOptions())
+	// Only an improvement replaces the cache: the fresh collect must still
+	// miss nothing the cache had (a collector can time out on this attempt,
+	// e.g. while the driver initializes another card) and miss fewer.
+	stillMissing := gpusMissingFrom(&hw, a.telemetryGPUs)
+	if len(stillMissing) >= len(missing) || !allIn(stillMissing, missing) {
+		slog.Debug("hardware inventory re-collect is no improvement; keeping the cached inventory",
+			"missing", gpuKeysLog(missing), "fresh_missing", gpuKeysLog(stillMissing), "attempt", a.gpuRetries)
+		return
+	}
+	// The helper retry may have filled in modules a fresh collect cannot
+	// read right now (helper down): keep those rather than lose them.
+	if len(hw.Memory.Modules) == 0 {
+		hw.Memory.Modules = a.hw.Memory.Modules
+	}
+	a.hw = &hw
+	// The runtime's Vulkan ordinals come from the inventory only; the GPU
+	// totals already arrive with every sample (publishHostInfo), and the
+	// next one carries this mapping too.
+	a.vulkan = vulkanMapFromReport(&hw)
+	slog.Info("hardware inventory re-collected: telemetry reported GPUs it lacked",
+		"missing", gpuKeysLog(missing), "gpus", len(hw.GPUs), "attempt", a.gpuRetries)
+	a.sendSystemReport(ctx)
+}
+
+// gpusMissingFrom returns the keys in seen that hw has no GPU for.
+func gpusMissingFrom(hw *sample.SystemReport, seen []runtimectl.GPUKey) []runtimectl.GPUKey {
+	var missing []runtimectl.GPUKey
+	for _, k := range seen {
+		if !slices.ContainsFunc(hw.GPUs, func(g sample.GPUInfo) bool { return gpuKeyOf(g.Vendor, g.Index) == k }) {
+			missing = append(missing, k)
+		}
+	}
+	return missing
+}
+
+// allIn reports whether every key in keys is also in set.
+func allIn(keys, set []runtimectl.GPUKey) bool {
+	for _, k := range keys {
+		if !slices.Contains(set, k) {
+			return false
+		}
+	}
+	return true
+}
+
+// gpuKeysLog renders GPU keys for a log attribute as vendor:index strings.
+func gpuKeysLog(keys []runtimectl.GPUKey) []string {
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = k.String()
+	}
+	return parts
 }
 
 // sendSystemReport pushes the cached inventory (best-effort; a failure is logged).
@@ -2735,6 +2859,10 @@ func (a *Agent) collectOnce(ctx context.Context) {
 			continue
 		}
 		s.GPUs = append(s.GPUs, gpus...)
+	}
+	a.telemetryGPUs = a.telemetryGPUs[:0]
+	for _, g := range s.GPUs {
+		a.telemetryGPUs = append(a.telemetryGPUs, gpuKeyOf(g.Vendor, g.Index))
 	}
 	// Publish the hardware half of this sample to the runtime owner NOW,
 	// before the scrape/model-status/runtime-probe steps below: those can take

@@ -138,6 +138,26 @@ from `host.InfoWithContext`, and per-OS mainboard/BIOS/DIMM detail via
 - **macOS** (`system_profiler.go`): `system_profiler` output for mainboard/BIOS
   identity.
 
+The GPUs come from the same per-vendor collectors telemetry uses (§8.2.2), each
+bounded by the 2 s source budget. A collector that errors drops its cards from
+the report and is logged at Warn (`hardware inventory: gpu collect failed`, with
+the collector's name); one that answers with no cards is logged at Debug.
+**`Run` collects the inventory once at start and otherwise only re-sends the
+cached copy**, so a GPU whose driver is not ready at that moment would be missing
+from the report until the agent restarts, while telemetry reports it a second
+later. On a ROCm host this is a boot race, not a hypothetical: the agent unit
+starts after `network-online.target`, a few seconds before amdgpu has finished
+initializing every card. The agent therefore compares each telemetry tick's GPUs
+(`vendor`, `index`) with the cached inventory, and when telemetry sees one the
+inventory lacks it re-collects the whole inventory and, if the fresh collect
+improves on the cache (it misses fewer of telemetry's cards and none the cache
+had: a collector can time out on the retry too), replaces the cache (keeping memory modules the helper
+retry filled in when the fresh collect has none), hands the runtime the new
+Vulkan mapping, logs it at Info and re-sends the report. Re-collects run on
+`Run`'s goroutine, at most one per 10 s and at most six over the agent's
+lifetime, after which one Warn names the GPUs still missing; an inventory that
+covers what telemetry sees costs nothing beyond the comparison.
+
 Per GPU the report carries `index`, `name`, `uuid`, `driver_version`,
 `memory_total_bytes` and `pci_bus_id` — the last three `omitempty`, so a
 consumer can tell "not reported" from "reported blank" — and, from an agent
