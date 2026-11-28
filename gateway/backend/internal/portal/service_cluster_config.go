@@ -788,21 +788,9 @@ func (s *Service) buildCluster(ctx context.Context, head routing.RuntimeSpec, me
 // server (loopback) runs direct and knows its head as loopback, whatever the
 // cluster's transport: no relay is needed where nothing leaves the host.
 func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m derivedMember, id, transport string, headIPs []string, headDomain string) (AgentRuntimeSpecDTO, error) {
-	var gpuCeiling map[routing.GPUKey]int
-	ramCeiling := 0
-	if m.row.Stale {
-		var err error
-		if gpuCeiling, ramCeiling, err = s.serverMemoryCeilings(ctx, m.server.ID, m.server.GPULegacyVendor); err != nil {
-			return AgentRuntimeSpecDTO{}, err
-		}
-	}
-	parts := m.gpuParts()
-	gpus := make([]AgentRuntimeSpecGPUDTO, 0, len(parts))
-	for _, g := range parts {
-		gpus = append(gpus, AgentRuntimeSpecGPUDTO{
-			Vendor: g.Vendor, Index: g.Index,
-			VRAMMB: memberDemand(g.VRAMMeasuredMB, g.VRAMEstimateMB, m.row.Stale, gpuCeiling[resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, m.server.GPULegacyVendor)]),
-		})
+	gpuCeiling, ramCeiling, err := s.memberMemoryCeilings(ctx, m)
+	if err != nil {
+		return AgentRuntimeSpecDTO{}, err
 	}
 	spec := AgentRuntimeSpecDTO{
 		ID:                    id,
@@ -810,7 +798,7 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 		Binary:                m.binary.Path,
 		Args:                  []string{},
 		Env:                   map[string]string{},
-		GPUs:                  gpus,
+		GPUs:                  memberGPUDemands(m, gpuCeiling),
 		RAMMB:                 memberDemand(m.row.RAMMeasuredMB, m.ramEstimate(), m.row.Stale, ramCeiling),
 		StartupTimeoutSeconds: memberStartupTimeoutSeconds,
 		IdleTimeoutSeconds:    memberIdleTimeoutSeconds,
@@ -834,16 +822,50 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 		}
 		return spec, nil
 	}
+	if err := applyManualMemberSpec(&spec, m); err != nil {
+		return AgentRuntimeSpecDTO{}, err
+	}
+	return spec, nil
+}
+
+// memberMemoryCeilings is what a stale member's stored values are held at
+// (serverMemoryCeilings); none for a member whose values are not stale.
+func (s *Service) memberMemoryCeilings(ctx context.Context, m derivedMember) (map[routing.GPUKey]int, int, error) {
+	if !m.row.Stale {
+		return nil, 0, nil
+	}
+	return s.serverMemoryCeilings(ctx, m.server.ID, m.server.GPULegacyVendor)
+}
+
+// memberGPUDemands is the per-GPU demand of m's spec (memberDemand), each
+// GPU's stale value held at its card's ceiling, looked up under the server's
+// legacy vendor.
+func memberGPUDemands(m derivedMember, gpuCeiling map[routing.GPUKey]int) []AgentRuntimeSpecGPUDTO {
+	parts := m.gpuParts()
+	gpus := make([]AgentRuntimeSpecGPUDTO, 0, len(parts))
+	for _, g := range parts {
+		gpus = append(gpus, AgentRuntimeSpecGPUDTO{
+			Vendor: g.Vendor, Index: g.Index,
+			VRAMMB: memberDemand(g.VRAMMeasuredMB, g.VRAMEstimateMB, m.row.Stale, gpuCeiling[resolveLegacyGPUKey(routing.GPUKey{Vendor: g.Vendor, Index: g.Index}, m.server.GPULegacyVendor)]),
+		})
+	}
+	return gpus
+}
+
+// applyManualMemberSpec sets what a manual member's own spec decides on its
+// agent spec: the device backend, the cache flag, and its args and env
+// (never nil; a stored value that does not decode is refused).
+func applyManualMemberSpec(spec *AgentRuntimeSpecDTO, m derivedMember) error {
 	spec.DeviceBackend = normalizeDeviceBackend(m.spec.DeviceBackend)
 	spec.RPC.CacheEnabled = m.spec.CacheEnabled
 	if strings.TrimSpace(m.spec.Args) != "" {
 		if err := json.Unmarshal([]byte(m.spec.Args), &spec.Args); err != nil {
-			return AgentRuntimeSpecDTO{}, ErrRuntimeSpecArgsInvalid
+			return ErrRuntimeSpecArgsInvalid
 		}
 	}
 	if strings.TrimSpace(m.spec.Env) != "" {
 		if err := json.Unmarshal([]byte(m.spec.Env), &spec.Env); err != nil {
-			return AgentRuntimeSpecDTO{}, ErrRuntimeSpecEnvInvalid
+			return ErrRuntimeSpecEnvInvalid
 		}
 	}
 	if spec.Args == nil {
@@ -852,7 +874,7 @@ func (s *Service) memberAgentSpec(ctx context.Context, headSpecID string, m deri
 	if spec.Env == nil {
 		spec.Env = map[string]string{}
 	}
-	return spec, nil
+	return nil
 }
 
 // memberDemand is a member's demand for one GPU or for RAM: max(stored,

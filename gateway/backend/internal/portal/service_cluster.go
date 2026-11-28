@@ -1173,51 +1173,74 @@ func (s *Service) serverHostGPUs(ctx context.Context, serverID string) (map[rout
 		return out, err
 	}
 	var report struct {
-		GPUs []struct {
-			Index            int      `json:"index"`
-			Name             string   `json:"name"`
-			PCIBusID         string   `json:"pci_bus_id"`
-			Vendor           string   `json:"vendor"`
-			MemoryTotalBytes int64    `json:"memory_total_bytes"`
-			VRAMMeasurable   []string `json:"vram_measurable"`
-		} `json:"gpus"`
+		GPUs []reportedGPU `json:"gpus"`
 	}
 	if json.Unmarshal([]byte(hw.ReportJSON), &report) != nil {
 		return out, nil
 	}
-	goos := ""
-	telemetry, hasTelemetry, err := s.routes.TelemetryByServer(ctx, serverID)
+	goos, err := s.serverGOOS(ctx, serverID)
 	if err != nil {
 		return nil, err
 	}
-	if hasTelemetry {
-		goos = telemetry.OS
-	}
-	vendors := make([]string, len(report.GPUs))
-	for i, g := range report.GPUs {
-		if v := strings.ToLower(strings.TrimSpace(g.Vendor)); routing.ValidGPUVendor(v) {
-			vendors[i] = v
-		}
-	}
+	vendors := reportedGPUVendors(report.GPUs)
 	kfdHost := goos == "linux" && len(report.GPUs) > 0
 	for i, g := range report.GPUs {
 		kfdHost = kfdHost && gpuLooksAMD(vendors[i], g.Name)
 	}
 	for i, g := range report.GPUs {
-		vendor := vendors[i]
-		apple := vendor == routing.GPUVendorApple ||
-			(vendor == "" && (goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")))
-		out[routing.GPUKey{Vendor: vendor, Index: g.Index}] = hostGPU{
-			vendor:        vendor,
-			nvidia:        !apple && gpuLooksNVIDIA(vendor, g.Name, g.PCIBusID),
-			apple:         apple,
-			kfdHost:       kfdHost,
-			totalMB:       int(g.MemoryTotalBytes / (1024 * 1024)),
-			measurable:    g.VRAMMeasurable,
-			hasMeasurable: vendor != "" || len(g.VRAMMeasurable) > 0,
-		}
+		out[routing.GPUKey{Vendor: vendors[i], Index: g.Index}] = newHostGPU(g, vendors[i], goos, kfdHost)
 	}
 	return out, nil
+}
+
+// reportedGPU is one GPU of a server's hardware report, as serverHostGPUs
+// reads it.
+type reportedGPU struct {
+	Index            int      `json:"index"`
+	Name             string   `json:"name"`
+	PCIBusID         string   `json:"pci_bus_id"`
+	Vendor           string   `json:"vendor"`
+	MemoryTotalBytes int64    `json:"memory_total_bytes"`
+	VRAMMeasurable   []string `json:"vram_measurable"`
+}
+
+// serverGOOS is the runtime.GOOS of serverID's last telemetry sample, "" when
+// it has none (the family is unknown).
+func (s *Service) serverGOOS(ctx context.Context, serverID string) (string, error) {
+	telemetry, hasTelemetry, err := s.routes.TelemetryByServer(ctx, serverID)
+	if err != nil || !hasTelemetry {
+		return "", err
+	}
+	return telemetry.OS, nil
+}
+
+// reportedGPUVendors is each reported GPU's vendor, normalized; "" for a GPU
+// whose report names no valid vendor (an agent without gpu_vendor_identity).
+func reportedGPUVendors(gpus []reportedGPU) []string {
+	vendors := make([]string, len(gpus))
+	for i, g := range gpus {
+		if v := strings.ToLower(strings.TrimSpace(g.Vendor)); routing.ValidGPUVendor(v) {
+			vendors[i] = v
+		}
+	}
+	return vendors
+}
+
+// newHostGPU is the hostGPU of reported card g with its normalized vendor on
+// a host of family goos. A vendor-less report reads Apple from the host family
+// or the card's name, and NVIDIA from the name or PCI id (gpuLooksNVIDIA).
+func newHostGPU(g reportedGPU, vendor, goos string, kfdHost bool) hostGPU {
+	apple := vendor == routing.GPUVendorApple ||
+		(vendor == "" && (goos == "darwin" || strings.Contains(strings.ToLower(g.Name), "apple")))
+	return hostGPU{
+		vendor:        vendor,
+		nvidia:        !apple && gpuLooksNVIDIA(vendor, g.Name, g.PCIBusID),
+		apple:         apple,
+		kfdHost:       kfdHost,
+		totalMB:       int(g.MemoryTotalBytes / (1024 * 1024)),
+		measurable:    g.VRAMMeasurable,
+		hasMeasurable: vendor != "" || len(g.VRAMMeasurable) > 0,
+	}
 }
 
 // hostIsMixed reports whether host (serverHostGPUs) lists both NVIDIA and
@@ -1248,34 +1271,51 @@ func (s *Service) normalizeClusterMemberGPUVendors(entries []clusterEntry, prevG
 		if e.manual {
 			continue
 		}
-		var storedKeys []routing.GPUKey
-		for _, g := range prevGPUs {
-			if g.ServerID == e.server.ID {
-				storedKeys = append(storedKeys, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
-			}
-		}
+		storedKeys := storedMemberGPUKeys(prevGPUs, func(g routing.ClusterMemberGPU) bool { return g.ServerID == e.server.ID })
 		rules := s.gpuVendorRulesWith(e.server.ID, e.server.GPULegacyVendor).withStored(storedKeys)
 		if !e.visible {
 			rules.known = false
 		}
-		gpus := make([]routing.GPUKey, 0, len(e.gpus))
-		estimate := make(map[routing.GPUKey]int, len(e.gpus))
-		seen := make(map[routing.GPUKey]struct{}, len(e.gpus))
-		for _, k := range e.gpus {
-			vendor, err := rules.normalizeAt(k.Vendor, k.Index)
-			if err != nil {
-				return err
-			}
-			normalized := routing.GPUKey{Vendor: vendor, Index: k.Index}
-			if _, dup := seen[rules.resolve(normalized)]; dup {
-				return ErrRuntimeSpecGPUInvalid
-			}
-			seen[rules.resolve(normalized)] = struct{}{}
-			gpus = append(gpus, normalized)
-			estimate[normalized] = e.estimate[k]
+		if err := e.normalizeGPUVendors(rules); err != nil {
+			return err
 		}
-		e.gpus, e.estimate = gpus, estimate
 	}
+	return nil
+}
+
+// storedMemberGPUKeys is the GPU keys of the stored member GPU rows match
+// selects, in stored order.
+func storedMemberGPUKeys(prevGPUs []routing.ClusterMemberGPU, match func(routing.ClusterMemberGPU) bool) []routing.GPUKey {
+	var keys []routing.GPUKey
+	for _, g := range prevGPUs {
+		if match(g) {
+			keys = append(keys, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
+		}
+	}
+	return keys
+}
+
+// normalizeGPUVendors replaces e's GPU keys and their estimates with their
+// vendor normalized under rules, refusing a GPU rules cannot normalize and
+// two keys naming the same card (ErrRuntimeSpecGPUInvalid).
+func (e *clusterEntry) normalizeGPUVendors(rules gpuVendorRules) error {
+	gpus := make([]routing.GPUKey, 0, len(e.gpus))
+	estimate := make(map[routing.GPUKey]int, len(e.gpus))
+	seen := make(map[routing.GPUKey]struct{}, len(e.gpus))
+	for _, k := range e.gpus {
+		vendor, err := rules.normalizeAt(k.Vendor, k.Index)
+		if err != nil {
+			return err
+		}
+		normalized := routing.GPUKey{Vendor: vendor, Index: k.Index}
+		if _, dup := seen[rules.resolve(normalized)]; dup {
+			return ErrRuntimeSpecGPUInvalid
+		}
+		seen[rules.resolve(normalized)] = struct{}{}
+		gpus = append(gpus, normalized)
+		estimate[normalized] = e.estimate[k]
+	}
+	e.gpus, e.estimate = gpus, estimate
 	return nil
 }
 
@@ -1297,24 +1337,28 @@ func checkClusterMemberBackends(entries []clusterEntry, prevMembers []routing.Cl
 		if refusal == nil {
 			continue
 		}
-		var stored *devicePlanInputs
-		if j := slices.IndexFunc(prevMembers, func(m routing.ClusterMember) bool {
-			return m.Position == i && m.ServerID == e.server.ID && m.MemberSpecID == ""
-		}); j >= 0 {
-			var keys []routing.GPUKey
-			for _, g := range prevGPUs {
-				if g.MemberPosition == i && g.ServerID == e.server.ID {
-					keys = append(keys, routing.GPUKey{Vendor: g.GPUVendor, Index: g.GPUIndex})
-				}
-			}
-			in := newDevicePlanInputs(prevMembers[j].DeviceBackend, keys, legacy, false)
-			stored = &in
-		}
+		stored := storedAutomaticMemberInputs(prevMembers, prevGPUs, i, e.server.ID, legacy)
 		if err := refusalUnlessUnchanged(refusal, newDevicePlanInputs(e.req.DeviceBackend, e.gpus, legacy, false), stored); err != nil {
 			return e.refusal(err, "the device backend of the member on server %q cannot drive its GPUs", e.server.Name)
 		}
 	}
 	return nil
+}
+
+// storedAutomaticMemberInputs is the device-plan inputs of the stored
+// automatic member at position on serverID, nil when there is none.
+func storedAutomaticMemberInputs(prevMembers []routing.ClusterMember, prevGPUs []routing.ClusterMemberGPU, position int, serverID, legacy string) *devicePlanInputs {
+	j := slices.IndexFunc(prevMembers, func(m routing.ClusterMember) bool {
+		return m.Position == position && m.ServerID == serverID && m.MemberSpecID == ""
+	})
+	if j < 0 {
+		return nil
+	}
+	keys := storedMemberGPUKeys(prevGPUs, func(g routing.ClusterMemberGPU) bool {
+		return g.MemberPosition == position && g.ServerID == serverID
+	})
+	in := newDevicePlanInputs(prevMembers[j].DeviceBackend, keys, legacy, false)
+	return &in
 }
 
 // checkClusterMemberGPUs is step 9 of validateClusterHead. An Apple GPU gets
@@ -1504,31 +1548,47 @@ func indexStoredMembership(entries []clusterEntry, prevMembers []routing.Cluster
 // server (whose port the entry keeps). With one member per server this is
 // the pairing by server.
 func matchStoredRows(entries []clusterEntry, prevMembers []routing.ClusterMember, gpuOrder map[int][]routing.GPUKey) map[int]routing.ClusterMember {
-	out := make(map[int]routing.ClusterMember, len(entries))
-	taken := make([]bool, len(prevMembers))
-	pair := func(match func(e clusterEntry, m routing.ClusterMember) bool) {
-		for _, e := range entries {
-			if _, done := out[e.position]; done {
-				continue
-			}
-			for j, m := range prevMembers {
-				if !taken[j] && m.ServerID == e.server.ID && match(e, m) {
-					taken[j], out[e.position] = true, m
-					break
-				}
-			}
-		}
+	p := storedRowPairing{
+		entries: entries,
+		prev:    prevMembers,
+		taken:   make([]bool, len(prevMembers)),
+		out:     make(map[int]routing.ClusterMember, len(entries)),
 	}
 	sameSpec := func(e clusterEntry, m routing.ClusterMember) bool { return m.MemberSpecID == e.specID() }
 	sameGPUs := func(e clusterEntry, m routing.ClusterMember) bool {
 		return !e.manual && m.MemberSpecID == "" && sameGPUSelection(gpuOrder[m.Position], e.gpus, e.server.GPULegacyVendor)
 	}
-	pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameGPUs(e, m) })
-	pair(sameGPUs)
-	pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameSpec(e, m) })
-	pair(sameSpec)
-	pair(func(clusterEntry, routing.ClusterMember) bool { return true })
-	return out
+	p.pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameGPUs(e, m) })
+	p.pair(sameGPUs)
+	p.pair(func(e clusterEntry, m routing.ClusterMember) bool { return m.Position == e.position && sameSpec(e, m) })
+	p.pair(sameSpec)
+	p.pair(func(clusterEntry, routing.ClusterMember) bool { return true })
+	return p.out
+}
+
+// storedRowPairing is matchStoredRows' state: the stored rows already taken
+// and the pairing so far, by entry position.
+type storedRowPairing struct {
+	entries []clusterEntry
+	prev    []routing.ClusterMember
+	taken   []bool
+	out     map[int]routing.ClusterMember
+}
+
+// pair pairs every still unpaired entry with the first untaken stored row on
+// the entry's server that match accepts.
+func (p *storedRowPairing) pair(match func(e clusterEntry, m routing.ClusterMember) bool) {
+	for _, e := range p.entries {
+		if _, done := p.out[e.position]; done {
+			continue
+		}
+		for j, m := range p.prev {
+			if !p.taken[j] && m.ServerID == e.server.ID && match(e, m) {
+				p.taken[j], p.out[e.position] = true, m
+				break
+			}
+		}
+	}
 }
 
 // planMemberRow builds the membership row and GPU rows of the entry at
